@@ -1826,10 +1826,15 @@ pub const PromoteSink = struct {
 
 pub const WriteCache = cache_mod.Cache(Resident, PromoteSink);
 
-/// The cache's per-shard item table: one item per possible resident at the
-/// smallest record (two grains: the header and one of value).
-pub fn writeCacheItemsPerShard(bound: u64, shards: u32) usize {
-    return @intCast(@max(bound / (2 * RECORD_ALIGN) / shards, 16));
+/// The smallest record: two grains, the header and one of value.
+const WRITE_CACHE_ENTRY_FLOOR: u64 = 2 * RECORD_ALIGN;
+
+/// The cache's per-shard sizing: the item table one item per possible
+/// resident at the smallest record (at least 16); the index grows on
+/// demand to the same count (`cache.Items`: an idle ring's index is the
+/// seed's, not the sealed ring's — 336 MiB of maps at a 27 GiB ring).
+pub fn writeCacheItems(bound: u64, shards: u32) cache_mod.Items {
+    return .{ .max = @intCast(@max(bound / WRITE_CACHE_ENTRY_FLOOR / shards, 16)), .entry_floor = WRITE_CACHE_ENTRY_FLOOR, .slack = 16 };
 }
 
 /// Touch `key` in the cache (its last write or read): a shard lock, a map
@@ -3321,7 +3326,7 @@ test "the write cache over the ONE cache core (owner ruling 2026-10-21): a stage
     var sink: PromoteSink = .{ .pool = &pool, .hooks = kicks.hooks() };
     // One shard: the order is exact; four records of 8 KiB fit the bound.
     const bound: u64 = 4 * 8192;
-    const c = try WriteCache.init(gpa, &sink, bound, 1, writeCacheItemsPerShard(bound, 1), null);
+    const c = try WriteCache.init(gpa, &sink, bound, 1, writeCacheItems(bound, 1), null);
     defer c.deinit();
     const v: [100]u8 = @splat(1);
     for (1..5) |i| _ = try stageWrite(&pool, &r.seg, c, tkey(@intCast(i), i), &v, 0, .none);
@@ -4011,4 +4016,13 @@ test "linux: the write cache (charter §6.1 'Staged', 2026-10-21) — the ring i
     defer c.release();
     try testing.expectEqual(BindVerdict.absent, c.verdict);
     try testing.expect(!Ring.Ram.holdsData(c.memfd));
+}
+
+test "tie: the write cache's sizing — the table one item per smallest record (2 grains) a shard, at least 16; the index grows on demand to exactly the table at the sealed ring's bound (27 GiB over 32 shards: 110,592 a shard)" {
+    const items = writeCacheItems(27 * derive.GiB, 32);
+    try testing.expectEqual(@as(usize, 27 * derive.GiB / (2 * RECORD_ALIGN) / 32), items.max);
+    try testing.expectEqual(@as(usize, 110_592), items.max);
+    try testing.expectEqual(items.max, items.indexFor(27 * derive.GiB, 32));
+    try testing.expectEqual(@as(usize, 16), writeCacheItems(64 * derive.MiB, 1024).max);
+    try testing.expectEqual(@as(usize, 16), writeCacheItems(64 * derive.MiB, 1024).indexFor(64 * derive.MiB, 1024));
 }

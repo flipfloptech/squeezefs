@@ -1147,7 +1147,7 @@ pub const DataPlane = struct {
         st.bound = capacity;
         st.sink = .{ .pool = &st.pool, .hooks = st.pool.hooks };
         const shards = cache_mod.shardsFor(opts.facts.cpus, capacity, WRITE_CACHE_MIN_SHARD);
-        st.cache = staging.WriteCache.init(gpa, &st.sink, @max(capacity, st.pool.currentBytes()), shards, staging.writeCacheItemsPerShard(capacity, shards), null) catch return error.OutOfMemory;
+        st.cache = staging.WriteCache.init(gpa, &st.sink, @max(capacity, st.pool.currentBytes()), shards, staging.writeCacheItems(capacity, shards), null) catch return error.OutOfMemory;
         errdefer st.cache.deinit();
         {
             const residents = st.seg.residentsAlloc(gpa) catch return error.OutOfMemory;

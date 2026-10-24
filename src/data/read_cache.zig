@@ -36,23 +36,32 @@
 //! `read_cache_stale_served` is the must-stay-0 tripwire of the verify
 //! seam (`SQUEEZEFS_TEST_READ_CACHE_VERIFY`).
 //!
-//! Memory: the slab is a `read_fill_pool.Pool` of `GRAIN` slots (lazily
-//! populated; refcounted so a serve's pin outlives an eviction; `mincore`
-//! residency; the idle trim), charged to the budget as `read_cache`
+//! Memory: the slab is a `GrainSlab` of `GRAIN` slots — the reservation
+//! (the knob's share of the MACHINE's RAM, so a share that drops lets the
+//! bound grow) in one lazily populated mapping, one stripe per core shard,
+//! every per-slot table lazily materialized: an idle instance holds the
+//! grains it filled, never its reservation (the idle-RSS law, `docs/
+//! evidence/rung-10-idle-rss.md` — the fill pool's ring and arrays over a
+//! 109 GiB machine's 7.2 M grains were 224 MiB of an idle daemon).
+//! Refcounted so a serve's pin outlives an eviction; the idle trim returns
+//! released grains oldest first. Charged to the budget as `read_cache`
 //! through the core's component. Yellow freezes growth (an insert evicts
 //! first), Red deposits nothing and the shed evicts to the authority's
 //! target.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const Atomic = std.atomic.Value;
 const assert = std.debug.assert;
 
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
 const budget = @import("../mem/budget.zig");
 const cache = @import("../mem/cache.zig");
+const lazy = @import("../mem/lazy.zig");
+const jc = @import("../meta/journal_core.zig");
 const rsc = @import("read_size_class.zig");
-const fill_pool = @import("read_fill_pool.zig");
 const lease_epoch = @import("lease_epoch.zig");
 
 pub const BlockKey = rsc.BlockKey;
@@ -91,6 +100,9 @@ pub const stats = struct {
     /// `read_cache_grain_window_puts`: windows deposited (the core's
     /// `fills` count grains).
     pub var read_cache_grain_window_puts: counters.ShardedCounter = .{};
+    /// `read_cache_grain_trimmed_bytes`: released grains whose pages the
+    /// idle trim (Yellow/Red ticks, the Red shed) returned.
+    pub var read_cache_grain_trimmed_bytes: counters.ShardedCounter = .{};
     /// `read_cache_stale_served`: the verify seam re-read the device after
     /// a serve and the bytes differed (must stay 0).
     pub var read_cache_stale_served: counters.Tripwire = .init("read_cache_stale_served");
@@ -109,12 +121,222 @@ pub fn derivedCapacity(pct: u64, machine_ram: u64) u64 {
     return cache.derivedBound(pct, machine_ram, machine_ram);
 }
 
-/// Slab slots for a budget: one per grain plus one per shard for the
-/// deposit that triggers an eviction, plus the in-flight headroom of one
-/// window per core (a window's slots are acquired before its shard lock).
-pub fn slabSlots(budget_bytes: u64, shards: u32, cores: u32) u32 {
-    return @intCast(budget_bytes / GRAIN + shards + @as(u64, cores) * WINDOW_MAX_GRAINS);
+/// A shard's entries over a reservation: its share of the reservation's
+/// grains, plus one for the deposit that triggers an eviction, plus one
+/// window of in-flight headroom (a window's slots are acquired before its
+/// shard lock). The same count sizes the shard's item table and its slab
+/// stripe; the index holds the live bound's (`Items.indexFor`).
+pub fn perShardSlots(reservation: u64, shards: u32) u32 {
+    return @intCast(reservation / shards / GRAIN + 1 + WINDOW_MAX_GRAINS);
 }
+
+/// The core's sizing: the table the reservation's, the index the bound's.
+pub fn coreItems(reservation: u64, shards: u32) cache.Items {
+    return .{ .max = perShardSlots(reservation, shards), .entry_floor = GRAIN, .slack = 1 + WINDOW_MAX_GRAINS };
+}
+
+/// THE GRAIN SLAB: the reservation's `GRAIN` slots in ONE lazily populated
+/// anonymous mapping, split into one STRIPE per core shard — a shard's
+/// grains live in its stripe, so the slot an eviction frees is the one
+/// the shard's next deposit takes. Per stripe, under its spin lock: a bump
+/// cursor over the never-used slots, the WARM chain of released slots
+/// (resident: a fill wrote them; most recent at the head, so a deposit
+/// reuses the hottest page and the idle trim takes the tail — the oldest
+/// release) and the COLD chain of trimmed ones (pages returned). Per slot,
+/// lazily materialized (`mem/lazy.zig`): the refcount (the tier's
+/// reference + each serve's pin: the last release chains the slot, so a
+/// pinned slot is never reused under a copy), the chain links and the idle
+/// clock's stamp. Nothing is allocated per op; an idle instance costs the
+/// slots it has filled. Residency is counted, not measured: a slot is
+/// resident from its fill until its trim (`GRAIN` is the page).
+pub const GrainSlab = struct {
+    pub const Slot = u32;
+    /// Chain links hold `slot + 1` so the lazily zeroed table reads empty.
+    const NONE: u32 = 0;
+
+    const Stripe = struct {
+        lock: jc.SpinLock align(std.atomic.cache_line) = .{},
+        /// Slots `[0, fresh)` of the stripe were handed out at least once.
+        fresh: u32 = 0,
+        warm_head: u32 = NONE,
+        warm_tail: u32 = NONE,
+        cold_head: u32 = NONE,
+    };
+
+    gpa: Allocator,
+    base: [*]align(std.heap.page_size_min) u8,
+    bytes_len: usize,
+    capacity: u32,
+    per_stripe: u32,
+    stripes: []Stripe,
+    refs: []Atomic(u32),
+    next: []u32,
+    prev: []u32,
+    freed_tick: []Atomic(u64),
+    /// The idle clock: the sampler's tick count (a test points it at its own).
+    clock: *const Atomic(u64) = &budget.authority.tick_count,
+    checked_out_bytes: counters.Gauge = .{},
+    /// The warm chains' bytes: released, still resident.
+    warm_bytes: counters.Gauge = .{},
+
+    pub fn init(gpa: Allocator, stripes: u32, per_stripe: u32) Allocator.Error!*GrainSlab {
+        assert(stripes > 0 and per_stripe > 0);
+        const capacity: u32 = std.math.mul(u32, stripes, per_stripe) catch return error.OutOfMemory;
+        const self = try gpa.create(GrainSlab);
+        errdefer gpa.destroy(self);
+        const slab_bytes = try lazy.alloc(u8, @as(usize, capacity) * GRAIN);
+        errdefer lazy.free(u8, slab_bytes);
+        const stripe_tab = try gpa.alloc(Stripe, stripes);
+        errdefer gpa.free(stripe_tab);
+        @memset(stripe_tab, .{});
+        const refs = try lazy.alloc(Atomic(u32), capacity);
+        errdefer lazy.free(Atomic(u32), refs);
+        const next = try lazy.alloc(u32, capacity);
+        errdefer lazy.free(u32, next);
+        const prev = try lazy.alloc(u32, capacity);
+        errdefer lazy.free(u32, prev);
+        const freed_tick = try lazy.alloc(Atomic(u64), capacity);
+        self.* = .{ .gpa = gpa, .base = @alignCast(slab_bytes.ptr), .bytes_len = slab_bytes.len, .capacity = capacity, .per_stripe = per_stripe, .stripes = stripe_tab, .refs = refs, .next = next, .prev = prev, .freed_tick = freed_tick };
+        return self;
+    }
+
+    pub fn deinit(self: *GrainSlab) void {
+        lazy.free(Atomic(u64), self.freed_tick);
+        lazy.free(u32, self.prev);
+        lazy.free(u32, self.next);
+        lazy.free(Atomic(u32), self.refs);
+        self.gpa.free(self.stripes);
+        lazy.free(u8, self.base[0..self.bytes_len]);
+        self.gpa.destroy(self);
+    }
+
+    /// Test seam: the idle clock.
+    pub fn setClock(self: *GrainSlab, clock: *const Atomic(u64)) void {
+        self.clock = clock;
+    }
+
+    fn stripeOf(self: *const GrainSlab, slot: Slot) *Stripe {
+        return &self.stripes[slot / self.per_stripe];
+    }
+
+    fn unlinkWarm(self: *GrainSlab, st: *Stripe, slot: Slot) void {
+        const p = self.prev[slot];
+        const n = self.next[slot];
+        if (p != NONE) self.next[p - 1] = n else st.warm_head = n;
+        if (n != NONE) self.prev[n - 1] = p else st.warm_tail = p;
+        self.warm_bytes.sub(GRAIN);
+    }
+
+    /// A slot of stripe `stripe` at refcount 1: the warm head, else a
+    /// cold slot, else a never-used one; null when the stripe is full.
+    pub fn acquire(self: *GrainSlab, stripe: usize) ?Slot {
+        const st = &self.stripes[stripe];
+        const slot: Slot = blk: {
+            st.lock.lock();
+            defer st.lock.unlock();
+            if (st.warm_head != NONE) {
+                const s = st.warm_head - 1;
+                self.unlinkWarm(st, s);
+                break :blk s;
+            }
+            if (st.cold_head != NONE) {
+                const s = st.cold_head - 1;
+                st.cold_head = self.next[s];
+                break :blk s;
+            }
+            if (st.fresh < self.per_stripe) {
+                const s: Slot = @intCast(stripe * self.per_stripe + st.fresh);
+                st.fresh += 1;
+                break :blk s;
+            }
+            return null;
+        };
+        assert(self.refs[slot].load(.monotonic) == 0);
+        self.refs[slot].store(1, .monotonic);
+        self.checked_out_bytes.add(GRAIN);
+        return slot;
+    }
+
+    /// One more reference (a serve's pin, taken under the shard lock while
+    /// the tier's reference stands, so the slot cannot be freed under it).
+    pub fn pin(self: *GrainSlab, slot: Slot) void {
+        const prev = self.refs[slot].fetchAdd(1, .monotonic);
+        assert(prev != 0);
+    }
+
+    /// Drop a reference; true when this was the last and the slot went to
+    /// its stripe's warm head. acq_rel: the last release orders every
+    /// reader's loads before the chain push, so a re-acquirer's fill never
+    /// races a straggling copy.
+    pub fn unpin(self: *GrainSlab, slot: Slot) bool {
+        const prev = self.refs[slot].fetchSub(1, .acq_rel);
+        assert(prev != 0);
+        if (prev != 1) return false;
+        self.checked_out_bytes.sub(GRAIN);
+        self.freed_tick[slot].store(self.clock.load(.monotonic), .monotonic);
+        const st = self.stripeOf(slot);
+        st.lock.lock();
+        defer st.lock.unlock();
+        self.prev[slot] = NONE;
+        self.next[slot] = st.warm_head;
+        if (st.warm_head != NONE) self.prev[st.warm_head - 1] = slot + 1 else st.warm_tail = slot + 1;
+        st.warm_head = slot + 1;
+        self.warm_bytes.add(GRAIN);
+        return true;
+    }
+
+    pub fn bytes(self: *GrainSlab, slot: Slot) []align(std.heap.page_size_min) u8 {
+        return @alignCast(self.base[@as(usize, slot) * GRAIN ..][0..GRAIN]);
+    }
+
+    pub fn checkedOutBytes(self: *const GrainSlab) u64 {
+        return self.checked_out_bytes.load();
+    }
+
+    /// Everything the slab holds resident: the checked-out grains and the
+    /// warm (released, untrimmed) ones.
+    pub fn residentBytes(self: *const GrainSlab) u64 {
+        return self.checked_out_bytes.load() + self.warm_bytes.load();
+    }
+
+    pub fn freeSlots(self: *const GrainSlab) usize {
+        return self.capacity - @as(usize, @intCast(self.checked_out_bytes.load() / GRAIN));
+    }
+
+    /// The idle trim (`budget.TrimFn`): every warm slot released ≥
+    /// `min_idle_ticks` ago goes cold.
+    pub fn trim(self: *GrainSlab, min_idle_ticks: u64) void {
+        self.trimToward(min_idle_ticks, 0);
+    }
+
+    /// Return warm slots, each stripe's oldest release first, until the
+    /// warm bytes are ≤ `target_warm_bytes` (or every stripe's tail is
+    /// younger than `min_idle_ticks`). A slot is unlinked under its
+    /// stripe's lock (no acquirer can take it), its pages returned outside
+    /// it, then chained cold.
+    pub fn trimToward(self: *GrainSlab, min_idle_ticks: u64, target_warm_bytes: u64) void {
+        const now = self.clock.load(.monotonic);
+        for (self.stripes) |*st| {
+            while (self.warm_bytes.load() > target_warm_bytes) {
+                const slot: Slot = blk: {
+                    st.lock.lock();
+                    defer st.lock.unlock();
+                    if (st.warm_tail == NONE) break;
+                    const s = st.warm_tail - 1;
+                    if (now -| self.freed_tick[s].load(.monotonic) < min_idle_ticks) break;
+                    self.unlinkWarm(st, s);
+                    break :blk s;
+                };
+                if (builtin.os.tag == .linux) _ = std.os.linux.madvise(self.bytes(slot).ptr, GRAIN, std.os.linux.MADV.DONTNEED);
+                stats.read_cache_grain_trimmed_bytes.add(GRAIN);
+                st.lock.lock();
+                defer st.lock.unlock();
+                self.next[slot] = st.cold_head;
+                st.cold_head = slot + 1;
+            }
+        }
+    }
+};
 
 /// A grain's key: its device offset (the index's hash and the comparison)
 /// and the block it belongs to (the SHARD's hash — one shard per block).
@@ -150,7 +372,7 @@ pub const Grain = struct {
 /// the shard lock — the device still has the bytes.
 pub const DropSink = struct {
     pub const runs_under_lock = true;
-    slab: *fill_pool.Pool,
+    slab: *GrainSlab,
 
     pub fn onEvict(self: *DropSink, g: *const Grain, _: cache.Why) cache.Outcome {
         _ = self.slab.unpin(g.slot);
@@ -166,7 +388,7 @@ fn leaseEpochOf(_: ?*anyopaque, ino: u64) u64 {
 
 pub const ReadCache = struct {
     gpa: Allocator,
-    slab: *fill_pool.Pool,
+    slab: *GrainSlab,
     sink: DropSink,
     core: *Core,
     block_size: u64,
@@ -177,16 +399,16 @@ pub const ReadCache = struct {
     /// The slab's reservation: the bound can grow to this and no further.
     capacity_bytes: u64,
 
-    pub const InitError = Allocator.Error || fill_pool.InitError;
+    pub const InitError = Allocator.Error;
     pub const PutOutcome = enum { inserted, refused, ineligible };
 
     /// `budget_bytes` is the bound at init (`cache.resolveBound` over the
     /// mount's facts; 0 disables the tier: every probe misses, every
     /// deposit refuses, one slot and one shard are allocated).
-    /// `capacity_bytes` is the slab's reservation — the percentage of the
+    /// `capacity_bytes` is the reservation — the percentage of the
     /// MACHINE's RAM (`derive.Facts.probe()`, before the fleet share
-    /// divides it): a lazily populated mapping, so an unreached bound costs
-    /// nothing; the live bound re-derived at every budget tick
+    /// divides it): lazily populated slab and tables, so an unreached
+    /// bound costs nothing; the live bound re-derived at every budget tick
     /// (`rederive`) grows up to it when the share drops (the mount's own
     /// CLI and supervisor are three `squeezefs` processes at mount time:
     /// every supervised mount resolves its first budget at a third).
@@ -194,16 +416,14 @@ pub const ReadCache = struct {
         assert(block_size >= GRAIN and derive.isAligned(block_size, GRAIN));
         const self = try gpa.create(ReadCache);
         errdefer gpa.destroy(self);
-        const cap = @max(capacity_bytes, budget_bytes);
+        // Off: one shard of one slot, nothing reserved.
+        const cap = if (budget_bytes == 0) 0 else @max(capacity_bytes, budget_bytes);
         const shard_count = if (budget_bytes == 0) 1 else cache.shardsFor(cores, cap, MIN_SHARD_BYTES);
-        const slots = if (budget_bytes == 0) 1 else slabSlots(cap, shard_count, cores);
-        const slab = try fill_pool.Pool.initRam(gpa, @intCast(GRAIN), slots);
+        const items: cache.Items = if (budget_bytes == 0) .{ .max = 1 } else coreItems(cap, shard_count);
+        const slab = try GrainSlab.init(gpa, shard_count, @intCast(items.max));
         errdefer slab.deinit();
-        // Items per shard: its share of the RESERVATION's grains + one for
-        // the deposit that evicts + one window of headroom.
-        const per_shard: usize = @intCast(cap / shard_count / GRAIN + 1 + WINDOW_MAX_GRAINS);
         self.* = .{ .gpa = gpa, .slab = slab, .sink = .{ .slab = slab }, .core = undefined, .block_size = block_size, .budget_bytes = budget_bytes, .pct = pct, .capacity_bytes = cap };
-        self.core = try Core.init(gpa, &self.sink, budget_bytes, shard_count, per_shard, .{ .call = &leaseEpochOf });
+        self.core = try Core.init(gpa, &self.sink, budget_bytes, shard_count, items, .{ .call = &leaseEpochOf });
         return self;
     }
 
@@ -253,7 +473,7 @@ pub const ReadCache = struct {
     const Pins = struct {
         slots: [WINDOW_MAX_GRAINS]u32 = undefined,
         n: usize = 0,
-        slab: *fill_pool.Pool,
+        slab: *GrainSlab,
 
         fn visit(self: *Pins, g: *const Grain) void {
             self.slab.pin(g.slot);
@@ -319,14 +539,17 @@ pub const ReadCache = struct {
         if (!self.enabled()) return .refused;
         if (!self.windowEligible(rel_s, rel_s + data.len)) return .ineligible;
         const n: usize = @intCast(data.len / GRAIN);
+        // The block's shard is its stripe: the slot a tail eviction frees
+        // is the one the retry takes.
+        const stripe = self.core.shardIndex(grainKey(block, 0));
         var inserted: usize = 0;
         for (0..n) |i| {
-            const slot = self.slab.acquire() orelse blk: {
+            const slot = self.slab.acquire(stripe) orelse blk: {
                 // The slab bounds slots as the budget bounds bytes: an
-                // exhausted slab evicts a tail and retries once.
+                // exhausted stripe evicts its shard's tail and retries once.
                 stats.read_cache_grain_slab_exhausted.inc();
                 _ = self.core.evictOne(grainKey(block, 0));
-                break :blk self.slab.acquire() orelse break;
+                break :blk self.slab.acquire(stripe) orelse break;
             };
             @memcpy(self.slab.bytes(slot)[0..GRAIN], data[i * GRAIN ..][0..GRAIN]);
             const key = grainKey(block, rel_s + @as(u64, i) * GRAIN);
@@ -434,11 +657,13 @@ pub const ReadCache = struct {
     pub fn writeStatsJson(self: *const ReadCache, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll("{");
         try self.core.stats.writeJson(w, "read_cache_grain");
-        try w.print(",\"read_cache_grain_purges\":{d},\"read_cache_grain_binding_refusals\":{d},\"read_cache_grain_slab_exhausted\":{d},\"read_cache_grain_window_puts\":{d},\"read_cache_stale_served\":{d}}}", .{
+        try w.print(",\"read_cache_grain_purges\":{d},\"read_cache_grain_binding_refusals\":{d},\"read_cache_grain_slab_exhausted\":{d},\"read_cache_grain_window_puts\":{d},\"read_cache_grain_trimmed_bytes\":{d},\"read_cache_grain_resident_bytes\":{d},\"read_cache_stale_served\":{d}}}", .{
             stats.read_cache_grain_purges.load(),
             stats.read_cache_grain_binding_refusals.load(),
             stats.read_cache_grain_slab_exhausted.load(),
             stats.read_cache_grain_window_puts.load(),
+            stats.read_cache_grain_trimmed_bytes.load(),
+            self.slab.residentBytes(),
             stats.read_cache_stale_served.load(),
         });
     }
@@ -458,8 +683,9 @@ test "tie: 25 % of 100 GiB RAM is a 25 GiB read cache; a cage below the solo 70 
     try testing.expectEqual(@as(u64, 0), resolveReadCacheBytes(0, facts, 70 * gib));
     try testing.expectEqual(@as(u64, 4096), GRAIN);
     try testing.expectEqual(@as(usize, 16), WINDOW_MAX_GRAINS);
-    // Slots: grains + shards + one window per core.
-    try testing.expectEqual(@as(u32, 1024 + 2 + 2 * 16), slabSlots(4 * derive.MiB, 2, 2));
+    // A shard's slots: its grains + the evicting deposit + one window.
+    try testing.expectEqual(@as(u32, 512 + 1 + 16), perShardSlots(4 * derive.MiB, 2));
+    try testing.expectEqual(cache.Items{ .max = 512 + 1 + 16, .entry_floor = GRAIN, .slack = 17 }, coreItems(4 * derive.MiB, 2));
     // Every grain of a block SHARDS to the block; the index hashes and
     // compares the grain (one hash for both made a block's grains one
     // probe cluster: the lanes burned 96 % of the box on the first A/B).
@@ -469,6 +695,90 @@ test "tie: 25 % of 100 GiB RAM is a 25 GiB read cache; a cage below the solo 70 
     try testing.expect(a.hash() != b.hash());
     try testing.expect(!a.eql(b));
     try testing.expectEqual(BlockKey.init(1, 1 << 22).hash(), a.shardHash());
+}
+
+/// Pages `mincore` reports resident over `[ptr, ptr + len)` (Linux).
+fn residentPages(ptr: *const anyopaque, len: usize) !usize {
+    const page = std.heap.pageSize();
+    const start = std.mem.alignBackward(usize, @intFromPtr(ptr), page);
+    const span = std.mem.alignForward(usize, @intFromPtr(ptr) + len, page) - start;
+    const vec = try testing.allocator.alloc(u8, span / page);
+    defer testing.allocator.free(vec);
+    try testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.syscall3(.mincore, start, span, @intFromPtr(vec.ptr))));
+    var n: usize = 0;
+    for (vec) |v| n += v & 1;
+    return n;
+}
+
+test "the idle-RSS law at the read cache: the reservation is 25 % of a 109 GiB machine (7.1 M grains over 32 shards), the bound a 64 MiB budget's 22 MiB — the index holds the BOUND's grains, and the slab, the slot tables and the item tables are resident only where a deposit touched them (dev: 1.39 GiB of an idle daemon, all written at birth)" {
+    const bs: u64 = 1024 * GRAIN;
+    const reservation: u64 = 109 * derive.GiB / 4;
+    const bound: u64 = 22 * derive.MiB;
+    const rc = try ReadCache.init(testing.allocator, bs, DEFAULT_PCT, bound, reservation, 32);
+    defer rc.deinit();
+    try testing.expectEqual(@as(usize, 32), rc.shardCount());
+    const per_shard = perShardSlots(reservation, 32);
+    try testing.expectEqual(@as(usize, per_shard), rc.core.items.max);
+    for (0..32) |i| try testing.expectEqual(@as(usize, bound / 32 / GRAIN + 1 + WINDOW_MAX_GRAINS), rc.core.indexItems(i));
+    try testing.expectEqual(@as(u32, 32 * per_shard), rc.slab.capacity);
+    // Deposits into a few blocks: a handful of grains.
+    var win: [4 * GRAIN]u8 = undefined;
+    fillGrain(&win, 0x6b);
+    for (0..8) |k| try testing.expectEqual(ReadCache.PutOutcome.inserted, rc.putValidated(BlockKey.init(4, k * bs), 0, &win, 7, lease_epoch.load(7), .always, false));
+    try testing.expectEqual(@as(u64, 32 * GRAIN), rc.currentBytes());
+    try testing.expectEqual(@as(u64, 32 * GRAIN), rc.slab.residentBytes());
+    if (builtin.os.tag != .linux) return;
+    // ≤ one page per stripe touched in each lazy table (8 blocks ⇒ ≤ 8
+    // stripes), 32 grains of slab: never the reservation's 7.1 M slots.
+    const slab = rc.slab;
+    try testing.expect(try residentPages(slab.base, slab.bytes_len) <= 32);
+    try testing.expect(try residentPages(slab.refs.ptr, slab.refs.len * 4) <= 8);
+    try testing.expect(try residentPages(slab.freed_tick.ptr, slab.freed_tick.len * 8) <= 8);
+    var items_pages: usize = 0;
+    for (rc.core.shards) |*sh| items_pages += try residentPages(sh.items.ptr, sh.items.len * @sizeOf(@TypeOf(sh.items[0])));
+    try testing.expect(items_pages <= 8 * 2);
+    // A release goes warm (still resident), the idle trim takes it cold.
+    rc.shedTo(0);
+    try testing.expectEqual(@as(u64, 0), rc.currentBytes());
+    try testing.expectEqual(@as(u64, 32 * GRAIN), rc.slab.residentBytes());
+    const trimmed0 = stats.read_cache_grain_trimmed_bytes.load();
+    rc.slab.trim(0);
+    try testing.expectEqual(@as(u64, 0), rc.slab.residentBytes());
+    try testing.expectEqual(trimmed0 + 32 * GRAIN, stats.read_cache_grain_trimmed_bytes.load());
+    try testing.expectEqual(@as(usize, 0), try residentPages(slab.base, slab.bytes_len));
+}
+
+test "the grain slab: a stripe hands out never-used slots, then reuses its warm chain hottest first; the idle trim takes the oldest release and only past its idle age; a full stripe answers null while its neighbour still has room" {
+    const slab = try GrainSlab.init(testing.allocator, 2, 3);
+    defer slab.deinit();
+    var clock: Atomic(u64) = .init(10);
+    slab.setClock(&clock);
+    const a = slab.acquire(0).?;
+    const b = slab.acquire(0).?;
+    const c = slab.acquire(0).?;
+    try testing.expectEqual(@as(?GrainSlab.Slot, null), slab.acquire(0));
+    try testing.expectEqual(@as(GrainSlab.Slot, 3), slab.acquire(1).?);
+    try testing.expectEqual(@as(usize, 2), slab.freeSlots());
+    @memset(slab.bytes(a), 1);
+    @memset(slab.bytes(b), 2);
+    // A pin outlives the tier's release.
+    slab.pin(b);
+    try testing.expect(slab.unpin(a));
+    clock.store(11, .monotonic);
+    try testing.expect(!slab.unpin(b));
+    try testing.expect(slab.unpin(b));
+    try testing.expectEqual(@as(u64, 2 * GRAIN), slab.warm_bytes.load());
+    // The hottest release (b) is reused first.
+    try testing.expectEqual(b, slab.acquire(0).?);
+    try testing.expect(slab.unpin(b));
+    // Trim at age 1 at tick 11: a (released at 10) goes, b (11) stays.
+    slab.trim(1);
+    try testing.expectEqual(@as(u64, GRAIN), slab.warm_bytes.load());
+    try testing.expectEqual(b, slab.acquire(0).?);
+    try testing.expectEqual(a, slab.acquire(0).?);
+    try testing.expectEqual(@as(?GrainSlab.Slot, null), slab.acquire(0));
+    for ([_]GrainSlab.Slot{ a, b, c, 3 }) |s| try testing.expect(slab.unpin(s));
+    try testing.expectEqual(slab.capacity, @as(u32, @intCast(slab.freeSlots())));
 }
 
 fn fillGrain(buf: []u8, tag: u8) void {

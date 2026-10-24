@@ -51,6 +51,19 @@
 //!     Yellow freezes growth (`insert(.., .freeze)` evicts first), Red
 //!     sheds to the authority's target through the component's `shed`.
 //!
+//! Memory (the idle-RSS law, `docs/evidence/rung-10-idle-rss.md`): the
+//! item table holds the RESERVATION's entries (`Items.max` — what the
+//! bound may grow to) in a lazily materialized mapping (`mem/lazy.zig`)
+//! taken by a bump cursor, so an unreached reservation is never resident;
+//! the INDEX (the key and inode maps: hashed, so touched all over, and
+//! written whole at their allocation) holds the entries the shard HAS —
+//! seeded at `INDEX_SEED_ITEMS`, doubled by the insert that finds it full,
+//! up to what the live bound admits (`Items.indexFor`). Sized by the
+//! reservation, the read cache's index over 25 % of a 109 GiB machine was
+//! 672 MiB of an idle daemon whose bound was 23 MB; sized by the bound,
+//! an empty default-budget mount still wrote 1 GB of the two caches'
+//! indexes.
+//!
 //! The striped lock makes the touch-vs-evict race a locked section, not a
 //! lock-free protocol: a touch and an eviction of one item serialize on
 //! the shard, so no model is owed (the tier that pins bytes across the
@@ -64,6 +77,7 @@ const assert = std.debug.assert;
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
 const budget = @import("budget.zig");
+const lazy = @import("lazy.zig");
 const jc = @import("../meta/journal_core.zig");
 
 /// `max(next_pow2(cores), 16)`, halved while `bound / shards < min_shard`
@@ -92,6 +106,29 @@ pub fn derivedBound(pct: u64, total_ram: u64, budget_bytes: u64) u64 {
 pub fn resolveBound(pct: u64, facts: derive.Facts, budget_bytes: u64) u64 {
     return derivedBound(pct, facts.total_ram, budget_bytes);
 }
+
+/// A shard's index starts at this many entries (an idle 32-shard read
+/// cache's two maps: ≈ 1.3 MiB) and doubles on demand: ≤ log2(bound's ÷
+/// seed) doublings a shard over the instance's life.
+pub const INDEX_SEED_ITEMS: usize = 1024;
+
+/// A shard's entry counts. The item table holds `max` (the reservation's
+/// entries; lazily materialized, so an unreached reservation costs
+/// nothing); the index grows to what a bound admits — `bound / shards /
+/// entry_floor + slack` (the smallest entry and the in-flight headroom
+/// the instance's own `max` formula carries), at most `max`. `entry_floor`
+/// 0: the index is the table, sized at init.
+pub const Items = struct {
+    max: usize,
+    entry_floor: u64 = 0,
+    slack: usize = 0,
+
+    pub fn indexFor(self: Items, bound: u64, shards: u32) usize {
+        if (self.entry_floor == 0) return self.max;
+        const admitted = bound / @max(shards, 1) / self.entry_floor;
+        return @intCast(@min(@as(u64, self.max), admitted +| self.slack));
+    }
+};
 
 /// Why the sink is handed an entry.
 pub const Why = enum(u8) {
@@ -170,6 +207,8 @@ pub const Stats = struct {
     /// Live entries a census walk visited (a census costs the live
     /// entries, never the capacity).
     census_visits: counters.ShardedCounter = .{},
+    /// A shard's index doubled (an insert found it full under the bound).
+    index_growths: counters.ShardedCounter = .{},
     bytes: counters.Gauge = .{},
     bound_bytes: counters.Gauge = .{},
     shards: counters.Gauge = .{},
@@ -177,7 +216,7 @@ pub const Stats = struct {
     /// The family's keys, each prefixed (`<prefix>_hits`, …), inside the
     /// caller's braces.
     pub fn writeJson(self: *const Stats, w: *std.Io.Writer, prefix: []const u8) std.Io.Writer.Error!void {
-        try w.print("\"{s}_hits\":{d},\"{s}_misses\":{d},\"{s}_fills\":{d},\"{s}_evictions\":{d},\"{s}_stale_refusals\":{d},\"{s}_invalidations\":{d},\"{s}_sink_released\":{d},\"{s}_sink_kept\":{d},\"{s}_insert_refusals\":{d},\"{s}_census_visits\":{d},\"{s}_bytes\":{d},\"{s}_bound_bytes\":{d},\"{s}_shards\":{d}", .{
+        try w.print("\"{s}_hits\":{d},\"{s}_misses\":{d},\"{s}_fills\":{d},\"{s}_evictions\":{d},\"{s}_stale_refusals\":{d},\"{s}_invalidations\":{d},\"{s}_sink_released\":{d},\"{s}_sink_kept\":{d},\"{s}_insert_refusals\":{d},\"{s}_census_visits\":{d},\"{s}_index_growths\":{d},\"{s}_bytes\":{d},\"{s}_bound_bytes\":{d},\"{s}_shards\":{d}", .{
             prefix, self.hits.load(),
             prefix, self.misses.load(),
             prefix, self.fills.load(),
@@ -188,6 +227,7 @@ pub const Stats = struct {
             prefix, self.sink_kept.load(),
             prefix, self.insert_refusals.load(),
             prefix, self.census_visits.load(),
+            prefix, self.index_growths.load(),
             prefix, self.bytes.load(),
             prefix, self.bound_bytes.load(),
             prefix, self.shards.load(),
@@ -258,6 +298,10 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             map: KeyMap = .empty,
             inos: InoMap = .empty,
             items: []Item,
+            /// Entries the index holds room for: an insert that finds it
+            /// full doubles it (to the bound's `Items.indexFor`), past
+            /// that it finds no room.
+            index_items: usize,
             /// Items `[0, fresh)` have been taken at least once; the rest
             /// are untouched zero pages. A freed item chains through
             /// `next` from `free_head`.
@@ -269,7 +313,7 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             max_bytes: u64,
 
             fn hasRoom(s: *const Shard) bool {
-                return s.free_head != NIL or s.fresh < s.items.len;
+                return (s.free_head != NIL or s.fresh < s.items.len) and s.map.count() < s.index_items;
             }
 
             /// A free item: the chain first, then the bump cursor.
@@ -355,34 +399,36 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
         shards: []Shard,
         mask: u64,
         bound: u64,
+        items: Items,
         epochs: ?EpochSource,
         stats: Stats = .{},
         /// Census generations (`censusNext`): one per walk, never 0.
         census_gen: Atomic(u32) = .init(0),
 
         /// `bound == 0` disables the instance (every lookup misses, every
-        /// insert refuses). `per_shard_items` bounds the item table per
-        /// shard: the instance derives it from its smallest entry.
-        pub fn init(gpa: Allocator, sink: *Sink, bound: u64, shard_count: u32, per_shard_items: usize, epochs: ?EpochSource) Allocator.Error!*Self {
-            assert(shard_count > 0 and std.math.isPowerOfTwo(shard_count) and per_shard_items > 0);
+        /// insert refuses). `items` sizes a shard's item table (the
+        /// reservation, lazily) and its index (the bound's): the instance
+        /// derives both from its smallest entry.
+        pub fn init(gpa: Allocator, sink: *Sink, bound: u64, shard_count: u32, items: Items, epochs: ?EpochSource) Allocator.Error!*Self {
+            assert(shard_count > 0 and std.math.isPowerOfTwo(shard_count) and items.max > 0);
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
             const shards = try gpa.alloc(Shard, shard_count);
             errdefer gpa.free(shards);
             var built: usize = 0;
             errdefer for (shards[0..built]) |*s| destroyShard(gpa, s);
+            const index_items = @max(if (items.entry_floor == 0) items.max else @min(items.indexFor(bound, shard_count), INDEX_SEED_ITEMS), 1);
             for (shards) |*s| {
-                // Page-allocated and NOT initialized: zero pages until taken
-                // (`State.free` is 0; a free item's other fields are never
-                // read).
-                const items = try std.heap.page_allocator.alloc(Item, per_shard_items);
-                errdefer std.heap.page_allocator.free(items);
-                s.* = .{ .items = items, .max_bytes = bound / shard_count };
-                try s.map.ensureTotalCapacity(gpa, @intCast(per_shard_items));
-                try s.inos.ensureTotalCapacity(gpa, @intCast(per_shard_items));
+                // Lazily materialized: zero pages until taken (`State.free`
+                // is 0; a free item's other fields are never read).
+                const table = try lazy.alloc(Item, items.max);
+                errdefer lazy.free(Item, table);
+                s.* = .{ .items = table, .index_items = index_items, .max_bytes = bound / shard_count };
+                try s.map.ensureTotalCapacity(gpa, @intCast(index_items));
+                try s.inos.ensureTotalCapacity(gpa, @intCast(index_items));
                 built += 1;
             }
-            self.* = .{ .gpa = gpa, .sink = sink, .shards = shards, .mask = shard_count - 1, .bound = bound, .epochs = epochs };
+            self.* = .{ .gpa = gpa, .sink = sink, .shards = shards, .mask = shard_count - 1, .bound = bound, .items = items, .epochs = epochs };
             self.stats.shards.set(shard_count);
             self.stats.bound_bytes.set(bound);
             return self;
@@ -391,7 +437,7 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
         fn destroyShard(gpa: Allocator, s: *Shard) void {
             s.map.deinit(gpa);
             s.inos.deinit(gpa);
-            std.heap.page_allocator.free(s.items);
+            lazy.free(Item, s.items);
         }
 
         /// Every live entry goes to the sink as `.deinit` (its answer is
@@ -414,9 +460,10 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
         }
 
         /// Re-derive the bound live (the authority's budget moved: a fleet
-        /// share changed, a cage was resized): the shards' shares follow;
-        /// a smaller bound evicts down to it through the sink. Never turns
-        /// a disabled instance on (its tables were sized for nothing).
+        /// share changed, a cage was resized): the shards' shares follow
+        /// (the index grows to a larger one on demand); a smaller one
+        /// evicts down to it through the sink. Never turns a disabled
+        /// instance on (its tables were sized for nothing).
         pub fn setBound(self: *Self, bound: u64) void {
             if (!self.enabled() or bound == self.bound) return;
             const b = @max(bound, 1);
@@ -424,6 +471,45 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             for (self.shards) |*s| s.max_bytes = b / self.shards.len;
             self.stats.bound_bytes.set(b);
             if (self.currentBytes() > b) _ = self.evictUntil(b);
+        }
+
+        /// Under `s`'s lock: the size a full index doubles to (at most the
+        /// live bound's), 0 when it is not full or may not grow.
+        fn indexGrowthLocked(self: *const Self, s: *const Shard) usize {
+            if (s.map.count() < s.index_items) return 0;
+            const cap = self.items.indexFor(self.bound, @intCast(self.shards.len));
+            if (s.index_items >= cap) return 0;
+            return @min(s.index_items *| 2, cap);
+        }
+
+        /// Grow `s`'s index to `next` entries: the new maps allocated
+        /// outside the shard lock, the live entries moved under it (O(live)
+        /// — at most log2 times a shard) and the maps swapped. A concurrent
+        /// grower that got there first wins (the work is dropped); an
+        /// allocation failure keeps the index (the insert refuses, counted).
+        fn growShard(self: *Self, s: *Shard, next: usize) void {
+            var map: KeyMap = .empty;
+            map.ensureTotalCapacity(self.gpa, @intCast(next)) catch return;
+            defer map.deinit(self.gpa);
+            var inos: InoMap = .empty;
+            inos.ensureTotalCapacity(self.gpa, @intCast(next)) catch return;
+            defer inos.deinit(self.gpa);
+            s.lock.lock();
+            defer s.lock.unlock();
+            if (s.index_items >= next) return;
+            var it = s.map.iterator();
+            while (it.next()) |e| map.putAssumeCapacityNoClobber(e.key_ptr.*, e.value_ptr.*);
+            var ino_it = s.inos.iterator();
+            while (ino_it.next()) |e| inos.putAssumeCapacityNoClobber(e.key_ptr.*, e.value_ptr.*);
+            std.mem.swap(KeyMap, &s.map, &map);
+            std.mem.swap(InoMap, &s.inos, &inos);
+            s.index_items = next;
+            self.stats.index_growths.inc();
+        }
+
+        /// The entries a shard's index holds room for (tests).
+        pub fn indexItems(self: *const Self, shard: usize) usize {
+            return self.shards[shard].index_items;
         }
 
         pub fn shardIndex(self: *const Self, key: Key) usize {
@@ -586,6 +672,7 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
             // keeps its victim backs the insert off: one refusal, never a
             // storm of failing promotions down the tail.
             var attempts: u32 = 0;
+            var grown = false;
             while (attempts < 2) : (attempts += 1) {
                 if (self.evictShardTo(s, @max(bound, entry.bytes), entry.bytes).kept > 0) break;
                 s.lock.lock();
@@ -594,8 +681,16 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
                     return .exists;
                 }
                 if (!s.hasRoom() or s.bytes.load(.monotonic) + entry.bytes > @max(bound, entry.bytes)) {
-                    // A concurrent insert took the room: once more, then refuse.
+                    // A full index doubles (once per insert, outside the
+                    // lock, an attempt of its own); a concurrent insert
+                    // that took the room: once more, then refuse.
+                    const grow = if (grown) 0 else self.indexGrowthLocked(s);
                     s.lock.unlock();
+                    if (grow != 0) {
+                        grown = true;
+                        self.growShard(s, grow);
+                        attempts -= @intFromBool(attempts > 0);
+                    }
                     continue;
                 }
                 defer s.lock.unlock();
@@ -895,12 +990,63 @@ test "tie: the bound is pct % of system RAM (100 GiB ⇒ 25 GiB at 25 %), scaled
     try testing.expectEqual(@as(u32, 1), shardsFor(64, 0, derive.MiB));
 }
 
+test "the index holds the entries a shard HAS: seeded at min(INDEX_SEED_ITEMS, the bound's), doubled by the insert that finds it full up to `Items.indexFor` (bound / shards / entry_floor + slack, at most max; entry_floor 0: the table at init) — every entry survives each move (the key and the inode maps), a smaller bound never shrinks it" {
+    try testing.expectEqual(@as(usize, 8 / 2 / 1 + 3), (Items{ .max = 1024, .entry_floor = 1, .slack = 3 }).indexFor(8, 2));
+    try testing.expectEqual(@as(usize, 1024), (Items{ .max = 1024, .entry_floor = 1, .slack = 3 }).indexFor(1 << 20, 2));
+    try testing.expectEqual(@as(usize, 77), (Items{ .max = 77 }).indexFor(1, 1));
+    // The read cache's shape: 25 % of a 109 GiB machine reserved over 32
+    // shards, a 64 MiB budget's 22 MiB bound: the index may grow to the
+    // bound's, never the reservation's.
+    const grain: u64 = 4096;
+    const reservation: u64 = 109 * derive.GiB / 4;
+    const read_items: Items = .{ .max = @intCast(reservation / 32 / grain + 17), .entry_floor = grain, .slack = 17 };
+    try testing.expectEqual(@as(usize, 22 * derive.MiB / 32 / grain + 17), read_items.indexFor(22 * derive.MiB, 32));
+    try testing.expectEqual(read_items.max, read_items.indexFor(reservation, 32));
+
+    var sink: DropSink = .{};
+    defer sink.deinit();
+    const C = Cache(TestEntry, DropSink);
+    // A big bound starts at the seed.
+    const big = try C.init(testing.allocator, &sink, 1 << 30, 1, .{ .max = 4096, .entry_floor = 1, .slack = 0 }, null);
+    defer big.deinit();
+    try testing.expectEqual(INDEX_SEED_ITEMS, big.indexItems(0));
+    // The table sized at init when entry_floor is 0.
+    const flat = try C.init(testing.allocator, &sink, 1 << 30, 1, .{ .max = 4096 }, null);
+    defer flat.deinit();
+    try testing.expectEqual(@as(usize, 4096), flat.indexItems(0));
+    // ONE shard of 1-byte entries, reserved for 1024, bound 8.
+    const c = try C.init(testing.allocator, &sink, 8, 1, .{ .max = 1024, .entry_floor = 1, .slack = 0 }, null);
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 8), c.indexItems(0));
+    for (0..8) |i| try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(1 + i % 2, i, 0, 1, @intCast(i)), .{}));
+    c.setBound(40);
+    try testing.expectEqual(@as(usize, 8), c.indexItems(0));
+    for (8..40) |i| try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(1 + i % 2, i, 0, 1, @intCast(i)), .{}));
+    // 8 → 16 → 32 → 40 (the bound's), on demand.
+    try testing.expectEqual(@as(usize, 40), c.indexItems(0));
+    try testing.expectEqual(@as(u64, 3), c.stats.index_growths.load());
+    try testing.expectEqual(@as(u64, 40), c.currentBytes());
+    try testing.expectEqual(@as(usize, 0), sink.released.items.len);
+    // Every entry still indexed by key AND by inode after three moves.
+    for (0..40) |i| try testing.expect(c.contains(.{ .ino = 1 + i % 2, .off = i }));
+    try testing.expectEqual(@as(u32, 20), c.invalidateIno(2, {}, null).released);
+    try testing.expectEqual(@as(u64, 20), c.currentBytes());
+    // Smaller never shrinks it; a larger bound grows it only on demand.
+    c.setBound(4);
+    try testing.expectEqual(@as(usize, 40), c.indexItems(0));
+    try testing.expectEqual(@as(u64, 4), c.currentBytes());
+    c.setBound(1 << 30);
+    try testing.expectEqual(@as(usize, 40), c.indexItems(0));
+    for (100..137) |i| try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(3, i, 0, 1, @intCast(i)), .{}));
+    try testing.expectEqual(@as(usize, 80), c.indexItems(0));
+}
+
 test "the core (drop sink): exact LRU order under a counting seam — the tail is the least recently touched; a lookup touches; insert over the bound evicts the tail through the sink before the room is reused; `.exists` on a held key; stats" {
     var sink: DropSink = .{};
     defer sink.deinit();
     const C = Cache(TestEntry, DropSink);
     // ONE shard, bound 4 entries of 1 byte.
-    const c = try C.init(testing.allocator, &sink, 4, 1, 8, null);
+    const c = try C.init(testing.allocator, &sink, 4, 1, .{ .max = 8 }, null);
     defer c.deinit();
     for (1..5) |i| try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(7, i, 0, 1, @intCast(i)), .{}));
     try testing.expectEqual(@as(u64, 4), c.currentBytes());
@@ -951,7 +1097,7 @@ test "the core: epoch validation on lookup — an entry filled under epoch E is 
     };
     Epochs.table = @splat(0);
     const C = Cache(TestEntry, DropSink);
-    const c = try C.init(testing.allocator, &sink, 8, 1, 8, .{ .call = &Epochs.of });
+    const c = try C.init(testing.allocator, &sink, 8, 1, .{ .max = 8 }, .{ .call = &Epochs.of });
     defer c.deinit();
     try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(3, 0, 0, 1, 30), .{}));
     try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(3, 1, 0, 1, 31), .{}));
@@ -989,7 +1135,7 @@ test "the core (promote sink): the sink runs OUTSIDE the lock with the entry sti
     var sink: PromoteSink = .{};
     defer sink.deinit();
     const C = Cache(TestEntry, PromoteSink);
-    const c = try C.init(testing.allocator, &sink, 4, 1, 8, null);
+    const c = try C.init(testing.allocator, &sink, 4, 1, .{ .max = 8 }, null);
     defer c.deinit();
     sink.cache = c;
     for (1..5) |i| try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(9, i * 4096, 0, 1, @intCast(i)), .{}));
@@ -1046,7 +1192,7 @@ test "the core: setBound re-derives the shards' shares live — a larger bound a
     var sink: DropSink = .{};
     defer sink.deinit();
     const C = Cache(TestEntry, DropSink);
-    const c = try C.init(testing.allocator, &sink, 2, 1, 8, null);
+    const c = try C.init(testing.allocator, &sink, 2, 1, .{ .max = 8 }, null);
     defer c.deinit();
     for (1..3) |i| try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(1, i, 0, 1, @intCast(i)), .{}));
     c.setBound(4);
@@ -1058,7 +1204,7 @@ test "the core: setBound re-derives the shards' shares live — a larger bound a
     try testing.expectEqual(@as(u64, 1), c.currentBytes());
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, sink.released.items);
     try testing.expect(c.contains(.{ .ino = 1, .off = 4 }));
-    const off = try C.init(testing.allocator, &sink, 0, 1, 1, null);
+    const off = try C.init(testing.allocator, &sink, 0, 1, .{ .max = 1 }, null);
     defer off.deinit();
     off.setBound(8);
     try testing.expect(!off.enabled());
@@ -1068,7 +1214,7 @@ test "the core: a census walks the LIVE entries once (never the capacity) — an
     var sink: DropSink = .{};
     defer sink.deinit();
     const C = Cache(TestEntry, DropSink);
-    const c = try C.init(testing.allocator, &sink, 8, 2, 8, null);
+    const c = try C.init(testing.allocator, &sink, 8, 2, .{ .max = 8 }, null);
     defer c.deinit();
     const All = struct {
         fn pick(_: *const u8, _: *const TestEntry) bool {
@@ -1096,7 +1242,7 @@ test "the core: a census walks the LIVE entries once (never the capacity) — an
     n = 0;
     while (c.censusNext(&cursor, &d, All.pick)) |_| n += 1;
     try testing.expectEqual(@as(usize, 3), n);
-    const off = try C.init(testing.allocator, &sink, 0, 1, 1, null);
+    const off = try C.init(testing.allocator, &sink, 0, 1, .{ .max = 1 }, null);
     defer off.deinit();
     cursor = 0;
     try testing.expectEqual(@as(?TestEntry, null), off.censusNext(&cursor, &d, All.pick));
@@ -1113,7 +1259,7 @@ test "the core (promote sink): a STALE entry's lookup is a refusal that hands th
     };
     Epochs.table = @splat(0);
     const C = Cache(TestEntry, PromoteSink);
-    const c = try C.init(testing.allocator, &sink, 8, 1, 8, .{ .call = &Epochs.of });
+    const c = try C.init(testing.allocator, &sink, 8, 1, .{ .max = 8 }, .{ .call = &Epochs.of });
     defer c.deinit();
     sink.cache = c;
     try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(5, 0, 0, 1, 50), .{}));
@@ -1145,7 +1291,7 @@ test "the core: the item table materializes lazily — only items ever taken are
     var sink: DropSink = .{};
     defer sink.deinit();
     const C = Cache(TestEntry, DropSink);
-    const c = try C.init(testing.allocator, &sink, 64, 1, 4, null);
+    const c = try C.init(testing.allocator, &sink, 64, 1, .{ .max = 4 }, null);
     defer c.deinit();
     const s = &c.shards[0];
     try testing.expectEqual(@as(u32, 0), s.fresh);
@@ -1170,7 +1316,7 @@ test "the core: invalidateKey and invalidateKeys drop held keys through the sink
     var sink: DropSink = .{};
     defer sink.deinit();
     const C = Cache(TestEntry, DropSink);
-    const c = try C.init(testing.allocator, &sink, 16, 2, 8, null);
+    const c = try C.init(testing.allocator, &sink, 16, 2, .{ .max = 8 }, null);
     defer c.deinit();
     try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(1, 0, 0, 2, 10), .{}));
     try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(1, 1, 0, 2, 11), .{}));
@@ -1181,7 +1327,7 @@ test "the core: invalidateKey and invalidateKeys drop held keys through the sink
     try testing.expectEqualSlices(u32, &.{ 10, 11 }, sink.released.items);
     try testing.expectEqual(Why.invalidate, sink.whys.items[1]);
     try testing.expectEqual(@as(u64, 2), c.currentBytes());
-    const off = try C.init(testing.allocator, &sink, 0, 1, 1, null);
+    const off = try C.init(testing.allocator, &sink, 0, 1, .{ .max = 1 }, null);
     defer off.deinit();
     try testing.expect(!off.enabled());
     try testing.expectEqual(InsertOutcome.refused, off.insert(mk(1, 0, 0, 1, 1), .{}));

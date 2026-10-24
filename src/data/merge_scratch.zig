@@ -27,6 +27,7 @@ const assert = std.debug.assert;
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
 const budget = @import("../mem/budget.zig");
+const lazy = @import("../mem/lazy.zig");
 const journal = @import("../meta/journal.zig");
 const key = @import("../meta/key.zig");
 const record = @import("../meta/record.zig");
@@ -85,7 +86,12 @@ pub fn poolCap(cpus: u32) usize {
 
 pub const Slab = struct {
     pool: *Pool,
+    /// Lazily materialized (`mem/lazy.zig`): a slab no merge has taken
+    /// holds no page (the pool was 44.5 MiB of an idle daemon, written at
+    /// birth by the allocator's `undefined` fill).
     buf: []align(slab_page) u8,
+    /// A merge has taken it (its pages are the gauge's).
+    touched: bool = false,
     first: std.heap.BufferFirstAllocator,
 
     /// The slab-first allocator: the merge's own working set and the tx's
@@ -134,34 +140,34 @@ pub const Pool = struct {
     slabs: []Slab,
     free: mpmc.BoundedMpmc(*Slab),
     permits: semaphore.Semaphore,
-    /// The pool's bytes (`slabs × slab_len`) for the budget: set at init,
-    /// 0 after deinit (the registry is append-only).
+    /// The slabs a merge has touched × `slab_len` (the budget's gauge: the
+    /// pool's resident bytes); 0 after deinit (the registry is append-only).
     bytes: counters.Gauge = .{},
+    /// `slabs × slab_len`: what the pool may hold (its component's floor).
+    reserved_bytes: u64,
 
     pub fn init(gpa: Allocator, io: Io, n: usize, slab_len: usize) Allocator.Error!Pool {
         const count: usize = @max(n, 1);
         const slabs = try gpa.alloc(Slab, count);
         errdefer gpa.free(slabs);
         var built: usize = 0;
-        errdefer for (slabs[0..built]) |s| gpa.free(s.buf);
+        errdefer for (slabs[0..built]) |s| lazy.free(u8, s.buf);
         for (slabs) |*s| {
-            const buf = try gpa.alignedAlloc(u8, .fromByteUnits(slab_page), slab_len);
+            const buf: []align(slab_page) u8 = @alignCast(try lazy.alloc(u8, slab_len));
             s.* = .{ .pool = undefined, .buf = buf, .first = undefined };
             built += 1;
         }
         var free = try mpmc.BoundedMpmc(*Slab).init(gpa, count);
         errdefer free.deinit(gpa);
         for (slabs) |*s| free.pushSpin(s);
-        var pool: Pool = .{ .gpa = gpa, .io = io, .slabs = slabs, .free = free, .permits = semaphore.Semaphore.init(count) };
-        pool.bytes.set(count * slab_len);
-        return pool;
+        return .{ .gpa = gpa, .io = io, .slabs = slabs, .free = free, .permits = semaphore.Semaphore.init(count), .reserved_bytes = count * slab_len };
     }
 
     /// Waits for every slab to come home first: a tx's deinit on the
     /// journal lane trails the ack its committer already returned on.
     pub fn deinit(self: *Pool) void {
         _ = self.permits.acquireUncancelable(self.io, self.slabs.len);
-        for (self.slabs) |s| self.gpa.free(s.buf);
+        for (self.slabs) |s| lazy.free(u8, s.buf);
         self.gpa.free(self.slabs);
         self.free.deinit(self.gpa);
         self.bytes.set(0);
@@ -174,7 +180,7 @@ pub const Pool = struct {
     /// txs cannot be returned under pressure; attribution, like
     /// `nvme_ranged_slab`.
     pub fn component(self: *Pool) budget.Component {
-        return budget.Component.init("layout_publish_scratch", self.bytes.load(), 0, .{ .gauge = &self.bytes }, null);
+        return budget.Component.init("layout_publish_scratch", self.reserved_bytes, 0, .{ .gauge = &self.bytes }, null);
     }
 
     pub fn capacity(self: *const Pool) usize {
@@ -195,6 +201,10 @@ pub const Pool = struct {
         }
         while (true) {
             if (self.free.tryPop()) |s| {
+                if (!s.touched) {
+                    s.touched = true;
+                    self.bytes.add(s.buf.len);
+                }
                 s.pool = self;
                 s.first = .init(s.buf, Overflow.allocator(self));
                 return s;
@@ -261,15 +271,23 @@ test "ties: a slab is two records at the volume's cap (2 × 65,792 B at 256 KiB 
     try testing.expectEqual(@as(usize, 256), poolCap(64));
 }
 
-test "tie: the budget component `layout_publish_scratch` reads exactly pool_count × slab_bytes (128 × 364,544 B = 44.5 MiB at 32 CPUs and 256 KiB nodes), floor the same, weight 0, no shed; a pool's bytes are its own gauge" {
+test "tie: the budget component `layout_publish_scratch` reads the slabs a merge has touched × slab_bytes (an idle pool 0 — its slabs are lazily materialized), floor pool_count × slab_bytes (128 × 364,544 B = 44.5 MiB at 32 CPUs and 256 KiB nodes), weight 0, no shed; a pool's bytes are its own gauge" {
     var p = try Pool.init(testing.allocator, testing.io, 3, 2 * slab_page);
     defer p.deinit();
     const c = p.component();
     try testing.expectEqualStrings("layout_publish_scratch", c.name);
-    try testing.expectEqual(@as(u64, 3 * 2 * slab_page), c.source.current());
+    try testing.expectEqual(@as(u64, 0), c.source.current());
     try testing.expectEqual(@as(u64, 3 * 2 * slab_page), c.floor);
     try testing.expectEqual(@as(u64, 0), c.weight);
     try testing.expect(c.shed == null and c.trim == null and !c.kernel_reclaimable);
+    const a = p.acquire();
+    try testing.expectEqual(@as(u64, 2 * slab_page), c.source.current());
+    a.release();
+    const b = p.acquire();
+    const d = p.acquire();
+    const e = p.acquire();
+    try testing.expectEqual(p.capacity() * p.slabLen(), c.source.current());
+    for ([_]*Slab{ b, d, e }) |x| x.release();
     try testing.expectEqual(p.capacity() * p.slabLen(), c.source.current());
     try testing.expectEqual(@as(u64, 128 * 364_544), @as(u64, poolCap(32)) * slabLen(256 * 1024));
 }

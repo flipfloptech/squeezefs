@@ -37,6 +37,7 @@ const Atomic = std.atomic.Value;
 const counters = @import("../core/counters.zig");
 const clock = @import("../core/clock.zig");
 const budget = @import("../mem/budget.zig");
+const lazy = @import("../mem/lazy.zig");
 const jc = @import("../meta/journal_core.zig");
 const dlm = @import("../meta/dlm.zig");
 const ino_witness = @import("../meta/ino_witness.zig");
@@ -195,8 +196,11 @@ pub const Table = struct {
         const words = bodyWords(record_cap);
         const sets = try gpa.alloc(Set, SETS);
         errdefer gpa.free(sets);
-        const bodies = try gpa.alloc(Atomic(u64), words * SLOTS);
-        errdefer gpa.free(bodies);
+        // Lazily materialized (`mem/lazy.zig`): a body is resident once a
+        // fill wrote it — the table was 16 MiB of an idle daemon, written
+        // at birth by the allocator's `undefined` fill.
+        const bodies = try lazy.alloc(Atomic(u64), words * SLOTS);
+        errdefer lazy.free(Atomic(u64), bodies);
         for (sets, 0..) |*set, si| {
             set.* = .{ .ways = undefined };
             for (&set.ways, 0..) |*s, wi| {
@@ -209,7 +213,7 @@ pub const Table = struct {
     }
 
     pub fn deinit(self: *Table) void {
-        self.gpa.free(self.bodies);
+        lazy.free(Atomic(u64), self.bodies);
         self.gpa.free(self.sets);
         stats.read_view_bytes.set(0);
         self.* = undefined;

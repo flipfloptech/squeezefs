@@ -1672,6 +1672,83 @@ test "T_self is the member's clock, never its beat's liveness: with the beat sta
     try gate.preAdmission();
 }
 
+test "THE DOUBLE PARK (the kill matrix's, 2026-10-24) at the membership core: the manager dies ⇒ PARK #1 at T_self ⇒ the successor admits the reclaim in grace and the deadline is the reclaim's (its send instant + T_self, never a stale one); renewals carry the member past the grace window; the beat silent past T_self but short of T_owner ⇒ PARK #2, and its reclaim RE-POINTS against the epoch the successor holds (granted, no refusal, no poison: idempotent against the manager's view); the beat silent past T_owner is a REAL eviction (the successor evicts at T_owner and ships the death) ⇒ PARK #3, and the reclaim's UnknownLease is HONEST: the member fences, poisoned once" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    defer o.deinit();
+    manual_now_ms = 0;
+    var osvc: OwnerService = .{ .owner = &o, .now = &manualNow };
+    const me = testIdentity(5);
+    var dl: DirectLink = .{ .owner_svc = &osvc, .peer = me };
+    osvc.register(&dl.svc);
+    var gate = park.ParkGate.arm(testing.io, 0, park.tParkMaxMs(46_500, clocks.grace_ms));
+    var p: Poison = .{};
+    var m: Member = .{ .gpa = gpa, .id = writerMemberId(me), .role = .writer, .link = dl.link(), .pid = 7, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0, .mount = "/mnt/m", .gate = &gate, .poison = p.sink() };
+    try testing.expectEqual(Member.JoinOutcome.granted, m.join(0, null));
+    // PARK #1: the manager dies; T_self passes with no renewal.
+    dl.dead = true;
+    const parks0 = park.stats.appender_parks.load();
+    try testing.expectEqual(TickVerdict.parked, m.tick(clocks.t_self_ms, 1_000));
+    // The successor arms at term 2 expecting the member; the reclaim lands
+    // and re-arms the deadline at its own send instant.
+    const t1 = clocks.t_self_ms + 5_000;
+    var succ = try Owner.arm(gpa, clocks, 0, 2, 1, &.{m.id}, t1);
+    defer succ.deinit();
+    var deaths: Deaths = .{};
+    defer deaths.list.deinit(gpa);
+    succ.bindDeathSink(deaths.sink());
+    var ssvc: OwnerService = .{ .owner = &succ, .now = &manualNow };
+    var sdl: DirectLink = .{ .owner_svc = &ssvc, .peer = me };
+    ssvc.register(&sdl.svc);
+    m.link = sdl.link();
+    manual_now_ms = t1;
+    try testing.expectEqual(TickVerdict.rejoined, m.tick(t1, 2_000));
+    try testing.expectEqual(t1 + clocks.t_self_ms, m.words.learnedLabel().deadline_ms);
+    // Renewals at the cadence carry the member past the grace window: a
+    // reclaim from here is admitted only on the epoch the successor holds.
+    var t = t1;
+    while (t <= t1 + clocks.grace_ms) {
+        t += clocks.renew_ms;
+        manual_now_ms = t;
+        try testing.expectEqual(TickVerdict.renewed, m.tick(t, 2_000));
+    }
+    try testing.expect(!succ.graceOpenForReassert(t));
+    const e_held = m.epoch;
+    // PARK #2: the beat silent past T_self, short of T_owner (the
+    // successor still holds the lease): the member parks on its own clock.
+    const t2 = t + clocks.t_self_ms;
+    try testing.expect(t2 < t + clocks.t_owner_ms);
+    try testing.expectEqual(TickVerdict.parked, m.tick(t2, 3_000));
+    try testing.expectEqual(parks0 + 2, park.stats.appender_parks.load());
+    manual_now_ms = t2 + 1;
+    try testing.expectEqual(@as(u32, 0), succ.expireDue(t2 + 1));
+    const refusals0 = stats.membership_reclaim_refusals.load();
+    try testing.expectEqual(TickVerdict.rejoined, m.tick(t2 + 1, 4_000));
+    try testing.expect(m.epoch > e_held);
+    try testing.expectEqual(refusals0, stats.membership_reclaim_refusals.load());
+    try testing.expectEqual(t2 + 1 + clocks.t_self_ms, m.words.learnedLabel().deadline_ms);
+    try testing.expectEqual(@as(u32, 0), p.count);
+    try testing.expectEqual(@as(usize, 0), deaths.list.items.len);
+    // Silent past T_owner: the successor evicts the silent member and ships
+    // its death — a REAL eviction, its region the successor's to recover.
+    const t3 = t2 + 1 + clocks.t_owner_ms;
+    manual_now_ms = t3;
+    try testing.expectEqual(@as(u32, 1), succ.expireDue(t3));
+    try testing.expectEqual(@as(usize, 1), deaths.list.items.len);
+    try testing.expectEqual(m.epoch, deaths.list.items[0].epoch);
+    // PARK #3 on the member's clock, then the reclaim: UnknownLease is the
+    // owner's honest verdict — the member fences, poisoned once.
+    try testing.expectEqual(TickVerdict.parked, m.tick(t3, 5_000));
+    park.stats.appender_park_expiries.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(TickVerdict.fenced, m.tick(t3 + 1, 6_000));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(refusals0 + 1, stats.membership_reclaim_refusals.load());
+    try testing.expect(gate.isExpired());
+    try testing.expectEqual(@as(u32, 1), p.count);
+}
+
 test "the clients seam lists every member of the shard: a writer through its row's classifier (dead-pid proof applies), a reader as a live row" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);

@@ -12476,8 +12476,13 @@ test "smoke: A FULL DATA STORE ANSWERS ENOSPC — NEVER EIO — AT write(2) AND 
         const full = std.mem.count(u8, seg, "data store FULL");
         const closed = std.mem.count(u8, seg, "full-store episode closed");
         const errors = std.mem.count(u8, seg, "error(");
-        const warnings = std.mem.count(u8, seg, "warning(");
-        std.debug.print("smoke[full store]: the daemon's log over the episode: {d} 'data store FULL' line(s), {d} close(s), {d} warning(s), {d} error(s), {d} TRIPWIRE line(s)\n", .{ full, closed, warnings, errors, std.mem.count(u8, seg, "TRIPWIRE") });
+        // The memory authority's lines judge the host, not the episode: its
+        // unreclaimable arm is the cgroup's `memory.stat` over the fleet
+        // share — every process of the venue's cgroup (the full smoke beside
+        // the row put its 95 % and HARD BACKSTOP lines inside the episode).
+        const authority = std.mem.count(u8, seg, "warning(squeezefs): mem_budget:");
+        const warnings = std.mem.count(u8, seg, "warning(") - authority;
+        std.debug.print("smoke[full store]: the daemon's log over the episode: {d} 'data store FULL' line(s), {d} close(s), {d} warning(s) (+{d} of the memory authority), {d} error(s), {d} TRIPWIRE line(s)\n", .{ full, closed, warnings, authority, errors, std.mem.count(u8, seg, "TRIPWIRE") });
         if (errors != 0 or warnings != full or full != 1) std.debug.print("--- the daemon's alert lines ---\n{s}\n", .{seg});
         try testing.expectEqual(@as(usize, 1), full);
         try testing.expectEqual(@as(usize, 1), closed);

@@ -55,6 +55,10 @@ pub const FakeDevice = struct {
     fail_next_read: ?seams.ReadError = null,
     fail_next_flush: ?seams.DmaError = null,
     hook: ?Hook = null,
+    /// Runs at a write's entry, BEFORE the injection verdict: a device
+    /// holding a DMA it may yet refuse (a thin pool queueing it, then its
+    /// `no_space_timeout`).
+    entry_hook: ?Hook = null,
     /// Runs inside `flush` (after the injection verdict, before the flush
     /// is recorded): the window a barrier is in flight.
     flush_hook: ?Hook = null,
@@ -113,6 +117,7 @@ pub const FakeDevice = struct {
     }
 
     fn writeInner(self: *FakeDevice, vol: u64, off: u64, data: []const u8, fixed: bool) seams.DmaError!void {
+        if (self.entry_hook) |h| h.call(h.ctx, self, vol, off, data.len);
         self.lock.lockUncancelable(std.testing.io);
         var injected = self.fail_next;
         const torn = self.torn_grains;

@@ -2635,6 +2635,69 @@ test "a joiner whose upload the device HOLDS past the bark (generic/347: a thin 
     try testing.expect(!w.table.has(13, 0));
 }
 
+// generic/347 again: the joiner's verdict IS the joined upload's. A device
+// that holds a DMA and then REFUSES it (a thin pool queueing writes for its
+// `no_space_timeout`, then failing them ENOSPC) already cost the joiner one
+// device wait; re-driving its own upload paid a second one on a device with
+// a per-IO timeout — two waits for one refusal, toward the kernel's request
+// deadline. The joiner takes the refusal: ONE device attempt, both flushes
+// answer `stay_parked`, the block stays parked whole.
+test "a joiner whose upload the device HOLDS and then REFUSES takes the refusal verdict at once — one device attempt, never a second wait; the block stays parked" {
+    const io = testing.io;
+    const w = try UploadWorld.init(testing.allocator);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(14, .striped, 0);
+    const e = w.table.checkout(14, 0, false, null).?;
+    var data: [wt.BS]u8 = @splat(0x67);
+    _ = try w.table.recordWrite(e, 0, &data);
+    const Gate = struct {
+        hold: std.atomic.Value(bool) = .init(true),
+        in_dma: std.atomic.Value(u32) = .init(0),
+        fn hook(ctx: *anyopaque, _: *wt.FakeDevice, _: u64, _: u64, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // The first DMA is held; any later one passes straight to the verdict.
+            if (self.in_dma.fetchAdd(1, .acq_rel) != 0) return;
+            while (self.hold.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    var gate: Gate = .{};
+    w.f.dev.entry_hook = .{ .ctx = &gate, .call = &Gate.hook };
+    defer w.f.dev.entry_hook = null;
+    const Flush = struct {
+        fn run(io_: Io, table: *Table, deps: UploadDeps, out: *Disposition) void {
+            out.* = flushParkedBlock(table, deps, io_, 14, 0);
+        }
+    };
+    const joins0 = pipeline.stats.write_pipeline_join_waits.load();
+    var first: Disposition = .published;
+    var second: Disposition = .published;
+    const th = try std.Thread.spawn(.{}, Flush.run, .{ io, &w.table, w.deps(), &first });
+    var tj: ?std.Thread = null;
+    var joined = false;
+    defer if (!joined) {
+        w.f.dev.setFailWrites(0, error.NoSpaceLeft);
+        gate.hold.store(false, .release);
+        th.join();
+        if (tj) |t| t.join();
+    };
+    while (gate.in_dma.load(.acquire) == 0) try std.Thread.yield();
+    tj = try std.Thread.spawn(.{}, Flush.run, .{ io, &w.table, w.deps(), &second });
+    // The joiner is parked on the upload before the device answers.
+    while (pipeline.stats.write_pipeline_join_waits.load() == joins0) try std.Thread.yield();
+    // The device refuses the held DMA (and would refuse every later one).
+    w.f.dev.setFailWrites(std.math.maxInt(u32), error.NoSpaceLeft);
+    gate.hold.store(false, .release);
+    th.join();
+    tj.?.join();
+    joined = true;
+    w.f.dev.setFailWrites(0, error.NoSpaceLeft);
+    try testing.expectEqual(Disposition.stay_parked, first);
+    try testing.expectEqual(Disposition.stay_parked, second);
+    try testing.expectEqual(@as(u32, 1), gate.in_dma.load(.acquire));
+    try testing.expect(w.table.has(14, 0));
+    try testing.expect(!w.table.get(14, 0).?.upload_inflight);
+}
+
 /// A pseudo-transform for the scratch-pool law: the image is the plaintext
 /// XOR a marker, built IN the scratch (as every real transform's is).
 const XorSeam = struct {

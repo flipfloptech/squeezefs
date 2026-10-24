@@ -526,6 +526,11 @@ const VolRow = struct {
     queued: Atomic(u64) = .init(0),
     /// This volume ever elided a free: the debt drainer's target set.
     debt_target: Atomic(bool) = .init(false),
+    /// The device answered a reclaim command `NotSupported` (a disk without
+    /// discard): every later command would too, so the volume stops issuing
+    /// them for this mount and says so once. Monotonic: a flag with no paired
+    /// data — a lane that misses the store issues one more refused command.
+    unsupported: Atomic(bool) = .init(false),
 };
 
 pub const FreeOutcome = enum {
@@ -969,13 +974,18 @@ pub const Reclaimer = struct {
     /// command is `reclaim_skipped += k`, NEVER a zeroing-write fallback.
     fn issueRange(self: *Reclaimer, row: *VolRow, r: Range, venue: Venue) void {
         _ = self;
-        if (row.target.substrate == .skip) {
+        if (row.target.substrate == .skip or row.unsupported.load(.monotonic)) {
             stats.block_free_reclaim_skipped.add(r.k);
             return;
         }
         stats.block_free_reclaim_commands.inc();
         row.target.issue(row.target.ctx, r.start, r.len) catch |e| {
-            log.warn("reclaim: vol {d} refused a {t} of {d} bytes at {d} ({t}); {d} block(s) counted skipped (space not returned — never a zeroing write)", .{ row.alloc.cfg.vol, row.target.substrate, r.len, r.start, e, r.k });
+            if (e == error.NotSupported) {
+                if (!row.unsupported.swap(true, .monotonic))
+                    log.warn("reclaim: vol {d}'s device does not support {t} (NotSupported) — reclaim stops issuing it on this mount; frees count skipped (space not returned — never a zeroing write)", .{ row.alloc.cfg.vol, row.target.substrate });
+            } else {
+                log.warn("reclaim: vol {d} refused a {t} of {d} bytes at {d} ({t}); {d} block(s) counted skipped (space not returned — never a zeroing write)", .{ row.alloc.cfg.vol, row.target.substrate, r.len, r.start, e, r.k });
+            }
             stats.block_free_reclaim_skipped.add(r.k);
             return;
         };
@@ -1608,10 +1618,14 @@ const Recorder = struct {
     gpa: Allocator,
     refuse: bool = false,
     issued: Atomic(u64) = .init(0),
+    refused: Atomic(u64) = .init(0),
 
     fn issue(ctx: ?*anyopaque, start: u64, len: u64) errors.Error!void {
         const self: *Recorder = @ptrCast(@alignCast(ctx.?));
-        if (self.refuse) return error.NotSupported;
+        if (self.refuse) {
+            _ = self.refused.fetchAdd(1, .monotonic);
+            return error.NotSupported;
+        }
         self.lock.lock();
         defer self.lock.unlock();
         self.commands.append(self.gpa, .{ .start = start, .len = len, .k = 0 }) catch return error.OutOfMemory;
@@ -2098,6 +2112,23 @@ test "a refused device command counts skipped and never falls back to a zeroing 
     try testing.expectEqual(@as(u64, 1), g.r.drainSync(io));
     try testing.expectEqual(skipped0 + 2, stats.block_free_reclaim_skipped.load());
     try testing.expectEqual(@as(usize, 0), g.rec.commands.items.len);
+}
+
+test "a device that answers NotSupported is asked once: later frees count skipped without a command (generic/767's scsi_debug: 42 warnings in one pass)" {
+    const io = testing.io;
+    var f = try Fixture.init(.{ .budget_bytes = test_budget, .batch_ms = 0 }, .bdev_discard, 8);
+    defer f.deinit();
+    f.r.cfg.elision = false;
+    f.rec.refuse = true;
+    try f.mintPublished(6);
+    const skipped0 = stats.block_free_reclaim_skipped.load();
+    for ([_]u64{ 1, 3, 5 }) |b| {
+        try testing.expectEqual(FreeOutcome.terminal, f.r.freeBlock(io, 0, b, f.alloc.stampOf(b)));
+        try testing.expectEqual(@as(u64, 1), f.r.drainSync(io));
+    }
+    try testing.expectEqual(@as(u64, 1), f.rec.refused.load(.monotonic));
+    try testing.expectEqual(skipped0 + 3, stats.block_free_reclaim_skipped.load());
+    for ([_]u64{ 1, 3, 5 }) |b| try testing.expectEqual(block_alloc.State.free, f.alloc.stateOf(b));
 }
 
 test "stats JSON names every family; config from env reads the registry rows" {

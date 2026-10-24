@@ -1596,6 +1596,9 @@ const Peer = struct {
     /// This daemon's environment when it differs from the rig's (the
     /// MutualTls rows: every node its own certificate and key).
     env: ?*const std.process.Environ.Map = null,
+    /// The set this daemon mounts when it is not the rig's (a set over
+    /// device-mapper slices).
+    meta_uri: ?[]const u8 = null,
     mp: [:0]u8,
     log_path: [:0]u8,
     log_file: ?Io.File = null,
@@ -1670,7 +1673,7 @@ const Peer = struct {
             argv[n] = a;
             n += 1;
         }
-        argv[n] = rig.meta_uri;
+        argv[n] = self.meta_uri orelse rig.meta_uri;
         n += 1;
         argv[n] = self.mp;
         n += 1;
@@ -2722,6 +2725,182 @@ test "smoke: `volume enable-symmetric` — format --single-writer (meta + 2 data
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     _ = try fsckClean(rig, "the conversion and the two-daemon pass");
+}
+
+/// THE NO-EAGAIN ROW's width: past a joined member's floor-ring bounds as
+/// they stood before 0003 §BO — 64 request cells on its journal lane (one
+/// per fsync) and 128 committer-queue cells.
+const no_eagain_width: usize = 300;
+
+/// The row's bound per phase: the storm takes seconds on a loaded venue;
+/// a phase past this is a wedge, not a slow host.
+const no_eagain_phase_ns: u64 = 120 * std.time.ns_per_s;
+
+/// The slow device's added latency per write and flush — a device a
+/// fabric away, not the venue's RAM disk: a barrier in flight (and the
+/// landings its cover waits for) holds every fsync arriving behind it —
+/// 300 at once on B's lane at 5 and at 15 ms. At 25 ms B's floor ring
+/// also parked its pass at ring admission and 94 committers parked for
+/// room, but a checkpoint cycle's writes held a lock past the 2 s tick
+/// (`lock_ticked_reregisters`, a must-stay-0 gauge): the committer side's
+/// crossing is the unit row's to pin, reported here.
+const no_eagain_delay_ms: u32 = 5;
+
+/// One thread of the no-EAGAIN storm. Its setup: `mkdir s/d<i>` (the VFS
+/// serializes creates in one parent, so the directories come first); at
+/// the first gate its create, `d<i>/f` (O_CREAT|O_EXCL):
+/// 300 parents, so 300 creates reach the daemon at once; at the second its
+/// fsyncs: the directory (FUSE_FSYNCDIR: the metadata barrier, always) and
+/// the file. Every inode is the thread's own, so the kernel's per-inode
+/// lock around fsync serializes none of them.
+const NoEagainThread = struct {
+    s_fd: linux.fd_t,
+    idx: usize,
+    gate: *std.atomic.Value(u32),
+    arrived: *std.atomic.Value(usize),
+    mkdir_e: linux.E = .SUCCESS,
+    create_e: linux.E = .SUCCESS,
+    fsyncdir_e: linux.E = .SUCCESS,
+    fsync_e: linux.E = .SUCCESS,
+
+    fn awaitGate(self: *NoEagainThread, phase: u32) void {
+        while (self.gate.load(.acquire) < phase) std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    fn run(self: *NoEagainThread) void {
+        var nb: [16]u8 = undefined;
+        const name = std.fmt.bufPrintSentinel(&nb, "d{d}", .{self.idx}, 0) catch unreachable;
+        var dfd: linux.fd_t = -1;
+        var ffd: linux.fd_t = -1;
+        self.mkdir_e = linux.errno(linux.mkdirat(self.s_fd, name, 0o755));
+        if (self.mkdir_e == .SUCCESS) {
+            const drc = linux.openat(self.s_fd, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+            self.create_e = linux.errno(drc);
+            if (self.create_e == .SUCCESS) dfd = @intCast(drc);
+        }
+        _ = self.arrived.fetchAdd(1, .acq_rel);
+        self.awaitGate(1);
+        if (dfd >= 0) {
+            const frc = linux.openat(dfd, "f", .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o644);
+            self.create_e = linux.errno(frc);
+            if (self.create_e == .SUCCESS) ffd = @intCast(frc);
+        }
+        _ = self.arrived.fetchAdd(1, .acq_rel);
+        self.awaitGate(2);
+        if (dfd >= 0) self.fsyncdir_e = linux.errno(linux.fsync(dfd));
+        if (ffd >= 0) self.fsync_e = linux.errno(linux.fsync(ffd));
+        if (ffd >= 0) _ = linux.close(ffd);
+        if (dfd >= 0) _ = linux.close(dfd);
+        _ = self.arrived.fetchAdd(1, .acq_rel);
+    }
+};
+
+/// Wait until `want` threads arrived, bounded: false past `no_eagain_phase_ns`.
+fn awaitArrived(arrived: *std.atomic.Value(usize), want: usize) bool {
+    const deadline = clock.monotonicNs() + no_eagain_phase_ns;
+    while (arrived.load(.acquire) < want) {
+        if (clock.monotonicNs() >= deadline) return false;
+        sleepMs(1);
+    }
+    return true;
+}
+
+test "smoke: 300 CONCURRENT FSYNCS AND 300 CONCURRENT CREATES ON ONE MOUNT NEVER ANSWER EAGAIN (0003 §BO) — a set over device-mapper slices, mount A (the manager) + B JOINED: B's journal lane and conveyor are the floor ring's (64 request cells, 128 queue cells: the bounds that answered EAGAIN before §BO) → the device made a slow one (dm-delay: every write and flush 5 ms later) → 300 threads each `mkdir` a directory in B's own `s`, then at one gate create a file in it (300 parents: 300 creates at the daemon at once), then at a second gate fsync the directory (the metadata barrier) and the file: every op answers 0 — never EAGAIN — inside the row's bound, with more than 64 fsyncs held on B's lane at once; B's must-stay-0 gauges 0 → the working table back → umount B, umount A" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    if (DmErrorSet.delayMissing(rig)) |why| return testkit.skipWhy(@src(), why);
+    var dm = try DmErrorSet.up(rig);
+    defer dm.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    {
+        const r = try rig.squeezefs(&.{ "format", dm.meta_uri, dm.data_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    try rig.spawnMountOf(dm.meta_uri, &.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.meta_uri = dm.meta_uri;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "mounted JOINED as appender 1") != null);
+        const out = try b.onMount("mkdir s && echo made");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("made\n", out);
+    }
+    var gate: std.atomic.Value(u32) = .init(0);
+    var arrived: std.atomic.Value(usize) = .init(0);
+    const storm = try gpa.alloc(NoEagainThread, no_eagain_width);
+    defer gpa.free(storm);
+    const threads = try gpa.alloc(std.Thread, no_eagain_width);
+    defer gpa.free(threads);
+    var phase_ms: [3]u64 = undefined;
+    {
+        var pb: [160]u8 = undefined;
+        const s_fd = try openRaw(try std.fmt.bufPrintSentinel(&pb, "{s}/s", .{b.mp}, 0), .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+        defer _ = linux.close(s_fd);
+        // The slow device from the setup's mkdirs on: their windows fill
+        // B's floor ring ahead of the creates.
+        try dm.delayWrites(no_eagain_delay_ms);
+        var spawned: usize = 0;
+        // Every exit opens both gates and joins (a wedged phase aborted B's
+        // connection first, so every thread's syscall returned), then
+        // swaps the working table back.
+        defer {
+            gate.store(2, .release);
+            for (threads[0..spawned]) |t| t.join();
+            dm.delayWrites(0) catch {};
+        }
+        for (storm, threads, 0..) |*t, *th, i| {
+            t.* = .{ .s_fd = s_fd, .idx = i, .gate = &gate, .arrived = &arrived };
+            th.* = try std.Thread.spawn(.{ .stack_size = 4 << 20 }, NoEagainThread.run, .{t});
+            spawned += 1;
+        }
+        for ([_]u32{ 0, 1, 2 }, &phase_ms) |phase, *ms| {
+            const t0 = clock.monotonicNs();
+            gate.store(phase, .release);
+            if (!awaitArrived(&arrived, (phase + 1) * no_eagain_width)) {
+                std.debug.print("\nsmoke[no-eagain]: phase {d} still owes {d} threads past {d} s — B's kernel stacks:\n", .{ phase, (phase + 1) * no_eagain_width - arrived.load(.acquire), no_eagain_phase_ns / std.time.ns_per_s });
+                printKernelStacks(io, b.pid);
+                abortFuseConnectionOf(io, b.mp);
+                return error.StormWedged;
+            }
+            ms.* = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+        }
+    }
+    var again: usize = 0;
+    var failed: usize = 0;
+    for (storm) |t| for ([_]linux.E{ t.mkdir_e, t.create_e, t.fsyncdir_e, t.fsync_e }, [_][]const u8{ "mkdir", "create", "fsync(dir)", "fsync(file)" }) |e, what| {
+        if (e == .SUCCESS) continue;
+        if (failed == 0) std.debug.print("\nsmoke[no-eagain]: thread {d}'s {s} answered {t}\n", .{ t.idx, what, e });
+        failed += 1;
+        if (e == .AGAIN) again += 1;
+    };
+    const tb = try b.stats();
+    defer gpa.free(tb);
+    const hwm = numberAfter(tb, "\"journal_lane_fsync_waiters_hwm\":") orelse 0;
+    std.debug.print("\nsmoke[no-eagain]: writes and flushes {d} ms late: {d} mkdirs in {d} ms, {d} concurrent creates in {d} ms, {d} fsyncs (dir + file) in {d} ms; B: fsync waiters hwm {d}, room parks {d}, coalesced barriers {d}; failed {d} (EAGAIN {d})\n", .{ no_eagain_delay_ms, no_eagain_width, phase_ms[0], no_eagain_width, phase_ms[1], 2 * no_eagain_width, phase_ms[2], hwm, numberAfter(tb, "\"meta_conveyor_room_parks\":") orelse 0, numberAfter(tb, "\"journal_lane_barriers_coalesced\":") orelse 0, failed, again });
+    try testing.expectEqual(@as(usize, 0), again);
+    try testing.expectEqual(@as(usize, 0), failed);
+    // Past the request cells a barrier once took: the storm met the old
+    // bound and waited through it.
+    try testing.expect(hwm > 64);
+    try expectMustStayZero(tb);
+    try b.umount();
+    try b.expectCleanExit("B's clean unmount after the storm");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
 /// The rejoin row's cycles: each one a clean umount of B and its remount
@@ -7577,6 +7756,23 @@ const DmErrorSet = struct {
         , .{ name, self.sectors, self.loop, name, meta_sectors, name, name, data_sectors, name, meta_sectors, name, data_sectors, name, meta_sectors + data_sectors })));
         self.up_count = 2;
         return self;
+    }
+
+    /// The venue's dm-delay target (loaded on demand), else the skip's
+    /// reason.
+    fn delayMissing(rig: *Rig) ?testkit.Why {
+        const r = rig.sh(rig.work, "modprobe dm-delay >/dev/null 2>&1; dmsetup targets | grep -q '^delay '") catch return .{ .class = .no_kernel_feature, .detail = "dm-delay" };
+        defer rig.freeRun(r);
+        return if (r.term.success()) null else .{ .class = .no_kernel_feature, .detail = "dm-delay" };
+    }
+
+    /// Every write and flush of the set `ms` slower (dm-delay over the
+    /// whole device; reads untouched) — a slow metadata device's latency;
+    /// 0 swaps the working table back. Suspended without lockfs, as `load`.
+    fn delayWrites(self: *DmErrorSet, ms: u32) !void {
+        var script: [512]u8 = undefined;
+        const table = if (ms == 0) try std.fmt.bufPrint(script[256..], "0 {d} linear {s} 0", .{ self.sectors, self.loop }) else try std.fmt.bufPrint(script[256..], "0 {d} delay {s} 0 0 {s} 0 {d}", .{ self.sectors, self.loop, self.loop, ms });
+        self.rig.gpa.free(try self.rig.shOk(self.rig.work, try std.fmt.bufPrint(script[0..256], "dmsetup suspend --nolockfs {s} && dmsetup load {s} --table \"{s}\" && dmsetup resume {s} && echo ok", .{ self.name, self.name, table, self.name })));
     }
 
     /// The table swap without lockfs (`_dmerror_load_error_table`'s

@@ -1205,6 +1205,115 @@ test "the park ladder has no lost wake: 20 k ops from a client thread with rando
     for (s.m.slots()) |*sl| try testing.expectEqual(slot_core.FREE, sl.core.state.load(.monotonic));
 }
 
+/// The handoff's filesystem: a READ that fills its window with 0x5A.
+const StubReadFs = struct {
+    reads: Atomic(u32) = .init(0),
+
+    pub fn read(self: *StubReadFs, c: *filesystem.Ctx, a: filesystem.ReadArgs) filesystem.Error!filesystem.Data {
+        _ = self.reads.fetchAdd(1, .monotonic);
+        @memset(c.window[0..a.size], 0x5A);
+        return .{ .len = a.size };
+    }
+};
+
+/// A fiber that holds its lane's slot until `word` is set.
+fn holdSlot(io: Io, word: *futex.Word) void {
+    while (word.load(.acquire) == 0) io.futexWaitUncancelable(u32, &word.raw, 0);
+}
+
+/// The product sink over a ONE-lane executor whose fibers the test holds,
+/// a RAM session's slot dequeued as the owner would, and a stub filesystem.
+const SaturatedSink = struct {
+    sqz: *sqz_io.SqzIo,
+    io: Io,
+    holders: Io.Group = .init,
+    hold: futex.Word = .init(0),
+    held: u32 = 0,
+    ts: TestSession,
+    fs: StubReadFs = .{},
+    pending: [8]DataPlaneSink.Pending = undefined,
+    per_owner: [1]DataPlaneSink.PerOwner = undefined,
+    sink: DataPlaneSink = undefined,
+
+    fn init(self: *SaturatedSink) !void {
+        const sqz = try sqz_io.SqzIo.init(testing.allocator, .{ .budget_bytes = 1 << 30, .meta_lanes = 1, .meta_capacity = 16, .blocking_cap = 8 });
+        errdefer sqz.deinit();
+        self.* = .{ .sqz = sqz, .io = sqz.io(), .ts = try TestSession.init(testing.allocator, test_geometry) };
+        self.per_owner = .{.{ .pending = &self.pending }};
+        self.sink = .{ .gpa = testing.allocator, .io = self.io, .sqz = self.sqz, .plane = undefined, .fs = filesystem.Filesystem.of(StubReadFs, &self.fs), .guards = undefined, .probe = undefined, .shared_enabled = false, .opens = undefined, .pool = undefined, .placed = undefined, .inval = undefined, .dd = null, .direct_write = false, .direct_read = false, .max_file_size = 1 << 40, .uid = 0, .gid = 0, .pid = 1, .per_owner = &self.per_owner };
+    }
+
+    /// Every fiber slot of the lane held.
+    fn saturate(self: *SaturatedSink) void {
+        const lane = self.sqz.homeLane(null, null);
+        while (true) {
+            self.sqz.spawnGroupOn(lane, &self.holders, holdSlot, .{ self.io, &self.hold }) catch break;
+            self.held += 1;
+        }
+    }
+
+    fn unhold(self: *SaturatedSink) void {
+        self.hold.store(1, .release);
+        futex.ioWake(self.io, &self.hold, std.math.maxInt(u32));
+    }
+
+    fn deinit(self: *SaturatedSink) void {
+        self.unhold();
+        self.holders.await(self.io) catch {};
+        self.ts.deinit();
+        self.sqz.deinit();
+    }
+
+    /// One read submitted and dequeued: the op and its completion.
+    fn dequeueRead(self: *SaturatedSink, cl: StubClient, slot_idx: u32, len: u32) !struct { op: DataOp, c: Completion, gen: u64 } {
+        const s = self.ts.s;
+        const gen = cl.submit(slot_idx, .read, 1, 0, len);
+        const idx = s.consumer.pop(s.ring).?;
+        const slot = s.m.slot(idx) catch unreachable;
+        try testing.expect(slot_core.tryBeginServe(slot));
+        try testing.expect(s.beginInflight());
+        const desc = slot_core.snapshot(slot);
+        s.map.retain();
+        const window = s.m.arenaWindow(desc.arena_off, desc.len) catch unreachable;
+        return .{ .op = .{ .op = .read, .desc = desc, .binding = s.binding(desc.binding).?.*, .t0_ns = clock.monotonicNs(), .window = window }, .c = .{ .session = s, .slot_index = idx, .latch = false }, .gen = gen };
+    }
+};
+
+// Decision 0003 §BO/§BQ's law at the interposer: a read or write on a
+// regular file never answers EAGAIN, and the host's handoff onto a lane
+// that every lane refuses (every fiber slot busy) is the same saturation
+// the kernel path waits out.
+test "a handoff every lane refuses WAITS: an interposed read with the executor's lanes saturated never answers EAGAIN — it runs once a fiber slot frees, byte-exact" {
+    var x: SaturatedSink = undefined;
+    try x.init();
+    defer x.deinit();
+    const s = x.ts.s;
+    _ = s.bind(.{ .ino = 7, .rights = .{ .read = true } }, false, .mount).?;
+    const cl: StubClient = .{ .s = s };
+    x.saturate();
+    try testing.expect(x.held > 0);
+    const d = try x.dequeueRead(cl, 3, 2048);
+    x.sink.readHandoffOn(s, d.op, d.c);
+    const slot = s.m.slot(3) catch unreachable;
+    if (slot_core.isDoneFor(slot, d.gen)) {
+        const r = slot_core.result(slot);
+        std.debug.print("\nthe saturated handoff answered {d}\n", .{r});
+        try testing.expect(r != -@as(i64, @backingInt(linux.E.AGAIN)));
+    }
+    // A slot frees: the owner's next flush runs the op.
+    x.unhold();
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!slot_core.isDoneFor(slot, d.gen)) {
+        if (clock.monotonicNs() > deadline) return error.TestTimeout;
+        DataPlaneSink.flushFn(&x.sink, 0);
+        std.Thread.yield() catch {};
+    }
+    try testing.expectEqual(@as(i64, 2048), try cl.awaitDone(3, d.gen));
+    const window = s.m.slotWindow(3) catch unreachable;
+    try testing.expect(std.mem.allEqual(u8, window[0..2048], 0x5A));
+    try testing.expectEqual(@as(u32, 1), x.fs.reads.load(.monotonic));
+}
+
 test "/proc/stat's cpu line parses to (total, idle + iowait); garbage is null" {
     const r = parseProcStatCpu("cpu  100 0 50 800 20 0 10 0 0 0\ncpu0 1 2 3 4 5 6 7 8 9 10\n").?;
     try testing.expectEqual(@as(u64, 980), r[0]);

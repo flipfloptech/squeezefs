@@ -186,6 +186,8 @@ pub const stats = struct {
     pub var drain_inplace_declines: counters.ShardedCounter = .{};
     /// A failed seed read or DMA: the entry stays parked (never lossy), loud.
     pub var drain_inplace_dma_errors: counters.ShardedCounter = .{};
+    /// The edge seed READS among them (the class a FAILED volume logs once).
+    pub var drain_inplace_seed_read_errors: counters.ShardedCounter = .{};
     /// The drains of a CONTENT-VALID buffer that landed its dirty pages in
     /// place (decision 0003 §AJ.7; inside `drain_inplace_drains`).
     pub var drain_inplace_dirty_drains: counters.ShardedCounter = .{};
@@ -205,7 +207,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks", "parked_ino_scans", "reserved_landings", "reserved_landing_declines", "upload_join_overlong" }) |name| {
+    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_seed_read_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks", "parked_ino_scans", "reserved_landings", "reserved_landing_declines", "upload_join_overlong" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load() });
@@ -1842,7 +1844,8 @@ fn drainInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
             deps.device.read(begun.vol_tag, begun.dest + pg, &page) catch |err| {
                 sole_owner_patch.abandonInPlace(pdeps, begun);
                 stats.drain_inplace_dma_errors.inc();
-                log.err("in-place drain ino {d} block {d}: the edge seed read of page {d} failed ({s}) — the block stays parked", .{ e.key.ino, e.key.block, pg / PAGE, @errorName(err) });
+                stats.drain_inplace_seed_read_errors.inc();
+                if (pdeps.vols.admitsLine(.edge_seed_read)) log.err("in-place drain ino {d} block {d}: the edge seed read of page {d} failed ({s}) — the block stays parked", .{ e.key.ino, e.key.block, pg / PAGE, @errorName(err) });
                 return .stay_parked;
             };
             var covered_buf: [CoverageUnion.max_runs]cov.Run = undefined;

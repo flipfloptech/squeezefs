@@ -211,6 +211,9 @@ pub const stats = struct {
     pub var layout_map_merges: counters.ShardedCounter = .{};
     pub var layout_map_merge_blocks: counters.ShardedCounter = .{};
     pub var layout_map_merge_failures: counters.ShardedCounter = .{};
+    /// The block-map COMMITS among them (`commitBlockMap`, the window publish):
+    /// the class a FAILED volume logs once (`Volumes.admitsLine`).
+    pub var layout_map_commit_failures: counters.ShardedCounter = .{};
     /// Inserts a STALE write-back unit (formed before a size-setting
     /// commit) presented at or past the ino's current EOF: dropped, never
     /// re-inserted, the layout size never raised (`MergeRequest.size_epoch`).
@@ -338,7 +341,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "layout_map_punches", "layout_shifts", "layout_shift_refusals", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_replaced", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_commit_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "layout_map_punches", "layout_shifts", "layout_shift_refusals", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_replaced", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -665,6 +668,7 @@ pub const DataPlane = struct {
             .zcrx_registry = zcrx.steering.Registry.init(gpa),
             .publish_scratch = undefined,
         };
+        self.vols.lines = be.lineSeam();
         self.publish_scratch = try merge_scratch.Pool.init(gpa, io, merge_scratch.poolCap(opts.facts.cpus), merge_scratch.slabLen(@intCast(node_size)));
         errdefer self.publish_scratch.deinit();
         budget.authority.register(self.publish_scratch.component());
@@ -743,6 +747,7 @@ pub const DataPlane = struct {
         errdefer self.rp.deinit();
         self.rp.registerComponents(&budget.authority);
         self.rp.issuer = .{ .ctx = self, .issue = &issuePrefetch };
+        self.rp.lines = self.vols.lines;
         self.rp.seams.verify_grain_serves = knobs.boolKnob("SQUEEZEFS_TEST_READ_CACHE_VERIFY", opts.env);
         if (self.rp.grains.enabled()) log.info("data plane: the read cache holds {d} MiB of device grains over {d} shard(s) (SQUEEZEFS_READ_CACHE_PCT)", .{ rcfg.read_cache_bytes >> 20, self.rp.grains.shardCount() });
 
@@ -1863,7 +1868,8 @@ pub const DataPlane = struct {
         fsync_mod.fsync(ctx, io, ino, &prof) catch |e| return switch (e) {
             error.NoSpaceLeft => error.NoSpaceLeft,
             error.InputOutput, error.IntentBarrierFailed, error.MetaBarrierFailed => blk: {
-                log.err("fsync ino {d}: a leg failed ({s}) — EIO to the application, the touched bits stay set", .{ ino, @errorName(e) });
+                fsync_mod.stats.fsync_leg_failures.inc();
+                if (self.vols.admitsLine(.fsync_leg)) log.err("fsync ino {d}: a leg failed ({s}) — EIO to the application, the touched bits stay set", .{ ino, @errorName(e) });
                 break :blk error.InputOutput;
             },
             error.WriterGuardFenced => error.WriterGuardFenced,
@@ -1884,7 +1890,8 @@ pub const DataPlane = struct {
         fsync_mod.syncfs(ctx, self.gpa, io, prof) catch |e| return switch (e) {
             error.NoSpaceLeft => error.NoSpaceLeft,
             error.InputOutput, error.IntentBarrierFailed, error.MetaBarrierFailed => blk: {
-                log.err("syncfs: a leg failed ({s}) — EIO to the application, the custody it could not land stays parked", .{@errorName(e)});
+                fsync_mod.stats.syncfs_leg_failures.inc();
+                if (self.vols.admitsLine(.syncfs_leg)) log.err("syncfs: a leg failed ({s}) — EIO to the application, the custody it could not land stays parked", .{@errorName(e)});
                 break :blk error.InputOutput;
             },
             error.WriterGuardFenced => error.WriterGuardFenced,
@@ -3365,7 +3372,8 @@ pub const DataPlane = struct {
         self.backend.commit(t) catch |e| {
             holds.drop(out.slice());
             stats.layout_map_merge_failures.inc();
-            log.err("ino {d}: the block-map commit of {d} binding(s) failed ({s})", .{ req.ino, req.inserts.len, @errorName(e) });
+            stats.layout_map_commit_failures.inc();
+            if (self.vols.admitsLine(.block_map_commit)) log.err("ino {d}: the block-map commit of {d} binding(s) failed ({s})", .{ req.ino, req.inserts.len, @errorName(e) });
             return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.VolumeFailed, error.VolumeClosed => error.WriterGuardFenced,
@@ -3821,7 +3829,8 @@ pub const DataPlane = struct {
         self.backend.commit(t) catch |e| {
             holds.drop(out.slice());
             stats.layout_map_merge_failures.inc();
-            log.err("ino {d}: the block-map commit of {d} binding(s) failed ({s})", .{ ino, window.len, @errorName(e) });
+            stats.layout_map_commit_failures.inc();
+            if (self.vols.admitsLine(.block_map_commit)) log.err("ino {d}: the block-map commit of {d} binding(s) failed ({s})", .{ ino, window.len, @errorName(e) });
             return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.VolumeFailed, error.VolumeClosed => error.WriterGuardFenced,

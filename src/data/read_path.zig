@@ -66,6 +66,7 @@ const errors = @import("../core/errors.zig");
 const knobs = @import("../core/knobs.zig");
 const log = @import("../core/log.zig");
 const budget = @import("../mem/budget.zig");
+const journal = @import("../meta/journal.zig");
 const layout = @import("layout.zig");
 const block_alloc = @import("block_alloc.zig");
 const staging = @import("staging.zig");
@@ -711,6 +712,9 @@ pub const ReadPath = struct {
     seams: Seams = .{},
     /// The speculative-fill issuer (null = plans are bookkept, never run).
     issuer: ?Issuer = null,
+    /// The set's one-line law (`write_seams.Volumes.lines`): a lost staged
+    /// read logs once per FAILED episode, counted always. Null: every line.
+    lines: ?journal.FailureLatch.LineSeam = null,
 
     const PipelineTable = struct {
         /// 64 files in flight per read path: the stream-lane population a
@@ -1186,7 +1190,8 @@ pub const ReadPath = struct {
             // STABLE lost identity: size-consistent zeros, counted and warned.
             const zeros = staging.lostStagedRangeLen(offset, out.len, cur.size);
             staging.stats.staged_payload_lost_reads.inc();
-            log.warn("staged payload unreachable for ino {d}: serving {d} zero bytes at offset {d} (another client's live staged custody, or a crash discarded it)", .{ ino, zeros, offset });
+            const line = if (self.lines) |l| l.admits(l.ctx, .staged_payload_lost) else true;
+            if (line) log.warn("staged payload unreachable for ino {d}: serving {d} zero bytes at offset {d} (another client's live staged custody, or a crash discarded it)", .{ ino, zeros, offset });
             @memset(out, 0);
             stats.read_copy_dest_bytes.add(out.len);
             return out.len;
@@ -3706,6 +3711,34 @@ const StagedRing = struct {
         fx.rp.write_side = .{ .ctx = fx, .overlay_read = &none, .extent_runs = &runs, .staged_block = &block, .staged_payload = &stagedPayload, .has_retained_extents = &no, .open_overlay = &no2, .has_custody = &no2 };
     }
 };
+
+test "a FAILED volume's lost staged reads: N reads of a stably lost identity each serve their size-consistent zeros and are counted (staged_payload_lost_reads), and the set's law admits ONE warning for all N" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{});
+    defer f.deinit();
+    f.kind = .staged;
+    f.size = 6000;
+    f.file_id = @splat(0xA5);
+    f.mint(1);
+    StagedRing.bind(f);
+    StagedRing.mode = .lost;
+    defer StagedRing.mode = .promoted;
+    var latch: journal.FailureLatch = .{};
+    f.rp.lines = latch.lineSeam();
+    try testing.expect(latch.failStop());
+    const buf = try alignedBuf(testing.allocator, 4096);
+    defer testing.allocator.free(buf);
+    const lost0 = staging.stats.staged_payload_lost_reads.load();
+    const quieted0 = journal.meta_failed_volume_lines_quieted.load();
+    const n_ops = 16;
+    for (0..n_ops) |_| {
+        @memset(buf, 0xEE);
+        try testing.expectEqual(@as(usize, 4096), try f.rp.read(io, 7, 0, 4096, .{ .buf = buf }, .{}));
+        try testing.expectEqualSlices(u8, &@as([4096]u8, @splat(0)), buf);
+    }
+    try testing.expectEqual(lost0 + n_ops, staging.stats.staged_payload_lost_reads.load());
+    try testing.expectEqual(quieted0 + n_ops - 1, journal.meta_failed_volume_lines_quieted.load());
+}
 
 test "a staged read whose identity moved between its resolve and its ring lookup re-resolves instead of serving zeros: the promotion that committed the packed layout and released the ring entry in that window serves the tenant's bytes; a re-stage under a fresh identity serves the fresh copy; only an identity still staged and still absent after a FRESH resolve is the lost arm (repro-port: fstests generic/127 under the promote-at-fsync lever — a host-wide sync promoted fsx's file while one page was read, `staged payload unreachable for ino 8: serving 4096 zero bytes`)" {
     const io = testing.io;

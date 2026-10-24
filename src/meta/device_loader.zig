@@ -74,6 +74,8 @@ pub const Stats = struct {
     journal_entry_failures: counters.ShardedCounter = .{},
     range_read_failures: counters.ShardedCounter = .{},
     format_step_failures: counters.ShardedCounter = .{},
+    /// Read-failure episodes opened on a volume (`ReadEpisode`).
+    read_failure_episodes: counters.ShardedCounter = .{},
 
     fn failures(self: *Stats, site: Site) *counters.ShardedCounter {
         return switch (site) {
@@ -146,6 +148,35 @@ fn takeInjectedBarrierFailure() ?uring_fs.Error {
     return uring_fs.fromErrno(@fromBackingInt(@intCast(@as(u16, @intCast(raw)))));
 }
 
+/// A volume's node-read failure episode while it is not FAILED (a failed
+/// read never latches the volume, so the latch cannot bound its lines):
+/// the first failed node read opens it (one line), every failure inside it
+/// is counted, the next node read that lands closes it (one line with the
+/// tally). One word — the OPEN bit over the failures since the open — so
+/// the tally is exact under concurrent readers; RMW coherence on the one
+/// location orders it (no paired fence).
+pub const ReadEpisode = struct {
+    state: std.atomic.Value(u64) = .init(0),
+
+    const OPEN: u64 = 1 << 63;
+
+    /// Count a failed read; true iff THIS call opened the episode.
+    pub fn noteFailure(self: *ReadEpisode) bool {
+        var cur = self.state.load(.monotonic);
+        while (self.state.cmpxchgWeak(cur, (cur | OPEN) + 1, .monotonic, .monotonic)) |seen| cur = seen;
+        return cur & OPEN == 0;
+    }
+
+    /// A read landed: the episode's failure count iff THIS call closed it
+    /// (one load when no episode is open).
+    pub fn noteSuccess(self: *ReadEpisode) ?u64 {
+        if (self.state.load(.monotonic) & OPEN == 0) return null;
+        const prior = self.state.swap(0, .monotonic);
+        if (prior & OPEN == 0) return null;
+        return prior & ~OPEN;
+    }
+};
+
 /// The binding: the io pool, the device path, its registered posture.
 pub const DeviceLoader = struct {
     gpa: Allocator,
@@ -163,6 +194,7 @@ pub const DeviceLoader = struct {
     /// writes are fence sites too, DMT:173). Null before the lane spawns
     /// (the mount's reads) and in offline tools.
     latch: ?*journal.FailureLatch = null,
+    reads: ReadEpisode = .{},
 
     pub fn loader(self: *DeviceLoader) node_cache.NodeLoader {
         return .{ .ctx = self, .readExtent = readExtent, .appendBset = appendBset, .writeImage = writeImage };
@@ -180,10 +212,10 @@ pub const DeviceLoader = struct {
         return .{ .ctx = self, .writePage = writePageFn };
     }
 
-    fn ioFailed(self: *const DeviceLoader, site: Site, offset: u64, len: usize, e: uring_fs.Error) LoaderError {
+    fn ioFailed(self: *DeviceLoader, site: Site, offset: u64, len: usize, e: uring_fs.Error) LoaderError {
         stats.io_errors.inc();
         stats.failures(site).inc();
-        if (self.admitsLine(site)) log.err("metadata device {s}: {s} at offset {d} ({d} B) failed: {s} ({s})", .{ self.path, site.label(), offset, len, @errorName(e), @tagName(uring_fs.classOf(e)) });
+        if (self.failureLine(site)) |clause| log.err("metadata device {s}: {s} at offset {d} ({d} B) failed: {s} ({s}){s}", .{ self.path, site.label(), offset, len, @errorName(e), @tagName(uring_fs.classOf(e)), clause });
         if (self.latch) |l| _ = l.classifyFence(e, site.label());
         return error.Io;
     }
@@ -193,6 +225,30 @@ pub const DeviceLoader = struct {
     fn admitsLine(self: *const DeviceLoader, site: Site) bool {
         const l = self.latch orelse return true;
         return l.admitsLine(site.logClass());
+    }
+
+    /// Whether a failure at `site` logs, and the clause its line carries
+    /// (null = counted only). A failed node read never latches the volume,
+    /// so on a volume not FAILED its lines follow the read-failure episode
+    /// (`ReadEpisode`); a FAILED volume's follow the latch.
+    fn failureLine(self: *DeviceLoader, site: Site) ?[]const u8 {
+        if (site != .node_read) return if (self.admitsLine(site)) "" else null;
+        const opened = self.reads.noteFailure();
+        if (opened) stats.read_failure_episodes.inc();
+        const failed = if (self.latch) |l| l.isFailed() else false;
+        if (failed) return if (self.admitsLine(.node_read)) "" else null;
+        if (!opened) return null;
+        // Healthy: always admitted; marks the class for a later FAILED.
+        _ = self.admitsLine(.node_read);
+        return " — a read-failure episode opens on this volume: later failed node reads are counted (node_read_failures), not logged, until a node read succeeds";
+    }
+
+    /// A node read landed: the open read-failure episode closes with its
+    /// tally (on a FAILED volume the latch's one line stands for it).
+    fn readSucceeded(self: *DeviceLoader) void {
+        const n = self.reads.noteSuccess() orelse return;
+        if (self.latch) |l| if (l.isFailed()) return;
+        log.info("metadata device {s}: the read-failure episode closed — a node read succeeded after {d} failed node read(s) (node_read_failures)", .{ self.path, n });
     }
 
     // ---- the NodeLoader ----
@@ -207,12 +263,13 @@ pub const DeviceLoader = struct {
         if (got.len != buf.len) {
             stats.io_errors.inc();
             stats.node_read_failures.inc();
-            if (self.admitsLine(.node_read)) log.err("metadata device {s}: node read at offset {d} returned {d} of {d} B (a short extent)", .{ self.path, addr, got.len, buf.len });
+            if (self.failureLine(.node_read)) |clause| log.err("metadata device {s}: node read at offset {d} returned {d} of {d} B (a short extent){s}", .{ self.path, addr, got.len, buf.len, clause });
             return error.Io;
         }
         @memcpy(buf, got);
         stats.node_reads.inc();
         stats.node_read_bytes.add(buf.len);
+        self.readSucceeded();
     }
 
     /// A 4 KiB-padded frame at `addr + off`: the posture law applies (a
@@ -441,15 +498,15 @@ test "a FAILED volume's device lines: every failure is counted by its site, and 
     const reads0 = stats.node_read_failures.load();
     const appends0 = stats.bset_append_failures.load();
     const errors0 = stats.io_errors.load();
-    // Healthy: every failure logs (a read past the device's end is a short
-    // extent).
+    // Healthy: every failed write logs.
     log.testing.expectErrorLogs(2);
-    try testing.expectError(error.Io, ld.readExtent(ld.ctx, 1 << 20, buf));
-    try testing.expectError(error.Io, ld.readExtent(ld.ctx, 1 << 20, buf));
+    try testing.expectEqual(error.Io, d.dev.ioFailed(.bset_append, 1 << 19, 4096, error.InputOutput));
+    try testing.expectEqual(error.Io, d.dev.ioFailed(.bset_append, 1 << 19, 4096, error.InputOutput));
     try log.testing.expectAllFired();
     try testing.expect(latch.failStop());
-    // FAILED under N operations per site: the node read already logged on
-    // this latch (quiet); the bset append logs its first line only.
+    // FAILED under N operations per site: the bset append already logged on
+    // this latch (quiet); the node read (past the device's end: a short
+    // extent) logs its first line only.
     const n_ops = 50;
     log.testing.expectErrorLogs(1);
     for (0..n_ops) |_| {
@@ -458,9 +515,42 @@ test "a FAILED volume's device lines: every failure is counted by its site, and 
     }
     try log.testing.expectAllFired();
     try testing.expectEqual(@as(usize, 1), log.testing.capturedErrorLogs());
-    try testing.expectEqual(reads0 + 2 + n_ops, stats.node_read_failures.load());
-    try testing.expectEqual(appends0 + n_ops, stats.bset_append_failures.load());
+    try testing.expectEqual(reads0 + n_ops, stats.node_read_failures.load());
+    try testing.expectEqual(appends0 + 2 + n_ops, stats.bset_append_failures.load());
     try testing.expectEqual(errors0 + 2 + 2 * n_ops, stats.io_errors.load());
+}
+
+test "a volume that never latches FAILED: failed node reads form an episode — the first opens it (ONE line naming the rule), every failure inside it is counted, the next node read that lands closes it with the tally; the next failure opens a new one (the 753 row's never-latched cycle logged ~7,000 node-read lines in one mount)" {
+    const gpa = testing.allocator;
+    const d = try TestDevice.create(gpa, "read-episode", 1 << 20);
+    defer d.destroy();
+    var latch: journal.FailureLatch = .{};
+    d.dev.latch = &latch;
+    const ld = d.dev.loader();
+    const buf = try gpa.alloc(u8, node.MIN_NODE_SIZE);
+    defer gpa.free(buf);
+    const reads0 = stats.node_read_failures.load();
+    const episodes0 = stats.read_failure_episodes.load();
+    // N failed reads (past the device's end: a short extent): one episode,
+    // one line.
+    const n_ops = 50;
+    log.testing.expectErrorLogs(1);
+    for (0..n_ops) |_| try testing.expectError(error.Io, ld.readExtent(ld.ctx, 1 << 20, buf));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(reads0 + n_ops, stats.node_read_failures.load());
+    try testing.expectEqual(episodes0 + 1, stats.read_failure_episodes.load());
+    try testing.expectEqual(@as(u64, ReadEpisode.OPEN | n_ops), d.dev.reads.state.load(.monotonic));
+    // A read that lands closes it (an info line with the tally).
+    try ld.readExtent(ld.ctx, 0, buf);
+    try testing.expectEqual(@as(u64, 0), d.dev.reads.state.load(.monotonic));
+    try ld.readExtent(ld.ctx, 0, buf);
+    // The next failure is a new episode: its own line.
+    log.testing.expectErrorLogs(1);
+    for (0..n_ops) |_| try testing.expectError(error.Io, ld.readExtent(ld.ctx, 1 << 20, buf));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(episodes0 + 2, stats.read_failure_episodes.load());
+    try testing.expectEqual(reads0 + 2 * n_ops, stats.node_read_failures.load());
+    try testing.expect(!latch.isFailed());
 }
 
 test "a format plan written through the device lands byte-identical to the in-RAM image, with its barriers in plan order" {

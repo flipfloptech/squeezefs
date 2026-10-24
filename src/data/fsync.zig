@@ -96,11 +96,15 @@ pub const stats = struct {
     pub var syncfs_calls: counters.ShardedCounter = .{};
     pub var syncfs_custody_inos: counters.ShardedCounter = .{};
     pub var syncfs_parked_blocks: counters.ShardedCounter = .{};
+    /// fsyncs and syncfs calls a leg failed (EIO to the application): the
+    /// classes a FAILED volume logs once (`write_seams.Volumes.admitsLine`).
+    pub var fsync_leg_failures: counters.ShardedCounter = .{};
+    pub var syncfs_leg_failures: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "fsync_calls", "fsync_data_namespaces_touched", "fsync_data_namespaces_flushed", "fsync_write_through_skips", "fsync_noop_clean", "fsync_parallel_joins", "fsync_flush_enospc_retries", "fsync_promote_failures", "fsync_promote_refusals", "fsync_promote_enospc", "fsync_touched_unresolved", "syncfs_calls", "syncfs_custody_inos", "syncfs_parked_blocks" }) |name| {
+    inline for (.{ "fsync_calls", "fsync_data_namespaces_touched", "fsync_data_namespaces_flushed", "fsync_write_through_skips", "fsync_noop_clean", "fsync_parallel_joins", "fsync_flush_enospc_retries", "fsync_promote_failures", "fsync_promote_refusals", "fsync_promote_enospc", "fsync_touched_unresolved", "syncfs_calls", "syncfs_custody_inos", "syncfs_parked_blocks", "fsync_leg_failures", "syncfs_leg_failures" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.writeAll("\"fsync_phase_ns\":{");

@@ -1252,17 +1252,18 @@ pub const FailureLatch = struct {
     failed: std.atomic.Value(bool) = .init(false),
     /// The typed cause: FAILED by the fence (vs the generic rungs).
     fenced: std.atomic.Value(bool) = .init(false),
-    /// One bit per `LogClass` (a u5 tag: every class fits) that logged a
-    /// line on this latch (this mount).
-    logged: std.atomic.Value(u32) = .init(0),
+    /// The classes that logged a line on this latch (this mount).
+    marks: LineMarks = .{},
 
     pub const Class = enum { journal_write, barrier };
 
     /// The per-operation failure lines of a volume (the lane's windows and
     /// hole covers, the device binding's sites, the checkpoint task's
-    /// passes). Once the volume is FAILED every operation behind it fails
-    /// the same way, so each class logs once per FAILED episode and counts
-    /// the rest on its own counter (`admitsLine`).
+    /// passes; the data plane's sync legs, in-place DMAs, block-map commits
+    /// and lost staged reads, keyed to the plane's set). Once the volume
+    /// is FAILED every operation behind it fails the same way, so each
+    /// class logs once per FAILED episode and counts the rest on its own
+    /// counter (`admitsLine`).
     pub const LogClass = enum(u5) {
         window_write,
         hole_checkpoint,
@@ -1278,23 +1279,58 @@ pub const FailureLatch = struct {
         format_step,
         checkpoint_tick,
         maintenance_pass,
+        fsync_leg,
+        syncfs_leg,
+        inplace_dma,
+        edge_seed_read,
+        staged_payload_lost,
+        block_map_commit,
     };
 
-    /// True iff a failure of `class` logs its line: always on a healthy
-    /// volume; on a FAILED one only when the class never logged on this
-    /// latch — every later failure until remount is counted, not logged
-    /// (`meta_failed_volume_lines_quieted`). A line logged while healthy
-    /// marks its class too, so the latch adds no second line after it.
+    /// The one-line law (`LineMarks.admits`) over this volume's latch.
     pub fn admitsLine(self: *FailureLatch, class: LogClass) bool {
-        const bit = @as(u32, 1) << @backingInt(class);
-        // The AcqRel mark is taken BEFORE `isFailed`'s Acquire read (paired
-        // with the latch's AcqRel swap): a class that logged while healthy
-        // finds its bit set once FAILED.
-        const prior = self.logged.fetchOr(bit, .acq_rel);
-        if (!self.isFailed() or prior & bit == 0) return true;
-        meta_failed_volume_lines_quieted.inc();
-        return false;
+        return self.marks.admits(class, self);
     }
+
+    /// The law as a seam (a data-path fixture binds a bare latch).
+    pub fn lineSeam(self: *FailureLatch) LineSeam {
+        return .{ .ctx = self, .admits = admitsLineFn };
+    }
+
+    fn admitsLineFn(ctx: *anyopaque, class: LogClass) bool {
+        const self: *FailureLatch = @ptrCast(@alignCast(ctx));
+        return self.admitsLine(class);
+    }
+
+    /// The one-line law's marks: one bit per `LogClass` (a u5 tag: every
+    /// class fits) that logged a line in its owner's lifetime (a mount).
+    pub const LineMarks = struct {
+        logged: std.atomic.Value(u32) = .init(0),
+
+        /// True iff a failure of `class` logs its line: always while
+        /// `owner` (anything with `isFailed()`) is healthy; once it is
+        /// FAILED only when the class never logged here — every later
+        /// failure until remount is counted, not logged
+        /// (`meta_failed_volume_lines_quieted`). A line logged while
+        /// healthy marks its class too, so FAILED adds no second line.
+        pub fn admits(self: *LineMarks, class: LogClass, owner: anytype) bool {
+            const bit = @as(u32, 1) << @backingInt(class);
+            // The AcqRel mark is taken BEFORE `isFailed`'s Acquire read
+            // (paired with the latch's AcqRel swap): a class that logged
+            // while healthy finds its bit set once FAILED.
+            const prior = self.logged.fetchOr(bit, .acq_rel);
+            if (!owner.isFailed() or prior & bit == 0) return true;
+            meta_failed_volume_lines_quieted.inc();
+            return false;
+        }
+    };
+
+    /// The law behind a seam: the data path asks its set (`MetaSet`, any
+    /// member FAILED) without naming the meta types.
+    pub const LineSeam = struct {
+        ctx: *anyopaque,
+        admits: *const fn (ctx: *anyopaque, class: LogClass) bool,
+    };
 
     /// Why a volume is FAILED (the stats face and the teardown log).
     pub const Verdict = enum { healthy, failed, fenced };

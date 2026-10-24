@@ -7847,15 +7847,49 @@ const xattr_storm_script =
     \\        pass
 ;
 
+/// One worker of the data storm beside it (generic/475's fsstress shape on
+/// the data plane): 64 KiB writes with an fsync, 4 KiB overwrites in place,
+/// reads, and a `syncfs` of the mount, over 8 files of `<mp>/d<N>`; every
+/// refusal is swallowed — the storm runs until killed.
+const data_storm_script =
+    \\import ctypes, os, random, sys
+    \\mp, w = sys.argv[1], sys.argv[2]
+    \\d = os.path.join(mp, "d" + w)
+    \\r = random.Random(int(w))
+    \\libc = ctypes.CDLL(None, use_errno=True)
+    \\big, small = b"y" * 65536, b"z" * 4096
+    \\while True:
+    \\    try:
+    \\        os.makedirs(d, exist_ok=True)
+    \\        fd = os.open(os.path.join(d, "f%d" % r.randrange(8)), os.O_RDWR | os.O_CREAT, 0o644)
+    \\        try:
+    \\            op = r.randrange(100)
+    \\            if op < 40:
+    \\                os.pwrite(fd, big, r.randrange(16) * 65536)
+    \\                os.fsync(fd)
+    \\            elif op < 70:
+    \\                os.pwrite(fd, small, r.randrange(256) * 4096)
+    \\            elif op < 92:
+    \\                os.pread(fd, 65536, r.randrange(16) * 65536)
+    \\            else:
+    \\                libc.syncfs(fd)
+    \\        finally:
+    \\            os.close(fd)
+    \\    except OSError:
+    \\        pass
+;
+
 const dm_error_cycles: usize = 8;
 const dm_error_storm_workers: usize = 4;
+const dm_error_data_workers: usize = 2;
 
-/// The per-operation failure lines of a metadata volume
-/// (`journal.FailureLatch.LogClass`): once the volume latched FAILED every
-/// operation behind it fails the same way, so each class logs at most one
-/// line from the latch to the daemon's exit (generic/753's scratch daemons
-/// logged ~50 of each per mount).
-const failed_volume_line_classes = [_]struct { name: []const u8, needle: []const u8 }{
+/// The per-operation failure lines of a set (`journal.FailureLatch.LogClass`:
+/// the metadata volume's and the data plane's): once the volume latched
+/// FAILED every operation behind it fails the same way, so each class logs
+/// at most one line from the latch to the daemon's exit (generic/753's
+/// scratch daemons logged ~50 of each per mount; generic/475's up to 67
+/// fsync legs). A line is in a class when it carries `needle` (and `also`).
+const failed_volume_line_classes = [_]struct { name: []const u8, needle: []const u8, also: ?[]const u8 = null }{
     .{ .name = "window write", .needle = ") write failed: " },
     .{ .name = "hole checkpoint (drain)", .needle = "post-failure checkpoint could not drain" },
     .{ .name = "hole checkpoint (isolation)", .needle = "post-isolation checkpoint could not cover" },
@@ -7869,34 +7903,68 @@ const failed_volume_line_classes = [_]struct { name: []const u8, needle: []const
     .{ .name = "journal entry", .needle = ": journal entry at offset " },
     .{ .name = "checkpoint tick", .needle = "kv checkpoint tick failed" },
     .{ .name = "maintenance pass", .needle = "kv maintenance pass failed" },
+    .{ .name = "fsync leg", .needle = ": a leg failed (", .also = "fsync ino " },
+    .{ .name = "syncfs leg", .needle = "syncfs: a leg failed (" },
+    .{ .name = "in-place DMA", .needle = ": DMA failed (" },
+    .{ .name = "edge seed read", .needle = "the edge seed read of page" },
+    .{ .name = "lost staged read", .needle = "staged payload unreachable" },
+    .{ .name = "block-map commit", .needle = "the block-map commit of" },
 };
 
-/// The census of one cycle's daemon log `t` (its mount to its exit): each
-/// class's lines from the first latch line on. False when a class logged
-/// twice or more once FAILED (printed); true when no latch line is there.
+/// A failed node read on a volume that never latches FAILED opens a
+/// read-failure episode (one line), closed by the next node read that lands.
+const read_episode_closed = "the read-failure episode closed";
+
+/// The lines of class `c` in `t`.
+fn classLines(t: []const u8, c: @TypeOf(failed_volume_line_classes[0])) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, t, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, c.needle) == null) continue;
+        if (c.also) |a| if (std.mem.indexOf(u8, line, a) == null) continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// The census of one cycle's daemon log `t` (its mount to its exit). A
+/// latched cycle: each class's lines from the first latch line on, at most
+/// one. A cycle that never latched: the node-read lines, at most one per
+/// read-failure episode (its open; every close is a line of its own).
+/// False when either law broke (printed).
 fn failedVolumeLinesOnce(t: []const u8, cycle: usize) bool {
     const marked = std.mem.indexOf(u8, t, "volume marked FAILED");
     const latching = std.mem.indexOf(u8, t, "latching the volume FAILED");
     const at = @min(marked orelse t.len, latching orelse t.len);
-    if (at == t.len) return true;
+    if (at == t.len) {
+        const reads = classLines(t, failed_volume_line_classes[4]);
+        const closes = std.mem.count(u8, t, read_episode_closed);
+        if (reads != 0) std.debug.print("\nsmoke[dm-error]: cycle {d} (never latched): {d} node-read line(s), {d} episode close(s)", .{ cycle, reads, closes });
+        return reads <= closes + 1;
+    }
     const from = (std.mem.lastIndexOfScalar(u8, t[0..at], '\n') orelse 0);
     var ok = true;
     for (failed_volume_line_classes) |c| {
-        const before = std.mem.count(u8, t[0..from], c.needle);
-        const after = std.mem.count(u8, t[from..], c.needle);
+        const before = classLines(t[0..from], c);
+        const after = classLines(t[from..], c);
         if (before + after != 0) std.debug.print("\nsmoke[dm-error]: cycle {d}: {s}: {d} line(s) before the latch, {d} after", .{ cycle, c.name, before, after });
         if (after > 1) ok = false;
     }
     return ok;
 }
 
-test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIES OF IT — ITS UNMOUNT ALWAYS COMPLETES AND NEVER LEAVES A SERVER-LESS MOUNT (xfstests generic/753; charter §1.8) — a set over a device-mapper device whose table flips to `error` without lockfs under an xattr storm, 8 cycles: the volume latches FAILED (a create answers EIO), the daemon stays alive with its mount in the table; the storm killed, `squeezefs umount` exits 0 without the `no squeezefs daemon serves it` fallback, the daemon exits 1 by itself naming the FAILED member (its supervisor: `exited (wait status 0x100)` — never a signal), no mount at the path, a second `squeezefs umount` answers `not mounted`; the working table back, the next mount serves the storm's tree, unmounts clean and the set fscks clean; once a volume latched FAILED each per-operation failure class (window write, hole cover, node read, bset append, checkpoint tick, …) logs at most ONE line until the exit, the rest counted (red on 517121d: up to 226 window-write, 231 hole and 210 bset-append lines after the latch in one cycle) (red on 7a6e224: every failed node read freed its 256 KiB buffer twice — the second munmap took a FUSE worker's live listxattr array, SIGSEGV, wait status 0x8b, the test's unmount met a mount with no daemon)" {
+test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIES OF IT — ITS UNMOUNT ALWAYS COMPLETES AND NEVER LEAVES A SERVER-LESS MOUNT (xfstests generic/753; charter §1.8) — a set over a device-mapper device whose table flips to `error` without lockfs under an xattr storm, 8 cycles: the volume latches FAILED (a create answers EIO), the daemon stays alive with its mount in the table; the storm killed, `squeezefs umount` exits 0 without the `no squeezefs daemon serves it` fallback, the daemon exits 1 by itself naming the FAILED member (its supervisor: `exited (wait status 0x100)` — never a signal), no mount at the path, a second `squeezefs umount` answers `not mounted`; the working table back, the next mount serves the storm's tree, unmounts clean and the set fscks clean; once a volume latched FAILED each per-operation failure class (window write, hole cover, node read, bset append, checkpoint tick, …) logs at most ONE line until the exit, the rest counted (red on 517121d: up to 226 window-write, 231 hole and 210 bset-append lines after the latch in one cycle) — the data plane's classes too, under a cache-less data storm beside it (fsync and syncfs legs, in-place DMAs, edge seed reads, lost staged reads, block-map commits); a cycle whose volume never latches logs ONE node-read line per read-failure episode (red on 5d3e411: 11,463 in-place DMA lines after the latch in one cycle, 5,910 node-read lines in the never-latched one) (red on 7a6e224: every failed node read freed its 256 KiB buffer twice — the second munmap took a FUSE worker's live listxattr array, SIGSEGV, wait status 0x8b, the test's unmount met a mount with no daemon)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
+    // The cache-less posture: the data storm's bytes go straight to the data
+    // volumes. With the write cache, a FAILED daemon's supervisor holds the
+    // unpromoted ring for the next mount, and the cycle's second umount
+    // meets that supervisor instead of `not mounted`.
+    try rig.env.put("SQUEEZEFS_WRITE_CACHE_PCT", "0");
     var dm = try DmErrorSet.up(rig);
     defer dm.deinit();
     if (rig.log_file == null) rig.log_file = try openLogAppend(rig.log_path);
@@ -7925,15 +7993,16 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
             defer gpa.free(text);
             break :blk @as(linux.pid_t, @intCast(numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid));
         };
-        var workers: [dm_error_storm_workers]std.process.Child = undefined;
+        var workers: [dm_error_storm_workers + dm_error_data_workers]std.process.Child = undefined;
         var spawned: usize = 0;
         defer for (workers[0..spawned]) |*w| {
             if (w.id) |wp| _ = linux.kill(-wp, .KILL);
             w.kill(io);
         };
-        while (spawned < dm_error_storm_workers) : (spawned += 1) {
+        while (spawned < workers.len) : (spawned += 1) {
             var nb: [8]u8 = undefined;
-            workers[spawned] = try std.process.spawn(io, .{ .argv = &.{ "python3", "-c", xattr_storm_script, rig.mp, try std.fmt.bufPrint(&nb, "{d}", .{spawned}) }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = 0 });
+            const script = if (spawned < dm_error_storm_workers) xattr_storm_script else data_storm_script;
+            workers[spawned] = try std.process.spawn(io, .{ .argv = &.{ "python3", "-c", script, rig.mp, try std.fmt.bufPrint(&nb, "{d}", .{spawned}) }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = 0 });
         }
         // generic/753's `sleep $((RANDOM % 3))`, 0 included: the failure
         // lands right after the bring-up too.
@@ -7978,12 +8047,16 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
         // What the FAILED volume counted instead of logging.
         if (try rig.statsTry()) |st| {
             defer gpa.free(st);
-            std.debug.print("\nsmoke[dm-error]: cycle {d}: counted {d} window write failure(s), {d} uncovered hole(s), {d} bset append failure(s), {d} node read failure(s); {d} line(s) quieted", .{
+            std.debug.print("\nsmoke[dm-error]: cycle {d}: counted {d} window write failure(s), {d} uncovered hole(s), {d} bset append failure(s), {d} node read failure(s) in {d} read-failure episode(s), {d} fsync leg(s), {d} syncfs leg(s), {d} block-map commit(s); {d} line(s) quieted", .{
                 cycle,
                 numberAfter(st, "\"journal_lane_write_failures\":") orelse 0,
                 numberAfter(st, "\"meta_kv_journal_hole_checkpoint_failures\":") orelse 0,
                 numberAfter(st, "\"bset_append_failures\":") orelse 0,
                 numberAfter(st, "\"node_read_failures\":") orelse 0,
+                numberAfter(st, "\"read_failure_episodes\":") orelse 0,
+                numberAfter(st, "\"fsync_leg_failures\":") orelse 0,
+                numberAfter(st, "\"syncfs_leg_failures\":") orelse 0,
+                numberAfter(st, "\"layout_map_commit_failures\":") orelse 0,
                 numberAfter(st, "\"meta_failed_volume_lines_quieted\":") orelse 0,
             });
         }

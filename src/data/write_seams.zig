@@ -134,6 +134,16 @@ pub const VolumeInfo = struct {
 pub const Volumes = struct {
     rows: [router.MAX_VOLUMES]?VolumeInfo = @splat(null),
     count: std.atomic.Value(u32) = .init(0),
+    /// The one-line law of the plane's set (`MetaSet.lineSeam`): once a
+    /// member is FAILED each data-path failure class logs once until
+    /// remount, the rest counted. Null (the tests' bare fixtures): every
+    /// line logs.
+    lines: ?journal.FailureLatch.LineSeam = null,
+
+    pub fn admitsLine(self: *const Volumes, class: journal.FailureLatch.LogClass) bool {
+        const l = self.lines orelse return true;
+        return l.admits(l.ctx, class);
+    }
 
     pub fn add(self: *Volumes, v: VolumeInfo) void {
         const cur = self.count.load(.monotonic);
@@ -683,6 +693,25 @@ test "volumes: ordinal and tag lookups; candidates are the active allocators" {
     var out: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
     try testing.expectEqual(@as(usize, 1), v.candidates(&out).len);
     try testing.expectEqual(a, v.candidates(&out)[0]);
+}
+
+test "the data path's failure lines follow the set's one-line law through its seam: no seam (a bare fixture) logs every line; a healthy latch logs every line; once FAILED each data-path class logs its first line and the rest are counted, not logged" {
+    var v: Volumes = .{};
+    for (0..3) |_| try testing.expect(v.admitsLine(.fsync_leg));
+    var latch: journal.FailureLatch = .{};
+    v.lines = latch.lineSeam();
+    for (0..3) |_| try testing.expect(v.admitsLine(.inplace_dma));
+    try testing.expect(latch.failStop());
+    const quieted0 = journal.meta_failed_volume_lines_quieted.load();
+    const n_ops = 40;
+    var lines: [3]usize = @splat(0);
+    for (0..n_ops) |_| {
+        if (v.admitsLine(.fsync_leg)) lines[0] += 1;
+        if (v.admitsLine(.syncfs_leg)) lines[1] += 1;
+        if (v.admitsLine(.inplace_dma)) lines[2] += 1;
+    }
+    try testing.expectEqualSlices(usize, &.{ 1, 1, 0 }, &lines);
+    try testing.expectEqual(quieted0 + 3 * n_ops - 2, journal.meta_failed_volume_lines_quieted.load());
 }
 
 test "the fence's class: a probe reading FAILED counts the fence and leaves the must-stay-0 alone; a healthy probe (or none) fires the must-stay-0 and counts nothing" {

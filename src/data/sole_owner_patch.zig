@@ -296,7 +296,7 @@ pub fn finishInPlace(deps: Deps, b: Begun, len: u64, dma: seams.DmaError!void, a
     vol.alloc.publishBlock(b.idx);
     deps.purge.purgeRange(b.mapping, b.rel, len);
     dma catch |e| {
-        log.err("{s} ino {d} block {d} rel {d}: DMA failed ({s}) — EIO for exactly this write; the block is re-stabilized with its old bytes intact outside the window", .{ arm, b.ino, b.block, b.rel, @errorName(e) });
+        if (deps.vols.admitsLine(.inplace_dma)) log.err("{s} ino {d} block {d} rel {d}: DMA failed ({s}) — EIO for exactly this write; the block is re-stabilized with its old bytes intact outside the window", .{ arm, b.ino, b.block, b.rel, @errorName(e) });
         return switch (e) {
             error.InputOutput => error.InputOutput,
             error.NoSpaceLeft => error.NoSpaceLeft,
@@ -341,6 +341,7 @@ pub fn tryPatch(deps: Deps, io: Io, req: Request) PatchError!bool {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const journal = @import("../meta/journal.zig");
 const wt = @import("write_testing.zig");
 
 test "the shape half: FIRST failing predicate wins, one bucket per write; cap 0 or an empty payload is silent" {
@@ -543,6 +544,31 @@ test "patch_dma_error_returns_eio_and_restabilizes: the word is published back u
     try testing.expect(std.mem.allEqual(u8, got[0..PAGE], 0xAA));
     try testing.expect(std.mem.allEqual(u8, got[2 * PAGE ..], 0xAA));
     try testing.expectEqual(@as(u32, 0), p.stamps); // a failed patch stamps nothing
+}
+
+test "a FAILED volume's in-place DMA failures: N failed patches each answer EIO and are counted (patch_dma_errors), and the set's law admits ONE line for all N" {
+    const io = testing.io;
+    const f = try wt.Fixture.init(testing.allocator, 8);
+    defer f.deinit();
+    var latch: journal.FailureLatch = .{};
+    f.vols.lines = latch.lineSeam();
+    defer f.vols.lines = null;
+    try testing.expect(latch.failStop());
+    var p: Probe = .{};
+    _ = try f.publishBlock(3, 0, 0xAA);
+    var payload: [PAGE]u8 align(4096) = @splat(1);
+    const errs0 = stats.patch_dma_errors.load();
+    const quieted0 = journal.meta_failed_volume_lines_quieted.load();
+    const n_ops = 24;
+    log.testing.expectErrorLogs(1);
+    for (0..n_ops) |_| {
+        f.dev.fail_next = error.InputOutput;
+        try testing.expectError(error.InputOutput, tryPatch(mkDeps(f, &p), io, .{ .ino = 3, .block = 0, .rel = PAGE, .vehicle = .{ .bytes = &payload } }));
+    }
+    try log.testing.expectAllFired();
+    try testing.expectEqual(@as(usize, 1), log.testing.capturedErrorLogs());
+    try testing.expectEqual(errs0 + n_ops, stats.patch_dma_errors.load());
+    try testing.expectEqual(quieted0 + n_ops - 1, journal.meta_failed_volume_lines_quieted.load());
 }
 
 test "clone_cfr_vs_patch_storm (composed with block_alloc's pair): a clone pinning under a patch storm never observes an unstable snapshot as valid; the refcount is conserved; the model with either fence weakened fails" {

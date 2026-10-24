@@ -40,6 +40,7 @@ const node_cache = @import("node_cache.zig");
 const merged_walk = @import("merged_walk.zig");
 const tx = @import("tx.zig");
 const ledger = @import("ledger.zig");
+const journal = @import("journal.zig");
 const inos = @import("inos.zig");
 const conveyor = @import("conveyor.zig");
 const checkpoint_cycle = @import("checkpoint_cycle.zig");
@@ -127,6 +128,9 @@ pub const MetaSet = struct {
     /// joined to their manager).
     posture: backend.Posture = .manager,
     closed: bool = false,
+    /// The data path's failure lines (`lineSeam`): one per class once any
+    /// member is FAILED.
+    line_marks: journal.FailureLatch.LineMarks = .{},
 
     // ---- open / close ----
 
@@ -552,6 +556,21 @@ pub const MetaSet = struct {
     pub fn isFailed(self: *const MetaSet) bool {
         for (self.volumes) |be| if (be.isFailed()) return true;
         return false;
+    }
+
+    /// The one-line law over the SET (a member FAILED fails every mutation
+    /// of the mount): the data plane's failure lines.
+    pub fn admitsLine(self: *MetaSet, class: journal.FailureLatch.LogClass) bool {
+        return self.line_marks.admits(class, self);
+    }
+
+    pub fn lineSeam(self: *MetaSet) journal.FailureLatch.LineSeam {
+        return .{ .ctx = self, .admits = admitsLineFn };
+    }
+
+    fn admitsLineFn(ctx: *anyopaque, class: journal.FailureLatch.LogClass) bool {
+        const self: *MetaSet = @ptrCast(@alignCast(ctx));
+        return self.admitsLine(class);
     }
 
     pub fn stampBlockMapTree(self: *MetaSet) Error!void {

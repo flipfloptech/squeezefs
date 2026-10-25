@@ -883,7 +883,7 @@ ipc.layout.test.ingress delta law: an unstamped slot, a stamp from the future, a
 ipc.layout.test.node partition: largest-remainder weighted round-robin by CPU share; a single node or zero shares is all node 0	2	3
 ipc.layout.test.property: SessionHeader.decode over PRNG bytes and a mutated valid image refuses or round-trips its geometry	16187	16161
 ipc.layout.test.the ONE slab law: min(arena/slots, max_op) floored to a page at or above it; sub-page slabs verbatim; slot × slab page-aligned for every slot	12	13
-ipc.rendezvous.test.THE FD SCREEN rule by rule: O_PATH, a non-regular fd, a foreign st_dev, append/sync/dsync/tmpfile/nlink 0, an invalid access mode — each its class; rights follow the DESCRIPTION's mode; O_DIRECT travels	12	13
+ipc.rendezvous.test.THE FD SCREEN rule by rule: O_PATH, a non-regular fd, a foreign st_dev, append/sync/dsync/tmpfile/nlink 0, an invalid access mode — each its class; rights follow the DESCRIPTION's mode; O_DIRECT and O_NOATIME travel	12	13
 ipc.rendezvous.test.heartbeat watch: a moving word is alive; 20 slices unchanged asks for the probe; a move after resets the clock	6	6
 ipc.rendezvous.test.knob faces: the dirty seam, the op-timeout seam and the socket dir read their rows	455	455
 ipc.rendezvous.test.nonce lifecycle: multi-use within the TTL; lazy rotation keeps the previous; a blob read at t is accepted until the SECOND rotation after t (60–120 s); older refuses	8	8

@@ -1270,6 +1270,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             fuse_atime_touches.inc();
         }
 
+        /// `file_accessed`: a read through a description (READ, READDIR,
+        /// READDIRPLUS) judges its open flags first — `O_NOATIME` never
+        /// moves atime, whatever the mount's law (`atime.fileAccessed`).
+        fn fileAccessed(self: *Self, local: u64, v: *InodeValue, open_flags: u32) void {
+            if (!atime.fileAccessed(open_flags)) return;
+            self.touchAtime(local, v);
+        }
+
         /// A READ served off the interception host's ring fast path
         /// (`ipc/host/service.zig` `serveRead`: the arena copy, no handler,
         /// no record) under the mount's atime posture — on the service
@@ -1279,8 +1287,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// rule (`economy.AtimeRule`); a standing stamp takes no second one
         /// (a hot file: one park per drain tick), a busy stripe parks
         /// nothing (never a spin on those threads). The ring binds regular
-        /// files alone, so nodiratime never applies here.
+        /// files alone, so nodiratime never applies here. A description
+        /// opened `O_NOATIME` parks nothing.
         pub fn note_read(self: *Self, _: *Ctx, a: filesystem.NoteReadArgs) void {
+            if (!atime.fileAccessed(a.flags)) return;
             const law = self.atime_law.current();
             if (law.read_only or law.posture == .noatime) return;
             const local = localOf(a.ino) catch return;
@@ -3790,7 +3800,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const local = try localOf(a.ino);
             c.stage(.meta_backend_start);
             var v = try self.readInode(local);
-            self.touchAtime(local, &v);
+            self.fileAccessed(local, &v, a.flags);
             v.size = self.claimedSize(local, v);
             if (a.offset >= v.size) {
                 c.stage(.meta_backend_done);
@@ -4995,8 +5005,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // reserved cookies (never emitted) resume as the end of the stream.
             if (virtual_inodes.isReservedCookie(a.offset)) return .{ .len = 0 };
             // The directory was read (every page of a listing is a read;
-            // nodiratime spares it).
-            self.touchAtime(dir, &dv);
+            // nodiratime and an O_NOATIME directory fd spare it).
+            self.fileAccessed(dir, &dv, a.flags);
             const pos = key.decodeReaddirCookie(a.offset) catch return error.InvalidArgument;
             var plain = codec.DirentWriter.init(c.window, a.size);
             var rich = codec.DirentPlusWriter.init(c.window, a.size);
@@ -10105,13 +10115,13 @@ test "charter §4 'Access time' — a read the handler never sees (the intercept
     _ = try h.fs.drainPendingTimes(&ctx);
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
     const t0 = fuse_atime_touches.load();
-    h.fs.note_read(&ctx, .{ .ino = f });
+    h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
     try testing.expectEqual(t0 + 1, fuse_atime_touches.load());
     try testing.expectEqual(@as(u64, 1), h.fs.pending.len());
     // The candidate does not show over a settled record...
     try testing.expectEqual(past + 10, (try h.getattr(f)).atime);
     // ...a second note parks nothing (one per drain tick)...
-    h.fs.note_read(&ctx, .{ .ino = f });
+    h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
     try testing.expectEqual(t0 + 1, fuse_atime_touches.load());
     // ...and the drain drops it: no Δ, the stored record unmoved.
     try testing.expectEqual(@as(u64, 0), try h.fs.drainPendingTimes(&ctx));
@@ -10122,7 +10132,7 @@ test "charter §4 'Access time' — a read the handler never sees (the intercept
     written.mtime = past + 20;
     written.ctime = past + 20;
     _ = try h.attr(h.setattr(f, written));
-    h.fs.note_read(&ctx, .{ .ino = f });
+    h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
     const shown = try h.getattr(f);
     try testing.expect(shown.atime >= past + 20);
     try testing.expectEqual(past + 20, shown.mtime);
@@ -10134,18 +10144,18 @@ test "charter §4 'Access time' — a read the handler never sees (the intercept
     // strictatime: the candidate is judged — it lands over a settled record.
     _ = try h.attr(h.setattr(f, settled));
     _ = h.fs.atime_law.set(.{ .posture = .strictatime });
-    h.fs.note_read(&ctx, .{ .ino = f });
+    h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
     try testing.expect((try h.getattr(f)).atime > past + 10);
     try testing.expectEqual(@as(u64, 1), try h.fs.drainPendingTimes(&ctx));
     // noatime: nothing parks.
     _ = h.fs.atime_law.set(.{ .posture = .noatime });
     const t1 = fuse_atime_touches.load();
-    h.fs.note_read(&ctx, .{ .ino = f });
+    h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
     try testing.expectEqual(t1, fuse_atime_touches.load());
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
 }
 
-test "charter §4 'Access time' — O_NOATIME (LTP open12): under strictatime a READ, a READDIR and a READDIRPLUS whose `fuse_read_in.flags` carry the description's O_NOATIME move nothing (the GETATTR after shows the stamp standing, nothing parks, no touch counts); the same reads without it move atime; READLINK (no description) keeps the mount's law" {
+test "charter §4 'Access time' — O_NOATIME (LTP open12): under strictatime a READ, a READDIR and a READDIRPLUS whose `fuse_read_in.flags` carry the description's O_NOATIME move nothing (the GETATTR after shows the stamp standing, nothing parks, no touch counts), and `note_read` handed it parks nothing; the same reads without it move atime; READLINK (no description) keeps the mount's law" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
@@ -10178,8 +10188,10 @@ test "charter §4 'Access time' — O_NOATIME (LTP open12): under strictatime a 
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .readdir = dir_in }, d).errno());
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .readdirplus = dir_in }, d).errno());
     try testing.expectEqual(past, (try h.getattr(d)).atime);
+    h.fs.note_read(&ctx, .{ .ino = f, .flags = o_noatime });
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
     try testing.expectEqual(t0, fuse_atime_touches.load());
+    try testing.expectEqual(past, (try h.getattr(f)).atime);
     // The same reads without the flag: each moves (strictatime).
     try testing.expectEqual(@as(?linux.E, null), h.read(f, 0, 4).errno());
     try testing.expect((try h.getattr(f)).atime > past);
@@ -10189,10 +10201,15 @@ test "charter §4 'Access time' — O_NOATIME (LTP open12): under strictatime a 
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .readdirplus = plain_dir }, d).errno());
     try testing.expect((try h.getattr(d)).atime > past);
     try testing.expectEqual(t0 + 2, fuse_atime_touches.load());
+    _ = try h.fs.drainPendingTimes(&ctx);
+    _ = try h.attr(h.setattr(f, back));
+    h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
+    try testing.expect((try h.getattr(f)).atime > past);
+    try testing.expectEqual(t0 + 3, fuse_atime_touches.load());
     // READLINK: the mount's law alone.
     try testing.expectEqual(@as(?linux.E, null), h.call(.readlink, l).errno());
     try testing.expect((try h.getattr(l)).atime > past);
-    try testing.expectEqual(t0 + 3, fuse_atime_touches.load());
+    try testing.expectEqual(t0 + 4, fuse_atime_touches.load());
     _ = try h.fs.drainPendingTimes(&ctx);
 }
 

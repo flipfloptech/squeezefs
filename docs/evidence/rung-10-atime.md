@@ -171,3 +171,48 @@ conveyor window gate `9744d22`), legs A B B A:
 
 Inside the legs' own spread: the read cache's stripe spin lock, atime's per-read hint load and
 the window gate cost nothing measurable. Sessions `/build/perf/mx/ram-sqz-rabba-{base,dev}-{1,2}`.
+
+## O_NOATIME — the file's law before the mount's (2026-10-25, LTP open12)
+
+**The red.** The LTP verdict on `bd97cda` failed `open12`'s O_NOATIME case on all eight
+iterations (`open12.c:99: TFAIL: File access time changed`; ext4's control passes;
+`/build/tmp/suites-ltp-20261025-000716-494138`). The test's `.all_filesystems` loop mounts
+nothing at `mntpoint` (no `.mount_device`; strace shows only the `/dev/zero` support probes), so
+every iteration ran on the TMPDIR's filesystem — ours, `relatime`: a fresh file, `open(O_RDONLY |
+O_NOATIME)`, one byte read, and the daemon stamped it by the mount's law. Reproduced by hand on
+the `bd97cda` binary (`passed 24, failed 8`).
+
+**The kernel (7.3, read).** `file_accessed` (`include/linux/fs.h:2278`) skips `touch_atime` for
+`f_flags & O_NOATIME` in-core alone; `fuse_read_args_fill` (`fs/fuse/file.c:599`) sends
+`in.flags = file->f_flags` on READ and on READDIR/READDIRPLUS (`fs/fuse/readdir.c:395/397`), so an
+`F_SETFL` toggle shows in the next request; `may_open` (`fs/namei.c:4283`) and `setfl`
+(`fs/fcntl.c:51`) admit the flag for the owner or `CAP_FOWNER` alone — the daemon honours what it
+is handed. READLINK has no description (`touch_atime` on the path).
+
+**The fix (every leg).** `atime.fileAccessed(open_flags)` is the rule. The handler's READ and
+READDIR/READDIRPLUS judge `fuse_read_in.flags` (`ReaddirArgs` now carries them) before the law
+(`KvFs.fileAccessed`); `note_read` takes the flags (`NoteReadArgs.flags`): the worker's arm (a)
+serve and direct leg hand the READ's own (`fsNoteRead` — never the OPEN's, which zero-message
+opens never send); the interception host captures `O_NOATIME` off the bound fd at BIND
+(`fdFacts` → `ScreenOk.noatime` → `Binding.noatime`, host-side, no wire bit) and every arm reads
+`Binding.openFlags()` — the ring fast path's note, the handoff's READ, the direct arm's lease
+grant; the shim unbinds on an `F_SETFL` toggle of `O_NOATIME`, as of `O_DIRECT`. Cost on the hot
+read path: one AND and a branch on a flag word already in hand (the READ's args, the request the
+worker holds, the binding row the op carries); the IPC builds that word from two bools of the
+row it copied, replacing the `O_DIRECT` select it had.
+
+**Red first** (commit `test(atime): red`, against the `dev` daemon): unit `O_NOATIME (LTP
+open12)` — `expected 1000000000, found 1792903914` (the READ's GETATTR); smoke ATIME row —
+`FAIL relatime O_NOATIME listing atime: 1792905626.151510384 != 1792905629.479501241` and, in the
+row's first cut, `FAIL strictatime O_NOATIME read atime: 1792904783.884218276 !=
+1792904784.998219384`. The row's arms: the O_NOATIME listing sits in the relatime phase (no
+kernel readdir cache: every listing reaches the daemon; a strictatime listing is a READDIR per
+`getdents`, the EOF page stamped iff the coarse clock ticked — `iterate_dir`'s `file_accessed`
+per call, ext4's too — so its touch count is not exact there), the O_NOATIME read in the
+strictatime phase (under relatime the kernel keeps the pages the first open filled). The helper
+runs `python3 -I`: a plain `-c` lists its cwd, the mount's root, for its imports.
+
+**Counts** (`local`, 7.3.0-1.7-mainline-sqz, quiet host): the ATIME row 10/10; THE READ VIEW,
+THE DIRECT ARM, THE INTERCEPTION HOST (and its death row) pass; unit filters `atime` 59, `kv_fs`
+120, `read_view` 46, `O_NOATIME` 46, `fcntl F_SETLK` 40, `ring binding` 42, `FD SCREEN` 40, `fd
+facts` 40, `bindings: ids` 40 — 0 failed; `zig build rails` 18/18; `zig fmt --check` clean.

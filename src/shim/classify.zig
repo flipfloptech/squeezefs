@@ -75,7 +75,8 @@ pub const Reason = enum(u8) {
     /// The session is poisoned (deadline, generation bump, ring full).
     poisoned = 9,
     mmap_unbind = 10,
-    /// `F_SETLK*`/`F_OFD_SETLK*`, `F_SETFL` + O_APPEND, an O_DIRECT toggle.
+    /// `F_SETLK*`/`F_OFD_SETLK*`, `F_SETFL` + O_APPEND, an O_DIRECT or
+    /// O_NOATIME toggle.
     fcntl_unbind = 11,
     /// The lane gate's sticky latch on an offsetful description.
     kernel_latch = 12,

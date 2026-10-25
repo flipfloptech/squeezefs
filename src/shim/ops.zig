@@ -477,9 +477,10 @@ pub fn sweep(st: *State, fd: sys.fd_t) void {
 }
 
 /// `fcntl` BEFORE the real call: locks, `F_SETFL` + O_APPEND, an O_DIRECT
-/// toggle on a bound fd ⇒ demote + unbind (the daemon captured the
-/// description's read class at bind; a diverged class would serve the
-/// wrong admission semantics).
+/// or O_NOATIME toggle on a bound fd ⇒ demote + unbind (the daemon
+/// captured the description's read class and its atime exemption at bind;
+/// a diverged class would serve the wrong admission semantics, a diverged
+/// exemption the wrong atime law).
 pub fn fcntlPre(st: *State, fd: sys.fd_t, cmd: c_int, arg: usize) void {
     const F = linux.F;
     const unbind = switch (cmd) {
@@ -489,7 +490,7 @@ pub fn fcntlPre(st: *State, fd: sys.fd_t, cmd: c_int, arg: usize) void {
             if (want & sys.O.APPEND != 0) break :blk true;
             if (!st.table.isBound(fd)) break :blk false;
             const cur = sys.getfl(fd) orelse break :blk false;
-            break :blk (cur ^ want) & sys.O.DIRECT != 0;
+            break :blk (cur ^ want) & (sys.O.DIRECT | sys.O.NOATIME) != 0;
         },
         else => false,
     };

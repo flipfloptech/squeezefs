@@ -185,6 +185,7 @@ pub const OpenFlags = struct {
     dsync: bool = false,
     tmpfile: bool = false,
     direct: bool = false,
+    noatime: bool = false,
 };
 
 pub const FileKind = enum { regular, directory, other };
@@ -199,6 +200,9 @@ pub const FdFacts = struct {
 pub const ScreenOk = struct {
     ino: u64,
     rights: wire.Rights,
+    /// The description's `O_NOATIME` (host-side: the mount's atime law
+    /// never judges a read through it; no wire bit).
+    noatime: bool = false,
 };
 
 pub const ScreenVerdict = union(enum) {
@@ -243,7 +247,7 @@ pub fn screenFd(f: FdFacts, expected_dev: ?u64, admit_directory: bool) ScreenVer
     };
     var r = rights;
     r.odirect = fl.direct;
-    return .{ .ok = .{ .ino = st.ino, .rights = r } };
+    return .{ .ok = .{ .ino = st.ino, .rights = r, .noatime = fl.noatime } };
 }
 
 // ---------------------------------------------------------------------------
@@ -482,10 +486,10 @@ test "the trust predicates: a dir owned by root or the owner with no group/world
 
 const good_facts: FdFacts = .{ .flags = .{ .accmode = .rdwr }, .stat = .{ .kind = .regular, .dev = 77, .ino = 1234, .nlink = 1 } };
 
-test "THE FD SCREEN rule by rule: O_PATH, a non-regular fd, a foreign st_dev, append/sync/dsync/tmpfile/nlink 0, an invalid access mode — each its class; rights follow the DESCRIPTION's mode; O_DIRECT travels" {
+test "THE FD SCREEN rule by rule: O_PATH, a non-regular fd, a foreign st_dev, append/sync/dsync/tmpfile/nlink 0, an invalid access mode — each its class; rights follow the DESCRIPTION's mode; O_DIRECT and O_NOATIME travel" {
     const ok = screenFd(good_facts, 77, false).ok;
     try testing.expectEqual(@as(u64, 1234), ok.ino);
-    try testing.expect(ok.rights.read and ok.rights.write and !ok.rights.odirect);
+    try testing.expect(ok.rights.read and ok.rights.write and !ok.rights.odirect and !ok.noatime);
     var f = good_facts;
     f.flags = null;
     try testing.expectEqual(RefuseClass.flags, screenFd(f, 77, false).refuse);
@@ -535,6 +539,10 @@ test "THE FD SCREEN rule by rule: O_PATH, a non-regular fd, a foreign st_dev, ap
     f.flags.?.accmode = .wronly;
     const wo = screenFd(f, 77, false).ok;
     try testing.expect(!wo.rights.read and wo.rights.write);
+    f = good_facts;
+    f.flags.?.noatime = true;
+    const na = screenFd(f, 77, false).ok;
+    try testing.expect(na.noatime and na.rights.read and na.rights.write and !na.rights.odirect);
 }
 
 fn policy() Policy {

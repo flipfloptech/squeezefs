@@ -215,6 +215,7 @@ pub fn fdFacts(fd: linux.fd_t) rendezvous.FdFacts {
             .dsync = o.DSYNC,
             .tmpfile = o.TMPFILE,
             .direct = o.DIRECT,
+            .noatime = o.NOATIME,
         };
     }
     var st: linux.Statx = undefined;
@@ -612,7 +613,7 @@ test "SCM_RIGHTS discipline: one fd rides a frame and is owned by the receiver; 
     try testing.expect(!socketAlive(fds[0]));
 }
 
-test "fd facts: a regular O_RDWR|O_DIRECT file, an O_PATH fd, a directory, a memfd on a foreign device, an O_APPEND fd — the screen's inputs read off the DESCRIPTION" {
+test "fd facts: a regular O_RDWR|O_DIRECT file, an O_PATH fd, a directory, a memfd on a foreign device, an O_APPEND fd, an O_NOATIME fd — the screen's inputs read off the DESCRIPTION" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
@@ -653,6 +654,13 @@ test "fd facts: a regular O_RDWR|O_DIRECT file, an O_PATH fd, a directory, a mem
     defer closeFd(ap);
     try testing.expect(fdFacts(ap).flags.?.append);
     try testing.expectEqual(wire.RefuseClass.flags, rendezvous.screenFd(fdFacts(ap), dev, false).refuse);
+    // O_NOATIME (the file is ours: the kernel admits the flag) travels to
+    // the binding; the plain description carries none.
+    try testing.expect(!facts.flags.?.noatime and !rendezvous.screenFd(facts, dev, false).ok.noatime);
+    const na: linux.fd_t = @intCast(linux.openat(linux.AT.FDCWD, file_z, .{ .ACCMODE = .RDONLY, .NOATIME = true, .CLOEXEC = true }, 0));
+    defer closeFd(na);
+    try testing.expect(fdFacts(na).flags.?.noatime);
+    try testing.expect(rendezvous.screenFd(fdFacts(na), dev, false).ok.noatime);
     const om = dirOwnerMode(dfd).?;
     try testing.expectEqual(linux.geteuid(), om.uid);
 }

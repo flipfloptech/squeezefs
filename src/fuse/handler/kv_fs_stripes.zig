@@ -533,7 +533,7 @@ const OneHome = struct {
 /// One READDIR page of `dir` from `offset` into `window`: the names and
 /// the last cookie (0 when the page was empty).
 fn readdirPage(fs: *kv_fs.MemFs, c: *filesystem.Ctx, dir: u64, offset: u64, size: u32, names: *std.ArrayList([]const u8), arena: Allocator) !struct { last: u64, n: usize } {
-    const d = try fs.readdir(c, .{ .ino = dir, .fh = 1, .offset = offset, .size = size });
+    const d = try fs.readdir(c, .{ .ino = dir, .fh = 1, .offset = offset, .size = size, .flags = 0 });
     var off: usize = 0;
     var last: u64 = 0;
     var n: usize = 0;

@@ -44,7 +44,17 @@ pub const Binding = struct {
     /// unprivileged uid without `CAP_FSETID` (root is exempt).
     kill_priv: bool,
     durability: wire.Durability,
+    /// The description was `O_NOATIME` at BIND (the shim unbinds on an
+    /// `F_SETFL` toggle of it, as of `O_DIRECT`).
+    noatime: bool = false,
     live: Atomic(bool) = .init(false),
+
+    /// The description's open flags as the handler's arms read them — the
+    /// kernel's `fuse_read_in.flags` / `fuse_write_in.flags` for a bound fd.
+    pub fn openFlags(self: *const Binding) u32 {
+        const o: linux.O = .{ .DIRECT = self.rights.odirect, .NOATIME = self.noatime };
+        return @bitCast(o);
+    }
 };
 
 pub const PoisonReason = enum {
@@ -160,6 +170,7 @@ pub const Session = struct {
         const b = &self.bindings[@intCast(id - 1)];
         b.ino = ok.ino;
         b.rights = ok.rights;
+        b.noatime = ok.noatime;
         b.kill_priv = kill_priv;
         b.durability = durability;
         // release pairs with `binding`'s acquire: the row's fields are
@@ -273,7 +284,7 @@ pub const TestSession = struct {
     }
 };
 
-test "bindings: ids are dense from 1, a dead row is a descriptor reject, the table refuses past its bound; bindsIno sees live rows only" {
+test "bindings: ids are dense from 1, a dead row is a descriptor reject, the table refuses past its bound; bindsIno sees live rows only; the row's open flags carry O_DIRECT and O_NOATIME as screened" {
     var ts = try TestSession.init(testing.allocator, .{ .ring_entries = 8, .slots = 4, .arena_bytes = 8 * layout.PAGE_BYTES, .max_op_bytes = layout.PAGE_BYTES });
     defer ts.deinit();
     const s = ts.s;
@@ -284,7 +295,13 @@ test "bindings: ids are dense from 1, a dead row is a descriptor reject, the tab
     try testing.expectEqual(binds0 + 2, stats.ipc_binds.load());
     try testing.expectEqual(@as(u64, 77), s.binding(1).?.ino);
     try testing.expect(s.binding(2).?.kill_priv and s.binding(2).?.durability == .sync);
-    try testing.expect(s.binding(0) == null and s.binding(3) == null);
+    // The description's flags as the handler's arms read them.
+    try testing.expectEqual(@as(u32, 0), s.binding(1).?.openFlags());
+    try testing.expectEqual(@as(?u64, 3), s.bind(.{ .ino = 79, .rights = .{ .read = true, .odirect = true }, .noatime = true }, false, .mount));
+    const o: linux.O = .{ .DIRECT = true, .NOATIME = true };
+    try testing.expectEqual(@as(u32, @bitCast(o)), s.binding(3).?.openFlags());
+    try testing.expectEqual(@as(?u64, 79), s.unbind(3));
+    try testing.expect(s.binding(0) == null and s.binding(4) == null);
     try testing.expect(s.bindsIno(78));
     try testing.expectEqual(@as(?u64, 78), s.unbind(2));
     try testing.expect(s.unbind(2) == null);

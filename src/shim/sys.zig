@@ -167,6 +167,7 @@ pub const O = struct {
     pub const DSYNC: u32 = @bitCast(linux.O{ .DSYNC = true });
     pub const PATH: u32 = @bitCast(linux.O{ .PATH = true });
     pub const DIRECT: u32 = @bitCast(linux.O{ .DIRECT = true });
+    pub const NOATIME: u32 = @bitCast(linux.O{ .NOATIME = true });
     pub const CLOEXEC: u32 = @bitCast(linux.O{ .CLOEXEC = true });
 };
 

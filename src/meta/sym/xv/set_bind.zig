@@ -326,7 +326,7 @@ test "a FLIPPED directory over a two-member set behind the filesystem: the expli
         var offset: u64 = 0;
         var total: usize = 0;
         while (true) {
-            const data = try fs.readdir(&c, .{ .ino = d, .fh = 1, .offset = offset, .size = 1024 });
+            const data = try fs.readdir(&c, .{ .ino = d, .fh = 1, .offset = offset, .size = 1024, .flags = 0 });
             var off: usize = 0;
             var n: usize = 0;
             while (off + abi.fuse_dirent.NAME_OFFSET <= data.len) {

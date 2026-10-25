@@ -279,7 +279,8 @@ pub const ReleaseArgs = struct { ino: u64, fh: u64, flags: u32, lock_owner: u64,
 pub const FsyncArgs = struct { ino: u64, fh: u64, datasync: bool };
 /// `ino` = the request's nodeid (the root's): the op names the mount.
 pub const SyncfsArgs = struct { ino: u64 };
-pub const ReaddirArgs = struct { ino: u64, fh: u64, offset: u64, size: u32 };
+/// `flags`: the directory description's open flags (`fuse_read_in.flags`).
+pub const ReaddirArgs = struct { ino: u64, fh: u64, offset: u64, size: u32, flags: u32 };
 pub const StatfsArgs = struct { ino: u64 };
 pub const SetxattrArgs = struct { ino: u64, name: []const u8, value: []const u8, flags: u32 };
 pub const GetxattrArgs = struct { ino: u64, name: []const u8, size: u32 };
@@ -360,7 +361,10 @@ pub const VTable = struct {
     note_read: *const fn (*anyopaque, *Ctx, NoteReadArgs) void = &defaults.note_read,
 };
 
-pub const NoteReadArgs = struct { ino: u64 };
+/// `flags`: the reading description's open flags as the leg holds them
+/// (`fuse_read_in.flags` on the FUSE legs; the bound fd's, captured at
+/// BIND, on the interception host's) — `O_NOATIME` spares the read.
+pub const NoteReadArgs = struct { ino: u64, flags: u32 };
 
 const defaults = struct {
     fn init(_: *anyopaque, _: *Ctx, _: InitArgs) Error!void {}

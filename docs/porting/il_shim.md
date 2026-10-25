@@ -163,7 +163,8 @@ PLT-free internals — the design's stated residual, `R:docs/design-preload-inte
   shape); `F_SETFL` adding `O_APPEND` ⇒ demote + unbind; `F_SETFL` toggling `O_DIRECT` on a
   BOUND fd (one extra `F_GETFL`, control-plane) ⇒ demote + unbind — the daemon captured the
   description's read class at bind (`BindingRights::odirect`, `R:src/ipc_host.rs:354-357`) and a
-  diverged class would serve the wrong admission semantics. The variadic arg is declared as a
+  diverged class would serve the wrong admission semantics; toggling `O_NOATIME` likewise (the
+  daemon captured the description's atime exemption at bind, charter §4 "Access time"). The variadic arg is declared as a
   pointer and forwarded verbatim.
 
 ### 1.10 `mmap`, `mmap64` (`R:interpose.rs:1744-1831`) — the per-inode unbind + invalidation
@@ -214,7 +215,7 @@ never the interposed symbol, never `dlsym` — AS-safe) (`R:interpose.rs:281-317
 | Transition | Site |
 |---|---|
 | `fork` (atfork PREPARE, in the parent) / `posix_spawn{,p}` | `fork_flush_all` → `fork_demote_flush`: epoch bump, one flush per cell armed under the PREVIOUS epoch, under a 1024-spin `try_lock`; re-load the offset after the disarm (an op that completed meanwhile wrote through) (`R:fd_table.rs:395-465`; `R:interpose.rs:1379-1391, 1357-1360`) |
-| `F_SETLK*`/`F_OFD_SETLK*`; `F_SETFL` + `O_APPEND`; `O_DIRECT` toggle | `demote_and_flush` + unbind (`R:interpose.rs:1693-1723`) |
+| `F_SETLK*`/`F_OFD_SETLK*`; `F_SETFL` + `O_APPEND`; `O_DIRECT` or `O_NOATIME` toggle | `demote_and_flush` + unbind (`R:interpose.rs:1693-1723`) |
 | `mmap` W3(a) walk | `unbind_ino` flushes per armed cell (`R:fd_table.rs:604-617`) |
 | session poison (per-op `Real{poisoned}`) | `demote_and_flush` + unbind (`R:interpose.rs:690-696, 784-792, 936-939`) |
 | any offsetful fallthrough to the real call (incl. transient backpressure) | disarm-once + flush under the held lock; that fd prices at the two-syscall resync discipline thereafter (`R:interpose.rs:782-789, 925-931`) |

@@ -836,10 +836,12 @@ pub const IpcHost = struct {
                         // The arm's reads under this lease are the device's
                         // alone (the daemon never sees them): the grant is
                         // the one read the mount's atime posture can judge
-                        // (charter §4 "Access time").
+                        // (charter §4 "Access time"; the bound
+                        // description's O_NOATIME spares it).
                         var quiet: op_trace.OpTrace = .{ .unique = 0, .class = .other, .profiling = false, .t_entry = 0 };
                         var ctx: filesystem.Ctx = .{ .unique = 0, .uid = linux.geteuid(), .gid = linux.getegid(), .pid = @intCast(linux.getpid()), .io = self.d.io, .trace = &quiet, .wd_slot = null, .window = &.{} };
-                        self.d.fs.vtable.note_read(self.d.fs.impl, &ctx, .{ .ino = s.binding(req.binding_id).?.ino });
+                        const b = s.binding(req.binding_id).?;
+                        self.d.fs.vtable.note_read(self.d.fs.impl, &ctx, .{ .ino = b.ino, .flags = b.openFlags() });
                     },
                     .refused => |class| {
                         direct_lease.countRefusal(class);

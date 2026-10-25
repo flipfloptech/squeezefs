@@ -1478,7 +1478,7 @@ ipc.host.service.test.poison: a published slot index past the table, a non-SUBMI
 ipc.host.service.test.the dequeue loop over a RAM session: a session-less owner parks on its private word; admission wakes it; reads and writes are served through the sink with the completion order (ledger → result → DONE → doorbell); every slot returns FREE; the flush runs once per sweep; the heartbeat moves	46695	738
 ipc.host.service.test.the park ladder has no lost wake: 20 k ops from a client thread with randomised gaps over a parking owner — every op completes within the 5 ms bound's many, no op is stranded, parks and wakes are counted	18387449	330576
 ipc.host.service.test.the validation on the dequeue thread: a dead binding, an oversize len, an out-of-window arena, an unknown op reject -EINVAL and the wrong direction -EBADF — each a counted, logged descriptor-reject tripwire through the ONE errno table	206	206
-ipc.host.session.test.bindings: ids are dense from 1, a dead row is a descriptor reject, the table refuses past its bound; bindsIno sees live rows only	204	200
+ipc.host.session.test.bindings: ids are dense from 1, a dead row is a descriptor reject, the table refuses past its bound; bindsIno sees live rows only; the row's open flags carry O_DIRECT and O_NOATIME as screened	204	200
 ipc.host.session.test.the in-flight ledger admits exactly `slots` and refuses the next; the completion releases it first, publishes the result, DONE and the doorbell, and drops its share	227	228
 ipc.host.severed_pool.test.pool slots = clamp(arena_cap / max_op, 1, 65536): the default arena cap over the 1 MiB op; the rails	8	9
 ipc.host.severed_pool.test.the pool: a miss allocates an aligned slab, a put recycles it, the next get is a hit; the bound frees past the free list; hits + misses ≡ gets; the gauge tracks live bytes	151	151
@@ -1499,7 +1499,7 @@ ipc.layout.test.ingress delta law: an unstamped slot, a stamp from the future, a
 ipc.layout.test.node partition: largest-remainder weighted round-robin by CPU share; a single node or zero shares is all node 0	10	11
 ipc.layout.test.property: SessionHeader.decode over PRNG bytes and a mutated valid image refuses or round-trips its geometry	33755	33509
 ipc.layout.test.the ONE slab law: min(arena/slots, max_op) floored to a page at or above it; sub-page slabs verbatim; slot × slab page-aligned for every slot	49	49
-ipc.rendezvous.test.THE FD SCREEN rule by rule: O_PATH, a non-regular fd, a foreign st_dev, append/sync/dsync/tmpfile/nlink 0, an invalid access mode — each its class; rights follow the DESCRIPTION's mode; O_DIRECT travels	10	11
+ipc.rendezvous.test.THE FD SCREEN rule by rule: O_PATH, a non-regular fd, a foreign st_dev, append/sync/dsync/tmpfile/nlink 0, an invalid access mode — each its class; rights follow the DESCRIPTION's mode; O_DIRECT and O_NOATIME travel	10	11
 ipc.rendezvous.test.heartbeat watch: a moving word is alive; 20 slices unchanged asks for the probe; a move after resets the clock	7	7
 ipc.rendezvous.test.knob faces: the dirty seam, the op-timeout seam and the socket dir read their rows	140	141
 ipc.rendezvous.test.nonce lifecycle: multi-use within the TTL; lazy rotation keeps the previous; a blob read at t is accepted until the SECOND rotation after t (60–120 s); older refuses	14	15
@@ -1509,7 +1509,7 @@ ipc.rendezvous.test.the blob is built from the identity + nonce and decodes back
 ipc.rendezvous.test.the direct arm's device screen: root always; the owner by the owner bit, the group by the group bit, others by the other bit — never a bit that is not theirs	12	7
 ipc.rendezvous.test.the trust predicates: a dir owned by root or the owner with no group/world write bit; a peer uid of root or the mount owner — and NOT our own uid	10	10
 ipc.rendezvous_linux.test.SCM_RIGHTS discipline: one fd rides a frame and is owned by the receiver; a frame with TWO fds is refused with both closed; a plain frame carries none; EOF is Eof	127	127
-ipc.rendezvous_linux.test.fd facts: a regular O_RDWR|O_DIRECT file, an O_PATH fd, a directory, a memfd on a foreign device, an O_APPEND fd — the screen's inputs read off the DESCRIPTION	420	411
+ipc.rendezvous_linux.test.fd facts: a regular O_RDWR|O_DIRECT file, an O_PATH fd, a directory, a memfd on a foreign device, an O_APPEND fd, an O_NOATIME fd — the screen's inputs read off the DESCRIPTION	420	411
 ipc.rendezvous_linux.test.listeners: an abstract SEQPACKET listener accepts a connect; a path listener in an owner-private dir binds, advertises, accepts and is unlinked at close; a world-writable dir is refused on both sides	240	236
 ipc.ring_core.test.a hostile cell scribble reads as empty or full, never out of bounds	4	4
 ipc.ring_core.test.capacity rails: MIN 2 (a 1-cell ring is structurally broken), MAX 2^16 (seq − pos stays inside i32)	10	10

@@ -184,12 +184,17 @@ pub const ring = struct {
 
         /// A READ the warm ladder served or the direct leg carried (no
         /// handler ran): the mount's atime posture still judges it, on this
-        /// thread, without a record read (`KvFs.note_read`).
+        /// thread, without a record read (`KvFs.note_read`), with the
+        /// reading description's flags the READ carries (`O_NOATIME`).
         fn fsNoteRead(ctx: *anyopaque, req: fsv.Request) void {
             const b = of(ctx);
+            const flags: u32 = switch (req.op) {
+                .read => |r| r.flags,
+                else => 0,
+            };
             var quiet: op_trace.OpTrace = .{ .unique = 0, .class = .other, .profiling = false, .t_entry = 0 };
             var c: Ctx = .{ .unique = req.header.unique, .uid = req.header.uid, .gid = req.header.gid, .pid = req.header.pid, .io = b.d.io, .trace = &quiet, .wd_slot = null, .window = &.{}, .kernel = true };
-            b.d.fs.vtable.note_read(b.d.fs.impl, &c, .{ .ino = req.nodeid() });
+            b.d.fs.vtable.note_read(b.d.fs.impl, &c, .{ .ino = req.nodeid(), .flags = flags });
         }
 
         /// The direct device leg with its post-DMA recheck hook.
@@ -329,5 +334,46 @@ test "ring binding: the session's vtable reaches the lifecycle — init negotiat
     try testing.expectEqual(@as(?open_table.Entry, null), opens.get(ino));
     try testing.expectEqual(stranded0, @import("../core/counters.zig").tripwireCount("open_count_stranded"));
     try testing.expectEqual(@as(u64, 0), opens.openCount());
+    f.destroy();
+}
+
+test "ring binding: a READ no handler sees (the warm ladder's serve, the direct leg) reaches `note_read` with the READ's own flags — the reading description's O_NOATIME parks nothing; the same READ without it parks the strictatime stamp" {
+    const abi = @import("abi.zig");
+    var store = try kv_fs.MemStore.init(testing.allocator);
+    defer store.deinit();
+    var nodata: kv_fs.NoData = .{};
+    var fs = try kv_fs.MemFs.mount(testing.allocator, testing.io, &store, &nodata, .{ .dlm_stripes = 64 });
+    defer fs.unmount();
+    var reg = try watchdog.Registry.init(testing.allocator, 1);
+    defer reg.deinit();
+    var guards = try op_guard.Table.init(testing.allocator, 64);
+    defer guards.deinit();
+    var opens = try open_table.OpenTable.init(testing.allocator, 64);
+    defer opens.deinit();
+    var binding: ring.Binding = .{};
+    binding.bind(.{ .fs = Filesystem.of(kv_fs.MemFs, &fs), .io = testing.io, .registry = &reg, .guards = &guards, .opens = &opens });
+    const f = binding.filesystem();
+    var rec: RecordingTx = .{};
+    const t = rec.tx();
+    var window: [4096]u8 = undefined;
+    f.init(.{ .negotiated = 0, .minor = 45, .plan = undefined, .io = testing.io });
+    const header: abi.fuse_in_header = .{ .len = 40, .opcode = 35, .unique = 2, .nodeid = 1, .uid = 0, .gid = 0, .pid = 7, .total_extlen = 0, .padding = 0 };
+    const h: fsv.Handle = .{ .tx = &t, .slot = .{ .ring = .{ .qid = 0, .ent_idx = 0, .commit_id = 2 } }, .unique = 2, .window = &window };
+    f.dispatch(.{ .header = header, .op = .{ .create = .{ .name = "f", .flags = 0, .mode = 0o644, .umask = 0, .open_flags = 0 } } }, h, null);
+    const ino = (abi.decodePrefix(abi.fuse_entry_out, &rec.last_out) orelse return error.TestBadReply).nodeid;
+    _ = fs.atime_law.set(.{ .posture = .strictatime });
+    var rd_header = header;
+    rd_header.opcode = 15;
+    rd_header.nodeid = ino;
+    const pending0 = fs.pending.len();
+    const touches0 = kv_fs.fuse_atime_touches.load();
+    var rd: abi.fuse_read_in = .{ .fh = 1, .offset = 0, .size = 16, .read_flags = 0, .lock_owner = 0, .flags = @import("atime.zig").O_NOATIME, .padding = 0 };
+    f.noteRead(.{ .header = rd_header, .op = .{ .read = rd } });
+    try testing.expectEqual(pending0, fs.pending.len());
+    try testing.expectEqual(touches0, kv_fs.fuse_atime_touches.load());
+    rd.flags = 0;
+    f.noteRead(.{ .header = rd_header, .op = .{ .read = rd } });
+    try testing.expectEqual(pending0 + 1, fs.pending.len());
+    try testing.expectEqual(touches0 + 1, kv_fs.fuse_atime_touches.load());
     f.destroy();
 }

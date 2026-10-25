@@ -691,11 +691,11 @@ pub fn Dispatcher(comptime Transport: type) type {
                     return codec.replyOk(u);
                 },
                 .readdir => |r| {
-                    const d = try fs.vtable.readdir(fs.impl, c, .{ .ino = ino, .fh = r.fh, .offset = r.offset, .size = r.size });
+                    const d = try fs.vtable.readdir(fs.impl, c, .{ .ino = ino, .fh = r.fh, .offset = r.offset, .size = r.size, .flags = r.flags });
                     return codec.replyData(u, c.window[0..d.len]);
                 },
                 .readdirplus => |r| {
-                    const d = try fs.vtable.readdirplus(fs.impl, c, .{ .ino = ino, .fh = r.fh, .offset = r.offset, .size = r.size });
+                    const d = try fs.vtable.readdirplus(fs.impl, c, .{ .ino = ino, .fh = r.fh, .offset = r.offset, .size = r.size, .flags = r.flags });
                     try self.noteDirentPlus(c.window[0..d.len]);
                     return codec.replyData(u, c.window[0..d.len]);
                 },

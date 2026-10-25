@@ -697,13 +697,13 @@ pub const DataPlaneSink = struct {
                 stats.ipc_read_arena_copy_bytes.add(sv.n);
                 stats.ipc_ops_read.inc();
                 stats.ipc_bytes_out.add(sv.n);
-                self.noteRead(op.binding.ino);
+                self.noteRead(&op.binding);
                 c.complete(@intCast(sv.n));
             },
             .eof => {
                 stats.ipc_fast_path_serves.inc();
                 stats.ipc_ops_read.inc();
-                self.noteRead(op.binding.ino);
+                self.noteRead(&op.binding);
                 c.complete(0);
             },
             .demote => |why| {
@@ -730,12 +730,13 @@ pub const DataPlaneSink = struct {
     /// A read the fast path served without the handler: the mount's atime
     /// posture still applies to it (charter §4 "Access time") — the
     /// filesystem's `note_read` parks what it must and never waits (the
-    /// handler arms stamp inside `read` itself).
-    fn noteRead(self: *DataPlaneSink, ino: u64) void {
+    /// handler arms stamp inside `read` itself); the bound description's
+    /// `O_NOATIME` spares it.
+    fn noteRead(self: *DataPlaneSink, b: *const session_mod.Binding) void {
         // No op trace: this is not an op (no clock read, no latency row).
         var quiet: op_trace.OpTrace = .{ .unique = 0, .class = .other, .profiling = false, .t_entry = 0 };
         var ctx = self.ctxFor(&quiet, &.{});
-        self.fs.vtable.note_read(self.fs.impl, &ctx, .{ .ino = ino });
+        self.fs.vtable.note_read(self.fs.impl, &ctx, .{ .ino = b.ino, .flags = b.openFlags() });
     }
 
     /// The read handoff: the FULL handler on a lane homed on the session's
@@ -782,8 +783,7 @@ pub const DataPlaneSink = struct {
         var trace = op_trace.OpTrace.begin(0, .read);
         defer trace.finish();
         var ctx = self.ctxFor(&trace, op.window);
-        const o_direct: u32 = @bitCast(linux.O{ .DIRECT = true });
-        const r = self.fs.vtable.read(self.fs.impl, &ctx, .{ .ino = op.binding.ino, .fh = 0, .offset = op.desc.offset, .size = op.desc.len, .flags = if (op.binding.rights.odirect) o_direct else 0 }) catch |e| return c.fail(errors.toErrno(e));
+        const r = self.fs.vtable.read(self.fs.impl, &ctx, .{ .ino = op.binding.ino, .fh = 0, .offset = op.desc.offset, .size = op.desc.len, .flags = op.binding.openFlags() }) catch |e| return c.fail(errors.toErrno(e));
         // The handler's window IS the arena: landed in place.
         stats.ipc_read_dest_serves.inc();
         stats.ipc_read_demote_bytes.add(r.len);
@@ -862,7 +862,6 @@ pub const DataPlaneSink = struct {
         const nodeid = op.binding.ino;
         const end = op_guard.validateRange(op.desc.offset, op.desc.len, self.max_file_size) catch |e| return c.fail(errors.toErrno(e));
         const bytes = sev.bytes();
-        const o_direct: u32 = @bitCast(linux.O{ .DIRECT = true });
         const written = blk: {
             var adm = op_guard.admitWrite(self.guards, self.io, self.probe, self.shared_enabled, nodeid, op.desc.offset, end);
             defer adm.release(self.io);
@@ -880,7 +879,7 @@ pub const DataPlaneSink = struct {
                 .placed = placed_payload,
                 .class = class,
                 .write_flags = if (op.binding.kill_priv) abi.FUSE_WRITE_KILL_SUIDGID else 0,
-                .flags = if (op.binding.rights.odirect) o_direct else 0,
+                .flags = op.binding.openFlags(),
             }) catch |e| return c.fail(errors.toErrno(e));
             break :blk wr.size;
         };

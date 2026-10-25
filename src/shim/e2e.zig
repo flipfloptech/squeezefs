@@ -327,6 +327,18 @@ test "e2e: fcntl F_SETLK / F_SETFL+O_APPEND unbind after flushing the mirror; mm
     ops.closePre(rig.st, f2b);
     sys.close(f2b);
     sys.close(f2);
+    // F_SETFL toggling O_NOATIME: the daemon captured the description's
+    // atime exemption at bind — unbind, either way.
+    const f2c = try rig.openBound(sys.O.RDWR);
+    ops.fcntlPre(rig.st, f2c, linux.F.SETFL, sys.O.NOATIME);
+    try testing.expect(!rig.st.table.isBound(f2c));
+    sys.close(f2c);
+    const f2d = try rig.openBound(sys.O.RDWR | sys.O.NOATIME);
+    ops.fcntlPre(rig.st, f2d, linux.F.SETFL, sys.O.NOATIME);
+    try testing.expect(rig.st.table.isBound(f2d));
+    ops.fcntlPre(rig.st, f2d, linux.F.SETFL, 0);
+    try testing.expect(!rig.st.table.isBound(f2d));
+    sys.close(f2d);
     // mmap MAP_SHARED on one of two fds of the inode: both unbind, the
     // inode never binds again.
     const g1 = try rig.openBound(sys.O.RDWR);

@@ -30,6 +30,17 @@
 //! only when mtime ≥ atime, ctime ≥ atime, or atime is a day old or more
 //! (whole seconds, the kernel's `tv_sec` compare); always under
 //! `strictatime`; and never when the new stamp equals the old (no change).
+//!
+//! The FILE's law before the mount's: `file_accessed(file)` skips
+//! `touch_atime` for a description whose `f_flags` carry `O_NOATIME`, and
+//! the kernel keeps that in-core alone — the daemon learns it from the
+//! flags every read hands it (`fuse_read_in.flags` is the reading
+//! description's `f_flags` on READ and READDIR/READDIRPLUS alike,
+//! `fuse_read_args_fill`; an `F_SETFL` toggle shows in the next one). Who
+//! may set the flag (the owner or `CAP_FOWNER`) the kernel judges at open
+//! (`may_open`) and at `F_SETFL`: the daemon honours the flag it is handed.
+//! READLINK has no description (`touch_atime` on the path): the mount's
+//! law alone.
 
 const std = @import("std");
 
@@ -57,6 +68,15 @@ pub const Law = packed struct(u8) {
         return @as(u8, @bitCast(a)) == @as(u8, @bitCast(b));
     }
 };
+
+/// `O_NOATIME` as the kernel's open-flag word carries it.
+pub const O_NOATIME: u32 = @bitCast(std.os.linux.O{ .NOATIME = true });
+
+/// `file_accessed(file)`: false iff the reading description's open flags
+/// carry `O_NOATIME` — no read through it moves atime, whatever the law.
+pub fn fileAccessed(open_flags: u32) bool {
+    return open_flags & O_NOATIME == 0;
+}
 
 /// Linux's relatime horizon: an atime a day old is refreshed by a read.
 pub const RELATIME_HORIZON_S: i64 = 24 * 60 * 60;
@@ -194,6 +214,17 @@ test "strictatime always moves; noatime never; nodiratime spares directories alo
     try testing.expect(needsUpdate(strict_nodir, false, read, now));
     const ro: Law = .{ .posture = .strictatime, .read_only = true };
     try testing.expect(!needsUpdate(ro, false, fresh, now));
+}
+
+test "file_accessed: O_NOATIME in the description's flags (0o1000000 on x86_64 and arm64) spares the read under every law; every other bit of the word leaves the law to judge" {
+    const arch = @import("builtin").cpu.arch;
+    if (arch == .x86_64 or arch == .aarch64) try testing.expectEqual(@as(u32, 0o1000000), O_NOATIME);
+    const o_rdonly_direct: u32 = @bitCast(std.os.linux.O{ .DIRECT = true });
+    try testing.expect(fileAccessed(0));
+    try testing.expect(fileAccessed(o_rdonly_direct));
+    try testing.expect(fileAccessed(~O_NOATIME));
+    try testing.expect(!fileAccessed(O_NOATIME));
+    try testing.expect(!fileAccessed(O_NOATIME | o_rdonly_direct));
 }
 
 test "lawOf reads the mountinfo fields: relatime (the default), its absence is strictatime, noatime, nodiratime beside either, ro in the per-mount or the superblock field" {

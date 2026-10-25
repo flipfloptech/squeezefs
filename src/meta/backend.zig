@@ -2323,9 +2323,11 @@ pub const KvBackend = struct {
                 const t = KvTree.openAsReader(gpa, be.cache, .{ .slot = key.guestForestSlot(r.slot) }, root, &be.seq, &why) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Io => return error.Io,
-                    // A writer's open logs and refuses the stale root itself.
                     error.RootStale => {
-                        if (!reader) return error.Corrupt;
+                        if (!reader) {
+                            log.err("meta volume {s}: slot {d}'s tree root 0x{x} (node_seq {d}, lessee {?d}) does not verify: {f} — refusing the mount", .{ be.path, r.slot, root.addr, root.seq, r.lessee, why.? });
+                            return error.Corrupt;
+                        }
                         // A FOREIGN lessee's root gone stale behind its
                         // newest durable home (its page, folded above): the
                         // lessee is live and moving its tree — a reader reads

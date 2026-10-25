@@ -96,6 +96,11 @@ pub fn foldGuestRoots(gpa: std.mem.Allocator, kvs: []const tree.KeyValue, pages:
         var extents: u64 = v.slot_tree_extents;
         var g = v.g;
         var lessee: ?u32 = if (v.variant == .unleased) null else v.appender_id;
+        // Whether `root` is a page's: at tree 0's generation the settled
+        // page entry is the live home and beats the grant-time word; between
+        // homes only the generation orders, never a node seq — a recovered
+        // tree moves under its adopter's space, below the dead joiner's.
+        var from_page = false;
         for (pages) |p| for (p.slotEntries()) |e| if (e.slot == slot) {
             const ahead = view == .projected and e.g > v.g;
             const verdict: lease_table.Settle = if (ahead)
@@ -103,7 +108,8 @@ pub fn foldGuestRoots(gpa: std.mem.Allocator, kvs: []const tree.KeyValue, pages:
             else
                 lease_table.settleEntry(v, e, p.appender_id);
             switch (verdict) {
-                .adopt, .complete_release => |a| if (a.g > g or (a.g == g and a.words.root.seq >= root.seq)) {
+                .adopt, .complete_release => |a| if (a.g > g or (a.g == g and !from_page)) {
+                    from_page = true;
                     root = a.words.root;
                     cursor = @max(cursor, a.words.cursor);
                     extents = a.words.extents;

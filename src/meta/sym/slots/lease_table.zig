@@ -85,11 +85,6 @@ pub const SlotWords = struct {
     /// The tree's image count (the affinity ceiling's input).
     extents: u32 = 0,
     seq_floor: u64 = 0,
-
-    /// Floors fold by max; the root is the newer word's.
-    pub fn floored(self: SlotWords, other: SlotWords) SlotWords {
-        return .{ .root = if (other.root.seq >= self.root.seq) other.root else self.root, .cursor = @max(self.cursor, other.cursor), .extents = other.extents, .seq_floor = @max(self.seq_floor, other.seq_floor) };
-    }
 };
 
 // ---------------------------------------------------------------------------

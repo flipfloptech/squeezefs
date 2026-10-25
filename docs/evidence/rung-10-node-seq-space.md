@@ -66,11 +66,13 @@ the log.
 | smoke: dm-error, held tail, replay proof, kill -9 mid-tar, format sweep, custody, free hold, the kill rows, join after the manager's kill, re-join ×3, the striped dead-manager rows | | 55 pass, 1 skip (a shim row's other step) |
 | smoke: the dm-error and held-tail rows, 5 passes (`-Dfresh=true`) | | 5/5 |
 | `zig build rails`, `zig fmt --check` | | 18/18 steps, 32/32 tests; clean |
+| xfstests `generic/753 475 750 388` through the harness, 3 runs | | Passed all 4 in each run (388 not run: no shutdown); fsck clean; 0 tripwires, 0 fold mismatches |
 
 ## Seen, not fixed
 
 - The held-tail prefix law (§BR.3½) dropped acked windows past a hole in 14 of the 423 cycles
-  above, on both binaries (`N acked window(s) of the held journal tail lay past a hole`). This is
-  the designed trade, and that metadata is lost after a device failure.
+  above, on both binaries, and 13, 6 and 9 times in the three subset runs (`N acked window(s) of
+  the held journal tail lay past a hole`). This is the designed trade, and that metadata is lost
+  after a device failure.
 - A volume that a pre-bound writer already re-minted into another space may still carry colliding
   nodes. The open warns on it, and it should be reformatted.

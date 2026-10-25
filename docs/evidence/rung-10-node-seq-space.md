@@ -98,6 +98,50 @@ writer's open now names a stale guest root (slot, root, lessee, what the extent 
 | unit filters slot_state / lease_table / guest / reader / backend / recovery / re-join / node_seq / meta.tree / journal / journal_tail / conveyor / supervisor / replay | 0 fail |
 | `zig build rails`, `zig fmt --check` | 18/18 steps, 32/32 tests; clean |
 
+## Verdict on 9739f8a: a re-minted guest root adopted its lost incarnation's frames after a power cut
+
+generic/073 and 342 failed their post-test fsck with `[C1]` on a guest slot's inode and xattr.
+On `182eead` the dm-flakey family `039 040 041 056 057 059 073 342` failed 5 of 12 harness runs,
+at 056, 057 or 073.
+
+**It was not the fold.** A debug build logged every fold tie at the open: no minted tree-0 root was
+ever beaten. With the fold reverted and the bound kept, 5 of 6 runs still failed.
+
+**It was the residue floor.** A snapshot of the metadata slice taken before the failing remount
+(the suite mount helper's dd) showed the chain:
+- The remount re-minted slot 2's root at `0x1180000` under base+3. That is the seq of the lost
+  root there, whose own frame (the slot's inode put, its delta, a 4139 B layout xattr past the
+  4 KiB writeback delta) had landed before the cut. No cycle had named that root.
+- The same extent also carries an earlier format's frames, stamped above this format's space.
+  `residueSeqCeiling` answered that foreign maximum, the bounded handle ignored the raise whole,
+  and the lost root's own stamp beneath it never floored the mint.
+- The lost frame verified as the new root's own, and the replay applied its records a second time.
+
+**The law.** A first mint's residue floor is the highest stamp inside the minting space
+(`residueSeqCeiling(buf, below = the handle's ceiling)`): `KvTree.create` and the census reclaim.
+
+**A second law closed with it.** 9bbc5f8's generation-only fold would take a page copy older than
+tree 0's replayed record at the same generation: a demotion's record landed and the page rewrite
+did not. At one generation the two homes order by mint order inside one space (the reference's
+law); across spaces the root inside the lessee's own space is the newer. The generation's only
+foreign root is its grant-time one, which keeps the adopted hot-directory slot.
+
+| check | red | fix |
+|---|---|---|
+| unit `a guest tree re-created after a crash … mints above the lost root's stamp …` (`bdea9d1`) | `expected null` (the lost record read back) | pass (`203b26f`) |
+| unit `a page copy OLDER than tree 0's replayed record …` (`552f536`) | `expected 0x5000, found 0x4000` | pass (`92c67aa`) |
+| harness `039 040 041 056 057 059 073 342`, ×12 | 7/12 on `182eead` | 12/12 on `203b26f` |
+| smoke THE SHARED HOT DIRECTORY ACROSS DAEMONS (the cross-space adoption), the first runs beside the 753 loop, one more under 12 × `yes` | | 23/23 |
+| 753 by hand, re-format every cycle, beside the row loop | | 40/40, fsck clean |
+| crash and power-cut rows (the guest-slot guard, punch, free hold, kill rows, replay proof, kill -9 mid-tar, held tail, dm-error, format sweep, promotion kill) and the two-mount, offer, handover, recovery, re-join and reader rows, under 12 × `yes` | | 76 pass, 1 skip (the shim's other step) |
+| xfstests `073 342 753 475 039 040 041 056 057 059` ×2 | | Passed all 10 in each run; fsck clean; 0 tripwires |
+| unit filters journal / journal_tail / conveyor / supervisor / replay / slot_state / node_seq / guest / reader / backend / recovery / re-join / lease_table / residue / meta.tree / status; `zig build rails`; `zig fmt --check` | | 0 fail; 18/18 steps, 32/32 tests; clean |
+
+The new smoke row (generic/056, 342 and 073 shapes over dm-flakey, 8 rounds over an earlier
+format's logs) is a guard. Its rounds re-mint every slot and fsck clean on both heads, but the
+alignment the defect needs (the first re-minted extent's residue topped by a foreign stamp) is the
+unit row's to pin.
+
 ## Seen, not fixed
 
 - The held-tail prefix law (§BR.3½) dropped acked windows past a hole in 14 of the 423 cycles

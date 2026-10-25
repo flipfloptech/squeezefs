@@ -325,6 +325,16 @@ fstests_run() {
       first_unadjudicated=$id
       break 2
     done
+    # A test whose output matched but whose post-test check failed (the
+    # filesystem check, dmesg, kmemleak) writes no .out.bad: check names it on
+    # its own line — `generic/073 … _check_generic_filesystem: … inconsistent`
+    # (2026-10-25: 073 and 342 ran past the watcher to the end of the pass).
+    local checked
+    while read -r checked; do
+      grep -qxF "$checked" "$RESULTS/ledger-ids.txt" && continue
+      first_unadjudicated=$checked
+      break 2
+    done < <(grep -oE '^[a-z]+/[0-9]+[[:space:]].*_check_[a-z_]+:' "$RESULTS/check-run$n.out" 2>/dev/null | awk '{print $1}')
     sleep 2
   done
   if [ -n "$first_unadjudicated" ]; then

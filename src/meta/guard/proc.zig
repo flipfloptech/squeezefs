@@ -58,6 +58,12 @@ comptime {
 /// Read a small file whole with raw syscalls (control path at open and
 /// every 10 s; procfs reports size 0 so the read is buffer-driven).
 pub fn readSmall(path: [*:0]const u8, buf: []u8) ?[]const u8 {
+    return readPaged(path, buf, null);
+}
+
+/// `readSmall`, running `between` after the first `read(2)` (a seq_file
+/// serves one page per call).
+fn readPaged(path: [*:0]const u8, buf: []u8, between: ?*const TestSeams.Hook) ?[]const u8 {
     const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return null;
     const fd: linux.fd_t = @intCast(rc);
@@ -67,10 +73,25 @@ pub fn readSmall(path: [*:0]const u8, buf: []u8) ?[]const u8 {
         const n = linux.read(fd, buf.ptr + total, buf.len - total);
         if (linux.errno(n) != .SUCCESS) return null;
         if (n == 0) break;
+        if (total == 0) if (between) |h| h.call(h.ctx);
         total += n;
     }
     return buf[0..total];
 }
+
+/// Test seams (compiled out of the product; one load when unarmed).
+pub const TestSeams = struct {
+    /// Runs in a census's `/proc/locks` read between its first page and the
+    /// next `read(2)` — the instant the seq_file has released the lock table.
+    between_locks_pages: std.atomic.Value(?*const Hook) = .init(null),
+
+    pub const Hook = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque) void,
+    };
+};
+
+pub var test_seams: TestSeams = .{};
 
 /// `/proc/sys/kernel/random/boot_id` as its 16 uuid bytes; zero when
 /// unreadable or malformed (the gate treats zero as "proves nothing").
@@ -184,6 +205,24 @@ pub fn exclusiveLocker(path: []const u8) ?Holder {
     var st: linux.Statx = undefined;
     if (linux.errno(linux.statx(linux.AT.FDCWD, z, 0, .{ .INO = true, .MNT_ID = true }, &st)) != .SUCCESS) return null;
     return lockerOf(&st) catch null;
+}
+
+/// Does an exclusive `flock` stand on `path` right now — the kernel's word:
+/// `LOCK_SH | LOCK_NB` on a fresh open file description is refused under
+/// one and granted otherwise (then dropped at once, with the description).
+/// Null = `path` cannot be probed here (unopenable, or another errno).
+fn exclusiveStands(path: []const u8) ?bool {
+    var zbuf: [linux.PATH_MAX]u8 = undefined;
+    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return null;
+    const rc = linux.open(z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    return switch (linux.errno(linux.flock(fd, std.posix.LOCK.SH | std.posix.LOCK.NB))) {
+        .SUCCESS => false,
+        .AGAIN => true,
+        else => null,
+    };
 }
 
 /// systemd-udevd locks a whole-disk block device while it handles it
@@ -425,7 +464,9 @@ fn lockerOf(st: *const linux.Statx) error{Unreadable}!?Holder {
     const mount = mountinfo.entryOf(readSmall(mountinfo.path, &buf) orelse return error.Unreadable, st.mnt_id) orelse return error.Unreadable;
     // Copied out: `buf` is reused for `/proc/locks` below.
     const dev_major, const dev_minor = .{ mount.dev_major, mount.dev_minor };
-    const text = readSmall("/proc/locks", &buf) orelse return error.Unreadable;
+    // Acquire pairs with the arming test's release store.
+    const seam = if (builtin.is_test) test_seams.between_locks_pages.load(.acquire) else null;
+    const text = readPaged("/proc/locks", &buf, seam) orelse return error.Unreadable;
     const pid = flockHolderIn(text, dev_major, dev_minor, st.ino) orelse return null;
     return .{ .pid = pid, .squeezefs = pid == linux.getpid() or runsOurExe(pid) };
 }
@@ -619,7 +660,7 @@ test "flockExclusive waits out an EXCLUSIVE holder that is not this binary — s
         holder.stdin = null;
         _ = holder.wait(testing.io) catch {};
     };
-    try awaitLocker(path, @intCast(holder.id.?));
+    _ = try awaitLocker(path, @intCast(holder.id.?));
     const Opener = struct {
         fn run(f: linux.fd_t, w: *counters.ShardedCounter, out: *linux.E, done: *std.atomic.Value(bool)) void {
             var locker: ?Holder = null;
@@ -651,17 +692,126 @@ fn scratch(buf: []u8, tag: []const u8) !?[:0]const u8 {
     return path;
 }
 
-/// flock(1) (`pid`) took its lock on `path`: its line is in `/proc/locks`.
-fn awaitLocker(path: []const u8, pid: linux.pid_t) !void {
+/// `pid` took its lock on `path`: a census names it (one that tore names
+/// none — the next is asked). The locker named.
+fn awaitLocker(path: []const u8, pid: linux.pid_t) !Holder {
     const hang_guard = clock.monotonicNs() + 60 * std.time.ns_per_s;
-    while (exclusiveLocker(path) == null) {
+    while (true) {
+        if (exclusiveLocker(path)) |h| return h;
         if (clock.monotonicNs() >= hang_guard) {
-            std.debug.print("\nflock(1) pid {d} never took the lock on {s}\n", .{ pid, path });
+            std.debug.print("\npid {d} never took the lock on {s}\n", .{ pid, path });
             return error.HolderNeverLocked;
         }
         try std.Thread.yield();
     }
 }
+
+/// A census `/proc/locks` tears, on demand. The table is a positional
+/// seq_file: each `read(2)` serves one page under the lock table's lock and
+/// the next resumes at the record INDEX it reached, so records dropped
+/// before that index between two reads shift every later record down and
+/// as many at the boundary are never printed. The global list is per-CPU,
+/// walked in CPU order, each CPU's newest first: byte-range locks taken on
+/// `cpu` AFTER the holder's lock was taken there (pin the holder's creator
+/// to `cpu` too) fill the first page and stand before it; the seam drops
+/// them all between the census's first page and its next read, and the
+/// holder's record lands among those skipped.
+const TornCensus = struct {
+    /// The venue's one rig: another copy's fillers taken after this
+    /// holder's lock would stand before it, and each drop tears every
+    /// census on the host.
+    const VENUE_LOCK = "/build/tmp/proc-flock-torn-census.lock";
+    venue_fd: linux.fd_t,
+    /// The fillers' file, holding them (closing it drops them all).
+    fd: linux.fd_t = -1,
+    fired: std.atomic.Value(bool) = .init(false),
+    /// `exiting + shared` of the census's flockExclusive when the tear fired.
+    counted_at_fire: u64 = 0,
+    counters: ?Waits = null,
+    hook: TestSeams.Hook = undefined,
+
+    /// Taken before the holder's lock exists; held until `end` (another
+    /// copy's rig is milliseconds).
+    fn begin(counters_: ?Waits) !TornCensus {
+        const rc = linux.open(VENUE_LOCK, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .CREAT = true }, 0o644);
+        if (linux.errno(rc) != .SUCCESS) return error.RigUnopenable;
+        const fd: linux.fd_t = @intCast(rc);
+        while (true) switch (linux.errno(linux.flock(fd, std.posix.LOCK.EX))) {
+            .SUCCESS => return .{ .venue_fd = fd, .counters = counters_ },
+            .INTR => {},
+            else => {
+                _ = linux.close(fd);
+                return error.RigUnlocked;
+            },
+        };
+    }
+
+    fn end(self: *TornCensus) void {
+        disarm();
+        self.drop();
+        _ = linux.close(self.venue_fd);
+    }
+
+    /// The lowest CPU this thread may run on, and its current mask.
+    fn firstCpu(mask: *linux.cpu_set_t) !usize {
+        if (linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), mask)) != .SUCCESS) return error.NoAffinity;
+        for (mask, 0..) |word, i| if (word != 0) return i * @bitSizeOf(usize) + @ctz(word);
+        return error.NoAffinity;
+    }
+
+    fn pin(cpu: usize) !void {
+        var one: linux.cpu_set_t = @splat(0);
+        one[cpu / @bitSizeOf(usize)] = @as(usize, 1) << @intCast(cpu % @bitSizeOf(usize));
+        try linux.sched_setaffinity(0, &one);
+    }
+
+    /// The fillers, on `cpu` (then this thread's `mask` again): one record
+    /// per disjoint byte, `N: POSIX  ADVISORY  READ  <pid> <dev>:<ino> s e`
+    /// (≥ 40 B), page/16 of them — 2.5 pages, past the first whatever the
+    /// page size.
+    fn take(self: *TornCensus, filler: [:0]const u8, cpu: usize, mask: *const linux.cpu_set_t) !void {
+        try pin(cpu);
+        defer linux.sched_setaffinity(0, mask) catch {};
+        const rc = linux.open(filler.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.FillerUnopenable;
+        self.fd = @intCast(rc);
+        var range = std.mem.zeroes(linux.Flock);
+        range.type = linux.F.RDLCK;
+        range.whence = linux.SEEK.SET;
+        range.len = 1;
+        for (0..std.heap.pageSize() / 16) |i| {
+            range.start = @intCast(2 * i);
+            if (linux.errno(linux.fcntl(self.fd, linux.F.SETLK, @intFromPtr(&range))) != .SUCCESS) return error.FillerRefused;
+        }
+        self.fired.store(false, .release);
+    }
+
+    fn drop(self: *TornCensus) void {
+        if (self.fd < 0) return;
+        _ = linux.close(self.fd);
+        self.fd = -1;
+    }
+
+    fn tear(ctx: *anyopaque) void {
+        const self: *TornCensus = @ptrCast(@alignCast(ctx));
+        if (self.fired.load(.acquire)) return;
+        if (self.counters) |c| self.counted_at_fire = c.exiting.?.load() + c.shared.?.load();
+        self.drop();
+        // Release pairs with the test's acquire of `fired`.
+        self.fired.store(true, .release);
+    }
+
+    /// The next census (and only it, while the fillers stand) tears.
+    fn arm(self: *TornCensus) void {
+        self.hook = .{ .ctx = self, .call = tear };
+        // Release pairs with the census's acquire load (`lockerOf`).
+        test_seams.between_locks_pages.store(&self.hook, .release);
+    }
+
+    fn disarm() void {
+        test_seams.between_locks_pages.store(null, .release);
+    }
+};
 
 test "writerFlockHeld (the readers' 'is a writer here?') waits out an exclusive holder that is not this binary — udevd's re-read after the writer's last close — and reads 'no writer' once it lets go; this process's own holder reads 'writer' with no wait" {
     var path_buf: [64]u8 = undefined;
@@ -683,7 +833,7 @@ test "writerFlockHeld (the readers' 'is a writer here?') waits out an exclusive 
         holder.stdin = null;
         _ = holder.wait(testing.io) catch {};
     };
-    try awaitLocker(path, @intCast(holder.id.?));
+    _ = try awaitLocker(path, @intCast(holder.id.?));
     const Reader = struct {
         fn run(p: []const u8, w: *counters.ShardedCounter, out: *bool, done: *std.atomic.Value(bool)) void {
             out.* = writerFlockHeld(testing.io, p, w);
@@ -718,7 +868,7 @@ test "an exclusive holder that is not this binary and outlasts the bound: flockE
         holder.stdin = null;
         _ = holder.wait(testing.io) catch {};
     }
-    try awaitLocker(path, @intCast(holder.id.?));
+    _ = try awaitLocker(path, @intCast(holder.id.?));
     // Both judgements wait out the same bound: run them side by side.
     const Reader = struct {
         fn run(p: []const u8, out: *bool) void {
@@ -744,6 +894,64 @@ test "an exclusive holder that is not this binary and outlasts the bound: flockE
         std.debug.print("\nthe refusal: {s}\n", .{w.buffered()});
         return error.LockerUnnamed;
     }
+}
+
+test "a census /proc/locks TORE (a positional seq_file read a page per read(2): locks dropped before the page boundary between two reads hide the records at it) names no locker while flock(1) holds; writerFlockHeld still reads a writer — 'no writer' is the kernel's word (a LOCK_SH | LOCK_NB granted), read only once the holder lets go (gate 137)" {
+    var path_buf: [64]u8 = undefined;
+    const path = (try scratch(&path_buf, "torn")) orelse return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer _ = linux.unlink(path.ptr);
+    var filler_buf: [64]u8 = undefined;
+    const filler = (try scratch(&filler_buf, "torn-fill")).?;
+    defer _ = linux.unlink(filler.ptr);
+    var mask: linux.cpu_set_t = undefined;
+    const cpu = try TornCensus.firstCpu(&mask);
+    var rig = try TornCensus.begin(null);
+    defer rig.end();
+    // flock(1) inherits the pin: its lock is on `cpu`'s list.
+    try TornCensus.pin(cpu);
+    const spawned = std.process.spawn(testing.io, .{ .argv = &.{ "flock", "-x", path, "cat" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    try linux.sched_setaffinity(0, &mask);
+    var holder = try spawned;
+    defer if (holder.stdin) |s| {
+        s.close(testing.io);
+        holder.stdin = null;
+        _ = holder.wait(testing.io) catch {};
+    };
+    _ = try awaitLocker(path, @intCast(holder.id.?));
+    // The instrument: the census tears, the kernel's word stands.
+    try rig.take(filler, cpu, &mask);
+    rig.arm();
+    try testing.expectEqual(@as(?Holder, null), exclusiveLocker(path));
+    try testing.expect(rig.fired.load(.acquire));
+    try testing.expectEqual(@as(?bool, true), exclusiveStands(path));
+    // The reader's first census tears the same way.
+    try rig.take(filler, cpu, &mask);
+    const Reader = struct {
+        fn run(p: []const u8, w: *counters.ShardedCounter, out: *bool, done: *std.atomic.Value(bool)) void {
+            out.* = writerFlockHeld(testing.io, p, w);
+            done.store(true, .release);
+        }
+    };
+    var waits: counters.ShardedCounter = .{};
+    var held = true;
+    var done: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, Reader.run, .{ path, &waits, &held, &done });
+    // The reader ends within its bound, held or not.
+    var joined = false;
+    defer if (!joined) t.join();
+    // The reader is waiting (or, judging, is done): only then let go.
+    while (waits.load() == 0 and !done.load(.acquire)) std.Thread.yield() catch {};
+    const judged_while_held = done.load(.acquire);
+    holder.stdin.?.close(testing.io);
+    holder.stdin = null;
+    _ = holder.wait(testing.io) catch {};
+    t.join();
+    joined = true;
+    try testing.expect(rig.fired.load(.acquire));
+    // While flock(1) held, the only verdict is "writer" (the bound outlasted,
+    // on a host that starved this thread past it); once it let go, "no writer".
+    try testing.expect(if (judged_while_held) held else !held);
+    try testing.expect(waits.load() > 0);
 }
 
 test "the orderly-exit ceiling is the umount verb's exit bound plus two ticks (the pre-signal census, the replay) and dwarfs udev's wait; the exiting step is the verb's exit-poll quantum; a live foreign locker is never judged exiting" {
@@ -850,7 +1058,7 @@ test "the replay hold: a writer lock whose CREATOR has exited while its open fil
     _ = linux.waitpid(creator, &status, 0);
     // The lock stands with a dead creator: `/proc/locks` names its pid,
     // whose exe is unreadable now (not "squeezefs") — the replay all the same.
-    const seen = exclusiveLocker(path).?;
+    const seen = try awaitLocker(path, creator);
     try testing.expectEqual(creator, seen.pid);
     try testing.expectEqual(@as(?Exiting, .replay), judgeExiting(testing.io, creator, seen.squeezefs));
     const rc2 = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
@@ -885,6 +1093,77 @@ test "the replay hold: a writer lock whose CREATOR has exited while its open fil
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "orderly-exit ceiling while exiting (its process is gone") != null);
 }
 
+test "a census /proc/locks TORE mid-wait behind an EXITING holder names no locker: the round keeps the replay judgement — the exiting wait goes on (never a shared wait, never udev's 5 s bound: a mount racing an orderly exit refused BUSY early) and opens once the description closes" {
+    var path_buf: [64]u8 = undefined;
+    const path = (try scratch(&path_buf, "torn-replay")) orelse return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer _ = linux.unlink(path.ptr);
+    var filler_buf: [72]u8 = undefined;
+    const filler = (try scratch(&filler_buf, "torn-replay-fill")).?;
+    defer _ = linux.unlink(filler.ptr);
+    var mask: linux.cpu_set_t = undefined;
+    const cpu = try TornCensus.firstCpu(&mask);
+    var shared: counters.ShardedCounter = .{};
+    var exiting: counters.ShardedCounter = .{};
+    var rig = try TornCensus.begin(.{ .shared = &shared, .exiting = &exiting });
+    defer rig.end();
+    const rc_s = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc_s));
+    const supervisor_fd: linux.fd_t = @intCast(rc_s);
+    var released = false;
+    defer if (!released) {
+        _ = linux.close(supervisor_fd);
+    };
+    // The creator inherits the pin: its lock is on `cpu`'s list.
+    try TornCensus.pin(cpu);
+    const rc = linux.fork();
+    if (rc == 0) {
+        _ = linux.flock(supervisor_fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+        linux.exit(0);
+    }
+    try linux.sched_setaffinity(0, &mask);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const creator: linux.pid_t = @intCast(rc);
+    var status: i32 = 0;
+    _ = linux.waitpid(creator, &status, 0);
+    _ = try awaitLocker(path, creator);
+    const rc2 = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc2));
+    const fd: linux.fd_t = @intCast(rc2);
+    defer _ = linux.close(fd);
+    const Opener = struct {
+        fn run(f: linux.fd_t, w: Waits, out: *linux.E, holder: *?Holder, done: *std.atomic.Value(bool)) void {
+            out.* = flockExclusive(testing.io, f, w, holder);
+            done.store(true, .release);
+        }
+    };
+    var result: linux.E = .SUCCESS;
+    var locker: ?Holder = null;
+    var done: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, Opener.run, .{ fd, Waits{ .shared = &shared, .exiting = &exiting }, &result, &locker, &done });
+    // The opener ends once the description closes.
+    var joined = false;
+    defer if (!joined) {
+        if (!released) _ = linux.close(supervisor_fd);
+        released = true;
+        t.join();
+    };
+    // The opener judged the replay and waits: only then tear its next
+    // census, and release once that round has counted its retry.
+    while (exiting.load() == 0 and !done.load(.acquire)) std.Thread.yield() catch {};
+    try rig.take(filler, cpu, &mask);
+    rig.arm();
+    while (!done.load(.acquire) and !(rig.fired.load(.acquire) and exiting.load() + shared.load() > rig.counted_at_fire)) std.Thread.yield() catch {};
+    TornCensus.disarm();
+    _ = linux.close(supervisor_fd);
+    released = true;
+    t.join();
+    joined = true;
+    try testing.expect(rig.fired.load(.acquire));
+    try testing.expectEqual(linux.E.SUCCESS, result);
+    try testing.expectEqual(@as(u64, 0), shared.load());
+    try testing.expect(locker != null and locker.?.pid == creator and locker.?.exiting == .replay);
+}
+
 /// `argv` ran and exited 0 (its output dropped).
 fn runOk(argv: []const []const u8) bool {
     var child = std.process.spawn(testing.io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
@@ -916,7 +1195,7 @@ test "a file on btrfs, whose statx device is the subvolume's anonymous one while
         holder.stdin = null;
         _ = holder.wait(testing.io) catch {};
     }
-    try awaitLocker(file, @intCast(holder.id.?));
+    _ = try awaitLocker(file, @intCast(holder.id.?));
 }
 
 test "/etc/nvme reads as empty when absent, never written" {

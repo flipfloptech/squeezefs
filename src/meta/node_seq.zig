@@ -200,10 +200,25 @@ pub const NodeSeqHandle = struct {
 };
 
 /// The writer's handle on its own volume (a flat volume's, the manager's),
-/// seeded at the ledger's `max(seq, node_seq_watermark)`.
+/// seeded at the ledger's `max(seq, node_seq_watermark)`: bounded by
+/// incarnation 0's span over the volume's base, so a raise to a stamp of
+/// another space — a recycled extent's residue from an earlier format
+/// (`KvTree.create`), a dead joiner's root — is ignored and the volume
+/// never re-mints another space's seqs. The frame incarnation check is an
+/// equality: an earlier format's frame past a new node's log end at the
+/// same extent would verify as the node's own (xfstests generic/753). A
+/// seed already past the span (a pre-bound writer lifted the counter out
+/// and its watermark persisted it) keeps the unbounded handle — bounded,
+/// it could mint nothing; the open names it (`seedEscaped`).
 pub fn managerHandle(seed: u64, volume_base: u64) NodeSeqHandle {
-    _ = volume_base;
-    return NodeSeqHandle.shared(seed);
+    if (seedEscaped(seed, volume_base)) return NodeSeqHandle.shared(seed);
+    return NodeSeqHandle.sharedBounded(seed, volume_base);
+}
+
+/// Whether `seed` lies at or past incarnation 0's span over `volume_base`
+/// (the bounded handle's ceiling).
+pub fn seedEscaped(seed: u64, volume_base: u64) bool {
+    return seed >= (incarnationBase(volume_base, 1) orelse std.math.maxInt(u64));
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +289,25 @@ test "the handle mints inside its space (first mint = base + 1) and parks at the
     // A joined handle at the saturating edge never overflows.
     const edge = NodeSeqHandle.incarnation(std.math.maxInt(u64) - 1);
     try testing.expectEqual(std.math.maxInt(u64), edge.ceilingValue());
+}
+
+test "the writer's handle is bounded by incarnation 0's span: an earlier format's residue stamp (another base) and a joiner's root are ignored, a stamp of its own space lands; a seed a pre-bound writer already lifted past the span keeps the unbounded handle" {
+    const b: u64 = 1 << 40;
+    var h = managerHandle(b + 2, b);
+    try testing.expect(!seedEscaped(b + 2, b));
+    try testing.expectEqual(b + INCARNATION_SPACE, h.ceilingValue());
+    h.raiseTo(b + 64 * INCARNATION_SPACE + 1);
+    h.raiseTo(b + INCARNATION_SPACE + 3);
+    try testing.expectEqual(b + 3, try h.mint());
+    h.raiseTo(b + 9);
+    try testing.expectEqual(b + 10, try h.mint());
+    // A legacy seed below the base (a ledger seq) is inside the bound.
+    try testing.expectEqual(b + INCARNATION_SPACE, managerHandle(7, b).ceilingValue());
+    const escaped = b + 64 * INCARNATION_SPACE + 5;
+    try testing.expect(seedEscaped(escaped, b));
+    var legacy = managerHandle(escaped, b);
+    try testing.expectEqual(std.math.maxInt(u64), legacy.ceilingValue());
+    try testing.expectEqual(escaped + 1, try legacy.mint());
 }
 
 test "the incarnation record round-trips and refuses other shapes" {

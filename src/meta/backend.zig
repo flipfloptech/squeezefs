@@ -643,6 +643,7 @@ pub const KvBackend = struct {
         };
         // The device path the pool keys on is the backend's owned copy.
         be.dev.path = be.path;
+        if (node_seq.seedEscaped(be.seq.load(), node_seq.nodeSeqBase(sb.uuid))) log.warn("meta volume {s}: the node-seq watermark 0x{x} lies past this volume's own space [0x{x}, +2^{d}) — an earlier writer raised it to a recycled extent's residue of another format; mints continue above it unbounded, and an earlier format's frame on a recycled extent may still verify under a re-minted seq: reformat the volume", .{ path, be.seq.load(), node_seq.nodeSeqBase(sb.uuid), node_seq.INCARNATION_SPACE_BITS });
         be.cache = try node_cache.NodeCache.init(gpa, io, .{ .layout = layout, .heap_base = sb.heap.start, .budget_bytes = opts.cache_budget_bytes }, be.dev.loader());
         errdefer be.cache.deinit();
         be.cache.setDurableTail(mounted.journal_tail_seq);
@@ -864,7 +865,7 @@ pub const KvBackend = struct {
         precovered catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Io => return error.Io,
-            else => return error.Corrupt,
+            else => return be.bringUpRefused("the bring-up checkpoint of the replayed window", e),
         };
         try be.guard.?.commit();
         be.gate_ns = clock.monotonicNs() - t_gate;
@@ -874,7 +875,7 @@ pub const KvBackend = struct {
         covered catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Io => return error.Io,
-            else => return error.Corrupt,
+            else => return be.bringUpRefused("the bring-up checkpoint after the writer claim", e),
         };
         // The symmetric plane: the D0 winner IS the manager (charter §5.7)
         // — region 0 goes Live with `is_manager` under this identity, the
@@ -892,7 +893,7 @@ pub const KvBackend = struct {
             joined catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Io => return error.Io,
-                else => return error.Corrupt,
+                else => return be.bringUpRefused("the checkpoint that makes the manager's join durable", e),
             };
         }
         be.ckpt_thread = std.Thread.spawn(.{}, ckptMain, .{be}) catch return error.ThreadSpawnFailed;
@@ -905,6 +906,13 @@ pub const KvBackend = struct {
 
     fn ckptMain(be: *KvBackend) void {
         be.task.runUntilStopped();
+    }
+
+    /// The open's cycle refused for a reason no device line names: the
+    /// mount's refusal says "see the log", so the log says which cycle.
+    fn bringUpRefused(be: *const KvBackend, what: []const u8, e: anyerror) OpenError {
+        log.err("meta volume {s}: {s} failed ({s}) — the volume is refused", .{ be.path, what, @errorName(e) });
+        return error.Corrupt;
     }
 
     const ClassifiedSuperblock = struct { sb: superblock.Superblock, next_generation: u64 };

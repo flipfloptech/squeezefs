@@ -170,6 +170,11 @@ pub const stats = struct {
     /// resolved after every tier missed; `SQUEEZEFS_IL_DIRECT_READ`).
     pub var ipc_dd_read_serves: counters.ShardedCounter = .{};
     pub var ipc_dd_read_bytes: counters.ShardedCounter = .{};
+    /// Direct reads served and handed to the mount's atime law before
+    /// their ACK (the sink's `note_read`, the binding's open flags: an
+    /// O_NOATIME description is exempted there) — ≡ `ipc_dd_read_serves`
+    /// at quiescence on a wired host.
+    pub var ipc_dd_read_atime_notes: counters.ShardedCounter = .{};
     /// Direct reads whose post-DMA recheck failed (the binding or the
     /// incarnation moved under the DMA, or a short/failed CQE): the handler
     /// owns the truth — a read handoff follows, nothing fabricated.

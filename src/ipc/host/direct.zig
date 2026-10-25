@@ -209,6 +209,15 @@ pub const ReadFallback = struct {
     call: *const fn (ctx: *anyopaque, s: *Session, op: DataOp, c: Completion) void,
 };
 
+/// The sink's atime note, for a direct read the lane SERVED (charter §4
+/// "Access time": the law is the file's, not the path's): the binding's
+/// ino and open flags reach the filesystem's `note_read` — never blocks,
+/// never fails (the fallback's handler stamps its own read).
+pub const ReadNote = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, b: *const session_mod.Binding) void,
+};
+
 pub const Shard = struct {
     index: u16,
     engine: *Engine,
@@ -437,6 +446,7 @@ pub const Engine = struct {
     stop: Atomic(bool) = .init(false),
     /// Set by the sink before `start` (the sink is built after the engine).
     read_fallback: ?ReadFallback = null,
+    read_note: ?ReadNote = null,
 
     pub const Deps = struct {
         io: Io,
@@ -795,6 +805,9 @@ const wt = @import("../../data/write_testing.zig");
 const layout_mod = @import("../../data/layout.zig");
 const ipc_layout = @import("../layout.zig");
 const slot_core = @import("../slot_core.zig");
+const kv_fs = @import("../../fuse/handler/kv_fs.zig");
+const op_trace = @import("../../fuse/handler/op_trace.zig");
+const filesystem = @import("../../fuse/handler/filesystem.zig");
 
 const Lab = struct {
     f: *wt.Fixture,
@@ -1095,6 +1108,96 @@ test "the dd lane's READ: the leg the ladder resolved becomes one READ SQE on th
     r4.c.complete(0);
     slot_core.release(try s.m.slot(4));
     try testing.expectEqual(@as(u32, 0), engine.inflightTotal());
+}
+
+/// The lab's atime face: a RAM filesystem's `note_read` reached as the
+/// sink reaches it (the binding's ino and open flags).
+const NoteProbe = struct {
+    var calls: u32 = 0;
+
+    fn call(ctx: *anyopaque, b: *const session_mod.Binding) void {
+        const fs: *kv_fs.MemFs = @ptrCast(@alignCast(ctx));
+        calls += 1;
+        var quiet: op_trace.OpTrace = .{ .unique = 0, .class = .other, .profiling = false, .t_entry = 0 };
+        var c: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &quiet, .wd_slot = null, .window = &.{} };
+        fs.note_read(&c, .{ .ino = b.ino, .flags = b.openFlags() });
+    }
+};
+
+test "the dd lane's READ under the atime law (charter §4 'Access time'): a direct read the lane SERVED is noted before its ACK with the binding's open flags — under strictatime a plain binding's read parks ONE stamp, an O_NOATIME binding's none; a read whose recheck failed is the fallback's (the handler stamps its own), never noted here; every served read noted (`ipc_dd_read_atime_notes` ≡ `ipc_dd_read_serves`)" {
+    const gpa = testing.allocator;
+    const lab = try Lab.init(gpa);
+    defer lab.deinit(gpa);
+    const fds = [_]linux.fd_t{lab.fd};
+    const engine = try Engine.init(gpa, .{ .io = testing.io, .wp = lab.wp, .vols = &lab.f.vols, .vol_fds = &fds, .pool = &lab.pool, .inval = &lab.inval, .opens = null, .cfg = .{ .shards = 2, .coop_taskrun = true, .lane_flush = true, .inline_reap = true, .ring_park = true }, .latch = true });
+    defer engine.deinit();
+    try engine.start();
+    // The filesystem the note lands in: a RAM KvFs under strictatime with
+    // one file, its create's parked times drained (no stamp stands).
+    var store = try kv_fs.MemStore.init(gpa);
+    defer store.deinit();
+    var nodata: kv_fs.NoData = .{};
+    var fs = try kv_fs.MemFs.mount(gpa, testing.io, &store, &nodata, .{ .dlm_stripes = 64 });
+    defer fs.unmount();
+    var quiet: op_trace.OpTrace = .{ .unique = 0, .class = .other, .profiling = false, .t_entry = 0 };
+    var fctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &quiet, .wd_slot = null, .window = &.{} };
+    const file = (try fs.create(&fctx, .{ .parent = 1, .name = "f", .mode = 0o644, .flags = 0, .umask = 0, .open_flags = 0 })).entry.nodeid;
+    _ = try fs.drainPendingTimes(&fctx);
+    try testing.expectEqual(@as(u64, 0), fs.pending.len());
+    _ = fs.atime_law.set(.{ .posture = .strictatime });
+    engine.read_note = .{ .ctx = @ptrCast(&fs), .call = &NoteProbe.call };
+    NoteProbe.calls = 0;
+    var ts = try session_mod.TestSession.init(gpa, lab_geometry);
+    defer ts.deinit();
+    const s = ts.s;
+    const plain = s.bind(.{ .ino = file, .rights = .{ .read = true, .odirect = true } }, false, .mount).?;
+    const noatime = s.bind(.{ .ino = file, .rights = .{ .read = true, .odirect = true }, .noatime = true }, false, .mount).?;
+    const b = try lab.f.publishBlock(2, 0, 0xAA);
+    var img: [wt.BS]u8 = @splat(0xAA);
+    try testing.expectEqual(@as(usize, wt.BS), linux.pwrite(lab.fd, &img, img.len, @intCast(b.offset)));
+    RecheckProbe.verdict = true;
+    const hook: fsv.CompletionHook = .{ .ctx = null, .token = .{ 2, 0, 0, 0, 0, 0 }, .call = &RecheckProbe.call };
+    const serves0 = stats.ipc_dd_read_serves.load();
+    const notes0 = stats.ipc_dd_read_atime_notes.load();
+    const touches0 = kv_fs.fuse_atime_touches.load();
+    const Read = struct {
+        fn served(e: *Engine, sess: *Session, idx: u32, binding: u64, leg_off: u64, h: fsv.CompletionHook) !i64 {
+            const r = try submitRead(sess, idx, binding, 5 * 4096, 4096);
+            try testing.expect(e.tryDirectRead(0, sess, r.op, .{ .fd = e.vol_fds[0], .off = leg_off, .len = 4096, .hook = h }, r.c));
+            const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+            while (!slot_core.isDoneFor(try sess.m.slot(idx), r.gen) and clock.monotonicNs() < deadline) {
+                e.flushLane(0);
+                sleepNs(100 * std.time.ns_per_us);
+            }
+            const res = slot_core.result(try sess.m.slot(idx));
+            slot_core.release(try sess.m.slot(idx));
+            return res;
+        }
+    };
+    // The O_NOATIME description first: served, nothing parks (a wrongly
+    // parked stamp would also absorb the plain read's below).
+    try testing.expectEqual(@as(i64, 4096), try Read.served(engine, s, 1, noatime, b.offset + 5 * 4096, hook));
+    try testing.expectEqual(touches0, kv_fs.fuse_atime_touches.load());
+    try testing.expectEqual(@as(u64, 0), fs.pending.len());
+    // The plain description: served, ONE stamp parked (strictatime, judged).
+    try testing.expectEqual(@as(i64, 4096), try Read.served(engine, s, 2, plain, b.offset + 5 * 4096, hook));
+    try testing.expectEqual(touches0 + 1, kv_fs.fuse_atime_touches.load());
+    try testing.expectEqual(@as(u64, 1), fs.pending.len());
+    // A moved block: the fallback owns the op (its handler stamps); the
+    // lane notes nothing.
+    RecheckProbe.verdict = false;
+    FallbackProbe.calls = 0;
+    engine.read_fallback = .{ .ctx = @ptrCast(engine), .call = &FallbackProbe.call };
+    try testing.expectEqual(@as(i64, 7), try Read.served(engine, s, 3, plain, b.offset + 5 * 4096, hook));
+    try testing.expectEqual(@as(u32, 1), FallbackProbe.calls);
+    RecheckProbe.verdict = true;
+    engine.read_fallback = null;
+    // Every served read noted, the fallback's not.
+    try testing.expectEqual(serves0 + 2, stats.ipc_dd_read_serves.load());
+    try testing.expectEqual(notes0 + 2, stats.ipc_dd_read_atime_notes.load());
+    try testing.expectEqual(@as(u32, 2), NoteProbe.calls);
+    try testing.expectEqual(@as(u32, 0), engine.inflightTotal());
+    _ = try fs.drainPendingTimes(&fctx);
 }
 
 /// A doorbell rung from another thread after `delay_ns`.

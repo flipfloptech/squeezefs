@@ -450,7 +450,7 @@ fn served(o: client.Outcome) !usize {
     };
 }
 
-test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the il0 xattr → a session in-process over the ONE client library → bind → ring pwrite 4 MiB (sever-at-dequeue, the write cache's one record) read back through the kernel path byte-exact → the second block's pieces pool while the record promotes (the file striped from here) → a third block's 4 MiB stream of 1 MiB pieces places, its first merge adopting the assembly (ONE assembly, ONE merge when the four drain in one pass; the bytes whatever the passes did) → a cold read then a warm read on the sync fast path (arena_copy_bytes ≡ bytes) → a W1-shaped 4 KiB overwrite serves INLINE on the dd lane (patch_edge_rmw_reads 0) → 8 no-wait tickets complete in offset order → the fd screen's refusals → kernel fsync → umount with the live session tears down cleanly (the client poisoned, no mount left)" {
+test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the il0 xattr → a session in-process over the ONE client library → bind → ring pwrite 4 MiB (sever-at-dequeue, the write cache's one record) read back through the kernel path byte-exact → the second block's pieces pool while the record promotes (the file striped from here) → a third block's 4 MiB stream of 1 MiB pieces places, its first merge adopting the assembly (ONE assembly, ONE merge when the four drain in one pass; the bytes whatever the passes did) → a cold read then a warm read on the sync fast path (arena_copy_bytes ≡ bytes), every direct read handed to the atime law → a W1-shaped 4 KiB overwrite serves INLINE on the dd lane (patch_edge_rmw_reads 0) → 8 no-wait tickets complete in offset order → the fd screen's refusals → kernel fsync → umount with the live session tears down cleanly (the client poisoned, no mount left)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -665,6 +665,12 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
         defer gpa.free(text);
         try testing.expect(std.mem.indexOf(u8, text, "\"closure\":{\"reads\":true,\"writes\":true,\"dd\":true}") != null);
     }
+    // The atime law on the dd lane (charter §4 "Access time"): every read it
+    // served was handed to the law before its ACK — judged at the lane's
+    // counter (a parked stamp absorbs the next read's, so neither
+    // `fuse_atime_touches` nor `stat` is exact here).
+    try testing.expect((try rig.stat("ipc_dd_read_serves")) >= 2);
+    try testing.expectEqual(try rig.stat("ipc_dd_read_serves"), try rig.stat("ipc_dd_read_atime_notes"));
 
     // 4. The W1 shape INLINE on the dd lane: 4 KiB aligned into block 0,
     //    non-extending, not stream-adjacent.
@@ -785,6 +791,7 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
         // Exactly the EBADF row above: the wrong-direction tripwire.
         try testing.expectEqual(@as(?u64, 1), numberAfter(text, "\"ipc_descriptor_rejects\":"));
         try testing.expect((numberAfter(text, "\"ipc_inval_notifies\":") orelse 0) >= 1);
+        try testing.expectEqual(numberAfter(text, "\"ipc_dd_read_serves\":"), numberAfter(text, "\"ipc_dd_read_atime_notes\":"));
     }
 
     // 8. `umount` while THIS process still holds `ring.dat` open: refused

@@ -8049,18 +8049,23 @@ const atime_sh_lib =
     \\# read FILE (generic/003's `cat`) and judge: Y the atime moved past the sample, N it did not; mtime and ctime never move on a read
     \\readj() { f=$1; want=$2; tag=$3; a0=$(at "$f"); m0=$(mt "$f"); c0=$(ct "$f"); sleep 1.1; cat "$f" > /dev/null; a1=$(at "$f"); if [ "$want" = Y ]; then later "$a0" "$a1" "$tag atime"; else same "$a0" "$a1" "$tag atime"; fi; same "$m0" "$(mt "$f")" "$tag mtime"; same "$c0" "$(ct "$f")" "$tag ctime"; }
     \\listj() { d=$1; want=$2; tag=$3; a0=$(at "$d"); m0=$(mt "$d"); sleep 1.1; ls "$d" > /dev/null; a1=$(at "$d"); if [ "$want" = Y ]; then later "$a0" "$a1" "$tag atime"; else same "$a0" "$a1" "$tag atime"; fi; same "$m0" "$(mt "$d")" "$tag mtime"; }
+    \\# read FILE, or list DIR, through a description opened O_NOATIME (LTP open12; the caller is root): no stamp moves, whatever the law
+    \\# (python -I: a plain `-c` lists its cwd, the mount's root, for its imports — a listing of its own)
+    \\noatimej() { p=$1; tag=$2; a0=$(at "$p"); m0=$(mt "$p"); c0=$(ct "$p"); sleep 1.1; python3 -I -c 'import os, sys; fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOATIME); n = len(os.listdir(fd)) if os.path.isdir(sys.argv[1]) else len(os.read(fd, 4096)); os.close(fd); assert n > 0' "$p"; same "$a0" "$(at "$p")" "$tag atime"; same "$m0" "$(mt "$p")" "$tag mtime"; same "$c0" "$(ct "$p")" "$tag ctime"; }
     \\posture() { awk -v mp="$mp" '$5 == mp { o = $6 } END { print o }' /proc/self/mountinfo; }
     \\
 ;
 
 /// Phase 1 (the mount is the kernel's default, relatime): generic/003's
 /// first arm — the first read after the write moves atime alone, the
-/// second does not, a directory's first listing does, its second does
-/// not, a symlink's readlink does.
+/// second does not, a listing through an O_NOATIME directory fd does not
+/// (LTP open12: the file's law before the mount's), the plain first
+/// listing after it does, its second does not, a symlink's readlink does.
 const atime_sh_relatime = atime_sh_lib ++
     \\mkdir dir1; echo aaa > dir1/file1; ln -s file1 dir1/link1
     \\readj dir1/file1 Y "relatime first read"
     \\readj dir1/file1 N "relatime second read"
+    \\noatimej dir1 "relatime O_NOATIME listing"
     \\listj dir1 Y "relatime first listing"
     \\listj dir1 N "relatime second listing"
     \\l0=$(at dir1/link1); sleep 1.1; readlink dir1/link1 > /dev/null; later "$l0" "$(at dir1/link1)" "relatime readlink"
@@ -8086,7 +8091,11 @@ const atime_sh_nodiratime = atime_sh_lib ++
 /// Phase 3: `-o remount,strictatime` — three `cat`s of a file read already
 /// (relatime would move none; the second and third are opens the kernel
 /// would have served from its page cache under FOPEN_KEEP_CACHE — a
-/// strictatime open drops it) all move; `-o remount,noatime` — a new
+/// strictatime open drops it) all move; a read through a description
+/// opened O_NOATIME moves nothing, the plain read after it moves (the
+/// read arm lives here: under relatime the kernel keeps the pages the
+/// first open filled, and a second open's read never reaches the daemon);
+/// `-o remount,noatime` — a new
 /// file's first read does not, a write still moves mtime and ctime;
 /// `-o remount,ro,strictatime` — nothing moves; back to `rw,relatime`
 /// — the written file's first read moves again.
@@ -8096,6 +8105,8 @@ const atime_sh_strict_noatime_ro = atime_sh_lib ++
     \\readj dir1/file1 Y "strictatime first read"
     \\readj dir1/file1 Y "strictatime second read"
     \\readj dir1/file1 Y "strictatime third read"
+    \\noatimej dir1/file1 "strictatime O_NOATIME read"
+    \\readj dir1/file1 Y "strictatime read after the O_NOATIME one"
     \\mount -i -o remount,noatime,diratime "$mp"
     \\case ",$(posture)," in *,noatime,*) ;; *) echo "FAIL posture: $(posture)"; exit 1 ;; esac
     \\echo ccc > dir2/file3
@@ -8143,7 +8154,7 @@ const atime_sh_knob_strict = atime_sh_lib ++
     \\
 ;
 
-test "smoke: ATIME — RELATIME, STRICTATIME, NOATIME ARE THE KERNEL MOUNT'S (fstests generic/003 and 192; charter §4 'Access time') — format → mount (the kernel's relatime): the first read after a write moves atime alone (mtime, ctime unmoved), the second does not, a directory's first listing does, a readlink does → `mount -o remount,nodiratime` (the daemon learns the flag from the mount table, nothing from the kernel): a fresh directory's listing stays, its file's read moves → `-o remount,strictatime`: three `cat`s of a read file all move (a strictatime open drops the kernel's cached pages: every open-read cycle reaches the daemon) → `-o remount,noatime`: a new file's read moves nothing, a write still moves mtime/ctime → `-o remount,ro,strictatime`: nothing → `rw,relatime` again: the written file's read moves → umount, remount: every stamp as shown (durable at the cadence and the dismount) → SQUEEZEFS_ATIME=noatime over the kernel's relatime: a read moves nothing; =strictatime: two reads move, the mount's nodiratime stands → fsck --offline --scrub 0 findings, the must-stay-0 set clean" {
+test "smoke: ATIME — RELATIME, STRICTATIME, NOATIME ARE THE KERNEL MOUNT'S (fstests generic/003 and 192; charter §4 'Access time') — format → mount (the kernel's relatime): the first read after a write moves atime alone (mtime, ctime unmoved), the second does not, a listing through an O_NOATIME directory fd does not while the directory's first plain listing after it does (LTP open12), a readlink does → `mount -o remount,nodiratime` (the daemon learns the flag from the mount table, nothing from the kernel): a fresh directory's listing stays, its file's read moves → `-o remount,strictatime`: three `cat`s of a read file all move (a strictatime open drops the kernel's cached pages: every open-read cycle reaches the daemon), a read through an O_NOATIME description moves nothing while the plain read after it moves → `-o remount,noatime`: a new file's read moves nothing, a write still moves mtime/ctime → `-o remount,ro,strictatime`: nothing → `rw,relatime` again: the written file's read moves → umount, remount: every stamp as shown (durable at the cadence and the dismount) → SQUEEZEFS_ATIME=noatime over the kernel's relatime: a read moves nothing; =strictatime: two reads move, the mount's nodiratime stands → fsck --offline --scrub 0 findings, the must-stay-0 set clean" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -8176,8 +8187,8 @@ test "smoke: ATIME — RELATIME, STRICTATIME, NOATIME ARE THE KERNEL MOUNT'S (fs
     {
         const ta = try rig.stats();
         defer gpa.free(ta);
-        // Every Y above is one touch: 1 + 1 (dir) + 1 (link) + 1 (file2) + 3 (strict) + 1 (after the write) = 8.
-        try testing.expectEqual(@as(?u64, 8), numberAfter(ta, "\"fuse_atime_touches\":"));
+        // Every Y above is one touch, an O_NOATIME read none: 1 + 1 (dir) + 1 (link) + 1 (file2) + 3 (strict) + 1 (strict, after the O_NOATIME read) + 1 (after the write) = 9.
+        try testing.expectEqual(@as(?u64, 9), numberAfter(ta, "\"fuse_atime_touches\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"fuse_atime_touches_dropped\":"));
         try expectMustStayZero(ta);
     }

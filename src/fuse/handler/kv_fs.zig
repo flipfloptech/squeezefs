@@ -10145,6 +10145,57 @@ test "charter §4 'Access time' — a read the handler never sees (the intercept
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
 }
 
+test "charter §4 'Access time' — O_NOATIME (LTP open12): under strictatime a READ, a READDIR and a READDIRPLUS whose `fuse_read_in.flags` carry the description's O_NOATIME move nothing (the GETATTR after shows the stamp standing, nothing parks, no touch counts); the same reads without it move atime; READLINK (no description) keeps the mount's law" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var trace = op_trace.OpTrace.begin(0, .other);
+    defer trace.finish();
+    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+    const d = try h.mkdir(1, "d");
+    const f = try h.create(d, "f", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, "aaa\n", 0).errno());
+    h.release(f);
+    const l = (try h.entry(h.call(.{ .symlink = .{ .name = "l", .link = "f" } }, d))).nodeid;
+    const past: u64 = 1_000_000_000;
+    var back = abi.zeroed(abi.fuse_setattr_in);
+    back.valid = abi.FATTR_ATIME | abi.FATTR_MTIME | abi.FATTR_CTIME;
+    back.atime = past;
+    back.mtime = past;
+    back.ctime = past;
+    for ([_]u64{ f, d, l }) |ino| _ = try h.attr(h.setattr(ino, back));
+    _ = h.fs.atime_law.set(.{ .posture = .strictatime });
+    _ = try h.fs.drainPendingTimes(&ctx);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+    const t0 = fuse_atime_touches.load();
+    // The kernel's word for `open(…, O_NOATIME)`, spelled apart from the law's.
+    const o_noatime: u32 = @bitCast(linux.O{ .NOATIME = true });
+    const o_directory: u32 = @bitCast(linux.O{ .DIRECTORY = true });
+    const rd: abi.fuse_read_in = .{ .fh = 1, .offset = 0, .size = 4, .read_flags = 0, .lock_owner = 0, .flags = o_noatime, .padding = 0 };
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .read = rd }, f).errno());
+    try testing.expectEqual(past, (try h.getattr(f)).atime);
+    const dir_in: abi.fuse_read_in = .{ .fh = 1, .offset = 0, .size = 4096, .read_flags = 0, .lock_owner = 0, .flags = o_noatime | o_directory, .padding = 0 };
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .readdir = dir_in }, d).errno());
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .readdirplus = dir_in }, d).errno());
+    try testing.expectEqual(past, (try h.getattr(d)).atime);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+    try testing.expectEqual(t0, fuse_atime_touches.load());
+    // The same reads without the flag: each moves (strictatime).
+    try testing.expectEqual(@as(?linux.E, null), h.read(f, 0, 4).errno());
+    try testing.expect((try h.getattr(f)).atime > past);
+    try testing.expectEqual(t0 + 1, fuse_atime_touches.load());
+    var plain_dir = dir_in;
+    plain_dir.flags = o_directory;
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .readdirplus = plain_dir }, d).errno());
+    try testing.expect((try h.getattr(d)).atime > past);
+    try testing.expectEqual(t0 + 2, fuse_atime_touches.load());
+    // READLINK: the mount's law alone.
+    try testing.expectEqual(@as(?linux.E, null), h.call(.readlink, l).errno());
+    try testing.expect((try h.getattr(l)).atime > past);
+    try testing.expectEqual(t0 + 3, fuse_atime_touches.load());
+    _ = try h.fs.drainPendingTimes(&ctx);
+}
+
 test "KILLPRIV_V2: a flagged write clears suid (and sgid only with group-exec) and drops security.capability in the write's commit; an unflagged write clears nothing; a flagged truncate and an O_TRUNC open fold the strip too" {
     var h: Harness = undefined;
     try h.init();

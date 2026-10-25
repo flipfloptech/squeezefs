@@ -215,6 +215,21 @@ test "a slot the manager adopted from a dead joiner: its page entry at tree 0's 
     try testing.expectEqual(@as(u64, 0x1f40000), out.items[0].root.addr);
 }
 
+test "a page copy OLDER than tree 0's replayed record at the same generation — the manager demoted the slot to tree 0 (its record landed) and the page rewrite that drops it did not (a power cut between the two) — folds to tree 0's newer root: within one seq space the later mint is the newer home, the page's word an older root whose records the ledger's tail may already have passed" {
+    const gpa = testing.allocator;
+    const b: u64 = 1 << 40;
+    const demoted: cr.SlotState = .{ .variant = .leased, .appender_id = 0, .g = 1, .root = .{ .addr = 0x5000, .seq = b + 20 }, .cursor = 9 };
+    const kvs = [_]tree.KeyValue{.{ .key = @constCast(keyOf(7).slice()), .value = @constCast(&demoted.encode()) }};
+    var p0 = page.Page.free(0, 1, page.SegmentTable.one(.{ .start = 0, .len = 4096 }));
+    try p0.setSlots(&.{.{ .slot = 7, .state = .live, .g = 1, .slot_tree_extents = 1, .root_addr = 0x4000, .root_seq = b + 10, .cursor = 8 }});
+    var out: std.ArrayList(GuestRoot) = .empty;
+    defer out.deinit(gpa);
+    try foldGuestRoots(gpa, &kvs, &.{p0}, .replayed, &out);
+    try testing.expectEqual(@as(u64, 0x5000), out.items[0].root.addr);
+    try testing.expectEqual(b + 20, out.items[0].root.seq);
+    try testing.expectEqual(@as(u64, 9), out.items[0].cursor);
+}
+
 test "the projected fold (a reader's tree 0, no ring): a page entry ABOVE the record's generation is a lease the projection has not caught up with — adopted with its owner as the lessee, the highest generation winning over an older lessee's live entry; the replayed fold judges the same entry stale residue" {
     const gpa = testing.allocator;
     // The projection still says Unleased at g 1 (root 4096); appender 5's

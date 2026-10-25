@@ -199,6 +199,13 @@ pub const NodeSeqHandle = struct {
     }
 };
 
+/// The writer's handle on its own volume (a flat volume's, the manager's),
+/// seeded at the ledger's `max(seq, node_seq_watermark)`.
+pub fn managerHandle(seed: u64, volume_base: u64) NodeSeqHandle {
+    _ = volume_base;
+    return NodeSeqHandle.shared(seed);
+}
+
 // ---------------------------------------------------------------------------
 // Tests (node_seq.rs:249–298 and the spec's §3 laws).
 // ---------------------------------------------------------------------------

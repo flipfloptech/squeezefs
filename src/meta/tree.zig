@@ -1643,6 +1643,57 @@ test "create floors the root's seq above the extent's residue: a tree re-created
     try testing.expectEqual(@as(?[]u8, null), try reborn.lookup(gpa, &ikey(2)));
 }
 
+test "a re-formatted volume's node seqs never leave its own space: the writer's first guest tree, minted on a recycled extent, ignores the earlier format's residue stamps — a counter raised to them re-mints the earlier format's seqs, and the earlier frames past a new node's log end at the same extent verify as its own (xfstests generic/753 on a scratch device every test re-formats: `SMO fold-source log-view mismatch … disk walk ends at 262144, the live object's append cursor is at 258048`, the checkpoint wedged, then `corruption outside the replay window`)" {
+    const gpa = testing.allocator;
+    var vol = try smo.TestVolume.init(gpa, .{});
+    defer vol.deinit();
+    // The new format's base and the earlier format's, in another space
+    // (each is its own uuid's `nodeSeqBase`).
+    const base_new: u64 = 1 << 40;
+    const base_old: u64 = base_new + 64 * node_seq.INCARNATION_SPACE;
+    // The earlier format: a guest tree at extent 0 (its record's seq is
+    // minted from the same counter in this standalone shape), a guest tree
+    // at extent 1 whose log holds three frames.
+    vol.seq.raiseTo(base_old);
+    var buf: [64]u8 = undefined;
+    const first = try vol.createTree(.{ .slot = key.guestForestSlot(3) });
+    try first.insert(&ikey(1), testValue(1, 24, &buf));
+    try vol.flushDirty(first);
+    const second = try vol.createTree(.{ .slot = key.guestForestSlot(4) });
+    for (0..3) |round| {
+        for (0..4) |i| try second.insert(&ikey(10 * round + i), testValue(i, 24, &buf));
+        try vol.flushDirty(second);
+    }
+    const old_e1 = second.rootPtr();
+    // The new format over the same device (the heap is never wiped): a
+    // fresh cache and allocator, the writer's handle at its own seed.
+    var fresh = try vol.freshCache();
+    defer fresh.deinit();
+    var alloc = try alloc_ext.ExtentAllocator.format(gpa, vol.cfg.extents, vol.cfg.reserve, vol.cfg.pending_cap);
+    defer alloc.deinit();
+    var seq = node_seq.managerHandle(base_new + 2, base_new);
+    const guest = try KvTree.create(gpa, fresh, &alloc, .{ .slot = key.guestForestSlot(5) }, &seq);
+    defer guest.destroy();
+    try testing.expectEqual(first.rootPtr().addr, guest.rootPtr().addr);
+    // The next node the new format places takes the next free extent (an
+    // SMO's) under the seq it mints next.
+    const e1 = fresh.extentAddr(try alloc.claimInternal());
+    try testing.expectEqual(old_e1.addr, e1);
+    const next = try seq.mint();
+    var w = try node.writeNode(gpa, fresh.cfg.layout, .{ .node_addr = e1, .node_seq = next, .tree_id = 0, .level = 0, .min_key = "", .max_key = &KEY_SPACE_MAX }, &.{}, 0, null);
+    defer w.deinit(gpa);
+    try fresh.loader.writeImage(fresh.loader.ctx, e1, w.image);
+    const img = try snapshot.SharedBuf.createExtent(gpa, fresh.cfg.layout.node_size);
+    defer img.release();
+    try fresh.loader.readExtent(fresh.loader.ctx, e1, img.data);
+    var loaded = try node.verifyNodeExtent(gpa, img.data, fresh.cfg.layout, e1, 0, null);
+    defer loaded.deinit(gpa);
+    // A header-only node: none of the earlier format's frames is its own.
+    try testing.expectEqual(@as(usize, 0), loaded.bset_ranges.len);
+    try testing.expect(next != old_e1.seq);
+    try testing.expect(seq.load() >= base_new and seq.load() < node_seq.incarnationBase(base_new, 1).?);
+}
+
 test "the routing law: slot-tree kinds route by the key's slot (the key must decode as the tagged kind), control by kind 8, interior by header id — slot trees through the slot ‖ separator key; alloc deltas and unmounted slots route nowhere" {
     var vol = try smo.TestVolume.init(testing.allocator, .{});
     defer vol.deinit();

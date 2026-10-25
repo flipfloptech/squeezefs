@@ -790,6 +790,7 @@ const TornCensus = struct {
     /// (≥ 40 B), page/16 of them — 2.5 pages, past the first whatever the
     /// page size.
     fn take(self: *TornCensus, filler: [:0]const u8, cpu: usize, mask: *const linux.cpu_set_t) !void {
+        self.drop();
         try pin(cpu);
         defer linux.sched_setaffinity(0, mask) catch {};
         const rc = linux.open(filler.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
@@ -974,6 +975,112 @@ test "a census /proc/locks TORE (a positional seq_file read a page per read(2): 
     try testing.expect(waits.load() > 0);
 }
 
+test "a LIVE lock held through a description THIS process holds is named off its own fdinfo, never the census: with /proc/locks torn under it (the seam armed, a page of locks standing before it), flockExclusive refuses at once (no wait, the holder this process) and writerFlockHeld reads 'writer' with no wait — the census is never read" {
+    var path_buf: [64]u8 = undefined;
+    const path = (try scratch(&path_buf, "own")) orelse return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer _ = linux.unlink(path.ptr);
+    var filler_buf: [64]u8 = undefined;
+    const filler = (try scratch(&filler_buf, "own-fill")).?;
+    defer _ = linux.unlink(filler.ptr);
+    var mask: linux.cpu_set_t = undefined;
+    const cpu = try TornCensus.firstCpu(&mask);
+    var rig = try TornCensus.begin(null);
+    defer rig.end();
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    const rc_own = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc_own));
+    const own: linux.fd_t = @intCast(rc_own);
+    defer _ = linux.close(own);
+    try TornCensus.pin(cpu);
+    const locked = linux.errno(linux.flock(own, std.posix.LOCK.EX | std.posix.LOCK.NB));
+    try linux.sched_setaffinity(0, &mask);
+    try testing.expectEqual(linux.E.SUCCESS, locked);
+    try rig.take(filler, cpu, &mask);
+    rig.arm();
+    var shared: counters.ShardedCounter = .{};
+    var exiting: counters.ShardedCounter = .{};
+    var locker: ?Holder = null;
+    try testing.expectEqual(linux.E.AGAIN, flockExclusive(testing.io, fd, .{ .shared = &shared, .exiting = &exiting }, &locker));
+    try testing.expectEqual(@as(u64, 0), shared.load() + exiting.load());
+    try testing.expect(locker != null and locker.?.pid == linux.getpid() and locker.?.squeezefs and locker.?.exiting == null);
+    try rig.take(filler, cpu, &mask);
+    var waits: counters.ShardedCounter = .{};
+    try testing.expect(writerFlockHeld(testing.io, path, &waits));
+    try testing.expectEqual(@as(u64, 0), waits.load());
+    try testing.expect(!rig.fired.load(.acquire));
+}
+
+test "a DEAD creator's lock on a description THIS process holds (the replay hold, the supervisor's part) is named off this process's fdinfo from the first round: with /proc/locks torn under it, flockExclusive judges it `replay` at once — no shared wait — and opens once the description closes" {
+    var path_buf: [64]u8 = undefined;
+    const path = (try scratch(&path_buf, "own-replay")) orelse return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer _ = linux.unlink(path.ptr);
+    var filler_buf: [72]u8 = undefined;
+    const filler = (try scratch(&filler_buf, "own-replay-fill")).?;
+    defer _ = linux.unlink(filler.ptr);
+    var mask: linux.cpu_set_t = undefined;
+    const cpu = try TornCensus.firstCpu(&mask);
+    var rig = try TornCensus.begin(null);
+    defer rig.end();
+    const rc_s = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc_s));
+    const supervisor_fd: linux.fd_t = @intCast(rc_s);
+    var released = false;
+    defer if (!released) {
+        _ = linux.close(supervisor_fd);
+    };
+    // The creator inherits the pin: its lock is on `cpu`'s list.
+    try TornCensus.pin(cpu);
+    const rc_c = linux.fork();
+    if (rc_c == 0) {
+        _ = linux.flock(supervisor_fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+        linux.exit(0);
+    }
+    try linux.sched_setaffinity(0, &mask);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc_c));
+    const creator: linux.pid_t = @intCast(rc_c);
+    var status: i32 = 0;
+    _ = linux.waitpid(creator, &status, 0);
+    const rc2 = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc2));
+    const fd: linux.fd_t = @intCast(rc2);
+    defer _ = linux.close(fd);
+    try rig.take(filler, cpu, &mask);
+    rig.arm();
+    var shared: counters.ShardedCounter = .{};
+    var exiting: counters.ShardedCounter = .{};
+    const Opener = struct {
+        fn run(f: linux.fd_t, w: Waits, out: *linux.E, holder: *?Holder, done: *std.atomic.Value(bool)) void {
+            out.* = flockExclusive(testing.io, f, w, holder);
+            done.store(true, .release);
+        }
+    };
+    var result: linux.E = .SUCCESS;
+    var locker: ?Holder = null;
+    var done: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, Opener.run, .{ fd, Waits{ .shared = &shared, .exiting = &exiting }, &result, &locker, &done });
+    // The opener ends once the description closes.
+    var joined = false;
+    defer if (!joined) {
+        if (!released) _ = linux.close(supervisor_fd);
+        released = true;
+        t.join();
+    };
+    // A round counted: only then release.
+    while (exiting.load() + shared.load() == 0 and !done.load(.acquire)) std.Thread.yield() catch {};
+    _ = linux.close(supervisor_fd);
+    released = true;
+    t.join();
+    joined = true;
+    try testing.expectEqual(linux.E.SUCCESS, result);
+    try testing.expectEqual(@as(u64, 0), shared.load());
+    try testing.expect(exiting.load() > 0);
+    try testing.expect(locker != null and locker.?.pid == creator and locker.?.exiting == .replay);
+    try testing.expect(!rig.fired.load(.acquire));
+}
+
 test "the orderly-exit ceiling is the umount verb's exit bound plus two ticks (the pre-signal census, the replay) and dwarfs udev's wait; the exiting step is the verb's exit-poll quantum; a live foreign locker is never judged exiting" {
     try testing.expectEqual(umount_verb.DAEMON_EXIT_WAIT_NS + 2 * tick_law.tick_ns, EXITING_HOLDER_WAIT_NS);
     try testing.expect(EXITING_HOLDER_WAIT_NS > SHARED_LOCK_WAIT_NS);
@@ -1113,7 +1220,7 @@ test "the replay hold: a writer lock whose CREATOR has exited while its open fil
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "orderly-exit ceiling while exiting (its process is gone") != null);
 }
 
-test "a census /proc/locks TORE mid-wait behind an EXITING holder names no locker: the round keeps the replay judgement — the exiting wait goes on (never a shared wait, never udev's 5 s bound: a mount racing an orderly exit refused BUSY early) and opens once the description closes" {
+test "a census /proc/locks TORE behind an EXITING holder whose description ANOTHER process holds (the supervisor's) names no locker: a round that saw no flock counts in no class and keeps the last judgement — torn at the first round and mid-wait, the exiting wait goes on (never a shared wait, never udev's 5 s bound: a mount racing an orderly exit refused BUSY early) and opens once the description closes" {
     var path_buf: [64]u8 = undefined;
     const path = (try scratch(&path_buf, "torn-replay")) orelse return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
     defer _ = linux.unlink(path.ptr);
@@ -1126,26 +1233,53 @@ test "a census /proc/locks TORE mid-wait behind an EXITING holder names no locke
     var exiting: counters.ShardedCounter = .{};
     var rig = try TornCensus.begin(.{ .shared = &shared, .exiting = &exiting });
     defer rig.end();
-    const rc_s = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc_s));
-    const supervisor_fd: linux.fd_t = @intCast(rc_s);
-    var released = false;
-    defer if (!released) {
-        _ = linux.close(supervisor_fd);
-    };
-    // The creator inherits the pin: its lock is on `cpu`'s list.
+    // The supervisor's part, in a child: it opens the description, its own
+    // child (the daemon) takes the lock and exits, and it holds the
+    // description until `hold` reaches EOF — no description of this
+    // process holds the lock, so only the census can name it. `ready`
+    // carries the creator's pid once it is reaped. Raw syscalls only.
+    var hold: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&hold, .{ .CLOEXEC = true })));
+    var ready: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true })));
+    // Both children inherit the pin: the lock is on `cpu`'s list.
     try TornCensus.pin(cpu);
-    const rc = linux.fork();
-    if (rc == 0) {
-        _ = linux.flock(supervisor_fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+    const rc_s = linux.fork();
+    if (rc_s == 0) {
+        _ = linux.close(hold[1]);
+        _ = linux.close(ready[0]);
+        const rc_d = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        if (linux.errno(rc_d) != .SUCCESS) linux.exit(1);
+        const d: linux.fd_t = @intCast(rc_d);
+        const rc_c = linux.fork();
+        if (rc_c == 0) {
+            _ = linux.flock(d, std.posix.LOCK.EX | std.posix.LOCK.NB);
+            linux.exit(0);
+        }
+        const daemon: linux.pid_t = @intCast(rc_c);
+        var daemon_status: i32 = 0;
+        _ = linux.waitpid(daemon, &daemon_status, 0);
+        _ = linux.write(ready[1], std.mem.asBytes(&daemon), @sizeOf(linux.pid_t));
+        var eof: [1]u8 = undefined;
+        _ = linux.read(hold[0], &eof, 1);
         linux.exit(0);
     }
     try linux.sched_setaffinity(0, &mask);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
-    const creator: linux.pid_t = @intCast(rc);
-    var status: i32 = 0;
-    _ = linux.waitpid(creator, &status, 0);
-    _ = try awaitLocker(path, creator);
+    _ = linux.close(hold[0]);
+    _ = linux.close(ready[1]);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc_s));
+    const supervisor: linux.pid_t = @intCast(rc_s);
+    var released = false;
+    defer if (!released) {
+        _ = linux.close(hold[1]);
+        var status: i32 = 0;
+        _ = linux.waitpid(supervisor, &status, 0);
+    };
+    var creator: linux.pid_t = 0;
+    const got = linux.read(ready[0], std.mem.asBytes(&creator), @sizeOf(linux.pid_t));
+    _ = linux.close(ready[0]);
+    if (linux.errno(got) != .SUCCESS or got != @sizeOf(linux.pid_t)) return error.SupervisorStandInFailed;
+    try testing.expectEqual(creator, (try awaitLocker(path, creator)).pid);
     const rc2 = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc2));
     const fd: linux.fd_t = @intCast(rc2);
@@ -1159,26 +1293,36 @@ test "a census /proc/locks TORE mid-wait behind an EXITING holder names no locke
     var result: linux.E = .SUCCESS;
     var locker: ?Holder = null;
     var done: std.atomic.Value(bool) = .init(false);
+    // The opener's first census tears.
+    try rig.take(filler, cpu, &mask);
+    rig.arm();
     const t = try std.Thread.spawn(.{}, Opener.run, .{ fd, Waits{ .shared = &shared, .exiting = &exiting }, &result, &locker, &done });
     // The opener ends once the description closes.
     var joined = false;
     defer if (!joined) {
-        if (!released) _ = linux.close(supervisor_fd);
+        if (!released) {
+            _ = linux.close(hold[1]);
+            var status: i32 = 0;
+            _ = linux.waitpid(supervisor, &status, 0);
+        }
         released = true;
         t.join();
     };
-    // The opener judged the replay and waits: only then tear its next
-    // census, and release once that round has counted its retry.
-    while (exiting.load() == 0 and !done.load(.acquire)) std.Thread.yield() catch {};
+    // A later round named the replay and counted it: tear one mid-wait,
+    // and release once a round after it has counted.
+    while (!done.load(.acquire) and !(rig.fired.load(.acquire) and exiting.load() > 0)) std.Thread.yield() catch {};
+    const first_tore = rig.fired.load(.acquire);
     try rig.take(filler, cpu, &mask);
     rig.arm();
     while (!done.load(.acquire) and !(rig.fired.load(.acquire) and exiting.load() + shared.load() > rig.counted_at_fire)) std.Thread.yield() catch {};
     TornCensus.disarm();
-    _ = linux.close(supervisor_fd);
+    _ = linux.close(hold[1]);
+    var reaped: i32 = 0;
+    _ = linux.waitpid(supervisor, &reaped, 0);
     released = true;
     t.join();
     joined = true;
-    try testing.expect(rig.fired.load(.acquire));
+    try testing.expect(first_tore and rig.fired.load(.acquire));
     try testing.expectEqual(linux.E.SUCCESS, result);
     try testing.expectEqual(@as(u64, 0), shared.load());
     try testing.expect(locker != null and locker.?.pid == creator and locker.?.exiting == .replay);

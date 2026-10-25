@@ -118,8 +118,8 @@ pub fn probeForeignOnPath(gpa: std.mem.Allocator, env: *const std.process.Enviro
     return probeForeign(gpa, &dev, volume_len);
 }
 
-/// Is a writer's layer-A guard held on `path` right now? Read off
-/// `/proc/locks`: the probe takes no lock of its own.
+/// Is a writer's layer-A guard held on `path` right now
+/// (`guard.proc.writerFlockHeld`)?
 pub fn writerGuardHeld(io: Io, path: []const u8) bool {
     return guard.proc.writerFlockHeld(io, path, null);
 }

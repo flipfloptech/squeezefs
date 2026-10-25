@@ -8,8 +8,8 @@
 //! projection, no flock, no claim, no ring).
 //!
 //! The arm is decided at the mount by the writer faces — an exclusive
-//! writer `flock` on the device on this host (read off `/proc/locks`, no
-//! lock of our own) or a heartbeat-fresh `writer_claim` on any volume:
+//! writer `flock` on the device on this host (`proc.writerFlockHeld`) or a
+//! heartbeat-fresh `writer_claim` on any volume:
 //!
 //! - TOKENS: a member of the home shard as a READER (a random 16 B member
 //!   id, the role `reader`, no region, no park gate), the manager link off

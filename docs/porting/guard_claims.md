@@ -425,8 +425,12 @@ absorbs by the LOCKER `/proc/locks` names (`guard.proc.flockExclusive`, decision
 542): this process or a process of this executable refuses at once; any other locker —
 udevd's `LOCK_SH` rules and its `LOCK_EX` + `BLKRRPART` after every write-close of a whole
 disk (strace, systemd 259) — is polled every 5 ms for ≤ 5 s, then refused, the refusal
-naming it by pid and comm. The readers' "is a writer here?" (`guard.proc.writerFlockHeld`,
-no lock taken) applies the same rule to the same `/proc/locks` read.
+naming it by pid and comm; a round whose census names no exclusive locker keeps the last
+judgement. The readers' "is a writer here?" (`guard.proc.writerFlockHeld`) applies the same
+rule to the same `/proc/locks` read, and reads "no writer" only on the kernel's word — a
+`LOCK_SH|LOCK_NB` dropped at once, asked when the census names no locker: the census can
+tear (a positional seq_file read a page per `read(2)`; decision 0002 row 295, amended
+2026-10-24).
 
 ### 2.7 The recovery ladder (charter §5.7; DMT:207, 225 — "in that order of automation")
 

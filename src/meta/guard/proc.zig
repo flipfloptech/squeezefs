@@ -31,6 +31,11 @@
 //!   AT ONCE — the single-writer law. A holder that is no mount verb (an
 //!   offline verb's door) is live too.
 //!
+//! The holder is named off `/proc/locks`, whose census can tear
+//! (`writerFlockHeld`): a round that names no exclusive locker keeps the
+//! last judgement, and before any the holder is one this binary cannot
+//! name (the first class).
+//!
 //! What this does not see: a holder stopped by a raw `kill -TERM` with
 //! its mount still attached (its census and drains, sub-second) — a mount
 //! racing that window refuses as before; once its mount leaves the table
@@ -180,18 +185,25 @@ pub fn localIdentity() claim.Identity {
 const PROC_LOCKS_CAP: usize = 1 << 20;
 
 /// Is a writer's exclusive `flock` (the D0 guard's layer A) held on `path`
-/// on this host — read off `/proc/locks`, so the probe takes NO lock of its
-/// own (a `-o ro` reader "claims nothing", and a transient `LOCK_SH` would
-/// refuse a writer's `LOCK_EX | LOCK_NB` racing it). A locker that is not
-/// this binary (udev's re-read after a write-close, below) is waited out
-/// like `flockExclusive` does; one that outlasts the bound reads as held.
-/// Unreadable procfs reads as "no lock" (the claim face judges then).
+/// on this host? `/proc/locks` names the locker; "no writer" is the
+/// kernel's word alone (`exclusiveStands`: a `LOCK_SH | LOCK_NB` granted
+/// and dropped at once — a racing writer's `flockExclusive` waits it out
+/// as a holder it cannot name, never refuses on it), because a census that
+/// names none proves nothing: the table is a positional seq_file read a
+/// page per `read(2)`, so locks dropped before a page boundary between two
+/// reads hide the records at it (gate 137: a holder that never let go read
+/// "no writer"). A locker of this binary reads as held at once; any other
+/// (udev's re-read after a write-close, below), named or not, is waited
+/// out like `flockExclusive` does, and one that outlasts the bound reads
+/// as held. A `path` this process cannot probe reads the census alone.
 /// `waits` counts each retry a locker caused.
 pub fn writerFlockHeld(io: Io, path: []const u8, waits: ?*counters.ShardedCounter) bool {
     const deadline = clock.monotonicNs() + SHARED_LOCK_WAIT_NS;
     while (true) {
-        const h = exclusiveLocker(path) orelse return false;
-        if (h.squeezefs or clock.monotonicNs() >= deadline) return true;
+        if (exclusiveLocker(path)) |h| {
+            if (h.squeezefs) return true;
+        } else if (!(exclusiveStands(path) orelse false)) return false;
+        if (clock.monotonicNs() >= deadline) return true;
         if (waits) |w| w.inc();
         io.sleep(.fromMilliseconds(SHARED_LOCK_RETRY_MS), .awake) catch return true;
     }
@@ -275,6 +287,11 @@ pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: Waits, locker: *?Holder) li
     var st: linux.Statx = undefined;
     // The exiting holder named once per wait (the release line pairs it).
     var waiting_on: ?linux.pid_t = null;
+    // The last locker a census named, with its judgement. A round whose
+    // census names none — a shared holder (udev's rules, a reader's probe),
+    // or a census that tore (`writerFlockHeld`) — learns nothing and keeps
+    // it; none named yet = a holder this binary cannot name.
+    var named: ?Holder = null;
     while (true) {
         const e = linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB));
         if (e == .SUCCESS) {
@@ -284,11 +301,14 @@ pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: Waits, locker: *?Holder) li
         if (e != .AGAIN) return e;
         if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true, .MNT_ID = true }, &st)) != .SUCCESS) return .AGAIN;
         // Unreadable `/proc/locks`: the refusal stands.
-        var h = (lockerOf(&st) catch return .AGAIN) orelse Holder{ .pid = 0, .squeezefs = false };
-        if (h.pid != 0) {
-            h.exiting = judgeExiting(io, h.pid, h.squeezefs);
-            locker.* = h;
+        if (lockerOf(&st) catch return .AGAIN) |seen| {
+            if (seen.pid != 0) {
+                named = seen;
+                named.?.exiting = judgeExiting(io, seen.pid, seen.squeezefs);
+                locker.* = named;
+            }
         }
+        const h = named orelse Holder{ .pid = 0, .squeezefs = false };
         const now = clock.monotonicNs();
         if (h.exiting) |why| {
             if (now >= start + EXITING_HOLDER_WAIT_NS) return .AGAIN;

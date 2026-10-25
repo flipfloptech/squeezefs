@@ -147,9 +147,8 @@ const OfflineVolume = struct {
     }
 
     /// The Layer-A probe: an exclusive flock on the volume (a live mount on
-    /// this host) read off `/proc/locks` — taking the lock to test it would
-    /// refuse a racing writer, and a held SHARED lock is udev's block-device
-    /// probe, never a mount (`guard.proc.flockExclusive`).
+    /// this host), `guard.proc.writerFlockHeld` — a held SHARED lock is
+    /// udev's block-device probe, never a mount (`guard.proc.flockExclusive`).
     fn flockHeld(self: *const OfflineVolume, io: Io) bool {
         return guard.proc.writerFlockHeld(io, self.path, null);
     }

@@ -199,6 +199,14 @@ pub const NodeSeqHandle = struct {
     }
 };
 
+/// The incarnation ordinal whose space holds `seq` over `volume_base`: 0
+/// for incarnation 0's `[B, B + 2^K)` and for a legacy seed below `B`
+/// (nothing else mints there). Two seqs order only inside one ordinal.
+pub fn spaceOf(volume_base: u64, seq: u64) u64 {
+    if (seq < volume_base) return 0;
+    return (seq - volume_base) >> INCARNATION_SPACE_BITS;
+}
+
 /// The writer's handle on its own volume (a flat volume's, the manager's),
 /// seeded at the ledger's `max(seq, node_seq_watermark)`: bounded by
 /// incarnation 0's span over the volume's base, so a raise to a stamp of
@@ -291,7 +299,7 @@ test "the handle mints inside its space (first mint = base + 1) and parks at the
     try testing.expectEqual(std.math.maxInt(u64), edge.ceilingValue());
 }
 
-test "the writer's handle is bounded by incarnation 0's span: an earlier format's residue stamp (another base) and a joiner's root are ignored, a stamp of its own space lands; a seed a pre-bound writer already lifted past the span keeps the unbounded handle" {
+test "the writer's handle is bounded by incarnation 0's span: an earlier format's residue stamp (another base) and a joiner's root are ignored, a stamp of its own space lands; a seed a pre-bound writer already lifted past the span keeps the unbounded handle; the space ordinal of a seq" {
     const b: u64 = 1 << 40;
     var h = managerHandle(b + 2, b);
     try testing.expect(!seedEscaped(b + 2, b));
@@ -303,6 +311,10 @@ test "the writer's handle is bounded by incarnation 0's span: an earlier format'
     try testing.expectEqual(b + 10, try h.mint());
     // A legacy seed below the base (a ledger seq) is inside the bound.
     try testing.expectEqual(b + INCARNATION_SPACE, managerHandle(7, b).ceilingValue());
+    // The space ordinal: 0 below and inside incarnation 0, o inside o.
+    try testing.expectEqual(@as(u64, 0), spaceOf(b, 7));
+    try testing.expectEqual(@as(u64, 0), spaceOf(b, b + INCARNATION_SPACE - 1));
+    try testing.expectEqual(@as(u64, 3), spaceOf(b, b + 3 * INCARNATION_SPACE + 9));
     const escaped = b + 64 * INCARNATION_SPACE + 5;
     try testing.expect(seedEscaped(escaped, b));
     var legacy = managerHandle(escaped, b);

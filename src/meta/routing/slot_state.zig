@@ -14,6 +14,8 @@ const cr = @import("../sym/control_records.zig");
 const page = @import("../sym/appender_page.zig");
 const lease_table = @import("../sym/slots/lease_table.zig");
 const tree = @import("../tree.zig");
+const node_seq = @import("../node_seq.zig");
+const journal = @import("../journal.zig");
 
 pub const SlotState = cr.SlotState;
 pub const Root = cr.Root;
@@ -83,11 +85,34 @@ pub const Tree0View = enum {
     projected,
 };
 
+/// Whether a page's root at tree 0's generation is NEWER than tree 0's
+/// word there. A generation's roots are its lessee's mints, in the
+/// lessee's incarnation space, plus the one it was granted or recovered
+/// with (the previous lessee's, possibly another space). Within one space
+/// the later mint is the newer root (one writer's monotone handle: a
+/// demotion's record beats an older page copy a power cut left); across
+/// spaces the root inside the lessee's own space is the newer — the
+/// generation's only foreign root is its grant-time one (a recovered tree
+/// moves under its adopter's space, below the dead joiner's). A node seq
+/// is never ordered across spaces. `lessee_space`: the page owner's
+/// incarnation ordinal when the fold knows it (appender 0, the manager:
+/// 0), else null — a joiner's page, a reader's live home.
+fn pageRootNewer(page_root: cr.Root, tree0_root: cr.Root, lessee_space: ?u64, volume_base: u64) bool {
+    // A slot granted before its first mint names no root in tree 0.
+    if (tree0_root.addr == 0) return true;
+    const sp = node_seq.spaceOf(volume_base, page_root.seq);
+    if (sp == node_seq.spaceOf(volume_base, tree0_root.seq)) return page_root.seq >= tree0_root.seq;
+    const own = lessee_space orelse return true;
+    return sp == own;
+}
+
 /// Fold tree 0's `slot_state` records (`kvs`, the scan range's) with the
 /// entries of `pages` — appender 0's and every live lessee's, each
 /// settled under its owner — into `out`: every record, a never-minted
-/// slot with `root.addr == 0` (its cursor is still a floor).
-pub fn foldGuestRoots(gpa: std.mem.Allocator, kvs: []const tree.KeyValue, pages: []const page.Page, view: Tree0View, out: *std.ArrayList(GuestRoot)) FoldError!void {
+/// slot with `root.addr == 0` (its cursor is still a floor). `volume_base`:
+/// the volume's `nodeSeqBase(uuid)`, whose incarnation spaces order a
+/// generation's two homes (`pageRootNewer`).
+pub fn foldGuestRoots(gpa: std.mem.Allocator, kvs: []const tree.KeyValue, pages: []const page.Page, view: Tree0View, volume_base: u64, out: *std.ArrayList(GuestRoot)) FoldError!void {
     for (kvs) |kv| {
         const slot = slotOfKey(kv.key) orelse continue;
         const v = decode(kv.value) catch return error.Corrupt;
@@ -96,10 +121,9 @@ pub fn foldGuestRoots(gpa: std.mem.Allocator, kvs: []const tree.KeyValue, pages:
         var extents: u64 = v.slot_tree_extents;
         var g = v.g;
         var lessee: ?u32 = if (v.variant == .unleased) null else v.appender_id;
-        // Whether `root` is a page's: at tree 0's generation the settled
-        // page entry is the live home and beats the grant-time word; between
-        // homes only the generation orders, never a node seq — a recovered
-        // tree moves under its adopter's space, below the dead joiner's.
+        // Whether `root` is a page's: at tree 0's generation a settled page
+        // entry beats tree 0's word only when its root is the newer
+        // (`pageRootNewer`); between pages only the generation orders.
         var from_page = false;
         for (pages) |p| for (p.slotEntries()) |e| if (e.slot == slot) {
             const ahead = view == .projected and e.g > v.g;
@@ -108,7 +132,7 @@ pub fn foldGuestRoots(gpa: std.mem.Allocator, kvs: []const tree.KeyValue, pages:
             else
                 lease_table.settleEntry(v, e, p.appender_id);
             switch (verdict) {
-                .adopt, .complete_release => |a| if (a.g > g or (a.g == g and !from_page)) {
+                .adopt, .complete_release => |a| if (a.g > g or (a.g == g and !from_page and pageRootNewer(a.words.root, root, if (p.appender_id == journal.FIXED_RING_APPENDER) 0 else null, volume_base))) {
                     from_page = true;
                     root = a.words.root;
                     cursor = @max(cursor, a.words.cursor);
@@ -153,13 +177,13 @@ test "the offline fold: tree 0's root stands alone; a Live page entry at the rec
     try p0.setSlots(&.{.{ .slot = 3, .state = .live, .g = 2, .slot_tree_extents = 7, .root_addr = 8192, .root_seq = 9, .cursor = 50 }});
     var out: std.ArrayList(GuestRoot) = .empty;
     defer out.deinit(gpa);
-    try foldGuestRoots(gpa, &kvs, &.{}, .replayed, &out);
+    try foldGuestRoots(gpa, &kvs, &.{}, .replayed, 0, &out);
     try testing.expectEqual(@as(usize, 2), out.items.len);
     try testing.expectEqual(@as(u64, 4096), out.items[0].root.addr);
     try testing.expectEqual(@as(u64, 0), out.items[1].root.addr);
     try testing.expectEqual(@as(u64, 2), out.items[1].cursor);
     out.clearRetainingCapacity();
-    try foldGuestRoots(gpa, &kvs, &.{p0}, .replayed, &out);
+    try foldGuestRoots(gpa, &kvs, &.{p0}, .replayed, 0, &out);
     try testing.expectEqual(@as(u64, 8192), out.items[0].root.addr);
     try testing.expectEqual(@as(u64, 50), out.items[0].cursor);
     try testing.expectEqual(@as(u64, 7), out.items[0].extents);
@@ -168,7 +192,7 @@ test "the offline fold: tree 0's root stands alone; a Live page entry at the rec
     other.appender_id = 5;
     const kvs2 = [_]tree.KeyValue{.{ .key = @constCast(keyOf(3).slice()), .value = @constCast(&other.encode()) }};
     out.clearRetainingCapacity();
-    try testing.expectError(error.Conflict, foldGuestRoots(gpa, &kvs2, &.{p0}, .replayed, &out));
+    try testing.expectError(error.Conflict, foldGuestRoots(gpa, &kvs2, &.{p0}, .replayed, 0, &out));
     // Slot 3 leased to appender 5 at g 3: appender 0's page still carries
     // its entry at g 2 (stale residue, dropped), appender 5's page names
     // the root its SMOs moved to — the fold takes the lessee's.
@@ -179,14 +203,14 @@ test "the offline fold: tree 0's root stands alone; a Live page entry at the rec
     var p5 = page.Page.free(5, 1, page.SegmentTable.one(.{ .start = 0, .len = 4096 }));
     try p5.setSlots(&.{.{ .slot = 3, .state = .live, .g = 3, .slot_tree_extents = 2, .root_addr = 16384, .root_seq = 12, .cursor = 60 }});
     out.clearRetainingCapacity();
-    try foldGuestRoots(gpa, &kvs3, &.{ p0, p5 }, .replayed, &out);
+    try foldGuestRoots(gpa, &kvs3, &.{ p0, p5 }, .replayed, 0, &out);
     try testing.expectEqual(@as(u64, 16384), out.items[0].root.addr);
     try testing.expectEqual(@as(u64, 12), out.items[0].root.seq);
     try testing.expectEqual(@as(u64, 60), out.items[0].cursor);
     try testing.expectEqual(@as(?u32, 5), out.items[0].lessee);
     // Without the lessee's page the fold stands at the grant-time word.
     out.clearRetainingCapacity();
-    try foldGuestRoots(gpa, &kvs3, &.{p0}, .replayed, &out);
+    try foldGuestRoots(gpa, &kvs3, &.{p0}, .replayed, 0, &out);
     try testing.expectEqual(@as(u64, 4096), out.items[0].root.addr);
 }
 
@@ -204,14 +228,14 @@ test "a slot the manager adopted from a dead joiner: its page entry at tree 0's 
     try p0.setSlots(&.{.{ .slot = 65, .state = .live, .g = 2, .slot_tree_extents = 3, .root_addr = 0x1f40000, .root_seq = b + 89, .cursor = 40 }});
     var out: std.ArrayList(GuestRoot) = .empty;
     defer out.deinit(gpa);
-    try foldGuestRoots(gpa, &kvs, &.{p0}, .replayed, &out);
+    try foldGuestRoots(gpa, &kvs, &.{p0}, .replayed, b, &out);
     try testing.expectEqual(@as(u64, 0x1f40000), out.items[0].root.addr);
     try testing.expectEqual(b + 89, out.items[0].root.seq);
     try testing.expectEqual(@as(u64, 40), out.items[0].cursor);
     // A release the next open completes from the page (row 5): the same.
     try p0.setSlots(&.{.{ .slot = 65, .state = .releasing, .g = 2, .slot_tree_extents = 3, .root_addr = 0x1f40000, .root_seq = b + 89, .cursor = 41 }});
     out.clearRetainingCapacity();
-    try foldGuestRoots(gpa, &kvs, &.{p0}, .replayed, &out);
+    try foldGuestRoots(gpa, &kvs, &.{p0}, .replayed, b, &out);
     try testing.expectEqual(@as(u64, 0x1f40000), out.items[0].root.addr);
 }
 
@@ -224,7 +248,7 @@ test "a page copy OLDER than tree 0's replayed record at the same generation —
     try p0.setSlots(&.{.{ .slot = 7, .state = .live, .g = 1, .slot_tree_extents = 1, .root_addr = 0x4000, .root_seq = b + 10, .cursor = 8 }});
     var out: std.ArrayList(GuestRoot) = .empty;
     defer out.deinit(gpa);
-    try foldGuestRoots(gpa, &kvs, &.{p0}, .replayed, &out);
+    try foldGuestRoots(gpa, &kvs, &.{p0}, .replayed, b, &out);
     try testing.expectEqual(@as(u64, 0x5000), out.items[0].root.addr);
     try testing.expectEqual(b + 20, out.items[0].root.seq);
     try testing.expectEqual(@as(u64, 9), out.items[0].cursor);
@@ -243,18 +267,18 @@ test "the projected fold (a reader's tree 0, no ring): a page entry ABOVE the re
     try p5.setSlots(&.{.{ .slot = 3, .state = .live, .g = 2, .slot_tree_extents = 2, .root_addr = 16384, .root_seq = 12, .cursor = 60 }});
     var out: std.ArrayList(GuestRoot) = .empty;
     defer out.deinit(gpa);
-    try foldGuestRoots(gpa, &kvs, &.{ p0, p5 }, .projected, &out);
+    try foldGuestRoots(gpa, &kvs, &.{ p0, p5 }, .projected, 0, &out);
     try testing.expectEqual(@as(u64, 16384), out.items[0].root.addr);
     try testing.expectEqual(@as(u64, 60), out.items[0].cursor);
     try testing.expectEqual(@as(?u32, 5), out.items[0].lessee);
     // Page order does not decide: the generation does.
     out.clearRetainingCapacity();
-    try foldGuestRoots(gpa, &kvs, &.{ p5, p0 }, .projected, &out);
+    try foldGuestRoots(gpa, &kvs, &.{ p5, p0 }, .projected, 0, &out);
     try testing.expectEqual(@as(u64, 16384), out.items[0].root.addr);
     // The same entries against a REPLAYED tree 0: an Unleased record
     // makes both Live entries stale residue — tree 0's word stands.
     out.clearRetainingCapacity();
-    try foldGuestRoots(gpa, &kvs, &.{ p0, p5 }, .replayed, &out);
+    try foldGuestRoots(gpa, &kvs, &.{ p0, p5 }, .replayed, 0, &out);
     try testing.expectEqual(@as(u64, 4096), out.items[0].root.addr);
     try testing.expectEqual(@as(?u32, null), out.items[0].lessee);
 }

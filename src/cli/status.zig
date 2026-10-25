@@ -200,7 +200,7 @@ pub fn readRefCensus(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
         if (try readAppender0Page(gpa, &dev, sb)) |p0| try pages.append(gpa, p0);
         var roots: std.ArrayList(slot_state.GuestRoot) = .empty;
         defer roots.deinit(gpa);
-        slot_state.foldGuestRoots(gpa, kvs.items, pages.items, .projected, &roots) catch |e| return switch (e) {
+        slot_state.foldGuestRoots(gpa, kvs.items, pages.items, .projected, node_seq.nodeSeqBase(sb.uuid), &roots) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Corrupt, error.Conflict => error.Unexpected,
         };

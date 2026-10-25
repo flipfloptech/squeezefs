@@ -2287,7 +2287,7 @@ pub const KvBackend = struct {
         if (reader) if (test_seams.reader_after_pages) |h| h.call(h.ctx);
         var roots: std.ArrayList(slot_state.GuestRoot) = .empty;
         defer roots.deinit(gpa);
-        slot_state.foldGuestRoots(gpa, kvs.items, pages.items, if (reader) .projected else .replayed, &roots) catch |e| switch (e) {
+        slot_state.foldGuestRoots(gpa, kvs.items, pages.items, if (reader) .projected else .replayed, node_seq.nodeSeqBase(be.sb.uuid), &roots) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Corrupt => {
                 if (reader) return be.readerStale(.{ .what = .fold });
@@ -2485,7 +2485,7 @@ pub const KvBackend = struct {
         var out: std.ArrayList(slot_state.GuestRoot) = .empty;
         defer out.deinit(gpa);
         const kv = [_]tree.KeyValue{.{ .key = @constCast(k.slice()), .value = value }};
-        slot_state.foldGuestRoots(gpa, &kv, pages.items, .projected, &out) catch |e| switch (e) {
+        slot_state.foldGuestRoots(gpa, &kv, pages.items, .projected, node_seq.nodeSeqBase(be.sb.uuid), &out) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Corrupt, error.Conflict => return be.readerStale(.{ .what = .fold, .slot = slot }),
         };

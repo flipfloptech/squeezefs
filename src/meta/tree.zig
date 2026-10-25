@@ -403,14 +403,16 @@ pub const KvTree = struct {
         // re-created tree would re-mint the SAME seq into the SAME recycled
         // extent and the dead incarnation's frames there would verify as
         // its own (node.zig's incarnation check compares for equality).
-        // The residue ceiling floors the mint above every stamp the extent
-        // still carries (§2.6; a foreign-space stamp is ignored by the
-        // handle's own law).
+        // The residue ceiling floors the mint above every stamp of the
+        // handle's OWN space the extent still carries (§2.6): a stamp of
+        // another space (an earlier format's, a joiner's) can never equal
+        // a mint, and a foreign maximum the bounded handle ignores must not
+        // hide the lost root's stamp beneath it.
         {
             const residue = try snapshot.SharedBuf.createExtent(gpa, cache.cfg.layout.node_size);
             defer residue.release();
             try cache.loader.readExtent(cache.loader.ctx, addr, residue.data);
-            seq.raiseTo(node.residueSeqCeiling(residue.data));
+            seq.raiseTo(node.residueSeqCeiling(residue.data, seq.ceilingValue()));
         }
         const ns = try seq.mint();
         var w = try node.writeNode(gpa, cache.cfg.layout, .{

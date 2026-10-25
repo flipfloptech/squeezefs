@@ -1035,7 +1035,7 @@ pub const VolumeBinding = struct {
                     error.Io => error.Io,
                 };
                 defer gpa.free(img);
-                be.seq.raiseTo(node.residueSeqCeiling(img));
+                be.seq.raiseTo(node.residueSeqCeiling(img, be.seq.ceilingValue()));
                 try (if (node.residueStampedBy(img, appender_id)) orphans else unwritten).append(gpa, e);
             }
         }

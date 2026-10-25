@@ -769,18 +769,23 @@ pub fn describeRefusal(gpa: Allocator, buf: []const u8, layout: NodeLayout, node
     return "";
 }
 
-/// §2.6 The highest node-seq stamp the RESIDUE of one extent carries: the
-/// header's `node_seq` if the page decodes, and `node_seq_at_write` of every
-/// frame header at any 4 KiB slot whose magic is KBSF and whose checksum
-/// verifies over `[0..32)` — whatever incarnation stamped it; geometry,
-/// version and reserved are never trusted (only the stamp is read). 0 when
-/// nothing verifies. The offline census reclaim floors the writer's seq
-/// above it.
-pub fn residueSeqCeiling(buf: []const u8) u64 {
+/// §2.6 The highest node-seq stamp BELOW `below` the RESIDUE of one extent
+/// carries: the header's `node_seq` if the page decodes, and
+/// `node_seq_at_write` of every frame header at any 4 KiB slot whose magic
+/// is KBSF and whose checksum verifies over `[0..32)` — whatever
+/// incarnation stamped it; geometry, version and reserved are never trusted
+/// (only the stamp is read). 0 when nothing verifies. `below` is the
+/// minting handle's ceiling: a stamp at or above it is another space's (an
+/// earlier format's, a joiner's), can never equal a mint of this one, and
+/// must not hide this space's own highest stamp beneath it — a handle that
+/// ignores the foreign maximum would re-mint a lost root's seq into the
+/// same extent (xfstests generic/056, 073, 342 after a power cut). The
+/// census reclaim and a tree's first mint floor the writer's seq above it.
+pub fn residueSeqCeiling(buf: []const u8, below: u64) u64 {
     var ceiling: u64 = 0;
     if (buf.len >= NODE_PAGE) {
         if (decodeHeaderPage(buf[0..NODE_PAGE], null)) |h| {
-            ceiling = h.node_seq;
+            if (h.node_seq < below) ceiling = h.node_seq;
         } else |_| {}
     }
     var pos: usize = NODE_PAGE;
@@ -789,7 +794,8 @@ pub fn residueSeqCeiling(buf: []const u8) u64 {
         if (std.mem.readInt(u32, hdr[0..4], .little) != bset.BSET_FRAME_MAGIC) continue;
         const checked = bset.BSET_FRAME_CHECKSUM_OFF;
         if (std.mem.readInt(u64, hdr[checked..][0..8], .little) != checksum.hash64(hdr[0..checked])) continue;
-        ceiling = @max(ceiling, std.mem.readInt(u64, hdr[8..16], .little));
+        const stamp = std.mem.readInt(u64, hdr[8..16], .little);
+        if (stamp < below) ceiling = @max(ceiling, stamp);
     }
     return ceiling;
 }
@@ -1557,7 +1563,7 @@ test "stale bsets from a recycled extent do not leak: a first life (seq 5, base 
     }
     try testing.expectEqual(dropped_before, meta_kv_node_dropped_tail_bsets.load());
     // The residue ceiling sees every verifying stamp whatever the incarnation.
-    try testing.expectEqual(@as(u64, 5), residueSeqCeiling(vol.extent(l, 0)));
+    try testing.expectEqual(@as(u64, 5), residueSeqCeiling(vol.extent(l, 0), std.math.maxInt(u64)));
 }
 
 test "torn-tail classifier: a torn unit truncates the view and is counted (priors intact); a valid bset after a tear with horizon ≤ durable_tail fails loud; a geometry liar is Corrupt, not a tear" {
@@ -1836,16 +1842,16 @@ test "a frame with a foreign version or a non-zero reserved field is Garbage (a 
     }
 }
 
-test "residue ceiling: the header's seq and every verifying frame stamp at any 4 KiB slot; 0 for nothing" {
+test "residue ceiling: the header's seq and every verifying frame stamp at any 4 KiB slot below the minting space's ceiling; 0 for nothing" {
     const gpa = testing.allocator;
     const l = defaultLayout();
     var vol = try Volume.init(gpa, DEFAULT_NODE_SIZE);
     defer vol.deinit(gpa);
-    try testing.expectEqual(@as(u64, 0), residueSeqCeiling(vol.bytes));
-    try testing.expectEqual(@as(u64, 0), residueSeqCeiling(vol.bytes[0..100]));
+    try testing.expectEqual(@as(u64, 0), residueSeqCeiling(vol.bytes, std.math.maxInt(u64)));
+    try testing.expectEqual(@as(u64, 0), residueSeqCeiling(vol.bytes[0..100], std.math.maxInt(u64)));
     var hdr = try vol.writeNodeAt(gpa, l, wp(0, 40, "", "\xff"), &.{}, 0);
     defer hdr.deinit(gpa);
-    try testing.expectEqual(@as(u64, 40), residueSeqCeiling(vol.bytes));
+    try testing.expectEqual(@as(u64, 40), residueSeqCeiling(vol.bytes, std.math.maxInt(u64)));
     // Frames of other incarnations deep in the extent, under any stamp:
     // every verifying one counts; a frame with a broken checksum does not.
     var r = [_]Record{try putIno(gpa, 1, 1)};
@@ -1854,20 +1860,25 @@ test "residue ceiling: the header's seq and every verifying frame stamp at any 4
     const f1 = try bset.encodeBsetFrame(gpa, .{}, DEFAULT_NODE_SIZE, 77, refsOf(&r, &rbuf), 1);
     defer gpa.free(f1);
     vol.write(10 * NODE_PAGE, f1);
-    try testing.expectEqual(@as(u64, 77), residueSeqCeiling(vol.bytes));
+    try testing.expectEqual(@as(u64, 77), residueSeqCeiling(vol.bytes, std.math.maxInt(u64)));
     const f2 = try stampedFrame(gpa, DEFAULT_NODE_SIZE, 90, .{ .appender_id = 1, .g = 1 }, 2, 2);
     defer gpa.free(f2);
     vol.write(20 * NODE_PAGE, f2);
-    try testing.expectEqual(@as(u64, 90), residueSeqCeiling(vol.bytes));
+    try testing.expectEqual(@as(u64, 90), residueSeqCeiling(vol.bytes, std.math.maxInt(u64)));
+    // A stamp at or above the ceiling is another space's: skipped, never
+    // hiding the highest stamp below it (77, the header's 40 below 41).
+    try testing.expectEqual(@as(u64, 77), residueSeqCeiling(vol.bytes, 90));
+    try testing.expectEqual(@as(u64, 40), residueSeqCeiling(vol.bytes, 77));
+    try testing.expectEqual(@as(u64, 0), residueSeqCeiling(vol.bytes, 40));
     vol.bytes[20 * NODE_PAGE + 9] ^= 1;
-    try testing.expectEqual(@as(u64, 77), residueSeqCeiling(vol.bytes));
+    try testing.expectEqual(@as(u64, 77), residueSeqCeiling(vol.bytes, std.math.maxInt(u64)));
     // The ceiling trusts only the checksum: a verifying frame of a foreign
     // VERSION still names its incarnation (residue is residue).
     std.mem.writeInt(u16, vol.bytes[10 * NODE_PAGE + 4 ..][0..2], 3, .little);
     restampFrame(vol.bytes[10 * NODE_PAGE ..][0..FRAME_LEN]);
-    try testing.expectEqual(@as(u64, 77), residueSeqCeiling(vol.bytes));
+    try testing.expectEqual(@as(u64, 77), residueSeqCeiling(vol.bytes, std.math.maxInt(u64)));
     vol.bytes[10 * NODE_PAGE + 9] ^= 1;
-    try testing.expectEqual(@as(u64, 40), residueSeqCeiling(vol.bytes));
+    try testing.expectEqual(@as(u64, 40), residueSeqCeiling(vol.bytes, std.math.maxInt(u64)));
 }
 
 test "residue stamped by: an unwritten extent and a header-only image answer false for every appender; a verifying frame stamped by the appender anywhere in the extent answers true, a broken checksum or another appender's stamp does not" {

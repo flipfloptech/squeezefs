@@ -303,7 +303,10 @@ pub const IpcHost = struct {
             .wait_bound_ns = &d.plane.wp.stall_answer_ns,
         });
         errdefer self.sink.deinit();
-        if (self.dd) |dd| dd.read_fallback = self.sink.readFallback();
+        if (self.dd) |dd| {
+            dd.read_fallback = self.sink.readFallback();
+            dd.read_note = self.sink.readNote();
+        }
         // The owners (threads spawn on admission).
         self.owners = try gpa.alloc(*service.Owner, ceiling);
         errdefer gpa.free(self.owners);

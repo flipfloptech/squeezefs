@@ -758,6 +758,17 @@ pub const DataPlaneSink = struct {
         return .{ .ctx = self, .call = &readFallbackFn };
     }
 
+    fn readNoteFn(ctx: *anyopaque, b: *const session_mod.Binding) void {
+        const self: *DataPlaneSink = @ptrCast(@alignCast(ctx));
+        self.noteRead(b);
+    }
+
+    /// The engine's face on the atime law (`direct.Engine.read_note`): a
+    /// direct read the lane served is noted as the fast path's are.
+    pub fn readNote(self: *DataPlaneSink) direct.ReadNote {
+        return .{ .ctx = self, .call = &readNoteFn };
+    }
+
     /// A handoff onto a FUSE-class lane homed on the session's node; a lane
     /// at capacity walks the rotation. False = every lane refused: the
     /// caller's op waits (`wait`), never EAGAIN.

@@ -85,8 +85,11 @@
 //! snapshot taken BEFORE the DMA) becomes ONE `READ` SQE on MY shard with
 //! the arena window as the destination — zero daemon copies — and the CQE
 //! runs the leg's recheck (incarnation still ∧ the map still binds; charter
-//! §6.3's validation after the bytes are in hand): valid ⇒ the ACK; else
-//! the handler re-serves the op through the ordinary read handoff.
+//! §6.3's validation after the bytes are in hand): valid ⇒ the atime note
+//! (the sink's `note_read` with the binding's open flags — charter §4
+//! "Access time": the law is the file's, not the path's) and the ACK; else
+//! the handler re-serves the op through the ordinary read handoff, and
+//! stamps it there.
 //!
 //! Completion ordering: none is promised across ops — a slot completes
 //! when ITS CQE is drained, the shard CQ is consumed in CQE order by
@@ -746,6 +749,13 @@ pub const Engine = struct {
             stats.ipc_read_arena_dma_bytes.add(p.len);
             stats.ipc_ops_read.inc();
             stats.ipc_bytes_out.add(p.len);
+            // Served: the mount's atime law judges it before the ACK (a
+            // stat after the read folds the stamp), with the binding's
+            // open flags.
+            if (self.read_note) |n| {
+                n.call(n.ctx, &r.op.binding);
+                stats.ipc_dd_read_atime_notes.inc();
+            }
             p.c.complete(@intCast(p.len));
             return;
         }

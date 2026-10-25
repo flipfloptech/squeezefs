@@ -223,9 +223,22 @@ again after `-o remount,strictatime` (`dev`'s binary on the same shape: `passed 
 through the harness (`LTP_FILES=syscalls LTP_PATTERN='^open12$' SUITE_RUNS=1`): `1 pass`, 0
 alerts, fsck 0 findings (`ledger rc 3` is the subset's stale-row artifact).
 
-**Owed (found here, not this fix's).** The interception host's direct-drive READ lane
-(`SQUEEZEFS_IL_DIRECT_READ`, default 1: `service.serveRead` → `direct.tryDirectRead` →
-`finishRead`) notes no read at all: a cold aligned ring read it serves never reaches
-`note_read`, so the mount's law misses it (the FUSE worker's direct leg notes at its bridge).
-The fix is the worker's shape (note at the submission, `Binding.openFlags()`), with a red e2e of
-its own.
+**The direct-drive READ lane (closed, a gap of `bbced72`'s).** The interception host's
+direct-drive READ lane (`SQUEEZEFS_IL_DIRECT_READ`, default 1: `service.serveRead` →
+`direct.tryDirectRead` → `finishRead`) noted no read at all: a cold aligned ring read it served
+never reached `note_read`. It now notes every read it SERVES, after the recheck and before the
+ACK, through the sink's face (`Engine.read_note` = `DataPlaneSink.readNote`, the fast path's
+`noteRead` with `Binding.openFlags()`: O_NOATIME exempts it). A failed recheck notes nothing
+there: the fallback's handler stamps its own read, so a read is judged once (the FUSE worker's
+direct leg notes at its bridge push instead). Red first (`test(ipc): red`, the lane's face and
+counter inert): unit `the dd lane's READ under the atime law` over a RAM KvFs under strictatime —
+the plain binding's served read `expected 1, found 0` (the same on an `origin/dev` checkout with
+the plain arm alone, `dev` having no O_NOATIME binding); THE INTERCEPTION HOST — `expected 2,
+found 0`: every direct read served is handed to the law, `ipc_dd_read_atime_notes ≡
+ipc_dd_read_serves`. The row judges at the lane's counter: a parked stamp absorbs the next
+read's (one per drain tick per file, a per-stripe hint bit), so neither `fuse_atime_touches` nor
+`stat` is exact there; the O_NOATIME exemption on this lane is the unit's to judge. Counts on the
+fix: the unit filters `the dd lane` 44, `service` 55, `ipc.host` 66, `atime` 61, `kv_fs` 120,
+`read_view` 46, `O_NOATIME` 47 — 0 failed; THE INTERCEPTION HOST (and its death row), THE DIRECT
+ARM, THE READ VIEW pass; `zig build shim-smoke` 43/43; the ATIME row 10/10; rails 18/18; fmt
+clean.

@@ -216,3 +216,16 @@ runs `python3 -I`: a plain `-c` lists its cwd, the mount's root, for its imports
 THE DIRECT ARM, THE INTERCEPTION HOST (and its death row) pass; unit filters `atime` 59, `kv_fs`
 120, `read_view` 46, `O_NOATIME` 46, `fcntl F_SETLK` 40, `ring binding` 42, `FD SCREEN` 40, `fd
 facts` 40, `bindings: ids` 40 — 0 failed; `zig build rails` 18/18; `zig fmt --check` clean.
+
+**LTP open12 by hand** (binary `616f997`, TMPDIR on a fresh mount, `env --default-signal=INT,QUIT`,
+run from `testcases/bin` as `ltp.sh` does): `passed 32, failed 0` under the kernel's relatime and
+again after `-o remount,strictatime` (`dev`'s binary on the same shape: `passed 24, failed 8`);
+through the harness (`LTP_FILES=syscalls LTP_PATTERN='^open12$' SUITE_RUNS=1`): `1 pass`, 0
+alerts, fsck 0 findings (`ledger rc 3` is the subset's stale-row artifact).
+
+**Owed (found here, not this fix's).** The interception host's direct-drive READ lane
+(`SQUEEZEFS_IL_DIRECT_READ`, default 1: `service.serveRead` → `direct.tryDirectRead` →
+`finishRead`) notes no read at all: a cold aligned ring read it serves never reaches
+`note_read`, so the mount's law misses it (the FUSE worker's direct leg notes at its bridge).
+The fix is the worker's shape (note at the submission, `Binding.openFlags()`), with a red e2e of
+its own.

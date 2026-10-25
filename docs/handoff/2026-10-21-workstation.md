@@ -237,6 +237,62 @@ final head waits on the rulings above.
    unreclaimable arm would read Red at 33 GB of desktop memory); `/sbin/*.squeezefs` helper symlinks
    and `/run/squeezefs-suites.env` are venue-global and repoint to whichever tree ran last.
 
+## The release window continued, 2026-10-23 → 10-25 (on 7.3; checkpoint `dev` `78a4389`)
+
+**The six owner rulings of 10-23** and **the six of 10-24** are all landed: export handles
+(`380e4c1`), inode flags (`07d0e74`), fallocate (`2a079de` + follow-ups), the suites on the shipped
+SYMMETRIC posture (`291ca31`), generic/563 by-design row, two flake rows retired; generic/741
+by-design-symmetric-join, generic/424 statx row with NO kernel patches, FIEMAP UNSUPPORTED (the
+kernel answers it for FUSE; the patch stays on the unmerged branch `feat/fiemap`), the supervisor
+HOLDS a failed replay's journal tail (§BR), a live member evicted with nothing un-landed RE-JOINS IN
+PLACE (§BS), no write cache without a supervisor (§BR.6). The owner's standing rules from the
+window: never skip or adjudicate unless 100 % certain; a failed suite means fix now; no disk-size
+limit; xfstests watched by log, fail fast, resume discovery after a failure (`FSTESTS_AFTER`).
+
+**xfstests `-g auto` PASSED on `e5253be`** (794 ran, the 6 failures all adjudicated rows, 0
+unadjudicated, fsck 0 findings on both sets; the alert census explained: ~100 dm-error FAILED
+mounts × the once-per-class latch lines, the scsi_debug discard notice, generic/347's watchdog
+during dm-thin's 60 s hold). The harness moved its sets to DISK (`/build/suites-disk`, no-CoW
+btrfs — the zram /build/tmp filled under 299/302/303) and gained a run token (a hand-run `check`
+had unmounted 366's scratch), scope cleanup after a fail-early stop, raw-device and 36 MiB–17 TiB
+sets.
+
+**What the suites and their follow-ups found and fixed (gates 87–138), by class:**
+- **Silent data loss / wrong bytes (every one red-first):** a failed read freed its buffer twice
+  (`b61d5cb`); a punch starting on a block boundary zeroed nothing (`8ad5340`); a freed block re-used
+  before its free was durable — after a power cut one file read ANOTHER file's bytes and fsck was
+  clean (`b23ed27`, §BT); a joiner's append to a holder's file read zeros (the holder ran the size
+  claim through its truncate path), a stale grant size overwrote the holder's bytes (`a81c2b7`);
+  alternating appends lost bytes (`1afede7`, register-then-check); a truncate racing a claim regrew
+  over clipped blocks (`9e3b042`); a joiner read a holder's block-map file as zeros (`27740ec`); a
+  joiner wrote into the manager's tree 0 on disk (`ac7986e`); a failed re-stage left zeros
+  (`c9b0a4d`, `e56c1ee`); every unservable foreign binding now answers EIO, never zeros (`ab57acf`).
+- **Hangs/wedges and killed mounts:** the times drain held a directory lock until its journal landed
+  (`9075cbd`); a stalled device's parked write waited for the kernel's 135 s abort (now ENOSPC/EIO
+  before it, `d5f06b1`); a coherence notify unmounted binds (`1d4c668`); the sideband locked a
+  directory it owed a reply on (`b9e7e3d`); a live member evicted behind slow follow-ups (`13e3334`);
+  a join after a manager remount dialled the dead port (`71374e9`).
+- **No EAGAIN anywhere:** fsyncs coalesce (`c46daa5`), committers park (`5c9e261`), full device lanes
+  park (`5898907`), the interposer's handoff waits (`216af19`); short counts are POSIX (`4599ba2`).
+- **Memory and caches:** an idle daemon 2,035 → 262 MB at a 64 MiB budget (`3985727`…`702cce1`); the
+  census storm (a writer wiped peers' read caches, `0fbd2c4`); inserts lost a doubling race
+  (`33e9b2d`).
+- **Tripwires reclassified as counted regimes:** `alloc_trim_window_parks`,
+  `parked_gate_wall_supply_visible`, `upload_join_overlong`; the conveyor's window gate
+  (`9744d22`, a real correctness fix behind `meta_conveyor_pass_panics`).
+- **Log hygiene:** a FAILED volume logs each class once (`5d3e411`, `afd1649`: 12,110 → 1,802 lines).
+
+**Perf A-B-B-A on 7.3 (`d46dd83`):** atime + idle RSS + the window gate cost nothing measurable
+(rr4k +0.5 %, sw1m −0.6 %). **Owed on a quiet host:** fsync coalescing, the free hold, the resolve
+fault's two loads per write, the append path, the census fix's read-while-write win.
+
+**Next (in order):** the `writerFlockHeld` red (agent in flight) → the final head → the perf session
+→ the verdict suites on the final head (xfstests, LTP, pjdfstest/mdtest/tarx ×3) → the final gate
+with no fixes + the train 3/3 → the tag (owner confirms) → the 9.33 boot + one gate. **Owed, not
+blocking:** cache-less small-file packing (a per-file exclusion with a model, §BR.11 (d)); the
+watchdog's repeated census during a known device stall; small-block read-cache hits; the map
+window's over-purge on a slide.
+
 ## Method notes (added today)
 
 - **The gate is fast now** (4–7 min sharded; the 65 min figure is stale). A branch gets ONE gate

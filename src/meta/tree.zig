@@ -1643,6 +1643,57 @@ test "create floors the root's seq above the extent's residue: a tree re-created
     try testing.expectEqual(@as(?[]u8, null), try reborn.lookup(gpa, &ikey(2)));
 }
 
+test "a guest tree re-created after a crash on its recycled extent mints above the lost root's stamp even where an earlier format's frame there carries a HIGHER stamp of another space — the residue floor is the highest stamp of the mint's OWN space, never a foreign maximum the bounded handle drops whole (xfstests generic/056, 073, 342 after a power cut on a re-formatted scratch device: the lost root's frames verified as the re-minted root's own, [C1] on the slot's records)" {
+    const gpa = testing.allocator;
+    var vol = try smo.TestVolume.init(gpa, .{});
+    defer vol.deinit();
+    const base: u64 = 1 << 40;
+    var buf: [64]u8 = undefined;
+    // An earlier format's tree at extent 0: its frames stamped in another
+    // space, above this format's.
+    vol.seq.raiseTo(base + 64 * node_seq.INCARNATION_SPACE);
+    const earlier = try vol.createTree(.{ .slot = key.guestForestSlot(3) });
+    for (0..3) |round| {
+        for (0..4) |i| try earlier.insert(&ikey(10 * round + i), testValue(i, 24, &buf));
+        try vol.flushDirty(earlier);
+    }
+    // This format: the writer's handle at its own seed; a guest tree minted
+    // on extent 0 (its claim never durable), one record appended into its
+    // root, then the crash.
+    var lost_root: RootPtr = undefined;
+    {
+        var cache = try vol.freshCache();
+        defer cache.deinit();
+        var alloc = try alloc_ext.ExtentAllocator.format(gpa, vol.cfg.extents, vol.cfg.reserve, vol.cfg.pending_cap);
+        defer alloc.deinit();
+        var seq = node_seq.managerHandle(base + 2, base);
+        const lost = try KvTree.create(gpa, cache, &alloc, .{ .slot = key.guestForestSlot(5) }, &seq);
+        defer lost.destroy();
+        lost_root = lost.rootPtr();
+        try testing.expectEqual(earlier.rootPtr().addr, lost_root.addr);
+        try lost.insert(&ikey(1), testValue(1, 24, &buf));
+        const n = try cache.get(lost_root.addr);
+        defer n.release();
+        const d = n.lockWrite(testing.io);
+        const frozen = try n.freezeLocked(d, cache.cfg.layout);
+        n.unlockWrite(testing.io);
+        try testing.expect(frozen != null);
+        try testing.expect(try cache.appendFrozen(n));
+    }
+    // The next mount: the handle reseeded at the same watermark, the
+    // extent free again, the slot re-minted from the replayed window.
+    var cache = try vol.freshCache();
+    defer cache.deinit();
+    var alloc = try alloc_ext.ExtentAllocator.format(gpa, vol.cfg.extents, vol.cfg.reserve, vol.cfg.pending_cap);
+    defer alloc.deinit();
+    var seq = node_seq.managerHandle(base + 2, base);
+    const reborn = try KvTree.create(gpa, cache, &alloc, .{ .slot = key.guestForestSlot(5) }, &seq);
+    defer reborn.destroy();
+    try testing.expectEqual(lost_root.addr, reborn.rootPtr().addr);
+    try testing.expectEqual(@as(?[]u8, null), try reborn.lookup(gpa, &ikey(1)));
+    try testing.expect(reborn.rootPtr().seq > lost_root.seq);
+}
+
 test "a re-formatted volume's node seqs never leave its own space: the writer's first guest tree, minted on a recycled extent, ignores the earlier format's residue stamps — a counter raised to them re-mints the earlier format's seqs, and the earlier frames past a new node's log end at the same extent verify as its own (xfstests generic/753 on a scratch device every test re-formats: `SMO fold-source log-view mismatch … disk walk ends at 262144, the live object's append cursor is at 258048`, the checkpoint wedged, then `corruption outside the replay window`)" {
     const gpa = testing.allocator;
     var vol = try smo.TestVolume.init(gpa, .{});

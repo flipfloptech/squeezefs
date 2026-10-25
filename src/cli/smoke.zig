@@ -9245,6 +9245,23 @@ const DmErrorSet = struct {
         return if (r.term.success()) null else .{ .class = .no_kernel_feature, .detail = "dm-flakey" };
     }
 
+    /// `fsck --offline --scrub` of the set, clean or refused; the metadata
+    /// slice as fsck found it is kept beside the work dir on a refusal
+    /// (fsck's guarded open replays and checkpoints in place).
+    fn fsckClean(self: *DmErrorSet, label: []const u8) !void {
+        const rig = self.rig;
+        var script: [256]u8 = undefined;
+        rig.freeRunOk(try rig.sh(rig.work, try std.fmt.bufPrint(&script, "dd if=/dev/mapper/{s}-meta of=meta.prefsck.img bs=4M iflag=direct conv=sparse status=none", .{self.name})));
+        const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", self.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+            std.debug.print("\n--- fsck --offline after {s} ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ label, r.term, r.stdout, r.stderr });
+            rig.freeRunOk(try rig.sh(rig.work, try std.fmt.bufPrint(&script, "mkdir -p /build/tmp/fsck-refused-dm-{d} && cp --sparse=always meta.prefsck.img /build/tmp/fsck-refused-dm-{d}/", .{ linux.getpid(), linux.getpid() })));
+            std.debug.print("the metadata slice before fsck kept in /build/tmp/fsck-refused-dm-{d}\n", .{linux.getpid()});
+            return error.FsckNotClean;
+        }
+    }
+
     /// A POWER CUT from this instant (xfstests `_load_flakey_table
     /// $FLAKEY_DROP_WRITES`): every write and flush of the set is
     /// acknowledged and dropped, reads served; false swaps the working
@@ -15840,6 +15857,96 @@ test "smoke: A PUNCH, A ZERO RANGE AND A SAME-SIZE TRUNCATE SURVIVE A POWER CUT 
     }
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+test "smoke: A HARD LINK, A RENAME AND A DIRECTORY FSYNC IN FRESH GUEST SLOTS SURVIVE A POWER CUT ON A RE-FORMATTED DEVICE (fstests generic/056, 073, 342; charter §5.1 node seqs) — a set over device-mapper slices, 8 rounds, each over an earlier format's long logs (a dozen synced batches of xattr'd files) on the extents the round's first guest roots take, inside one checkpoint period (no cycle names the slots' first roots before the cut): generic/056 (`foo` written and fsync'd, `ln foo foo_link`, a 6000 B xattr on `foo` fsync'd — past the 4 KiB writeback delta, so the slot's root takes a bset before any cycle names it — `bar` touched and fsync'd), generic/342 (`a/foo` written and fsync'd, `mv a/foo a/bar`, a new `a/foo` written and fsync'd) and generic/073's directory fsync (`mv a/bar b/bar`, fsync `a`) — the root's children land in guest slot trees minted on recycled extents → dm-flakey drops every write (the power cut) → the working table → remount: every fsync'd byte and name as before the cut → clean unmount → fsck --offline --scrub clean (the guard of the remount's guest re-mints over recycled extents: on 182eead the harness's generic/056, 057 and 073 failed 5 of 12 runs with [C1] on a guest slot's inode and xattr — the remount re-minted a guest root on the extent its lost root held, under the lost root's seq, because an earlier format's higher stamp there hid the lost one from the residue floor, and the lost frames verified as the new root's own; the alignment that needs — the first re-minted extent's residue topped by a foreign stamp — is the unit row's to pin, this row's rounds re-mint every slot over an earlier format's logs and fsck clean)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    if (DmErrorSet.flakeyMissing(rig)) |why| return testkit.skipWhy(@src(), why);
+    var dm = try DmErrorSet.up(rig);
+    defer dm.deinit();
+    const before =
+        \\xfs_io -f -c "pwrite -S 0xaa -b 4K 0 4K" -c fsync foo >/dev/null
+        \\ln foo foo_link
+        \\python3 -c "import os; os.setxattr('foo', 'user.big', b'x' * 6000)" && xfs_io -c fsync foo
+        \\touch bar && xfs_io -c fsync bar
+        \\mkdir a b && xfs_io -f -c "pwrite -S 0xf1 0 16K" -c fsync a/foo >/dev/null
+        \\mv a/foo a/bar
+        \\xfs_io -f -c "pwrite -S 0xba 0 16K" -c fsync a/foo >/dev/null
+        \\mv a/bar b/bar
+        \\xfs_io -c fsync a
+        \\xfs_io -c fsync b
+        \\echo done
+    ;
+    const after =
+        \\x=$(python3 -c "import os; print(len(os.getxattr('foo', 'user.big')))" 2>&1)
+        \\echo "foo $(od -An -tx1 -v foo | sort -u | tr -s ' \n' ' ') links $(stat -c %h foo) $(stat -c %i foo) $(stat -c %i foo_link) user.big $x"
+        \\echo "/: $(ls | tr '\n' ' ')"
+        \\echo "a: $(ls a | tr '\n' ' ') b: $(ls b | tr '\n' ' ')"
+        \\echo "a/foo $(od -An -tx1 -v a/foo | sort -u | tr -s ' \n' ' ') b/bar $(od -An -tx1 -v b/bar | sort -u | tr -s ' \n' ' ')"
+    ;
+    const residue =
+        \\for b in 0 1 2 3 4 5 6 7 8 9 10 11; do
+        \\  for i in 0 1 2 3 4 5 6 7; do python3 -c "import os; open('r$b.$i', 'w').close(); os.setxattr('r$b.$i', 'user.r', b'r' * 1500)"; done
+        \\  sync -f .
+        \\done
+        \\echo done
+    ;
+    for (0..8) |round| {
+        // An earlier format's long logs on the extents the next one's first
+        // guest roots take (the scratch device xfstests re-formats).
+        for ([_]bool{ true, false }) |earlier| {
+            const r = try rig.squeezefs(&.{ "format", "--force", dm.meta_uri, dm.data_uri });
+            defer rig.freeRun(r);
+            if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+            try testing.expect(r.term.success());
+            if (!earlier) break;
+            const m = if (round == 0) 0 else try rig.logLen();
+            try rig.spawnSupervisedOf(dm.meta_uri, &.{});
+            _ = try rig.awaitReady(m);
+            const out = try rig.onMountTimed(residue, 120);
+            defer gpa.free(out);
+            try testing.expectEqualStrings("done\n", out);
+            try rig.umount();
+            try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+        }
+        const mark = try rig.logLen();
+        try rig.spawnSupervisedOf(dm.meta_uri, &.{});
+        _ = try rig.awaitReady(mark);
+        {
+            const out = try rig.onMountTimed(before, 120);
+            defer gpa.free(out);
+            try testing.expectEqualStrings("done\n", out);
+        }
+        // What the mount serves before the cut.
+        const want = try rig.onMountTimed(after, 60);
+        defer gpa.free(want);
+        // The power cut: every write dropped from here, the unmount's too.
+        try dm.dropWrites(true);
+        {
+            errdefer dm.dropWrites(false) catch {};
+            try rig.umount();
+            try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+        }
+        try dm.dropWrites(false);
+        // The remount is the recovery (xfstests' `_flakey_drop_and_remount`).
+        const mark2 = try rig.logLen();
+        try rig.spawnSupervisedOf(dm.meta_uri, &.{});
+        _ = try rig.awaitReady(mark2);
+        {
+            const out = try rig.onMountTimed(after, 60);
+            defer gpa.free(out);
+            std.debug.print("smoke[guest-cut]: round {d} after the cut:\n{s}", .{ round, out });
+            try testing.expectEqualStrings(want, out);
+        }
+        try rig.umount();
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+        try dm.fsckClean("the guest-slot power cut's remount");
+    }
 }
 
 test "smoke: FALLOCATE STRIPS THE SETID BITS (fstests generic/683; decision 0003 §BK: the kernel strips nothing around FUSE_FALLOCATE — the daemon owns `should_remove_suid` + the group rule) — mounted allow_other: over root's 192 KiB files `fallocate -o 64k -l 64k` by a non-owner outside the group without CAP_FSETID (setpriv) ⇒ 6666→666, 6676→676, 6766→766, 6777→777, 2676→676, 2777→777, 2666→666 (a non-member's sgid goes without group-exec); by root every mode kept; `.stats` fuse_fallocate_setid_strips = 7; B JOINS and the non-owner's `truncate -s 0` through B's mount over A's 6666 and 6676 files (the SHIPPED setattr's kill bit — FATTR_KILL_SUIDGID's law: suid always, sgid iff group-exec; handoff 2026-10-21 create 7b) lands 2666 and 676 at the holder, record_killpriv_strips = 2 on A, both views agree; no alert line" {

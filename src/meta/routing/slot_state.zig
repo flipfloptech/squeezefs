@@ -184,6 +184,31 @@ test "the offline fold: tree 0's root stands alone; a Live page entry at the rec
     try testing.expectEqual(@as(u64, 4096), out.items[0].root.addr);
 }
 
+test "a slot the manager adopted from a dead joiner: its page entry at tree 0's generation names a root its own SMOs minted in incarnation 0's space — LOWER than the joiner's grant-time root from incarnation 1's — and the fold takes the page's: homes are ordered by generation alone, never by node seq across spaces (smoke THE SHARED HOT DIRECTORY ACROSS DAEMONS: the open picked B's dead root at 0xa00000, whose extent A had recycled, and refused Corrupt)" {
+    const gpa = testing.allocator;
+    const b: u64 = 1 << 40;
+    const space: u64 = 1 << 38;
+    // Tree 0: leased to appender 0 at g 2, the words the recovery installed
+    // (B's root, minted in incarnation 1's space).
+    const adopted: cr.SlotState = .{ .variant = .leased, .appender_id = 0, .g = 2, .root = .{ .addr = 0xa00000, .seq = b + space + 1 }, .cursor = 19 };
+    const kvs = [_]tree.KeyValue{.{ .key = @constCast(keyOf(65).slice()), .value = @constCast(&adopted.encode()) }};
+    // Appender 0's page: the live home at g 2, the root A's SMOs moved the
+    // tree to (incarnation 0's space).
+    var p0 = page.Page.free(0, 1, page.SegmentTable.one(.{ .start = 0, .len = 4096 }));
+    try p0.setSlots(&.{.{ .slot = 65, .state = .live, .g = 2, .slot_tree_extents = 3, .root_addr = 0x1f40000, .root_seq = b + 89, .cursor = 40 }});
+    var out: std.ArrayList(GuestRoot) = .empty;
+    defer out.deinit(gpa);
+    try foldGuestRoots(gpa, &kvs, &.{p0}, .replayed, &out);
+    try testing.expectEqual(@as(u64, 0x1f40000), out.items[0].root.addr);
+    try testing.expectEqual(b + 89, out.items[0].root.seq);
+    try testing.expectEqual(@as(u64, 40), out.items[0].cursor);
+    // A release the next open completes from the page (row 5): the same.
+    try p0.setSlots(&.{.{ .slot = 65, .state = .releasing, .g = 2, .slot_tree_extents = 3, .root_addr = 0x1f40000, .root_seq = b + 89, .cursor = 41 }});
+    out.clearRetainingCapacity();
+    try foldGuestRoots(gpa, &kvs, &.{p0}, .replayed, &out);
+    try testing.expectEqual(@as(u64, 0x1f40000), out.items[0].root.addr);
+}
+
 test "the projected fold (a reader's tree 0, no ring): a page entry ABOVE the record's generation is a lease the projection has not caught up with — adopted with its owner as the lessee, the highest generation winning over an older lessee's live entry; the replayed fold judges the same entry stale residue" {
     const gpa = testing.allocator;
     // The projection still says Unleased at g 1 (root 4096); appender 5's

@@ -68,6 +68,36 @@ the log.
 | `zig build rails`, `zig fmt --check` | | 18/18 steps, 32/32 tests; clean |
 | xfstests `generic/753 475 750 388` through the harness, 3 runs | | Passed all 4 in each run (388 not run: no shutdown); fsck clean; 0 tripwires, 0 fold mismatches |
 
+## Gate 141: the bound exposed a cross-space order in the offline fold
+
+On `afdb099` the smoke row THE SHARED HOT DIRECTORY ACROSS DAEMONS went red at its final fsck
+(`cannot open metadata set …: Corrupt`, with no reason logged). An error-traced build over the
+kept image showed `openGuestTrees` → `RootStale`: slot 65's root `0xa00000` carries node_seq
+B+2^38+1 (dead joiner B's incarnation 1), but the extent holds B+91.
+
+A had recovered B's region and adopted its slots (`Leased{0, g 2}` in tree 0, with the
+recovery's words). A's SMOs moved those trees inside incarnation 0's space and recycled
+`0xa00000`. A's page names the moved root at g 2. `slot_state.foldGuestRoots` let a page entry
+beat tree 0's word at equal generation only if its root seq was ≥ tree 0's, which is an order
+across spaces, and 44 slots of B and C folded to dead roots. Before the bound, the adoption's
+raise had lifted A's counter into B's space, so the order held by accident. That escape is
+exactly what re-mints a dead space's seqs.
+
+The law: a slot's two homes are ordered by generation alone. At tree 0's generation the settled
+page entry is the live home and wins; between pages only a higher generation wins. The node seq
+never decides. `SlotWords.floored` had the same order and was unused, so it is deleted. A
+writer's open now names a stale guest root (slot, root, lessee, what the extent holds).
+
+| check | result |
+|---|---|
+| unit `a slot the manager adopted from a dead joiner …` on `df32246` (red) | `expected 0x1f40000, found 0xa00000` |
+| the kept image's metadata open | refused on `afdb099`; opens with 194 trees on the fix |
+| the row, `afdb099` / `fd7ad76` / the fix (under the 753 loop's load) | 0/5 / 10/10 / 22/22 |
+| every two-mount, offer, handover, recovery, re-join, reader, fleet row plus the dm-error, held-tail, replay and free-hold rows | 88 pass, 1 skip (the shim's other step) |
+| 753 by hand, re-format every cycle, beside the row loop | 40/40 clean, fsck clean |
+| unit filters slot_state / lease_table / guest / reader / backend / recovery / re-join / node_seq / meta.tree / journal / journal_tail / conveyor / supervisor / replay | 0 fail |
+| `zig build rails`, `zig fmt --check` | 18/18 steps, 32/32 tests; clean |
+
 ## Seen, not fixed
 
 - The held-tail prefix law (§BR.3½) dropped acked windows past a hole in 14 of the 423 cycles

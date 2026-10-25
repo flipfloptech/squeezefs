@@ -31,10 +31,13 @@
 //!   AT ONCE — the single-writer law. A holder that is no mount verb (an
 //!   offline verb's door) is live too.
 //!
-//! The holder is named off `/proc/locks`, whose census can tear
-//! (`writerFlockHeld`): a round that names no exclusive locker keeps the
-//! last judgement, and before any the holder is one this binary cannot
-//! name (the first class).
+//! The holder is named exactly when this process holds the locking
+//! description (its own fdinfo: a live holder of this process refuses at
+//! once, the supervisor's replay hold is `replay` from the first round);
+//! any other off `/proc/locks`, whose census can tear (`writerFlockHeld`).
+//! A round that names no exclusive locker keeps the last judgement —
+//! before any, the holder is one this binary cannot name (the first class)
+//! — and one that saw no flock at all counts in no class (`lockerOf`).
 //!
 //! What this does not see: a holder stopped by a raw `kill -TERM` with
 //! its mount still attached (its census and drains, sub-second) — a mount
@@ -185,18 +188,20 @@ pub fn localIdentity() claim.Identity {
 const PROC_LOCKS_CAP: usize = 1 << 20;
 
 /// Is a writer's exclusive `flock` (the D0 guard's layer A) held on `path`
-/// on this host? `/proc/locks` names the locker; "no writer" is the
+/// on this host? `lockerOf` names the locker (this process's own
+/// descriptions exactly, the rest off `/proc/locks`); "no writer" is the
 /// kernel's word alone (`exclusiveStands`: a `LOCK_SH | LOCK_NB` granted
 /// and dropped at once — a racing writer's `flockExclusive` waits it out
 /// as a holder it cannot name, never refuses on it), because a census that
 /// names none proves nothing: the table is a positional seq_file read a
 /// page per `read(2)`, so locks dropped before a page boundary between two
 /// reads hide the records at it (gate 137: a holder that never let go read
-/// "no writer"). A locker of this binary reads as held at once; any other
-/// (udev's re-read after a write-close, below), named or not, is waited
-/// out like `flockExclusive` does, and one that outlasts the bound reads
-/// as held. A `path` this process cannot probe reads the census alone.
-/// `waits` counts each retry a locker caused.
+/// "no writer"). A locker of this binary reads as held at once (this
+/// process's own never through the census); any other (udev's re-read
+/// after a write-close, below), named or not, is waited out like
+/// `flockExclusive` does, and one that outlasts the bound reads as held. A
+/// `path` this process cannot probe reads the census alone. `waits` counts
+/// each retry a locker caused.
 pub fn writerFlockHeld(io: Io, path: []const u8, waits: ?*counters.ShardedCounter) bool {
     const deadline = clock.monotonicNs() + SHARED_LOCK_WAIT_NS;
     while (true) {
@@ -216,7 +221,7 @@ pub fn exclusiveLocker(path: []const u8) ?Holder {
     const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return null;
     var st: linux.Statx = undefined;
     if (linux.errno(linux.statx(linux.AT.FDCWD, z, 0, .{ .INO = true, .MNT_ID = true }, &st)) != .SUCCESS) return null;
-    return lockerOf(&st) catch null;
+    return (lockerOf(&st) catch return null).holder;
 }
 
 /// Does an exclusive `flock` stand on `path` right now — the kernel's word:
@@ -287,10 +292,11 @@ pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: Waits, locker: *?Holder) li
     var st: linux.Statx = undefined;
     // The exiting holder named once per wait (the release line pairs it).
     var waiting_on: ?linux.pid_t = null;
-    // The last locker a census named, with its judgement. A round whose
-    // census names none — a shared holder (udev's rules, a reader's probe),
-    // or a census that tore (`writerFlockHeld`) — learns nothing and keeps
-    // it; none named yet = a holder this binary cannot name.
+    // The last locker named (`lockerOf`), with its judgement. A round that
+    // names none — a shared holder (udev's rules, a reader's probe), a
+    // census that tore (`writerFlockHeld`), a holder gone since the flock —
+    // learns nothing and keeps it; none named yet = a holder this binary
+    // cannot name.
     var named: ?Holder = null;
     while (true) {
         const e = linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB));
@@ -301,14 +307,18 @@ pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: Waits, locker: *?Holder) li
         if (e != .AGAIN) return e;
         if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true, .MNT_ID = true }, &st)) != .SUCCESS) return .AGAIN;
         // Unreadable `/proc/locks`: the refusal stands.
-        if (lockerOf(&st) catch return .AGAIN) |seen| {
-            if (seen.pid != 0) {
-                named = seen;
-                named.?.exiting = judgeExiting(io, seen.pid, seen.squeezefs);
+        const seen = lockerOf(&st) catch return .AGAIN;
+        if (seen.holder) |found| {
+            if (found.pid != 0) {
+                named = found;
+                named.?.exiting = judgeExiting(io, found.pid, found.squeezefs);
                 locker.* = named;
             }
         }
         const h = named orelse Holder{ .pid = 0, .squeezefs = false };
+        // A round that saw no flock on the file caused no wait of a class:
+        // it counts in none (`waits` gauges each class's engagement).
+        const counted = seen.holder != null or seen.shared;
         const now = clock.monotonicNs();
         if (h.exiting) |why| {
             if (now >= start + EXITING_HOLDER_WAIT_NS) return .AGAIN;
@@ -316,13 +326,13 @@ pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: Waits, locker: *?Holder) li
                 waiting_on = h.pid;
                 log.info("writer lock: {f} holds it and is exiting ({s}) — waiting for its release (the orderly-exit ceiling, {d} s)", .{ h, why.text(), EXITING_HOLDER_WAIT_NS / std.time.ns_per_s });
             }
-            if (waits.exiting) |w| w.inc();
+            if (counted) if (waits.exiting) |w| w.inc();
             io.sleep(.fromMilliseconds(EXITING_RETRY_MS), .awake) catch return .AGAIN;
             continue;
         }
         if (h.squeezefs) return .AGAIN;
         if (now >= start + SHARED_LOCK_WAIT_NS) return .AGAIN;
-        if (waits.shared) |w| w.inc();
+        if (counted) if (waits.shared) |w| w.inc();
         io.sleep(.fromMilliseconds(SHARED_LOCK_RETRY_MS), .awake) catch return .AGAIN;
     }
 }
@@ -473,21 +483,39 @@ pub fn writeLocker(w: *Io.Writer, locker: ?Holder) Io.Writer.Error!void {
     try w.print("{f}, not a squeezefs process, held the writer lock past the {d} s wait", .{ h, SHARED_LOCK_WAIT_NS / std.time.ns_per_s });
 }
 
-/// The ONE `/proc/locks` read behind every writer-lock judgement: the
-/// exclusive `flock` locker of `st`'s inode (`.INO | .MNT_ID` statx), null =
-/// none. The device is the file's MOUNT's, off mountinfo: `/proc/locks` and
-/// mountinfo both print the superblock's `s_dev`, while statx reports btrfs's
-/// per-subvolume anonymous device (a guard blind to every lock on btrfs).
-fn lockerOf(st: *const linux.Statx) error{Unreadable}!?Holder {
+/// What one judgement round sees of the flocks on a file.
+const Seen = struct {
+    /// The exclusive locker (`holderOf`), null = none named.
+    holder: ?Holder = null,
+    /// The census showed a shared flock on the file (udev's rules, a
+    /// reader's probe) — the conflict a refused `LOCK_EX` met, when no
+    /// exclusive one stood.
+    shared: bool = false,
+};
+
+/// The ONE naming behind every writer-lock judgement, for `st`'s file
+/// (`.INO | .MNT_ID` statx). A lock held through a description THIS process
+/// holds is named off its own fdinfo (`ownLocker`, exact); any other off the
+/// census, `/proc/locks`, which can tear (`writerFlockHeld`) — so a census
+/// that names none proves nothing. The device is the file's MOUNT's, off
+/// mountinfo: `/proc/locks`, fdinfo's `lock:` lines and mountinfo all print
+/// the superblock's `s_dev`, while statx reports btrfs's per-subvolume
+/// anonymous device (a guard blind to every lock on btrfs).
+fn lockerOf(st: *const linux.Statx) error{Unreadable}!Seen {
     var buf: [PROC_LOCKS_CAP]u8 = undefined;
     if (!st.mask.MNT_ID) return error.Unreadable;
     const mount = mountinfo.entryOf(readSmall(mountinfo.path, &buf) orelse return error.Unreadable, st.mnt_id) orelse return error.Unreadable;
     // Copied out: `buf` is reused for `/proc/locks` below.
     const dev_major, const dev_minor = .{ mount.dev_major, mount.dev_minor };
+    if (ownLocker(dev_major, dev_minor, st.ino)) |pid| return .{ .holder = holderOf(pid) };
     // Acquire pairs with the arming test's release store.
     const seam = if (builtin.is_test) test_seams.between_locks_pages.load(.acquire) else null;
     const text = readPaged("/proc/locks", &buf, seam) orelse return error.Unreadable;
-    const pid = flockHolderIn(text, dev_major, dev_minor, st.ino) orelse return null;
+    const lines = flockLinesIn(text, dev_major, dev_minor, st.ino);
+    return .{ .holder = if (lines.writer) |pid| holderOf(pid) else null, .shared = lines.shared };
+}
+
+fn holderOf(pid: linux.pid_t) Holder {
     return .{ .pid = pid, .squeezefs = pid == linux.getpid() or runsOurExe(pid) };
 }
 
@@ -501,29 +529,110 @@ fn runsOurExe(pid: linux.pid_t) bool {
     return theirs.ino == ours.ino and theirs.dev_major == ours.dev_major and theirs.dev_minor == ours.dev_minor;
 }
 
-/// The `/proc/locks` scan: the locker pid of an exclusive FLOCK line whose
-/// `MAJ:MIN:INO` (hex major and minor, decimal inode) names the file (0 when
-/// its pid field does not parse).
-pub fn flockHolderIn(text: []const u8, dev_major: u32, dev_minor: u32, ino: u64) ?linux.pid_t {
+/// The locker pid of an exclusive flock on `(dev, ino)` held through an open
+/// file description THIS process holds, off its own `/proc/self/fdinfo/<fd>`
+/// `lock:` lines; null = none. Exact, where the census is not: each fd's
+/// lines print its description's locks under the inode's lock-list lock,
+/// and `/proc/self/fd` lists by fd number, never by position, so a
+/// description held through the walk is never skipped. The pid is the
+/// lock's creator's — a dead one for the supervisor's replay hold.
+fn ownLocker(dev_major: u32, dev_minor: u32, ino: u64) ?linux.pid_t {
+    const rc = linux.open("/proc/self/fd", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const dir: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(dir);
+    var buf: [4096]u8 = undefined; // one getdents64 batch; the loop reads on
+    while (true) {
+        const n = linux.getdents64(dir, &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS or n == 0) return null;
+        var off: usize = 0;
+        while (off < n) {
+            const d: *align(1) linux.dirent64 = @ptrCast(&buf[off]);
+            off += d.reclen;
+            const name = std.mem.sliceTo(@as([*:0]u8, @ptrCast(&d.name)), 0);
+            const fd = std.fmt.parseInt(linux.fd_t, name, 10) catch continue; // `.` and `..`
+            if (fd == dir) continue;
+            if (lockedThrough(fd, dev_major, dev_minor, ino)) |pid| return pid;
+        }
+    }
+}
+
+/// `fd`'s description holds an exclusive flock on `(dev, ino)`: its pid. Only
+/// a descriptor naming a path is asked (an anon inode, a socket or a pipe
+/// holds no file lock, and an io_uring's fdinfo dumps its rings); the line
+/// names its own file, so an fd closed and reused meanwhile reads as what
+/// it is now.
+fn lockedThrough(fd: linux.fd_t, dev_major: u32, dev_minor: u32, ino: u64) ?linux.pid_t {
+    var pb: [48]u8 = undefined;
+    const link = std.fmt.bufPrintSentinel(&pb, "/proc/self/fd/{d}", .{fd}, 0) catch return null;
+    var first: [1]u8 = undefined;
+    const n = linux.readlink(link.ptr, &first, first.len);
+    if (linux.errno(n) != .SUCCESS or n == 0 or first[0] != '/') return null;
+    const info = std.fmt.bufPrintSentinel(&pb, "/proc/self/fdinfo/{d}", .{fd}, 0) catch return null;
+    var buf: [4096]u8 = undefined; // a description's flock prints first, before its POSIX locks (`show_fd_locks`)
+    const text = readSmall(info.ptr, &buf) orelse return null;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        var it = std.mem.tokenizeAny(u8, line, " \t");
-        _ = it.next() orelse continue;
-        const kind = it.next() orelse continue;
-        if (!std.mem.eql(u8, kind, "FLOCK")) continue;
-        _ = it.next() orelse continue;
-        const mode = it.next() orelse continue;
-        if (!std.mem.eql(u8, mode, "WRITE")) continue;
-        const pid = it.next() orelse continue;
-        const where = it.next() orelse continue;
-        var parts = std.mem.splitScalar(u8, where, ':');
-        const maj = std.fmt.parseInt(u32, parts.next() orelse continue, 16) catch continue;
-        const min = std.fmt.parseInt(u32, parts.next() orelse continue, 16) catch continue;
-        const node = std.fmt.parseInt(u64, parts.next() orelse continue, 10) catch continue;
-        if (maj != dev_major or min != dev_minor or node != ino) continue;
-        return std.fmt.parseInt(linux.pid_t, pid, 10) catch 0; // procfs prints the pid in decimal
+        if (!std.mem.startsWith(u8, line, "lock:")) continue;
+        const l = FlockLine.parse(line["lock:".len..]) orelse continue;
+        if (l.exclusive and l.on(dev_major, dev_minor, ino)) return l.pid;
     }
     return null;
+}
+
+/// One granted FLOCK line in `/proc/locks`' format (an fdinfo `lock:`
+/// line's tail too): `N: FLOCK  ADVISORY  WRITE|READ <pid> MAJ:MIN:INO s e`,
+/// hex major and minor, decimal inode and pid (0 when it does not parse).
+/// Null = another line: a POSIX lock, a lease, a waiter's `->`.
+const FlockLine = struct {
+    pid: linux.pid_t,
+    exclusive: bool,
+    dev_major: u32,
+    dev_minor: u32,
+    ino: u64,
+
+    fn parse(line: []const u8) ?FlockLine {
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        _ = it.next() orelse return null;
+        if (!std.mem.eql(u8, it.next() orelse return null, "FLOCK")) return null;
+        _ = it.next() orelse return null;
+        const mode = it.next() orelse return null;
+        const exclusive = std.mem.eql(u8, mode, "WRITE");
+        if (!exclusive and !std.mem.eql(u8, mode, "READ")) return null;
+        const pid = it.next() orelse return null;
+        var parts = std.mem.splitScalar(u8, it.next() orelse return null, ':');
+        return .{
+            .pid = std.fmt.parseInt(linux.pid_t, pid, 10) catch 0, // procfs prints the pid in decimal
+            .exclusive = exclusive,
+            .dev_major = std.fmt.parseInt(u32, parts.next() orelse return null, 16) catch return null, // `%02x` (fs/locks.c)
+            .dev_minor = std.fmt.parseInt(u32, parts.next() orelse return null, 16) catch return null, // `%02x`
+            .ino = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null, // `%lu`
+        };
+    }
+
+    fn on(self: FlockLine, dev_major: u32, dev_minor: u32, ino: u64) bool {
+        return self.dev_major == dev_major and self.dev_minor == dev_minor and self.ino == ino;
+    }
+};
+
+/// The census's FLOCK lines on one file.
+const FlockLines = struct {
+    /// The exclusive one's locker pid.
+    writer: ?linux.pid_t = null,
+    /// A shared one stood.
+    shared: bool = false,
+};
+
+/// The `/proc/locks` scan for the file `(dev, ino)` names.
+fn flockLinesIn(text: []const u8, dev_major: u32, dev_minor: u32, ino: u64) FlockLines {
+    var out: FlockLines = .{};
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const l = FlockLine.parse(line) orelse continue;
+        if (!l.on(dev_major, dev_minor, ino)) continue;
+        if (l.exclusive) out.writer = l.pid else out.shared = true;
+    }
+    return out;
 }
 
 /// `/etc/nvme/hostnqn` + `/etc/nvme/hostid`, trimmed; absent reads empty.
@@ -612,20 +721,23 @@ test "a ZOMBIE holder is dead: a daemon that exited under a supervisor that reap
     try testing.expect(probe.provablyDead(pid, 1));
 }
 
-test "/proc/locks: an exclusive FLOCK line on the file's (major, minor, inode) is the writer's guard; a shared flock, a POSIX lock or another inode is not; our own exclusive flock on a scratch file is seen without taking a second lock" {
+test "/proc/locks: an exclusive FLOCK line on the file's (major, minor, inode) is the writer's guard; a shared flock is the conflict a refused LOCK_EX met, never a writer; a waiter, a POSIX lock or another inode is neither; an fdinfo `lock:` line's tail parses alike; our own exclusive flock on a scratch file is seen without taking a second lock" {
     const table =
         \\1: FLOCK  ADVISORY  WRITE 4242 fd:01:131074 0 EOF
+        \\1: -> FLOCK  ADVISORY  WRITE 4246 fd:01:131074 0 EOF
         \\2: FLOCK  ADVISORY  READ  4243 fd:01:131075 0 EOF
         \\3: POSIX  ADVISORY  WRITE 4244 fd:01:131076 0 EOF
         \\4: FLOCK  ADVISORY  WRITE 4245 00:1f:9 0 EOF
         \\
     ;
-    try testing.expectEqual(@as(?linux.pid_t, 4242), flockHolderIn(table, 0xfd, 1, 131074));
-    try testing.expectEqual(null, flockHolderIn(table, 0xfd, 1, 131075));
-    try testing.expectEqual(null, flockHolderIn(table, 0xfd, 1, 131076));
-    try testing.expectEqual(@as(?linux.pid_t, 4245), flockHolderIn(table, 0, 0x1f, 9));
-    try testing.expectEqual(null, flockHolderIn(table, 0xfd, 2, 131074));
-    try testing.expectEqual(null, flockHolderIn("garbage\n\n: : :\n", 1, 1, 1));
+    try testing.expectEqual(FlockLines{ .writer = 4242 }, flockLinesIn(table, 0xfd, 1, 131074));
+    try testing.expectEqual(FlockLines{ .shared = true }, flockLinesIn(table, 0xfd, 1, 131075));
+    try testing.expectEqual(FlockLines{}, flockLinesIn(table, 0xfd, 1, 131076));
+    try testing.expectEqual(FlockLines{ .writer = 4245 }, flockLinesIn(table, 0, 0x1f, 9));
+    try testing.expectEqual(FlockLines{}, flockLinesIn(table, 0xfd, 2, 131074));
+    try testing.expectEqual(FlockLines{}, flockLinesIn("garbage\n\n: : :\n", 1, 1, 1));
+    const tail = FlockLine.parse("\t1: FLOCK  ADVISORY  WRITE 4247 00:2b:77 0 EOF").?;
+    try testing.expect(tail.exclusive and tail.pid == 4247 and tail.on(0, 0x2b, 77));
     // A real file: no lock, then our exclusive flock, then released. Pid-
     // tagged: two test processes on the venue never share the probe.
     var path_buf: [64]u8 = undefined;
@@ -641,6 +753,7 @@ test "/proc/locks: an exclusive FLOCK line on the file's (major, minor, inode) i
     try testing.expect(!writerFlockHeld(testing.io, path, null));
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB)));
     try testing.expect(writerFlockHeld(testing.io, path, null));
+    try testing.expectEqual(linux.getpid(), exclusiveLocker(path).?.pid);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(fd, std.posix.LOCK.UN)));
     try testing.expect(!writerFlockHeld(testing.io, path, null));
 }

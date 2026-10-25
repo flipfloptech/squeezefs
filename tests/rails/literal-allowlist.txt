@@ -343,9 +343,6 @@ src/meta/guard/proc.zig:57 | 16 | 200652b036e8bb69 | OWED: derive it or document
 src/meta/guard/proc.zig:58 | 4 | f9d1c252b85a117a | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/guard/proc.zig:86 | 10 | 89506dbfa003dbea | OWED: derive it or document it on the line (charter §1.5)
 src/meta/guard/proc.zig:86 | 22 | 89506dbfa003dbea | OWED: derive it or document it on the line (charter §1.5)
-src/meta/guard/proc.zig:150 | 16 | 402287d6de2ef53c | OWED: derive it or document it on the line (charter §1.5)
-src/meta/guard/proc.zig:151 | 16 | dd20e0105330b82e | OWED: derive it or document it on the line (charter §1.5)
-src/meta/guard/proc.zig:152 | 10 | 330072f5778a84e4 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/journal.zig:327 | 0x0F | 3087979a241ea7f2 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
 src/meta/journal.zig:327 | 4 | 3087979a241ea7f2 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/key.zig:232 | 8 | 2baa4d4a2ef8c716 | a size — OWED: derive from derive.Facts or document the physical/format reason

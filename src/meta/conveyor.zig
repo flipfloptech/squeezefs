@@ -119,6 +119,7 @@ pub const CachedNode = node_cache.CachedNode;
 pub const NodeDirty = node_cache.NodeDirty;
 pub const NodeCache = node_cache.NodeCache;
 pub const OwnedRec = node_cache.OwnedRec;
+pub const RecordRef = node_cache.RecordRef;
 pub const QueuedTx = tx.QueuedTx;
 pub const Reservation = jc.Reservation;
 pub const SeqSpan = jc.SeqSpan;
@@ -141,6 +142,10 @@ pub const BATCH_BYTES_RING_DIVISOR: u64 = 16;
 /// The lock-revalidate retry budget (`COMMIT_RETRY_BUDGET`): SMOs are rare
 /// and serialized, so exhaustion is a protocol bug.
 pub const COMMIT_RETRY_BUDGET: u32 = node.RETRY_BUDGET;
+/// A member's records on one leaf, borrowed for the apply, held on the
+/// applier's stack up to this many (a create's three, a rename's handful;
+/// a wider member's group spills to the heap): 16 × 48 B.
+pub const APPLY_GROUP_STACK: usize = 16;
 /// A pass parked longer than this at ring admission is the wedged-not-failed
 /// class (D1.b audit row 2): the watchdog's escalation threshold. 30 s is the
 /// reference's measured ceiling on a healthy drain (three orders above the
@@ -3255,7 +3260,6 @@ pub const Conveyor = struct {
     /// records back seq-conditionally (`rollbackFailedTx`: a freeze may
     /// have taken one into the base). Answers the member's failure.
     fn applyLeafwise(self: *Conveyor, a: Allocator, m: *const Queued, p: *Window.Part) ?Error {
-        const gpa = self.deps.gpa;
         const io = self.deps.io;
         const recs = m.q.recs;
         const span = SeqSpan.stamped(p.seq, m.q.len);
@@ -3296,8 +3300,9 @@ pub const Conveyor = struct {
         std.mem.sort(u32, order, ByLeaf{ .leaves = leaves }, ByLeaf.lessThan);
         var rest: []u32 = order;
         var undo: std.ArrayList(tx.UndoKey) = .empty;
-        var group: std.ArrayList(OwnedRec) = .empty;
-        defer group.deinit(gpa);
+        // A leaf's run, borrowed from the member's staged records (the
+        // part's arena: alive past the apply; the run copies the bytes).
+        var group: std.ArrayList(RecordRef) = .empty;
         var attempt: u32 = 0;
         const err: ?Error = while (rest.len != 0) {
             const leaf = leaves[rest[0]];
@@ -3334,26 +3339,15 @@ pub const Conveyor = struct {
                 group.clearRetainingCapacity();
                 for (run) |i| {
                     const r = recs[i];
-                    const owned = OwnedRec.fromRecordRef(gpa, .{ .key = r.key, .seq = r.seq, .kind = r.kind, .value = r.value }) catch break :blk error.OutOfMemory;
-                    group.append(gpa, owned) catch {
-                        var o = owned;
-                        o.deinit();
-                        break :blk error.OutOfMemory;
-                    };
-                } else {
-                    // The elements are the apply's on every outcome.
-                    defer group.clearRetainingCapacity();
-                    leaf.applyLocked(dirty, group.items, p.start) catch |e| break :blk switch (e) {
-                        error.Superseded => error.Corrupt,
-                        error.ReaderMayNotMutate, error.LeafLeaseRefused => error.PartitionRefused,
-                        error.OutOfMemory => error.OutOfMemory,
-                    };
+                    group.append(a, .{ .key = r.key, .seq = r.seq, .kind = r.kind, .value = r.value }) catch break :blk error.OutOfMemory;
                 }
+                leaf.applyLockedRefs(dirty, group.items, p.start) catch |e| break :blk switch (e) {
+                    error.Superseded => error.Corrupt,
+                    error.ReaderMayNotMutate, error.LeafLeaseRefused => error.PartitionRefused,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
                 break :blk null;
             };
-            // A run never handed to the apply: its built elements are ours.
-            for (group.items) |*o| o.deinit();
-            group.clearRetainingCapacity();
             const threshold = applied == null and dirty.overlayBytes() >= self.deps.cache.cfg.writeback_delta_bytes;
             if (threshold) if (self.treeOf(leaf)) |t| t.enqueueMaintenance(leaf.addr);
             leaf.unlockWrite(io);
@@ -3895,8 +3889,13 @@ pub const Conveyor = struct {
         const poison = test_seams.poison_apply_ino.load(.monotonic);
         var pos_cursor = res_start;
         var stamp_cursor = seq_base;
-        var group: std.ArrayList(OwnedRec) = .empty;
-        defer group.deinit(gpa);
+        // A leaf's share of a member, borrowed from the member's staged
+        // records (alive past the apply; the run copies their bytes).
+        var group_buf: [APPLY_GROUP_STACK * @sizeOf(RecordRef)]u8 align(@alignOf(RecordRef)) = undefined;
+        var group_room: std.heap.BufferFirstAllocator = .init(&group_buf, gpa);
+        const ga = group_room.allocator();
+        var group: std.ArrayList(RecordRef) = .empty;
+        defer group.deinit(ga);
         for (members, 0..) |*m, qi| {
             const entry_start = pos_cursor;
             pos_cursor += m.q.len;
@@ -3907,23 +3906,14 @@ pub const Conveyor = struct {
                 group.clearRetainingCapacity();
                 for (m.q.recs, r.leaf_of[qi]) |rec, g| {
                     if (g != gi) continue;
-                    const owned = OwnedRec.fromRecordRef(gpa, .{ .key = rec.key, .seq = rec.seq, .kind = rec.kind, .value = rec.value }) catch {
-                        apply_err = error.OutOfMemory;
-                        break;
-                    };
-                    group.append(gpa, owned) catch {
-                        var o = owned;
-                        o.deinit();
+                    group.append(ga, .{ .key = rec.key, .seq = rec.seq, .kind = rec.kind, .value = rec.value }) catch {
                         apply_err = error.OutOfMemory;
                         break;
                     };
                 }
-                if (apply_err != null) {
-                    for (group.items) |*o| o.deinit();
-                    break;
-                }
+                if (apply_err != null) break;
                 if (group.items.len == 0) continue;
-                n.applyLocked(d, group.items, entry_start) catch |e| {
+                n.applyLockedRefs(d, group.items, entry_start) catch |e| {
                     apply_err = switch (e) {
                         error.Superseded => error.Corrupt,
                         error.ReaderMayNotMutate, error.LeafLeaseRefused => error.PartitionRefused,

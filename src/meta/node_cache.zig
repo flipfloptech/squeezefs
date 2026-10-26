@@ -855,7 +855,15 @@ pub const CachedNode = struct {
     /// entry's ≥-tail acked records at replay). The records' elements are
     /// consumed on every outcome; the slice stays the caller's.
     pub fn applyLocked(self: *CachedNode, dirty: *NodeDirty, records: []OwnedRec, floor: u64) ApplyError!void {
-        return self.applyLockedClass(dirty, records, floor, false);
+        return self.applyLockedClass(OwnedRec, dirty, records, floor, false);
+    }
+
+    /// `applyLocked` over BORROWED records (the conveyor's staged bytes,
+    /// alive across the call): the run copies each record's bytes once —
+    /// the owned form's refcounted copy per record, built and freed under
+    /// the leaf lock, is skipped. Nothing rides in: no head, no floor.
+    pub fn applyLockedRefs(self: *CachedNode, dirty: *NodeDirty, records: []const RecordRef, floor: u64) ApplyError!void {
+        return self.applyLockedClass(RecordRef, dirty, records, floor, false);
     }
 
     /// `applyLocked` for the serialized SMO task's OWN moves (leftover
@@ -864,20 +872,32 @@ pub const CachedNode = struct {
     /// departing holder's flush IS the release's work), as is an unleased
     /// slot on the manager.
     pub fn applyLockedStructural(self: *CachedNode, dirty: *NodeDirty, records: []OwnedRec, floor: u64) ApplyError!void {
-        return self.applyLockedClass(dirty, records, floor, true);
+        return self.applyLockedClass(OwnedRec, dirty, records, floor, true);
     }
 
-    fn consume(records: []OwnedRec) void {
-        for (records) |*r| r.deinit();
+    /// The apply's input: owned records (consumed on every outcome) or
+    /// borrowed ones (the caller's).
+    fn ApplyIn(comptime In: type) type {
+        return if (In == OwnedRec) []OwnedRec else []const RecordRef;
     }
 
-    fn applyLockedClass(self: *CachedNode, dirty: *NodeDirty, records: []OwnedRec, floor: u64, structural: bool) ApplyError!void {
+    fn consume(comptime In: type, records: ApplyIn(In)) void {
+        if (In == OwnedRec) for (records) |*r| r.deinit();
+    }
+
+    fn refOf(comptime In: type, r: *const In) RecordRef {
+        return if (In == OwnedRec) r.recordRef() else r.*;
+    }
+
+    fn applyLockedClass(self: *CachedNode, comptime In: type, dirty: *NodeDirty, records: ApplyIn(In), floor: u64, structural: bool) ApplyError!void {
+        comptime assert(In == OwnedRec or In == RecordRef);
+        const owned = In == OwnedRec;
         const gpa = self.cache.gpa;
         // The reader gate — the ONE place every RAM mutation passes: an
         // armed READER mutates nothing (its cache is a projection of
         // somebody else's tree). One monotonic load.
         if (self.cache.env.gate.isReader()) {
-            consume(records);
+            consume(In, records);
             partition_refusals.fire("a mount that armed reader revalidation tried to mutate a node");
             return error.ReaderMayNotMutate;
         }
@@ -890,22 +910,22 @@ pub const CachedNode = struct {
             switch (self.cache.lease.verdict(self.cache.lease.ctx, slot, structural)) {
                 .unarmed, .allowed => {},
                 .not_leased, .releasing => {
-                    consume(records);
+                    consume(In, records);
                     leaf_lease_refusals.fire("a leaf of a slot this mount does not lease (or mid-handover) was mutated");
                     return error.LeafLeaseRefused;
                 },
             }
         }
         self.state.markDirty() catch {
-            consume(records);
+            consume(In, records);
             return error.Superseded;
         };
         // The inos whose views this apply stales (`ino_witness`), named
         // before the records are consumed and bumped on every exit after
         // the snapshot's publish (a failed apply's bump is spurious, never
         // missing); a structural move changes no record's content.
-        const viewed: []const OwnedRec = if (structural or self.level != 0 or self.forestSlot() == null) &.{} else records;
-        const witnessed = WitnessSet.of(viewed);
+        const viewed: []const In = if (structural or self.level != 0 or self.forestSlot() == null) &.{} else records;
+        const witnessed = WitnessSet.of(In, viewed);
         defer witnessed.touch();
         // Every apply lowers the not-yet-durable floor; the tail rule reads
         // it back. acq_rel fetchMin paired with `takeDirtyFloor`'s swap.
@@ -916,24 +936,26 @@ pub const CachedNode = struct {
         // the records are consumed either way — so no record is ever
         // half-applied.
         var edit = snapshot.RunEdit.begin(gpa, &dirty.overlay.value) catch |e| {
-            consume(records);
+            consume(In, records);
             return e;
         };
         errdefer edit.abandon(gpa);
         var taken: usize = 0;
-        errdefer consume(records[taken..]);
+        errdefer consume(In, records[taken..]);
         var head_bytes = dirty.head_bytes;
         var overlay_bytes = dirty.overlay_bytes;
-        for (records) |*moved| {
-            var r = moved.*;
-            moved.* = undefined;
+        for (records) |*in| {
             taken += 1;
-            // The run copies the record's bytes; its references end here.
-            defer r.deinit();
+            // The run copies the record's bytes; an owned record's
+            // references end here.
+            defer if (owned) in.deinit();
+            const r = refOf(In, in);
+            // An SMO's leftover rides in with its head and its floor.
+            const riding: ?snapshot.Head = if (owned) in.folded else null;
             // Stamp (or tighten) the record's own floor contribution so an
             // SMO leftover transfer can rebuild successor floors exactly.
-            r.entry_floor = @min(r.entry_floor, floor);
-            const k = r.key.slice();
+            const entry_floor = @min(if (owned) in.entry_floor else std.math.maxInt(u64), floor);
+            const k = r.key;
             const run = edit.view();
             const pos = run.partitionPoint(KeySeq{ .k = k, .seq = r.seq }, keySeqLessEq);
             // The key's records above `r` follow `pos` (walked, not searched).
@@ -955,7 +977,7 @@ pub const CachedNode = struct {
             // riding in (an SMO's leftover) is taken as it is.
             var fold_buf: ?[]const u8 = null;
             defer if (fold_buf) |b| gpa.free(b);
-            const head: snapshot.HeadIn = if (r.folded != null) .of(r.folded) else switch (r.kind) {
+            const head: snapshot.HeadIn = if (riding != null) .of(riding) else switch (r.kind) {
                 .put => .own_value,
                 .delete => .tombstone,
                 .delta => blk: {
@@ -965,7 +987,7 @@ pub const CachedNode = struct {
                     else
                         self.foldBelowLocked(&run, run.partitionPoint(KeyOnly{ .k = k }, keyLess), pos, k, r.seq) catch break :blk .none;
                     defer prev.deinit(gpa);
-                    const next = rec.foldForward(gpa, &prev, r.kind, r.value.slice()) catch break :blk .none;
+                    const next = rec.foldForward(gpa, &prev, r.kind, r.value) catch break :blk .none;
                     switch (next) {
                         .live => |l| {
                             if (!l.materialized) break :blk .own_value;
@@ -977,11 +999,11 @@ pub const CachedNode = struct {
                     }
                 },
             };
-            overlay_bytes += r.recordRef().encodedLen();
+            overlay_bytes += r.encodedLen();
             // The sorted insert: any seq order — mount replay's original
             // seqs, two in-flight windows applied in either order (§AW) —
             // lands at its `(key, seq)` place; the run stays exact.
-            head_bytes += try edit.insert(gpa, pos, r.recordRef(), r.entry_floor, head);
+            head_bytes += try edit.insert(gpa, pos, r, entry_floor, head);
             // Single-head-per-key: the superseded newest below loses its
             // head (never read again — lookups take the group's newest).
             // In the copy: the published snapshot's record keeps serving.
@@ -1019,15 +1041,16 @@ pub const CachedNode = struct {
         n: usize = 0,
         overflow: bool = false,
 
-        fn of(records: []const OwnedRec) WitnessSet {
+        fn of(comptime In: type, records: []const In) WitnessSet {
             var s: WitnessSet = .{};
-            for (records) |*r| {
-                const ino = ino_witness.inoOfViewedKey(r.key.slice()) orelse continue;
+            for (records) |*in| {
+                const r = refOf(In, in);
+                const ino = ino_witness.inoOfViewedKey(r.key) orelse continue;
                 // An access stamp alone (the atime posture's Δ, charter §4
                 // "Access time") moves nothing a view carries: size, kind,
                 // layout, flags stand — a hot file read under strictatime
                 // would otherwise stale its view every drain tick.
-                if (r.kind == .delta and r.key.slice()[key.INO_MAJOR_KIND_OFF] == key.TREE_INODES and rec.inodeDeltaMask(r.value.slice()) == rec.DELTA_ATIME) continue;
+                if (r.kind == .delta and r.key[key.INO_MAJOR_KIND_OFF] == key.TREE_INODES and rec.inodeDeltaMask(r.value) == rec.DELTA_ATIME) continue;
                 if (s.n == s.inos.len) {
                     s.overflow = true;
                     break;
@@ -2402,9 +2425,18 @@ const Vol = struct {
 
     /// `apply` at a chosen seq: an earlier window's record landing after a
     /// later window's (decision 0003 §AW.4's either-order applies).
+    /// Both input forms, alternating by seq: the borrowed records the
+    /// conveyor applies (`applyLockedRefs`) and the owned ones replay and
+    /// the SMO apply — the oracles judge them alike.
     fn applyAt(n: *CachedNode, k: []const u8, kind: RecordKind, value: []const u8, seq: u64) !void {
         const gpa = testing.allocator;
-        var recs = [_]OwnedRec{try OwnedRec.fromRecordRef(gpa, .{ .key = k, .seq = seq, .kind = kind, .value = value })};
+        const r: RecordRef = .{ .key = k, .seq = seq, .kind = kind, .value = value };
+        if (seq & 2 != 0) {
+            const d = n.lockWrite(testing.io);
+            defer n.unlockWrite(testing.io);
+            return n.applyLockedRefs(d, &.{r}, seq);
+        }
+        var recs = [_]OwnedRec{try OwnedRec.fromRecordRef(gpa, r)};
         const d = n.lockWrite(testing.io);
         defer n.unlockWrite(testing.io);
         try n.applyLocked(d, &recs, seq);

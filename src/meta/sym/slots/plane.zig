@@ -1496,27 +1496,34 @@ pub const Plane = struct {
         // `A_max(t)` is DYNAMIC: the live leaf census at every decision
         // (the static knob, when set, is the whole law). Affinity reads
         // it only for a parent it could take.
+        const now_ns = clock.monotonicNs();
+        const now_ms = now_ns / std.time.ns_per_ms;
         var a_max: ?u64 = null;
+        var affinity_yields = false;
         if (parent_leased_non_native) {
             a_max = self.affinityCeiling();
-            if (acquire.affinityHolds(true, parent_tree_bytes, a_max.?)) {
+            // Affinity yields to another stream's window on the parent's
+            // tree (§BV): two directories in one small tree would else put
+            // two streams' creates on its edge at once.
+            const holds = acquire.affinityHolds(true, parent_tree_bytes, a_max.?);
+            affinity_yields = holds and self.windows_on and self.claims.heldByOther(parent_slot, minter, now_ms);
+            if (affinity_yields) mint_window.stats.mint_window_affinity_yields.inc();
+            if (holds and !affinity_yields) {
                 acquire.countChoice(.{ .affinity = parent_slot }, true);
+                // Under concurrency the parent's tree becomes this
+                // stream's window: other streams' picks skip it.
+                if (self.windows_on and !self.windowOn(minter, parent_slot, now_ns)) {
+                    if (self.decisionConcurrent(minter, now_ms)) self.setWindow(minter, parent_slot, pv.g, now_ns);
+                }
                 return .{ .slot = parent_slot, .g = pv.g };
             }
         }
-        const now_ns = clock.monotonicNs();
         if (self.windows_on) if (self.windowMint(minter, now_ns)) |m| {
             mint_window.stats.mint_window_mints.inc();
             acquire.countChoice(.{ .rotor = m.slot }, parent_leased_non_native);
             return m;
         };
-        const now_ms = now_ns / std.time.ns_per_ms;
-        // A window opens only beside another minting stream (one whose
-        // census ran on this plane within one window age): a lone creator
-        // has nobody to separate from and keeps the census's per-mint
-        // spread over the rotor.
-        const concurrent = self.windows_on and self.mint_recent.otherLive(minter, now_ms);
-        if (self.windows_on) self.mint_recent.note(minter, now_ms, mint_window.windowAgeNs() / std.time.ns_per_ms);
+        const concurrent = self.windows_on and self.decisionConcurrent(minter, now_ms);
         var rotor: [lt.LeaseTable.PICK_MAX]acquire.RotorTree = undefined;
         var n: usize = 0;
         var free: usize = 0;
@@ -1533,7 +1540,7 @@ pub const Plane = struct {
         }
         const in: acquire.MintInputs = .{
             .parent_slot = parent_slot,
-            .parent_leased_non_native = parent_leased_non_native,
+            .parent_leased_non_native = parent_leased_non_native and !affinity_yields,
             .parent_tree_bytes = parent_tree_bytes,
             .a_max = a_max orelse self.affinityCeiling(),
             .node_size = be.sb.node_size,
@@ -1565,19 +1572,54 @@ pub const Plane = struct {
         return acquire.affinityCeiling(self.usedLeafBytes(), self.be.sb.node_size);
     }
 
+    /// A decision mint (the census, or an affinity mint outside a
+    /// window): CONCURRENT iff another ACTIVE stream — one with two
+    /// decisions of its own — decided on this plane within one window age;
+    /// the stream's decisions are counted in its way and it is noted as
+    /// active from its second. A one-off caller (a `mkdir`) beside busy
+    /// streams opens a window of its own (its mint never lands on their
+    /// edges, nor theirs on its tree) yet never makes another stream
+    /// concurrent: a serial creator keeps the census's per-mint spread.
+    fn decisionConcurrent(self: *Plane, minter: u32, now_ms: u64) bool {
+        const decisions = blk: {
+            const set = self.windows.setOf(minter);
+            set.lock.lock();
+            defer set.lock.unlock();
+            const e = set.take(minter);
+            e.census +|= 1;
+            break :blk e.census;
+        };
+        const concurrent = self.mint_recent.otherLive(minter, now_ms);
+        if (decisions >= 2) self.mint_recent.note(minter, now_ms, mint_window.windowAgeNs() / std.time.ns_per_ms);
+        return concurrent;
+    }
+
     /// One mint off the stream's standing window: mints and time left, its
     /// claim untaken, its slot a rotor lease of this mount at the window's
     /// generation and not releasing. Null = no window stands (the census).
     fn windowMint(self: *Plane, minter: u32, now_ns: u64) ?Mint {
+        return self.windowServe(minter, null, now_ns);
+    }
+
+    /// The stream's standing window is on `slot` (an affinity window):
+    /// one mint off it.
+    fn windowOn(self: *Plane, minter: u32, slot: u16, now_ns: u64) bool {
+        return self.windowServe(minter, slot, now_ns) != null;
+    }
+
+    /// A standing window serves one mint: on `on` when given (the parent's
+    /// tree, any leased slot), else on a rotor tree.
+    fn windowServe(self: *Plane, minter: u32, on: ?u16, now_ns: u64) ?Mint {
         const set = self.windows.setOf(minter);
         set.lock.lock();
         defer set.lock.unlock();
         const e = set.find(minter) orelse return null;
         const w = &e.w;
         if (w.claim == 0 or w.left == 0 or now_ns >= w.expires_ns) return null;
+        if (on) |s| if (w.slot != s) return null;
         if (!self.claims.stillMine(w.slot, w.claim)) return null;
         const v = self.table.view(w.slot);
-        if (!(v.leasedBy(self.me) and v.state != .releasing and v.rotor and v.g == w.g)) return null;
+        if (!(v.leasedBy(self.me) and v.state != .releasing and (on != null or v.rotor) and v.g == w.g)) return null;
         w.left -= 1;
         return .{ .slot = w.slot, .g = w.g };
     }

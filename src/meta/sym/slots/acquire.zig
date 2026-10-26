@@ -243,38 +243,35 @@ pub fn mintChoice(in: MintInputs) MintChoice {
         }
     }
     // The pick (steps 2 and 3) skips a claimed tree while any is
-    // unclaimed; the over-ceiling verdict above reads every tree.
+    // unclaimed; the over-ceiling verdict above reads every tree. Ties go
+    // to the first candidate at or after the rr cursor, cyclically — a
+    // run of mints over equal trees spreads over all of them, never onto
+    // the lowest-indexed one.
     var any_free = false;
     for (in.rotor) |r| any_free = any_free or !r.claimed;
-    const start = firstCandidate(in.rotor, in.rr % in.rotor.len, any_free);
-    if (all_over) {
-        if (in.rotor.len < in.rotor_cap) return .overflow;
-        var best = in.rotor[start];
-        for (in.rotor) |r| if ((!any_free or !r.claimed) and r.bytes < best.bytes) {
-            best = r;
-        };
-        return .{ .smallest = best.slot };
-    }
-    // 3. The most signed headroom `a_max − bytes`, ties by the rr cursor.
-    var best_i = start;
-    var best_h: i128 = @as(i128, in.a_max) - in.rotor[best_i].bytes;
-    for (in.rotor, 0..) |r, i| {
+    const n = in.rotor.len;
+    const at = in.rr % n;
+    var best_i: ?usize = null;
+    var best_h: i128 = 0;
+    for (0..n) |k| {
+        const i = (at + k) % n;
+        const r = in.rotor[i];
         if (any_free and r.claimed) continue;
+        // Step 2's smallest tree is step 3's most headroom (`a_max` is one
+        // constant across the trees).
         const h: i128 = @as(i128, in.a_max) - r.bytes;
-        if (h > best_h) {
+        if (best_i == null or h > best_h) {
             best_h = h;
             best_i = i;
         }
     }
-    return .{ .rotor = in.rotor[best_i].slot };
-}
-
-/// The rr cursor's tree, or — when it is claimed and an unclaimed one
-/// exists — the first unclaimed tree.
-fn firstCandidate(rotor: []const RotorTree, at: usize, any_free: bool) usize {
-    if (!any_free or !rotor[at].claimed) return at;
-    for (rotor, 0..) |r, i| if (!r.claimed) return i;
-    unreachable;
+    const best = in.rotor[best_i.?].slot;
+    if (all_over) {
+        if (n < in.rotor_cap) return .overflow;
+        return .{ .smallest = best };
+    }
+    // 3. The most signed headroom `a_max − bytes`.
+    return .{ .rotor = best };
 }
 
 /// The counters a choice feeds (the overflow arm counts its own grant).
@@ -1175,6 +1172,15 @@ test "mint_choice: affinity below the ceiling; a spill to the most-headroom roto
     // an unclaimed one exists — the rr cursor's and the most-headroom
     // alike; every tree claimed ⇒ the law over all; the over-ceiling
     // verdict reads every tree, claimed or not.
+    // Ties go to the first candidate at or after the rr cursor,
+    // cyclically: four equal trees, four consecutive cursors, four trees.
+    const equal = [_]RotorTree{ .{ .slot = 5, .bytes = node }, .{ .slot = 6, .bytes = 2 * node }, .{ .slot = 7, .bytes = node }, .{ .slot = 8, .bytes = node } };
+    var eq = over;
+    eq.rotor = &equal;
+    for ([_]u16{ 5, 7, 7, 8, 5 }, 0..) |want, rr| {
+        eq.rr = rr;
+        try testing.expectEqual(want, mintChoice(eq).rotor);
+    }
     const claimed = [_]RotorTree{ .{ .slot = 5, .bytes = 3 * node, .claimed = true }, .{ .slot = 6, .bytes = 8 * node }, .{ .slot = 7, .bytes = 12 * node } };
     var cl = over;
     cl.rotor = &claimed;

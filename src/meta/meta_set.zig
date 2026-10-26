@@ -1165,7 +1165,7 @@ test "a two-member set: format → open (either URI order) → 200 creates sprea
     }
 }
 
-test "the mint window follows its CALLER, not the thread (decision 0003 §BV): a rank the scheduler moves between drain workers keeps its window's tree; two ranks one worker serves take two trees; a lone caller keeps the census's per-mint spread" {
+test "the mint window follows its CALLER, not the thread (decision 0003 §BV): a lone caller keeps the census's per-mint spread; a one-off caller beside it takes a tree of its own and never makes it concurrent; a second caller's window — off every other window's tree — follows it to another thread, and a third caller on the first thread takes a third tree" {
     const gpa = testing.allocator;
     const s = try TestSet.create(gpa, "mint-caller", 1);
     defer s.destroy();
@@ -1182,17 +1182,30 @@ test "the mint window follows its CALLER, not the thread (decision 0003 §BV): a
     const l0 = slotOfEff(set, try set.allocateIno(root, false, false, 900));
     const l1 = slotOfEff(set, try set.allocateIno(root, false, false, 900));
     try testing.expect(l0 != l1);
-    try testing.expectEqual(g0, routing_slots.mint_window.stats.mint_window_grants.load());
-    // A second caller beside it: each opens its window, on distinct trees.
+    // A one-off caller beside it (a `mkdir`): it takes a window of its own
+    // (its mint off the creator's trees) and never makes the creator
+    // concurrent — the creator's spread goes on.
+    const off = slotOfEff(set, try set.allocateIno(root, false, false, 7));
+    try testing.expectEqual(g0 + 1, routing_slots.mint_window.stats.mint_window_grants.load());
+    const l2 = slotOfEff(set, try set.allocateIno(root, false, false, 900));
+    try testing.expect(l2 != l1 and l2 != off);
+    try testing.expectEqual(g0 + 1, routing_slots.mint_window.stats.mint_window_grants.load());
+    // A second caller: its first decision opens its window beside the
+    // active creator, on a tree no window claims.
     const t2 = slotOfEff(set, try set.allocateIno(root, false, false, 1002));
-    const t1 = slotOfEff(set, try set.allocateIno(root, false, false, 900));
-    try testing.expect(t1 != t2);
     try testing.expectEqual(g0 + 2, routing_slots.mint_window.stats.mint_window_grants.load());
-    // Caller 900 from another thread (the rank moved CPUs) stays in its
-    // tree; caller 1002 from this thread stays in its own.
+    try testing.expect(t2 != off);
+    // The creator's census skips both windows' trees.
+    for (0..4) |_| {
+        const l = slotOfEff(set, try set.allocateIno(root, false, false, 900));
+        try testing.expect(l != t2 and l != off);
+    }
+    // Caller 1002 from another thread (the rank moved CPUs) stays in its
+    // window's tree; a third caller on THIS thread (two ranks one drain
+    // worker serves) takes a tree of its own and stays there.
     const Other = struct {
         fn run(st: *MetaSet, r: u64, out: *[8]u16, err: *?anyerror) void {
-            for (out) |*o| o.* = route_table.slotOf(st.globalIno(st.allocateIno(r, false, false, 900) catch |e| {
+            for (out) |*o| o.* = route_table.slotOf(st.globalIno(st.allocateIno(r, false, false, 1002) catch |e| {
                 err.* = e;
                 return;
             }));
@@ -1203,9 +1216,11 @@ test "the mint window follows its CALLER, not the thread (decision 0003 §BV): a
     const th = try std.Thread.spawn(.{}, Other.run, .{ set, root, &moved, &err });
     th.join();
     if (err) |e| return e;
-    for (moved) |sl| try testing.expectEqual(t1, sl);
-    for (0..8) |_| try testing.expectEqual(t2, slotOfEff(set, try set.allocateIno(root, false, false, 1002)));
-    try testing.expectEqual(g0 + 2, routing_slots.mint_window.stats.mint_window_grants.load());
+    for (moved) |sl| try testing.expectEqual(t2, sl);
+    const t3 = slotOfEff(set, try set.allocateIno(root, false, false, 1003));
+    try testing.expect(t3 != t2 and t3 != off);
+    for (0..8) |_| try testing.expectEqual(t3, slotOfEff(set, try set.allocateIno(root, false, false, 1003)));
+    try testing.expectEqual(g0 + 3, routing_slots.mint_window.stats.mint_window_grants.load());
 }
 
 test "the mint window across a remount (decision 0003 §BV): eight threads create under the root at once — their mints in windows on distinct rotor trees — then a clean close and a reopen, and eight threads create again: no ino twice, every first-session file present after the remount, the windows' trees past every travelled ino" {

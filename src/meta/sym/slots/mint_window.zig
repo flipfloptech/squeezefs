@@ -6,9 +6,13 @@
 //! tree's window meanwhile, so concurrent creates append to different
 //! trees' rightmost leaves. A STREAM is the FUSE caller (the request's
 //! pid: one rank, one shell — whichever drain worker serves it) or, for a
-//! mint with no caller, the calling thread. A lone stream (no other
-//! stream's census on the plane within one window age) keeps the census's
-//! per-mint spread. PORTABLE: atomics and arithmetic; the plane
+//! mint with no caller, the calling thread. A window opens beside
+//! another ACTIVE stream (one with two decision mints of its own) that
+//! decided within one window age; a lone stream — a serial creator, with
+//! the odd `mkdir` beside it — keeps the census's per-mint spread (charter
+//! §5.4's 64 slices from birth). Under the window arm the affinity arm
+//! yields to another stream's window on the parent's tree and, beside an
+//! active stream, makes that tree the stream's window. PORTABLE: atomics and arithmetic; the plane
 //! (`plane.zig`) owns the census and the lease reads.
 //!
 //! Why the window is a TREE and not an ino range inside one tree: a slot
@@ -58,6 +62,9 @@ pub const stats = struct {
     /// The claim's CAS lost to another thread's (the mint goes ahead
     /// in the tree it chose, with no window).
     pub var mint_window_claim_races: counters.ShardedCounter = .{};
+    /// A parent's tree under the affinity ceiling that another stream's
+    /// window claims: the affinity arm yielded to the window path.
+    pub var mint_window_affinity_yields: counters.ShardedCounter = .{};
 };
 
 /// The mints one window serves before the census re-judges the rotor:
@@ -168,9 +175,10 @@ pub const Claims = struct {
     }
 };
 
-/// The last census mint on a plane: its thread and the end of its window
-/// age, in the claim word's encoding. A census that finds ANOTHER thread
-/// here, live, is concurrent and opens a window; a lone thread never does.
+/// The last ACTIVE stream on a plane (its second decision mint or later)
+/// and the end of its window age, in the claim word's encoding. A
+/// decision that finds ANOTHER stream here, live, is concurrent and opens
+/// a window; a lone stream never does.
 pub const Recent = struct {
     word: std.atomic.Value(u64) = .init(0),
 
@@ -228,7 +236,10 @@ pub fn setsFor(cpus: u64) usize {
 pub const Windows = struct {
     sets: []Set,
 
-    pub const Entry = struct { token: u32 = 0, w: Window = .{} };
+    /// A stream's way: its window and its decision mints (a stream with
+    /// two is ACTIVE; a one-off caller — a `mkdir` beside a serial
+    /// creator — never makes another stream concurrent).
+    pub const Entry = struct { token: u32 = 0, census: u32 = 0, w: Window = .{} };
 
     pub const Set = struct {
         lock: jc.SpinLock = .{},

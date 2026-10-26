@@ -11880,7 +11880,7 @@ const mint_storm_files: u64 = 2000;
 /// One arm of the mint-window row on a freshly formatted set:
 /// the storm, every file counted, the arm's counters and the conveyor's
 /// leaf waits per window; umount and fsck --offline --scrub.
-const MintArm = struct { grants: u64, window_mints: u64, burns: u64, windows: u64, waits_ns: u64, takes: u64, hold_ns: u64 };
+const MintArm = struct { grants: u64, window_mints: u64, burns: u64, affinity: u64, windows: u64, waits_ns: u64, takes: u64, hold_ns: u64 };
 
 fn mintStormArm(rig: *Rig, arm: []const u8) !MintArm {
     try rig.formatSet(false);
@@ -11915,6 +11915,7 @@ fn mintStormArm(rig: *Rig, arm: []const u8) !MintArm {
         .grants = d.of(before, after, "\"mint_window_grants\":"),
         .window_mints = d.of(before, after, "\"mint_window_mints\":"),
         .burns = d.of(before, after, "\"mint_burns\":"),
+        .affinity = d.of(before, after, "\"affinity_mints\":"),
         .windows = d.hist(before, after, "\"meta_apply_total\":", "\"count\":"),
         .waits_ns = d.hist(before, after, "\"leaf_takes_apply\":", "\"sum_ns\":"),
         .takes = d.hist(before, after, "\"leaf_takes_apply\":", "\"count\":"),
@@ -11936,7 +11937,7 @@ test "smoke: THE MINT WINDOWS UNDER A 32-STREAM CREATE STORM (decision 0003 §BV
     const window = try mintStormArm(rig, "window");
     const creates = mint_storm_streams * mint_storm_files;
     for ([_]struct { name: []const u8, a: MintArm }{ .{ .name = "census", .a = census }, .{ .name = "window", .a = window } }) |r| {
-        std.debug.print("smoke[mint windows]: {s}: {d} creates over {d} apply windows — leaf waits {d} ns per window ({d} takes), hold {d} ns per window; window grants {d}, window mints {d}, burns {d}\n", .{ r.name, creates, r.a.windows, r.a.waits_ns / @max(r.a.windows, 1), r.a.takes, r.a.hold_ns / @max(r.a.windows, 1), r.a.grants, r.a.window_mints, r.a.burns });
+        std.debug.print("smoke[mint windows]: {s}: {d} creates over {d} apply windows — leaf waits {d} ns per window ({d} takes), hold {d} ns per window; window grants {d}, window mints {d}, affinity mints {d}, burns {d}\n", .{ r.name, creates, r.a.windows, r.a.waits_ns / @max(r.a.windows, 1), r.a.takes, r.a.hold_ns / @max(r.a.windows, 1), r.a.grants, r.a.window_mints, r.a.affinity, r.a.burns });
     }
     try testing.expectEqual(@as(u64, 0), census.grants);
     try testing.expectEqual(@as(u64, 0), census.window_mints);

@@ -584,8 +584,9 @@ pub const Notify = struct {
     }
 };
 
-/// An open reservation: `[start, padded_end)`.
-const Open = struct { start: u64, padded_end: u64 };
+/// An open reservation: `[start, padded_end)`; `resident`: the journal
+/// tail holds it whole (§BX).
+const Open = struct { start: u64, padded_end: u64, resident: bool = false };
 
 /// The in-flight reservation registry (`docs/porting/kv_journal_ledger.md`
 /// §2.7): `minInflightStart` feeds the checkpoint tail rule (a tx between its
@@ -619,8 +620,20 @@ pub const InflightRegistry = struct {
     seq_offset: std.atomic.Value(u64) = .init(0),
     /// Wakes `pollCompletedUpto` waiters when the watermark advances.
     completion_notify: Notify = .{},
+    /// THE RESIDENT PREFIX (§BX): the start of the first open reservation
+    /// the journal tail does not hold whole, `maxInt` when it holds every
+    /// open one — every position below it is landed (completed) or in the
+    /// tail, which is what the supervisor's death replay walks before it
+    /// stops at a hole. An answer ahead of the landing is released only at
+    /// or past its own reservation's start. Written under the lock
+    /// (seq_cst: paired with the waiters' count the hook reads after it).
+    resident_upto: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    /// Fired after the lock whenever `resident_upto` moves up (the
+    /// conveyor's parked answers); none = nothing waits.
+    resident_hook: ?ResidentHook = null,
 
     pub const Registered = struct { res: Reservation, seq_base: u64 };
+    pub const ResidentHook = struct { ctx: *anyopaque, moved: *const fn (ctx: *anyopaque) void };
 
     /// `head_pos` is the core's head at open (the recovered head); `capacity`
     /// pre-sizes the open list so the steady state allocates nothing per op.
@@ -649,6 +662,8 @@ pub const InflightRegistry = struct {
         // Allocates only past the pre-sized capacity (a growing conveyor),
         // amortised; the steady state is `appendAssumeCapacity`.
         try self.open.append(self.gpa, .{ .start = res.start, .padded_end = res.paddedEnd() });
+        // Every open one before it resident: this one is the first that is not.
+        if (self.resident_upto.load(.monotonic) == std.math.maxInt(u64)) self.resident_upto.store(res.start, .seq_cst);
         // Monotonic suffices: the registry lock orders this read against
         // `raiseSeqFloor`'s RMW, which runs under the same lock.
         const seq_base = res.start +| self.seq_offset.load(.monotonic);
@@ -668,8 +683,44 @@ pub const InflightRegistry = struct {
         std.debug.assert(idx != null);
         if (idx) |i| _ = self.open.orderedRemove(i);
         self.completed_upto = if (self.open.items.len == 0) core.headPos() else self.open.items[0].start;
+        const moved = self.republishResident();
         self.lock.unlock();
         self.completion_notify.notifyWaiters();
+        if (moved) self.fireResident();
+    }
+
+    /// The journal tail holds the open reservation at `start` whole: its
+    /// window's every member and its PAD (self-apply), or its image (the
+    /// venue).
+    pub fn markResident(self: *InflightRegistry, start: u64) void {
+        self.lock.lock();
+        const idx = self.indexOf(start);
+        if (idx) |i| self.open.items[i].resident = true;
+        const moved = self.republishResident();
+        self.lock.unlock();
+        if (moved) self.fireResident();
+    }
+
+    /// The resident prefix (`resident_upto`).
+    pub fn residentUpto(self: *const InflightRegistry) u64 {
+        return self.resident_upto.load(.seq_cst);
+    }
+
+    /// Under the lock: the first open reservation not resident. The scan
+    /// stops there — the head of the list, all but always.
+    fn republishResident(self: *InflightRegistry) bool {
+        var upto: u64 = std.math.maxInt(u64);
+        for (self.open.items) |o| if (!o.resident) {
+            upto = o.start;
+            break;
+        };
+        if (upto == self.resident_upto.load(.monotonic)) return false;
+        self.resident_upto.store(upto, .seq_cst);
+        return true;
+    }
+
+    fn fireResident(self: *InflightRegistry) void {
+        if (self.resident_hook) |h| h.moved(h.ctx);
     }
 
     fn indexOf(self: *const InflightRegistry, start: u64) ?usize {

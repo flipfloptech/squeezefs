@@ -52,6 +52,13 @@
 //!                                                 its slots go back (the same); the gate checking
 //!                                                 before it registers (the parked pass outlives
 //!                                                 the landing that made room)
+//!  14 resident_answers_lie_inside_the_resident_prefix — a member answered on its own claim (the
+//!                                                 death replay's hole below it: the original
+//!                                                 defect); a member that reads its window's
+//!                                                 claim prefix alone (the earlier reservation's
+//!                                                 hole); the claim flag stored without the fence
+//!                                                 (store-buffered past the advance's flag load:
+//!                                                 the cursor stalls, the window is never marked)
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -117,6 +124,14 @@ const Weakening = enum {
     tail_count_before_release,
     /// The tail gate reads the count BEFORE it registers on `tail_freed`.
     tail_gate_check_before_register,
+    /// A member answers once its own slot is written (no residency check).
+    answer_on_own_claim,
+    /// A member checks its window's claim prefix alone, not the registry's
+    /// resident prefix below its window.
+    window_prefix_only,
+    /// The claim flag's store is not seq_cst: it sits in the store buffer
+    /// while the cursor's advance loads the next flag (Dekker's shape).
+    claim_flag_unfenced,
 };
 
 const Item = struct { id: u8, len: u8 };
@@ -1853,6 +1868,203 @@ fn TailSlots(comptime weakening: Weakening) type {
     };
 }
 
+/// Model 14 (§BX): an answer ahead of the landing lies inside the resident
+/// prefix — every reservation below it held by the journal tail or landed,
+/// so a death replay (which stops at the first hole) carries it. An earlier
+/// reservation P (another window, an SMO entry: here resident only when it
+/// LANDS) and a self-applied window W of two members M0 < M1. A member
+/// writes its tail slot, stores its claim flag (seq_cst: the fence step
+/// drains it), advances W's claim prefix (load it, load the flag at it, CAS
+/// it one on — the CAS that completes it marks W resident in the
+/// registry), takes its share of `pending`, then answers once
+/// `resident_upto` (the first open reservation not resident) is at W's
+/// start or past it AND its own prefix is claimed or W is resident (marked
+/// or landed); else it registers on the residency notify, re-checks and
+/// parks. Every advance, mark and landing notifies. The predicate's two
+/// loads are one step: both words only grow, so an earlier read of either
+/// is a stale-low read that only delays. The lane lands P, then W once both
+/// members took their share. Invariant (a death at ANY step): an answered
+/// member has P and every member at or below it resident. Final: both
+/// answered, W's prefix complete.
+fn ResidentAnswers(comptime weakening: Weakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 3;
+        const lane_t = 2;
+        const n: u8 = 2;
+
+        const Mpc = enum(u8) { slot, flag, fence, adv_load, adv_flag, adv_cas, mark, submit, check, register, recheck, parked, done };
+        const Lpc = enum(u8) { land_p, land_w, done };
+
+        slot: [2]bool = @splat(false),
+        flag: [2]bool = @splat(false),
+        /// The flag's store in its member's store buffer.
+        pend: [2]bool = @splat(false),
+        prefix: u8 = 0,
+        p_landed: bool = false,
+        w_marked: bool = false,
+        w_landed: bool = false,
+        submitted: u8 = 0,
+        answered: [2]bool = @splat(false),
+        /// A notify since the member registered.
+        woken: [2]bool = @splat(false),
+        mpc: [2]Mpc = @splat(.slot),
+        /// The prefix value the member's advance loop holds.
+        k: [2]u8 = @splat(0),
+        lpc: Lpc = .land_p,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        fn quiescent(self: *const Self) bool {
+            if (self.lpc != .done) return false;
+            for (self.mpc) |pc| if (pc != .done and pc != .parked) return false;
+            return true;
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            if (t == lane_t) return self.lpc == .done;
+            return self.mpc[t] == .done or (self.mpc[t] == .parked and !self.woken[t] and self.quiescent());
+        }
+
+        fn notify(self: *Self) void {
+            self.woken = @splat(true);
+        }
+
+        /// The member's flag as its own loads see it (store forwarding).
+        fn flagSeen(self: *const Self, i: usize, at: usize) bool {
+            return self.flag[at] or (at == i and self.pend[i]);
+        }
+
+        /// A locked RMW drains the issuing thread's store buffer.
+        fn drain(self: *Self, i: usize) void {
+            if (self.pend[i]) {
+                self.flag[i] = true;
+                self.pend[i] = false;
+            }
+        }
+
+        fn residentUpto(self: *const Self) u8 {
+            if (!self.p_landed) return 0;
+            if (!(self.w_marked or self.w_landed)) return 1;
+            return 2;
+        }
+
+        fn mayAnswer(self: *const Self, i: usize) bool {
+            return switch (weakening) {
+                .answer_on_own_claim => true,
+                .window_prefix_only => self.prefix >= i + 1 or self.w_marked or self.w_landed,
+                else => blk: {
+                    const upto = self.residentUpto();
+                    break :blk upto >= 1 and (self.prefix >= i + 1 or upto > 1);
+                },
+            };
+        }
+
+        fn stepMember(self: *Self, i: usize) void {
+            switch (self.mpc[i]) {
+                .slot => {
+                    self.slot[i] = true;
+                    self.mpc[i] = .flag;
+                },
+                .flag => {
+                    self.pend[i] = true;
+                    self.mpc[i] = if (weakening == .claim_flag_unfenced) .adv_load else .fence;
+                },
+                .fence => {
+                    self.drain(i);
+                    self.mpc[i] = .adv_load;
+                },
+                .adv_load => {
+                    self.k[i] = self.prefix;
+                    self.mpc[i] = .adv_flag;
+                },
+                .adv_flag => {
+                    const k = self.k[i];
+                    self.mpc[i] = if (k < n and self.flagSeen(i, k)) .adv_cas else .submit;
+                },
+                .adv_cas => {
+                    self.drain(i);
+                    if (self.prefix == self.k[i]) {
+                        self.prefix += 1;
+                        self.notify();
+                        self.k[i] = self.prefix;
+                        self.mpc[i] = if (self.prefix == n) .mark else .adv_flag;
+                    } else {
+                        self.k[i] = self.prefix;
+                        self.mpc[i] = .adv_flag;
+                    }
+                },
+                .mark => {
+                    self.w_marked = true;
+                    self.notify();
+                    self.mpc[i] = .submit;
+                },
+                .submit => {
+                    self.drain(i);
+                    self.submitted += 1;
+                    self.mpc[i] = .check;
+                },
+                .check => {
+                    if (self.mayAnswer(i)) {
+                        self.answered[i] = true;
+                        self.mpc[i] = .done;
+                    } else self.mpc[i] = .register;
+                },
+                .register => {
+                    self.woken[i] = false;
+                    self.mpc[i] = .recheck;
+                },
+                .recheck => {
+                    if (self.mayAnswer(i)) {
+                        self.answered[i] = true;
+                        self.mpc[i] = .done;
+                    } else self.mpc[i] = .parked;
+                },
+                .parked => if (self.woken[i]) {
+                    self.mpc[i] = .register;
+                },
+                .done => unreachable,
+            }
+        }
+
+        fn stepLane(self: *Self) void {
+            switch (self.lpc) {
+                .land_p => {
+                    self.p_landed = true;
+                    self.notify();
+                    self.lpc = .land_w;
+                },
+                .land_w => if (self.submitted == n) {
+                    self.w_landed = true;
+                    self.notify();
+                    self.lpc = .done;
+                },
+                .done => unreachable,
+            }
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            if (t == lane_t) return self.stepLane();
+            self.stepMember(t);
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            for (self.answered, 0..) |a, i| {
+                if (!a) continue;
+                if (!self.p_landed) return error.AnsweredPastAHole;
+                for (self.slot[0 .. i + 1]) |held| if (!held) return error.AnsweredPastAHole;
+            }
+        }
+
+        pub fn final(self: *const Self) !void {
+            for (self.answered) |a| if (!a) return error.MemberNeverAnswered;
+            if (self.prefix != n) return error.ClaimPrefixStalled;
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -1935,8 +2147,15 @@ test "conveyor_tail_gate_never_meets_a_full_table (§BW): holds (register, read 
 }
 
 // The state counts the evidence note records.
+test "conveyor_resident_answers_lie_inside_the_resident_prefix (§BX): holds (slot, seq_cst claim flag, the prefix advanced by CAS and marked resident by the CAS that completes it, then the answer once the registry's resident prefix reaches the window and the member's own prefix is claimed, else register, re-check, park); answering on the member's own claim and reading the window's prefix alone each answer past a hole; the claim flag unfenced stalls the cursor" {
+    try explorer.expectHolds(ResidentAnswers(.none), .{});
+    try explorer.expectFails(ResidentAnswers(.answer_on_own_claim), .{}, error.InvariantViolated);
+    try explorer.expectFails(ResidentAnswers(.window_prefix_only), .{}, error.InvariantViolated);
+    try explorer.expectFails(ResidentAnswers(.claim_flag_unfenced), .{}, error.FinalViolated);
+}
+
 test "conveyor models: exhaustive within the explorer's default limits" {
-    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none), LeafwiseDestroy(.none), TailSlots(.none) }) |Model| {
+    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none), LeafwiseDestroy(.none), TailSlots(.none), ResidentAnswers(.none) }) |Model| {
         var report: explorer.Report = undefined;
         try explorer.explore(Model, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

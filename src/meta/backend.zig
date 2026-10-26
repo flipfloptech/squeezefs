@@ -5198,7 +5198,7 @@ fn recordsOfCreates(n: usize) u64 {
     return @as(u64, n) * 3;
 }
 
-test "§AW.4 two windows apply in either order, with the checkpointer's freeze between them: W1 (the older seqs, Δtime 1001) is held before its apply, W2 (Δtime 2002 on the same parent) applies and is acked, the parent's leaf freezes — its base now holds W2's Δ — then W1 lands its Δ BELOW it; the parent's mtime is W2's (the seq decides, never the apply order), the read never trips the fold's newest-first contract nor serves a stale head, the next Δ applies over both sources, and the reopen agrees" {
+test "§AW.4 two windows apply in either order, with the checkpointer's freeze between them: W1 (the older seqs, Δtime 1001) is held before its apply, W2 (Δtime 2002 on the same parent) applies — its answer waits for W1 to reach the journal tail (§BX: a death replay stops at W1's hole) — the parent's leaf freezes — its base now holds W2's Δ — then W1 lands its Δ BELOW it; the parent's mtime is W2's (the seq decides, never the apply order), the read never trips the fold's newest-first contract nor serves a stale head, the next Δ applies over both sources, and the reopen agrees" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "aw4-freeze", "600000");
     defer v.destroy();
@@ -5231,12 +5231,18 @@ test "§AW.4 two windows apply in either order, with the checkpointer's freeze b
     try testing.expectEqual(@as(u32, 1), conveyor.test_seams.apply_held.load(.acquire));
     conveyor.test_seams.apply_held.store(0, .release);
     try testing.expectEqual(@as(u32, 0), done1.load(.acquire));
-    // W2: reserved after W1 (its seqs are higher), applied and acked
-    // while W1 waits; the parent reads W2's stamp.
+    // W2: reserved after W1 (its seqs are higher), applied while W1
+    // waits; the parent reads W2's stamp. Its answer waits for W1 (§BX).
     const acks0 = be.conveyorStats().acks_at_apply.load();
-    _ = try commitCreateKernelAt(be, "w2", 2002);
-    try testing.expectEqual(acks0 + 1, be.conveyorStats().acks_at_apply.load());
+    const waits0 = be.conveyorStats().resident_waits.load();
+    var out2: anyerror!u64 = error.TestUnexpectedResult;
+    var done2 = std.atomic.Value(u32).init(0);
+    const t2 = try std.Thread.spawn(.{}, Committer.run, .{ be, "w2", 2002, &out2, &done2 });
+    while (be.conveyorStats().resident_waits.load() == waits0 and clock.monotonicNs() < deadline) try testing.io.sleep(.fromMilliseconds(1), .awake);
+    try testing.expectEqual(waits0 + 1, be.conveyorStats().resident_waits.load());
+    try testing.expectEqual(acks0, be.conveyorStats().acks_at_apply.load());
     try testing.expectEqual(@as(u32, 0), done1.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), done2.load(.acquire));
     try testing.expectEqual(@as(u64, 2002), try parentMtime(be));
     // The checkpointer's lock window on the parent's leaf: the open
     // overlay (W2's Δ among it) becomes base.
@@ -5257,7 +5263,10 @@ test "§AW.4 two windows apply in either order, with the checkpointer's freeze b
     conveyor.test_seams.hold_next_apply.store(0, .release);
     conveyor.test_seams.apply_release.notifyWaiters(be.io);
     t1.join();
+    t2.join();
     _ = try out1;
+    _ = try out2;
+    try testing.expectEqual(acks0 + 2, be.conveyorStats().acks_at_apply.load());
     try testing.expectEqual(@as(u64, 2002), try parentMtime(be));
     // The next Δ's apply folds below itself over the same two sources.
     _ = try commitCreateKernelAt(be, "w3", 3003);
@@ -5272,12 +5281,19 @@ test "§AW.4 two windows apply in either order, with the checkpointer's freeze b
     while (conveyor.test_seams.apply_held.load(.acquire) == 0 and clock.monotonicNs() < deadline) try testing.io.sleep(.fromMilliseconds(1), .awake);
     try testing.expectEqual(@as(u32, 1), conveyor.test_seams.apply_held.load(.acquire));
     conveyor.test_seams.apply_held.store(0, .release);
-    _ = try commitCreateKernelAt(be, "w5", 4004);
+    const waits1 = be.conveyorStats().resident_waits.load();
+    var out5: anyerror!u64 = error.TestUnexpectedResult;
+    var done5 = std.atomic.Value(u32).init(0);
+    const t5 = try std.Thread.spawn(.{}, Committer.run, .{ be, "w5", 4004, &out5, &done5 });
+    while (be.conveyorStats().resident_waits.load() == waits1 and clock.monotonicNs() < deadline + 10 * std.time.ns_per_s) try testing.io.sleep(.fromMilliseconds(1), .awake);
+    try testing.expectEqual(@as(u32, 0), done5.load(.acquire));
     try testing.expectEqual(@as(u64, 4004), try parentMtime(be));
     conveyor.test_seams.hold_next_apply.store(0, .release);
     conveyor.test_seams.apply_release.notifyWaiters(be.io);
     t4.join();
+    t5.join();
     _ = try out4;
+    _ = try out5;
     try testing.expectEqual(@as(u64, 4004), try parentMtime(be));
     _ = try commitCreateKernelAt(be, "w6", 5005);
     try testing.expectEqual(@as(u64, 5005), try parentMtime(be));

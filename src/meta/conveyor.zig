@@ -762,10 +762,14 @@ pub const Stats = struct {
     self_handoffs: counters.ShardedCounter = .{},
     self_applies: counters.ShardedCounter = .{},
     /// `meta_conveyor_resident_waits`: answers at the apply that waited for
-    /// the journal tail to hold every reservation below their window
-    /// (`awaitResident`); `meta_resident_wait`: the wait.
+    /// the journal tail to hold every reservation below their own (§BX,
+    /// `awaitResident`); `meta_resident_wait`: the wait.
+    /// `meta_conveyor_resident_landings`: answers at the apply left to the
+    /// landing instead (an applier on the journal lane's own fiber never
+    /// parks there).
     resident_waits: counters.ShardedCounter = .{},
     resident_wait: counters.ShardedLatencyHistogram = .{},
+    resident_landings: counters.ShardedCounter = .{},
     /// `meta_conveyor_tail_gate_parks`: passes parked because the members
     /// of the self-applied windows in flight plus the batch would not fit
     /// the journal tail's slot table (`awaitTailSlots`).
@@ -890,7 +894,7 @@ pub const Stats = struct {
             self.hold_bound_ns.load(),
             self.holds_pacing.load(),
         });
-        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_tail_gate_parks\":{d},\"meta_conveyor_resident_waits\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.tail_gate_parks.load(), self.resident_waits.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
+        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_tail_gate_parks\":{d},\"meta_conveyor_resident_waits\":{d},\"meta_conveyor_resident_landings\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.tail_gate_parks.load(), self.resident_waits.load(), self.resident_landings.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
         try w.print(",\"meta_conveyor_window_gate_parks\":{d},\"meta_conveyor_room_parks\":{d},\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.window_gate_parks.load(),
             self.commit_room_parks.load(),
@@ -1273,6 +1277,12 @@ pub const Window = struct {
     /// the tail's copy and the image's.
     pad_ops: []const journal.WriteOp = &.{},
     pad_header_bytes: u64 = 0,
+    /// §BX: the leading members whose tail slots are written; the CAS that
+    /// completes it marks the window resident in the registry.
+    claimed_prefix: std.atomic.Value(u32) = .init(0),
+    /// Applied on the journal lane's own fiber (the pass's, alone): an
+    /// answer there never parks for the resident prefix.
+    on_lane: bool = false,
 
     /// One self-applying member's share of the window (§BC): its own
     /// arena (the members apply concurrently), its sub-range and seq, its
@@ -1289,6 +1299,9 @@ pub const Window = struct {
         undo: []tx.UndoKey = &.{},
         tail_slot: ?u32 = null,
         answered: bool = false,
+        /// §BX: its tail slot is written (seq_cst: model 14's fence — the
+        /// advance's load of the next flag must see it or its CAS must).
+        claimed: std.atomic.Value(bool) = .init(false),
     };
 
     /// A self-applied window with a member answered ahead of the landing:
@@ -1672,6 +1685,11 @@ pub const Conveyor = struct {
     /// relaxed load per drain otherwise).
     room_waiters: std.atomic.Value(u32) = .init(0),
     room: sync.Notify = .init,
+    /// §BX: answers parked for the resident prefix; every move of it (the
+    /// registry's hook) and every claim prefix's advance notifies while
+    /// the count is non-zero.
+    resident_waiters: std.atomic.Value(u32) = .init(0),
+    resident: sync.Notify = .init,
     stats: Stats = .{},
     /// The windows' own arenas and their images' (two per window in
     /// flight), and the self-applying members' parts (one per member of a
@@ -1696,6 +1714,7 @@ pub const Conveyor = struct {
         errdefer self.inflight.deinit(gpa);
         try self.inflight.ensureTotalCapacity(gpa, @intCast(inflight_cap));
         self.core = Core.init(deps.io, slots, &self.stats.queued);
+        deps.reg.resident_hook = .{ .ctx = self, .moved = residentMoved };
         return self;
     }
 
@@ -1705,6 +1724,7 @@ pub const Conveyor = struct {
         const gpa = self.deps.gpa;
         assert(self.core.pending() == 0);
         assert(self.inflight.count() == 0);
+        self.deps.reg.resident_hook = null;
         self.inflight.deinit(gpa);
         self.part_arenas.deinit(gpa);
         self.window_arenas.deinit(gpa);
@@ -2836,7 +2856,10 @@ pub const Conveyor = struct {
         const alone = self.windowsInflight() == 1;
         _ = self.in_apply.fetchAdd(1, .acq_rel);
         const a = self.deps.applier;
-        if (alone or !a.spawn(a.ctx, w)) self.applyWindow(w);
+        if (alone or !a.spawn(a.ctx, w)) {
+            w.on_lane = true;
+            self.applyWindow(w);
+        }
     }
 
     /// §BC: the members' turns. Each gets its sub-range, its seq and its
@@ -2978,18 +3001,35 @@ pub const Conveyor = struct {
             if (p.tail_slot == null) {
                 self.stats.tail_slot_misses.fire("the journal tail's slot table refused a member; acked at the landing");
                 if (failed[0] == null) early = false;
-            }
+            } else self.noteClaimed(w, idx);
         };
         if (w.pad_unclaimed and failed[0] == null) early = false;
+        // §BX: a success answered ahead of the landing lies inside the
+        // resident prefix — else it waits for it, holding the window (a
+        // party) past its share of `pending`: a member that waited before
+        // it would hold back the very landing an unclaimed sibling's hole
+        // waits for. A refusal answers now (nothing of it lands).
+        const waits = early and failed[0] == null and !self.residentFor(w, idx);
         if (early) {
             p.answered = true;
-            self.stats.acks_at_apply.inc();
-            self.answerOne(m, outcome, false);
+            if (waits) {
+                _ = w.parties.fetchAdd(1, .acq_rel);
+            } else {
+                self.stats.acks_at_apply.inc();
+                self.answerOne(m, outcome, false);
+            }
         }
         // The last member to finish writes the window. Nothing of `w` is
         // touched past this point by a member that answered itself: the
         // lane may finish and free the window at once.
         if (w.pending.fetchSub(1, .acq_rel) == 1) self.submitSelfApplied(w);
+        if (waits) {
+            self.awaitResident(w, idx);
+            self.stats.acks_at_apply.inc();
+            self.answerOne(m, outcome, false);
+            w.release();
+            return outcome;
+        }
         if (early) return outcome;
         return done.landing.recvUncancelable(self.deps.io) catch error.Corrupt;
     }
@@ -3418,8 +3458,15 @@ pub const Conveyor = struct {
             if (window.tail_slot == null) {
                 self.stats.tail_slot_misses.fire("the journal tail's slot table refused a window; acked at the landing");
                 ack_now = false;
-            }
+            } else self.deps.reg.markResident(window.res.start);
         };
+        // §BX: the answer lies inside the resident prefix; on the lane's own
+        // fiber nothing parks (the landings it waits for are that fiber's
+        // to reap), so an earlier hole leaves the answer to the landing.
+        if (ack_now and window.on_lane and !self.residentFor(window, null)) {
+            self.stats.resident_landings.inc();
+            ack_now = false;
+        }
         // Two parties while the applier answers: the lane's verdict may
         // land before the answer and must not free the window under it.
         if (ack_now) window.parties.store(2, .release);
@@ -3429,6 +3476,7 @@ pub const Conveyor = struct {
             return;
         };
         if (ack_now) {
+            if (!self.residentFor(window, null)) self.awaitResident(window, null);
             // The handoff precedes the ack: an fsync issued after the ack
             // finds the window in the lane's queue (§BB.4).
             if (window.claimAck(Window.ACK_APPLIER)) {
@@ -3437,6 +3485,75 @@ pub const Conveyor = struct {
             }
             window.release();
         }
+    }
+
+    /// §BX: member `idx`'s tail slot is written — its flag, then the
+    /// window's claim prefix carried past every leading claimed member; the
+    /// CAS that completes it marks the window resident (its PAD went first,
+    /// `handToMembers`). Seq_cst throughout (model 14: a flag store left in
+    /// the store buffer past the advance's load of the next flag stalls
+    /// the prefix).
+    fn noteClaimed(self: *Conveyor, w: *Window, idx: u32) void {
+        w.parts[idx].claimed.store(true, .seq_cst);
+        const n: u32 = @intCast(w.parts.len);
+        var k = w.claimed_prefix.load(.seq_cst);
+        while (k < n and w.parts[k].claimed.load(.seq_cst)) {
+            if (w.claimed_prefix.cmpxchgStrong(k, k + 1, .seq_cst, .seq_cst)) |actual| {
+                k = actual;
+                continue;
+            }
+            k += 1;
+            if (k == n and !w.pad_unclaimed) self.deps.reg.markResident(w.res.start);
+            self.notifyResident();
+        }
+    }
+
+    /// §BX: may member `idx` of `w` be answered ahead of the landing —
+    /// every reservation below it and its own entry resident (the earlier
+    /// ones through the registry, its window's earlier members and itself
+    /// through the claim prefix)? Null: the whole window (the venue's one
+    /// image), resident itself. Both words only grow, so the two loads in
+    /// either order can only answer late.
+    fn residentFor(self: *Conveyor, w: *Window, idx: ?u32) bool {
+        const upto = self.deps.reg.residentUpto();
+        if (upto > w.res.start) return true;
+        const i = idx orelse return false;
+        return upto == w.res.start and w.claimed_prefix.load(.seq_cst) >= i + 1;
+    }
+
+    /// Park until `residentFor` holds (register, re-check, park). Every
+    /// earlier reservation reaches the tail or lands without this one: a
+    /// self-applied member took its share of `pending` first, an applier
+    /// waits only for windows reserved before its own, and an SMO entry
+    /// lands on the lane.
+    fn awaitResident(self: *Conveyor, w: *Window, idx: ?u32) void {
+        const io = self.deps.io;
+        const t0 = clock.monotonicNs();
+        self.stats.resident_waits.inc();
+        // Seq_cst: the notifier stores the prefix (or the registry's word),
+        // then reads this count.
+        _ = self.resident_waiters.fetchAdd(1, .seq_cst);
+        defer _ = self.resident_waiters.fetchSub(1, .seq_cst);
+        while (true) {
+            var n = self.resident.notified();
+            _ = n.enable(io);
+            if (self.residentFor(w, idx) or (idx == null and w.ack_owner.load(.acquire) != Window.ACK_NONE)) {
+                n.cancel(io);
+                break;
+            }
+            n.waitUncancelable(io);
+        }
+        self.stats.resident_wait.record(clock.monotonicNs() -| t0);
+    }
+
+    fn notifyResident(self: *Conveyor) void {
+        if (self.resident_waiters.load(.seq_cst) != 0) self.resident.notifyWaiters(self.deps.io);
+    }
+
+    /// The registry's hook: its resident prefix moved.
+    fn residentMoved(ctx: *anyopaque) void {
+        const self: *Conveyor = @ptrCast(@alignCast(ctx));
+        self.notifyResident();
     }
 
     /// `test_seams.hold_next_apply`: the one armed window's applier parks
@@ -6071,7 +6188,7 @@ test "the stats JSON names every conveyor face" {
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w);
     const out = w.buffered();
-    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves", "meta_conveyor_pass_yields", "meta_conveyor_tail_gate_parks", "meta_conveyor_resident_waits" }) |name| {
+    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves", "meta_conveyor_pass_yields", "meta_conveyor_tail_gate_parks", "meta_conveyor_resident_waits", "meta_conveyor_resident_landings" }) |name| {
         try testing.expect(std.mem.indexOf(u8, out, name) != null);
     }
     var pb: [8192]u8 = undefined;

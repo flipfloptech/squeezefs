@@ -4031,7 +4031,8 @@ test "§BB.1 the ack at the apply: under the coalesced cadence this mount's kern
     const ino = try commitCreateKernel(be, "early");
     try testing.expect(try present(be, ino));
     try testing.expectEqual(acks0 + 1, be.conveyorStats().acks_at_apply.load());
-    try testing.expectEqual(@as(u32, 1), be.tail.?.image.writtenCount());
+    // Self-apply (§BV): the member's slot and its window's PAD's.
+    try testing.expectEqual(@as(u32, 2), be.tail.?.image.writtenCount());
     // fsync parks behind the un-landed window (§BB.4).
     const Sync = struct {
         fn run(b: *KvBackend, out: *?anyerror, done: *std.atomic.Value(u32)) void {
@@ -4501,7 +4502,8 @@ test "§BB.5 a journal write that fails AFTER its window was acked: the commit r
     defer journal_lane.test_seams.delay_issue.store(0, .release);
     const ino = try commitCreateKernel(be, "acked");
     try testing.expect(try present(be, ino));
-    try testing.expectEqual(@as(u32, 1), be.tail.?.image.writtenCount());
+    // Self-apply (§BV): the member's slot and its window's PAD's.
+    try testing.expectEqual(@as(u32, 2), be.tail.?.image.writtenCount());
     journal_lane.test_seams.fail_windows.store(1, .release);
     defer journal_lane.test_seams.fail_windows.store(0, .release);
     journal_lane.test_seams.delay_issue.store(0, .release);
@@ -5085,6 +5087,8 @@ test "§AW.4 two windows apply in either order, with the checkpointer's freeze b
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "aw4-freeze", "600000");
     defer v.destroy();
+    // The seam holds a window before its APPLIER's apply: the venue arm.
+    try v.env.put("SQUEEZEFS_META_APPLY", "venue");
     const be = try v.open();
     var closed = false;
     defer if (!closed) be.close();
@@ -5236,6 +5240,8 @@ test "the committer venue (SQUEEZEFS_META_PASS_VENUE=committer): a 4-thread stor
     const v = try TestVol.create(gpa, "storm-committer-pass", "20");
     defer v.destroy();
     try v.env.put("SQUEEZEFS_META_PASS_VENUE", "committer");
+    // The startup gate refuses `committer` with `self` (§BO.3): its pair.
+    try v.env.put("SQUEEZEFS_META_APPLY", "venue");
     const threads = 4;
     const per_thread = 60;
     var acked: [threads][per_thread]u64 = undefined;

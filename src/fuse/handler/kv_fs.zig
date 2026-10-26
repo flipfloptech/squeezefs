@@ -81,7 +81,8 @@
 //! the whole-entry cap with their `−ref` records (`inos.stageDestroy`,
 //! `inos.packDestroyEntries`; the batched-destroy economy, `unlink ≤ 1.05
 //! entries/op`). A forgotten corpse is unreachable by name and unknown to
-//! the kernel, so its destroy needs no 4a guard. A corpse whose FORGET or
+//! the kernel, so its destroy needs no 4a guard and its apply may take one
+//! leaf at a time (`KvTx.leafwise`, decision 0003 §BV). A corpse whose FORGET or
 //! gather died with the daemon (`kill -9`) is found by the next mount's
 //! sweep (`sweepCorpsesAtMount`: one pass over the inode tree for
 //! `nlink == 0`, the same destroy rider) before any request is served.

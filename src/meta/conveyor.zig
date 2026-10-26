@@ -1712,6 +1712,12 @@ pub const Conveyor = struct {
     /// after its slots went back, then notifies `tail_freed`.
     tail_members: std.atomic.Value(u32) = .init(0),
     tail_freed: sync.Notify = .init,
+    /// §BX.8: the PADs standing in the tail over rolled-back windows'
+    /// ranges until a durable ledger lies past them (`sweepHeldPads`); a
+    /// self-applied window's keeps one of its own window's `tail_members`.
+    held_pads: [HELD_PADS_MAX]HeldPad = undefined,
+    held_pads_n: std.atomic.Value(u32) = .init(0),
+    held_pads_lock: jc.SpinLock = .{},
     /// The thread the last pass ran on (`std.Thread.getCurrentId`): the
     /// venue witness — ≡ the journal lane's tid on a mounted volume.
     pass_thread: std.atomic.Value(u64) = .init(0),
@@ -1760,6 +1766,14 @@ pub const Conveyor = struct {
     /// window in flight), recycled (`ArenaPool`).
     window_arenas: ArenaPool,
     part_arenas: ArenaPool,
+
+    /// A held PAD's slot, the end of the range it stands over, and whether
+    /// it holds a unit of `tail_members`.
+    const HeldPad = struct { slot: u32, end: u64, counted: bool };
+    /// Rolled-back windows whose hole no ledger has covered yet: each is
+    /// a failed write the lane's cover could not pass (the SMO lock held
+    /// by an in-flight cycle, which covers it), so a handful at most.
+    const HELD_PADS_MAX = 16;
 
     pub fn init(gpa: Allocator, deps: Deps) Allocator.Error!*Conveyor {
         const self = try gpa.create(Conveyor);
@@ -4047,6 +4061,7 @@ pub const Conveyor = struct {
     /// in-window apply failure else the lane's verdict; guards drop BEFORE
     /// the ack; the window dies.
     pub fn finishWindow(self: *Conveyor, w: *Window, result: Error!void) void {
+        self.sweepHeldPads();
         self.untrack(w);
         // The landing's wake for a pass holding on this window (§L): after
         // the in-flight count dropped, so the pass's re-read sees 0; the
@@ -4065,13 +4080,12 @@ pub const Conveyor = struct {
             // The tail slots of a window that LANDED, before any answer: a
             // member answered here as failed (its PAD refused, §BX) leaves
             // nothing the death replay could still apply. A failed write's
-            // stay written for the supervisor's replay (§BB.5).
+            // stay written for the supervisor's replay (§BB.5) — an acked
+            // window's; one nobody was answered from is rolled back and
+            // replays nothing (§BX.8).
             if (result) |_| {
-                if (self.deps.tail) |t| {
-                    for (w.parts) |p| if (p.tail_slot) |slot| t.release(t.ctx, slot);
-                    if (w.pad_slot) |slot| t.release(t.ctx, slot);
-                }
-            } else |_| {}
+                self.releaseTailSlots(w);
+            } else |_| if (!w.anyAnswered()) self.retireRolledBack(w);
             // The members that waited for the landing (§BC: a served verb,
             // a control record, a tool; a member whose tail slot was
             // refused); the others answered themselves at the apply.
@@ -4085,17 +4099,128 @@ pub const Conveyor = struct {
             return;
         }
         // The slot first, as above (a member rolled out of a window whose
-        // start's copy stayed in the tail, §BX).
-        if (result) |_| {
-            if (w.tail_slot) |slot| if (self.deps.tail) |t| t.release(t.ctx, slot);
-        } else |_| {}
+        // start's copy stayed in the tail, §BX); a window the lane answers
+        // with a failure was rolled back (§BB.5) and replays nothing.
         const owner = w.ack_owner.load(.acquire);
-        if (owner == Window.ACK_LANE or w.claimAck(Window.ACK_LANE)) {
+        const lane_answers = owner == Window.ACK_LANE or w.claimAck(Window.ACK_LANE);
+        if (result) |_| {
+            self.releaseTailSlots(w);
+        } else |_| if (lane_answers) self.retireRolledBack(w);
+        if (lane_answers) {
             self.stats.acks_at_landing.inc();
             self.answerMembers(w, result);
         }
         self.returnTailMembers(w);
         w.release();
+    }
+
+    /// Every tail slot the window holds goes back: its members' entries and
+    /// its PAD (self-applied), or its image (venue).
+    fn releaseTailSlots(self: *Conveyor, w: *Window) void {
+        const t = self.deps.tail orelse return;
+        for (w.parts) |*p| if (p.tail_slot) |slot| {
+            t.release(t.ctx, slot);
+            p.tail_slot = null;
+        };
+        if (w.pad_slot) |slot| t.release(t.ctx, slot);
+        w.pad_slot = null;
+        if (w.tail_slot) |slot| t.release(t.ctx, slot);
+        w.tail_slot = null;
+    }
+
+    fn holdsTailSlots(w: *const Window) bool {
+        for (w.parts) |p| if (p.tail_slot != null) return true;
+        return w.pad_slot != null or w.tail_slot != null;
+    }
+
+    /// §BX.8: a window rolled back with nobody answered — its write failed
+    /// or the lane never took it — is answered as failed, so nothing of it
+    /// may replay at a death, while every later window answered ahead of
+    /// its landing chains to the device through its range. Before any
+    /// member's error: unless a durable ledger already lies past it (the
+    /// hole checkpoint's — the death replay skips what is behind the
+    /// ledger's tail), its range — every member a PAD, then its own PAD —
+    /// enters the tail, held until one does (`sweepHeldPads`); then the
+    /// window's own slots go back. A replacement the table refuses leaves
+    /// them as they were, logged: the replay would apply the failed
+    /// window, as it did before.
+    fn retireRolledBack(self: *Conveyor, w: *Window) void {
+        if (self.deps.tail == null or !holdsTailSlots(w)) return;
+        if (self.deps.core.reusableUpto() < w.res.paddedEnd()) {
+            // The held PAD keeps one of the window's own units of
+            // `tail_members` (its members and its PAD): the gate's count
+            // never gains an incrementer besides the pass.
+            const counted = w.tail_members != 0;
+            if (!self.holdPad(w, counted)) {
+                log.warn("meta volume {s}: the journal tail could not stand a PAD over the rolled-back window at [{d}, {d}) — its slots stay written until the hole is covered", .{ self.deps.volume, w.res.start, w.res.paddedEnd() });
+                return;
+            }
+            if (counted) w.tail_members -= 1;
+        }
+        self.releaseTailSlots(w);
+    }
+
+    /// The rolled-back window's range as PADs — one per member (each under
+    /// the entry cap, as its entry was) and the window's own — in a slot
+    /// recorded in `held_pads`. Claimed under the list's lock, so a claim
+    /// is never left unrecorded. Claimed before the window's own slots go
+    /// back, it takes one slot beyond the window's count for that instant,
+    /// as a rolled-out member's PAD does (`padMember`); a refusal is the
+    /// caller's.
+    fn holdPad(self: *Conveyor, w: *const Window, counted: bool) bool {
+        const t = self.deps.tail.?;
+        var scratch = std.heap.ArenaAllocator.init(self.deps.gpa);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var ops: std.ArrayList(journal.WriteOp) = .empty;
+        var pos = w.res.start;
+        for (w.members, 0..) |*m, i| {
+            // A self-applied window's parts outlive its members' answers.
+            const len = if (w.parts.len != 0) w.parts[i].len else m.q.len;
+            _ = journal.partOps(a, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, .{ .res = Reservation.unpadded(pos, len), .records = &.{}, .pad = true }, &ops) catch return false;
+            pos += len;
+        }
+        _ = journal.padOps(a, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, w.res.end(), w.res.pad, &ops) catch return false;
+        self.held_pads_lock.lock();
+        defer self.held_pads_lock.unlock();
+        const n = self.held_pads_n.load(.monotonic);
+        if (n == HELD_PADS_MAX) return false;
+        const slot = t.claim(t.ctx, w.seq_base, w.res.start, ops.items) orelse return false;
+        self.held_pads[n] = .{ .slot = slot, .end = w.res.paddedEnd(), .counted = counted };
+        // release: paired with `sweepHeldPads`' acquire fast-path load.
+        self.held_pads_n.store(n + 1, .release);
+        return true;
+    }
+
+    /// §BX.8: a held PAD goes back once a durable ledger lies past its
+    /// range — the slot first, then its count, then the gate's wake.
+    fn sweepHeldPads(self: *Conveyor) void {
+        if (self.held_pads_n.load(.acquire) == 0) return;
+        const t = self.deps.tail orelse return;
+        const upto = self.deps.core.reusableUpto();
+        var freed: u32 = 0;
+        {
+            self.held_pads_lock.lock();
+            defer self.held_pads_lock.unlock();
+            var n = self.held_pads_n.load(.monotonic);
+            var i: u32 = 0;
+            while (i < n) {
+                if (self.held_pads[i].end > upto) {
+                    i += 1;
+                    continue;
+                }
+                t.release(t.ctx, self.held_pads[i].slot);
+                if (self.held_pads[i].counted) freed += 1;
+                n -= 1;
+                self.held_pads[i] = self.held_pads[n];
+            }
+            self.held_pads_n.store(n, .release);
+        }
+        if (freed == 0) return;
+        // acq_rel: the slot releases above precede the drop the pass's
+        // acquire load reads.
+        _ = self.tail_members.fetchSub(freed, .acq_rel);
+        self.tail_freed.notifyWaiters(self.deps.io);
     }
 
     /// Per member in journal order: the in-window apply failure else

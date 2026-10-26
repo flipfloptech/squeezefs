@@ -4740,6 +4740,7 @@ fn rolledBackRow(v: *TestVol) !void {
     var ino: u64 = 0;
     var later: u64 = 0;
     var written_after: u32 = 0;
+    var members_after: u32 = 0;
     {
         const be = try v.open();
         defer be.close();
@@ -4772,6 +4773,10 @@ fn rolledBackRow(v: *TestVol) !void {
         try be.fsync();
         _ = try commitCreate(be, "after");
         written_after = be.tail.?.image.writtenCount();
+        // A window's count drops after its answers (its slots before them).
+        const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+        while (be.cv.tail_members.load(.acquire) != 0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+        members_after = be.cv.tail_members.load(.acquire);
     }
     {
         const copy = try KvBackend.open(gpa, v.io(), dst, .{ .env = &v.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .index = 1 });
@@ -4781,6 +4786,7 @@ fn rolledBackRow(v: *TestVol) !void {
         try testing.expect(try present(copy, later));
     }
     try testing.expectEqual(@as(u32, 0), written_after);
+    try testing.expectEqual(@as(u32, 0), members_after);
 }
 
 test "§BX.8 a self-applied window rolled back with nobody answered — its write failed, the hole not yet covered — replays nothing of it at a death, and its tail slots come back once a checkpoint covers it (red: its entries stayed written in the tail: the failed create replayed, the slots leaked)" {

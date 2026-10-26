@@ -663,6 +663,16 @@ pub fn writeEntryAfterRelease(j: *SmoJournal, r: jc.InflightRegistry.Registered,
 /// is 0); `0` = off; unarmed cost is one monotonic load per SMO.
 pub var test_smo_build_pause_tree: std.atomic.Value(u64) = .init(0);
 
+/// 1 ⇒ the next `smoReplace` fails right after its in-window reservation,
+/// as an allocation there would (self-disarming); unarmed cost is one
+/// monotonic load per SMO.
+pub var test_fail_after_reserve: std.atomic.Value(u32) = .init(0);
+
+fn failAfterReserveForTest() error{OutOfMemory}!void {
+    if (test_fail_after_reserve.load(.monotonic) == 0) return;
+    if (test_fail_after_reserve.cmpxchgStrong(1, 0, .acq_rel, .monotonic) == null) return error.OutOfMemory;
+}
+
 fn pauseArmFor(t: *const KvTree) u64 {
     return @as(u64, t.tree_id) + 1;
 }
@@ -1081,6 +1091,7 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
         // successor after the swap reserves after this and carries higher
         // seqs, so replay applies the pointer record first.
         if (prep) |*p| registered = try reserveInWindow(ctx.journal.?, p);
+        try failAfterReserveForTest();
         const leftovers = try nd.takeOverlay(gpa);
         const taken = gpa.alloc(bool, leftovers.len) catch |e| {
             for (leftovers) |*r| r.deinit();

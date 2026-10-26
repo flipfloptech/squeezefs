@@ -4803,6 +4803,78 @@ test "§BX.8 the venue arm: a window rolled back with nobody answered replays no
     try rolledBackRow(v);
 }
 
+test "§BX.9 an SMO that fails past its in-window reservation leaves nothing open: a threshold drain's replace fails right after reserving (`test_fail_after_reserve`) and B, a create committed then, is answered at its own apply, the completed prefix moves (fsync returns) and everything lands (red: the reservation stayed open, neither landed nor resident — every later answer at the apply parked behind it, and every landing with it)" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "smo-fails-reserved", "600000");
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    // A durable baseline first: the structural write the drain reaches is
+    // its SMO's.
+    for (0..8) |i| {
+        var nb: [16]u8 = undefined;
+        _ = try commitCreate(be, try std.fmt.bufPrint(&nb, "base-{d}", .{i}));
+    }
+    try be.checkpointNow();
+    smo.test_fail_after_reserve.store(1, .release);
+    defer smo.test_fail_after_reserve.store(0, .release);
+    // 4 KiB xattr values per create push the native leaf past its in-place
+    // log: the threshold drain replaces it. A commit answered at its landing
+    // waits on the completed prefix: the filler waits, not the test.
+    const Filler = struct {
+        fn run(b: *KvBackend, out: *?anyerror) void {
+            var i: usize = 0;
+            while (smo.test_fail_after_reserve.load(.acquire) != 0 and i < 256) : (i += 1) {
+                var nb: [16]u8 = undefined;
+                const t = b.begin(@src()) catch |e| {
+                    out.* = e;
+                    return;
+                };
+                _ = stageCreate(b, t, std.fmt.bufPrint(&nb, "big-{d}", .{i}) catch unreachable, 4000) catch |e| {
+                    out.* = e;
+                    return;
+                };
+                b.commit(t) catch |e| {
+                    out.* = e;
+                    return;
+                };
+            }
+            out.* = null;
+        }
+    };
+    var out_f: ?anyerror = error.TestNotRun;
+    const th_f = try std.Thread.spawn(.{}, Filler.run, .{ be, &out_f });
+    const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (smo.test_fail_after_reserve.load(.acquire) != 0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    const fired = smo.test_fail_after_reserve.load(.acquire) == 0;
+    const Committer = struct {
+        fn create(b: *KvBackend, ino: *u64, out: *?anyerror, done: *std.atomic.Value(u32)) void {
+            const t = b.begin(@src()) catch unreachable;
+            t.kernel_origin = true;
+            ino.* = stageCreate(b, t, "b", 0) catch unreachable;
+            out.* = if (b.commit(t)) |_| null else |e| e;
+            done.store(1, .release);
+        }
+    };
+    var ino_b: u64 = 0;
+    var out_b: ?anyerror = error.TestNotRun;
+    var done_b = std.atomic.Value(u32).init(0);
+    const th_b = try std.Thread.spawn(.{}, Committer.create, .{ be, &ino_b, &out_b, &done_b });
+    const b_deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (done_b.load(.acquire) == 0 and clock.monotonicNs() < b_deadline) std.Thread.yield() catch {};
+    const answered = done_b.load(.acquire) == 1;
+    // A red run leaves the reservation open: complete it, so the row ends.
+    if (!answered) be.reg.complete(&be.core, .{ .start = be.reg.minInflightStart(), .len = 0, .pad = 0 });
+    th_b.join();
+    th_f.join();
+    try testing.expect(fired);
+    try testing.expect(answered);
+    try testing.expectEqual(@as(?anyerror, null), out_b);
+    try testing.expectEqual(@as(?anyerror, null), out_f);
+    try be.fsync();
+    try testing.expect(try present(be, ino_b));
+}
+
 test "§BB.5 a journal write that fails AFTER its window was acked: the commit returned Ok and its record STANDS (no rollback), the volume latches FAILED at once (one loud line), the tail still holds the window for the supervisor's replay" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "acked-fail", "600000");

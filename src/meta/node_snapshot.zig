@@ -951,7 +951,11 @@ pub const Chunk = struct {
     }
 
     /// A compacted copy of records `[from, to)` with room for `extra_recs`
-    /// more records and `extra_bytes` more arena bytes.
+    /// more records and `extra_bytes` more arena bytes. The whole chunk
+    /// with no dead arena bytes (no cleared materialized head, no records
+    /// a split moved out) is copied verbatim — its records and its arena,
+    /// two memcpys, every offset still exact — instead of record by record:
+    /// an apply copies the chunk its record lands in, under the leaf lock.
     fn copyRange(self: *const Chunk, gpa: Allocator, from: usize, to: usize, extra_recs: usize, extra_bytes: usize) Allocator.Error!Chunk {
         var out: Chunk = .empty;
         errdefer out.deinit(gpa);
@@ -959,6 +963,11 @@ pub const Chunk = struct {
         for (self.recs.items[from..to]) |r| live += recBytes(r);
         try out.recs.ensureTotalCapacityPrecise(gpa, to - from + extra_recs);
         try out.bytes.ensureTotalCapacityPrecise(gpa, live + extra_bytes);
+        if (from == 0 and to == self.len() and live == self.bytes.items.len) {
+            out.recs.appendSliceAssumeCapacity(self.recs.items);
+            out.bytes.appendSliceAssumeCapacity(self.bytes.items);
+            return out;
+        }
         for (self.recs.items[from..to]) |*r| {
             const rv: RecView = .{ .chunk = self, .rec = r };
             const head: HeadIn = switch (r.head) {
@@ -2199,6 +2208,78 @@ test "RunEdit.clearHead copies a shared chunk once and mutates the copy: the pub
     try testing.expect(flat[3].folded == null);
     try testing.expect(!flat[4].folded.?.live.materialized);
     try testing.expectEqualSlices(u8, flat[4].value.slice(), flat[4].folded.?.live.value.slice());
+}
+
+test "a chunk copy is the compacted copy record for record: a chunk with no dead arena bytes is copied verbatim (its arena byte-identical, every offset kept), one with a cleared materialized head or after a split is compacted (its arena exactly the live bytes); keys, values, seqs, kinds, floors and heads read alike either way" {
+    const gpa = testing.allocator;
+    const Check = struct {
+        fn sameRecords(a: *const Chunk, b: *const Chunk) !void {
+            try testing.expectEqual(a.len(), b.len());
+            for (0..a.len()) |i| {
+                const x = a.view(i);
+                const y = b.view(i);
+                try testing.expect(x.ref().eql(y.ref()));
+                try testing.expectEqual(x.rec.entry_floor, y.rec.entry_floor);
+                const hx = x.head();
+                const hy = y.head();
+                try testing.expectEqual(hx == null, hy == null);
+                if (hx) |h| switch (h) {
+                    .live => |v| try testing.expectEqualSlices(u8, v, hy.?.live),
+                    else => try testing.expectEqual(std.meta.activeTag(h), std.meta.activeTag(hy.?)),
+                };
+            }
+        }
+        fn liveBytes(c: *const Chunk) usize {
+            var n: usize = 0;
+            for (c.recs.items) |r| n += Chunk.recBytes(r);
+            return n;
+        }
+    };
+    var chunk: Chunk = .empty;
+    defer chunk.deinit(gpa);
+    // Inserted out of order (the arena is not in record order), a Put head
+    // borrowing its value, a materialized Δ head, a tombstone head.
+    const order_in = [_]u64{ 5, 1, 9, 3, 7 };
+    for (order_in, 0..) |ino, i| {
+        const v = iv(ino).encode();
+        const k = key.inodeKey(ino);
+        const r: RecordRef = .{ .key = &k, .seq = ino, .kind = .put, .value = &v };
+        var at: usize = 0;
+        while (at < chunk.len() and key.order(chunk.view(at).key(), r.key) == .lt) at += 1;
+        const head: HeadIn = switch (i % 3) {
+            0 => .own_value,
+            1 => .{ .folded = "materialized-head" },
+            else => .tombstone,
+        };
+        try chunk.insertRec(gpa, at, r, 100 + ino, head);
+    }
+    // No dead bytes: verbatim.
+    try testing.expectEqual(chunk.bytes.items.len, Check.liveBytes(&chunk));
+    var whole = try chunk.copyRange(gpa, 0, chunk.len(), 1, 64);
+    defer whole.deinit(gpa);
+    try testing.expectEqualSlices(u8, chunk.bytes.items, whole.bytes.items);
+    try testing.expect(whole.recs.capacity >= chunk.len() + 1);
+    try testing.expect(whole.bytes.capacity >= chunk.bytes.items.len + 64);
+    try Check.sameRecords(&chunk, &whole);
+    // A cleared materialized head leaves dead bytes: compacted.
+    for (chunk.recs.items) |*r| if (r.head == .live and r.head.live.materialized) {
+        r.head = .none;
+    };
+    try testing.expect(Check.liveBytes(&chunk) < chunk.bytes.items.len);
+    var compact = try chunk.copyRange(gpa, 0, chunk.len(), 0, 0);
+    defer compact.deinit(gpa);
+    try testing.expectEqual(Check.liveBytes(&chunk), compact.bytes.items.len);
+    try Check.sameRecords(&chunk, &compact);
+    // A split's lower half keeps the upper half's bytes: compacted too.
+    var lower = try compact.copyRange(gpa, 0, compact.len(), 0, 0);
+    defer lower.deinit(gpa);
+    try testing.expectEqualSlices(u8, compact.bytes.items, lower.bytes.items);
+    lower.recs.shrinkRetainingCapacity(2);
+    var lower_copy = try lower.copyRange(gpa, 0, lower.len(), 0, 0);
+    defer lower_copy.deinit(gpa);
+    try testing.expectEqual(Check.liveBytes(&lower), lower_copy.bytes.items.len);
+    try testing.expect(lower_copy.bytes.items.len < lower.bytes.items.len);
+    try Check.sameRecords(&lower, &lower_copy);
 }
 
 test "Run.applyBytesBound tie: two chunk copies of CHUNK_MAX + 1 records and their arena with their boxes, one slot per half-full chunk plus two, the run's box; ChunkRec is 48 bytes" {

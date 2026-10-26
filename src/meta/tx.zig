@@ -766,7 +766,7 @@ test "entry length is the exact journal arithmetic; the queue entry's frames are
     const res = journal.Reservation.unpadded(seq_base, q.len);
     var solo = try journal.buildEntryWrite(testing.allocator, layout, geo, 0, res, frames);
     defer solo.deinit();
-    var batch = try journal.buildBatchWrite(testing.allocator, layout, geo, 0, res, &.{.{ .res = res, .records = frames }});
+    var batch = try journal.buildBatchWrite(.init(testing.allocator), layout, geo, 0, res, &.{.{ .res = res, .records = frames }});
     defer batch.deinit();
     try testing.expectEqual(solo.ops.len, batch.ops.len);
     for (solo.ops, batch.ops) |s, b| {

@@ -730,19 +730,21 @@ pub fn partOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender
 }
 
 /// A conveyor window's write from its members' ops already built
-/// (`partOps`, each on its committer): the window's PAD entry, then the
-/// ring's aligned form. `entry_bytes` = Σ the surviving members' lengths.
-pub fn buildWindowFromOps(gpa: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, window: Reservation, member_ops: []const []const WriteOp, entry_bytes: u64, header_bytes: u64) Error!WriteImage {
-    var arena = std.heap.ArenaAllocator.init(gpa);
+/// (`partOps`, each on its committer) and its PAD entry's (`padOps`, the
+/// pass's): the ring's aligned form, in `arena_in`. `entry_bytes` = Σ the
+/// surviving members' lengths; `header_bytes` counts the PAD's page
+/// headers too.
+pub fn buildWindowFromOps(arena_in: std.heap.ArenaAllocator, layout: RingLayout, geo: CoreGeometry, window: Reservation, member_ops: []const []const WriteOp, pad_ops: []const WriteOp, entry_bytes: u64, header_bytes: u64) Error!WriteImage {
+    var arena = arena_in;
     errdefer arena.deinit();
     const a = arena.allocator();
-    var n: usize = 0;
+    var n: usize = pad_ops.len;
     for (member_ops) |m| n += m.len;
-    var ops: std.ArrayList(WriteOp) = try .initCapacity(a, n + 8);
+    var ops: std.ArrayList(WriteOp) = try .initCapacity(a, n);
     for (member_ops) |m| ops.appendSliceAssumeCapacity(m);
-    const header_ops_bytes = header_bytes + try padOps(a, layout, geo, appender_id, window.end(), window.pad, &ops);
+    ops.appendSliceAssumeCapacity(pad_ops);
     const aligned = try alignedOps(a, layout, geo, window.start, window.paddedEnd(), ops.items);
-    return .{ .arena = arena, .ops = aligned, .acct = accountWindow(geo, window, entry_bytes, header_ops_bytes, aligned) };
+    return .{ .arena = arena, .ops = aligned, .acct = accountWindow(geo, window, entry_bytes, header_bytes, aligned) };
 }
 
 /// A conveyor batch's write: N ordinary checksummed entries at back-to-back
@@ -753,9 +755,10 @@ pub fn buildWindowFromOps(gpa: Allocator, layout: RingLayout, geo: CoreGeometry,
 /// simply absent (an unwritten hole; its page headers are written iff a
 /// survivor owns the page's first byte). Each member's bytes are BY
 /// CONSTRUCTION identical to a solo `buildEntryWrite` of the same
-/// reservation (shared `entryOps`) — the batch-of-1 equivalence.
-pub fn buildBatchWrite(gpa: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, window: Reservation, parts: []const BatchPart) Error!WriteImage {
-    var arena = std.heap.ArenaAllocator.init(gpa);
+/// reservation (shared `entryOps`) — the batch-of-1 equivalence. The image
+/// lives in `arena_in` (the conveyor's are recycled, `conveyor.ArenaPool`).
+pub fn buildBatchWrite(arena_in: std.heap.ArenaAllocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, window: Reservation, parts: []const BatchPart) Error!WriteImage {
+    var arena = arena_in;
     errdefer arena.deinit();
     const a = arena.allocator();
     var ops: std.ArrayList(WriteOp) = .empty;
@@ -2193,7 +2196,7 @@ test "aligned runs: a window spanning pages coalesces adjacent pages into one im
     const m3 = Reservation.unpadded(window.start + lens[0] + lens[1], lens[2]);
     const r1 = sizedRecords(1, lens[0], 0x71, m1.start, &k1, &v1);
     const r3 = sizedRecords(3, lens[2], 0x73, m3.start, &k3, &v3);
-    var img = try buildBatchWrite(testing.allocator, ring.layout, ring.geo, 0, window, &.{ .{ .res = m1, .records = &r1 }, .{ .res = m3, .records = &r3 } });
+    var img = try buildBatchWrite(.init(testing.allocator), ring.layout, ring.geo, 0, window, &.{ .{ .res = m1, .records = &r1 }, .{ .res = m3, .records = &r3 } });
     defer img.deinit();
     // [0, 6000 + pad) covers pages 0 and 1 contiguously ⇒ ONE run from page 0's base.
     try testing.expectEqual(@as(usize, 1), img.ops.len);
@@ -2250,7 +2253,7 @@ test "batch of one equals a solo write byte for byte; torn first member drops al
         parts[i] = .{ .res = res, .records = &recs[i] };
         cursor += lens[i];
     }
-    var batch = try buildBatchWrite(testing.allocator, ring.layout, ring.geo, 0, window, &parts);
+    var batch = try buildBatchWrite(.init(testing.allocator), ring.layout, ring.geo, 0, window, &parts);
     defer batch.deinit();
     var solo = try buildEntryWrite(testing.allocator, ring.layout, ring.geo, 0, parts[1].res, parts[1].records);
     defer solo.deinit();

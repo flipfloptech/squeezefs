@@ -1133,6 +1133,63 @@ pub const Queued = struct {
 
 const Core = conveyor_core.ConveyorCore(Queued);
 
+/// Arenas a window's bytes live in, recycled (§BV): one thread fills them
+/// (the pass, a self-applying member, the last member's image, an
+/// applier) and another frees them (the lane's verdict). smp_allocator
+/// parks a freed block on the FREEING thread's list and maps a fresh slab
+/// for a thread whose own list is empty, so per-window arenas built on the
+/// committers and freed on the lane moved every committer's slabs onto
+/// the lane's list: +127 MiB resident after 10,000 creates under a 64 MiB
+/// budget (the idle-RSS law). A recycled arena keeps one buffer of its
+/// high-water size, so the bytes circulate whichever thread fills or
+/// frees them; what the pool parks is what the windows in flight held.
+pub const ArenaPool = struct {
+    lock: jc.SpinLock = .{},
+    parked: []std.heap.ArenaAllocator.State,
+    n: usize = 0,
+
+    /// smp_allocator's slab length: a larger buffer is mapped at its
+    /// allocation and unmapped at its free, never parked on a list.
+    pub const retain_limit: usize = 64 * 1024;
+
+    pub fn init(gpa: Allocator, cap: usize) Allocator.Error!ArenaPool {
+        return .{ .parked = try gpa.alloc(std.heap.ArenaAllocator.State, cap) };
+    }
+
+    pub fn deinit(self: *ArenaPool, gpa: Allocator) void {
+        for (self.parked[0..self.n]) |s| s.promote(gpa).deinit();
+        gpa.free(self.parked);
+    }
+
+    pub fn take(self: *ArenaPool, gpa: Allocator) std.heap.ArenaAllocator {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.n == 0) return .init(gpa);
+        self.n -= 1;
+        return self.parked[self.n].promote(gpa);
+    }
+
+    /// Reset `arena` and park it; a full pool frees it.
+    pub fn give(self: *ArenaPool, arena: *std.heap.ArenaAllocator) void {
+        _ = arena.reset(.{ .retain_with_limit = retain_limit });
+        self.lock.lock();
+        if (self.n < self.parked.len) {
+            self.parked[self.n] = arena.state;
+            self.n += 1;
+            self.lock.unlock();
+            return;
+        }
+        self.lock.unlock();
+        arena.deinit();
+    }
+
+    pub fn parkedCount(self: *ArenaPool) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.n;
+    }
+};
+
 /// A reserved batch: the pass's from the reservation to the handoff, its
 /// APPLIER's (the first member's committer, §AW) through the RAM apply,
 /// the encode and the submit, then in the lane's hands until `finish`
@@ -1199,6 +1256,10 @@ pub const Window = struct {
     /// landing then — its chain would stop at the window's end).
     pad_slot: ?u32 = null,
     pad_unclaimed: bool = false,
+    /// §BV: a self-applied window's trailing PAD (arena-owned, the pass's):
+    /// the tail's copy and the image's.
+    pad_ops: []const journal.WriteOp = &.{},
+    pad_header_bytes: u64 = 0,
 
     /// One self-applying member's share of the window (§BC): its own
     /// arena (the members apply concurrently), its sub-range and seq, its
@@ -1239,10 +1300,11 @@ pub const Window = struct {
     fn release(self: *Window) void {
         // acq_rel: the last party sees every other party's writes.
         if (self.parties.fetchSub(1, .acq_rel) == 1) {
-            if (self.image) |*img| img.deinit();
-            for (self.parts) |*p| p.arena.deinit();
-            self.arena.deinit();
-            self.conveyor.deps.gpa.destroy(self);
+            const cv = self.conveyor;
+            if (self.image) |*img| cv.window_arenas.give(&img.arena);
+            for (self.parts) |*p| cv.part_arenas.give(&p.arena);
+            cv.window_arenas.give(&self.arena);
+            cv.deps.gpa.destroy(self);
         }
     }
 
@@ -1598,6 +1660,11 @@ pub const Conveyor = struct {
     room_waiters: std.atomic.Value(u32) = .init(0),
     room: sync.Notify = .init,
     stats: Stats = .{},
+    /// The windows' own arenas and their images' (two per window in
+    /// flight), and the self-applying members' parts (one per member of a
+    /// window in flight), recycled (`ArenaPool`).
+    window_arenas: ArenaPool,
+    part_arenas: ArenaPool,
 
     pub fn init(gpa: Allocator, deps: Deps) Allocator.Error!*Conveyor {
         const self = try gpa.create(Conveyor);
@@ -1608,7 +1675,11 @@ pub const Conveyor = struct {
         errdefer gpa.free(batch_buf);
         std.debug.assert(deps.lane.window_cells >= 2);
         const inflight_cap = windowCap(deps.lane.window_cells);
-        self.* = .{ .deps = deps, .slots = slots, .core = undefined, .batch_buf = batch_buf, .inflight_cap = inflight_cap };
+        var window_arenas = try ArenaPool.init(gpa, 2 * inflight_cap);
+        errdefer window_arenas.deinit(gpa);
+        var part_arenas = try ArenaPool.init(gpa, inflight_cap * @max(deps.caps.max_txs, 1));
+        errdefer part_arenas.deinit(gpa);
+        self.* = .{ .deps = deps, .slots = slots, .core = undefined, .batch_buf = batch_buf, .inflight_cap = inflight_cap, .window_arenas = window_arenas, .part_arenas = part_arenas };
         errdefer self.inflight.deinit(gpa);
         try self.inflight.ensureTotalCapacity(gpa, @intCast(inflight_cap));
         self.core = Core.init(deps.io, slots, &self.stats.queued);
@@ -1622,6 +1693,8 @@ pub const Conveyor = struct {
         assert(self.core.pending() == 0);
         assert(self.inflight.count() == 0);
         self.inflight.deinit(gpa);
+        self.part_arenas.deinit(gpa);
+        self.window_arenas.deinit(gpa);
         gpa.free(self.batch_buf);
         gpa.free(self.slots);
         gpa.destroy(self);
@@ -2660,7 +2733,7 @@ pub const Conveyor = struct {
             self.failBatch(members.items, error.OutOfMemory);
             return;
         };
-        w.* = .{ .conveyor = self, .arena = std.heap.ArenaAllocator.init(gpa), .members = &.{}, .failed = &.{}, .res = undefined, .seq_base = 0, .undo = &.{}, .image = null, .entries = 0, .t_handoff_ns = 0, .t_pass_ns = t_pass, .held = held };
+        w.* = .{ .conveyor = self, .arena = self.window_arenas.take(gpa), .members = &.{}, .failed = &.{}, .res = undefined, .seq_base = 0, .undo = &.{}, .image = null, .entries = 0, .t_handoff_ns = 0, .t_pass_ns = t_pass, .held = held };
         const wa = w.arena.allocator();
         const window_members = wa.dupe(Queued, members.items) catch {
             w.arena.deinit();
@@ -2761,6 +2834,21 @@ pub const Conveyor = struct {
         const gpa = self.deps.gpa;
         const wa = w.arena.allocator();
         const n = w.members.len;
+        // §BV: the window's trailing PAD is the pass's, built once here: the
+        // tail takes it before any turn and the image is written from the
+        // same bytes. Built on the last member's thread it was freed on the
+        // lane's, and smp_allocator parks a freed block on the FREEING
+        // thread's list: every committer mapped fresh slabs while the lane's
+        // list grew (+127 MiB resident after 10,000 creates under a 64 MiB
+        // budget, the idle-RSS law).
+        if (w.res.pad != 0) {
+            var pad_ops: std.ArrayList(journal.WriteOp) = .empty;
+            w.pad_header_bytes = journal.padOps(wa, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, w.res.end(), w.res.pad, &pad_ops) catch {
+                self.abandonWindow(w, error.OutOfMemory);
+                return;
+            };
+            w.pad_ops = pad_ops.items;
+        }
         w.parts = wa.alloc(Window.Part, n) catch {
             self.abandonWindow(w, error.OutOfMemory);
             return;
@@ -2768,7 +2856,7 @@ pub const Conveyor = struct {
         var pos = w.res.start;
         var seq = w.seq_base;
         for (w.parts, w.members) |*p, *m| {
-            p.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .start = pos, .seq = seq, .len = m.q.len };
+            p.* = .{ .arena = self.part_arenas.take(gpa), .start = pos, .seq = seq, .len = m.q.len };
             pos += m.q.len;
             seq += m.q.len;
         }
@@ -2780,10 +2868,7 @@ pub const Conveyor = struct {
         // whatever lies past a missing link (every window after the first:
         // THE REPLAY PROOF under self). The tail gate counted its slot.
         if (self.deps.ack_at_apply and w.res.pad != 0) if (self.deps.tail) |t| {
-            var pad_ops: std.ArrayList(journal.WriteOp) = .empty;
-            if (journal.padOps(wa, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, w.res.end(), w.res.pad, &pad_ops)) |_| {
-                w.pad_slot = t.claim(t.ctx, w.seq_base + w.res.len, w.res.end(), pad_ops.items);
-            } else |_| {}
+            w.pad_slot = t.claim(t.ctx, w.seq_base + w.res.len, w.res.end(), w.pad_ops);
             if (w.pad_slot == null) {
                 w.pad_unclaimed = true;
                 self.stats.tail_slot_misses.fire("the journal tail could not take a self-applied window's PAD; its members answered at the landing");
@@ -3134,7 +3219,7 @@ pub const Conveyor = struct {
         } else |_| {}
         w.image = if (wa.alloc([]const journal.WriteOp, w.parts.len)) |member_ops| blk: {
             for (w.parts, member_ops) |p, *mo| mo.* = p.ops;
-            break :blk journal.buildWindowFromOps(gpa, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, w.res, member_ops, entry_bytes, header_bytes) catch null;
+            break :blk journal.buildWindowFromOps(self.window_arenas.take(gpa), self.deps.ring_layout, self.deps.geo, w.res, member_ops, w.pad_ops, entry_bytes, header_bytes + w.pad_header_bytes) catch null;
         } else |_| null;
         w.t_handoff_ns = clock.monotonicNs();
         self.stats.self_window_span.record(w.t_handoff_ns -| w.t_turns_ns);
@@ -3280,7 +3365,7 @@ pub const Conveyor = struct {
         }
         window.entries = survivors;
         if (!encode_failed and parts.items.len != 0) {
-            window.image = journal.buildBatchWrite(gpa, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, window.res, parts.items) catch null;
+            window.image = journal.buildBatchWrite(self.window_arenas.take(gpa), self.deps.ring_layout, self.deps.geo, self.deps.appender_id, window.res, parts.items) catch null;
             encode_failed = window.image == null;
         }
         window.t_handoff_ns = clock.monotonicNs();

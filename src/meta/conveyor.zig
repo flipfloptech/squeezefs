@@ -777,6 +777,10 @@ pub const Stats = struct {
     /// tail's table full — the entry stays and the error is answered at
     /// the landing (§BX).
     pad_landings: counters.ShardedCounter = .{},
+    /// `meta_conveyor_undo_keys`: pre-images the apply captured (A7) — one
+    /// per distinct key of a member a failed write may still roll back;
+    /// none for a member answered ahead of its landing (§BB.5).
+    undo_keys: counters.ShardedCounter = .{},
     /// `meta_conveyor_tail_gate_parks`: passes parked because the members
     /// of the self-applied windows in flight plus the batch would not fit
     /// the journal tail's slot table (`awaitTailSlots`).
@@ -902,6 +906,7 @@ pub const Stats = struct {
             self.holds_pacing.load(),
         });
         try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_tail_gate_parks\":{d},\"meta_conveyor_resident_waits\":{d},\"meta_conveyor_resident_landings\":{d},\"meta_conveyor_pad_landings\":{d},\"meta_conveyor_resident_helps\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.tail_gate_parks.load(), self.resident_waits.load(), self.resident_landings.load(), self.pad_landings.load(), self.resident_helps.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
+        try w.print(",\"meta_conveyor_undo_keys\":{d}", .{self.undo_keys.load()});
         try w.print(",\"meta_conveyor_window_gate_parks\":{d},\"meta_conveyor_room_parks\":{d},\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.window_gate_parks.load(),
             self.commit_room_parks.load(),
@@ -3381,6 +3386,7 @@ pub const Conveyor = struct {
                 .absent => .absent,
             };
             try undo.append(a, .{ .tree_id = rec.tree_id, .key = try a.dupe(u8, rec.key), .pre = pre });
+            self.stats.undo_keys.inc();
         }
     }
 
@@ -3870,6 +3876,7 @@ pub const Conveyor = struct {
                 try undo.append(wa, .{ .tree_id = rec.tree_id, .key = try wa.dupe(u8, rec.key), .pre = pre });
             }
         }
+        self.stats.undo_keys.add(undo.items.len);
         return undo.items;
     }
 

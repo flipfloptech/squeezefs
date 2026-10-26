@@ -4747,6 +4747,33 @@ test "§BB.5 a journal write that fails AFTER its window was acked: the commit r
     try testing.expect(be.tail.?.image.writtenCount() >= 1);
 }
 
+test "§BB.5 pre-images only where a rollback can read them: under self-apply this mount's kernel's create, answered at its apply, captures none (a window with an answered member never rolls back); a commit acked at the landing captures one per key, and its failed write still rolls it back" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "undo-keys", "600000");
+    defer v.destroy();
+    v.lane_error_logs = 1;
+    const be = try v.open();
+    defer be.close();
+    const cs = be.conveyorStats();
+    const undo0 = cs.undo_keys.load();
+    const early0 = cs.acks_at_apply.load();
+    const answered = try commitCreateKernel(be, "answered");
+    try testing.expectEqual(early0 + 1, cs.acks_at_apply.load());
+    try testing.expectEqual(undo0, cs.undo_keys.load());
+    // The inode, the dentry and the parent's Δtime: three keys.
+    const landed = try commitCreate(be, "landed");
+    try testing.expectEqual(undo0 + 3, cs.undo_keys.load());
+    journal_lane.test_seams.fail_windows.store(1, .release);
+    defer journal_lane.test_seams.fail_windows.store(0, .release);
+    const rollbacks0 = cs.rollbacks.load();
+    try testing.expectError(error.JournalWriteFailed, commitCreate(be, "victim"));
+    try testing.expectEqual(rollbacks0 + 1, cs.rollbacks.load());
+    try testing.expect(!try present(be, be.nextIno() - 1));
+    try testing.expect(try present(be, answered));
+    try testing.expect(try present(be, landed));
+    try testing.expect(!be.isFailed());
+}
+
 /// lseek(2) whences the std table lacks (`include/uapi/linux/fs.h`).
 const seek_data: u32 = 3;
 const seek_hole: u32 = 4;

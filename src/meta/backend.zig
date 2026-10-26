@@ -4716,6 +4716,87 @@ test "§BX.7 the venue arm: W1's image in the tail at its window's start, its ap
     try turnClaimRow(v, be, .venue);
 }
 
+/// A window nobody was answered from, rolled back (decision 0003 §BX.8):
+/// its write fails (`fail_windows`) while the SMO lock is held, so the
+/// lane's hole checkpoint cannot cover it and the ledger's tail stays below
+/// it. A death then must replay nothing of it — the commit was answered as
+/// failed — while the chain to a later window answered at its apply still
+/// runs through its range (released, not replaced, the range would be a
+/// hole the replay stops at); once a checkpoint covers it, its tail slots
+/// are back. A BUFFERED ring (grain 1): the later window shares the failed
+/// one's page, so a hole there would cut it off.
+fn rolledBackRow(v: *TestVol) !void {
+    const gpa = testing.allocator;
+    v.lane_error_logs = 1;
+    // The format registered the file O_DIRECT; the open registers it again,
+    // BUFFERED.
+    uring_fs.clearMetaDevices();
+    defer uring_fs.clearMetaDevices();
+    try v.env.put("SQUEEZEFS_TEST_META_BUFFERED", "1");
+    var dst_buf: [160]u8 = undefined;
+    const dst = try std.fmt.bufPrint(&dst_buf, "{s}.death", .{v.path()});
+    defer unlinkPath(dst);
+    var base: u64 = 0;
+    var ino: u64 = 0;
+    var later: u64 = 0;
+    var written_after: u32 = 0;
+    {
+        const be = try v.open();
+        defer be.close();
+        try testing.expectEqual(@as(u64, 1), be.geo.grain);
+        base = try commitCreate(be, "base");
+        try be.fsync();
+        // The lane's hole checkpoint takes the SMO lock by a try-lock.
+        be.smo_lock.lockUncancelable(be.io);
+        var smo_held = true;
+        defer if (smo_held) be.smo_lock.unlock(be.io);
+        journal_lane.test_seams.fail_windows.store(1, .release);
+        defer journal_lane.test_seams.fail_windows.store(0, .release);
+        const t = try be.begin(@src());
+        ino = try stageCreate(be, t, "failed", 0);
+        if (be.commit(t)) |_| return error.TestUnexpectedSuccess else |_| {}
+        journal_lane.test_seams.fail_windows.store(0, .release);
+        try testing.expect(!try present(be, ino));
+        // A later create answered at its apply: its chain to the device
+        // runs through the rolled-back range.
+        later = try commitCreateKernel(be, "later");
+        // The daemon dies now: the supervisor's judged replay, then the
+        // device as the next mount reads it.
+        const j = try judgeDeath(v, be);
+        try testing.expectEqual(@as(u32, 0), j.past_hole);
+        try snapshotImage(v.path(), dst);
+        // A checkpoint covers the hole: every slot is back.
+        be.smo_lock.unlock(be.io);
+        smo_held = false;
+        try be.checkpointNow();
+        try be.fsync();
+        _ = try commitCreate(be, "after");
+        written_after = be.tail.?.image.writtenCount();
+    }
+    {
+        const copy = try KvBackend.open(gpa, v.io(), dst, .{ .env = &v.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .index = 1 });
+        defer copy.close();
+        try testing.expect(try present(copy, base));
+        try testing.expect(!try present(copy, ino));
+        try testing.expect(try present(copy, later));
+    }
+    try testing.expectEqual(@as(u32, 0), written_after);
+}
+
+test "§BX.8 a self-applied window rolled back with nobody answered — its write failed, the hole not yet covered — replays nothing of it at a death, and its tail slots come back once a checkpoint covers it (red: its entries stayed written in the tail: the failed create replayed, the slots leaked)" {
+    const v = try TestVol.create(testing.allocator, "rolled-back-self", "600000");
+    defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_APPLY", "self");
+    try rolledBackRow(v);
+}
+
+test "§BX.8 the venue arm: a window rolled back with nobody answered replays nothing of it at a death, and its image's slot comes back (red: the image claimed at its start stayed written)" {
+    const v = try TestVol.create(testing.allocator, "rolled-back-venue", "600000");
+    defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_APPLY", "venue");
+    try rolledBackRow(v);
+}
+
 test "§BB.5 a journal write that fails AFTER its window was acked: the commit returned Ok and its record STANDS (no rollback), the volume latches FAILED at once (one loud line), the tail still holds the window for the supervisor's replay" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "acked-fail", "600000");

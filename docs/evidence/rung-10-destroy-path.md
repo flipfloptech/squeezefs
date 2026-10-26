@@ -66,10 +66,20 @@ indicative only):
 Unsettled (phases back to back, the file removal's corpses reclaimed during the directory phases) the directory
 rows read 0.64–0.97× and 0.64–0.86×. Every run: fsck clean, 0 tripwires, 0 pass panics, 0 tail-gate parks.
 
+## The idle-RSS row (gate 144)
+
+With `self` the default, THE RE-JOINED MEMBER row read VmRSS 400 MiB against its bound 336 (291–303 MiB on every
+earlier gate). 10,000 creates under `SQUEEZEFS_MEM_BUDGET_MB=64`, then smaps by mapping: `self` 449 MiB, `venue`
+320, +520 anon mappings; `strace -k` on mmap named 2,719 slabs mapped under `submitSelfApplied`'s PAD (134 under
+the venue's `applyWindow`), then, with the PAD built by the pass, 1,152 under its aligned run. smp_allocator parks
+a freed block on the FREEING thread's list: a window's bytes filled on the committers and freed at the lane's
+verdict moved every committer's slabs onto the lane's list. The windows' arenas are now recycled (§BW.9): `self`
+313 MiB, `venue` 315; red `f0d2c57` (194 cross-thread frees for 32 windows, the 32 `Window`s after).
+
 ## Tests
 
-Red first: `d70b6ad` (the destroy holds its earlier leaf), `709d0d2` (no lane turn; both maps' tombstones),
-`0f10a59` (a member meets the tail full), `44b4538` (the tail lacks the window's PAD). Unit `test rails` with `self` the default: 3082/3246 passed, 164
+Red first: `8797835` (the destroy holds its earlier leaf), `eb82428` (no lane turn; both maps' tombstones),
+`eb12f84` (a member meets the tail full), `06433e3` (the tail lacks the window's PAD). Unit `test rails` with `self` the default: 3082/3246 passed, 164
 skipped; filters `conveyor`, `reclaim`, `destroy`, `self-apply`, `backend`, `token`, `§BW` green; models 12
 and 13 hold with every weakening failing. Smoke and xfstests: the branch's last section.
 

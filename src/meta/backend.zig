@@ -4457,6 +4457,36 @@ test "§BV a self-apply storm with leafwise destroys: 4 threads of kernel create
     }
 }
 
+test "§BV the death replay of self-applied windows: three of this mount's kernel creates under self-apply, each its own window, answered at the apply with their writes never issued — the journal tail holds every member's entry AND every window's trailing PAD, so the supervisor's judged replay against the device keeps all three (past_hole 0); the creates land once issued" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "self-tail", "600000");
+    defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_APPLY", "self");
+    const be = try v.open();
+    defer be.close();
+    _ = try commitCreateKernel(be, "landed");
+    try be.fsync();
+    journal_lane.test_seams.delay_issue.store(1, .release);
+    defer journal_lane.test_seams.delay_issue.store(0, .release);
+    var held: [3]u64 = undefined;
+    for (&held, 0..) |*ino, i| {
+        var nb: [16]u8 = undefined;
+        ino.* = try commitCreateKernel(be, try std.fmt.bufPrint(&nb, "held-{d}", .{i}));
+    }
+    // The supervisor's judgement were the daemon to die now.
+    var zbuf: [linux.PATH_MAX]u8 = undefined;
+    const rc = linux.open(try align_probe.pathZ(&zbuf, v.path()), .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    const j = try journal_tail.linux_tail.judgedReplay(gpa, be.tail.?.image, fd, null);
+    try testing.expectEqual(@as(u32, 0), j.past_hole);
+    try testing.expect(j.replay.windows >= held.len);
+    journal_lane.test_seams.delay_issue.store(0, .release);
+    try be.fsync();
+    for (held) |ino| try testing.expect(try present(be, ino));
+}
+
 test "§BB.5 a journal write that fails AFTER its window was acked: the commit returned Ok and its record STANDS (no rollback), the volume latches FAILED at once (one loud line), the tail still holds the window for the supervisor's replay" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "acked-fail", "600000");

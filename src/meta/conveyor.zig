@@ -1193,6 +1193,12 @@ pub const Window = struct {
     /// Its share of `Conveyor.tail_members` (§BV), returned at its
     /// terminal outcome.
     tail_members: u32 = 0,
+    /// §BV: the tail slot holding the window's trailing PAD (self-applied,
+    /// answered at the apply), claimed by the pass before any turn;
+    /// `pad_unclaimed`: it could not be (no member answers ahead of the
+    /// landing then — its chain would stop at the window's end).
+    pad_slot: ?u32 = null,
+    pad_unclaimed: bool = false,
 
     /// One self-applying member's share of the window (§BC): its own
     /// arena (the members apply concurrently), its sub-range and seq, its
@@ -2271,13 +2277,13 @@ pub const Conveyor = struct {
         }
     }
 
-    /// The drain's caps: under self-apply with a journal tail a batch never
-    /// holds more members than the tail has slots (each may claim one;
-    /// `awaitTailSlots`).
+    /// The drain's caps: under self-apply with a journal tail a window's
+    /// members and its PAD never need more slots than the table has (each
+    /// claims one; `awaitTailSlots`).
     fn passCaps(self: *const Conveyor) Caps {
         var caps = self.deps.caps;
         if (self.deps.self_apply) if (self.deps.tail) |t| {
-            caps.max_txs = @max(1, @min(caps.max_txs, t.slots(t.ctx)));
+            caps.max_txs = @max(1, @min(caps.max_txs, t.slots(t.ctx) -| 1));
         };
         return caps;
     }
@@ -2601,7 +2607,7 @@ pub const Conveyor = struct {
         // A1¼: the window's lane cell, and under self-apply its members'
         // tail slots, before the pass takes anything.
         self.awaitWindowCell();
-        self.awaitTailSlots(members.items.len);
+        self.awaitTailSlots(members.items.len + 1);
         // A1½: the token recall — the union of the batch's objects (every
         // record of every non-`token_quiet` member) taken in flight ONCE,
         // under the members' 4a guards, BEFORE ring admission and any node
@@ -2720,7 +2726,8 @@ pub const Conveyor = struct {
             return;
         };
         if (self.deps.self_apply and self.deps.tail != null) {
-            w.tail_members = @intCast(window_members.len);
+            // Its members and its PAD (§BV).
+            w.tail_members = @intCast(window_members.len + 1);
             // acq_rel: paired with `returnTailMembers`' drop.
             _ = self.tail_members.fetchAdd(w.tail_members, .acq_rel);
         }
@@ -2767,6 +2774,21 @@ pub const Conveyor = struct {
         }
         w.self_applied = true;
         w.t_turns_ns = clock.monotonicNs();
+        // §BV: the window's trailing PAD rides the journal tail BEFORE any
+        // member can answer itself — a member's entry chains to the next
+        // window's only through it, and the death replay's prefix law drops
+        // whatever lies past a missing link (every window after the first:
+        // THE REPLAY PROOF under self). The tail gate counted its slot.
+        if (self.deps.ack_at_apply and w.res.pad != 0) if (self.deps.tail) |t| {
+            var pad_ops: std.ArrayList(journal.WriteOp) = .empty;
+            if (journal.padOps(wa, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, w.res.end(), w.res.pad, &pad_ops)) |_| {
+                w.pad_slot = t.claim(t.ctx, w.seq_base + w.res.len, w.res.end(), pad_ops.items);
+            } else |_| {}
+            if (w.pad_slot == null) {
+                w.pad_unclaimed = true;
+                self.stats.tail_slot_misses.fire("the journal tail could not take a self-applied window's PAD; its members answered at the landing");
+            }
+        };
         w.pending.store(@intCast(n), .release);
         self.stats.self_handoffs.inc();
         // The turns fan out as a binary tree: the pass wakes member 0, each
@@ -2849,13 +2871,17 @@ pub const Conveyor = struct {
         // outcome now whatever its origin — nothing of it will land.
         const outcome: Outcome = if (failed[0]) |e| e else {};
         var early = kernel_origin and (self.deps.ack_at_apply or failed[0] != null);
-        if (early and failed[0] == null) if (self.deps.tail) |t| {
+        // §BV: under the apply ack EVERY member's entry (or its PAD) rides
+        // the tail, whoever it answers — a range missing from the tail is a
+        // hole the death replay stops at, and answered members lie past it.
+        if (self.deps.ack_at_apply and p.ops.len != 0) if (self.deps.tail) |t| {
             p.tail_slot = t.claim(t.ctx, p.seq, p.start, p.ops);
             if (p.tail_slot == null) {
                 self.stats.tail_slot_misses.fire("the journal tail's slot table refused a member; acked at the landing");
-                early = false;
+                if (failed[0] == null) early = false;
             }
         };
+        if (w.pad_unclaimed and failed[0] == null) early = false;
         if (early) {
             p.answered = true;
             self.stats.acks_at_apply.inc();
@@ -3584,7 +3610,10 @@ pub const Conveyor = struct {
             // The tail slots of a window that LANDED; a failed write's stay
             // written for the supervisor's replay (§BB.5).
             if (result) |_| {
-                for (w.parts) |p| if (p.tail_slot) |slot| if (self.deps.tail) |t| t.release(t.ctx, slot);
+                if (self.deps.tail) |t| {
+                    for (w.parts) |p| if (p.tail_slot) |slot| t.release(t.ctx, slot);
+                    if (w.pad_slot) |slot| t.release(t.ctx, slot);
+                }
             } else |_| {}
             self.returnTailMembers(w);
             w.release();
@@ -5413,7 +5442,7 @@ test "THE WINDOW GATE: with the lane's window cells all but one held (nothing la
 // ring bounds the committer queue, but a committer queues BEFORE ring
 // admission — the 129th simultaneous committer of a floor ring got
 // `ConveyorFull`, EAGAIN to a create, an mkdir, an unlink.
-test "THE TAIL GATE (§BV): under self-apply every member acked at the apply holds a journal-tail slot until its window lands — with a 4-slot table held full by four un-landed windows, the fifth committer's pass parks BEFORE its reservation (no member ever meets the full table: meta_conveyor_tail_slot_misses stays 0) and goes on at the first landing; every create acked and present" {
+test "THE TAIL GATE (§BV): under self-apply every member answered at the apply holds a journal-tail slot until its window lands, and so does the window's PAD — with a 4-slot table counted full by two un-landed windows (a member and a PAD each), the third committer's pass parks BEFORE its reservation (no member ever meets the full table: meta_conveyor_tail_slot_misses stays 0) and goes on at the first landing; every create acked and present" {
     const h = try Harness.create(.{}, null, false);
     defer h.destroy();
     const io = testing.io;
@@ -5465,19 +5494,22 @@ test "THE TAIL GATE (§BV): under self-apply every member acked at the apply hol
             out.* = null;
         }
     };
-    var inos: [Tail.table + 1]u64 = undefined;
-    var results: [Tail.table + 1]?anyerror = @splat(error.TestNotRun);
+    // A window counts its member and its PAD.
+    const filling = Tail.table / 2;
+    var inos: [filling + 1]u64 = undefined;
+    var results: [filling + 1]?anyerror = @splat(error.TestNotRun);
     const misses0 = h.cv.stats.tail_slot_misses.load();
     const acks0 = h.cv.stats.acks_at_apply.load();
-    // Four committers one at a time: each answered at its apply, each
-    // window held un-landed with its member's slot.
-    for (0..Tail.table) |i| {
+    // Committers one at a time until the count fills the table: each
+    // answered at its apply, each window held un-landed with its slots.
+    for (0..filling) |i| {
         const th = try std.Thread.spawn(.{}, Committer.run, .{ h, &inos[i], &results[i] });
         th.join();
         try testing.expectEqual(@as(?anyerror, null), results[i]);
     }
-    try testing.expectEqual(Tail.table, tail.used.load(.acquire));
-    const fifth = try std.Thread.spawn(.{}, Committer.run, .{ h, &inos[Tail.table], &results[Tail.table] });
+    try testing.expectEqual(Tail.table, h.cv.tail_members.load(.acquire));
+    try testing.expect(tail.used.load(.acquire) >= filling);
+    const fifth = try std.Thread.spawn(.{}, Committer.run, .{ h, &inos[filling], &results[filling] });
     var joined = false;
     defer if (!joined) {
         while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
@@ -5491,10 +5523,10 @@ test "THE TAIL GATE (§BV): under self-apply every member acked at the apply hol
         }
     };
     if (!awaitObservable(Stopped{ .cv = h.cv, .misses0 = misses0 })) return error.FifthNeverStopped;
-    // The gate, not the table, stopped the fifth: no member met it full.
+    // The gate, not the table, stopped the next: no member met it full.
     try testing.expectEqual(misses0, h.cv.stats.tail_slot_misses.load());
     try testing.expectEqual(@as(u64, 1), h.cv.stats.tail_gate_parks.load());
-    try testing.expectEqual(@as(u64, Tail.table), h.cv.windowsInflight());
+    try testing.expectEqual(@as(u64, filling), h.cv.windowsInflight());
     // The landings make room: the fifth reserves, applies, is answered at
     // its apply.
     while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
@@ -5505,11 +5537,11 @@ test "THE TAIL GATE (§BV): under self-apply every member acked at the apply hol
             return s.cv.stats.acks_at_apply.load() >= s.want;
         }
     };
-    if (!awaitObservable(Answered{ .cv = h.cv, .want = acks0 + Tail.table + 1 })) return error.FifthNeverAnswered;
+    if (!awaitObservable(Answered{ .cv = h.cv, .want = acks0 + filling + 1 })) return error.FifthNeverAnswered;
     while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
     fifth.join();
     joined = true;
-    try testing.expectEqual(@as(?anyerror, null), results[Tail.table]);
+    try testing.expectEqual(@as(?anyerror, null), results[filling]);
     for (inos) |ino| try testing.expect(try h.present(ino));
     try testing.expectEqual(misses0, h.cv.stats.tail_slot_misses.load());
     try testing.expectEqual(@as(u32, 0), tail.used.load(.acquire));

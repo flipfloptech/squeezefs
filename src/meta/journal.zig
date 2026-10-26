@@ -639,8 +639,9 @@ fn entryOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id
 /// PAD at `end` spanning `pad` bytes (a zero payload of `pad − 24`), owning
 /// (and writing the headers of) the pages whose first byte it covers exactly
 /// as an entry would. Nothing when `pad == 0`. Answers the page-header
-/// bytes appended.
-fn padOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, end: u64, pad: u64, ops: *std.ArrayList(WriteOp)) Allocator.Error!u64 {
+/// bytes appended. (A self-applied window's pad rides the journal tail on
+/// its own, `conveyor.handToMembers`.)
+pub fn padOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, end: u64, pad: u64, ops: *std.ArrayList(WriteOp)) Allocator.Error!u64 {
     if (pad == 0) return 0;
     std.debug.assert(pad >= jc.PAD_MIN);
     const payload = try arena.alloc(u8, @intCast(pad - ENTRY_HDR_LEN));

@@ -4611,6 +4611,109 @@ test "§BX the same law on the venue arm: W1's applier held before its window's 
     try residentAnswerRow(v, be, .venue);
 }
 
+/// Holds the checkpoint task inside an SMO's entry write
+/// (`before_smo_entry`: its reservation registered, its device write not
+/// yet issued) until released.
+const SmoHold = struct {
+    held: std.atomic.Value(u32) = .init(0),
+    go: std.atomic.Value(u32) = .init(0),
+
+    fn hook(self: *SmoHold) node_cache.Hook {
+        return .{ .ctx = self, .call = call };
+    }
+
+    fn call(ctx: *anyopaque) void {
+        const self: *SmoHold = @ptrCast(@alignCast(ctx));
+        if (self.held.swap(1, .acq_rel) != 0) return;
+        while (self.go.load(.acquire) == 0) std.Thread.yield() catch {};
+    }
+};
+
+test "§BX an SMO's entry rides the journal tail from its build to its landing: a threshold drain's entry held before its device write — its reservation, taken inside the SMO's lock window, open below every later window — and B, a create committed then, is answered at its own apply without parking; a death then replays through the SMO's entry to B; released, both land (red: the SMO's reservation resident only at its landing — B parked behind its write)" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "smo-resident", "600000");
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    // A durable baseline first: the structural write the hold meets is the
+    // drain's SMO entry, not a first touch's control record.
+    for (0..8) |i| {
+        var nb: [16]u8 = undefined;
+        _ = try commitCreate(be, try std.fmt.bufPrint(&nb, "base-{d}", .{i}));
+    }
+    try be.checkpointNow();
+    var hold: SmoHold = .{};
+    defer test_seams.before_smo_entry = null;
+    test_seams.before_smo_entry = hold.hook();
+    // 4 KiB xattr values per create push the native leaf past its in-place
+    // log: the threshold drain replaces it (an SMO, its entry held). A
+    // commit answered at its landing and reserved past the held entry lands
+    // only after it (the completed prefix): the filler waits, not the test.
+    const Filler = struct {
+        fn run(b: *KvBackend, h: *const SmoHold, out: *?anyerror) void {
+            var i: usize = 0;
+            while (h.held.load(.acquire) == 0 and i < 256) : (i += 1) {
+                var nb: [16]u8 = undefined;
+                const t = b.begin(@src()) catch |e| {
+                    out.* = e;
+                    return;
+                };
+                _ = stageCreate(b, t, std.fmt.bufPrint(&nb, "big-{d}", .{i}) catch unreachable, 4000) catch |e| {
+                    out.* = e;
+                    return;
+                };
+                b.commit(t) catch |e| {
+                    out.* = e;
+                    return;
+                };
+            }
+            out.* = null;
+        }
+    };
+    var out_f: ?anyerror = error.TestNotRun;
+    const th_f = try std.Thread.spawn(.{}, Filler.run, .{ be, &hold, &out_f });
+    var f_joined = false;
+    defer if (!f_joined) th_f.join();
+    defer hold.go.store(1, .release);
+    const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (hold.held.load(.acquire) == 0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 1), hold.held.load(.acquire));
+    const Committer = struct {
+        fn create(b: *KvBackend, ino: *u64, out: *?anyerror, done: *std.atomic.Value(u32)) void {
+            const t = b.begin(@src()) catch unreachable;
+            t.kernel_origin = true;
+            ino.* = stageCreate(b, t, "b", 0) catch unreachable;
+            out.* = if (b.commit(t)) |_| null else |e| e;
+            done.store(1, .release);
+        }
+    };
+    const cs = be.conveyorStats();
+    const waits0 = cs.resident_waits.load();
+    var ino_b: u64 = 0;
+    var out_b: ?anyerror = error.TestNotRun;
+    var done_b = std.atomic.Value(u32).init(0);
+    const th_b = try std.Thread.spawn(.{}, Committer.create, .{ be, &ino_b, &out_b, &done_b });
+    defer th_b.join();
+    // Every exit releases the SMO before it joins (a red run leaves B parked).
+    defer hold.go.store(1, .release);
+    // A bound against the hang only: the answer takes microseconds.
+    const b_deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (done_b.load(.acquire) == 0 and clock.monotonicNs() < b_deadline) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 1), done_b.load(.acquire));
+    try testing.expectEqual(@as(?anyerror, null), out_b);
+    try testing.expectEqual(waits0, cs.resident_waits.load());
+    {
+        const j = try judgeDeath(v, be);
+        try testing.expectEqual(@as(u32, 0), j.past_hole);
+    }
+    hold.go.store(1, .release);
+    th_f.join();
+    f_joined = true;
+    try testing.expectEqual(@as(?anyerror, null), out_f);
+    try be.fsync();
+    try testing.expect(try present(be, ino_b));
+}
+
 /// The convoy's shape (§BX.7): A (window W1) held INSIDE its apply — its
 /// entry (self) or its window's image (venue) already in the tail, written
 /// at its turn or its window's start — and B (W2) committed beside it. B's

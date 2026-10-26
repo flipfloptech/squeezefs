@@ -778,6 +778,10 @@ pub const Stats = struct {
     /// `meta_conveyor_resident_helps`: windows at the resident prefix's front
     /// a parked answer claimed for (its members' entries, its image).
     resident_helps: counters.ShardedCounter = .{},
+    /// `meta_conveyor_resident_smo_waits`: parked answers whose resident
+    /// prefix stopped at a reservation no window in flight holds — an SMO's
+    /// entry, resident only by its landing.
+    resident_smo_waits: counters.ShardedCounter = .{},
     /// `meta_conveyor_pad_landings`: rolled-out members whose PAD found the
     /// tail's table full — the entry stays and the error is answered at
     /// the landing (§BX).
@@ -910,7 +914,7 @@ pub const Stats = struct {
             self.hold_bound_ns.load(),
             self.holds_pacing.load(),
         });
-        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_tail_gate_parks\":{d},\"meta_conveyor_resident_waits\":{d},\"meta_conveyor_resident_landings\":{d},\"meta_conveyor_pad_landings\":{d},\"meta_conveyor_resident_helps\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.tail_gate_parks.load(), self.resident_waits.load(), self.resident_landings.load(), self.pad_landings.load(), self.resident_helps.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
+        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_tail_gate_parks\":{d},\"meta_conveyor_resident_waits\":{d},\"meta_conveyor_resident_landings\":{d},\"meta_conveyor_pad_landings\":{d},\"meta_conveyor_resident_helps\":{d},\"meta_conveyor_resident_smo_waits\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.tail_gate_parks.load(), self.resident_waits.load(), self.resident_landings.load(), self.pad_landings.load(), self.resident_helps.load(), self.resident_smo_waits.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
         try w.print(",\"meta_conveyor_undo_keys\":{d}", .{self.undo_keys.load()});
         try w.print(",\"meta_conveyor_window_gate_parks\":{d},\"meta_conveyor_room_parks\":{d},\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.window_gate_parks.load(),
@@ -3726,8 +3730,11 @@ pub const Conveyor = struct {
         if (self.resident_head) |h| h.prev = &me;
         self.resident_head = &me;
         self.resident_lock.unlock(io);
+        var first = true;
         while (true) {
-            self.helpBelow(w, idx);
+            const at_smo = self.helpBelow(w, idx);
+            if (first and at_smo) self.stats.resident_smo_waits.inc();
+            first = false;
             var n = me.notify.notified();
             _ = n.enable(io);
             if (me.covered(self)) {
@@ -3751,23 +3758,23 @@ pub const Conveyor = struct {
     /// prefix's front (pinned by a party while it helps) — rather than wait
     /// for owners not yet running (a turn whose fiber its lane's thread has
     /// not reached). It stops at a reservation it cannot claim (an SMO
-    /// entry, a window still being handed out) or one whose owner is mid-
-    /// claim: that claim's own advance wakes it.
-    fn helpBelow(self: *Conveyor, w: *Window, idx: ?u32) void {
+    /// entry — true: no window holds it —, a window still being handed out)
+    /// or one whose owner is mid-claim: that claim's own advance wakes it.
+    fn helpBelow(self: *Conveyor, w: *Window, idx: ?u32) bool {
         if (idx) |i| for (0..i) |j| self.claimMemberOnce(w, @intCast(j));
         while (true) {
             const upto = self.deps.reg.residentUpto();
-            if (upto >= w.res.start) return;
-            const front = self.pinInflight(upto) orelse return;
+            if (upto >= w.res.start) return false;
+            const front = self.pinInflight(upto) orelse return true;
             defer front.release();
             switch (front.helpable.load(.acquire)) {
                 .self => for (0..front.parts.len) |j| self.claimMemberOnce(front, @intCast(j)),
                 .venue => self.claimWindowOnce(front),
-                .no => return,
+                .no => return false,
             }
             if (self.deps.reg.residentUpto() == upto) {
                 self.stats.resident_helps.inc();
-                return;
+                return false;
             }
             self.stats.resident_helps.inc();
         }
@@ -6761,7 +6768,7 @@ test "the stats JSON names every conveyor face" {
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w);
     const out = w.buffered();
-    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves", "meta_conveyor_pass_yields", "meta_conveyor_tail_gate_parks", "meta_conveyor_resident_waits", "meta_conveyor_resident_landings", "meta_conveyor_pad_landings", "meta_conveyor_resident_helps" }) |name| {
+    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves", "meta_conveyor_pass_yields", "meta_conveyor_tail_gate_parks", "meta_conveyor_resident_waits", "meta_conveyor_resident_landings", "meta_conveyor_pad_landings", "meta_conveyor_resident_helps", "meta_conveyor_resident_smo_waits" }) |name| {
         try testing.expect(std.mem.indexOf(u8, out, name) != null);
     }
     var pb: [8192]u8 = undefined;

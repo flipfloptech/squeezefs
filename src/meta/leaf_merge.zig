@@ -633,6 +633,9 @@ pub fn smoMerge(t: *KvTree, ctx: *SmoContext, parent: *CachedNode, left: *Cached
     // ---- Step 2: parent, then both children in ascending address order;
     // reserve inside; move both deltas; publish → flip → retire; release.
     var registered: ?jc.InflightRegistry.Registered = null;
+    // §BX.9: an error past the reservation leaves it a landed PAD, once the
+    // locks went back.
+    errdefer if (registered) |r| ctx.journal.?.padAbandoned(r.res);
     {
         const pd = parent.lockWrite(io);
         errdefer parent.unlockWrite(io);
@@ -695,6 +698,7 @@ pub fn smoMerge(t: *KvTree, ctx: *SmoContext, parent: *CachedNode, left: *Cached
     // ---- Step 3: after release — entry bytes, both retirements gated on
     // the entry's last record's position, parent maintenance, counters.
     const gate: u64 = if (registered) |r| smo.writeEntryAfterRelease(ctx.journal.?, r, &prep.?, "merge") else try t.seq.mint();
+    registered = null;
     try ctx.freePending(old_l, gate, forced_retirement);
     try ctx.freePending(old_r, gate, forced_retirement);
     smo.requeueIfOverThreshold(t, parent);
@@ -761,6 +765,8 @@ pub fn smoRootCollapse(t: *KvTree, ctx: *SmoContext, root: *CachedNode, out: *Ma
         prep = try smo.PreparedEntry.prepare(ctx, j, recs);
     }
     var registered: ?jc.InflightRegistry.Registered = null;
+    // §BX.9: as in the merge.
+    errdefer if (registered) |r| ctx.journal.?.padAbandoned(r.res);
     {
         const rd = root.lockWrite(io);
         errdefer root.unlockWrite(io);
@@ -788,6 +794,7 @@ pub fn smoRootCollapse(t: *KvTree, ctx: *SmoContext, root: *CachedNode, out: *Ma
         root.unlockWrite(io);
     }
     const gate: u64 = if (registered) |r| smo.writeEntryAfterRelease(ctx.journal.?, r, &prep.?, "root-collapse") else try t.seq.mint();
+    registered = null;
     try ctx.freePending(old_extent, gate, forced_retirement);
     stats.meta_kv_root_collapses.inc();
     out.root_collapses += 1;

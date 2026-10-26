@@ -230,6 +230,39 @@ pub const SmoJournal = struct {
         if (self.device) |d| d.completed(d.ctx);
     }
 
+    /// §BX.9: a reservation whose SMO failed before its entry was written
+    /// (an error between the reservation, inside the lock window, and the
+    /// entry's build): a PAD over its range — the entry's and its own pad —
+    /// landed, then the reservation completed, so neither the completed
+    /// prefix nor the resident prefix waits on it and the chain to every
+    /// later entry runs through it. Nothing of the SMO is journaled: the
+    /// replay folds to the pre-SMO routing plus the by-key window, as for a
+    /// failed write (`writeEntryAfterRelease`). A PAD that cannot be built
+    /// or written completes as that write's unwritten hole.
+    pub fn padAbandoned(self: *SmoJournal, res: Reservation) void {
+        self.writePad(res) catch |e| log.warn("SMO journal: the PAD over a failed SMO's reservation at {d} could not be written ({s}): an unwritten hole", .{ res.start, @errorName(e) });
+        self.reg.complete(self.core, res);
+        if (self.device) |d| d.completed(d.ctx);
+    }
+
+    fn writePad(self: *SmoJournal, res: Reservation) (journal.Error || error{Io})!void {
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var entry_ops: std.ArrayList(journal.WriteOp) = .empty;
+        var header_bytes = try journal.partOps(a, self.layout, self.geo, self.appender_id, .{ .res = Reservation.unpadded(res.start, res.len), .records = &.{}, .pad = true }, &entry_ops);
+        var pad_ops: std.ArrayList(journal.WriteOp) = .empty;
+        header_bytes += try journal.padOps(a, self.layout, self.geo, self.appender_id, res.end(), res.pad, &pad_ops);
+        var img = try journal.buildWindowFromOps(std.heap.ArenaAllocator.init(self.gpa), self.layout, self.geo, res, &.{entry_ops.items}, pad_ops.items, 0, header_bytes);
+        defer img.arena.deinit();
+        if (self.device) |d| {
+            try d.write(d.ctx, img.ops);
+        } else {
+            journal.applyOps(self.image, self.layout.base, img.ops);
+        }
+        self.stats.noteWritten(img.acct, 0);
+    }
+
     fn testFailArmed(self: *SmoJournal) bool {
         var v = self.test_fail_writes.load(.monotonic);
         while (v > 0) {
@@ -1082,6 +1115,9 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
     const parent: ?*CachedNode = if (is_root) null else try t.resolveParent(n);
     defer if (parent) |p| p.release();
     var registered: ?jc.InflightRegistry.Registered = null;
+    // §BX.9: an error past the reservation leaves it a landed PAD, once the
+    // locks went back.
+    errdefer if (registered) |r| ctx.journal.?.padAbandoned(r.res);
     {
         const pd: ?*node_cache.NodeDirty = if (parent) |p| p.lockWrite(io) else null;
         errdefer if (parent) |p| p.unlockWrite(io);
@@ -1168,6 +1204,7 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
     // ---- P4 / P5: the entry bytes after release, then the old extent to
     // pending-free gated on the free record's own position.
     const gate: u64 = if (registered) |r| writeEntryAfterRelease(ctx.journal.?, r, &prep.?, "replace") else try t.seq.mint();
+    registered = null;
     try ctx.freePending(old_extent, gate, forced_retirement);
     if (parent) |p| requeueIfOverThreshold(t, p);
     if (build.successors.items.len == 1) {

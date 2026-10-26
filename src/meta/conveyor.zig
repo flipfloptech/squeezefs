@@ -2996,7 +2996,7 @@ pub const Conveyor = struct {
 
     /// §BC: ONE member's apply on its own committer's thread — A3 resolve
     /// (seeded) → A4 lock ITS leaves (ascending) → A5 revalidate → A7 its
-    /// pre-images → A9 apply → A10 the threshold → unlock → A12 its own
+    /// pre-images (none when it answers at its apply) → A9 apply → A10 the threshold → unlock → A12 its own
     /// ops (a PAD over its range if it rolled out) → the tail → the ack
     /// (this mount's kernel's own op, §BB.1) → the window's submit when it
     /// is the last member. A served verb, a control record or a tool waits
@@ -3029,7 +3029,13 @@ pub const Conveyor = struct {
             if (m.q.leafwise) {
                 failed[0] = self.applyLeafwise(a, m, p);
             } else {
-                self.applyUnion(a, members, p, failed);
+                // §BB.5: a member whose success is answered here (the
+                // `early` rule below, its inputs all fixed before the
+                // apply) leaves its window answered, and an answered
+                // window never rolls back — its pre-images would never be
+                // read. A failed apply removes its records in-window.
+                const answered_at_apply = kernel_origin and self.deps.ack_at_apply and p.tail_slot != null and !w.pad_unclaimed;
+                self.applyUnion(a, members, p, failed, !answered_at_apply);
             }
         }
         self.stats.pass_leaf_locks.record(clock.monotonicNs() -| t_apply);
@@ -3183,7 +3189,7 @@ pub const Conveyor = struct {
     /// §BC, a member's apply under ITS leaf set: every leaf locked
     /// ascending and held across the whole apply (a name's change is seen
     /// whole — the dentry and the inode together).
-    fn applyUnion(self: *Conveyor, a: Allocator, members: []Queued, p: *Window.Part, failed: []?Error) void {
+    fn applyUnion(self: *Conveyor, a: Allocator, members: []Queued, p: *Window.Part, failed: []?Error, capture_undo: bool) void {
         var attempt: u32 = 0;
         while (failed[0] == null) : (attempt += 1) {
             if (attempt >= COMMIT_RETRY_BUDGET) {
@@ -3209,7 +3215,7 @@ pub const Conveyor = struct {
                 tree.stats.meta_kv_commit_smo_retries.inc();
                 continue;
             }
-            p.undo = self.captureUndo(a, members, &r) catch |e| {
+            if (capture_undo) p.undo = self.captureUndo(a, members, &r) catch |e| {
                 self.unlockAll(r.lock_set);
                 r.releaseRefs();
                 failed[0] = e;

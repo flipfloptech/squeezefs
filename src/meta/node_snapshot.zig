@@ -188,7 +188,39 @@ pub const IdxRec = struct {
     src: u16,
     key_len: u16,
     kind: RecordKind,
+    /// The key's bytes just past the index's shared prefix
+    /// (`RecordIndex.prefix_len`), zero-padded: a search orders most
+    /// entries on these alone, without reading the key from its source
+    /// image (`discOf`). It fills the struct's padding.
+    disc: [DISC_LEN]u8 = @splat(0),
 };
+
+/// The discriminator's width: the bytes `IdxRec`'s alignment padding holds.
+pub const DISC_LEN: usize = 3;
+
+/// `k`'s discriminator at `at` (its bytes `[at, at + DISC_LEN)`, zero
+/// past its end), big-endian. Between two keys sharing the first `at`
+/// bytes a smaller discriminator is the smaller key — a key that ends
+/// inside the window pads zeros, so it compares below any longer key
+/// with a byte there, and equal discriminators decide nothing.
+pub fn discOf(k: []const u8, at: usize) [DISC_LEN]u8 {
+    var d: [DISC_LEN]u8 = @splat(0);
+    if (at < k.len) {
+        const n = @min(DISC_LEN, k.len - at);
+        @memcpy(d[0..n], k[at..][0..n]);
+    }
+    return d;
+}
+
+fn discWord(d: [DISC_LEN]u8) u32 {
+    return std.mem.readInt(u24, &d, .big);
+}
+
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    const n = @min(a.len, b.len);
+    for (0..n) |i| if (a[i] != b[i]) return i;
+    return n;
+}
 
 comptime {
     assert(@sizeOf(IdxRec) == 24);
@@ -214,6 +246,10 @@ pub const RecordIndex = struct {
     /// Exactly what `build`/`extendWith` charged: `indexBytes(entries.len,
     /// sources.len)`; `deinit` credits it.
     charged: u64,
+    /// The prefix every key shares (the first and the last key's: the keys
+    /// are sorted), capped at a byte: each entry's `disc` is its key's
+    /// bytes just past it.
+    prefix_len: u8 = 0,
 
     pub const BuildError = bset.ParseError || error{TooManySources};
 
@@ -283,8 +319,29 @@ pub const RecordIndex = struct {
         assert(n == total);
         var idx: RecordIndex = .{ .sources = sources, .entries = entries, .charge = charge, .charged = 0 };
         idx.normalizeRuns();
+        idx.prefix_len = idx.sharedPrefix(idx.firstKey(), idx.lastKey());
+        idx.stampDiscs(idx.entries, null);
         idx.chargeArrays();
         return idx;
+    }
+
+    fn firstKey(self: *const RecordIndex) []const u8 {
+        return if (self.entries.len == 0) "" else self.keyAt(self.entries[0]);
+    }
+
+    fn lastKey(self: *const RecordIndex) []const u8 {
+        return if (self.entries.len == 0) "" else self.keyAt(self.entries[self.entries.len - 1]);
+    }
+
+    /// The prefix two bounding keys share, capped at a byte.
+    fn sharedPrefix(_: *const RecordIndex, first: []const u8, last: []const u8) u8 {
+        return @intCast(@min(commonPrefixLen(first, last), std.math.maxInt(u8)));
+    }
+
+    /// Each of `entries`' discriminators at the index's prefix (keys read
+    /// from `src` when given — entries of a source not yet in the table).
+    fn stampDiscs(self: *const RecordIndex, entries: []IdxRec, src: ?Bytes) void {
+        for (entries) |*e| e.disc = discOf(if (src) |b| keyIn(b, e.*) else self.keyAt(e.*), self.prefix_len);
     }
 
     fn idxRecOf(src: Bytes, si: u16, r: RecordRef) IdxRec {
@@ -356,6 +413,20 @@ pub const RecordIndex = struct {
             }
             i = j;
         }
+        // The merged index's prefix: its first and last keys are the two
+        // sides' extremes. Unchanged (the common case: a freeze lands
+        // inside the node's range), the old entries keep their
+        // discriminators and only the new source's are stamped.
+        var prefix_len = self.prefix_len;
+        if (fresh.len != 0) {
+            const fresh_first = keyIn(new_source, fresh[0]);
+            const fresh_last = keyIn(new_source, fresh[fresh.len - 1]);
+            const first = if (self.entries.len != 0 and key.lessThan(self.firstKey(), fresh_first)) self.firstKey() else fresh_first;
+            const last = if (self.entries.len != 0 and key.lessThan(fresh_last, self.lastKey())) self.lastKey() else fresh_last;
+            prefix_len = self.sharedPrefix(first, last);
+        }
+        const restamp = prefix_len != self.prefix_len;
+        if (!restamp) self.stampDiscs(fresh, new_source);
         const entries = try gpa.alloc(IdxRec, self.entries.len + fresh.len);
         var a: usize = 0;
         var b: usize = 0;
@@ -381,7 +452,8 @@ pub const RecordIndex = struct {
         @memcpy(entries[n..][0 .. self.entries.len - a], self.entries[a..]);
         n += self.entries.len - a;
         @memcpy(entries[n..][0 .. fresh.len - b], fresh[b..]);
-        var idx: RecordIndex = .{ .sources = sources, .entries = entries, .charge = self.charge, .charged = 0 };
+        var idx: RecordIndex = .{ .sources = sources, .entries = entries, .charge = self.charge, .charged = 0, .prefix_len = prefix_len };
+        if (restamp) idx.stampDiscs(idx.entries, null);
         idx.chargeArrays();
         return idx;
     }
@@ -414,14 +486,58 @@ pub const RecordIndex = struct {
         return .{ .key = self.keyAt(e), .seq = e.seq, .kind = e.kind, .value = self.valueAt(e) };
     }
 
-    const KeyCtx = struct { idx: *const RecordIndex, k: []const u8 };
+    /// A search key against the index: below every entry, above every
+    /// one, or among them — sharing the index's prefix, with its
+    /// discriminator.
+    const Probe = union(enum) {
+        below,
+        above,
+        among: struct { idx: *const RecordIndex, k: []const u8, d: u32 },
+    };
 
-    fn entryKeyLess(ctx: KeyCtx, e: IdxRec) bool {
-        return key.order(ctx.idx.keyAt(e), ctx.k) == .lt;
+    fn probeOf(self: *const RecordIndex, k: []const u8) Probe {
+        if (self.entries.len == 0) return .below;
+        const l: usize = self.prefix_len;
+        const shared = self.firstKey()[0..l];
+        const n = @min(l, k.len);
+        return switch (key.order(k[0..n], shared[0..n])) {
+            .lt => .below,
+            .gt => .above,
+            // A proper prefix of the shared prefix sorts first.
+            .eq => if (k.len < l) .below else .{ .among = .{ .idx = self, .k = k, .d = discWord(discOf(k, l)) } },
+        };
     }
 
-    fn entryKeyLessEq(ctx: KeyCtx, e: IdxRec) bool {
-        return key.order(ctx.idx.keyAt(e), ctx.k) != .gt;
+    /// The first entry failing `less` (true on a prefix of the entries):
+    /// an entry's discriminator orders it against the key when the two
+    /// differ — no read of its key — and the key itself only on a tie.
+    fn partitionProbe(self: *const RecordIndex, p: Probe, comptime or_equal: bool) usize {
+        const q = switch (p) {
+            .below => return 0,
+            .above => return self.entries.len,
+            .among => |q| q,
+        };
+        const es = self.entries;
+        var lo: usize = 0;
+        var len: usize = es.len;
+        while (len > 0) {
+            const half = len / 2;
+            const mid = lo + half;
+            const e = es[mid];
+            const de = discWord(e.disc);
+            const less = if (de != q.d) de < q.d else switch (key.order(self.keyAt(e), q.k)) {
+                .lt => true,
+                .eq => or_equal,
+                .gt => false,
+            };
+            if (less) {
+                lo = mid + 1;
+                len -= half + 1;
+            } else {
+                len = half;
+            }
+        }
+        return lo;
     }
 
     /// `[lo, hi)` of entries whose key equals `k` (newest first). The end
@@ -429,14 +545,11 @@ pub const RecordIndex = struct {
     /// costs a compare or two where a second binary search cost log₂ n —
     /// and searched past `GROUP_WALK` records.
     pub fn groupBounds(self: *const RecordIndex, k: []const u8) Range {
-        const ctx: KeyCtx = .{ .idx = self, .k = k };
-        const lo = std.sort.partitionPoint(IdxRec, self.entries, ctx, entryKeyLess);
+        const p = self.probeOf(k);
+        const lo = self.partitionProbe(p, false);
         var hi = lo;
         while (hi < self.entries.len) : (hi += 1) {
-            if (hi - lo == GROUP_WALK) {
-                hi += std.sort.partitionPoint(IdxRec, self.entries[hi..], ctx, entryKeyLessEq);
-                break;
-            }
+            if (hi - lo == GROUP_WALK) return .{ .lo = lo, .hi = self.partitionProbe(p, true) };
             if (!std.mem.eql(u8, self.keyAt(self.entries[hi]), k)) break;
         }
         return .{ .lo = lo, .hi = hi };
@@ -444,7 +557,7 @@ pub const RecordIndex = struct {
 
     /// Index of the first entry with key ≥ `from`.
     pub fn firstAtOrAfter(self: *const RecordIndex, from: []const u8) usize {
-        return std.sort.partitionPoint(IdxRec, self.entries, KeyCtx{ .idx = self, .k = from }, entryKeyLess);
+        return self.partitionProbe(self.probeOf(from), false);
     }
 };
 
@@ -1757,6 +1870,20 @@ fn imageOf(gpa: Allocator, records: []const Record) !Bytes {
     return Bytes.fromOwned(gpa, img);
 }
 
+/// The index's order read off the full keys alone (the searches' oracle).
+const IndexKey = struct {
+    idx: *const RecordIndex,
+    k: []const u8,
+
+    fn less(ctx: IndexKey, e: IdxRec) bool {
+        return key.order(ctx.idx.keyAt(e), ctx.k) == .lt;
+    }
+
+    fn lessEq(ctx: IndexKey, e: IdxRec) bool {
+        return key.order(ctx.idx.keyAt(e), ctx.k) != .gt;
+    }
+};
+
 fn emptyRun(gpa: Allocator) !*Arc(Run) {
     return Arc(Run).create(gpa, Run.empty);
 }
@@ -1832,10 +1959,10 @@ test "a key's group [lo, hi) — the index's and the run's — is the two partit
     try testing.expect(run.slots.len > 2);
     for (0..sizes.len + 1) |ino| {
         const k = key.inodeKey(ino);
-        const ictx: RecordIndex.KeyCtx = .{ .idx = &idx, .k = &k };
+        const ictx: IndexKey = .{ .idx = &idx, .k = &k };
         const want_idx: Range = .{
-            .lo = std.sort.partitionPoint(IdxRec, idx.entries, ictx, RecordIndex.entryKeyLess),
-            .hi = std.sort.partitionPoint(IdxRec, idx.entries, ictx, RecordIndex.entryKeyLessEq),
+            .lo = std.sort.partitionPoint(IdxRec, idx.entries, ictx, IndexKey.less),
+            .hi = std.sort.partitionPoint(IdxRec, idx.entries, ictx, IndexKey.lessEq),
         };
         try testing.expectEqual(want_idx, idx.groupBounds(&k));
         try testing.expectEqual(if (ino < sizes.len) sizes[ino] else 0, want_idx.hi - want_idx.lo);
@@ -1912,10 +2039,159 @@ test "RecordIndex.extendWith equals a from-scratch build over the same sources" 
     var full = try RecordIndex.build(gpa, s3, null);
     defer full.deinit(gpa);
     try testing.expectEqual(full.entries.len, inc3.entries.len);
+    // Each extension widened the key range (ino 6 past 5): the prefix
+    // moved and every discriminator was restamped at it.
+    try testing.expectEqual(full.prefix_len, inc3.prefix_len);
     for (0..full.entries.len) |i| {
         try testing.expect(full.recordRef(i).eql(inc3.recordRef(i)));
         try testing.expectEqual(full.entries[i].src, inc3.entries[i].src);
+        try testing.expectEqual(full.entries[i].disc, inc3.entries[i].disc);
     }
+}
+
+test "the discriminator search is the full-key order exactly: over random indexes — one directory's dentries (a 9-byte shared prefix), mixed inode/xattr/dentry keys of neighbouring inos, keys whose discriminators tie — built whole and by extension (the prefix kept or moved), firstAtOrAfter and groupBounds equal the full-key partition points for present keys, keys between, below and above the range, proper prefixes of the shared prefix and keys with zero bytes in the window" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xd15c_0001);
+    const rnd = prng.random();
+    const Shape = enum { one_dir, mixed, ties };
+    for (0..48) |case| {
+        const shape: Shape = @fromBackingInt(@intCast(case % 3));
+        const parent: u64 = 0x0001_0000_0000_0000 | @as(u64, rnd.int(u32));
+        var pool: std.ArrayList([key.KEY_BUF_CAP]u8) = .empty;
+        defer pool.deinit(gpa);
+        var lens: std.ArrayList(usize) = .empty;
+        defer lens.deinit(gpa);
+        const n = 1 + rnd.uintLessThan(usize, 400);
+        for (0..n) |_| {
+            var kb: [key.KEY_BUF_CAP]u8 = @splat(0);
+            var kl: usize = 0;
+            switch (shape) {
+                .one_dir => {
+                    const k = key.dentryKey(parent, rnd.uintLessThan(u64, key.HASH54_MAX + 1), rnd.int(u8));
+                    @memcpy(kb[0..k.len], &k);
+                    kl = k.len;
+                },
+                .mixed => {
+                    const ino = parent + rnd.uintLessThan(u64, 600);
+                    switch (rnd.uintLessThan(u8, 3)) {
+                        0 => {
+                            const k = key.inodeKey(ino);
+                            @memcpy(kb[0..k.len], &k);
+                            kl = k.len;
+                        },
+                        1 => {
+                            const k = key.xattrKey(ino, rnd.uintLessThan(u64, 1 << 20), 0);
+                            @memcpy(kb[0..k.len], &k);
+                            kl = k.len;
+                        },
+                        else => {
+                            const k = key.dentryKey(ino, rnd.uintLessThan(u64, key.HASH54_MAX + 1), 0);
+                            @memcpy(kb[0..k.len], &k);
+                            kl = k.len;
+                        },
+                    }
+                },
+                .ties => {
+                    // The hash's top bits fixed: every discriminator past
+                    // the 9-byte prefix ties, the full key decides.
+                    const k = key.dentryKey(parent, (0x2A << 44) | rnd.uintLessThan(u64, 1 << 12), rnd.uintLessThan(u8, 4));
+                    @memcpy(kb[0..k.len], &k);
+                    kl = k.len;
+                },
+            }
+            try pool.append(gpa, kb);
+            try lens.append(gpa, kl);
+        }
+        // Sort and dedupe by key; split into two sources at a random point
+        // of the key order (by extension the second either stays inside
+        // the first's range or widens it).
+        const Ctx = struct {
+            pool: []const [key.KEY_BUF_CAP]u8,
+            lens: []const usize,
+            fn lt(ctx: @This(), x: usize, y: usize) bool {
+                return key.lessThan(ctx.pool[x][0..ctx.lens[x]], ctx.pool[y][0..ctx.lens[y]]);
+            }
+        };
+        const order_ix = try gpa.alloc(usize, n);
+        defer gpa.free(order_ix);
+        for (order_ix, 0..) |*o, i| o.* = i;
+        std.mem.sort(usize, order_ix, Ctx{ .pool = pool.items, .lens = lens.items }, Ctx.lt);
+        var uniq: std.ArrayList(usize) = .empty;
+        defer uniq.deinit(gpa);
+        for (order_ix) |i| {
+            if (uniq.items.len != 0) {
+                const prev = uniq.items[uniq.items.len - 1];
+                if (std.mem.eql(u8, pool.items[prev][0..lens.items[prev]], pool.items[i][0..lens.items[i]])) continue;
+            }
+            try uniq.append(gpa, i);
+        }
+        var recs: std.ArrayList(Record) = .empty;
+        defer {
+            rec.deinitRecords(gpa, recs.items);
+            recs.deinit(gpa);
+        }
+        for (uniq.items, 0..) |i, j| try recs.append(gpa, try Record.put(gpa, pool.items[i][0..lens.items[i]], j + 1, "v"));
+        const split = rnd.uintAtMost(usize, recs.items.len);
+        const inner = rnd.boolean();
+        var first_refs: std.ArrayList(RecordRef) = .empty;
+        defer first_refs.deinit(gpa);
+        var second_refs: std.ArrayList(RecordRef) = .empty;
+        defer second_refs.deinit(gpa);
+        for (recs.items, 0..) |*r, j| {
+            // `inner`: the second source takes every other record (inside
+            // the first's range); else the upper part (it widens it).
+            const second = if (inner) j % 2 == 1 else j >= split;
+            try (if (second) &second_refs else &first_refs).append(gpa, r.ref());
+        }
+        var idx: RecordIndex = undefined;
+        if (first_refs.items.len == 0 or second_refs.items.len == 0) {
+            const all = try gpa.alloc(Bytes, 1);
+            var refs: std.ArrayList(RecordRef) = .empty;
+            defer refs.deinit(gpa);
+            for (recs.items) |*r| try refs.append(gpa, r.ref());
+            all[0] = try Bytes.fromOwned(gpa, try bset.buildBset(gpa, refs.items, recs.items.len));
+            idx = try RecordIndex.build(gpa, all, null);
+        } else {
+            const one = try gpa.alloc(Bytes, 1);
+            one[0] = try Bytes.fromOwned(gpa, try bset.buildBset(gpa, first_refs.items, recs.items.len));
+            var base = try RecordIndex.build(gpa, one, null);
+            defer base.deinit(gpa);
+            idx = try base.extendWith(gpa, try Bytes.fromOwned(gpa, try bset.buildBset(gpa, second_refs.items, recs.items.len)));
+        }
+        defer idx.deinit(gpa);
+        try testing.expectEqual(recs.items.len, idx.entries.len);
+        // Probes: every present key, its neighbours (last byte ±1), a key
+        // past each end, prefixes of a present key (shorter than, at and
+        // past the shared prefix) and zero-padded extensions.
+        var probe_buf: [key.KEY_BUF_CAP + 4]u8 = undefined;
+        for (recs.items) |*r| {
+            const k = r.key;
+            try expectSearchExact(&idx, k);
+            @memcpy(probe_buf[0..k.len], k);
+            probe_buf[k.len - 1] +%= 1;
+            try expectSearchExact(&idx, probe_buf[0..k.len]);
+            probe_buf[k.len - 1] -%= 2;
+            try expectSearchExact(&idx, probe_buf[0..k.len]);
+            @memcpy(probe_buf[0..k.len], k);
+            for (0..k.len) |cut| try expectSearchExact(&idx, k[0..cut]);
+            probe_buf[k.len] = 0;
+            probe_buf[k.len + 1] = 0;
+            try expectSearchExact(&idx, probe_buf[0 .. k.len + 2]);
+        }
+        try expectSearchExact(&idx, "");
+        try expectSearchExact(&idx, &key.KEY_SPACE_MAX);
+        try expectSearchExact(&idx, &key.inodeKey(0));
+    }
+}
+
+fn expectSearchExact(idx: *const RecordIndex, k: []const u8) !void {
+    const ctx: IndexKey = .{ .idx = idx, .k = k };
+    const want: Range = .{
+        .lo = std.sort.partitionPoint(IdxRec, idx.entries, ctx, IndexKey.less),
+        .hi = std.sort.partitionPoint(IdxRec, idx.entries, ctx, IndexKey.lessEq),
+    };
+    try testing.expectEqual(want.lo, idx.firstAtOrAfter(k));
+    try testing.expectEqual(want, idx.groupBounds(k));
 }
 
 test "snapshot lookup folds across sources; a delta chain is a memo miss then a memo hit with zero decodes; newestSeqOf; census" {

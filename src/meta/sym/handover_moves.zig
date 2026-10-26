@@ -1094,3 +1094,66 @@ test "linux: A JOINER'S RENAME WHOSE EVERY OBJECT IS THE MANAGER'S resolves with
         for ([_]u64{ f, g, h, i }) |ino| try testing.expectEqual(@as(u32, 1), (try fs_.vtable.getattr(fs_.impl, &c, .{ .ino = ino, .fh = null })).attr.nlink);
     }
 }
+
+// ---------------------------------------------------------------------------
+// THE MINT AGAINST A HANDOVER OF ITS SLOT (decision 0003 §BV). A mint's slot
+// decision and its cursor `fetch_add` are two steps; a handover of the slot
+// that lands between them carries the cursor it read to the receiver, and
+// the minter's `fetch_add` then hands out the receiver's first ino.
+// ---------------------------------------------------------------------------
+
+test "linux: A MINT RACING THE HANDOVER OF ITS SLOT keeps no ino the receiver mints (decision 0003 §BV; `mint_window_model.MintRecheck`): A's create decides its rotor slot and parks before the cursor's fetch_add; A hands that slot to B, which mints its first ino there off the cursor A carried; A's create resumes — the ino it answers is never B's (red: the same global ino, minted twice)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "mint-race", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try wire_plane.WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    const b = try MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-mint-race-b", .endpoint = plane.advertised } });
+    defer b.close();
+    const bj = b.volumes[0];
+    const me = bj.joined.?.appenderId();
+    // A's create under the root: the census picks a rotor slot, the seam
+    // parks it before the fetch_add.
+    be0.slots.mint_seam.armed.store(true, .release);
+    const Minter = struct {
+        fn run(st: *MetaSet, out: *(meta_set.Error!u64)) void {
+            out.* = st.allocateIno(st.effectiveIno(inos.ROOT_INO), false, false);
+        }
+    };
+    var minted: meta_set.Error!u64 = error.Io;
+    const th = try std.Thread.spawn(.{}, Minter.run, .{ set, &minted });
+    var joined_minter = false;
+    defer if (!joined_minter) {
+        be0.slots.mint_seam.release.set(s.io());
+        th.join();
+    };
+    be0.slots.mint_seam.reached.waitUncancelable(s.io());
+    const slot: u16 = @intCast(be0.slots.mint_seam.slot.load(.acquire));
+    try testing.expect(be0.slots.table.view(slot).leasedBy(lt.MANAGER));
+    // The slot's tree on the device, then the handover to B: B's cursor is
+    // floored at the one A carried.
+    _ = try commitRecord(be0, slot, "written by A");
+    try be0.checkpointNow();
+    try testing.expectEqual(acquire.Verbs.OfferResult.offered, try be0.slots.verbs.offerSlot(lt.MANAGER, slot, me, std.math.maxInt(u64)));
+    const sink = bj.slots.carriageSink();
+    sink.offered(sink.ctx, slot, lt.MANAGER);
+    try testing.expect(bj.slots.table.view(slot).leasedBy(me));
+    const b_global = inos.makeGlobalIno(try bj.allocateInoInSlot(slot), slot, inos.ROUTING_WIDTH);
+    // A's create resumes.
+    be0.slots.mint_seam.release.set(s.io());
+    th.join();
+    joined_minter = true;
+    const a_global = set.globalIno(try minted);
+    std.debug.print("mint race: A's create answered ino {d} (slot {d}); B minted ino {d} in the slot A handed over ({d})\n", .{ a_global, route_table.slotOf(a_global), b_global, slot });
+    try testing.expect(a_global != b_global);
+    // What A answers is a slot A still leases.
+    try testing.expect(be0.slots.table.view(route_table.slotOf(a_global)).leasedBy(lt.MANAGER));
+}

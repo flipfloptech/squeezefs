@@ -690,6 +690,7 @@ pub const MetaSet = struct {
         if (v != parent_v) rstats.routing_mint_volume_picks.inc();
         const rr = self.slot_rr.fetchAdd(1, .monotonic);
         const slot = self.volumes[v].slots.mintSlot(parent_slot, v == parent_v, gather, rr) orelse self.rotors[v].pickSlot();
+        self.volumes[v].slots.holdMintForTest(slot);
         const be = self.volumeOfSlot(slot);
         const local = be.allocateInoInSlot(slot) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,

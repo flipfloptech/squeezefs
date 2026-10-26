@@ -64,6 +64,15 @@ pub const COLD_BARRIER_NS: u64 = std.time.ns_per_ms;
 /// The cold-start ship term: the fleet's measured ≈ 0.3 ms served ship.
 pub const COLD_SHIP_NS: u64 = 300 * std.time.ns_per_us;
 
+/// `holdMintForTest`'s hold: armed once, it parks the next mint after its
+/// decision, publishing the decided slot, until released.
+pub const MintSeam = struct {
+    armed: std.atomic.Value(bool) = .init(false),
+    slot: std.atomic.Value(u32) = .init(0),
+    reached: Io.Event = .unset,
+    release: Io.Event = .unset,
+};
+
 pub const Plane = struct {
     gpa: Allocator,
     io: Io,
@@ -122,6 +131,9 @@ pub const Plane = struct {
     /// here — before the open's first frame writer (the ring-recovery
     /// preflight inside the claim gate) — and installed into the cache.
     frames: fencing.FramePlane,
+    /// Test seam: the next mint parks between its slot decision and its
+    /// `fetch_add` (one relaxed load when unarmed).
+    mint_seam: MintSeam = .{},
 
     pub const InitError = error{ OutOfMemory, Io, Corrupt };
 
@@ -1484,6 +1496,15 @@ pub const Plane = struct {
             .none => null,
             else => c.slot(),
         };
+    }
+
+    /// The mint seam's hold (a test's): one shot, the slot published.
+    pub fn holdMintForTest(self: *Plane, slot: u16) void {
+        if (!self.mint_seam.armed.load(.monotonic)) return;
+        if (!self.mint_seam.armed.swap(false, .acq_rel)) return;
+        self.mint_seam.slot.store(slot, .release);
+        self.mint_seam.reached.set(self.io);
+        self.mint_seam.release.waitUncancelable(self.io);
     }
 
     /// One more rotor slot (PARK admission in-process; `AcquireSlots(1)`

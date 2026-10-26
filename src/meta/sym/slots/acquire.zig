@@ -73,6 +73,11 @@ pub const stats = struct {
     pub var affinity_mints: counters.ShardedCounter = .{};
     pub var rotor_mints: counters.ShardedCounter = .{};
     pub var dir_gather_mints: counters.ShardedCounter = .{};
+    /// A minted ino whose slot moved (released, granted away or back,
+    /// migrating) between the decision and its `fetch_add`'s recheck:
+    /// burned, the mint redone (decision 0003 §BV). Closure:
+    /// `affinity_mints + rotor_mints + dir_gather_mints ≡ mints + mint_burns`.
+    pub var mint_burns: counters.ShardedCounter = .{};
     /// The parent WAS leased and non-native but at/over the ceiling.
     pub var affinity_ceiling_spills: counters.ShardedCounter = .{};
     /// Every rotor tree strictly over the ceiling: one more rotor slot.

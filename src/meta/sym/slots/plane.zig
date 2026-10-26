@@ -1450,14 +1450,21 @@ pub const Plane = struct {
         return self.table.firstRotorHeldBy(self.me);
     }
 
+    /// A mint's slot and the lease generation its decision read: `g` is
+    /// set when the decision took a slot this mount leases (affinity, the
+    /// rotor) — the ino minted there is kept only if the slot still stands
+    /// at `g` after the `fetch_add` (`mintStands`); null for the gather
+    /// arm's parent slot, which the commit's door judges.
+    pub const Mint = struct { slot: u16, g: ?u32 = null };
+
     /// The slot a child of `parent_slot` mints into on this volume: the
     /// gather arm first, then `mint_choice` over the rotor; null = the
     /// caller's rotor (an unarmed plane).
-    pub fn mintSlot(self: *Plane, parent_slot: u16, parent_on_this_volume: bool, gather: bool, rr: u64) ?u16 {
+    pub fn mintSlot(self: *Plane, parent_slot: u16, parent_on_this_volume: bool, gather: bool, rr: u64) ?Mint {
         if (!self.armed) return null;
         const be = self.be;
         const native = be.stamp.native_slot == parent_slot;
-        if (acquire.gatherMintSlot(parent_on_this_volume, native, gather, parent_slot)) |s| return s;
+        if (acquire.gatherMintSlot(parent_on_this_volume, native, gather, parent_slot)) |s| return .{ .slot = s };
         const pv = self.table.view(parent_slot);
         // `A_max(t)` is DYNAMIC: the live leaf census at every decision
         // (the static knob, when set, is the whole law).
@@ -1466,7 +1473,7 @@ pub const Plane = struct {
         const parent_tree_bytes = self.treeBytes(parent_slot);
         if (acquire.affinityHolds(parent_leased_non_native, parent_tree_bytes, a_max)) {
             acquire.countChoice(.{ .affinity = parent_slot }, true);
-            return parent_slot;
+            return .{ .slot = parent_slot, .g = pv.g };
         }
         var rotor: [lt.LeaseTable.PICK_MAX]acquire.RotorTree = undefined;
         var n: usize = 0;
@@ -1491,11 +1498,26 @@ pub const Plane = struct {
         };
         const c = acquire.mintChoice(in);
         acquire.countChoice(c, in.parent_leased_non_native);
-        return switch (c) {
+        const slot = switch (c) {
             .overflow => self.overflowRotor(rotor[0..n]),
             .none => null,
             else => c.slot(),
-        };
+        } orelse return null;
+        // The generation is read AFTER the choice (an overflow's grant
+        // landed inside it): the recheck compares the ino's slot to it.
+        return .{ .slot = slot, .g = self.table.view(slot).g };
+    }
+
+    /// The handover law (decision 0003 §BV; `mint_window_model.
+    /// MintRecheck`): an ino minted in `slot` under a decision that read
+    /// generation `g` is KEPT only if, after its `fetch_add`, the slot
+    /// still names this mount at `g` and is not releasing. The release's
+    /// gate store (seq_cst) precedes its cursor read; this load (seq_cst)
+    /// follows the mint's `fetch_add` (seq_cst) — one of the two sees the
+    /// other, so a kept ino is below the cursor the release carries.
+    pub fn mintStands(self: *Plane, slot: u16, g: u32) bool {
+        const v = self.table.view(slot);
+        return v.leasedBy(self.me) and v.state != .releasing and v.g == g;
     }
 
     /// The mint seam's hold (a test's): one shot, the slot published.

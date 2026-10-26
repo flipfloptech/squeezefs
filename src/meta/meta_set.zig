@@ -48,6 +48,7 @@ const backend = @import("backend.zig");
 const guard = @import("guard.zig");
 const routing = @import("routing.zig");
 const routing_slots = @import("sym.zig").slots;
+const SlotPlane = @import("sym/slots/plane.zig").Plane;
 const xv = @import("sym.zig").xv;
 const dlm = @import("dlm.zig");
 const router = @import("../data/router.zig");
@@ -688,15 +689,32 @@ pub const MetaSet = struct {
         var hb: [route_table.MAX_VOLUMES]?u32 = undefined;
         const v: route_table.VolumeIndex = if (home) parent_v else @intCast(router.pickMintVolume(parent_v, self.healths(hb[0..self.volumes.len]), &self.mint_rr));
         if (v != parent_v) rstats.routing_mint_volume_picks.inc();
-        const rr = self.slot_rr.fetchAdd(1, .monotonic);
-        const slot = self.volumes[v].slots.mintSlot(parent_slot, v == parent_v, gather, rr) orelse self.rotors[v].pickSlot();
-        self.volumes[v].slots.holdMintForTest(slot);
-        const be = self.volumeOfSlot(slot);
-        const local = be.allocateInoInSlot(slot) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.Io,
-        };
-        return route_table.effectiveIno(inos.makeGlobalIno(local, slot, inos.ROUTING_WIDTH));
+        const plane = self.volumes[v].slots;
+        var burns: u64 = 0;
+        while (true) {
+            const rr = self.slot_rr.fetchAdd(1, .monotonic);
+            const m = plane.mintSlot(parent_slot, v == parent_v, gather, rr) orelse SlotPlane.Mint{ .slot = self.rotors[v].pickSlot() };
+            plane.holdMintForTest(m.slot);
+            const be = self.volumeOfSlot(m.slot);
+            const local = be.allocateInoInSlot(m.slot) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Io,
+            };
+            // The handover law (decision 0003 §BV): the ino is kept only
+            // if its slot still stands at the decision's generation.
+            if (m.g) |g| if (!plane.mintStands(m.slot, g)) {
+                routing_slots.acquire.stats.mint_burns.inc();
+                burns += 1;
+                // Each burn met a lease that moved under its mint; the
+                // census then skips the releasing slot or reads its new
+                // generation, so a run of them is a lease storm: the op
+                // goes back to the move gate (re-issued, every home
+                // re-resolved) rather than spin here.
+                if (burns >= routing_slots.acquire.rotorCap(routing_slots.acquire.MINT_SPREAD)) return error.Deferred;
+                continue;
+            };
+            return route_table.effectiveIno(inos.makeGlobalIno(local, m.slot, inos.ROUTING_WIDTH));
+        }
     }
 
     /// The filesystem's directory-parent memo for the handover's subtree

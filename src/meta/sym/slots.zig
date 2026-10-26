@@ -92,6 +92,7 @@ test {
     _ = tails_spill;
     _ = moves;
     _ = @import("slots/move_epoch_model.zig");
+    _ = @import("slots/mint_window_model.zig");
 }
 
 test "the tree gauges fold a sorted census: p50/p99/max of inos and bytes; empty reads 0" {

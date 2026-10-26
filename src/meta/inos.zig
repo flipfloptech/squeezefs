@@ -62,7 +62,12 @@ pub const stats = struct {
 /// greater than that minted value, so a ledger record never under-declares
 /// an ino it covers; a mint that commits after the snapshot rides the
 /// journal and is recovered by the replay fold; a mint that never commits
-/// is burned. `.acq_rel` on the mint pairs with `snapshot`'s `.acquire`.
+/// is burned. Both are seq_cst: besides the publication edge, a slot
+/// cursor's mint and a handover's read of it are the two halves of the
+/// mint recheck's Dekker pair (decision 0003 §BV — the minter's
+/// `fetch_add` then its seq_cst load of the lease word; the release's
+/// seq_cst gate store then this `snapshot`), so one side always sees the
+/// other.
 pub const InoWatermark = struct {
     next: std.atomic.Value(u64),
 
@@ -73,7 +78,7 @@ pub const InoWatermark = struct {
 
     /// One `fetch_add`, no reuse, no free-on-failure.
     pub fn allocate(self: *InoWatermark) u64 {
-        return self.next.fetchAdd(1, .acq_rel);
+        return self.next.fetchAdd(1, .seq_cst);
     }
 
     /// Reserve `n` consecutive locals (an intent-supply grant): one
@@ -82,9 +87,9 @@ pub const InoWatermark = struct {
         return self.next.fetchAdd(n, .acq_rel);
     }
 
-    /// The value a ledger record carries.
+    /// The value a ledger record and a released lease carry.
     pub fn snapshot(self: *const InoWatermark) u64 {
-        return self.next.load(.acquire);
+        return self.next.load(.seq_cst);
     }
 
     /// Raise to at least `floor` (recovery, a dominating peer watermark).

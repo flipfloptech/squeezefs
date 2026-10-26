@@ -1147,7 +1147,9 @@ test "linux: A MINT RACING THE HANDOVER OF ITS SLOT keeps no ino the receiver mi
     sink.offered(sink.ctx, slot, lt.MANAGER);
     try testing.expect(bj.slots.table.view(slot).leasedBy(me));
     const b_global = inos.makeGlobalIno(try bj.allocateInoInSlot(slot), slot, inos.ROUTING_WIDTH);
-    // A's create resumes.
+    // A's create resumes: its ino is burned (the slot stands at another
+    // generation, B's) and the mint redone in a slot A leases.
+    const burns0 = acquire.stats.mint_burns.load();
     be0.slots.mint_seam.release.set(s.io());
     th.join();
     joined_minter = true;
@@ -1156,4 +1158,5 @@ test "linux: A MINT RACING THE HANDOVER OF ITS SLOT keeps no ino the receiver mi
     try testing.expect(a_global != b_global);
     // What A answers is a slot A still leases.
     try testing.expect(be0.slots.table.view(route_table.slotOf(a_global)).leasedBy(lt.MANAGER));
+    try testing.expect(acquire.stats.mint_burns.load() >= burns0 + 1);
 }

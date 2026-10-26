@@ -575,14 +575,17 @@ fn runBytesOf(ops: []const WriteOp) u64 {
 }
 
 /// The accounting of a window `window` whose survivors sum to
-/// `entry_bytes`, over its aligned (or verbatim) `ops`.
-fn accountWindow(geo: CoreGeometry, window: Reservation, entry_bytes: u64, header_ops_bytes: u64, ops: []const WriteOp) WriteAccounting {
+/// `entry_bytes`, over its aligned (or verbatim) `ops`. `pads_written`: a
+/// rolled-out member's range is a PAD the ops carry (a self-applied
+/// window), not an unwritten hole — counted with the holes on an unpadded
+/// ring too.
+fn accountWindow(geo: CoreGeometry, window: Reservation, entry_bytes: u64, header_ops_bytes: u64, ops: []const WriteOp, pads_written: bool) WriteAccounting {
     const padded = geo.grain > 1;
     const acct: WriteAccounting = .{
         .entry_bytes = entry_bytes,
         .pad_bytes = window.pad,
         .header_bytes = if (padded) headerBytesOfSpan(geo, window.start, window.paddedLen()) else header_ops_bytes,
-        .hole_bytes = if (padded) window.len - entry_bytes else 0,
+        .hole_bytes = if (padded or pads_written) window.len - entry_bytes else 0,
         .run_bytes = runBytesOf(ops),
     };
     std.debug.assert(acct.closes());
@@ -707,7 +710,7 @@ pub fn buildEntryWrite(gpa: Allocator, layout: RingLayout, geo: CoreGeometry, ap
     var header_ops_bytes = try entryOps(a, layout, geo, appender_id, res, records, &ops);
     header_ops_bytes += try padOps(a, layout, geo, appender_id, res.end(), res.pad, &ops);
     const aligned = try alignedOps(a, layout, geo, res.start, res.paddedEnd(), ops.items);
-    return .{ .arena = arena, .ops = aligned, .acct = accountWindow(geo, res, res.len, header_ops_bytes, aligned) };
+    return .{ .arena = arena, .ops = aligned, .acct = accountWindow(geo, res, res.len, header_ops_bytes, aligned, false) };
 }
 
 /// One surviving member of a conveyor batch: its exact-sized sub-reservation
@@ -744,7 +747,7 @@ pub fn buildWindowFromOps(arena_in: std.heap.ArenaAllocator, layout: RingLayout,
     for (member_ops) |m| ops.appendSliceAssumeCapacity(m);
     ops.appendSliceAssumeCapacity(pad_ops);
     const aligned = try alignedOps(a, layout, geo, window.start, window.paddedEnd(), ops.items);
-    return .{ .arena = arena, .ops = aligned, .acct = accountWindow(geo, window, entry_bytes, header_bytes, aligned) };
+    return .{ .arena = arena, .ops = aligned, .acct = accountWindow(geo, window, entry_bytes, header_bytes, aligned, true) };
 }
 
 /// A conveyor batch's write: N ordinary checksummed entries at back-to-back
@@ -770,7 +773,7 @@ pub fn buildBatchWrite(arena_in: std.heap.ArenaAllocator, layout: RingLayout, ge
     }
     header_ops_bytes += try padOps(a, layout, geo, appender_id, window.end(), window.pad, &ops);
     const aligned = try alignedOps(a, layout, geo, window.start, window.paddedEnd(), ops.items);
-    return .{ .arena = arena, .ops = aligned, .acct = accountWindow(geo, window, entry_bytes, header_ops_bytes, aligned) };
+    return .{ .arena = arena, .ops = aligned, .acct = accountWindow(geo, window, entry_bytes, header_ops_bytes, aligned, false) };
 }
 
 /// Land `ops` on an image of the extent whose first byte is device offset

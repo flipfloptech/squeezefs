@@ -56,9 +56,13 @@
 //!                                                 death replay's hole below it: the original
 //!                                                 defect); a member that reads its window's
 //!                                                 claim prefix alone (the earlier reservation's
-//!                                                 hole); the claim flag stored without the fence
-//!                                                 (store-buffered past the advance's flag load:
-//!                                                 the cursor stalls, the window is never marked)
+//!                                                 hole); a failing member answered before its PAD
+//!                                                 replaced its entry (the replay applies an op
+//!                                                 answered as failed); the entry claimed after the
+//!                                                 apply (an answer parks behind a sibling's apply:
+//!                                                 the convoy); the claim flag stored without the
+//!                                                 fence (store-buffered past the advance's flag
+//!                                                 load: the cursor stalls)
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -132,6 +136,11 @@ const Weakening = enum {
     /// The claim flag's store is not seq_cst: it sits in the store buffer
     /// while the cursor's advance loads the next flag (Dekker's shape).
     claim_flag_unfenced,
+    /// A member claims its tail slot after its apply, not at its turn.
+    claim_after_apply,
+    /// A member whose apply fails answers its error before its PAD
+    /// replaces its entry in the tail.
+    error_before_pad,
 };
 
 const Item = struct { id: u8, len: u8 };
@@ -1870,33 +1879,39 @@ fn TailSlots(comptime weakening: Weakening) type {
 
 /// Model 14 (§BX): an answer ahead of the landing lies inside the resident
 /// prefix — every reservation below it held by the journal tail or landed,
-/// so a death replay (which stops at the first hole) carries it. An earlier
-/// reservation P (another window, an SMO entry: here resident only when it
-/// LANDS) and a self-applied window W of two members M0 < M1. A member
-/// writes its tail slot, stores its claim flag (seq_cst: the fence step
-/// drains it), advances W's claim prefix (load it, load the flag at it, CAS
-/// it one on — the CAS that completes it marks W resident in the
-/// registry), takes its share of `pending`, then answers once
-/// `resident_upto` (the first open reservation not resident) is at W's
-/// start or past it AND its own prefix is claimed or W is resident (marked
-/// or landed); else it registers on the residency notify, re-checks and
-/// parks. Every advance, mark and landing notifies. The predicate's two
-/// loads are one step: both words only grow, so an earlier read of either
-/// is a stale-low read that only delays. The lane lands P, then W once both
-/// members took their share. Invariant (a death at ANY step): an answered
-/// member has P and every member at or below it resident. Final: both
-/// answered, W's prefix complete.
-fn ResidentAnswers(comptime weakening: Weakening) type {
+/// so a death replay (which stops at the first hole) carries it — and never
+/// waits for a sibling's apply. An earlier reservation P (an SMO entry:
+/// resident only when it LANDS) and a self-applied window W of two members
+/// M0 < M1. At its turn a member writes its entry's tail slot, stores its
+/// claim flag (seq_cst: the fence step drains it) and advances W's claim
+/// prefix (load it, load the flag at it, CAS it one on; the CAS that
+/// completes it marks W resident), then applies. A success takes its share
+/// of `pending`, then answers once `resident_upto` (the first open
+/// reservation not resident) is at W's start or past it AND its own prefix
+/// is claimed or W is resident — else it registers, re-checks and parks;
+/// every advance, mark and landing wakes it. A failure (`m0_fails`: M0's
+/// apply) claims a PAD over its range, releases its entry's slot, THEN
+/// answers its error. The predicate's two loads are one step: both words
+/// only grow, so a stale read of either only delays. The lane lands P, then
+/// W once both members took their share. Invariants (a death at ANY step):
+/// an answered success has P and every member at or below it in the tail;
+/// a member answered as failed has only its PAD there (with both slots
+/// written the replay may apply either); a parked answer never waits on a
+/// sibling inside its apply with nothing in the tail. Final: both answered,
+/// W's prefix complete.
+fn ResidentAnswers(comptime weakening: Weakening, comptime m0_fails: bool) type {
     return struct {
         const Self = @This();
         pub const thread_count: usize = 3;
         const lane_t = 2;
         const n: u8 = 2;
+        const late_claim = weakening == .claim_after_apply;
 
-        const Mpc = enum(u8) { slot, flag, fence, adv_load, adv_flag, adv_cas, mark, submit, check, register, recheck, parked, done };
+        const Slot = enum(u8) { none, entry, both, pad };
+        const Mpc = enum(u8) { claim, flag, fence, adv_load, adv_flag, adv_cas, mark, apply, pad_claim, pad_release, answer_err, submit, check, register, recheck, parked, done };
         const Lpc = enum(u8) { land_p, land_w, done };
 
-        slot: [2]bool = @splat(false),
+        slot: [2]Slot = @splat(.none),
         flag: [2]bool = @splat(false),
         /// The flag's store in its member's store buffer.
         pend: [2]bool = @splat(false),
@@ -1905,10 +1920,12 @@ fn ResidentAnswers(comptime weakening: Weakening) type {
         w_marked: bool = false,
         w_landed: bool = false,
         submitted: u8 = 0,
-        answered: [2]bool = @splat(false),
+        answered_ok: [2]bool = @splat(false),
+        answered_err: [2]bool = @splat(false),
+        failed: [2]bool = @splat(false),
         /// A notify since the member registered.
         woken: [2]bool = @splat(false),
-        mpc: [2]Mpc = @splat(.slot),
+        mpc: [2]Mpc = @splat(if (late_claim) .apply else .claim),
         /// The prefix value the member's advance loop holds.
         k: [2]u8 = @splat(0),
         lpc: Lpc = .land_p,
@@ -1962,10 +1979,17 @@ fn ResidentAnswers(comptime weakening: Weakening) type {
             };
         }
 
+        /// After the claim's advance: the apply (turn-time claim), or the
+        /// share of `pending` (the late claim applied first).
+        fn afterClaim(self: *const Self, i: usize) Mpc {
+            if (!late_claim) return .apply;
+            return if (self.failed[i]) .answer_err else .submit;
+        }
+
         fn stepMember(self: *Self, i: usize) void {
             switch (self.mpc[i]) {
-                .slot => {
-                    self.slot[i] = true;
+                .claim => {
+                    self.slot[i] = if (self.failed[i]) .pad else .entry;
                     self.mpc[i] = .flag;
                 },
                 .flag => {
@@ -1982,7 +2006,7 @@ fn ResidentAnswers(comptime weakening: Weakening) type {
                 },
                 .adv_flag => {
                     const k = self.k[i];
-                    self.mpc[i] = if (k < n and self.flagSeen(i, k)) .adv_cas else .submit;
+                    self.mpc[i] = if (k < n and self.flagSeen(i, k)) .adv_cas else self.afterClaim(i);
                 },
                 .adv_cas => {
                     self.drain(i);
@@ -1999,16 +2023,36 @@ fn ResidentAnswers(comptime weakening: Weakening) type {
                 .mark => {
                     self.w_marked = true;
                     self.notify();
-                    self.mpc[i] = .submit;
+                    self.mpc[i] = self.afterClaim(i);
+                },
+                .apply => {
+                    self.failed[i] = m0_fails and i == 0;
+                    if (late_claim) {
+                        self.mpc[i] = .claim;
+                    } else if (self.failed[i]) {
+                        self.mpc[i] = if (weakening == .error_before_pad) .answer_err else .pad_claim;
+                    } else self.mpc[i] = .submit;
+                },
+                .pad_claim => {
+                    self.slot[i] = .both;
+                    self.mpc[i] = .pad_release;
+                },
+                .pad_release => {
+                    self.slot[i] = .pad;
+                    self.mpc[i] = if (weakening == .error_before_pad) .submit else .answer_err;
+                },
+                .answer_err => {
+                    self.answered_err[i] = true;
+                    self.mpc[i] = if (weakening == .error_before_pad and !late_claim) .pad_claim else .submit;
                 },
                 .submit => {
                     self.drain(i);
                     self.submitted += 1;
-                    self.mpc[i] = .check;
+                    self.mpc[i] = if (self.answered_err[i]) .done else .check;
                 },
                 .check => {
                     if (self.mayAnswer(i)) {
-                        self.answered[i] = true;
+                        self.answered_ok[i] = true;
                         self.mpc[i] = .done;
                     } else self.mpc[i] = .register;
                 },
@@ -2018,7 +2062,7 @@ fn ResidentAnswers(comptime weakening: Weakening) type {
                 },
                 .recheck => {
                     if (self.mayAnswer(i)) {
-                        self.answered[i] = true;
+                        self.answered_ok[i] = true;
                         self.mpc[i] = .done;
                     } else self.mpc[i] = .parked;
                 },
@@ -2051,15 +2095,22 @@ fn ResidentAnswers(comptime weakening: Weakening) type {
         }
 
         pub fn invariant(self: *const Self) !void {
-            for (self.answered, 0..) |a, i| {
+            for (self.answered_ok, 0..) |a, i| {
                 if (!a) continue;
                 if (!self.p_landed) return error.AnsweredPastAHole;
-                for (self.slot[0 .. i + 1]) |held| if (!held) return error.AnsweredPastAHole;
+                for (self.slot[0 .. i + 1]) |held| if (held == .none) return error.AnsweredPastAHole;
+            }
+            for (self.answered_err, self.slot) |a, sl| {
+                if (a and (sl == .entry or sl == .both)) return error.FailedOpReplayable;
+            }
+            for (self.mpc, 0..) |pc, i| {
+                if (pc != .parked) continue;
+                for (0..i) |j| if (self.mpc[j] == .apply and self.slot[j] == .none) return error.ParkedBehindAnApply;
             }
         }
 
         pub fn final(self: *const Self) !void {
-            for (self.answered) |a| if (!a) return error.MemberNeverAnswered;
+            for (self.answered_ok, self.answered_err) |ok, err| if (!ok and !err) return error.MemberNeverAnswered;
             if (self.prefix != n) return error.ClaimPrefixStalled;
         }
     };
@@ -2147,15 +2198,18 @@ test "conveyor_tail_gate_never_meets_a_full_table (§BW): holds (register, read 
 }
 
 // The state counts the evidence note records.
-test "conveyor_resident_answers_lie_inside_the_resident_prefix (§BX): holds (slot, seq_cst claim flag, the prefix advanced by CAS and marked resident by the CAS that completes it, then the answer once the registry's resident prefix reaches the window and the member's own prefix is claimed, else register, re-check, park); answering on the member's own claim and reading the window's prefix alone each answer past a hole; the claim flag unfenced stalls the cursor" {
-    try explorer.expectHolds(ResidentAnswers(.none), .{});
-    try explorer.expectFails(ResidentAnswers(.answer_on_own_claim), .{}, error.InvariantViolated);
-    try explorer.expectFails(ResidentAnswers(.window_prefix_only), .{}, error.InvariantViolated);
-    try explorer.expectFails(ResidentAnswers(.claim_flag_unfenced), .{}, error.FinalViolated);
+test "conveyor_resident_answers_lie_inside_the_resident_prefix (§BX): holds with M0's apply succeeding and failing (the entry claimed at the turn — slot, seq_cst flag, the prefix advanced by CAS and marked resident by the CAS that completes it — then the apply; a success answers once the registry's resident prefix reaches the window and its own prefix is claimed, else register, re-check, park; a failure claims its PAD, releases its entry, then answers); answering on the member's own claim and reading the window's prefix alone answer past a hole; a failure answered before its PAD leaves its entry replayable; the claim after the apply parks an answer behind a sibling's apply; the claim flag unfenced stalls the cursor" {
+    try explorer.expectHolds(ResidentAnswers(.none, false), .{});
+    try explorer.expectHolds(ResidentAnswers(.none, true), .{});
+    try explorer.expectFails(ResidentAnswers(.answer_on_own_claim, false), .{}, error.InvariantViolated);
+    try explorer.expectFails(ResidentAnswers(.window_prefix_only, false), .{}, error.InvariantViolated);
+    try explorer.expectFails(ResidentAnswers(.error_before_pad, true), .{}, error.InvariantViolated);
+    try explorer.expectFails(ResidentAnswers(.claim_after_apply, false), .{}, error.InvariantViolated);
+    try explorer.expectFails(ResidentAnswers(.claim_flag_unfenced, false), .{}, error.FinalViolated);
 }
 
 test "conveyor models: exhaustive within the explorer's default limits" {
-    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none), LeafwiseDestroy(.none), TailSlots(.none), ResidentAnswers(.none) }) |Model| {
+    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none), LeafwiseDestroy(.none), TailSlots(.none), ResidentAnswers(.none, false), ResidentAnswers(.none, true) }) |Model| {
         var report: explorer.Report = undefined;
         try explorer.explore(Model, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

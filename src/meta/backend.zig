@@ -4501,8 +4501,9 @@ fn judgeDeath(v: *TestVol, be: *KvBackend) !journal_tail.linux_tail.Judged {
 
 /// The answered-before-resident shape on either arm: A (window W1) held
 /// by `arm`'s seam before anything of it reaches the tail, B (W2, a later
-/// window) committed beside it. B must not be answered while A's range is
-/// a hole the death replay would stop at; released, both answer and the
+/// window) committed beside it. B is never answered while A's range is a
+/// hole the death replay would stop at: its parked answer claims A's entry
+/// (image) for A's held owner, then answers; released, A answers and the
 /// replay keeps both.
 fn residentAnswerRow(v: *TestVol, be: *KvBackend, comptime arm: enum { self, venue }) !void {
     const Committer = struct {
@@ -4551,6 +4552,7 @@ fn residentAnswerRow(v: *TestVol, be: *KvBackend, comptime arm: enum { self, ven
     held.store(0, .release);
     const cs = be.conveyorStats();
     const waits0 = cs.resident_waits.load();
+    const helps0 = cs.resident_helps.load();
     var ino_b: u64 = 0;
     var out_b: ?anyerror = error.TestNotRun;
     var done_b = std.atomic.Value(u32).init(0);
@@ -4563,12 +4565,18 @@ fn residentAnswerRow(v: *TestVol, be: *KvBackend, comptime arm: enum { self, ven
         released = true;
     };
     while (done_b.load(.acquire) == 0 and cs.resident_waits.load() == waits0) std.Thread.yield() catch {};
-    if (done_b.load(.acquire) != 0) {
-        // B was answered past A's hole: the death replay would lose it.
+    // B is answered only once A is in the tail — A's owner held, B's
+    // parked answer claims A's entry (its image) itself (§BX.7's help) —
+    // so a death now replays both.
+    const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (done_b.load(.acquire) == 0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 1), done_b.load(.acquire));
+    try testing.expectEqual(@as(?anyerror, null), out_b);
+    try testing.expect(cs.resident_helps.load() > helps0);
+    {
         const j = try judgeDeath(v, be);
         try testing.expectEqual(@as(u32, 0), j.past_hole);
     }
-    try testing.expectEqual(@as(u32, 0), done_b.load(.acquire));
     try testing.expectEqual(@as(u32, 0), done_a.load(.acquire));
     conveyor.test_seams.hold_member_ino.store(0, .release);
     conveyor.test_seams.hold_next_apply.store(0, .release);
@@ -4585,7 +4593,7 @@ fn residentAnswerRow(v: *TestVol, be: *KvBackend, comptime arm: enum { self, ven
     try testing.expect(try present(be, ino_b));
 }
 
-test "§BX an answer at the apply waits until the journal tail holds every reservation below its window (self-apply): A's member held at its turn — nothing of A in the tail or RAM — and B, a later window, is not answered past A's hole (the death replay keeps every answered op); released, both are answered and the replay keeps both" {
+test "§BX an answer at the apply waits until the journal tail holds every reservation below its window (self-apply): A's member held at its turn — nothing of A in the tail or RAM — and B, a later window, is answered only once A's entry is in the tail: B's parked answer claims it for A (§BX.7's help), so a death then replays both; released, A is answered too and the replay keeps both" {
     const v = try TestVol.create(testing.allocator, "resident-self", "600000");
     defer v.destroy();
     try v.env.put("SQUEEZEFS_META_APPLY", "self");
@@ -4594,7 +4602,7 @@ test "§BX an answer at the apply waits until the journal tail holds every reser
     try residentAnswerRow(v, be, .self);
 }
 
-test "§BX the same law on the venue arm: W1's applier held before its apply, W2 applied by another applier is not answered past W1's hole; released, both are answered and the replay keeps both" {
+test "§BX the same law on the venue arm: W1's applier held before its window's start, W2 applied by another applier is answered only once W1's image is in the tail (W2's parked answer claims it); released, both are answered and the replay keeps both" {
     const v = try TestVol.create(testing.allocator, "resident-venue", "600000");
     defer v.destroy();
     try v.env.put("SQUEEZEFS_META_APPLY", "venue");

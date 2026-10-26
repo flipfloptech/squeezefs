@@ -761,6 +761,11 @@ pub const Stats = struct {
     /// windows whose members applied themselves (§BC), and the members.
     self_handoffs: counters.ShardedCounter = .{},
     self_applies: counters.ShardedCounter = .{},
+    /// `meta_conveyor_leafwise_applies` / `_leaves`: self-applied members
+    /// that took their leaves one at a time (§BV: a corpse's destroy), and
+    /// the leaves they took (`leaves ÷ applies` = a destroy's spread).
+    leafwise_applies: counters.ShardedCounter = .{},
+    leafwise_leaves: counters.ShardedCounter = .{},
     /// `meta_conveyor_heap_admit_fast` / `_locked`: heap admissions by
     /// the lock-free fast path (§BD) against the locked law.
     heap_admit_fast: counters.ShardedCounter = .{},
@@ -821,6 +826,17 @@ pub const Stats = struct {
     /// volume with room, §BD) and the serializer's cost (§BC).
     leaf_takes_admission: counters.ShardedLatencyHistogram = .{},
     leaf_takes_apply: counters.ShardedLatencyHistogram = .{},
+    /// `lock_phase_ns.leafwise_leaf_hold`: one leaf a leafwise member held
+    /// (§BV) — the most a committer on that leaf waits behind a destroy.
+    leafwise_leaf_hold: counters.ShardedLatencyHistogram = .{},
+    /// `meta_leafwise_apply`: a leafwise member's whole apply, its first
+    /// take to its last release (its waits included, no leaf held across
+    /// one).
+    leafwise_apply: counters.ShardedLatencyHistogram = .{},
+    /// `meta_self_window_span`: a self-applied window's turns to its submit
+    /// (§BC) — how long its slowest member keeps the reservation, and so
+    /// the completed prefix every later window's verdict waits on, open.
+    self_window_span: counters.ShardedLatencyHistogram = .{},
 
     pub fn writeJson(self: *const Stats, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("{{\"meta_commit_group_size\":{{", .{});
@@ -861,7 +877,7 @@ pub const Stats = struct {
             self.hold_bound_ns.load(),
             self.holds_pacing.load(),
         });
-        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
+        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
         try w.print(",\"meta_conveyor_window_gate_parks\":{d},\"meta_conveyor_room_parks\":{d},\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.window_gate_parks.load(),
             self.commit_room_parks.load(),
@@ -900,6 +916,12 @@ pub const Stats = struct {
         try self.leaf_takes_admission.snapshot().writeJson(w);
         try w.writeAll(",\"leaf_takes_apply\":");
         try self.leaf_takes_apply.snapshot().writeJson(w);
+        try w.writeAll(",\"leafwise_leaf_hold\":");
+        try self.leafwise_leaf_hold.snapshot().writeJson(w);
+        try w.writeAll(",\"meta_leafwise_apply\":");
+        try self.leafwise_apply.snapshot().writeJson(w);
+        try w.writeAll(",\"meta_self_window_span\":");
+        try self.self_window_span.snapshot().writeJson(w);
         try w.writeAll("}");
     }
 };
@@ -1158,6 +1180,8 @@ pub const Window = struct {
     self_applied: bool = false,
     parts: []Part = &.{},
     pending: std.atomic.Value(u32) = .init(0),
+    /// The pass handed the members their turns (`meta_self_window_span`).
+    t_turns_ns: u64 = 0,
 
     /// One self-applying member's share of the window (§BC): its own
     /// arena (the members apply concurrently), its sub-range and seq, its
@@ -2637,6 +2661,7 @@ pub const Conveyor = struct {
             seq += m.q.len;
         }
         w.self_applied = true;
+        w.t_turns_ns = clock.monotonicNs();
         w.pending.store(@intCast(n), .release);
         self.stats.self_handoffs.inc();
         // The turns fan out as a binary tree: the pass wakes member 0, each
@@ -2681,52 +2706,10 @@ pub const Conveyor = struct {
         const len = m.q.len;
         const t_apply = clock.monotonicNs();
         self.stats.self_applies.inc();
-        var attempt: u32 = 0;
-        while (failed[0] == null) : (attempt += 1) {
-            if (attempt >= COMMIT_RETRY_BUDGET) {
-                log.err("meta volume {s}: commit retry budget exhausted (revalidation never passed — SMO protocol bug)", .{self.deps.volume});
-                failed[0] = error.RetryBudgetExhausted;
-                break;
-            }
-            var r = self.resolve(a, members, .apply) catch |e| {
-                failed[0] = e;
-                break;
-            };
-            const dirties = a.alloc(*NodeDirty, r.lock_set.len) catch {
-                r.releaseRefs();
-                failed[0] = error.OutOfMemory;
-                break;
-            };
-            const t_leaf = clock.monotonicNs();
-            self.lockAll(r.lock_set, dirties, .apply);
-            if (stale(members, &r)) {
-                self.unlockAll(r.lock_set);
-                self.stats.leaf_lock_hold.record(clock.monotonicNs() -| t_leaf);
-                r.releaseRefs();
-                tree.stats.meta_kv_commit_smo_retries.inc();
-                continue;
-            }
-            p.undo = self.captureUndo(a, members, &r) catch |e| {
-                self.unlockAll(r.lock_set);
-                r.releaseRefs();
-                failed[0] = e;
-                break;
-            };
-            self.applyMembers(members, &r, dirties, p.start, p.seq, failed);
-            var threshold_crossed = false;
-            for (r.lock_set, dirties) |n, d| {
-                if (d.overlayBytes() >= self.deps.cache.cfg.writeback_delta_bytes) {
-                    if (self.treeOf(n)) |t| {
-                        t.enqueueMaintenance(n.addr);
-                        threshold_crossed = true;
-                    }
-                }
-            }
-            self.unlockAll(r.lock_set);
-            self.stats.leaf_lock_hold.record(clock.monotonicNs() -| t_leaf);
-            r.releaseRefs();
-            if (threshold_crossed) self.deps.checkpoint.kickThreshold(self.deps.checkpoint.ctx);
-            break;
+        if (m.q.leafwise) {
+            failed[0] = self.applyLeafwise(a, m, p);
+        } else {
+            self.applyUnion(a, members, p, failed);
         }
         self.stats.pass_leaf_locks.record(clock.monotonicNs() -| t_apply);
         // A12, the member's own: its entry, or a PAD over its range.
@@ -2781,6 +2764,215 @@ pub const Conveyor = struct {
         return done.landing.recvUncancelable(self.deps.io) catch error.Corrupt;
     }
 
+    /// §BC, a member's apply under ITS leaf set: every leaf locked
+    /// ascending and held across the whole apply (a name's change is seen
+    /// whole — the dentry and the inode together).
+    fn applyUnion(self: *Conveyor, a: Allocator, members: []Queued, p: *Window.Part, failed: []?Error) void {
+        var attempt: u32 = 0;
+        while (failed[0] == null) : (attempt += 1) {
+            if (attempt >= COMMIT_RETRY_BUDGET) {
+                log.err("meta volume {s}: commit retry budget exhausted (revalidation never passed — SMO protocol bug)", .{self.deps.volume});
+                failed[0] = error.RetryBudgetExhausted;
+                return;
+            }
+            var r = self.resolve(a, members, .apply) catch |e| {
+                failed[0] = e;
+                return;
+            };
+            const dirties = a.alloc(*NodeDirty, r.lock_set.len) catch {
+                r.releaseRefs();
+                failed[0] = error.OutOfMemory;
+                return;
+            };
+            const t_leaf = clock.monotonicNs();
+            self.lockAll(r.lock_set, dirties, .apply);
+            if (stale(members, &r)) {
+                self.unlockAll(r.lock_set);
+                self.stats.leaf_lock_hold.record(clock.monotonicNs() -| t_leaf);
+                r.releaseRefs();
+                tree.stats.meta_kv_commit_smo_retries.inc();
+                continue;
+            }
+            p.undo = self.captureUndo(a, members, &r) catch |e| {
+                self.unlockAll(r.lock_set);
+                r.releaseRefs();
+                failed[0] = e;
+                return;
+            };
+            self.applyMembers(members, &r, dirties, p.start, p.seq, failed);
+            var threshold_crossed = false;
+            for (r.lock_set, dirties) |n, d| {
+                if (d.overlayBytes() >= self.deps.cache.cfg.writeback_delta_bytes) {
+                    if (self.treeOf(n)) |t| {
+                        t.enqueueMaintenance(n.addr);
+                        threshold_crossed = true;
+                    }
+                }
+            }
+            self.unlockAll(r.lock_set);
+            self.stats.leaf_lock_hold.record(clock.monotonicNs() -| t_leaf);
+            r.releaseRefs();
+            if (threshold_crossed) self.deps.checkpoint.kickThreshold(self.deps.checkpoint.ctx);
+            return;
+        }
+    }
+
+    /// §BV, a LEAFWISE member's apply (`QueuedTx.leafwise`: a corpse's
+    /// destroy — no name reaches its objects, no kernel holds them, so no
+    /// reader can tell this apply from an atomic one): ONE leaf at a time,
+    /// ascending — lock it, revalidate it against the records resolved to
+    /// it (a moved leaf re-resolves those alone), their pre-images, apply,
+    /// the threshold, unlock — then the next. THE LAW: it never waits for a
+    /// leaf while holding one, so a committer on any of its leaves waits
+    /// behind it for at most that leaf's share of its records, never for
+    /// its acquisition of the others (the union hold put every unlinker on
+    /// a 64-corpse destroy's leaves behind its whole acquisition, and its
+    /// window's reservation — the completed prefix — open as long). Its
+    /// entry is still ONE entry: replay is all or nothing. A failure after
+    /// a leaf was released (or the poison seam) rolls the member's applied
+    /// records back seq-conditionally (`rollbackFailedTx`: a freeze may
+    /// have taken one into the base). Answers the member's failure.
+    fn applyLeafwise(self: *Conveyor, a: Allocator, m: *const Queued, p: *Window.Part) ?Error {
+        const gpa = self.deps.gpa;
+        const io = self.deps.io;
+        const recs = m.q.recs;
+        const span = SeqSpan.stamped(p.seq, m.q.len);
+        self.stats.leafwise_applies.inc();
+        const t0 = clock.monotonicNs();
+        defer self.stats.leafwise_apply.record(clock.monotonicNs() -| t0);
+        // A retained leaf per record, seeded by the committer's admission.
+        const leaves = a.alloc(*CachedNode, recs.len) catch return error.OutOfMemory;
+        var resolved: usize = 0;
+        defer for (leaves[0..resolved]) |l| l.release();
+        for (recs, 0..) |r, ri| {
+            leaves[ri] = blk: {
+                if (ri < m.seeds.len) {
+                    const seed = m.seeds[ri];
+                    if (!seed.state.isSuperseded() and !key.lessThan(r.key, seed.min_key) and !key.lessThan(seed.max_key, r.key)) {
+                        self.stats.resolve_seeded.inc();
+                        break :blk seed.retain();
+                    }
+                }
+                self.stats.resolve_descended.inc();
+                const t = self.treeFor(r.tree_id, r.key) orelse return error.Corrupt;
+                break :blk t.resolveLeaf(r.key) catch |e| return mapTreeError(e);
+            };
+            resolved += 1;
+        }
+        // The records still to apply, by leaf address (record order kept
+        // within a leaf), re-sorted only after a re-resolve.
+        const order = a.alloc(u32, recs.len) catch return error.OutOfMemory;
+        for (order, 0..) |*o, i| o.* = @intCast(i);
+        const ByLeaf = struct {
+            leaves: []*CachedNode,
+            fn lessThan(ctx: @This(), x: u32, y: u32) bool {
+                const ax = ctx.leaves[x].addr;
+                const ay = ctx.leaves[y].addr;
+                return ax < ay or (ax == ay and x < y);
+            }
+        };
+        std.mem.sort(u32, order, ByLeaf{ .leaves = leaves }, ByLeaf.lessThan);
+        var rest: []u32 = order;
+        var undo: std.ArrayList(tx.UndoKey) = .empty;
+        var group: std.ArrayList(OwnedRec) = .empty;
+        defer group.deinit(gpa);
+        var attempt: u32 = 0;
+        const err: ?Error = while (rest.len != 0) {
+            const leaf = leaves[rest[0]];
+            var end: usize = 1;
+            while (end < rest.len and leaves[rest[end]].addr == leaf.addr) end += 1;
+            const run = rest[0..end];
+            const t_take = clock.monotonicNs();
+            const dirty = leaf.lockWrite(io);
+            const t_held = clock.monotonicNs();
+            self.stats.leaf_takes_apply.record(t_held -| t_take);
+            var moved = leaf.state.isSuperseded();
+            for (run) |i| moved = moved or key.lessThan(recs[i].key, leaf.min_key) or key.lessThan(leaf.max_key, recs[i].key);
+            if (moved) {
+                leaf.unlockWrite(io);
+                self.stats.leafwise_leaf_hold.record(clock.monotonicNs() -| t_held);
+                tree.stats.meta_kv_commit_smo_retries.inc();
+                attempt += 1;
+                if (attempt >= COMMIT_RETRY_BUDGET) {
+                    log.err("meta volume {s}: commit retry budget exhausted (revalidation never passed — SMO protocol bug)", .{self.deps.volume});
+                    break error.RetryBudgetExhausted;
+                }
+                const fresh_err: ?Error = for (run) |i| {
+                    const t = self.treeFor(recs[i].tree_id, recs[i].key) orelse break error.Corrupt;
+                    const fresh = t.resolveLeaf(recs[i].key) catch |e| break mapTreeError(e);
+                    leaves[i].release();
+                    leaves[i] = fresh;
+                } else null;
+                if (fresh_err) |e| break e;
+                std.mem.sort(u32, rest, ByLeaf{ .leaves = leaves }, ByLeaf.lessThan);
+                continue;
+            }
+            const applied: ?Error = blk: {
+                self.captureUndoRun(a, &undo, recs, run, leaf) catch |e| break :blk e;
+                group.clearRetainingCapacity();
+                for (run) |i| {
+                    const r = recs[i];
+                    const owned = OwnedRec.fromRecordRef(gpa, .{ .key = r.key, .seq = r.seq, .kind = r.kind, .value = r.value }) catch break :blk error.OutOfMemory;
+                    group.append(gpa, owned) catch {
+                        var o = owned;
+                        o.deinit();
+                        break :blk error.OutOfMemory;
+                    };
+                } else {
+                    // The elements are the apply's on every outcome.
+                    defer group.clearRetainingCapacity();
+                    leaf.applyLocked(dirty, group.items, p.start) catch |e| break :blk switch (e) {
+                        error.Superseded => error.Corrupt,
+                        error.ReaderMayNotMutate, error.LeafLeaseRefused => error.PartitionRefused,
+                        error.OutOfMemory => error.OutOfMemory,
+                    };
+                }
+                break :blk null;
+            };
+            // A run never handed to the apply: its built elements are ours.
+            for (group.items) |*o| o.deinit();
+            group.clearRetainingCapacity();
+            const threshold = applied == null and dirty.overlayBytes() >= self.deps.cache.cfg.writeback_delta_bytes;
+            if (threshold) if (self.treeOf(leaf)) |t| t.enqueueMaintenance(leaf.addr);
+            leaf.unlockWrite(io);
+            self.stats.leafwise_leaf_hold.record(clock.monotonicNs() -| t_held);
+            if (applied) |e| break e;
+            self.stats.leafwise_leaves.inc();
+            if (threshold) self.deps.checkpoint.kickThreshold(self.deps.checkpoint.ctx);
+            rest = rest[end..];
+        } else null;
+        p.undo = undo.items;
+        const poison = test_seams.poison_apply_ino.load(.monotonic);
+        const outcome: ?Error = if (err) |e| e else if (poison != 0 and namesInode(recs, poison)) error.Corrupt else null;
+        if (outcome != null and undo.items.len != 0) self.rollbackFailedTx(span, undo.items);
+        return outcome;
+    }
+
+    /// A7 for one leaf's run of a leafwise member, under that leaf's lock:
+    /// one pre-image per distinct `(tree, key)` across the member, first
+    /// touch wins (`captureUndo`'s law).
+    fn captureUndoRun(self: *Conveyor, a: Allocator, undo: *std.ArrayList(tx.UndoKey), recs: []const tx.Rec, run: []const u32, leaf: *CachedNode) Error!void {
+        const snap = leaf.snapshotLoad();
+        defer snap.release();
+        recs: for (run) |i| {
+            const rec = recs[i];
+            for (undo.items) |u| {
+                if (u.tree_id == rec.tree_id and std.mem.eql(u8, u.key, rec.key)) continue :recs;
+            }
+            var l = snap.value.lookup(self.deps.gpa, rec.key) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Corrupt,
+            };
+            defer l.deinit();
+            const pre: tx.PreImage = switch (l) {
+                .live => |lv| .{ .live = try a.dupe(u8, lv.value) },
+                .tombstone => .tombstone,
+                .absent => .absent,
+            };
+            try undo.append(a, .{ .tree_id = rec.tree_id, .key = try a.dupe(u8, rec.key), .pre = pre });
+        }
+    }
+
     /// §BC: every member applied (or rolled out) — the window's image from
     /// their ops, the handoff to the lane. Runs on the last member's thread.
     fn submitSelfApplied(self: *Conveyor, w: *Window) void {
@@ -2814,6 +3006,7 @@ pub const Conveyor = struct {
             break :blk journal.buildWindowFromOps(gpa, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, w.res, member_ops, entry_bytes, header_bytes) catch null;
         } else |_| null;
         w.t_handoff_ns = clock.monotonicNs();
+        self.stats.self_window_span.record(w.t_handoff_ns -| w.t_turns_ns);
         if (w.image == null) {
             self.abandonSelfApplied(w, error.OutOfMemory);
             return;
@@ -5334,13 +5527,15 @@ test "the stats JSON names every conveyor face" {
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w);
     const out = w.buffered();
-    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns" }) |name| {
+    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves" }) |name| {
         try testing.expect(std.mem.indexOf(u8, out, name) != null);
     }
-    var pb: [4096]u8 = undefined;
+    var pb: [8192]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&pb);
     try s.writePhasesJson(&pw);
-    try testing.expect(std.mem.indexOf(u8, pw.buffered(), "meta_pass_hold") != null);
+    for ([_][]const u8{ "meta_pass_hold", "leafwise_leaf_hold", "meta_leafwise_apply", "meta_self_window_span" }) |name| {
+        try testing.expect(std.mem.indexOf(u8, pw.buffered(), name) != null);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -4242,10 +4242,10 @@ test "§BC self-apply: a 4-thread storm of this mount's kernel's creates — eve
     }
 }
 
-/// Padded kernel creates until the native tree's first and last created
-/// inodes lie on two leaves (a 64 KiB node splits at the writeback); the
-/// inos in creation order.
-fn createAcrossTwoLeaves(be: *KvBackend, made: *std.ArrayList(u64)) !void {
+/// Padded kernel creates until there are at least `min` and the native
+/// tree's first and last created inodes lie on two leaves (a 64 KiB node
+/// splits at the writeback); the inos in creation order.
+fn createAcrossTwoLeaves(be: *KvBackend, made: *std.ArrayList(u64), min: usize) !void {
     const native = be.treeOf(.native).?;
     var round: usize = 0;
     while (round < 64) : (round += 1) {
@@ -4262,7 +4262,7 @@ fn createAcrossTwoLeaves(be: *KvBackend, made: *std.ArrayList(u64)) !void {
         defer a.release();
         const b = try native.resolveLeaf(&key.inodeKey(made.items[made.items.len - 1]));
         defer b.release();
-        if (a.addr != b.addr) return;
+        if (a.addr != b.addr and made.items.len >= min) return;
     }
     return error.TestNeverSplit;
 }
@@ -4288,7 +4288,7 @@ test "§BV a corpse's destroy under self-apply holds ONE leaf at a time: with th
     {
         const be = try v.open();
         defer be.close();
-        try createAcrossTwoLeaves(be, &made);
+        try createAcrossTwoLeaves(be, &made, 0);
         const io = v.io();
         const native = be.treeOf(.native).?;
         const leaf_a = try native.resolveLeaf(&key.inodeKey(made.items[0]));
@@ -4308,6 +4308,8 @@ test "§BV a corpse's destroy under self-apply holds ONE leaf at a time: with th
         try stageCorpseDestroy(be, t, held_ino);
         const cs = be.conveyorStats();
         const applies0 = cs.self_applies.load();
+        const leafwise0 = cs.leafwise_applies.load();
+        const leaves0 = cs.leafwise_leaves.load();
         _ = held.lockWrite(io);
         var held_locked = true;
         defer if (held_locked) held.unlockWrite(io);
@@ -4343,6 +4345,9 @@ test "§BV a corpse's destroy under self-apply holds ONE leaf at a time: with th
         try testing.expectEqual(@as(?anyerror, null), result);
         try testing.expect(!try present(be, first_ino));
         try testing.expect(!try present(be, held_ino));
+        try testing.expectEqual(applies0 + 1, cs.self_applies.load());
+        try testing.expectEqual(leafwise0 + 1, cs.leafwise_applies.load());
+        try testing.expectEqual(leaves0 + 2, cs.leafwise_leaves.load());
         try be.fsync();
     }
     {
@@ -4352,6 +4357,83 @@ test "§BV a corpse's destroy under self-apply holds ONE leaf at a time: with th
         try testing.expect(!try present(be, first_ino));
         try testing.expect(!try present(be, held_ino));
         for (made.items) |ino| if (ino != first_ino and ino != held_ino) try testing.expect(try present(be, ino));
+    }
+}
+
+test "§BV a self-apply storm with leafwise destroys: 4 threads of kernel creates beside a destroyer of corpses spread over the native tree's leaves, cadence checkpoints running — every member applied itself (self_applies ≡ commits ≡ acks at the apply), every destroy leafwise, a poisoned destroy rolls out ALONE across its leaves (its corpses stand, one rollback, nothing else rolled back), fsync drains the tail, the reopen replays every ack" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "leafwise-storm", "600000");
+    defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_APPLY", "self");
+    const threads = 4;
+    const per_thread = 50;
+    const batches = 8;
+    const per_batch = 8;
+    const poisoned = 3;
+    var acked: [threads][per_thread]u64 = undefined;
+    var pool: std.ArrayList(u64) = .empty;
+    defer pool.deinit(gpa);
+    var doomed: [batches][per_batch]u64 = undefined;
+    {
+        const be = try v.open();
+        defer be.close();
+        try createAcrossTwoLeaves(be, &pool, batches * per_batch);
+        // Each batch strides the whole pool: its corpses lie on every leaf.
+        const stride = pool.items.len / per_batch;
+        for (&doomed, 0..) |*b, bi| for (b, 0..) |*ino, k| {
+            ino.* = pool.items[bi + k * stride];
+        };
+        const Storm = struct {
+            fn create(b: *KvBackend, lane_id: usize, out: *[per_thread]u64) void {
+                for (out, 0..) |*ino, i| {
+                    var nb: [24]u8 = undefined;
+                    ino.* = commitCreateKernel(b, std.fmt.bufPrint(&nb, "st-{d}-{d}", .{ lane_id, i }) catch unreachable) catch unreachable;
+                }
+            }
+            fn destroy(b: *KvBackend, sets: *const [batches][per_batch]u64) void {
+                for (sets, 0..) |set, bi| {
+                    const t = b.begin(@src()) catch unreachable;
+                    t.kernel_origin = true;
+                    t.leafwise = true;
+                    for (set) |ino| stageCorpseDestroy(b, t, ino) catch unreachable;
+                    if (bi == poisoned) conveyor.test_seams.poison_apply_ino.store(set[0], .monotonic);
+                    const r = b.commit(t);
+                    if (bi == poisoned) {
+                        conveyor.test_seams.poison_apply_ino.store(0, .monotonic);
+                        if (r) |_| unreachable else |e| std.debug.assert(e == error.Corrupt);
+                    } else r catch unreachable;
+                }
+            }
+        };
+        const cs = be.conveyorStats();
+        const applies0 = cs.self_applies.load();
+        const early0 = cs.acks_at_apply.load();
+        const rollbacks0 = cs.rollbacks.load();
+        const leafwise0 = cs.leafwise_applies.load();
+        const leaves0 = cs.leafwise_leaves.load();
+        var handles: [threads + 1]std.Thread = undefined;
+        for (handles[0..threads], 0..) |*h, i| h.* = try std.Thread.spawn(.{}, Storm.create, .{ be, i, &acked[i] });
+        handles[threads] = try std.Thread.spawn(.{}, Storm.destroy, .{ be, &doomed });
+        for (handles) |h| h.join();
+        for (acked) |lane_acks| for (lane_acks) |ino| try testing.expect(try present(be, ino));
+        for (doomed, 0..) |set, bi| for (set) |ino| try testing.expectEqual(bi == poisoned, try present(be, ino));
+        const commits = threads * per_thread + batches;
+        try testing.expectEqual(@as(u64, commits), cs.self_applies.load() - applies0);
+        try testing.expectEqual(@as(u64, commits), cs.acks_at_apply.load() - early0);
+        try testing.expectEqual(@as(u64, batches), cs.leafwise_applies.load() - leafwise0);
+        try testing.expect(cs.leafwise_leaves.load() - leaves0 >= batches);
+        try testing.expectEqual(rollbacks0 + 1, cs.rollbacks.load());
+        try testing.expectEqual(@as(u64, 0), cs.tail_slot_misses.load());
+        try testing.expectEqual(@as(u64, 0), cs.windows_inflight.load());
+        try be.fsync();
+        try testing.expectEqual(@as(u32, 0), be.tail.?.image.writtenCount());
+    }
+    {
+        const be = try v.open();
+        defer be.close();
+        try testing.expect(be.replayStats().clean_unmount);
+        for (acked) |lane_acks| for (lane_acks) |ino| try testing.expect(try present(be, ino));
+        for (doomed, 0..) |set, bi| for (set) |ino| try testing.expectEqual(bi == poisoned, try present(be, ino));
     }
 }
 

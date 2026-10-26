@@ -43,6 +43,10 @@
 //!                                                 inbound windows BEFORE it takes the inbox (an
 //!                                                 fsync admitted without its submitter's window
 //!                                                 in its cover)
+//!  12 leafwise_destroy_never_waits_holding_a_leaf  — the destroy takes its leaf set as a union
+//!                                                 (every leaf locked ascending, held across the
+//!                                                 apply): a committer on its first leaf waits
+//!                                                 while the destroy waits for its second
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -98,6 +102,9 @@ const Weakening = enum {
     /// The lane's scan drains the inbound windows BEFORE it takes the
     /// fsync inbox.
     fsyncs_after_inbound_scan,
+    /// A leafwise member (a corpse's destroy) locks its whole leaf set
+    /// ascending and holds it across its apply, as a name's change does.
+    destroy_union_hold,
 };
 
 const Item = struct { id: u8, len: u8 };
@@ -1526,6 +1533,155 @@ fn FsyncInbox(comptime weakening: Weakening) type {
     };
 }
 
+/// Model 12 (§BV): a corpse's destroy under self-apply — two leaves L0 < L1,
+/// a record on each — beside two committers, C0 on L0 and C1 on L1, each
+/// its own apply under its one leaf. A leaf is a lock word (its owner, or
+/// free); a take of a held leaf is a no-op step (the explorer prunes it).
+/// Shipped: the destroy takes L0, applies, releases, THEN takes L1 — it
+/// never waits for a leaf while holding one, so a committer it blocks
+/// waits for one apply. The invariant: no committer waits for a leaf the
+/// destroy holds while the destroy itself waits (the chain that put every
+/// unlinker behind a destroy's whole acquisition). The final: every record
+/// applied once.
+fn LeafwiseDestroy(comptime weakening: Weakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 3;
+        const destroy_t = 0;
+        const c0_t = 1;
+        const c1_t = 2;
+        const free: u8 = 0xff;
+
+        const Dpc = enum(u8) { take0, apply0, give0, take1, apply1, give1, done };
+        const Cpc = enum(u8) { take, apply, give, done };
+
+        owner: [2]u8 = .{ free, free },
+        dpc: Dpc = .take0,
+        cpc: [2]Cpc = .{ .take, .take },
+        applied: [4]u8 = .{ 0, 0, 0, 0 },
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                destroy_t => self.dpc == .done,
+                c0_t, c1_t => self.cpc[t - 1] == .done,
+                else => unreachable,
+            };
+        }
+
+        fn take(self: *Self, leaf: usize, who: u8) bool {
+            if (self.owner[leaf] != free) return false;
+            self.owner[leaf] = who;
+            return true;
+        }
+
+        fn stepDestroy(self: *Self) void {
+            switch (weakening) {
+                .destroy_union_hold => switch (self.dpc) {
+                    .take0 => if (self.take(0, destroy_t)) {
+                        self.dpc = .take1;
+                    },
+                    .take1 => if (self.take(1, destroy_t)) {
+                        self.dpc = .apply0;
+                    },
+                    .apply0 => {
+                        self.applied[0] += 1;
+                        self.dpc = .apply1;
+                    },
+                    .apply1 => {
+                        self.applied[1] += 1;
+                        self.dpc = .give0;
+                    },
+                    .give0 => {
+                        self.owner[0] = free;
+                        self.dpc = .give1;
+                    },
+                    .give1 => {
+                        self.owner[1] = free;
+                        self.dpc = .done;
+                    },
+                    .done => unreachable,
+                },
+                else => switch (self.dpc) {
+                    .take0 => if (self.take(0, destroy_t)) {
+                        self.dpc = .apply0;
+                    },
+                    .apply0 => {
+                        self.applied[0] += 1;
+                        self.dpc = .give0;
+                    },
+                    .give0 => {
+                        self.owner[0] = free;
+                        self.dpc = .take1;
+                    },
+                    .take1 => if (self.take(1, destroy_t)) {
+                        self.dpc = .apply1;
+                    },
+                    .apply1 => {
+                        self.applied[1] += 1;
+                        self.dpc = .give1;
+                    },
+                    .give1 => {
+                        self.owner[1] = free;
+                        self.dpc = .done;
+                    },
+                    .done => unreachable,
+                },
+            }
+        }
+
+        fn stepCommitter(self: *Self, c: usize) void {
+            const who: u8 = @intCast(c + 1);
+            switch (self.cpc[c]) {
+                .take => if (self.take(c, who)) {
+                    self.cpc[c] = .apply;
+                },
+                .apply => {
+                    self.applied[2 + c] += 1;
+                    self.cpc[c] = .give;
+                },
+                .give => {
+                    self.owner[c] = free;
+                    self.cpc[c] = .done;
+                },
+                .done => unreachable,
+            }
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                destroy_t => self.stepDestroy(),
+                c0_t, c1_t => self.stepCommitter(t - 1),
+                else => unreachable,
+            }
+        }
+
+        /// The destroy is parked on a leaf another holds.
+        fn destroyWaits(self: *const Self) bool {
+            return switch (self.dpc) {
+                .take0 => self.owner[0] != free and self.owner[0] != destroy_t,
+                .take1 => self.owner[1] != free and self.owner[1] != destroy_t,
+                else => false,
+            };
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            for (0..2) |c| {
+                const blocked_by_destroy = self.cpc[c] == .take and self.owner[c] == destroy_t;
+                if (blocked_by_destroy and self.destroyWaits()) return error.CommitterBehindAWaitingDestroy;
+            }
+        }
+
+        pub fn final(self: *const Self) !void {
+            for (self.applied) |n| if (n != 1) return error.RecordNotAppliedOnce;
+            for (self.owner) |o| if (o != free) return error.LeafLeftHeld;
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -1595,9 +1751,14 @@ test "conveyor_fsync_inbox_loses_no_fsync_and_covers_its_window: holds (CAS push
     try explorer.expectFails(FsyncInbox(.fsyncs_after_inbound_scan), .{}, error.InvariantViolated);
 }
 
+test "conveyor_leafwise_destroy_never_waits_holding_a_leaf (§BV): holds (one leaf at a time — no committer ever waits for a leaf the destroy holds while the destroy itself waits; every record applied once); the union hold fails (C0 waits on L0 while the destroy, holding it, waits for L1 under C1)" {
+    try explorer.expectHolds(LeafwiseDestroy(.none), .{});
+    try explorer.expectFails(LeafwiseDestroy(.destroy_union_hold), .{}, error.InvariantViolated);
+}
+
 // The state counts the evidence note records.
 test "conveyor models: exhaustive within the explorer's default limits" {
-    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none) }) |Model| {
+    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none), LeafwiseDestroy(.none) }) |Model| {
         var report: explorer.Report = undefined;
         try explorer.explore(Model, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

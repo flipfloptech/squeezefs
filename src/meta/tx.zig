@@ -206,6 +206,11 @@ pub const KvTx = struct {
     /// flight makes the kernel drop the fresh reply (attr_version) and read
     /// against its stale size.
     kernel_told: bool = false,
+    /// Every record names an object no name reaches and no kernel holds (a
+    /// forgotten corpse's destroy): no reader can tell the RAM apply from
+    /// an atomic one, so a self-applying member takes its leaves ONE AT A
+    /// TIME (decision 0003 §BV). Crash atomicity is the entry's, unchanged.
+    leafwise: bool = false,
     names: NameNotes = .{},
 
     /// `site` is the committer's `@src()`.
@@ -460,6 +465,7 @@ pub const QueuedTx = struct {
     token_quiet: bool,
     kernel_origin: bool = false,
     kernel_told: bool = false,
+    leafwise: bool = false,
     names: NameNotes = .{},
     site: Site,
     /// Never read, only owned: the hold IS the same-key exclusion. Released
@@ -557,6 +563,7 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
     const token_quiet = tx.token_quiet;
     const kernel_origin = tx.kernel_origin;
     const kernel_told = tx.kernel_told;
+    const leafwise = tx.leafwise;
     const names = tx.names;
     const site = tx.site;
     const door_bypass = tx.door_bypass;
@@ -596,6 +603,7 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
         .token_quiet = token_quiet,
         .kernel_origin = kernel_origin,
         .kernel_told = kernel_told,
+        .leafwise = leafwise,
         .names = names,
         .site = site,
         .guards = guards,

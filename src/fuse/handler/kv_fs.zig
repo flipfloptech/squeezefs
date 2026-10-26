@@ -2489,8 +2489,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             // A corpse is an inode no kernel holds (its last FORGET evicted
             // it, or the mount's sweep found it before any lookup): nothing
-            // of it to invalidate (decision 0003 §AB.2).
+            // of it to invalidate (decision 0003 §AB.2) — and no name
+            // reaches it, so its apply may take one leaf at a time (§BV).
             t.kernel_origin = true;
+            t.leafwise = true;
             t_owned = false;
             try self.commit(c, t);
             fuse_reclaim_destroys.add(destroyed);
@@ -5596,9 +5598,10 @@ pub const MemStore = struct {
     /// count is a law the tests pin, decision 0003 §AV).
     records_committed: u64 = 0,
     /// The last commit's `kernel_origin` / `kernel_told` (the kernel
-    /// view's law).
+    /// view's law) and `leafwise` (§BV: a corpse's destroy alone).
     last_kernel_origin: bool = false,
     last_kernel_told: bool = false,
+    last_leafwise: bool = false,
     fsyncs: u64 = 0,
     /// Value bytes `lookup` and `range` copied out (a view copies none).
     value_bytes_copied: u64 = 0,
@@ -5712,6 +5715,7 @@ pub const MemStore = struct {
         self.records_committed += t.staged.items.len;
         self.last_kernel_origin = t.kernel_origin;
         self.last_kernel_told = t.kernel_told;
+        self.last_leafwise = t.leafwise;
     }
 
     pub fn lookup(self: *MemStore, gpa: Allocator, kind: u8, k: []const u8) StoreError!?[]u8 {
@@ -6765,12 +6769,16 @@ test "a FORGET whose corpse judgement would park the drain worker (the inode rea
     var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
     try h.fs.reclaimDrain(&c);
     try testing.expectEqual(destroyed0 + 1, fuse_reclaim_destroys.load());
+    // The destroy names only a corpse: it commits leafwise (§BV), with
+    // nothing of its kernel to invalidate.
+    try testing.expect(h.store.last_leafwise and h.store.last_kernel_origin);
     try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
     try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, g).errno());
     // Judged on the spot when the read serves: a corpse gathers, a live
-    // inode does not.
+    // inode does not. A name's change (the unlink) is never leafwise.
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "g" } }, 1).errno());
+    try testing.expect(!h.store.last_leafwise);
     h.forget(g, 1);
     try testing.expectEqual(deferred0 + 2, fuse_forget_judgements_deferred.load());
     try testing.expectEqual(@as(usize, 1), h.fs.reclaim.items.len);

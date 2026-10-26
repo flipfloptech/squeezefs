@@ -4242,6 +4242,119 @@ test "§BC self-apply: a 4-thread storm of this mount's kernel's creates — eve
     }
 }
 
+/// Padded kernel creates until the native tree's first and last created
+/// inodes lie on two leaves (a 64 KiB node splits at the writeback); the
+/// inos in creation order.
+fn createAcrossTwoLeaves(be: *KvBackend, made: *std.ArrayList(u64)) !void {
+    const native = be.treeOf(.native).?;
+    var round: usize = 0;
+    while (round < 64) : (round += 1) {
+        for (0..16) |i| {
+            var nb: [32]u8 = undefined;
+            const t = try be.begin(@src());
+            t.kernel_origin = true;
+            const ino = try stageCreate(be, t, try std.fmt.bufPrint(&nb, "lw-{d}-{d}", .{ round, i }), 2048);
+            try be.commit(t);
+            try made.append(testing.allocator, ino);
+        }
+        try be.checkpointNow();
+        const a = try native.resolveLeaf(&key.inodeKey(made.items[0]));
+        defer a.release();
+        const b = try native.resolveLeaf(&key.inodeKey(made.items[made.items.len - 1]));
+        defer b.release();
+        if (a.addr != b.addr) return;
+    }
+    return error.TestNeverSplit;
+}
+
+/// One corpse's destroy records: the inode and its pad xattr.
+fn stageCorpseDestroy(be: *KvBackend, t: *KvTx, ino: u64) !void {
+    const xk = key.xattrKey(ino, key.xattrNameHash56("user.pad", be.nameKey()), 0);
+    try inos.stageDestroy(t, ino, &.{&xk});
+}
+
+test "§BV a corpse's destroy under self-apply holds ONE leaf at a time: with the later of its two leaves held by another, the destroy waits for it holding NOTHING — the earlier leaf is free and its corpse already gone from RAM; released, the destroy lands whole and the reopen replays it" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "leafwise", "600000");
+    defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_APPLY", "self");
+    // No cadence cycle takes a leaf lock meanwhile: the destroy and the test
+    // are the only takers.
+    try v.env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "600000");
+    var made: std.ArrayList(u64) = .empty;
+    defer made.deinit(gpa);
+    var first_ino: u64 = 0;
+    var held_ino: u64 = 0;
+    {
+        const be = try v.open();
+        defer be.close();
+        try createAcrossTwoLeaves(be, &made);
+        const io = v.io();
+        const native = be.treeOf(.native).?;
+        const leaf_a = try native.resolveLeaf(&key.inodeKey(made.items[0]));
+        defer leaf_a.release();
+        const leaf_b = try native.resolveLeaf(&key.inodeKey(made.items[made.items.len - 1]));
+        defer leaf_b.release();
+        // The takes run ascending: `held` is the destroy's later leaf.
+        const a_first = leaf_a.addr < leaf_b.addr;
+        const first = if (a_first) leaf_a else leaf_b;
+        const held = if (a_first) leaf_b else leaf_a;
+        first_ino = if (a_first) made.items[0] else made.items[made.items.len - 1];
+        held_ino = if (a_first) made.items[made.items.len - 1] else made.items[0];
+        const t = try be.begin(@src());
+        t.kernel_origin = true;
+        t.leafwise = true;
+        try stageCorpseDestroy(be, t, first_ino);
+        try stageCorpseDestroy(be, t, held_ino);
+        const cs = be.conveyorStats();
+        const applies0 = cs.self_applies.load();
+        _ = held.lockWrite(io);
+        var held_locked = true;
+        defer if (held_locked) held.unlockWrite(io);
+        const Destroyer = struct {
+            fn run(b: *KvBackend, tx_: *KvTx, out: *?anyerror) void {
+                b.commit(tx_) catch |e| {
+                    out.* = e;
+                    return;
+                };
+                out.* = null;
+            }
+        };
+        var result: ?anyerror = error.TestNotRun;
+        const th = try std.Thread.spawn(.{}, Destroyer.run, .{ be, t, &result });
+        var joined = false;
+        defer if (!joined) {
+            if (held_locked) held.unlockWrite(io);
+            held_locked = false;
+            th.join();
+        };
+        // The destroy took its turn and queued on the held leaf.
+        while (cs.self_applies.load() == applies0 or held.lock.waiters(io) == 0) std.Thread.yield() catch {};
+        // THE LAW: waiting for one leaf, the destroy holds no other.
+        const first_free = first.lock.tryLock(io);
+        if (first_free) first.lock.unlock(io);
+        try testing.expect(first_free);
+        try testing.expect(!try present(be, first_ino));
+        try testing.expect(try present(be, held_ino));
+        held.unlockWrite(io);
+        held_locked = false;
+        th.join();
+        joined = true;
+        try testing.expectEqual(@as(?anyerror, null), result);
+        try testing.expect(!try present(be, first_ino));
+        try testing.expect(!try present(be, held_ino));
+        try be.fsync();
+    }
+    {
+        const be = try v.open();
+        defer be.close();
+        try testing.expect(be.replayStats().clean_unmount);
+        try testing.expect(!try present(be, first_ino));
+        try testing.expect(!try present(be, held_ino));
+        for (made.items) |ino| if (ino != first_ino and ino != held_ino) try testing.expect(try present(be, ino));
+    }
+}
+
 test "§BB.5 a journal write that fails AFTER its window was acked: the commit returned Ok and its record STANDS (no rollback), the volume latches FAILED at once (one loud line), the tail still holds the window for the supervisor's replay" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "acked-fail", "600000");

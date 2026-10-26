@@ -761,6 +761,10 @@ pub const Stats = struct {
     /// windows whose members applied themselves (§BC), and the members.
     self_handoffs: counters.ShardedCounter = .{},
     self_applies: counters.ShardedCounter = .{},
+    /// `meta_conveyor_tail_gate_parks`: passes parked because the members
+    /// of the self-applied windows in flight plus the batch would not fit
+    /// the journal tail's slot table (`awaitTailSlots`).
+    tail_gate_parks: counters.ShardedCounter = .{},
     /// `meta_conveyor_pass_yields`: turns the pass offered its venue
     /// between two of its batches (`PassSeam.yield`; the committer venue's
     /// is a no-op).
@@ -881,7 +885,7 @@ pub const Stats = struct {
             self.hold_bound_ns.load(),
             self.holds_pacing.load(),
         });
-        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
+        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_tail_gate_parks\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.tail_gate_parks.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
         try w.print(",\"meta_conveyor_window_gate_parks\":{d},\"meta_conveyor_room_parks\":{d},\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.window_gate_parks.load(),
             self.commit_room_parks.load(),
@@ -1385,6 +1389,9 @@ pub const TailSeam = struct {
     ctx: *anyopaque,
     claim: *const fn (ctx: *anyopaque, seq_base: u64, pos_base: u64, ops: []const journal.WriteOp) ?u32,
     release: *const fn (ctx: *anyopaque, slot: u32) void,
+    /// The slot table's size (re-read per pass: a joined ring's growth
+    /// re-creates the tail with no window in flight).
+    slots: *const fn (ctx: *anyopaque) u32,
 };
 
 /// Stage B's binding: the journal lane (Linux) or the in-RAM lane.
@@ -5332,6 +5339,108 @@ test "THE WINDOW GATE: with the lane's window cells all but one held (nothing la
 // ring bounds the committer queue, but a committer queues BEFORE ring
 // admission — the 129th simultaneous committer of a floor ring got
 // `ConveyorFull`, EAGAIN to a create, an mkdir, an unlink.
+test "THE TAIL GATE (§BV): under self-apply every member acked at the apply holds a journal-tail slot until its window lands — with a 4-slot table held full by four un-landed windows, the fifth committer's pass parks BEFORE its reservation (no member ever meets the full table: meta_conveyor_tail_slot_misses stays 0) and goes on at the first landing; every create acked and present" {
+    const h = try Harness.create(.{}, null, false);
+    defer h.destroy();
+    const io = testing.io;
+    const Tail = struct {
+        used: std.atomic.Value(u32) = .init(0),
+        const table: u32 = 4;
+        fn claim(ctx: *anyopaque, _: u64, _: u64, _: []const journal.WriteOp) ?u32 {
+            const t: *@This() = @ptrCast(@alignCast(ctx));
+            var u = t.used.load(.acquire);
+            while (u < table) : (u = t.used.load(.acquire)) {
+                if (t.used.cmpxchgWeak(u, u + 1, .acq_rel, .acquire) == null) return u;
+            }
+            return null;
+        }
+        fn release(ctx: *anyopaque, _: u32) void {
+            const t: *@This() = @ptrCast(@alignCast(ctx));
+            _ = t.used.fetchSub(1, .acq_rel);
+        }
+        fn slots(_: *anyopaque) u32 {
+            return table;
+        }
+    };
+    var tail: Tail = .{};
+    h.cv.deps.self_apply = true;
+    h.cv.deps.ack_at_apply = true;
+    h.cv.deps.tail = .{ .ctx = &tail, .claim = Tail.claim, .release = Tail.release, .slots = Tail.slots };
+    h.lane.hold = true;
+    h.threaded_pass = true;
+    const pass_thread = try std.Thread.spawn(.{}, Harness.passThreadMain, .{h});
+    defer {
+        while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
+        h.cv.quiesce();
+        h.pass_stop.store(true, .release);
+        h.pass_wake.notifyOne(io);
+        pass_thread.join();
+    }
+    const Committer = struct {
+        fn run(hh: *Harness, ino: *u64, out: *?anyerror) void {
+            const t = hh.gpa.create(tx.KvTx) catch unreachable;
+            defer hh.gpa.destroy(t);
+            t.* = tx.KvTx.init(hh.gpa, @src());
+            t.kernel_origin = true;
+            var nb: [16]u8 = undefined;
+            ino.* = hh.stageCreate(t, std.fmt.bufPrint(&nb, "tg-{d}", .{hh.inos.snapshot()}) catch unreachable) catch unreachable;
+            hh.cv.commit(t) catch |e| {
+                out.* = e;
+                return;
+            };
+            out.* = null;
+        }
+    };
+    var inos: [Tail.table + 1]u64 = undefined;
+    var results: [Tail.table + 1]?anyerror = @splat(error.TestNotRun);
+    const misses0 = h.cv.stats.tail_slot_misses.load();
+    const acks0 = h.cv.stats.acks_at_apply.load();
+    // Four committers one at a time: each answered at its apply, each
+    // window held un-landed with its member's slot.
+    for (0..Tail.table) |i| {
+        const th = try std.Thread.spawn(.{}, Committer.run, .{ h, &inos[i], &results[i] });
+        th.join();
+        try testing.expectEqual(@as(?anyerror, null), results[i]);
+    }
+    try testing.expectEqual(Tail.table, tail.used.load(.acquire));
+    const fifth = try std.Thread.spawn(.{}, Committer.run, .{ h, &inos[Tail.table], &results[Tail.table] });
+    var joined = false;
+    defer if (!joined) {
+        while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
+        fifth.join();
+    };
+    const Stopped = struct {
+        cv: *Conveyor,
+        misses0: u64,
+        fn ready(s: @This()) bool {
+            return s.cv.stats.tail_gate_parks.load() != 0 or s.cv.stats.tail_slot_misses.load() != s.misses0;
+        }
+    };
+    if (!awaitObservable(Stopped{ .cv = h.cv, .misses0 = misses0 })) return error.FifthNeverStopped;
+    // The gate, not the table, stopped the fifth: no member met it full.
+    try testing.expectEqual(misses0, h.cv.stats.tail_slot_misses.load());
+    try testing.expectEqual(@as(u64, 1), h.cv.stats.tail_gate_parks.load());
+    try testing.expectEqual(@as(u64, Tail.table), h.cv.windowsInflight());
+    // The landings make room: the fifth reserves, applies, is answered at
+    // its apply.
+    while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
+    const Answered = struct {
+        cv: *Conveyor,
+        want: u64,
+        fn ready(s: @This()) bool {
+            return s.cv.stats.acks_at_apply.load() >= s.want;
+        }
+    };
+    if (!awaitObservable(Answered{ .cv = h.cv, .want = acks0 + Tail.table + 1 })) return error.FifthNeverAnswered;
+    while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
+    fifth.join();
+    joined = true;
+    try testing.expectEqual(@as(?anyerror, null), results[Tail.table]);
+    for (inos) |ino| try testing.expect(try h.present(ino));
+    try testing.expectEqual(misses0, h.cv.stats.tail_slot_misses.load());
+    try testing.expectEqual(@as(u32, 0), tail.used.load(.acquire));
+}
+
 test "THE COMMITTER BURST: with the pass parked at the window gate (the one window it may fly held un-landed, the next batch drained) and every queue cell taken, 16 committers more are none of them refused — each parks for room (never ConveyorFull, never EAGAIN) and the drain that frees room wakes it; every create acked and present" {
     const h = try Harness.create(.{ .ring_pages = 120 }, null, false);
     defer h.destroy();
@@ -5632,7 +5741,7 @@ test "the stats JSON names every conveyor face" {
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w);
     const out = w.buffered();
-    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves", "meta_conveyor_pass_yields" }) |name| {
+    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves", "meta_conveyor_pass_yields", "meta_conveyor_tail_gate_parks" }) |name| {
         try testing.expect(std.mem.indexOf(u8, out, name) != null);
     }
     var pb: [8192]u8 = undefined;

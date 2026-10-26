@@ -2164,7 +2164,12 @@ pub const KvBackend = struct {
 
     fn tailSeam(be: *KvBackend) ?conveyor.TailSeam {
         if (be.tail == null) return null;
-        return .{ .ctx = be, .claim = tailClaim, .release = tailRelease };
+        return .{ .ctx = be, .claim = tailClaim, .release = tailRelease, .slots = tailSlots };
+    }
+
+    fn tailSlots(ctx: *anyopaque) u32 {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        return be.tail.?.image.header().n_slots;
     }
 
     fn tailClaim(ctx: *anyopaque, seq_base: u64, pos_base: u64, ops: []const journal.WriteOp) ?u32 {

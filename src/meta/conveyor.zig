@@ -761,8 +761,9 @@ pub const Stats = struct {
     /// windows whose members applied themselves (§BC), and the members.
     self_handoffs: counters.ShardedCounter = .{},
     self_applies: counters.ShardedCounter = .{},
-    /// `meta_conveyor_pass_yields`: lane turns the pass gave between two
-    /// of its batches (`PassSeam.yield`).
+    /// `meta_conveyor_pass_yields`: turns the pass offered its venue
+    /// between two of its batches (`PassSeam.yield`; the committer venue's
+    /// is a no-op).
     pass_yields: counters.ShardedCounter = .{},
     /// `meta_conveyor_leafwise_applies` / `_leaves`: self-applied members
     /// that took their leaves one at a time (§BV: a corpse's destroy), and
@@ -1539,6 +1540,8 @@ pub const Conveyor = struct {
     reserved_hwm: std.atomic.Value(u64) = .init(0),
     inflight: std.AutoHashMapUnmanaged(u64, *Window) = .empty,
     inflight_cap: usize,
+    /// Windows untracked since the map's last compaction (`untrack`).
+    inflight_removed: usize = 0,
     /// The thread the last pass ran on (`std.Thread.getCurrentId`): the
     /// venue witness — ≡ the journal lane's tid on a mounted volume.
     pass_thread: std.atomic.Value(u64) = .init(0),
@@ -2064,22 +2067,35 @@ pub const Conveyor = struct {
 
     /// The leader's loop: drain → `runBatch` until an empty drain releases
     /// leadership (release THEN re-check: the no-lost-wakeup theorem). The
-    /// caller holds leadership.
+    /// caller holds leadership. Between two batches the venue's thread gets
+    /// a turn (`PassSeam.yield`): under self-apply nothing else parks the
+    /// pass (no applier venue to pace it, no pad hold on a sub-page grain),
+    /// and at 64 ranks the queue never ran dry — the pass held the journal
+    /// lane for batch after batch while the windows it handed off sat
+    /// un-issued in the lane's inbox until the window gate parked it (§BV).
     pub fn pass(self: *Conveyor) void {
         self.pass_thread.store(@intCast(std.Thread.getCurrentId()), .release);
         while (true) {
-            // The growth gate before the pass's first read of the ring (the
-            // caps at the drain, the geometry and the head at the hold): a
-            // growth swaps them only while no pass is inside.
-            if (self.deps.growth_gate) |g| g.enter(g.ctx);
-            defer if (self.deps.growth_gate) |g| g.leave(g.ctx);
-            const batch = self.drain(self.deps.caps, self.batch_buf);
-            if (batch.len == 0) {
-                if (!self.core.unleadAndRecheck()) return;
-                continue;
+            {
+                // The growth gate before the pass's first read of the ring
+                // (the caps at the drain, the geometry and the head at the
+                // hold): a growth swaps them only while no pass is inside.
+                if (self.deps.growth_gate) |g| g.enter(g.ctx);
+                defer if (self.deps.growth_gate) |g| g.leave(g.ctx);
+                const batch = self.drain(self.deps.caps, self.batch_buf);
+                if (batch.len == 0) {
+                    if (!self.core.unleadAndRecheck()) return;
+                    continue;
+                }
+                const held = self.holdForFill(batch);
+                self.runBatch(held.batch, held.held);
             }
-            const held = self.holdForFill(batch);
-            self.runBatch(held.batch, held.held);
+            // Outside the growth gate; a hint: a stale zero costs one batch
+            // without a turn, a stale non-zero one turn.
+            if (self.stats.queued.load() != 0) if (self.deps.pass.yield) |y| {
+                self.stats.pass_yields.inc();
+                y(self.deps.pass.ctx);
+            };
         }
     }
 
@@ -3380,10 +3396,31 @@ pub const Conveyor = struct {
             self.inflight_lock.lock();
             defer self.inflight_lock.unlock();
             const r = self.inflight.remove(w.res.start);
-            if (r) self.stats.windows_inflight.sub(1);
+            if (r) {
+                self.stats.windows_inflight.sub(1);
+                self.inflight_removed += 1;
+                self.compactInflightLocked();
+            }
             break :blk r;
         };
         if (removed) if (self.deps.growth_gate) |g| g.windowLeft(g.ctx);
+    }
+
+    /// Every window is a NEW key (its reservation start) and every removal
+    /// a tombstone std's map keeps until it grows — which this one, sized
+    /// once at init, never does: past a few thousand windows each `track`
+    /// probed the whole table to a free slot. An emptied map clears; past a
+    /// quarter of its capacity in removals it rehashes in place (O(1)
+    /// amortized; neither allocates, §BV).
+    fn compactInflightLocked(self: *Conveyor) void {
+        const cap = self.inflight.capacity();
+        if (cap == 0 or self.inflight_removed * 4 < cap) return;
+        if (self.inflight.count() == 0) {
+            self.inflight.clearRetainingCapacity();
+        } else {
+            self.inflight.rehash(std.hash_map.AutoContext(u64){});
+        }
+        self.inflight_removed = 0;
     }
 
     fn lookupInflight(self: *Conveyor, start: u64) ?*Window {

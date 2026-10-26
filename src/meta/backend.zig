@@ -823,7 +823,7 @@ pub const KvBackend = struct {
             .appender_id = journal.FIXED_RING_APPENDER,
             .latch = &be.lane.latch,
             .lane = .{ .ctx = be, .submit = laneSubmit, .barrier = laneBarrier, .window_cells = be.lane.windowCellCount() },
-            .pass = .{ .ctx = be, .wake = wakePass },
+            .pass = .{ .ctx = be, .wake = wakePass, .yield = yieldPass },
             .checkpoint = .{ .ctx = be, .kickPark = kickPark, .kickThreshold = kickThreshold, .checkpointNow = checkpointNowHook, .checkpointPast = checkpointPastHook, .space = &be.space_notify, .posture = &be.cp.posture, .space_retry = be.cp.spaceRetryHold() },
             .smo_journal = &be.smo_journal,
             .caps = conveyor.resolveCaps(opts.env, cpus, geo),
@@ -1216,7 +1216,7 @@ pub const KvBackend = struct {
             .appender_id = standing.appender_id,
             .latch = &be.lane.latch,
             .lane = .{ .ctx = be, .submit = laneSubmit, .barrier = laneBarrier, .window_cells = be.lane.windowCellCount() },
-            .pass = .{ .ctx = be, .wake = wakePass },
+            .pass = .{ .ctx = be, .wake = wakePass, .yield = yieldPass },
             .checkpoint = .{ .ctx = be, .kickPark = kickPark, .kickThreshold = kickThreshold, .checkpointNow = checkpointNowHook, .checkpointPast = checkpointPastHook, .space = &be.space_notify, .posture = &be.cp.posture, .space_retry = be.cp.spaceRetryHold() },
             .smo_journal = &be.smo_journal,
             .caps = conveyor.resolveCaps(opts.env, cpus, be.geo),
@@ -1758,6 +1758,21 @@ pub const KvBackend = struct {
         if (be.pass_on_committer) return be.cv.runScheduledPass();
         const f = be.pass_fiber orelse return;
         if (f.state.wake()) f.lane.enqueue(f);
+    }
+
+    /// `conveyor.PassSeam.yield`: the pass fiber parks on an immediate
+    /// timer, so the journal lane runs one turn of its loop — its CQEs
+    /// reaped, its inbox (the windows' submits, stage B's wakes) drained,
+    /// its ready fibers run — and the timer brings the pass back, still the
+    /// leader. A wake that beats the timer cancels it. The committer venue
+    /// runs the pass on a committer: nothing to yield to.
+    fn yieldPass(ctx: *anyopaque) void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        const f = exec.lane.currentFiber() orelse return;
+        if (be.pass_fiber != f) return;
+        f.lane.timers.arm(f, clock.monotonicNs());
+        f.park();
+        if (!f.timerFired()) _ = f.lane.timers.cancel(f);
     }
 
     /// The dedicated guard fd (the flock's home for the mount's life; a

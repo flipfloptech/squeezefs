@@ -444,6 +444,8 @@ pub const GrantPassGate = struct {
     inflight: std.AutoHashMapUnmanaged(Object, u32) = .empty,
     /// Parked grants wake here at every settle.
     settled: sync.Notify = .init,
+    /// Objects removed from `inflight` since its last compaction.
+    removed: usize = 0,
 
     pub fn init(gpa: Allocator) GrantPassGate {
         return .{ .gpa = gpa };
@@ -483,10 +485,34 @@ pub const GrantPassGate = struct {
             for (objects) |o| {
                 const p = self.inflight.getPtr(o) orelse continue;
                 p.* -= 1;
-                if (p.* == 0) _ = self.inflight.remove(o);
+                if (p.* == 0) {
+                    _ = self.inflight.remove(o);
+                    self.removed += 1;
+                }
             }
+            self.compactLocked();
         }
         self.settled.notifyWaiters(io);
+    }
+
+    /// A removal leaves a tombstone, and std's map rehashes only when it
+    /// grows: every object a pass marks is a NEW key, whose insert probes
+    /// past every tombstone to a free slot — after a storm's churn, the
+    /// whole table (the 64-rank removal under self-apply spent 26 % of the
+    /// daemon's samples in `passBegin`'s probes on the journal lane,
+    /// decision 0003 §BV). An emptied map clears; past a quarter of its
+    /// capacity in removals it rehashes in place — O(capacity) per
+    /// capacity/4 removals, so O(1) amortized and the tombstones stay
+    /// under a quarter of the table.
+    fn compactLocked(self: *GrantPassGate) void {
+        const cap = self.inflight.capacity();
+        if (cap == 0 or self.removed * 4 < cap) return;
+        if (self.inflight.count() == 0) {
+            self.inflight.clearRetainingCapacity();
+        } else {
+            self.inflight.rehash(std.hash_map.AutoContext(Object){});
+        }
+        self.removed = 0;
     }
 
     pub fn inflightCount(self: *GrantPassGate, io: Io) usize {

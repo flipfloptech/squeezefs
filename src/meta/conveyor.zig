@@ -1190,6 +1190,9 @@ pub const Window = struct {
     pending: std.atomic.Value(u32) = .init(0),
     /// The pass handed the members their turns (`meta_self_window_span`).
     t_turns_ns: u64 = 0,
+    /// Its share of `Conveyor.tail_members` (§BV), returned at its
+    /// terminal outcome.
+    tail_members: u32 = 0,
 
     /// One self-applying member's share of the window (§BC): its own
     /// arena (the members apply concurrently), its sub-range and seq, its
@@ -1549,6 +1552,13 @@ pub const Conveyor = struct {
     inflight_cap: usize,
     /// Windows untracked since the map's last compaction (`untrack`).
     inflight_removed: usize = 0,
+    /// §BV: the members of the tracked windows of a self-applying conveyor
+    /// with a journal tail — the most slots of the tail's table they can
+    /// hold (one per member acked at the apply). The pass is the only
+    /// incrementer (at `track`); a window's terminal outcome decrements
+    /// after its slots went back, then notifies `tail_freed`.
+    tail_members: std.atomic.Value(u32) = .init(0),
+    tail_freed: sync.Notify = .init,
     /// The thread the last pass ran on (`std.Thread.getCurrentId`): the
     /// venue witness — ≡ the journal lane's tid on a mounted volume.
     pass_thread: std.atomic.Value(u64) = .init(0),
@@ -2089,7 +2099,7 @@ pub const Conveyor = struct {
                 // hold): a growth swaps them only while no pass is inside.
                 if (self.deps.growth_gate) |g| g.enter(g.ctx);
                 defer if (self.deps.growth_gate) |g| g.leave(g.ctx);
-                const batch = self.drain(self.deps.caps, self.batch_buf);
+                const batch = self.drain(self.passCaps(), self.batch_buf);
                 if (batch.len == 0) {
                     if (!self.core.unleadAndRecheck()) return;
                     continue;
@@ -2219,7 +2229,8 @@ pub const Conveyor = struct {
     fn redrainHeld(self: *Conveyor, batch: []Queued) HeldBatch {
         var sum: u64 = 0;
         for (batch) |m| sum += m.q.len;
-        const rest: Caps = .{ .max_txs = self.deps.caps.max_txs -| batch.len, .max_bytes = self.deps.caps.max_bytes -| sum };
+        const caps = self.passCaps();
+        const rest: Caps = .{ .max_txs = caps.max_txs -| batch.len, .max_bytes = caps.max_bytes -| sum };
         if (rest.max_txs == 0 or batch.len >= self.batch_buf.len) return .{ .batch = batch, .held = true };
         const more = self.drain(rest, self.batch_buf[batch.len..]);
         return .{ .batch = self.batch_buf[0 .. batch.len + more.len], .held = true };
@@ -2258,6 +2269,60 @@ pub const Conveyor = struct {
             }
             n.waitUncancelable(io);
         }
+    }
+
+    /// The drain's caps: under self-apply with a journal tail a batch never
+    /// holds more members than the tail has slots (each may claim one;
+    /// `awaitTailSlots`).
+    fn passCaps(self: *const Conveyor) Caps {
+        var caps = self.deps.caps;
+        if (self.deps.self_apply) if (self.deps.tail) |t| {
+            caps.max_txs = @max(1, @min(caps.max_txs, t.slots(t.ctx)));
+        };
+        return caps;
+    }
+
+    /// THE TAIL GATE (§BV): under self-apply every member acked at the apply
+    /// claims a slot of the journal tail's table and holds it until its
+    /// window lands — a batch's worth of slots per window where the venue
+    /// claims one, so the window gate (one cell per window) bounds nothing
+    /// here: 63 floor-ring windows of 64 members against a 256-slot table,
+    /// and a starved lane met the table full 2,169 times in one 64-rank
+    /// removal (`meta_conveyor_tail_slot_misses`, must-stay-0). The pass
+    /// reserves a window only while the members in flight plus its batch
+    /// fit; parked, it holds nothing (the window gate's law: register on
+    /// `tail_freed`, then re-read). The pass is the only incrementer (at
+    /// `track`), so the count it read can only fall before its own
+    /// increment; a terminal outcome gives its slots back BEFORE it drops
+    /// the count (`conveyor_core_model.TailSlots`: either reversed order
+    /// fails). Every tracked window reaches its terminal outcome, so the
+    /// park ends.
+    fn awaitTailSlots(self: *Conveyor, n: usize) void {
+        if (!self.deps.self_apply) return;
+        const t = self.deps.tail orelse return;
+        const cap = t.slots(t.ctx);
+        if (self.tail_members.load(.acquire) + n <= cap) return;
+        self.stats.tail_gate_parks.inc();
+        const io = self.deps.io;
+        while (true) {
+            var w = self.tail_freed.notified();
+            _ = w.enable(io);
+            if (self.tail_members.load(.acquire) + n <= cap) {
+                w.cancel(io);
+                return;
+            }
+            w.waitUncancelable(io);
+        }
+    }
+
+    /// A terminal window's share of the tail gate's count, returned AFTER
+    /// its slots went back; then the gate's wake.
+    fn returnTailMembers(self: *Conveyor, w: *Window) void {
+        if (w.tail_members == 0) return;
+        // acq_rel: the slot releases above precede the drop the pass's
+        // acquire load reads.
+        _ = self.tail_members.fetchSub(w.tail_members, .acq_rel);
+        self.tail_freed.notifyWaiters(self.deps.io);
     }
 
     /// Resolve a record's tree by `tree.route` (the ONE routing law); a
@@ -2533,8 +2598,10 @@ pub const Conveyor = struct {
             self.failBatch(members.items, if (self.deps.latch.isRetired()) error.Deferred else if (self.deps.latch.isFailed()) error.VolumeFailed else error.VolumeClosed);
             return;
         }
-        // A1¼: the window's lane cell, before the pass takes anything.
+        // A1¼: the window's lane cell, and under self-apply its members'
+        // tail slots, before the pass takes anything.
         self.awaitWindowCell();
+        self.awaitTailSlots(members.items.len);
         // A1½: the token recall — the union of the batch's objects (every
         // record of every non-`token_quiet` member) taken in flight ONCE,
         // under the members' 4a guards, BEFORE ring admission and any node
@@ -2652,6 +2719,11 @@ pub const Conveyor = struct {
             self.abandonWindow(w, error.OutOfMemory);
             return;
         };
+        if (self.deps.self_apply and self.deps.tail != null) {
+            w.tail_members = @intCast(window_members.len);
+            // acq_rel: paired with `returnTailMembers`' drop.
+            _ = self.tail_members.fetchAdd(w.tail_members, .acq_rel);
+        }
         self.stats.pass_total.record(clock.monotonicNs() -| t_pass);
         // §BC: every member applies its own transaction on its committer's
         // thread — the pass only reserved, stamped and serialized. A group
@@ -3514,6 +3586,7 @@ pub const Conveyor = struct {
             if (result) |_| {
                 for (w.parts) |p| if (p.tail_slot) |slot| if (self.deps.tail) |t| t.release(t.ctx, slot);
             } else |_| {}
+            self.returnTailMembers(w);
             w.release();
             return;
         }
@@ -3525,6 +3598,7 @@ pub const Conveyor = struct {
         if (result) |_| {
             if (w.tail_slot) |slot| if (self.deps.tail) |t| t.release(t.ctx, slot);
         } else |_| {}
+        self.returnTailMembers(w);
         w.release();
     }
 

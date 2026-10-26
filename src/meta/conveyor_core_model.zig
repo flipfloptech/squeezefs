@@ -47,6 +47,11 @@
 //!                                                 (every leaf locked ascending, held across the
 //!                                                 apply): a committer on its first leaf waits
 //!                                                 while the destroy waits for its second
+//!  13 tail_gate_never_meets_a_full_table           — no gate (a member finds the tail's table
+//!                                                 full); the lane drops the window's count BEFORE
+//!                                                 its slots go back (the same); the gate checking
+//!                                                 before it registers (the parked pass outlives
+//!                                                 the landing that made room)
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -105,6 +110,13 @@ const Weakening = enum {
     /// A leafwise member (a corpse's destroy) locks its whole leaf set
     /// ascending and holds it across its apply, as a name's change does.
     destroy_union_hold,
+    /// The pass reserves self-applied windows with no tail gate.
+    no_tail_gate,
+    /// A terminal window drops its members' count BEFORE its tail slots go
+    /// back (and notifies in between).
+    tail_count_before_release,
+    /// The tail gate reads the count BEFORE it registers on `tail_freed`.
+    tail_gate_check_before_register,
 };
 
 const Item = struct { id: u8, len: u8 };
@@ -1682,6 +1694,165 @@ fn LeafwiseDestroy(comptime weakening: Weakening) type {
     };
 }
 
+/// Model 13 (§BV): the journal tail's slots under self-apply — every member
+/// acked at the apply claims a slot, released at its window's landing. A
+/// table of 3 slots, windows of 2 members, 3 windows: the pass reserves a
+/// window only while the members of the windows it tracks plus the batch
+/// fit the table (register on `tail_freed`, read, park), counting them at
+/// `track`; the members claim their slots after the handoff; the lane, at a
+/// window's terminal outcome, gives the slots back, THEN drops the count,
+/// THEN notifies. Invariant: no member finds the table full (the tripwire
+/// `meta_conveyor_tail_slot_misses`), and the parked pass never outlives
+/// the landing that made room. Final: every window landed, every slot back.
+fn TailSlots(comptime weakening: Weakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 3;
+        const pass_t = 0;
+        const member_t = 1;
+        const lane_t = 2;
+        const slots: u8 = 3;
+        const per_window: u8 = 2;
+        const windows: u8 = 3;
+        const check_first = weakening == .tail_gate_check_before_register;
+        const count_first = weakening == .tail_count_before_release;
+
+        const Ppc = enum(u8) { register, check, park, parked, track, done };
+        const Lpc = enum(u8) { idle, release, drop, notify };
+
+        free: u8 = slots,
+        /// Members of the tracked windows (`Conveyor.tail_members`).
+        counted: u8 = 0,
+        /// Windows tracked and handed to their members.
+        handed: u8 = 0,
+        /// Windows whose members all claimed; the claims of the next.
+        claimed: u8 = 0,
+        claims: u8 = 0,
+        /// Windows the lane finished.
+        landed: u8 = 0,
+        /// `tail_freed`: its epoch and the pass's snapshot.
+        epoch: u8 = 0,
+        pass_epoch: u8 = 0,
+        met_full: bool = false,
+        ppc: Ppc = if (check_first) .check else .register,
+        lpc: Lpc = .idle,
+        /// The lane's steps done for the window it is finishing.
+        lane_done: u8 = 0,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        /// Parked with no wake owed and nobody left to deliver one.
+        fn stuck(self: *const Self) bool {
+            return self.ppc == .parked and self.epoch == self.pass_epoch and self.lpc == .idle and self.landed == self.handed;
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                pass_t => self.ppc == .done or self.stuck(),
+                member_t => self.claimed == self.handed and (self.ppc == .done or self.stuck()),
+                lane_t => self.lpc == .idle and self.landed == self.claimed and (self.ppc == .done or self.stuck()),
+                else => unreachable,
+            };
+        }
+
+        fn gateStart() Ppc {
+            return if (check_first) .check else .register;
+        }
+
+        fn stepPass(self: *Self) void {
+            switch (self.ppc) {
+                .register => {
+                    self.pass_epoch = self.epoch;
+                    self.ppc = if (check_first) .park else .check;
+                },
+                .check => {
+                    if (weakening == .no_tail_gate or self.counted + per_window <= slots) {
+                        self.ppc = .track;
+                    } else self.ppc = if (check_first) .register else .park;
+                },
+                .park => self.ppc = if (self.epoch != self.pass_epoch) gateStart() else .parked,
+                .parked => if (self.epoch != self.pass_epoch) {
+                    self.ppc = gateStart();
+                },
+                .track => {
+                    self.counted += per_window;
+                    self.handed += 1;
+                    self.ppc = if (self.handed == windows) .done else gateStart();
+                },
+                .done => unreachable,
+            }
+        }
+
+        fn stepMember(self: *Self) void {
+            if (self.claimed == self.handed) return;
+            if (self.free == 0) {
+                self.met_full = true;
+            } else self.free -= 1;
+            self.claims += 1;
+            if (self.claims == per_window) {
+                self.claims = 0;
+                self.claimed += 1;
+            }
+        }
+
+        fn release(self: *Self) void {
+            self.free += per_window;
+        }
+
+        fn drop(self: *Self) void {
+            self.counted -= per_window;
+        }
+
+        fn stepLane(self: *Self) void {
+            switch (self.lpc) {
+                .idle => if (self.landed < self.claimed) {
+                    self.lpc = if (count_first) .drop else .release;
+                },
+                .release => {
+                    self.release();
+                    self.lpc = if (count_first) .idle else .drop;
+                    if (count_first) self.landed += 1;
+                },
+                .drop => {
+                    self.drop();
+                    self.lpc = .notify;
+                },
+                .notify => {
+                    self.epoch +%= 1;
+                    if (count_first) {
+                        self.lpc = .release;
+                    } else {
+                        self.lpc = .idle;
+                        self.landed += 1;
+                    }
+                },
+            }
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                pass_t => self.stepPass(),
+                member_t => self.stepMember(),
+                lane_t => self.stepLane(),
+                else => unreachable,
+            }
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            if (self.met_full) return error.MemberMetAFullTail;
+            if (self.stuck() and self.counted + per_window <= slots) return error.GateOutlivedTheLanding;
+        }
+
+        pub fn final(self: *const Self) !void {
+            if (self.ppc != .done) return error.WindowNeverReserved;
+            if (self.landed != windows or self.counted != 0) return error.WindowLeftInFlight;
+            if (self.free != slots) return error.SlotNotReturned;
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -1756,9 +1927,16 @@ test "conveyor_leafwise_destroy_never_waits_holding_a_leaf (§BV): holds (one le
     try explorer.expectFails(LeafwiseDestroy(.destroy_union_hold), .{}, error.InvariantViolated);
 }
 
+test "conveyor_tail_gate_never_meets_a_full_table (§BV): holds (register, read the members in flight, park; count at track; the lane gives the slots back, then drops the count, then notifies); no gate and the count dropped before the slots went back each let a member meet a full table; checking before registering strands the parked pass with room" {
+    try explorer.expectHolds(TailSlots(.none), .{});
+    try explorer.expectFails(TailSlots(.no_tail_gate), .{}, error.InvariantViolated);
+    try explorer.expectFails(TailSlots(.tail_count_before_release), .{}, error.InvariantViolated);
+    try explorer.expectFails(TailSlots(.tail_gate_check_before_register), .{}, error.InvariantViolated);
+}
+
 // The state counts the evidence note records.
 test "conveyor models: exhaustive within the explorer's default limits" {
-    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none), LeafwiseDestroy(.none) }) |Model| {
+    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none), LeafwiseDestroy(.none), TailSlots(.none) }) |Model| {
         var report: explorer.Report = undefined;
         try explorer.explore(Model, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

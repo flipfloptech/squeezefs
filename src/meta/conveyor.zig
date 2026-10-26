@@ -761,6 +761,11 @@ pub const Stats = struct {
     /// windows whose members applied themselves (§BC), and the members.
     self_handoffs: counters.ShardedCounter = .{},
     self_applies: counters.ShardedCounter = .{},
+    /// `meta_conveyor_resident_waits`: answers at the apply that waited for
+    /// the journal tail to hold every reservation below their window
+    /// (`awaitResident`); `meta_resident_wait`: the wait.
+    resident_waits: counters.ShardedCounter = .{},
+    resident_wait: counters.ShardedLatencyHistogram = .{},
     /// `meta_conveyor_tail_gate_parks`: passes parked because the members
     /// of the self-applied windows in flight plus the batch would not fit
     /// the journal tail's slot table (`awaitTailSlots`).
@@ -885,7 +890,7 @@ pub const Stats = struct {
             self.hold_bound_ns.load(),
             self.holds_pacing.load(),
         });
-        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_tail_gate_parks\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.tail_gate_parks.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
+        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_tail_gate_parks\":{d},\"meta_conveyor_resident_waits\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.tail_gate_parks.load(), self.resident_waits.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
         try w.print(",\"meta_conveyor_window_gate_parks\":{d},\"meta_conveyor_room_parks\":{d},\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.window_gate_parks.load(),
             self.commit_room_parks.load(),
@@ -930,6 +935,8 @@ pub const Stats = struct {
         try self.leafwise_apply.snapshot().writeJson(w);
         try w.writeAll(",\"meta_self_window_span\":");
         try self.self_window_span.snapshot().writeJson(w);
+        try w.writeAll(",\"meta_resident_wait\":");
+        try self.resident_wait.snapshot().writeJson(w);
         try w.writeAll("}");
     }
 };
@@ -962,6 +969,12 @@ pub const TestSeams = struct {
     hold_next_apply: std.atomic.Value(u32) = .init(0),
     apply_held: std.atomic.Value(u32) = .init(0),
     apply_release: sync.Notify = .init,
+    /// Self-apply's twin of `hold_next_apply`: the member whose records name
+    /// this inode parks at its turn — after relaying its siblings' turns,
+    /// before anything of it reaches the tail or RAM — until the test
+    /// stores 0 and notifies `apply_release`; `member_held` publishes it.
+    hold_member_ino: std.atomic.Value(u64) = .init(0),
+    member_held: std.atomic.Value(u32) = .init(0),
 };
 
 pub var test_seams: TestSeams = .{};
@@ -2909,6 +2922,7 @@ pub const Conveyor = struct {
         self.relayTurn(w, 2 * idx + 1);
         self.relayTurn(w, 2 * idx + 2);
         const m = &w.members[idx];
+        self.holdMemberForTest(m);
         const p = &w.parts[idx];
         const a = p.arena.allocator();
         const members = w.members[idx .. idx + 1];
@@ -3437,6 +3451,24 @@ pub const Conveyor = struct {
             var n = test_seams.apply_release.notified();
             _ = n.enable(io);
             if (test_seams.hold_next_apply.load(.acquire) != 2) {
+                n.cancel(io);
+                break;
+            }
+            n.waitUncancelable(io);
+        }
+    }
+
+    /// `test_seams.hold_member_ino`: the member naming that inode parks
+    /// (register-then-check against the release).
+    fn holdMemberForTest(self: *Conveyor, m: *const Queued) void {
+        const ino = test_seams.hold_member_ino.load(.acquire);
+        if (ino == 0 or !namesInode(m.q.recs, ino)) return;
+        test_seams.member_held.store(1, .release);
+        const io = self.deps.io;
+        while (test_seams.hold_member_ino.load(.acquire) == ino) {
+            var n = test_seams.apply_release.notified();
+            _ = n.enable(io);
+            if (test_seams.hold_member_ino.load(.acquire) != ino) {
                 n.cancel(io);
                 break;
             }
@@ -6039,13 +6071,13 @@ test "the stats JSON names every conveyor face" {
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w);
     const out = w.buffered();
-    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves", "meta_conveyor_pass_yields", "meta_conveyor_tail_gate_parks" }) |name| {
+    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves", "meta_conveyor_pass_yields", "meta_conveyor_tail_gate_parks", "meta_conveyor_resident_waits" }) |name| {
         try testing.expect(std.mem.indexOf(u8, out, name) != null);
     }
     var pb: [8192]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&pb);
     try s.writePhasesJson(&pw);
-    for ([_][]const u8{ "meta_pass_hold", "leafwise_leaf_hold", "meta_leafwise_apply", "meta_self_window_span" }) |name| {
+    for ([_][]const u8{ "meta_pass_hold", "leafwise_leaf_hold", "meta_leafwise_apply", "meta_self_window_span", "meta_resident_wait" }) |name| {
         try testing.expect(std.mem.indexOf(u8, pw.buffered(), name) != null);
     }
 }

@@ -4488,6 +4488,121 @@ test "§BW the death replay of self-applied windows: three of this mount's kerne
     for (held) |ino| try testing.expect(try present(be, ino));
 }
 
+/// The supervisor's judgement were the daemon to die now (§BR.11 (c)): the
+/// tail's slots against the device's chain.
+fn judgeDeath(v: *TestVol, be: *KvBackend) !journal_tail.linux_tail.Judged {
+    var zbuf: [linux.PATH_MAX]u8 = undefined;
+    const rc = linux.open(try align_probe.pathZ(&zbuf, v.path()), .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.CannotOpenDevice;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    return journal_tail.linux_tail.judgedReplay(testing.allocator, be.tail.?.image, fd, null);
+}
+
+/// The answered-before-resident shape on either arm: A (window W1) held
+/// by `arm`'s seam before anything of it reaches the tail, B (W2, a later
+/// window) committed beside it. B must not be answered while A's range is
+/// a hole the death replay would stop at; released, both answer and the
+/// replay keeps both.
+fn residentAnswerRow(v: *TestVol, be: *KvBackend, comptime arm: enum { self, venue }) !void {
+    const Committer = struct {
+        fn run(b: *KvBackend, t: *KvTx, out: *?anyerror, done: *std.atomic.Value(u32)) void {
+            out.* = if (b.commit(t)) |_| null else |e| e;
+            done.store(1, .release);
+        }
+        fn create(b: *KvBackend, name: []const u8, ino: *u64, out: *?anyerror, done: *std.atomic.Value(u32)) void {
+            const t = b.begin(@src()) catch unreachable;
+            t.kernel_origin = true;
+            ino.* = stageCreate(b, t, name, 0) catch unreachable;
+            run(b, t, out, done);
+        }
+    };
+    _ = try commitCreateKernel(be, "landed");
+    try be.fsync();
+    // Nothing lands from here on: every answer rests on the tail alone.
+    journal_lane.test_seams.delay_issue.store(1, .release);
+    defer journal_lane.test_seams.delay_issue.store(0, .release);
+    // The venue arm: a window behind an un-landed one is spawned to an
+    // applier (an `alone` window applies inline on the pass).
+    if (arm == .venue) _ = try commitCreateKernel(be, "w0");
+    const ta = try be.begin(@src());
+    ta.kernel_origin = true;
+    const ino_a = try stageCreate(be, ta, "a", 0);
+    switch (arm) {
+        .self => conveyor.test_seams.hold_member_ino.store(ino_a, .release),
+        .venue => conveyor.test_seams.hold_next_apply.store(1, .release),
+    }
+    var out_a: ?anyerror = error.TestNotRun;
+    var done_a = std.atomic.Value(u32).init(0);
+    const th_a = try std.Thread.spawn(.{}, Committer.run, .{ be, ta, &out_a, &done_a });
+    defer th_a.join();
+    // Every exit releases A before it joins (a red run leaves it held).
+    var released = false;
+    defer if (!released) {
+        conveyor.test_seams.hold_member_ino.store(0, .release);
+        conveyor.test_seams.hold_next_apply.store(0, .release);
+        conveyor.test_seams.apply_release.notifyWaiters(be.io);
+    };
+    const held = switch (arm) {
+        .self => &conveyor.test_seams.member_held,
+        .venue => &conveyor.test_seams.apply_held,
+    };
+    while (held.load(.acquire) == 0) std.Thread.yield() catch {};
+    held.store(0, .release);
+    const cs = be.conveyorStats();
+    const waits0 = cs.resident_waits.load();
+    var ino_b: u64 = 0;
+    var out_b: ?anyerror = error.TestNotRun;
+    var done_b = std.atomic.Value(u32).init(0);
+    const th_b = try std.Thread.spawn(.{}, Committer.create, .{ be, "b", &ino_b, &out_b, &done_b });
+    defer th_b.join();
+    defer if (!released) {
+        conveyor.test_seams.hold_member_ino.store(0, .release);
+        conveyor.test_seams.hold_next_apply.store(0, .release);
+        conveyor.test_seams.apply_release.notifyWaiters(be.io);
+        released = true;
+    };
+    while (done_b.load(.acquire) == 0 and cs.resident_waits.load() == waits0) std.Thread.yield() catch {};
+    if (done_b.load(.acquire) != 0) {
+        // B was answered past A's hole: the death replay would lose it.
+        const j = try judgeDeath(v, be);
+        try testing.expectEqual(@as(u32, 0), j.past_hole);
+    }
+    try testing.expectEqual(@as(u32, 0), done_b.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), done_a.load(.acquire));
+    conveyor.test_seams.hold_member_ino.store(0, .release);
+    conveyor.test_seams.hold_next_apply.store(0, .release);
+    conveyor.test_seams.apply_release.notifyWaiters(be.io);
+    released = true;
+    while (done_a.load(.acquire) == 0 or done_b.load(.acquire) == 0) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(?anyerror, null), out_a);
+    try testing.expectEqual(@as(?anyerror, null), out_b);
+    const j = try judgeDeath(v, be);
+    try testing.expectEqual(@as(u32, 0), j.past_hole);
+    journal_lane.test_seams.delay_issue.store(0, .release);
+    try be.fsync();
+    try testing.expect(try present(be, ino_a));
+    try testing.expect(try present(be, ino_b));
+}
+
+test "§BX an answer at the apply waits until the journal tail holds every reservation below its window (self-apply): A's member held at its turn — nothing of A in the tail or RAM — and B, a later window, is not answered past A's hole (the death replay keeps every answered op); released, both are answered and the replay keeps both" {
+    const v = try TestVol.create(testing.allocator, "resident-self", "600000");
+    defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_APPLY", "self");
+    const be = try v.open();
+    defer be.close();
+    try residentAnswerRow(v, be, .self);
+}
+
+test "§BX the same law on the venue arm: W1's applier held before its apply, W2 applied by another applier is not answered past W1's hole; released, both are answered and the replay keeps both" {
+    const v = try TestVol.create(testing.allocator, "resident-venue", "600000");
+    defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_APPLY", "venue");
+    const be = try v.open();
+    defer be.close();
+    try residentAnswerRow(v, be, .venue);
+}
+
 test "§BB.5 a journal write that fails AFTER its window was acked: the commit returned Ok and its record STANDS (no rollback), the volume latches FAILED at once (one loud line), the tail still holds the window for the supervisor's replay" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "acked-fail", "600000");

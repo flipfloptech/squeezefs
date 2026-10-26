@@ -854,3 +854,60 @@ test "the drain worker's try-only probe never queues behind the verdict cache's 
     try testing.expectEqual(d, (try p3.result).nodeid);
     try testing.expectEqual(refusals1, stats.dir_stripe_verdict_try_refusals.load());
 }
+
+test "an rmdir reads its victim's verdict and never remembers it: with a reader inside the verdict cache, rmdir of a plain directory completes without joining the cache's queue — the cache's writes are for directories that live on (on mdtest -np 32 every rmdir inserted its dying victim's plain verdict under the EXCLUSIVE lock, and every rank's shared probe queued behind those inserts: 189 µs before the parent's verdict, 373 µs around the victim's, the whole op 600 µs)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var store = try kv_fs.MemStore.init(gpa);
+    defer store.deinit();
+    var nodata: kv_fs.NoData = .{};
+    var fs = try kv_fs.MemFs.mount(gpa, io, &store, &nodata, .{ .dlm_stripes = 64 });
+    defer fs.unmount();
+    var plane = try kv_fs.MemFs.XvPlane.init(gpa, io, &store, &fs.locks, 1, 0, 7, OneHome.resolver(), .{}, 16 << 10);
+    defer plane.deinit();
+    try testing.expectEqual(@as(u32, 0), try fs.bindXv(&plane));
+    const st = try fs.bindStripes(64, .{ .fixed = 2 });
+    defer fs.unbindStripes();
+    var tr = op_trace.OpTrace.begin(0, .other);
+    defer tr.finish();
+    var window: [4096]u8 = undefined;
+    var c: filesystem.Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 1, .io = io, .trace = &tr, .wd_slot = null, .window = &window };
+    const d = (try fs.mkdir(&c, .{ .parent = inos.ROOT_INO, .name = "rank", .mode = 0o755, .umask = 0 })).nodeid;
+    _ = try fs.mkdir(&c, .{ .parent = d, .name = "dir.0", .mode = 0o755, .umask = 0 });
+    const Remover = struct {
+        fs: *kv_fs.MemFs,
+        io: Io,
+        parent: u64,
+        result: Error!void = error.Unexpected,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            var t = op_trace.OpTrace.begin(2, .unlink);
+            defer t.finish();
+            var ctx: filesystem.Ctx = .{ .unique = 2, .uid = 0, .gid = 0, .pid = 1, .io = self.io, .trace = &t, .wd_slot = null, .window = &.{} };
+            self.result = self.fs.rmdir(&ctx, .{ .parent = self.parent, .name = "dir.0" });
+            self.done.store(true, .release);
+        }
+    };
+    const reads0 = stats.dir_stripe_verdict_reads.load();
+    // A reader inside (another worker's probe): the rmdir shares it, or
+    // queues for the exclusive hold an insert needs.
+    st.lock.lockSharedUncancelable(io);
+    var r: Remover = .{ .fs = &fs, .io = io, .parent = d };
+    const th = try std.Thread.spawn(.{}, Remover.run, .{&r});
+    var queued = false;
+    while (!r.done.load(.acquire)) {
+        if (st.lock.waiters(io) != 0) {
+            queued = true;
+            break;
+        }
+        try std.Thread.yield();
+    }
+    st.lock.unlockShared(io);
+    th.join();
+    try testing.expect(!queued);
+    try r.result;
+    // The victim's verdict was read (no stale answer), not remembered.
+    try testing.expectEqual(reads0 + 1, stats.dir_stripe_verdict_reads.load());
+    // Gone: the lookup answers a negative entry.
+    try testing.expectEqual(@as(u64, 0), (try fs.lookup(&c, .{ .parent = d, .name = "dir.0" })).nodeid);
+}

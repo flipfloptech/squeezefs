@@ -1545,7 +1545,7 @@ fn FsyncInbox(comptime weakening: Weakening) type {
     };
 }
 
-/// Model 12 (§BV): a corpse's destroy under self-apply — two leaves L0 < L1,
+/// Model 12 (§BW): a corpse's destroy under self-apply — two leaves L0 < L1,
 /// a record on each — beside two committers, C0 on L0 and C1 on L1, each
 /// its own apply under its one leaf. A leaf is a lock word (its owner, or
 /// free); a take of a held leaf is a no-op step (the explorer prunes it).
@@ -1694,7 +1694,7 @@ fn LeafwiseDestroy(comptime weakening: Weakening) type {
     };
 }
 
-/// Model 13 (§BV): the journal tail's slots under self-apply — every member
+/// Model 13 (§BW): the journal tail's slots under self-apply — every member
 /// acked at the apply claims a slot, released at its window's landing. A
 /// table of 3 slots, windows of 2 members, 3 windows: the pass reserves a
 /// window only while the members of the windows it tracks plus the batch
@@ -1922,12 +1922,12 @@ test "conveyor_fsync_inbox_loses_no_fsync_and_covers_its_window: holds (CAS push
     try explorer.expectFails(FsyncInbox(.fsyncs_after_inbound_scan), .{}, error.InvariantViolated);
 }
 
-test "conveyor_leafwise_destroy_never_waits_holding_a_leaf (§BV): holds (one leaf at a time — no committer ever waits for a leaf the destroy holds while the destroy itself waits; every record applied once); the union hold fails (C0 waits on L0 while the destroy, holding it, waits for L1 under C1)" {
+test "conveyor_leafwise_destroy_never_waits_holding_a_leaf (§BW): holds (one leaf at a time — no committer ever waits for a leaf the destroy holds while the destroy itself waits; every record applied once); the union hold fails (C0 waits on L0 while the destroy, holding it, waits for L1 under C1)" {
     try explorer.expectHolds(LeafwiseDestroy(.none), .{});
     try explorer.expectFails(LeafwiseDestroy(.destroy_union_hold), .{}, error.InvariantViolated);
 }
 
-test "conveyor_tail_gate_never_meets_a_full_table (§BV): holds (register, read the members in flight, park; count at track; the lane gives the slots back, then drops the count, then notifies); no gate and the count dropped before the slots went back each let a member meet a full table; checking before registering strands the parked pass with room" {
+test "conveyor_tail_gate_never_meets_a_full_table (§BW): holds (register, read the members in flight, park; count at track; the lane gives the slots back, then drops the count, then notifies); no gate and the count dropped before the slots went back each let a member meet a full table; checking before registering strands the parked pass with room" {
     try explorer.expectHolds(TailSlots(.none), .{});
     try explorer.expectFails(TailSlots(.no_tail_gate), .{}, error.InvariantViolated);
     try explorer.expectFails(TailSlots(.tail_count_before_release), .{}, error.InvariantViolated);

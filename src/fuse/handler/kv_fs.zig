@@ -82,7 +82,7 @@
 //! `inos.packDestroyEntries`; the batched-destroy economy, `unlink ≤ 1.05
 //! entries/op`). A forgotten corpse is unreachable by name and unknown to
 //! the kernel, so its destroy needs no 4a guard and its apply may take one
-//! leaf at a time (`KvTx.leafwise`, decision 0003 §BV). A corpse whose FORGET or
+//! leaf at a time (`KvTx.leafwise`, decision 0003 §BW). A corpse whose FORGET or
 //! gather died with the daemon (`kill -9`) is found by the next mount's
 //! sweep (`sweepCorpsesAtMount`: one pass over the inode tree for
 //! `nlink == 0`, the same destroy rider) before any request is served.
@@ -2491,7 +2491,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // A corpse is an inode no kernel holds (its last FORGET evicted
             // it, or the mount's sweep found it before any lookup): nothing
             // of it to invalidate (decision 0003 §AB.2) — and no name
-            // reaches it, so its apply may take one leaf at a time (§BV).
+            // reaches it, so its apply may take one leaf at a time (§BW).
             t.kernel_origin = true;
             t.leafwise = true;
             t_owned = false;
@@ -5599,7 +5599,7 @@ pub const MemStore = struct {
     /// count is a law the tests pin, decision 0003 §AV).
     records_committed: u64 = 0,
     /// The last commit's `kernel_origin` / `kernel_told` (the kernel
-    /// view's law) and `leafwise` (§BV: a corpse's destroy alone).
+    /// view's law) and `leafwise` (§BW: a corpse's destroy alone).
     last_kernel_origin: bool = false,
     last_kernel_told: bool = false,
     last_leafwise: bool = false,
@@ -6770,7 +6770,7 @@ test "a FORGET whose corpse judgement would park the drain worker (the inode rea
     var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
     try h.fs.reclaimDrain(&c);
     try testing.expectEqual(destroyed0 + 1, fuse_reclaim_destroys.load());
-    // The destroy names only a corpse: it commits leafwise (§BV), with
+    // The destroy names only a corpse: it commits leafwise (§BW), with
     // nothing of its kernel to invalidate.
     try testing.expect(h.store.last_leafwise and h.store.last_kernel_origin);
     try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);

@@ -500,7 +500,7 @@ pub const GrantPassGate = struct {
     /// past every tombstone to a free slot — after a storm's churn, the
     /// whole table (the 64-rank removal under self-apply spent 26 % of the
     /// daemon's samples in `passBegin`'s probes on the journal lane,
-    /// decision 0003 §BV). An emptied map clears; past a quarter of its
+    /// decision 0003 §BW). An emptied map clears; past a quarter of its
     /// capacity in removals it rehashes in place — O(capacity) per
     /// capacity/4 removals, so O(1) amortized and the tombstones stay
     /// under a quarter of the table.
@@ -1517,7 +1517,7 @@ test "constants with their WHY: the deadline is T_owner, the tick its quarter, t
     try testing.expectEqual(@as(usize, 11), fanoutBucket(12_500));
 }
 
-test "the gate's flight map never fills with tombstones (§BV): 100 000 distinct objects through passBegin/settle with at most 128 in flight — the map's tombstones stay under a quarter of its table, so a new object's insert never probes the whole of it" {
+test "the gate's flight map never fills with tombstones (§BW): 100 000 distinct objects through passBegin/settle with at most 128 in flight — the map's tombstones stay under a quarter of its table, so a new object's insert never probes the whole of it" {
     var g = GrantPassGate.init(testing.allocator);
     defer g.deinit();
     const io = testing.io;

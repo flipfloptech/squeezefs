@@ -770,7 +770,7 @@ pub const Stats = struct {
     /// is a no-op).
     pass_yields: counters.ShardedCounter = .{},
     /// `meta_conveyor_leafwise_applies` / `_leaves`: self-applied members
-    /// that took their leaves one at a time (§BV: a corpse's destroy), and
+    /// that took their leaves one at a time (§BW: a corpse's destroy), and
     /// the leaves they took (`leaves ÷ applies` = a destroy's spread).
     leafwise_applies: counters.ShardedCounter = .{},
     leafwise_leaves: counters.ShardedCounter = .{},
@@ -835,7 +835,7 @@ pub const Stats = struct {
     leaf_takes_admission: counters.ShardedLatencyHistogram = .{},
     leaf_takes_apply: counters.ShardedLatencyHistogram = .{},
     /// `lock_phase_ns.leafwise_leaf_hold`: one leaf a leafwise member held
-    /// (§BV) — the most a committer on that leaf waits behind a destroy.
+    /// (§BW) — the most a committer on that leaf waits behind a destroy.
     leafwise_leaf_hold: counters.ShardedLatencyHistogram = .{},
     /// `meta_leafwise_apply`: a leafwise member's whole apply, its first
     /// take to its last release (its waits included, no leaf held across
@@ -1133,7 +1133,7 @@ pub const Queued = struct {
 
 const Core = conveyor_core.ConveyorCore(Queued);
 
-/// Arenas a window's bytes live in, recycled (§BV): one thread fills them
+/// Arenas a window's bytes live in, recycled (§BW): one thread fills them
 /// (the pass, a self-applying member, the last member's image, an
 /// applier) and another frees them (the lane's verdict). smp_allocator
 /// parks a freed block on the FREEING thread's list and maps a fresh slab
@@ -1247,16 +1247,16 @@ pub const Window = struct {
     pending: std.atomic.Value(u32) = .init(0),
     /// The pass handed the members their turns (`meta_self_window_span`).
     t_turns_ns: u64 = 0,
-    /// Its share of `Conveyor.tail_members` (§BV), returned at its
+    /// Its share of `Conveyor.tail_members` (§BW), returned at its
     /// terminal outcome.
     tail_members: u32 = 0,
-    /// §BV: the tail slot holding the window's trailing PAD (self-applied,
+    /// §BW: the tail slot holding the window's trailing PAD (self-applied,
     /// answered at the apply), claimed by the pass before any turn;
     /// `pad_unclaimed`: it could not be (no member answers ahead of the
     /// landing then — its chain would stop at the window's end).
     pad_slot: ?u32 = null,
     pad_unclaimed: bool = false,
-    /// §BV: a self-applied window's trailing PAD (arena-owned, the pass's):
+    /// §BW: a self-applied window's trailing PAD (arena-owned, the pass's):
     /// the tail's copy and the image's.
     pad_ops: []const journal.WriteOp = &.{},
     pad_header_bytes: u64 = 0,
@@ -1620,7 +1620,7 @@ pub const Conveyor = struct {
     inflight_cap: usize,
     /// Windows untracked since the map's last compaction (`untrack`).
     inflight_removed: usize = 0,
-    /// §BV: the members of the tracked windows of a self-applying conveyor
+    /// §BW: the members of the tracked windows of a self-applying conveyor
     /// with a journal tail — the most slots of the tail's table they can
     /// hold (one per member acked at the apply). The pass is the only
     /// incrementer (at `track`); a window's terminal outcome decrements
@@ -2168,7 +2168,7 @@ pub const Conveyor = struct {
     /// pass (no applier venue to pace it, no pad hold on a sub-page grain),
     /// and at 64 ranks the queue never ran dry — the pass held the journal
     /// lane for batch after batch while the windows it handed off sat
-    /// un-issued in the lane's inbox until the window gate parked it (§BV).
+    /// un-issued in the lane's inbox until the window gate parked it (§BW).
     pub fn pass(self: *Conveyor) void {
         self.pass_thread.store(@intCast(std.Thread.getCurrentId()), .release);
         while (true) {
@@ -2361,7 +2361,7 @@ pub const Conveyor = struct {
         return caps;
     }
 
-    /// THE TAIL GATE (§BV): under self-apply every member acked at the apply
+    /// THE TAIL GATE (§BW): under self-apply every member acked at the apply
     /// claims a slot of the journal tail's table and holds it until its
     /// window lands — a batch's worth of slots per window where the venue
     /// claims one, so the window gate (one cell per window) bounds nothing
@@ -2799,7 +2799,7 @@ pub const Conveyor = struct {
             return;
         };
         if (self.deps.self_apply and self.deps.tail != null) {
-            // Its members and its PAD (§BV).
+            // Its members and its PAD (§BW).
             w.tail_members = @intCast(window_members.len + 1);
             // acq_rel: paired with `returnTailMembers`' drop.
             _ = self.tail_members.fetchAdd(w.tail_members, .acq_rel);
@@ -2834,7 +2834,7 @@ pub const Conveyor = struct {
         const gpa = self.deps.gpa;
         const wa = w.arena.allocator();
         const n = w.members.len;
-        // §BV: the window's trailing PAD is the pass's, built once here: the
+        // §BW: the window's trailing PAD is the pass's, built once here: the
         // tail takes it before any turn and the image is written from the
         // same bytes. Built on the last member's thread it was freed on the
         // lane's, and smp_allocator parks a freed block on the FREEING
@@ -2862,7 +2862,7 @@ pub const Conveyor = struct {
         }
         w.self_applied = true;
         w.t_turns_ns = clock.monotonicNs();
-        // §BV: the window's trailing PAD rides the journal tail BEFORE any
+        // §BW: the window's trailing PAD rides the journal tail BEFORE any
         // member can answer itself — a member's entry chains to the next
         // window's only through it, and the death replay's prefix law drops
         // whatever lies past a missing link (every window after the first:
@@ -2956,7 +2956,7 @@ pub const Conveyor = struct {
         // outcome now whatever its origin — nothing of it will land.
         const outcome: Outcome = if (failed[0]) |e| e else {};
         var early = kernel_origin and (self.deps.ack_at_apply or failed[0] != null);
-        // §BV: under the apply ack EVERY member's entry (or its PAD) rides
+        // §BW: under the apply ack EVERY member's entry (or its PAD) rides
         // the tail, whoever it answers — a range missing from the tail is a
         // hole the death replay stops at, and answered members lie past it.
         if (self.deps.ack_at_apply and p.ops.len != 0) if (self.deps.tail) |t| {
@@ -3033,7 +3033,7 @@ pub const Conveyor = struct {
         }
     }
 
-    /// §BV, a LEAFWISE member's apply (`QueuedTx.leafwise`: a corpse's
+    /// §BW, a LEAFWISE member's apply (`QueuedTx.leafwise`: a corpse's
     /// destroy — no name reaches its objects, no kernel holds them, so no
     /// reader can tell this apply from an atomic one): ONE leaf at a time,
     /// ascending — lock it, revalidate it against the records resolved to
@@ -3601,7 +3601,7 @@ pub const Conveyor = struct {
     /// once at init, never does: past a few thousand windows each `track`
     /// probed the whole table to a free slot. An emptied map clears; past a
     /// quarter of its capacity in removals it rehashes in place (O(1)
-    /// amortized; neither allocates, §BV).
+    /// amortized; neither allocates, §BW).
     fn compactInflightLocked(self: *Conveyor) void {
         const cap = self.inflight.capacity();
         if (cap == 0 or self.inflight_removed * 4 < cap) return;
@@ -5348,7 +5348,7 @@ test "a rollback that cannot complete on a volume ALREADY FAILED is the counted 
     try testing.expectEqual(@as(u64, 0), h.cv.windowsInflight());
 }
 
-test "the in-flight window map never fills with tombstones (§BV): 20 000 windows tracked and untracked two at a time leave its tombstones under a quarter of the table and allocate nothing — a new window's `track` never probes the whole of it" {
+test "the in-flight window map never fills with tombstones (§BW): 20 000 windows tracked and untracked two at a time leave its tombstones under a quarter of the table and allocate nothing — a new window's `track` never probes the whole of it" {
     var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
     const h = try Harness.createWithGpa(.{}, null, false, fa.allocator());
     defer h.destroy();
@@ -5369,7 +5369,7 @@ test "the in-flight window map never fills with tombstones (§BV): 20 000 window
     try testing.expect(tombstones * 4 <= cap);
 }
 
-test "the pass gives its venue a turn between two batches (§BV): a group of three under a one-tx batch cap is ONE pass of three batches — the venue's yield runs after the first and the second (more was queued), never after the last; every member acked" {
+test "the pass gives its venue a turn between two batches (§BW): a group of three under a one-tx batch cap is ONE pass of three batches — the venue's yield runs after the first and the second (more was queued), never after the last; every member acked" {
     const h = try Harness.create(.{}, .{ .max_txs = 1, .max_bytes = 1 << 20 }, true);
     defer h.destroy();
     const Turns = struct {
@@ -5527,7 +5527,7 @@ test "THE WINDOW GATE: with the lane's window cells all but one held (nothing la
 // ring bounds the committer queue, but a committer queues BEFORE ring
 // admission — the 129th simultaneous committer of a floor ring got
 // `ConveyorFull`, EAGAIN to a create, an mkdir, an unlink.
-test "THE TAIL GATE (§BV): under self-apply every member answered at the apply holds a journal-tail slot until its window lands, and so does the window's PAD — with a 4-slot table counted full by two un-landed windows (a member and a PAD each), the third committer's pass parks BEFORE its reservation (no member ever meets the full table: meta_conveyor_tail_slot_misses stays 0) and goes on at the first landing; every create acked and present" {
+test "THE TAIL GATE (§BW): under self-apply every member answered at the apply holds a journal-tail slot until its window lands, and so does the window's PAD — with a 4-slot table counted full by two un-landed windows (a member and a PAD each), the third committer's pass parks BEFORE its reservation (no member ever meets the full table: meta_conveyor_tail_slot_misses stays 0) and goes on at the first landing; every create acked and present" {
     const h = try Harness.create(.{}, null, false);
     defer h.destroy();
     const io = testing.io;
@@ -5632,7 +5632,7 @@ test "THE TAIL GATE (§BV): under self-apply every member answered at the apply 
     try testing.expectEqual(@as(u32, 0), tail.used.load(.acquire));
 }
 
-test "a self-applied window's arenas are recycled (§BV, the idle-RSS law): 48 creates, each from its own committer thread, every window landed by another — once 16 have landed, the only block of the conveyor's allocator a window's landing frees on another thread than the one that allocated it is its `Window`: its own arena, its member's part and its image come back from the pools (smp_allocator parks a freed block on the FREEING thread's list and maps a fresh slab for a thread whose own list is empty: +127 MiB resident after 10,000 creates under a 64 MiB budget)" {
+test "a self-applied window's arenas are recycled (§BW, the idle-RSS law): 48 creates, each from its own committer thread, every window landed by another — once 16 have landed, the only block of the conveyor's allocator a window's landing frees on another thread than the one that allocated it is its `Window`: its own arena, its member's part and its image come back from the pools (smp_allocator parks a freed block on the FREEING thread's list and maps a fresh slab for a thread whose own list is empty: +127 MiB resident after 10,000 creates under a 64 MiB budget)" {
     // Counts the frees of a block on another thread than its allocation's.
     const Crossing = struct {
         child: Allocator,

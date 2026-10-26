@@ -1,6 +1,6 @@
 # Rung 10 — the destroy path under self-apply, and self-apply ships (2026-10-26)
 
-Continues `rung-10-create-path-7.md`. Decision 0003 §BV. Venue: this workstation, `7.3.0-1.7-mainline-sqz`,
+Continues `rung-10-create-path-7.md`. Decision 0003 §BW. Venue: this workstation, `7.3.0-1.7-mainline-sqz`,
 branch `perf/destroy-path-self-apply` off `380866f`. **No benchmark was run**: another agent shared the host
 (load 7–17), so the rates below are correctness runs, not measurements — the counters judge the mechanism and
 the owner's quiet A-B-B-A judges the rates. Rig `~/tmp/destroy-self/mdrig.sh`: 2 MDT + 2 OST on 512-B loop
@@ -12,7 +12,7 @@ devices over `/build/tmp` (the RAM set's grain: the §L pad hold derives off), `
 Wave 7 put the 64-rank collapse on "the reclaim's grouped destroy windows take the venue". On `380866f` the
 destroy is not a group: it is ONE self-applied member of 64 corpses that locked its ~47 leaves ascending and
 held them across every wait (the red test: the earlier of its two leaves still write-locked while it waits for
-the second). Making it leafwise (§BV.1) cut the members' leaf hold 34 → 19 µs and the leaf-take wait 6 → 1 µs,
+the second). Making it leafwise (§BW.1) cut the members' leaf hold 34 → 19 µs and the leaf-take wait 6 → 1 µs,
 but **not the collapse**: the removal's window (handoff → verdict) stayed at 264 ms. The profile named the
 rest — 26 % of the daemon's samples in `GrantPassGate.passBegin`'s hash probes on `sqz-jrnl0`:
 
@@ -28,8 +28,8 @@ rest — 26 % of the daemon's samples in `GrantPassGate.passBegin`'s hash probes
 
 ## The fix (five commits after the red ones)
 
-Leafwise destroy (§BV.1, model 12); the pass yields the lane between batches (§BV.2); the maps compact
-(§BV.3); the tail gate (§BV.4, model 13); the tail holds a window whole (§BV.5); `self` ships (§BV.6). Laws:
+Leafwise destroy (§BW.1, model 12); the pass yields the lane between batches (§BW.2); the maps compact
+(§BW.3); the tail gate (§BW.4, model 13); the tail holds a window whole (§BW.5); `self` ships (§BW.6). Laws:
 a destroy never waits for a leaf while holding one; stage B runs between any two batches of one pass; no member
 ever meets the tail's table full; a window's PAD and every member's entry are in the tail before any member
 answers.
@@ -38,7 +38,7 @@ answers.
 landing held, kill -9, remount) replayed ONE window of the tail and lost `d/x`, `d/y`, `d/z`: each member claimed
 a slot for its own entry, and the window's trailing PAD — the link to the next window — was only in the image
 written at the landing, so the judged death replay (§BR.11 (c)) stopped at the first window's end. Red: backend
-"§BV the death replay of self-applied windows" (`past_hole` 2 for 0). Fixed by §BV.5; the row passes.
+"§BW the death replay of self-applied windows" (`past_hole` 2 for 0). Fixed by §BW.5; the row passes.
 
 | `-np 64` file removal, `self` (counters per phase) | `380866f` | leafwise only | all four |
 |---|---|---|---|
@@ -70,12 +70,12 @@ rows read 0.64–0.97× and 0.64–0.86×. Every run: fsck clean, 0 tripwires, 0
 
 Red first: `d70b6ad` (the destroy holds its earlier leaf), `709d0d2` (no lane turn; both maps' tombstones),
 `0f10a59` (a member meets the tail full), `44b4538` (the tail lacks the window's PAD). Unit `test rails` with `self` the default: 3082/3246 passed, 164
-skipped; filters `conveyor`, `reclaim`, `destroy`, `self-apply`, `backend`, `token`, `§BV` green; models 12
+skipped; filters `conveyor`, `reclaim`, `destroy`, `self-apply`, `backend`, `token`, `§BW` green; models 12
 and 13 hold with every weakening failing. Smoke and xfstests: the branch's last section.
 
 ## Seen, not changed
 
-§BV.7: the directory rows under `self` (removal 0.80–0.88×, creation 0.88–0.91×, settled; at 32 ranks the
+§BW.7: the directory rows under `self` (removal 0.80–0.88×, creation 0.88–0.91×, settled; at 32 ranks the
 rmdir's guarded section is 41 µs against 336, yet the op takes 696 µs against 556 — the gap is outside the
 commit, not established); `mkdir`'s parent-inode leaf convoy at 64 ranks (143–332 µs leaf waits); the turn
 spin's 560–637 k fall-throughs per 640 k ops on driven FUSE lanes; the reclaim's ≈ 22 k corpses/s in both arms;

@@ -209,7 +209,7 @@ pub const KvTx = struct {
     /// Every record names an object no name reaches and no kernel holds (a
     /// forgotten corpse's destroy): no reader can tell the RAM apply from
     /// an atomic one, so a self-applying member takes its leaves ONE AT A
-    /// TIME (decision 0003 §BV). Crash atomicity is the entry's, unchanged.
+    /// TIME (decision 0003 §BW). Crash atomicity is the entry's, unchanged.
     leafwise: bool = false,
     names: NameNotes = .{},
 

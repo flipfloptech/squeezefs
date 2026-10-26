@@ -4031,7 +4031,7 @@ test "§BB.1 the ack at the apply: under the coalesced cadence this mount's kern
     const ino = try commitCreateKernel(be, "early");
     try testing.expect(try present(be, ino));
     try testing.expectEqual(acks0 + 1, be.conveyorStats().acks_at_apply.load());
-    // Self-apply (§BV): the member's slot and its window's PAD's.
+    // Self-apply (§BW): the member's slot and its window's PAD's.
     try testing.expectEqual(@as(u32, 2), be.tail.?.image.writtenCount());
     // fsync parks behind the un-landed window (§BB.4).
     const Sync = struct {
@@ -4294,7 +4294,7 @@ fn stageCorpseDestroy(be: *KvBackend, t: *KvTx, ino: u64) !void {
     try inos.stageDestroy(t, ino, &.{&xk});
 }
 
-test "§BV a corpse's destroy under self-apply holds ONE leaf at a time: with the later of its two leaves held by another, the destroy waits for it holding NOTHING — the earlier leaf is free and its corpse already gone from RAM; released, the destroy lands whole and the reopen replays it" {
+test "§BW a corpse's destroy under self-apply holds ONE leaf at a time: with the later of its two leaves held by another, the destroy waits for it holding NOTHING — the earlier leaf is free and its corpse already gone from RAM; released, the destroy lands whole and the reopen replays it" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "leafwise", "600000");
     defer v.destroy();
@@ -4381,7 +4381,7 @@ test "§BV a corpse's destroy under self-apply holds ONE leaf at a time: with th
     }
 }
 
-test "§BV a self-apply storm with leafwise destroys: 4 threads of kernel creates beside a destroyer of corpses spread over the native tree's leaves, cadence checkpoints running — every member applied itself (self_applies ≡ commits ≡ acks at the apply), every destroy leafwise, a poisoned destroy rolls out ALONE across its leaves (its corpses stand, one rollback, nothing else rolled back), fsync drains the tail, the reopen replays every ack" {
+test "§BW a self-apply storm with leafwise destroys: 4 threads of kernel creates beside a destroyer of corpses spread over the native tree's leaves, cadence checkpoints running — every member applied itself (self_applies ≡ commits ≡ acks at the apply), every destroy leafwise, a poisoned destroy rolls out ALONE across its leaves (its corpses stand, one rollback, nothing else rolled back), fsync drains the tail, the reopen replays every ack" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "leafwise-storm", "600000");
     defer v.destroy();
@@ -4458,7 +4458,7 @@ test "§BV a self-apply storm with leafwise destroys: 4 threads of kernel create
     }
 }
 
-test "§BV the death replay of self-applied windows: three of this mount's kernel creates under self-apply, each its own window, answered at the apply with their writes never issued — the journal tail holds every member's entry AND every window's trailing PAD, so the supervisor's judged replay against the device keeps all three (past_hole 0); the creates land once issued" {
+test "§BW the death replay of self-applied windows: three of this mount's kernel creates under self-apply, each its own window, answered at the apply with their writes never issued — the journal tail holds every member's entry AND every window's trailing PAD, so the supervisor's judged replay against the device keeps all three (past_hole 0); the creates land once issued" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "self-tail", "600000");
     defer v.destroy();
@@ -4502,7 +4502,7 @@ test "§BB.5 a journal write that fails AFTER its window was acked: the commit r
     defer journal_lane.test_seams.delay_issue.store(0, .release);
     const ino = try commitCreateKernel(be, "acked");
     try testing.expect(try present(be, ino));
-    // Self-apply (§BV): the member's slot and its window's PAD's.
+    // Self-apply (§BW): the member's slot and its window's PAD's.
     try testing.expectEqual(@as(u32, 2), be.tail.?.image.writtenCount());
     journal_lane.test_seams.fail_windows.store(1, .release);
     defer journal_lane.test_seams.fail_windows.store(0, .release);

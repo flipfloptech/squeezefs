@@ -1,7 +1,7 @@
 # Rung 10 — self-apply follow-ups: the rmdir's prelude, and answers inside the resident prefix (2026-10-26)
 
 Continues `rung-10-destroy-path.md`. Decision 0003 §BX. Venue: this workstation, `7.3.0-1.7-mainline-sqz`,
-branch `perf/self-apply-followups` off `ca26920`. **No benchmark was run**: correctness runs only (rig
+branch `perf/self-apply-followups` off `e23cad3`. **No benchmark was run**: correctness runs only (rig
 `~/tmp/destroy-self/mdrig.sh`, 2 MDT + 2 OST on 512-B loop devices, `mdtest -n 10000 -u`, settled phases,
 a `.stats` delta per phase, fsck clean after every run); the owner's A-B-B-A judges the rates.
 
@@ -37,19 +37,26 @@ the kill rows, two mounts, the shared hot directory, the 32-stream mint storm �
 Red `6956c0a`: A held before anything of it reaches the journal tail, B in a later window answered at the
 apply; `judgedReplay` → `past_hole` 2 (self), 1 (venue): the supervisor drops B. Law: an answer ahead of the
 landing is released only when every reservation below its own entry is landed or in the tail (the
-registry's `resident_upto`, model 14). Fix `888d709`: `past_hole` 0 in both arms. Unit 3066/3231 (165
-skipped), rails, fmt; smoke 14/14 (THE REPLAY PROOF, the kill rows and matrix, both tar kills, the unlink
-storm, two mounts, 300 fsyncs, the idle-RSS rows); xfstests generic/001 013 074 753 pass.
+registry's `resident_upto`, model 14). The first fix (`888d709`) claimed each entry after its apply; every
+answer then waited for every earlier member's apply — a convoy (clean A/B, `self`: file creation 228 → 152 k
+at -np 32, 56–67 % of answers parked 115–345 µs). The owner's ruling: keep the law, cut the convoy.
 
-**The cost is not a fence and a cursor.** Clean interleaved A/B (`e23cad3` → `888d709`, `self`, quiet host):
+- **The entry at the turn** (red `7702840`, fix `24f8eaa`): a member claims its entry at its turn, before its
+  apply; a failing member claims a PAD, releases its entry, then answers its error; the venue claims its
+  image at the window's start, for every window. Parked: 26–36 % / 41–46 % (-np 32 / 64), 110–356 µs — a
+  turn delivered is not a turn run.
+- **The help** (red `86bcfc0`, fix `33c9d61`): each entry (image) is claimed once by CAS, by its owner or by
+  a parked answer, which claims what holds the prefix below it before it parks. Targeted wakes; the waiter
+  list under the executor's mutex (a spin lock wedged THE MINT WINDOWS row on the first cut).
 
-| | -np 32 before → after | -np 64 before → after |
-|---|---|---|
-| file creation | 228 → 152 k | 211 → 128 k |
-| file removal | 238 → 135 k | 221 → 122 k |
-| answers that waited / mean wait | 0 → 56 % / 115 µs | 0 → 67 % / 345 µs |
-| daemon CPU per op | 63 → 83 µs | 65 → 100 µs |
+| correctness runs (counters per phase) | self -np 32 | self -np 64 | venue -np 32 / 64 |
+|---|---|---|---|
+| answers that park | 10–17 % | 19–29 % | 6–15 % |
+| mean wait (help included) | 24–36 µs | 68–127 µs | 5–16 µs |
+| file creation / removal | 220 / 232 k | 191 / 190 k | 152–146 / 132–135 k |
+| directory creation / removal | 173 / 200 k | 129 / 181 k | 84–89 / 87–94 k |
 
-It is a convoy: every answer waits for EVERY earlier member's claim, and one member slow to run (64 ranks on
-32 CPUs) holds all later answers. The venue arm waits on 45–50 % of its windows (100–450 µs): a window that is
-not all this kernel's ops never reaches the tail before its landing. The options are in §BX.5.
+`past_hole` 0 in both arms; models 14 and 15 hold with every weakening failing; unit 3070/3235 (165
+skipped), rails, fmt; smoke 14/14; xfstests generic/001 013 074 753 pass; fsck clean after every run. What
+still parks at -np 64: an owner preempted inside its claim (64 ranks on 32 CPUs), a window the pass is still
+handing out, an SMO entry (it reaches the device only by its landing).

@@ -7,7 +7,8 @@
 //! acquisition and minting with parent affinity and the manager's five
 //! slot verbs (`acquire`), holder-decided handover — the dominance window,
 //! the offer rule, flush-then-transfer (`handover`), the page-budget law
-//! (`page_budget`) and slot → holder resolution (`resolve`). Portable
+//! (`page_budget`), slot → holder resolution (`resolve`) and the
+//! per-thread mint window with its models (`mint_window`). Portable
 //! throughout; the plane bound to a backend's regions, trees and
 //! checkpoint hooks is `sym/bind.zig`'s (Linux).
 
@@ -23,6 +24,7 @@ pub const page_budget = @import("slots/page_budget.zig");
 pub const resolve = @import("slots/resolve.zig");
 pub const tails_spill = @import("slots/tails_spill.zig");
 pub const moves = @import("slots/moves.zig");
+pub const mint_window = @import("slots/mint_window.zig");
 
 pub const LeaseTable = lease_table.LeaseTable;
 pub const Door = door.Door;
@@ -78,6 +80,8 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try counters.writeNamespaceJson(resolve.stats, w);
     try w.writeAll(",\"tails_spill\":");
     try counters.writeNamespaceJson(tails_spill.stats, w);
+    try w.writeAll(",\"mint_window\":");
+    try counters.writeNamespaceJson(mint_window.stats, w);
     try w.writeByte('}');
 }
 
@@ -91,6 +95,7 @@ test {
     _ = resolve;
     _ = tails_spill;
     _ = moves;
+    _ = mint_window;
     _ = @import("slots/move_epoch_model.zig");
     _ = @import("slots/mint_window_model.zig");
 }

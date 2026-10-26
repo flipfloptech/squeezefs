@@ -179,7 +179,10 @@ pub fn cursorFloor(tree0_cursor: u64, page_cursor: ?u64, window_max_ino: ?u64, h
 // The mint decision (spec §2.4 `mint_choice`).
 // ---------------------------------------------------------------------------
 
-pub const RotorTree = struct { slot: u16, bytes: u64 };
+/// A rotor tree in the census: its slot, its live bytes, and whether
+/// another thread's mint window claims it (`mint_window`, decision 0003
+/// §BV: the pick skips a claimed tree while any is unclaimed).
+pub const RotorTree = struct { slot: u16, bytes: u64, claimed: bool = false };
 
 pub const MintInputs = struct {
     /// The parent's slot and whether THIS mount leases it as a non-native slot.
@@ -239,18 +242,24 @@ pub fn mintChoice(in: MintInputs) MintChoice {
             break;
         }
     }
+    // The pick (steps 2 and 3) skips a claimed tree while any is
+    // unclaimed; the over-ceiling verdict above reads every tree.
+    var any_free = false;
+    for (in.rotor) |r| any_free = any_free or !r.claimed;
+    const start = firstCandidate(in.rotor, in.rr % in.rotor.len, any_free);
     if (all_over) {
         if (in.rotor.len < in.rotor_cap) return .overflow;
-        var best = in.rotor[in.rr % in.rotor.len];
-        for (in.rotor) |r| if (r.bytes < best.bytes) {
+        var best = in.rotor[start];
+        for (in.rotor) |r| if ((!any_free or !r.claimed) and r.bytes < best.bytes) {
             best = r;
         };
         return .{ .smallest = best.slot };
     }
     // 3. The most signed headroom `a_max − bytes`, ties by the rr cursor.
-    var best_i = in.rr % in.rotor.len;
+    var best_i = start;
     var best_h: i128 = @as(i128, in.a_max) - in.rotor[best_i].bytes;
     for (in.rotor, 0..) |r, i| {
+        if (any_free and r.claimed) continue;
         const h: i128 = @as(i128, in.a_max) - r.bytes;
         if (h > best_h) {
             best_h = h;
@@ -258,6 +267,14 @@ pub fn mintChoice(in: MintInputs) MintChoice {
         }
     }
     return .{ .rotor = in.rotor[best_i].slot };
+}
+
+/// The rr cursor's tree, or — when it is claimed and an unclaimed one
+/// exists — the first unclaimed tree.
+fn firstCandidate(rotor: []const RotorTree, at: usize, any_free: bool) usize {
+    if (!any_free or !rotor[at].claimed) return at;
+    for (rotor, 0..) |r, i| if (!r.claimed) return i;
+    unreachable;
 }
 
 /// The counters a choice feeds (the overflow arm counts its own grant).
@@ -1154,6 +1171,25 @@ test "mint_choice: affinity below the ceiling; a spill to the most-headroom roto
     var none = over;
     none.rotor = &.{};
     try testing.expectEqual(MintChoice.none, mintChoice(none));
+    // A claimed tree (another thread's mint window, §BV) is skipped while
+    // an unclaimed one exists — the rr cursor's and the most-headroom
+    // alike; every tree claimed ⇒ the law over all; the over-ceiling
+    // verdict reads every tree, claimed or not.
+    const claimed = [_]RotorTree{ .{ .slot = 5, .bytes = 3 * node, .claimed = true }, .{ .slot = 6, .bytes = 8 * node }, .{ .slot = 7, .bytes = 12 * node } };
+    var cl = over;
+    cl.rotor = &claimed;
+    try testing.expectEqual(@as(u16, 6), mintChoice(cl).rotor);
+    cl.rr = 2;
+    try testing.expectEqual(@as(u16, 6), mintChoice(cl).rotor);
+    const all_claimed = [_]RotorTree{ .{ .slot = 5, .bytes = 3 * node, .claimed = true }, .{ .slot = 6, .bytes = 8 * node, .claimed = true } };
+    cl.rotor = &all_claimed;
+    try testing.expectEqual(@as(u16, 5), mintChoice(cl).rotor);
+    const over_claimed = [_]RotorTree{ .{ .slot = 5, .bytes = 11 * node, .claimed = true }, .{ .slot = 6, .bytes = 13 * node } };
+    cl.rotor = &over_claimed;
+    cl.rotor_cap = 4;
+    try testing.expectEqual(MintChoice.overflow, mintChoice(cl));
+    cl.rotor_cap = 2;
+    try testing.expectEqual(@as(u16, 6), mintChoice(cl).smallest);
     const a0 = stats.affinity_mints.load();
     const r0 = stats.rotor_mints.load();
     const s0 = stats.affinity_ceiling_spills.load();

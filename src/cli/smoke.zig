@@ -5453,7 +5453,12 @@ test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B 
     std.debug.print("smoke: kill rows (b): B PARKED {d} ms after the kill (acks held; .stats readable, naming the park); the storm child is alive, waiting\n", .{parked_ms});
     // Remount A: the D0 ladder's same-host dead-pid proof; A wins volume
     // 0 again as the manager at term 2 with the grace window open.
-    const mark = try rig.logLen();
+    // The second arm's daemon appends to the first's log: its readiness
+    // is the line after the mark.
+    const mark = rig.logLen() catch |e| switch (e) {
+        error.FileNotFound => 0,
+        else => return e,
+    };
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(mark);
     {
@@ -11865,6 +11870,79 @@ test "smoke: the data plane WITHOUT the write cache (SQUEEZEFS_WRITE_CACHE_PCT=0
     const rig = try Rig.init(testing.allocator, io);
     defer rig.deinit();
     try dataPlanePass(rig, false);
+}
+
+/// The mint-window row: create streams (one shell process each, its own
+/// directory — mdtest -u's shape) × files per stream.
+const mint_storm_streams: u64 = 32;
+const mint_storm_files: u64 = 2000;
+
+/// One arm of the mint-window row on a freshly formatted set:
+/// the storm, every file counted, the arm's counters and the conveyor's
+/// leaf waits per window; umount and fsck --offline --scrub.
+const MintArm = struct { grants: u64, window_mints: u64, burns: u64, windows: u64, waits_ns: u64, takes: u64, hold_ns: u64 };
+
+fn mintStormArm(rig: *Rig, arm: []const u8) !MintArm {
+    try rig.formatSet(false);
+    try rig.env.put("SQUEEZEFS_META_MINT_WINDOW", arm);
+    // The second arm's daemon appends to the first's log: its readiness
+    // is the line after the mark.
+    const mark = rig.logLen() catch |e| switch (e) {
+        error.FileNotFound => 0,
+        else => return e,
+    };
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    const before = try rig.statsTail();
+    defer rig.gpa.free(before);
+    var script_buf: [512]u8 = undefined;
+    const script = try std.fmt.bufPrint(&script_buf, "mkdir {s}; cd {s}; s=0; while [ $s -lt {d} ]; do (mkdir s$s && cd s$s && seq -f f%g 1 {d} | xargs touch) & s=$((s+1)); done; wait; find . -type f | wc -l", .{ arm, arm, mint_storm_streams, mint_storm_files });
+    const out = try rig.onMountTimed(script, 600);
+    defer rig.gpa.free(out);
+    try testing.expectEqual(mint_storm_streams * mint_storm_files, std.fmt.parseInt(u64, std.mem.trim(u8, out, " \n"), 10) catch 0);
+    const after = try rig.statsTail();
+    defer rig.gpa.free(after);
+    try expectMustStayZero(after);
+    const d = struct {
+        fn of(a: []const u8, b: []const u8, k: []const u8) u64 {
+            return (numberAfter(b, k) orelse 0) -| (numberAfter(a, k) orelse 0);
+        }
+        fn hist(a: []const u8, b: []const u8, k: []const u8, f: []const u8) u64 {
+            return (histFieldAfter(b, k, f) orelse 0) -| (histFieldAfter(a, k, f) orelse 0);
+        }
+    };
+    const res: MintArm = .{
+        .grants = d.of(before, after, "\"mint_window_grants\":"),
+        .window_mints = d.of(before, after, "\"mint_window_mints\":"),
+        .burns = d.of(before, after, "\"mint_burns\":"),
+        .windows = d.hist(before, after, "\"meta_apply_total\":", "\"count\":"),
+        .waits_ns = d.hist(before, after, "\"leaf_takes_apply\":", "\"sum_ns\":"),
+        .takes = d.hist(before, after, "\"leaf_takes_apply\":", "\"count\":"),
+        .hold_ns = d.hist(before, after, "\"leaf_lock_hold\":", "\"sum_ns\":"),
+    };
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, arm);
+    return res;
+}
+
+test "smoke: THE MINT WINDOWS UNDER A 32-STREAM CREATE STORM (decision 0003 §BV; mdtest -u's shape) — 32 shell streams, each in its own directory, 2,000 creates each, once under SQUEEZEFS_META_MINT_WINDOW=census and once under the shipped `window` arm: every file counted, no ino burned on a quiet solo mount, the windows' counters move only under `window` (a grant per stream at least, most rotor mints off a window), no tripwire, fsck --offline --scrub clean after each; the conveyor's leaf waits and hold per apply window REPORTED for both arms (a timing relation is never asserted)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    const census = try mintStormArm(rig, "census");
+    const window = try mintStormArm(rig, "window");
+    const creates = mint_storm_streams * mint_storm_files;
+    for ([_]struct { name: []const u8, a: MintArm }{ .{ .name = "census", .a = census }, .{ .name = "window", .a = window } }) |r| {
+        std.debug.print("smoke[mint windows]: {s}: {d} creates over {d} apply windows — leaf waits {d} ns per window ({d} takes), hold {d} ns per window; window grants {d}, window mints {d}, burns {d}\n", .{ r.name, creates, r.a.windows, r.a.waits_ns / @max(r.a.windows, 1), r.a.takes, r.a.hold_ns / @max(r.a.windows, 1), r.a.grants, r.a.window_mints, r.a.burns });
+    }
+    try testing.expectEqual(@as(u64, 0), census.grants);
+    try testing.expectEqual(@as(u64, 0), census.window_mints);
+    try testing.expectEqual(@as(u64, 0), census.burns + window.burns);
+    try testing.expect(window.grants >= mint_storm_streams);
+    try testing.expect(window.window_mints >= creates / 2);
 }
 
 /// The unlink-storm law row: directories × files per directory, and the

@@ -20,6 +20,7 @@ const Io = std.Io;
 
 const counters = @import("../../../core/counters.zig");
 const clock = @import("../../../core/clock.zig");
+const derive = @import("../../../core/derive.zig");
 const log = @import("../../../core/log.zig");
 const knobs = @import("../../../core/knobs.zig");
 const sync = @import("../../../sync/sync.zig");
@@ -50,6 +51,7 @@ const acquire = slots.acquire;
 const handover = slots.handover;
 const page_budget = slots.page_budget;
 const resolve = slots.resolve;
+const mint_window = slots.mint_window;
 const fencing = @import("../membership/fencing.zig");
 
 comptime {
@@ -131,9 +133,18 @@ pub const Plane = struct {
     /// here — before the open's first frame writer (the ring-recovery
     /// preflight inside the claim gate) — and installed into the cache.
     frames: fencing.FramePlane,
+    /// The mint windows (decision 0003 §BV): the streams' windows, the
+    /// per-slot claims, the arm, the window's mints.
+    windows: mint_window.Windows,
+    claims: mint_window.Claims,
+    /// The last census mint's thread and the end of its window age: the
+    /// concurrency a window needs.
+    mint_recent: mint_window.Recent = .{},
     /// Test seam: the next mint parks between its slot decision and its
     /// `fetch_add` (one relaxed load when unarmed).
     mint_seam: MintSeam = .{},
+    windows_on: bool,
+    window_mints: u32,
 
     pub const InitError = error{ OutOfMemory, Io, Corrupt };
 
@@ -156,8 +167,16 @@ pub const Plane = struct {
             .cooldown_ns = cooldown_ns,
             .affinity_mib = knobs.optIntKnob("SQUEEZEFS_SYM_AFFINITY_MAX_MB", u64, env),
             .frames = fencing.FramePlane.init(gpa, table, be.stamp.native_slot),
+            .windows = undefined,
+            .claims = undefined,
+            .windows_on = std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_META_MINT_WINDOW", env), "window"),
+            .window_mints = mint_window.windowMints(be.sb.node_size),
         };
         errdefer self.frames.deinit();
+        self.claims = try mint_window.Claims.init(gpa);
+        errdefer self.claims.deinit(gpa);
+        self.windows = try mint_window.Windows.init(gpa, derive.facts().cpus);
+        errdefer self.windows.deinit(gpa);
         self.seam.hold = std.meta.stringToEnum(handover.Hold, knobs.enumKnob("SQUEEZEFS_TEST_HANDOVER_HOLD", env)) orelse .off;
         self.door = .{ .table = table, .io = io, .armed = false, .hosted = .{ .ctx = self, .hosts = hostsFn }, .foreign_touch = .{ .ctx = self, .note = foreignTouchFn }, .t_idle_ns = t_idle_ns };
         self.cache = resolve.SlotHolderCache.init(gpa, table, self, ownsFn);
@@ -258,6 +277,8 @@ pub const Plane = struct {
         self.judge.deinit();
         self.publications.deinit(self.gpa);
         self.frames.deinit();
+        self.claims.deinit(self.gpa);
+        self.windows.deinit(self.gpa);
         self.table.deinit();
         self.gpa.destroy(self);
     }
@@ -1452,45 +1473,69 @@ pub const Plane = struct {
 
     /// A mint's slot and the lease generation its decision read: `g` is
     /// set when the decision took a slot this mount leases (affinity, the
-    /// rotor) — the ino minted there is kept only if the slot still stands
-    /// at `g` after the `fetch_add` (`mintStands`); null for the gather
-    /// arm's parent slot, which the commit's door judges.
+    /// rotor, a window) — the ino minted there is kept only if the slot
+    /// still stands at `g` after the `fetch_add` (`mintStands`); null for
+    /// the gather arm's parent slot, which the commit's door judges.
     pub const Mint = struct { slot: u16, g: ?u32 = null };
 
     /// The slot a child of `parent_slot` mints into on this volume: the
-    /// gather arm first, then `mint_choice` over the rotor; null = the
-    /// caller's rotor (an unarmed plane).
-    pub fn mintSlot(self: *Plane, parent_slot: u16, parent_on_this_volume: bool, gather: bool, rr: u64) ?Mint {
+    /// gather arm first, then the parent's slot under the affinity
+    /// ceiling, then the minting stream's window (`minter`, a
+    /// `mint_window.minterToken`; decision 0003 §BV), else `mint_choice`
+    /// over the rotor — whose pick skips the trees other streams' windows
+    /// claim and, beside another minting stream, opens this stream's
+    /// window on it; null = the caller's rotor (an unarmed plane).
+    pub fn mintSlot(self: *Plane, parent_slot: u16, parent_on_this_volume: bool, gather: bool, rr: u64, minter: u32) ?Mint {
         if (!self.armed) return null;
         const be = self.be;
         const native = be.stamp.native_slot == parent_slot;
         if (acquire.gatherMintSlot(parent_on_this_volume, native, gather, parent_slot)) |s| return .{ .slot = s };
         const pv = self.table.view(parent_slot);
-        // `A_max(t)` is DYNAMIC: the live leaf census at every decision
-        // (the static knob, when set, is the whole law).
-        const a_max = if (self.affinity_mib) |_| self.a_max else acquire.affinityCeiling(self.usedLeafBytes(), be.sb.node_size);
         const parent_leased_non_native = parent_on_this_volume and !native and pv.leasedBy(self.me) and pv.state != .releasing;
-        const parent_tree_bytes = self.treeBytes(parent_slot);
-        if (acquire.affinityHolds(parent_leased_non_native, parent_tree_bytes, a_max)) {
-            acquire.countChoice(.{ .affinity = parent_slot }, true);
-            return .{ .slot = parent_slot, .g = pv.g };
+        const parent_tree_bytes = if (parent_leased_non_native) self.treeBytes(parent_slot) else 0;
+        // `A_max(t)` is DYNAMIC: the live leaf census at every decision
+        // (the static knob, when set, is the whole law). Affinity reads
+        // it only for a parent it could take.
+        var a_max: ?u64 = null;
+        if (parent_leased_non_native) {
+            a_max = self.affinityCeiling();
+            if (acquire.affinityHolds(true, parent_tree_bytes, a_max.?)) {
+                acquire.countChoice(.{ .affinity = parent_slot }, true);
+                return .{ .slot = parent_slot, .g = pv.g };
+            }
         }
+        const now_ns = clock.monotonicNs();
+        if (self.windows_on) if (self.windowMint(minter, now_ns)) |m| {
+            mint_window.stats.mint_window_mints.inc();
+            acquire.countChoice(.{ .rotor = m.slot }, parent_leased_non_native);
+            return m;
+        };
+        const now_ms = now_ns / std.time.ns_per_ms;
+        // A window opens only beside another minting stream (one whose
+        // census ran on this plane within one window age): a lone creator
+        // has nobody to separate from and keeps the census's per-mint
+        // spread over the rotor.
+        const concurrent = self.windows_on and self.mint_recent.otherLive(minter, now_ms);
+        if (self.windows_on) self.mint_recent.note(minter, now_ms, mint_window.windowAgeNs() / std.time.ns_per_ms);
         var rotor: [lt.LeaseTable.PICK_MAX]acquire.RotorTree = undefined;
         var n: usize = 0;
+        var free: usize = 0;
         var held: std.ArrayList(u16) = .empty;
         defer held.deinit(self.gpa);
         self.table.heldBy(self.me, &held) catch return null;
         for (held.items) |s| {
             const v = self.table.view(s);
             if (!v.rotor or v.state == .releasing or n == rotor.len) continue;
-            rotor[n] = .{ .slot = s, .bytes = self.treeBytes(s) };
+            const claimed = self.windows_on and self.claims.heldByOther(s, minter, now_ms);
+            rotor[n] = .{ .slot = s, .bytes = self.treeBytes(s), .claimed = claimed };
+            free += @intFromBool(!claimed);
             n += 1;
         }
         const in: acquire.MintInputs = .{
             .parent_slot = parent_slot,
             .parent_leased_non_native = parent_leased_non_native,
             .parent_tree_bytes = parent_tree_bytes,
-            .a_max = a_max,
+            .a_max = a_max orelse self.affinityCeiling(),
             .node_size = be.sb.node_size,
             .rotor = rotor[0..n],
             .rotor_cap = acquire.rotorCap(self.m),
@@ -1505,19 +1550,56 @@ pub const Plane = struct {
         } orelse return null;
         // The generation is read AFTER the choice (an overflow's grant
         // landed inside it): the recheck compares the ino's slot to it.
-        return .{ .slot = slot, .g = self.table.view(slot).g };
+        const g = self.table.view(slot).g;
+        if (self.windows_on) {
+            if (concurrent and n > 0 and free == 0) mint_window.stats.mint_window_shared.inc();
+            self.setWindow(minter, if (concurrent) slot else null, g, now_ns);
+        }
+        return .{ .slot = slot, .g = g };
     }
 
-    /// The handover law (decision 0003 §BV; `mint_window_model.
-    /// MintRecheck`): an ino minted in `slot` under a decision that read
-    /// generation `g` is KEPT only if, after its `fetch_add`, the slot
-    /// still names this mount at `g` and is not releasing. The release's
-    /// gate store (seq_cst) precedes its cursor read; this load (seq_cst)
-    /// follows the mint's `fetch_add` (seq_cst) — one of the two sees the
-    /// other, so a kept ino is below the cursor the release carries.
-    pub fn mintStands(self: *Plane, slot: u16, g: u32) bool {
-        const v = self.table.view(slot);
-        return v.leasedBy(self.me) and v.state != .releasing and v.g == g;
+    /// The affinity ceiling in force: the static knob verbatim, else the
+    /// live leaf census.
+    fn affinityCeiling(self: *Plane) u64 {
+        if (self.affinity_mib) |_| return self.a_max;
+        return acquire.affinityCeiling(self.usedLeafBytes(), self.be.sb.node_size);
+    }
+
+    /// One mint off the stream's standing window: mints and time left, its
+    /// claim untaken, its slot a rotor lease of this mount at the window's
+    /// generation and not releasing. Null = no window stands (the census).
+    fn windowMint(self: *Plane, minter: u32, now_ns: u64) ?Mint {
+        const set = self.windows.setOf(minter);
+        set.lock.lock();
+        defer set.lock.unlock();
+        const e = set.find(minter) orelse return null;
+        const w = &e.w;
+        if (w.claim == 0 or w.left == 0 or now_ns >= w.expires_ns) return null;
+        if (!self.claims.stillMine(w.slot, w.claim)) return null;
+        const v = self.table.view(w.slot);
+        if (!(v.leasedBy(self.me) and v.state != .releasing and v.rotor and v.g == w.g)) return null;
+        w.left -= 1;
+        return .{ .slot = w.slot, .g = w.g };
+    }
+
+    /// The census picked `slot` for this stream: its previous window's
+    /// claim goes back, and — beside another stream (`slot` non-null) —
+    /// `slot` is claimed for one window (a claim another stream took first
+    /// leaves this mint windowless: the next re-runs the census).
+    fn setWindow(self: *Plane, minter: u32, slot: ?u16, g: u32, now_ns: u64) void {
+        const set = self.windows.setOf(minter);
+        set.lock.lock();
+        defer set.lock.unlock();
+        if (set.find(minter)) |e| if (e.w.claim != 0) {
+            self.claims.release(e.w.slot, e.w.claim);
+            e.w = .{};
+        };
+        const s = slot orelse return;
+        const expires_ns = now_ns + mint_window.windowAgeNs();
+        const claim = self.claims.tryClaim(s, minter, now_ns / std.time.ns_per_ms, expires_ns / std.time.ns_per_ms) orelse return;
+        const e = set.take(minter);
+        e.w = .{ .slot = s, .g = g, .claim = claim, .left = self.window_mints -| 1, .expires_ns = expires_ns };
+        mint_window.stats.mint_window_grants.inc();
     }
 
     /// The mint seam's hold (a test's): one shot, the slot published.
@@ -1527,6 +1609,29 @@ pub const Plane = struct {
         self.mint_seam.slot.store(slot, .release);
         self.mint_seam.reached.set(self.io);
         self.mint_seam.release.waitUncancelable(self.io);
+    }
+
+    /// The handover law (decision 0003 §BV; `mint_window_model.
+    /// MintRecheck`): an ino minted in `slot` under a decision that read
+    /// generation `g` is KEPT only if, after its `fetch_add`, the slot
+    /// still names this mount at `g` and is not releasing. The release's
+    /// gate store (seq_cst) precedes its cursor read; this load (seq_cst)
+    /// follows the mint's `fetch_add` (seq_cst) — one of the two sees the
+    /// other, so a kept ino is below the cursor the release carries. A
+    /// refusal drops the thread's window on this plane.
+    pub fn mintStands(self: *Plane, slot: u16, g: u32, minter: u32) bool {
+        const v = self.table.view(slot);
+        if (v.leasedBy(self.me) and v.state != .releasing and v.g == g) return true;
+        if (self.windows_on) {
+            const set = self.windows.setOf(minter);
+            set.lock.lock();
+            defer set.lock.unlock();
+            if (set.find(minter)) |e| if (e.w.claim != 0 and e.w.slot == slot) {
+                self.claims.release(e.w.slot, e.w.claim);
+                e.w = .{};
+            };
+        }
+        return false;
     }
 
     /// One more rotor slot (PARK admission in-process; `AcquireSlots(1)`

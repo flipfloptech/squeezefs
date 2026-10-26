@@ -1,8 +1,8 @@
-//! The mint's recheck against a handover of its slot (`slots/plane.zig`
-//! `mintStands`, decision 0003 §BV) as an exhaustive model, with the
-//! weakenings that break it.
+//! The mint's two lock-free halves (decision 0003 §BV) as exhaustive
+//! models, each with the weakenings that break it.
 //!
-//! `MintRecheck`. Shared words: `holder`/`releasing` (the slot's lease
+//! 1. `MintRecheck` — the recheck against a handover of the minted slot
+//! (`slots/plane.zig` `mintStands`). Shared words: `holder`/`releasing` (the slot's lease
 //! word), `g` (the lease generation), `cell` (the slot's cursor cell on the
 //! minting mount), `floor` (the cursor the release carries to the
 //! receiver).
@@ -24,6 +24,14 @@
 //! word only, so the slot released and granted back between the check and
 //! the RMW reads as ours; (c) `gate_buffered` — the gate store drains
 //! after the cursor read (no fence between the release's two halves).
+//!
+//! 2. `WindowClaim` — two threads claiming one slot's mint window through
+//! its claim word (`mint_window.Claims.tryClaim`): read the word; free ⇒
+//! CAS(free → me); a thread holds the window iff its CAS won. The law:
+//! never two holders. Weakening `store_claim`: the free word read, then a
+//! plain store (check-then-store) — both hold. (A claim's expiry only
+//! frees a word a thread stopped using; the claim orders no mint — the
+//! recheck above does.)
 
 const std = @import("std");
 const explorer = @import("../../../model/explorer.zig");
@@ -134,4 +142,59 @@ test "the mint against a handover of its slot: check → RMW → recheck keeps o
     try explorer.expectFails(MintRecheck(.no_recheck), .{}, error.InvariantViolated);
     try explorer.expectFails(MintRecheck(.recheck_ignores_generation), .{}, error.InvariantViolated);
     try explorer.expectFails(MintRecheck(.gate_buffered), .{}, error.InvariantViolated);
+}
+
+pub const ClaimWeakening = enum { none, store_claim };
+
+pub fn WindowClaim(comptime weak: ClaimWeakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 2;
+        const FREE: u8 = 0;
+
+        word: u8 = FREE,
+        pc: [2]u8 = .{ 0, 0 },
+        seen: [2]u8 = .{ FREE, FREE },
+        holds: [2]bool = .{ false, false },
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return self.pc[t] >= 2;
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            const me: u8 = @intCast(t + 1);
+            switch (self.pc[t]) {
+                0 => self.seen[t] = self.word,
+                1 => if (self.seen[t] == FREE) switch (weak) {
+                    .none => if (self.word == FREE) {
+                        self.word = me;
+                        self.holds[t] = true;
+                    },
+                    .store_claim => {
+                        self.word = me;
+                        self.holds[t] = true;
+                    },
+                },
+                else => unreachable,
+            }
+            self.pc[t] += 1;
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            if (self.holds[0] and self.holds[1]) return error.TwoHolders;
+        }
+
+        pub fn final(self: *const Self) !void {
+            try self.invariant();
+        }
+    };
+}
+
+test "the window claim: one CAS from free names one holder; a check-then-store names two" {
+    try explorer.expectHolds(WindowClaim(.none), .{});
+    try explorer.expectFails(WindowClaim(.store_claim), .{}, error.InvariantViolated);
 }

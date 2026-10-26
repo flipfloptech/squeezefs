@@ -1125,7 +1125,7 @@ test "linux: A MINT RACING THE HANDOVER OF ITS SLOT keeps no ino the receiver mi
     be0.slots.mint_seam.armed.store(true, .release);
     const Minter = struct {
         fn run(st: *MetaSet, out: *(meta_set.Error!u64)) void {
-            out.* = st.allocateIno(st.effectiveIno(inos.ROOT_INO), false, false);
+            out.* = st.allocateIno(st.effectiveIno(inos.ROOT_INO), false, false, 0);
         }
     };
     var minted: meta_set.Error!u64 = error.Io;
@@ -1159,4 +1159,118 @@ test "linux: A MINT RACING THE HANDOVER OF ITS SLOT keeps no ino the receiver mi
     // What A answers is a slot A still leases.
     try testing.expect(be0.slots.table.view(route_table.slotOf(a_global)).leasedBy(lt.MANAGER));
     try testing.expect(acquire.stats.mint_burns.load() >= burns0 + 1);
+}
+
+test "linux: CONCURRENT MINTERS NEVER MINT ONE INO TWICE, across window refills and a handover of a windowed slot (decision 0003 §BV): eight threads mint through A's set, each past two window refills; mid-run, every thread paused inside its window, A hands the tree one window claims to B, which mints there; the threads resume — every ino A's threads and B minted is distinct, the windows stood on distinct trees, and the robbed window re-picked a tree A leases" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "mint-windows", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try wire_plane.WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    const b = try MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-mint-windows-b", .endpoint = plane.advertised } });
+    defer b.close();
+    const bj = b.volumes[0];
+    const me = bj.joined.?.appenderId();
+
+    const threads = 8;
+    const per_phase: usize = be0.slots.window_mints + be0.slots.window_mints / 2;
+    const Shared = struct {
+        set: *MetaSet,
+        per_phase: usize,
+        arrived: std.atomic.Value(u32) = .init(0),
+        go: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+    };
+    const Minter = struct {
+        sh: *Shared,
+        out: std.ArrayList(u64) = .empty,
+
+        fn mintPhase(self: *@This()) void {
+            for (0..self.sh.per_phase) |_| {
+                const eff = self.sh.set.allocateIno(self.sh.set.effectiveIno(inos.ROOT_INO), false, false, 0) catch {
+                    self.sh.failed.store(true, .release);
+                    return;
+                };
+                self.out.append(testing.allocator, self.sh.set.globalIno(eff)) catch {
+                    self.sh.failed.store(true, .release);
+                    return;
+                };
+            }
+        }
+
+        fn run(self: *@This()) void {
+            self.mintPhase();
+            _ = self.sh.arrived.fetchAdd(1, .acq_rel);
+            while (!self.sh.go.load(.acquire)) std.Thread.yield() catch {};
+            self.mintPhase();
+        }
+    };
+    var sh: Shared = .{ .set = set, .per_phase = per_phase };
+    var minters: [threads]Minter = undefined;
+    for (&minters) |*m| m.* = .{ .sh = &sh };
+    defer for (&minters) |*m| m.out.deinit(gpa);
+    const grants0 = slots_mod.mint_window.stats.mint_window_grants.load();
+    const wmints0 = slots_mod.mint_window.stats.mint_window_mints.load();
+    var ths: [threads]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer {
+        sh.go.store(true, .release);
+        for (ths[0..spawned]) |t| t.join();
+    }
+    for (&ths, &minters) |*t, *m| {
+        t.* = try std.Thread.spawn(.{}, Minter.run, .{m});
+        spawned += 1;
+    }
+    while (sh.arrived.load(.acquire) < threads) std.Thread.yield() catch {};
+    try testing.expect(!sh.failed.load(.acquire));
+    // Every thread paused inside a window: the live claims name distinct
+    // trees, one per windowed thread.
+    const now_ms = clock.monotonicNs() / std.time.ns_per_ms;
+    var claimed: std.ArrayList(u16) = .empty;
+    defer claimed.deinit(gpa);
+    var held: std.ArrayList(u16) = .empty;
+    defer held.deinit(gpa);
+    try be0.slots.table.heldBy(lt.MANAGER, &held);
+    for (held.items) |sl| if (be0.slots.claims.live(sl, now_ms)) try claimed.append(gpa, sl);
+    try testing.expect(claimed.items.len >= 2);
+    try testing.expect(claimed.items.len <= threads);
+    // The handover of one windowed tree to B; B mints there off the
+    // cursor A carried.
+    const robbed = claimed.items[0];
+    try testing.expectEqual(acquire.Verbs.OfferResult.offered, try be0.slots.verbs.offerSlot(lt.MANAGER, robbed, me, std.math.maxInt(u64)));
+    const sink = bj.slots.carriageSink();
+    sink.offered(sink.ctx, robbed, lt.MANAGER);
+    try testing.expect(bj.slots.table.view(robbed).leasedBy(me));
+    var b_inos: [64]u64 = undefined;
+    for (&b_inos) |*g| g.* = inos.makeGlobalIno(try bj.allocateInoInSlot(robbed), robbed, inos.ROUTING_WIDTH);
+    sh.go.store(true, .release);
+    for (ths[0..spawned]) |t| t.join();
+    spawned = 0;
+    try testing.expect(!sh.failed.load(.acquire));
+    // Every ino distinct; A's second phase never in the robbed tree.
+    var all: std.ArrayList(u64) = .empty;
+    defer all.deinit(gpa);
+    try all.appendSlice(gpa, &b_inos);
+    for (&minters) |*m| {
+        try testing.expectEqual(2 * per_phase, m.out.items.len);
+        try all.appendSlice(gpa, m.out.items);
+        for (m.out.items[per_phase..]) |g| try testing.expect(route_table.slotOf(g) != robbed);
+    }
+    std.mem.sort(u64, all.items, {}, std.sort.asc(u64));
+    for (all.items[1..], 1..) |g, i| if (g == all.items[i - 1]) {
+        std.debug.print("ino {d} (slot {d}) minted twice\n", .{ g, route_table.slotOf(g) });
+        return error.TestUnexpectedResult;
+    };
+    // The windows served the run: each thread's grants, the mints beside.
+    try testing.expect(slots_mod.mint_window.stats.mint_window_grants.load() >= grants0 + 2 * threads);
+    try testing.expect(slots_mod.mint_window.stats.mint_window_mints.load() >= wmints0 + threads * per_phase);
+    std.debug.print("mint windows: {d} threads × {d} mints, {d} live claims at the pause, slot {d} handed to B; grants +{d}, window mints +{d}\n", .{ threads, 2 * per_phase, claimed.items.len, robbed, slots_mod.mint_window.stats.mint_window_grants.load() - grants0, slots_mod.mint_window.stats.mint_window_mints.load() - wmints0 });
 }

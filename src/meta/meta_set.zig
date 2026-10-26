@@ -680,8 +680,10 @@ pub const MetaSet = struct {
     /// parent's member (a rename's whiteout: the op stays on two members at
     /// most). The child's slot takes its door token at the commit (the
     /// record names it). Returns the child's EFFECTIVE (key) ino;
-    /// `globalIno` inverts it.
-    pub fn allocateIno(self: *MetaSet, parent_eff: u64, prefer_parent: bool, gather: bool) Error!u64 {
+    /// `globalIno` inverts it. `caller` is the minting stream (the FUSE
+    /// request's pid; 0 = none: the calling thread) whose mint window a
+    /// rotor mint rides (decision 0003 §BV).
+    pub fn allocateIno(self: *MetaSet, parent_eff: u64, prefer_parent: bool, gather: bool, caller: u32) Error!u64 {
         if (self.posture == .reader) return error.PartitionRefused;
         const parent_v = self.route.volumeOfEffective(parent_eff);
         const parent_slot = route_table.slotOfEffective(parent_eff);
@@ -690,10 +692,11 @@ pub const MetaSet = struct {
         const v: route_table.VolumeIndex = if (home) parent_v else @intCast(router.pickMintVolume(parent_v, self.healths(hb[0..self.volumes.len]), &self.mint_rr));
         if (v != parent_v) rstats.routing_mint_volume_picks.inc();
         const plane = self.volumes[v].slots;
+        const minter = routing_slots.mint_window.minterToken(caller);
         var burns: u64 = 0;
         while (true) {
             const rr = self.slot_rr.fetchAdd(1, .monotonic);
-            const m = plane.mintSlot(parent_slot, v == parent_v, gather, rr) orelse SlotPlane.Mint{ .slot = self.rotors[v].pickSlot() };
+            const m = plane.mintSlot(parent_slot, v == parent_v, gather, rr, minter) orelse SlotPlane.Mint{ .slot = self.rotors[v].pickSlot() };
             plane.holdMintForTest(m.slot);
             const be = self.volumeOfSlot(m.slot);
             const local = be.allocateInoInSlot(m.slot) catch |e| return switch (e) {
@@ -702,7 +705,7 @@ pub const MetaSet = struct {
             };
             // The handover law (decision 0003 §BV): the ino is kept only
             // if its slot still stands at the decision's generation.
-            if (m.g) |g| if (!plane.mintStands(m.slot, g)) {
+            if (m.g) |g| if (!plane.mintStands(m.slot, g, minter)) {
                 routing_slots.acquire.stats.mint_burns.inc();
                 burns += 1;
                 // Each burn met a lease that moved under its mint; the
@@ -1073,7 +1076,7 @@ pub fn createChild(set: *MetaSet, parent_global: u64, name: []const u8, mode: u3
     const pv_bytes = (try set.lookup(set.gpa, key.TREE_INODES, &key.inodeKey(parent))) orelse return error.ParentMissing;
     defer set.gpa.free(pv_bytes);
     const pv = try record.InodeValue.decode(pv_bytes);
-    const child = try set.allocateIno(parent, false, false);
+    const child = try set.allocateIno(parent, false, false, 0);
     const global = set.globalIno(child);
     const parent_slot = route_table.slotOfEffective(parent);
     if (set.volumeIndexOfSlot(parent_slot) != set.volumeIndexOfSlot(route_table.slotOf(global))) {
@@ -1160,6 +1163,109 @@ test "a two-member set: format → open (either URI order) → 200 creates sprea
         try testing.expect(try present(set, fresh));
         try testing.expectEqual(@as(u64, 201), set.allocatedInos());
     }
+}
+
+test "the mint window follows its CALLER, not the thread (decision 0003 §BV): a rank the scheduler moves between drain workers keeps its window's tree; two ranks one worker serves take two trees; a lone caller keeps the census's per-mint spread" {
+    const gpa = testing.allocator;
+    const s = try TestSet.create(gpa, "mint-caller", 1);
+    defer s.destroy();
+    const set = try s.open();
+    defer set.close();
+    const root = set.effectiveIno(inos.ROOT_INO);
+    const slotOfEff = struct {
+        fn of(st: *MetaSet, eff: u64) u16 {
+            return route_table.slotOf(st.globalIno(eff));
+        }
+    }.of;
+    // A lone caller: no window, the per-mint spread (two mints, two trees).
+    const g0 = routing_slots.mint_window.stats.mint_window_grants.load();
+    const l0 = slotOfEff(set, try set.allocateIno(root, false, false, 900));
+    const l1 = slotOfEff(set, try set.allocateIno(root, false, false, 900));
+    try testing.expect(l0 != l1);
+    try testing.expectEqual(g0, routing_slots.mint_window.stats.mint_window_grants.load());
+    // A second caller beside it: each opens its window, on distinct trees.
+    const t2 = slotOfEff(set, try set.allocateIno(root, false, false, 1002));
+    const t1 = slotOfEff(set, try set.allocateIno(root, false, false, 900));
+    try testing.expect(t1 != t2);
+    try testing.expectEqual(g0 + 2, routing_slots.mint_window.stats.mint_window_grants.load());
+    // Caller 900 from another thread (the rank moved CPUs) stays in its
+    // tree; caller 1002 from this thread stays in its own.
+    const Other = struct {
+        fn run(st: *MetaSet, r: u64, out: *[8]u16, err: *?anyerror) void {
+            for (out) |*o| o.* = route_table.slotOf(st.globalIno(st.allocateIno(r, false, false, 900) catch |e| {
+                err.* = e;
+                return;
+            }));
+        }
+    };
+    var moved: [8]u16 = undefined;
+    var err: ?anyerror = null;
+    const th = try std.Thread.spawn(.{}, Other.run, .{ set, root, &moved, &err });
+    th.join();
+    if (err) |e| return e;
+    for (moved) |sl| try testing.expectEqual(t1, sl);
+    for (0..8) |_| try testing.expectEqual(t2, slotOfEff(set, try set.allocateIno(root, false, false, 1002)));
+    try testing.expectEqual(g0 + 2, routing_slots.mint_window.stats.mint_window_grants.load());
+}
+
+test "the mint window across a remount (decision 0003 §BV): eight threads create under the root at once — their mints in windows on distinct rotor trees — then a clean close and a reopen, and eight threads create again: no ino twice, every first-session file present after the remount, the windows' trees past every travelled ino" {
+    const gpa = testing.allocator;
+    const s = try TestSet.create(gpa, "mint-remount", 1);
+    defer s.destroy();
+    const threads = 8;
+    const Creator = struct {
+        set: *MetaSet,
+        tag: usize,
+        n: usize,
+        out: std.ArrayList(u64) = .empty,
+        failed: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var nb: [32]u8 = undefined;
+            for (0..self.n) |i| {
+                const name = std.fmt.bufPrint(&nb, "t{d}-{d}", .{ self.tag, i }) catch unreachable;
+                const g = createFile(self.set, inos.ROOT_INO, name) catch |e| {
+                    self.failed = e;
+                    return;
+                };
+                self.out.append(testing.allocator, g) catch |e| {
+                    self.failed = e;
+                    return;
+                };
+            }
+        }
+    };
+    var first: std.ArrayList(u64) = .empty;
+    defer first.deinit(gpa);
+    const grants0 = routing_slots.mint_window.stats.mint_window_grants.load();
+    for (0..2) |session| {
+        const set = try s.open();
+        defer set.close();
+        const per = set.volumes[0].slots.window_mints + 64;
+        var cs: [threads]Creator = undefined;
+        for (&cs, 0..) |*c, t| c.* = .{ .set = set, .tag = session * threads + t, .n = per };
+        defer for (&cs) |*c| c.out.deinit(gpa);
+        var ths: [threads]std.Thread = undefined;
+        for (&ths, &cs) |*th, *c| th.* = try std.Thread.spawn(.{}, Creator.run, .{c});
+        for (ths) |th| th.join();
+        for (&cs) |*c| {
+            if (c.failed) |e| return e;
+            try testing.expectEqual(per, c.out.items.len);
+        }
+        if (session == 1) for (first.items) |g| try testing.expect(try present(set, g));
+        var all: std.ArrayList(u64) = .empty;
+        defer all.deinit(gpa);
+        try all.appendSlice(gpa, first.items);
+        for (&cs) |*c| try all.appendSlice(gpa, c.out.items);
+        std.mem.sort(u64, all.items, {}, std.sort.asc(u64));
+        for (all.items[1..], 1..) |g, i| if (g == all.items[i - 1]) {
+            std.debug.print("session {d}: ino {d} (slot {d}) minted twice\n", .{ session, g, route_table.slotOf(g) });
+            return error.TestUnexpectedResult;
+        };
+        if (session == 0) for (&cs) |*c| try first.appendSlice(gpa, c.out.items);
+    }
+    // Both sessions ran their creates in windows (a refill each).
+    try testing.expect(routing_slots.mint_window.stats.mint_window_grants.load() >= grants0 + 2 * threads);
 }
 
 test "a two-member set: every member's writer claim refreshes on the beat and is deleted at the clean dismount (red: member 1's claim sat at its local ino 1 — slot 0's keyspace, hosted by member 0 alone — so its armed door refused every refresh and the dismount's delete SlotBusy; the claim went stale under a live writer and outlived the unmount)" {

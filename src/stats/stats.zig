@@ -396,6 +396,7 @@ pub const covered = [_]Covered{
     .{ .path = "src/meta/sym/slots/page_budget.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/slots/resolve.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/slots/tails_spill.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/slots/mint_window.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/slots/plane.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/tokens/token_table.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/tokens/token_cache.zig", .by = "src/meta/sym.zig" },

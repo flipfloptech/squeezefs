@@ -3129,7 +3129,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // parent or a rotor on another member ⇒ ONE intent). A re-issue
             // reuses the ino its first attempt minted (decision 0003 §X.2).
             const reused: ?u64 = if (c.move) |m| m.subject else null;
-            const local = if (reused) |g| try localOf(g) else self.store.allocateIno(parent, false, try self.gatherOptIn(parent)) catch |e| return storeErr(e);
+            const local = if (reused) |g| try localOf(g) else self.store.allocateIno(parent, false, try self.gatherOptIn(parent), c.pid) catch |e| return storeErr(e);
             const global = globalOf(local);
             noteSubjects(c, global, null);
             if (self.needsIntent(&.{ parent_global, global })) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global);
@@ -3430,7 +3430,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (whiteout) {
                 // On the old parent's member: the op stays on two members
                 // at most (the dentries' and the moved inode's).
-                const l = self.store.allocateIno(old_parent, true, false) catch |e| return storeErr(e);
+                const l = self.store.allocateIno(old_parent, true, false, c.pid) catch |e| return storeErr(e);
                 wo = .{ .local = l, .global = globalOf(l) };
             }
             _ = economy.stageRename(t, .{
@@ -3532,7 +3532,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (new0) |n| dest = .{ .ino = n.global, .value = (try self.readInodeOpt(n.local)) orelse return error.FileNotFound };
             var wo: ?u64 = null;
             if (whiteout) {
-                const l = self.store.allocateIno(try localOf(a.parent), true, false) catch |e| return storeErr(e);
+                const l = self.store.allocateIno(try localOf(a.parent), true, false, c.pid) catch |e| return storeErr(e);
                 wo = globalOf(l);
             }
             const plan = sym_xv.steps.planRename(.{ .old_parent = a.parent, .old_name = a.name, .new_parent = a.newparent, .new_name = a.newname, .child = old0.global, .child_mode = cv.mode, .dest = if (dest) |d| .{ .ino = d.ino, .value = d.value } else null, .whiteout = wo, .now = stamp });
@@ -5756,9 +5756,10 @@ pub const MemStore = struct {
         self.fsyncs += 1;
     }
 
-    /// One store, one keyspace: the parent and the mint decision are the
-    /// set facade's concerns; every mint is slot 0's.
-    pub fn allocateIno(self: *MemStore, _: u64, _: bool, _: bool) StoreError!u64 {
+    /// One store, one keyspace: the parent, the mint decision and the
+    /// minting stream are the set facade's concerns; every mint is slot
+    /// 0's.
+    pub fn allocateIno(self: *MemStore, _: u64, _: bool, _: bool, _: u32) StoreError!u64 {
         self.lock.lock();
         defer self.lock.unlock();
         const i = self.next_ino;

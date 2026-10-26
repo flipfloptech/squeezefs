@@ -3275,7 +3275,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const probe = (try self.findDentry(parent, name)) orelse return error.FileNotFound;
             if (want_dir and !probe.isDir()) return error.NotDir;
             if (!want_dir and probe.isDir()) return error.IsDir;
-            if (want_dir) if (self.stripes) |st| if (try st.mapOf(probe.global) != null) {
+            if (want_dir) if (self.stripes) |st| if (try st.victimMapOf(probe.global) != null) {
                 // `may_delete` for the striped rmdir (its own intent below).
                 try refuseRemoveFrom(try self.flagsRecordOf(parent_global));
                 try self.refuseLogicalParent(parent_global, logical_parent, true);

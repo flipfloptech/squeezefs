@@ -252,6 +252,17 @@ pub fn Stripes(comptime Fs: type) type {
         /// The prelude's question for a directory (or any ino): plain,
         /// striped (its map), or a stripe.
         pub fn verdictOf(self: *Self, global: u64) Error!Verdict {
+            return self.verdict(global, .remember);
+        }
+
+        /// A miss's plain answer: remembered for a directory that lives on
+        /// (its children's ops ask again), or not for an rmdir's victim — a
+        /// write would take the cache EXCLUSIVE once per rmdir for an entry
+        /// nobody asks again, and every worker's shared probe queued behind
+        /// those inserts (mdtest -np 32: 600 µs per rmdir, 560 of it there).
+        const PlainMiss = enum { remember, forget };
+
+        fn verdict(self: *Self, global: u64, plain_miss: PlainMiss) Error!Verdict {
             const g = self.plane.localGen(global);
             {
                 try self.lockCacheShared();
@@ -282,6 +293,7 @@ pub fn Stripes(comptime Fs: type) type {
             // The commit marker first (one targeted probe); present ⇒ the
             // whole map by name.
             const commit = (try self.fs.findDentry(local, stripe.STRIPED)) orelse {
+                if (plain_miss == .forget) return .plain;
                 if (g) |gen| {
                     try self.lockCache();
                     defer self.lock.unlock(self.io);
@@ -319,6 +331,14 @@ pub fn Stripes(comptime Fs: type) type {
         /// The map of a striped directory, null for anything else.
         pub fn mapOf(self: *Self, global: u64) Error!?StripeMap {
             return switch (try self.verdictOf(global)) {
+                .striped => |m| m,
+                else => null,
+            };
+        }
+
+        /// `mapOf` for an rmdir's victim: a plain answer is not remembered.
+        pub fn victimMapOf(self: *Self, global: u64) Error!?StripeMap {
+            return switch (try self.verdict(global, .forget)) {
                 .striped => |m| m,
                 else => null,
             };

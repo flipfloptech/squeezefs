@@ -761,6 +761,9 @@ pub const Stats = struct {
     /// windows whose members applied themselves (§BC), and the members.
     self_handoffs: counters.ShardedCounter = .{},
     self_applies: counters.ShardedCounter = .{},
+    /// `meta_conveyor_pass_yields`: lane turns the pass gave between two
+    /// of its batches (`PassSeam.yield`).
+    pass_yields: counters.ShardedCounter = .{},
     /// `meta_conveyor_leafwise_applies` / `_leaves`: self-applied members
     /// that took their leaves one at a time (§BV: a corpse's destroy), and
     /// the leaves they took (`leaves ÷ applies` = a destroy's spread).
@@ -877,7 +880,7 @@ pub const Stats = struct {
             self.hold_bound_ns.load(),
             self.holds_pacing.load(),
         });
-        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
+        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
         try w.print(",\"meta_conveyor_window_gate_parks\":{d},\"meta_conveyor_room_parks\":{d},\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.window_gate_parks.load(),
             self.commit_room_parks.load(),
@@ -1341,6 +1344,13 @@ pub const KernelView = struct {
 pub const PassSeam = struct {
     ctx: *anyopaque,
     wake: *const fn (ctx: *anyopaque) void,
+    /// Between two batches of one pass (more is queued): give the venue's
+    /// thread one turn of whatever else it runs before the next drain — on
+    /// the journal lane, its stage B (the windows' issues, the CQE reaps,
+    /// the verdicts that release the tail's slots and settle the token
+    /// unions). Leadership is held across it. Null = the pass's thread
+    /// runs nothing else (the portable contracts, the committer venue).
+    yield: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 /// The applier venue (§AW): where a reserved window's second half — the
@@ -5106,6 +5116,64 @@ test "a rollback that cannot complete on a volume ALREADY FAILED is the counted 
     try testing.expectEqual(@as(u64, 0), h.cv.windowsInflight());
 }
 
+test "the in-flight window map never fills with tombstones (§BV): 20 000 windows tracked and untracked two at a time leave its tombstones under a quarter of the table and allocate nothing — a new window's `track` never probes the whole of it" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const h = try Harness.createWithGpa(.{}, null, false, fa.allocator());
+    defer h.destroy();
+    fa.fail_index = fa.alloc_index;
+    defer fa.fail_index = std.math.maxInt(usize);
+    var pair: [2]Window = undefined;
+    for (0..20_000) |i| {
+        const w = &pair[i % 2];
+        w.* = .{ .conveyor = h.cv, .arena = undefined, .members = &.{}, .failed = &.{}, .res = Reservation.unpadded(@as(u64, i) * 4096, 100), .seq_base = 0, .undo = &.{}, .image = null, .entries = 0, .t_handoff_ns = 0 };
+        try h.cv.track(w);
+        if (i > 0) h.cv.untrack(&pair[(i + 1) % 2]);
+    }
+    const cap = h.cv.inflight.capacity();
+    var tombstones: usize = 0;
+    for (h.cv.inflight.metadata.?[0..cap]) |md| tombstones += @intFromBool(md.isTombstone());
+    h.cv.untrack(&pair[(20_000 - 1) % 2]);
+    try testing.expectEqual(@as(u64, 0), h.cv.windowsInflight());
+    try testing.expect(tombstones * 4 <= cap);
+}
+
+test "the pass gives its venue a turn between two batches (§BV): a group of three under a one-tx batch cap is ONE pass of three batches — the venue's yield runs after the first and the second (more was queued), never after the last; every member acked" {
+    const h = try Harness.create(.{}, .{ .max_txs = 1, .max_bytes = 1 << 20 }, true);
+    defer h.destroy();
+    const Turns = struct {
+        var yields: u32 = 0;
+        var queued_at_yield: [4]u64 = @splat(0);
+        var cv: ?*Conveyor = null;
+        fn yield(_: *anyopaque) void {
+            if (yields < queued_at_yield.len) queued_at_yield[yields] = cv.?.stats.queued.load();
+            yields += 1;
+        }
+    };
+    Turns.yields = 0;
+    Turns.cv = h.cv;
+    h.cv.deps.pass.yield = Turns.yield;
+    var txs: [3]*tx.KvTx = undefined;
+    var inos: [3]u64 = undefined;
+    var names: [3][8]u8 = undefined;
+    for (&txs, &inos, &names, 0..) |*t, *ino, *nb, i| {
+        t.* = try h.gpa.create(tx.KvTx);
+        t.*.* = tx.KvTx.init(h.gpa, @src());
+        ino.* = try h.stageCreate(t.*, try std.fmt.bufPrint(nb, "turn-{d}", .{i}));
+    }
+    defer for (txs) |t| h.gpa.destroy(t);
+    var results: [3]Outcome = undefined;
+    const passes0 = h.cv.stats.leader_passes.load();
+    const yields0 = h.cv.stats.pass_yields.load();
+    h.cv.commitGroup(&txs, &results);
+    for (results) |r| try r;
+    try testing.expectEqual(passes0 + 3, h.cv.stats.leader_passes.load());
+    try testing.expectEqual(@as(u32, 2), Turns.yields);
+    try testing.expectEqual(yields0 + 2, h.cv.stats.pass_yields.load());
+    try testing.expectEqual(@as(u64, 2), Turns.queued_at_yield[0]);
+    try testing.expectEqual(@as(u64, 1), Turns.queued_at_yield[1]);
+    for (inos) |ino| try testing.expect(try h.present(ino));
+}
+
 test "the in-flight window map is sized at init: tracking a full population of windows allocates nothing (never an allocation under inflight_lock)" {
     var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
     const h = try Harness.createWithGpa(.{}, null, false, fa.allocator());
@@ -5527,7 +5595,7 @@ test "the stats JSON names every conveyor face" {
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w);
     const out = w.buffered();
-    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves" }) |name| {
+    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves", "meta_conveyor_pass_yields" }) |name| {
         try testing.expect(std.mem.indexOf(u8, out, name) != null);
     }
     var pb: [8192]u8 = undefined;

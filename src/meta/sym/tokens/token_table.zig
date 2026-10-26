@@ -1491,6 +1491,29 @@ test "constants with their WHY: the deadline is T_owner, the tick its quarter, t
     try testing.expectEqual(@as(usize, 11), fanoutBucket(12_500));
 }
 
+test "the gate's flight map never fills with tombstones (§BV): 100 000 distinct objects through passBegin/settle with at most 128 in flight — the map's tombstones stay under a quarter of its table, so a new object's insert never probes the whole of it" {
+    var g = GrantPassGate.init(testing.allocator);
+    defer g.deinit();
+    const io = testing.io;
+    var rounds: [2][64]Object = undefined;
+    var next: Object = 1;
+    for (0..100_000 / 64) |r| {
+        const cur = &rounds[r % 2];
+        for (cur) |*o| {
+            o.* = next;
+            next += 1;
+        }
+        try g.passBegin(io, cur);
+        // The previous round's window reaches its terminal outcome.
+        if (r > 0) g.settle(io, &rounds[(r + 1) % 2]);
+    }
+    const cap = g.inflight.capacity();
+    var tombstones: usize = 0;
+    for (g.inflight.metadata.?[0..cap]) |md| tombstones += @intFromBool(md.isTombstone());
+    try testing.expectEqual(@as(usize, 64), g.inflightCount(io));
+    try testing.expect(tombstones * 4 <= cap);
+}
+
 test "the gate is a refcount: two users keep an object in flight until the LAST settles; a settle of an unmarked object is a no-op" {
     const io = testing.io;
     var g = GrantPassGate.init(testing.allocator);

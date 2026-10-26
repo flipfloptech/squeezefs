@@ -52,10 +52,19 @@ written at the landing, so the judged death replay (§BR.11 (c)) stopped at the 
 At 32 ranks the window went 3.6 ms → 0.3–0.5 ms, the recall 65 → 0 µs. `meta_conveyor_tail_gate_parks` stayed
 0 on these runs (the lane lands promptly once it runs); the gate is the bound for a slow device or a floor ring.
 
-**Correctness-run rates** (O-series, interleaved, loaded host — indicative only): file creation `self` 139–144 k
-vs `venue` 103–105 k at 64, 100–112 k vs 106 k at 32; file removal 200–209 k vs 89–100 k at 64, 186–217 k vs
-98 k at 32 — no collapse; directory creation 50–66 k vs 54–65 k; **directory removal 43–45 k vs 52–58 k**
-(0.76–0.86×, §BV.6 (a)). Every run: fsck clean, 0 tripwires, 0 pass panics.
+**Correctness-run rates** (the final tree, `self` the default against `SQUEEZEFS_META_APPLY=venue`, interleaved,
+each phase started once the reclaim had drained the previous one's corpses; load 6–9 from another agent —
+indicative only):
+
+| `mdtest -u` | `-np 64` self / venue | `-np 32` self / venue |
+|---|---|---|
+| file creation | 148.2 / 111.9 k (1.32×) | 123.6 / 108.3 k (1.14×) |
+| file removal | 212.9 / 99.6 k (2.14×) | 202.5 / 96.0 k (2.11×) |
+| directory creation | 54.0 / 59.1 k (0.91×) | 60.4 / 69.0 k (0.88×) |
+| directory removal | 44.6 / 50.9 k (0.88×) | 44.6 / 55.6 k (0.80×) |
+
+Unsettled (phases back to back, the file removal's corpses reclaimed during the directory phases) the directory
+rows read 0.64–0.97× and 0.64–0.86×. Every run: fsck clean, 0 tripwires, 0 pass panics, 0 tail-gate parks.
 
 ## Tests
 
@@ -66,8 +75,9 @@ and 13 hold with every weakening failing. Smoke and xfstests: the branch's last 
 
 ## Seen, not changed
 
-§BV.7: directory removal under `self` (the daemon's guarded section is the shorter one — 41 vs 315 µs — so the
-gap is outside the commit); `mkdir`'s parent-inode leaf convoy at 64 ranks (143–332 µs leaf waits); the turn
+§BV.7: the directory rows under `self` (removal 0.80–0.88×, creation 0.88–0.91×, settled; at 32 ranks the
+rmdir's guarded section is 41 µs against 336, yet the op takes 696 µs against 556 — the gap is outside the
+commit, not established); `mkdir`'s parent-inode leaf convoy at 64 ranks (143–332 µs leaf waits); the turn
 spin's 560–637 k fall-throughs per 640 k ops on driven FUSE lanes; the reclaim's ≈ 22 k corpses/s in both arms;
 `self` windows' journal pad (67–95 B/op against 28–30); and §BB's crash law has a narrow hole in BOTH arms — a
 member (`self`) or a window (`venue`, §AW.4) answered while an earlier one has not yet claimed its tail slot lies

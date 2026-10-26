@@ -60,3 +60,20 @@ at -np 32, 56–67 % of answers parked 115–345 µs). The owner's ruling: keep 
 skipped), rails, fmt; smoke 14/14; xfstests generic/001 013 074 753 pass; fsck clean after every run. What
 still parks at -np 64: an owner preempted inside its claim (64 ranks on 32 CPUs), a window the pass is still
 handing out, an SMO entry (it reaches the device only by its landing).
+
+## The A-B-B-A (2026-10-26, quiet host, the RAM-NVMe perf mount, dist builds)
+
+`dev` `e23cad3` (no resident-prefix law) against `6fd5a99` (option (a): turn-time claims, helping,
+targeted wakes), legs A B B A, `mpirun mdtest -n 10000 -u -i 1`, fsck clean after all 8 runs; k ops/s:
+
+| | -np 32 dev | -np 32 §BX | Δ | -np 64 dev | -np 64 §BX | Δ |
+|---|---|---|---|---|---|---|
+| file creation | 179 / 181 | 173 / 176 | −2.9 % | 169 / 181 | 155 / 165 | −8.5 % |
+| file removal | 228 / 228 | 230 / 222 | −0.5 % | 230 / 213 | 191 / 204 | −10.9 % |
+| directory creation | 192 / 185 | 181 / 186 | −2.7 % | 193 / 188 | 183 / 186 | −3.1 % |
+| directory removal | 193 / 185 | 179 / 185 | −3.7 % | 198 / 206 | 190 / 198 | −4.1 % |
+
+Landed for the durability law (a daemon crash loses no acked metadata). Against v0.1.0 every row
+stays 1.9–3.1×; directory removal is 3.1–3.4× (the rmdir fix `e23cad3`). The -np 64 file rows'
+cost (64 ranks on 32 CPUs: an owner preempted mid-claim) is the next lever — claiming every member's
+entry in the pass at handout, measured before it lands. Sessions: `/build/perf/bx-abba/`.

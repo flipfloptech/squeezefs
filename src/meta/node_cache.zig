@@ -936,7 +936,8 @@ pub const CachedNode = struct {
             const k = r.key.slice();
             const run = edit.view();
             const pos = run.partitionPoint(KeySeq{ .k = k, .seq = r.seq }, keySeqLessEq);
-            const gend = run.partitionPoint(KeyOnly{ .k = k }, keyLessEq);
+            // The key's records above `r` follow `pos` (walked, not searched).
+            const gend = run.groupEnd(pos, k);
             const key_newest = pos == gend;
             const prev_is_same_key = pos > 0 and std.mem.eql(u8, run.at(pos - 1).key(), k);
             // D7.a head materialization: fold-forward against the folded
@@ -1055,10 +1056,6 @@ pub const CachedNode = struct {
     }
 
     const KeyOnly = struct { k: []const u8 };
-
-    fn keyLessEq(ctx: KeyOnly, r: snapshot.RecView) bool {
-        return key.order(r.key(), ctx.k) != .gt;
-    }
 
     fn keyLess(ctx: KeyOnly, r: snapshot.RecView) bool {
         return key.order(r.key(), ctx.k) == .lt;

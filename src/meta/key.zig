@@ -106,8 +106,24 @@ pub fn untag(tag: u8) Tag {
 
 /// Keys compare by memcmp (a proper prefix sorts first). Because every
 /// field is big-endian, this equals the logical tuple order.
+///
+/// Eight bytes per step as big-endian words: every snapshot binary search,
+/// interior descent and run insert lands here, and the keys share long
+/// prefixes (an ino, a parent), which `std.mem.order`'s byte loop walked
+/// one compare at a time (6.4 % of the daemon's CPU in a 32-rank create
+/// phase). The result is `std.mem.order(u8, a, b)` exactly (the law test).
 pub fn order(a: []const u8, b: []const u8) std.math.Order {
-    return std.mem.order(u8, a, b);
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const x = std.mem.readInt(u64, a[i..][0..8], .big);
+        const y = std.mem.readInt(u64, b[i..][0..8], .big);
+        if (x != y) return if (x < y) .lt else .gt;
+    }
+    while (i < n) : (i += 1) {
+        if (a[i] != b[i]) return if (a[i] < b[i]) .lt else .gt;
+    }
+    return std.math.order(a.len, b.len);
 }
 
 pub fn lessThan(a: []const u8, b: []const u8) bool {
@@ -1228,6 +1244,39 @@ test "interior value is 16 B LE (child_addr ‖ child_seq); len ≠ 16 refuses" 
     try testing.expectEqual(@as(u64, 0x1112131415161718), d.childSeq());
     try testing.expectError(error.Corrupt, InteriorValue.decode(v[0..15]));
     try testing.expectError(error.Corrupt, InteriorValue.decode(&(v ++ [_]u8{0})));
+}
+
+test "order is memcmp order exactly: equal to std.mem.order(u8) on every length pair 0..40 with a difference at every position (both signs, across the word boundaries), on proper prefixes, equal keys and random keys sharing long prefixes" {
+    var a: [40]u8 = undefined;
+    var b: [40]u8 = undefined;
+    for (&a, 0..) |*x, i| x.* = @intCast(0x40 + i);
+    for (0..41) |la| for (0..41) |lb| {
+        @memcpy(&b, &a);
+        try testing.expectEqual(std.mem.order(u8, a[0..la], b[0..lb]), order(a[0..la], b[0..lb]));
+        for (0..@min(la, lb)) |d| {
+            for ([_]u8{ 0x00, 0x3F, 0x41, 0xFF }) |v| {
+                @memcpy(&b, &a);
+                b[d] = v +% @as(u8, @intCast(d));
+                try testing.expectEqual(std.mem.order(u8, a[0..la], b[0..lb]), order(a[0..la], b[0..lb]));
+                try testing.expectEqual(std.mem.order(u8, b[0..lb], a[0..la]), order(b[0..lb], a[0..la]));
+            }
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(0x0bde_c0de);
+    const rnd = prng.random();
+    for (0..20_000) |_| {
+        const la = rnd.uintAtMost(usize, 40);
+        const lb = rnd.uintAtMost(usize, 40);
+        const shared = rnd.uintAtMost(usize, @min(la, lb));
+        rnd.bytes(a[0..la]);
+        rnd.bytes(b[0..lb]);
+        @memcpy(b[0..shared], a[0..shared]);
+        try testing.expectEqual(std.mem.order(u8, a[0..la], b[0..lb]), order(a[0..la], b[0..lb]));
+    }
+    // The typed keys: inode and dentry neighbours order as their tuples.
+    try testing.expectEqual(std.math.Order.lt, order(&inodeKey(0x0100), &inodeKey(0x0101)));
+    try testing.expectEqual(std.math.Order.gt, order(&inodeKey(1 << 56), &inodeKey(0xFF)));
+    try testing.expectEqual(std.math.Order.lt, order(&inodeKey(7), &dentryKey(7, 0, 0)));
 }
 
 test "KEY_SPACE_MAX is 32 × 0xFF and sorts above every leaf key; key successor appends 0x00" {

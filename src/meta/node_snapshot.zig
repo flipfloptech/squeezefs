@@ -424,13 +424,22 @@ pub const RecordIndex = struct {
         return key.order(ctx.idx.keyAt(e), ctx.k) != .gt;
     }
 
-    /// `[lo, hi)` of entries whose key equals `k` (newest first).
+    /// `[lo, hi)` of entries whose key equals `k` (newest first). The end
+    /// is walked from `lo` — a group is a record or a few, so the walk
+    /// costs a compare or two where a second binary search cost log₂ n —
+    /// and searched past `GROUP_WALK` records.
     pub fn groupBounds(self: *const RecordIndex, k: []const u8) Range {
         const ctx: KeyCtx = .{ .idx = self, .k = k };
-        return .{
-            .lo = std.sort.partitionPoint(IdxRec, self.entries, ctx, entryKeyLess),
-            .hi = std.sort.partitionPoint(IdxRec, self.entries, ctx, entryKeyLessEq),
-        };
+        const lo = std.sort.partitionPoint(IdxRec, self.entries, ctx, entryKeyLess);
+        var hi = lo;
+        while (hi < self.entries.len) : (hi += 1) {
+            if (hi - lo == GROUP_WALK) {
+                hi += std.sort.partitionPoint(IdxRec, self.entries[hi..], ctx, entryKeyLessEq);
+                break;
+            }
+            if (!std.mem.eql(u8, self.keyAt(self.entries[hi]), k)) break;
+        }
+        return .{ .lo = lo, .hi = hi };
     }
 
     /// Index of the first entry with key ≥ `from`.
@@ -568,13 +577,15 @@ fn runKeyLessEq(ctx: RunCtx, r: RecView) bool {
     return key.order(r.key(), ctx.k) != .gt;
 }
 
+/// How far a group's end is walked before it is searched for: a key's
+/// group is one record or a few (a Δtime chain between two freezes), and a
+/// walk's compare is an equality test where the search's are orders.
+pub const GROUP_WALK: usize = 8;
+
 /// `[lo, hi)` of `run`'s records with key `k` (seq ascending).
 pub fn runGroup(run: *const Run, k: []const u8) Range {
-    const ctx: RunCtx = .{ .k = k };
-    return .{
-        .lo = run.partitionPoint(ctx, runKeyLess),
-        .hi = run.partitionPoint(ctx, runKeyLessEq),
-    };
+    const lo = run.partitionPoint(RunCtx{ .k = k }, runKeyLess);
+    return .{ .lo = lo, .hi = run.groupEnd(lo, k) };
 }
 
 /// The outcome of folding one key in a snapshot. `live.value` borrows the
@@ -1064,6 +1075,20 @@ pub const Run = struct {
             if (pred(context, c.view(mid))) a = mid + 1 else b = mid;
         }
         return s.start + a;
+    }
+
+    /// The end of `k`'s group whose first record is at run index `lo` (or
+    /// `lo` itself when no record of `k` is there): the records walked by
+    /// cursor, the rest searched past `GROUP_WALK`.
+    pub fn groupEnd(self: *const Run, lo: usize, k: []const u8) usize {
+        var i = lo;
+        var p = self.posOf(lo);
+        while (i < self.len) : (i += 1) {
+            if (i - lo == GROUP_WALK) return self.partitionPoint(RunCtx{ .k = k }, runKeyLessEq);
+            if (!std.mem.eql(u8, self.rec(p).key(), k)) break;
+            p = self.next(p);
+        }
+        return i;
     }
 
     /// Every record in its reference-counted form, one owned array (the
@@ -1767,6 +1792,49 @@ test "RecordIndex.build merges sources (key asc, seq desc, newer source first) a
     try testing.expectEqual(@as(usize, 4), idx.firstAtOrAfter(&key.inodeKey(2)));
     // Zero-copy: the key borrows the image.
     try testing.expectEqual(@intFromPtr(sources[2].slice().ptr) + bset.BSET_HEADER_LEN + rec.RECORD_HEADER_LEN, @intFromPtr(idx.recordRef(0).key.ptr));
+}
+
+test "a key's group [lo, hi) — the index's and the run's — is the two partition points exactly, for groups shorter than, at and past GROUP_WALK, straddling chunks, absent keys and the ends" {
+    const gpa = testing.allocator;
+    // ino i holds sizes[i] records: a Put then Δtimes (seq ascending).
+    const sizes = [_]usize{ 0, 1, 2, GROUP_WALK - 1, GROUP_WALK, GROUP_WALK + 1, 2 * GROUP_WALK + 1, 3, 0, 37 };
+    var recs: std.ArrayList(Record) = .empty;
+    defer {
+        rec.deinitRecords(gpa, recs.items);
+        recs.deinit(gpa);
+    }
+    var owned: std.ArrayList(OwnedRec) = .empty;
+    defer owned.deinit(gpa);
+    var seq: u64 = 1;
+    for (sizes, 0..) |n, ino| for (0..n) |j| {
+        try recs.append(gpa, if (j == 0) try put(gpa, ino, seq) else try dtimes(gpa, ino, seq, seq, seq));
+        try owned.append(gpa, try OwnedRec.fromRecordRef(gpa, recs.items[recs.items.len - 1].ref()));
+        seq += 1;
+    };
+    var refs: std.ArrayList(RecordRef) = .empty;
+    defer refs.deinit(gpa);
+    for (recs.items) |*r| try refs.append(gpa, r.ref());
+    const sources = try gpa.alloc(Bytes, 1);
+    sources[0] = try Bytes.fromOwned(gpa, try bset.buildBset(gpa, refs.items, seq - 1));
+    var idx = try RecordIndex.build(gpa, sources, null);
+    defer idx.deinit(gpa);
+    var run = try Run.fromSorted(gpa, owned.items);
+    defer run.deinit(gpa);
+    try testing.expect(run.slots.len > 2);
+    for (0..sizes.len + 1) |ino| {
+        const k = key.inodeKey(ino);
+        const ictx: RecordIndex.KeyCtx = .{ .idx = &idx, .k = &k };
+        const want_idx: Range = .{
+            .lo = std.sort.partitionPoint(IdxRec, idx.entries, ictx, RecordIndex.entryKeyLess),
+            .hi = std.sort.partitionPoint(IdxRec, idx.entries, ictx, RecordIndex.entryKeyLessEq),
+        };
+        try testing.expectEqual(want_idx, idx.groupBounds(&k));
+        try testing.expectEqual(if (ino < sizes.len) sizes[ino] else 0, want_idx.hi - want_idx.lo);
+        const rctx: RunCtx = .{ .k = &k };
+        const want_run: Range = .{ .lo = run.partitionPoint(rctx, runKeyLess), .hi = run.partitionPoint(rctx, runKeyLessEq) };
+        try testing.expectEqual(want_run, runGroup(&run, &k));
+        try testing.expectEqual(want_idx.hi - want_idx.lo, want_run.hi - want_run.lo);
+    }
 }
 
 test "RecordIndex charge tie: indexBytes = entries × @sizeOf(IdxRec) + sources × @sizeOf(Bytes); build charges the gauge and the stat, extendWith charges a second index while the first still stands, each deinit credits exactly its own" {

@@ -63,6 +63,11 @@
 //!                                                 the convoy); the claim flag stored without the
 //!                                                 fence (store-buffered past the advance's flag
 //!                                                 load: the cursor stalls)
+//!  15 a_helped_claim_is_claimed_once               — the helper's claim without the CAS (two
+//!                                                 entries: the PAD replaces one, the other stays
+//!                                                 replayable after the error); the owner reading
+//!                                                 its slot before the helper's `.done` (it
+//!                                                 releases nothing: the helper's entry stays)
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -141,6 +146,11 @@ const Weakening = enum {
     /// A member whose apply fails answers its error before its PAD
     /// replaces its entry in the tail.
     error_before_pad,
+    /// A parked answer claims a sibling's entry without the claim's CAS.
+    help_without_cas,
+    /// The owner reads its part's slot without waiting for a helper's
+    /// `.done`.
+    owner_skips_await,
 };
 
 const Item = struct { id: u8, len: u8 };
@@ -2116,6 +2126,123 @@ fn ResidentAnswers(comptime weakening: Weakening, comptime m0_fails: bool) type 
     };
 }
 
+/// Model 15 (§BX.7): a helped claim is claimed ONCE. A member's entry is
+/// claimed by its owner at its turn or by a parked answer helping the
+/// resident prefix along: the claimer CASes the part's state open →
+/// claiming, writes the slot (`tail_slot`), stores `.done` (release). The
+/// owner whose CAS lost waits for `.done`, then applies; its apply fails
+/// here (the PAD path): it claims a PAD, releases the slot its part names,
+/// then answers its error. Invariants (a death at ANY step): never two
+/// live entries for one member; once the error is answered, no live entry
+/// (the replay would apply an op answered as failed). Final: answered, the
+/// part's state `.done`.
+fn HelpedClaim(comptime weakening: Weakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 2;
+        const owner_t = 0;
+        const helper_t = 1;
+
+        const State = enum(u8) { open, claiming, done };
+        const Opc = enum(u8) { cas, write, publish, await_done, apply, pad_claim, pad_release, answer, done };
+        const Hpc = enum(u8) { cas, write, publish, done };
+
+        state: State = .open,
+        /// Live entry slots for the member; the slot its part names.
+        entries: u8 = 0,
+        named: bool = false,
+        pad: bool = false,
+        answered_err: bool = false,
+        opc: Opc = .cas,
+        hpc: Hpc = .cas,
+        /// The owner's read of its part's slot (at `apply`).
+        owner_saw_slot: bool = false,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return if (t == owner_t) self.opc == .done else self.hpc == .done;
+        }
+
+        fn stepOwner(self: *Self) void {
+            switch (self.opc) {
+                .cas => {
+                    if (self.state == .open) {
+                        self.state = .claiming;
+                        self.opc = .write;
+                    } else self.opc = if (weakening == .owner_skips_await) .apply else .await_done;
+                },
+                .write => {
+                    self.entries += 1;
+                    self.named = true;
+                    self.opc = .publish;
+                },
+                .publish => {
+                    self.state = .done;
+                    self.opc = .apply;
+                },
+                .await_done => if (self.state == .done) {
+                    self.opc = .apply;
+                },
+                .apply => {
+                    self.owner_saw_slot = self.named;
+                    self.opc = .pad_claim;
+                },
+                .pad_claim => {
+                    self.pad = true;
+                    self.opc = .pad_release;
+                },
+                .pad_release => {
+                    if (self.owner_saw_slot) self.entries -= 1;
+                    self.opc = .answer;
+                },
+                .answer => {
+                    self.answered_err = true;
+                    self.opc = .done;
+                },
+                .done => unreachable,
+            }
+        }
+
+        fn stepHelper(self: *Self) void {
+            switch (self.hpc) {
+                .cas => {
+                    if (weakening == .help_without_cas or self.state == .open) {
+                        if (weakening != .help_without_cas) self.state = .claiming;
+                        self.hpc = .write;
+                    } else self.hpc = .done;
+                },
+                .write => {
+                    self.entries += 1;
+                    self.named = true;
+                    self.hpc = .publish;
+                },
+                .publish => {
+                    self.state = .done;
+                    self.hpc = .done;
+                },
+                .done => unreachable,
+            }
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            if (t == owner_t) self.stepOwner() else self.stepHelper();
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            if (self.entries > 1) return error.TwoEntriesForOneMember;
+            if (self.answered_err and self.entries != 0) return error.FailedOpReplayable;
+        }
+
+        pub fn final(self: *const Self) !void {
+            if (!self.answered_err) return error.MemberNeverAnswered;
+            if (self.state != .done) return error.ClaimNeverPublished;
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -2208,8 +2335,14 @@ test "conveyor_resident_answers_lie_inside_the_resident_prefix (§BX): holds wit
     try explorer.expectFails(ResidentAnswers(.claim_flag_unfenced, false), .{}, error.FinalViolated);
 }
 
+test "conveyor_a_helped_claim_is_claimed_once (§BX.7): holds (the claim's CAS, the owner waiting for `.done` before it reads its slot, then the PAD claimed and the named slot released before the error); the helper without the CAS writes two entries (the PAD replaces one, the other replays after the error); the owner reading its slot before the helper's `.done` releases nothing" {
+    try explorer.expectHolds(HelpedClaim(.none), .{});
+    try explorer.expectFails(HelpedClaim(.help_without_cas), .{}, error.InvariantViolated);
+    try explorer.expectFails(HelpedClaim(.owner_skips_await), .{}, error.InvariantViolated);
+}
+
 test "conveyor models: exhaustive within the explorer's default limits" {
-    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none), LeafwiseDestroy(.none), TailSlots(.none), ResidentAnswers(.none, false), ResidentAnswers(.none, true) }) |Model| {
+    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none), LeafwiseDestroy(.none), TailSlots(.none), ResidentAnswers(.none, false), ResidentAnswers(.none, true), HelpedClaim(.none) }) |Model| {
         var report: explorer.Report = undefined;
         try explorer.explore(Model, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

@@ -771,7 +771,7 @@ pub const Stats = struct {
     resident_wait: counters.ShardedLatencyHistogram = .{},
     resident_landings: counters.ShardedCounter = .{},
     /// `meta_conveyor_resident_helps`: windows at the resident prefix's front
-    /// a parked answer claimed for (§BX.7).
+    /// a parked answer claimed for (its members' entries, its image).
     resident_helps: counters.ShardedCounter = .{},
     /// `meta_conveyor_pad_landings`: rolled-out members whose PAD found the
     /// tail's table full — the entry stays and the error is answered at
@@ -1220,6 +1220,15 @@ pub const ArenaPool = struct {
     }
 };
 
+/// §BX: a member's entry (self) or a window's image (venue) on its way to
+/// the journal tail: claimed ONCE — by its owner at its turn (its window's
+/// start), or by a parked answer helping the prefix along (`helpBelow`).
+const ClaimState = enum(u8) { open, claiming, done };
+
+/// What a parked answer may claim of a window in flight: nothing yet (the
+/// pass is still handing it out), its members' entries, or its image.
+const Helpable = enum(u8) { no, venue, self };
+
 /// §BX: an answer parked for the resident prefix (`awaitResident`), on its
 /// waiter's frame; the conveyor's list links it while it waits.
 const ResidentWaiter = struct {
@@ -1285,7 +1294,7 @@ pub const Window = struct {
     tail_slot: ?u32 = null,
     /// Parties that must leave before the window is freed: the lane's
     /// verdict, plus the applier while it answers ahead of the landing.
-    parties: std.atomic.Value(u8) = .init(1),
+    parties: std.atomic.Value(u32) = .init(1),
     /// §BC: the members applied themselves (one `Part` each, arena-owned);
     /// the last to finish built the image and submitted. `pending` counts
     /// the members still applying.
@@ -1313,6 +1322,11 @@ pub const Window = struct {
     /// Applied on the journal lane's own fiber (the pass's, alone): an
     /// answer there never parks for the resident prefix.
     on_lane: bool = false,
+    /// §BX: the venue's image claim (`claimWindowOnce`); `.done`
+    /// publishes `image` (null: unencodable) and `tail_slot` (release).
+    claim_state: std.atomic.Value(ClaimState) = .init(.open),
+    /// Set (release) once its members, parts and arm are published.
+    helpable: std.atomic.Value(Helpable) = .init(.no),
 
     /// One self-applying member's share of the window (§BC): its own
     /// arena (the members apply concurrently), its sub-range and seq, its
@@ -1329,6 +1343,11 @@ pub const Window = struct {
         undo: []tx.UndoKey = &.{},
         tail_slot: ?u32 = null,
         answered: bool = false,
+        /// §BX: its entry's claim — `.done` publishes `ops`,
+        /// `header_bytes`, `tail_slot` and `encode_err` (release).
+        claim_state: std.atomic.Value(ClaimState) = .init(.open),
+        /// The entry could not be encoded: the member fails unapplied.
+        encode_err: ?Error = null,
         /// §BX: its tail slot is written (seq_cst: model 14's fence — the
         /// advance's load of the next flag must see it or its CAS must).
         claimed: std.atomic.Value(bool) = .init(false),
@@ -2890,6 +2909,7 @@ pub const Conveyor = struct {
         // does a venue that refuses the spawn.
         const alone = self.windowsInflight() == 1;
         _ = self.in_apply.fetchAdd(1, .acq_rel);
+        w.helpable.store(.venue, .release);
         const a = self.deps.applier;
         if (alone or !a.spawn(a.ctx, w)) {
             w.on_lane = true;
@@ -2946,6 +2966,7 @@ pub const Conveyor = struct {
             }
         };
         w.pending.store(@intCast(n), .release);
+        w.helpable.store(.self, .release);
         self.stats.self_handoffs.inc();
         // The turns fan out as a binary tree: the pass wakes member 0, each
         // member wakes 2i+1 and 2i+2 before its own apply — the pass pays
@@ -2993,19 +3014,9 @@ pub const Conveyor = struct {
         // its apply (its records are stamped and final): the resident prefix
         // advances in turn order, never behind a sibling's apply. An entry
         // that cannot be encoded fails the member unapplied.
-        var ops: std.ArrayList(journal.WriteOp) = .empty;
-        const encoded: Error!u64 = blk: {
-            const frames = m.q.framesAlloc() catch break :blk error.OutOfMemory;
-            break :blk journal.partOps(a, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, .{ .res = sub, .records = frames }, &ops) catch |e| switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.Corrupt,
-            };
-        };
-        if (encoded) |hb| {
-            p.header_bytes = hb;
-            p.ops = ops.items;
-            self.claimMember(w, idx);
-        } else |e| failed[0] = e;
+        self.claimMemberOnce(w, idx);
+        awaitClaimed(&p.claim_state);
+        if (p.encode_err) |e| failed[0] = e;
         self.holdMemberForTest(m, .apply);
         const t_apply = clock.monotonicNs();
         self.stats.self_applies.inc();
@@ -3066,20 +3077,80 @@ pub const Conveyor = struct {
         return done.landing.recvUncancelable(self.deps.io) catch error.Corrupt;
     }
 
-    /// §BX: member `idx`'s entry (or PAD) into the tail and its window's
-    /// claim prefix — under the apply ack, whoever the member answers (a
-    /// range missing from the tail is a hole the death replay stops at).
-    fn claimMember(self: *Conveyor, w: *Window, idx: u32) void {
-        if (!self.deps.ack_at_apply) return;
-        const t = self.deps.tail orelse return;
+    /// §BX: member `idx`'s entry into the tail and its window's claim
+    /// prefix, ONCE — by its owner at its turn or by a parked answer
+    /// helping (`helpBelow`); under the apply ack, whoever the member
+    /// answers (a range missing from the tail is a hole the death replay
+    /// stops at). Its records are stamped and final from the handout; the
+    /// part's arena is thread-safe. Nothing between the CAS and `.done`
+    /// parks, so an owner waiting on a helper on its own thread never
+    /// waits on a parked fiber; the prefix's advance (which may) follows.
+    fn claimMemberOnce(self: *Conveyor, w: *Window, idx: u32) void {
         const p = &w.parts[idx];
-        if (p.ops.len == 0) return;
-        p.tail_slot = t.claim(t.ctx, p.seq, p.start, p.ops);
-        if (p.tail_slot == null) {
-            self.stats.tail_slot_misses.fire("the journal tail's slot table refused a member; acked at the landing");
-            return;
+        if (p.claim_state.cmpxchgStrong(.open, .claiming, .acq_rel, .acquire) != null) return;
+        const m = &w.members[idx];
+        var ops: std.ArrayList(journal.WriteOp) = .empty;
+        const encoded: Error!u64 = blk: {
+            const frames = m.q.framesAlloc() catch break :blk error.OutOfMemory;
+            break :blk journal.partOps(p.arena.allocator(), self.deps.ring_layout, self.deps.geo, self.deps.appender_id, .{ .res = Reservation.unpadded(p.start, m.q.len), .records = frames }, &ops) catch |e| switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Corrupt,
+            };
+        };
+        if (encoded) |hb| {
+            p.header_bytes = hb;
+            p.ops = ops.items;
+            if (self.deps.ack_at_apply and p.ops.len != 0) if (self.deps.tail) |t| {
+                p.tail_slot = t.claim(t.ctx, p.seq, p.start, p.ops);
+                if (p.tail_slot == null) self.stats.tail_slot_misses.fire("the journal tail's slot table refused a member; acked at the landing");
+            };
+        } else |e| p.encode_err = e;
+        const claimed = p.tail_slot != null;
+        p.claim_state.store(.done, .release);
+        if (claimed) self.noteClaimed(w, idx);
+    }
+
+    /// The venue's twin: the window's image as if every member survives,
+    /// built and claimed ONCE — by its applier at the window's start or by
+    /// a parked answer helping. Nothing between the CAS and `.done` parks.
+    fn claimWindowOnce(self: *Conveyor, w: *Window) void {
+        if (w.claim_state.cmpxchgStrong(.open, .claiming, .acq_rel, .acquire) != null) return;
+        const gpa = self.deps.gpa;
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        w.image = if (fullParts(w, arena_state.allocator())) |parts|
+            journal.buildBatchWrite(self.window_arenas.take(gpa), self.deps.ring_layout, self.deps.geo, self.deps.appender_id, w.res, parts) catch null
+        else |_|
+            null;
+        if (w.image != null and self.deps.ack_at_apply) if (self.deps.tail) |t| {
+            w.tail_slot = t.claim(t.ctx, w.seq_base, w.res.start, w.ops());
+            if (w.tail_slot == null) self.stats.tail_slot_misses.fire("the journal tail's slot table refused a window; acked at the landing");
+        };
+        const claimed = w.tail_slot != null;
+        w.claim_state.store(.done, .release);
+        if (claimed) self.deps.reg.markResident(w.res.start);
+    }
+
+    /// Every member's part of a window, as if each survives (frames from the
+    /// members' stamped records).
+    fn fullParts(w: *Window, arena: Allocator) Error![]journal.BatchPart {
+        const parts = try arena.alloc(journal.BatchPart, w.members.len);
+        var pos = w.res.start;
+        for (w.members, parts) |*m, *part| {
+            part.* = .{ .res = Reservation.unpadded(pos, m.q.len), .records = try m.q.framesAlloc() };
+            pos += m.q.len;
         }
-        self.noteClaimed(w, idx);
+        return parts;
+    }
+
+    /// The claim's owner after its CAS: a helper holding it is past its
+    /// CAS and never parks before `.done` (microseconds).
+    fn awaitClaimed(state: *const std.atomic.Value(ClaimState)) void {
+        var spins: u32 = 0;
+        while (state.load(.acquire) != .done) : (spins += 1) {
+            // A yield every 64 hints: the helper's encode-and-claim is a few µs.
+            if (spins % 64 == 63) std.Thread.yield() catch {} else std.atomic.spinLoopHint();
+        }
     }
 
     /// §BX: a rolled-out member's PAD replaces its entry in the tail — the
@@ -3417,23 +3488,9 @@ pub const Conveyor = struct {
         // turns into a PAD in the tail before anyone is answered. Every
         // window under the apply ack, whoever it answers: a range missing
         // from the tail is a hole the death replay stops at.
-        var parts: std.ArrayList(journal.BatchPart) = .empty;
-        {
-            var pos_cursor = window.res.start;
-            for (members) |*m| {
-                const start = pos_cursor;
-                pos_cursor += m.q.len;
-                const frames = m.q.framesAlloc() catch return self.abandonWindow(window, error.Corrupt);
-                parts.append(arena, .{ .res = Reservation.unpadded(start, m.q.len), .records = frames }) catch return self.abandonWindow(window, error.Corrupt);
-            }
-        }
-        window.image = journal.buildBatchWrite(self.window_arenas.take(gpa), self.deps.ring_layout, self.deps.geo, self.deps.appender_id, window.res, parts.items) catch return self.abandonWindow(window, error.Corrupt);
-        if (self.deps.ack_at_apply) if (self.deps.tail) |t| {
-            window.tail_slot = t.claim(t.ctx, window.seq_base, window.res.start, window.ops());
-            if (window.tail_slot == null) {
-                self.stats.tail_slot_misses.fire("the journal tail's slot table refused a window; acked at the landing");
-            } else self.deps.reg.markResident(window.res.start);
-        };
+        self.claimWindowOnce(window);
+        awaitClaimed(&window.claim_state);
+        if (window.image == null) return self.abandonWindow(window, error.Corrupt);
         self.holdApplyForTest(.apply);
         var attempt: u32 = 0;
         while (true) : (attempt += 1) {
@@ -3494,14 +3551,17 @@ pub const Conveyor = struct {
         // A12: the survivors' entries, ONE submission, outside every lock —
         // the image built at the start when every member survived.
         var survivors: u64 = 0;
-        for (window.members, window.failed, parts.items) |*m, f, part| {
+        var pos_cursor = window.res.start;
+        for (window.members, window.failed) |*m, f| {
+            pos_cursor += m.q.len;
             if (f != null) continue;
             survivors += 1;
-            if (self.deps.door) |d| d.frontier(d.ctx, &m.q.door, part.res.end());
+            if (self.deps.door) |d| d.frontier(d.ctx, &m.q.door, pos_cursor);
         }
         window.entries = survivors;
-        if (survivors != parts.items.len and survivors != 0) {
-            if (!self.rebuildAfterRollOut(window, arena, parts.items)) {
+        if (survivors != members.len and survivors != 0) {
+            const rebuilt = if (fullParts(window, arena)) |parts| self.rebuildAfterRollOut(window, arena, parts) else |_| false;
+            if (!rebuilt) {
                 window.t_handoff_ns = clock.monotonicNs();
                 self.stats.apply_total.record(window.t_handoff_ns -| t_apply);
                 // A failed write with nothing landed — the lane's verdict for
@@ -3543,7 +3603,7 @@ pub const Conveyor = struct {
         }
         // Two parties while the applier answers: the lane's verdict may
         // land before the answer and must not free the window under it.
-        if (ack_now) window.parties.store(2, .release);
+        if (ack_now) _ = window.parties.fetchAdd(1, .acq_rel);
         self.deps.lane.submit(self.deps.lane.ctx, window) catch |e| {
             self.abandonWindow(window, e);
             if (ack_now) window.release();
@@ -3647,6 +3707,7 @@ pub const Conveyor = struct {
         self.resident_head = &me;
         self.resident_lock.unlock(io);
         while (true) {
+            self.helpBelow(w, idx);
             var n = me.notify.notified();
             _ = n.enable(io);
             if (me.covered(self)) {
@@ -3663,6 +3724,44 @@ pub const Conveyor = struct {
         self.resident_lock.unlock(io);
         _ = self.resident_waiters.fetchSub(1, .seq_cst);
         self.stats.resident_wait.record(clock.monotonicNs() -| t0);
+    }
+
+    /// §BX: a parked answer claims what still holds the resident prefix
+    /// below it — its window's earlier members, then each window at the
+    /// prefix's front (pinned by a party while it helps) — rather than wait
+    /// for owners not yet running (a turn whose fiber its lane's thread has
+    /// not reached). It stops at a reservation it cannot claim (an SMO
+    /// entry, a window still being handed out) or one whose owner is mid-
+    /// claim: that claim's own advance wakes it.
+    fn helpBelow(self: *Conveyor, w: *Window, idx: ?u32) void {
+        if (idx) |i| for (0..i) |j| self.claimMemberOnce(w, @intCast(j));
+        while (true) {
+            const upto = self.deps.reg.residentUpto();
+            if (upto >= w.res.start) return;
+            const front = self.pinInflight(upto) orelse return;
+            defer front.release();
+            switch (front.helpable.load(.acquire)) {
+                .self => for (0..front.parts.len) |j| self.claimMemberOnce(front, @intCast(j)),
+                .venue => self.claimWindowOnce(front),
+                .no => return,
+            }
+            if (self.deps.reg.residentUpto() == upto) {
+                self.stats.resident_helps.inc();
+                return;
+            }
+            self.stats.resident_helps.inc();
+        }
+    }
+
+    /// The window in flight at reservation `start`, held by a party: while
+    /// it is tracked its lane's party is not yet released (`finishWindow`
+    /// untracks first), so the RMW never revives a freed window.
+    fn pinInflight(self: *Conveyor, start: u64) ?*Window {
+        self.inflight_lock.lock();
+        defer self.inflight_lock.unlock();
+        const w = self.inflight.get(start) orelse return null;
+        _ = w.parties.fetchAdd(1, .acq_rel);
+        return w;
     }
 
     /// Wake the parked answers the resident prefix now covers.

@@ -979,7 +979,13 @@ pub const TestSeams = struct {
     /// stores 0 and notifies `apply_release`; `member_held` publishes it.
     hold_member_ino: std.atomic.Value(u64) = .init(0),
     member_held: std.atomic.Value(u32) = .init(0),
+    /// Where both holds park (§BX): `.turn` — before anything of the
+    /// window or member reaches the tail or RAM; `.apply` — before its
+    /// apply.
+    hold_at: std.atomic.Value(HoldAt) = .init(.turn),
 };
+
+pub const HoldAt = enum(u8) { turn, apply };
 
 pub var test_seams: TestSeams = .{};
 
@@ -2945,7 +2951,8 @@ pub const Conveyor = struct {
         self.relayTurn(w, 2 * idx + 1);
         self.relayTurn(w, 2 * idx + 2);
         const m = &w.members[idx];
-        self.holdMemberForTest(m);
+        self.holdMemberForTest(m, .turn);
+        self.holdMemberForTest(m, .apply);
         const p = &w.parts[idx];
         const a = p.arena.allocator();
         const members = w.members[idx .. idx + 1];
@@ -3335,7 +3342,8 @@ pub const Conveyor = struct {
         const gpa = self.deps.gpa;
         const t_apply = clock.monotonicNs();
         defer self.leftApply();
-        self.holdApplyForTest();
+        self.holdApplyForTest(.turn);
+        self.holdApplyForTest(.apply);
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -3559,8 +3567,8 @@ pub const Conveyor = struct {
     /// `test_seams.hold_next_apply`: the one armed window's applier parks
     /// (never spins: it shares its lane with the window it must let pass)
     /// until the test releases it; register-then-check against the release.
-    fn holdApplyForTest(self: *Conveyor) void {
-        if (test_seams.hold_next_apply.load(.acquire) != 1) return;
+    fn holdApplyForTest(self: *Conveyor, at: HoldAt) void {
+        if (test_seams.hold_next_apply.load(.acquire) != 1 or test_seams.hold_at.load(.acquire) != at) return;
         if (test_seams.hold_next_apply.cmpxchgStrong(1, 2, .acq_rel, .acquire) != null) return;
         test_seams.apply_held.store(1, .release);
         const io = self.deps.io;
@@ -3577,9 +3585,9 @@ pub const Conveyor = struct {
 
     /// `test_seams.hold_member_ino`: the member naming that inode parks
     /// (register-then-check against the release).
-    fn holdMemberForTest(self: *Conveyor, m: *const Queued) void {
+    fn holdMemberForTest(self: *Conveyor, m: *const Queued, at: HoldAt) void {
         const ino = test_seams.hold_member_ino.load(.acquire);
-        if (ino == 0 or !namesInode(m.q.recs, ino)) return;
+        if (ino == 0 or test_seams.hold_at.load(.acquire) != at or !namesInode(m.q.recs, ino)) return;
         test_seams.member_held.store(1, .release);
         const io = self.deps.io;
         while (test_seams.hold_member_ino.load(.acquire) == ino) {

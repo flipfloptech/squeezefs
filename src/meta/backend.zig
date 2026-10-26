@@ -4603,6 +4603,111 @@ test "§BX the same law on the venue arm: W1's applier held before its apply, W2
     try residentAnswerRow(v, be, .venue);
 }
 
+/// The convoy's shape (§BX.7): A (window W1) held INSIDE its apply — its
+/// entry (self) or its window's image (venue) already in the tail, written
+/// at its turn or its window's start — and B (W2) committed beside it. B's
+/// answer must not wait for A's apply: the death replay already runs
+/// through A. Released, A is answered too and the replay keeps both.
+fn turnClaimRow(v: *TestVol, be: *KvBackend, comptime arm: enum { self, venue }) !void {
+    const Committer = struct {
+        fn run(b: *KvBackend, t: *KvTx, out: *?anyerror, done: *std.atomic.Value(u32)) void {
+            out.* = if (b.commit(t)) |_| null else |e| e;
+            done.store(1, .release);
+        }
+        fn create(b: *KvBackend, name: []const u8, ino: *u64, out: *?anyerror, done: *std.atomic.Value(u32)) void {
+            const t = b.begin(@src()) catch unreachable;
+            t.kernel_origin = true;
+            ino.* = stageCreate(b, t, name, 0) catch unreachable;
+            run(b, t, out, done);
+        }
+    };
+    _ = try commitCreateKernel(be, "landed");
+    try be.fsync();
+    // Nothing lands from here on: every answer rests on the tail alone.
+    journal_lane.test_seams.delay_issue.store(1, .release);
+    defer journal_lane.test_seams.delay_issue.store(0, .release);
+    if (arm == .venue) _ = try commitCreateKernel(be, "w0");
+    conveyor.test_seams.hold_at.store(.apply, .release);
+    defer conveyor.test_seams.hold_at.store(.turn, .release);
+    const ta = try be.begin(@src());
+    ta.kernel_origin = true;
+    const ino_a = try stageCreate(be, ta, "a", 0);
+    switch (arm) {
+        .self => conveyor.test_seams.hold_member_ino.store(ino_a, .release),
+        .venue => conveyor.test_seams.hold_next_apply.store(1, .release),
+    }
+    var out_a: ?anyerror = error.TestNotRun;
+    var done_a = std.atomic.Value(u32).init(0);
+    const th_a = try std.Thread.spawn(.{}, Committer.run, .{ be, ta, &out_a, &done_a });
+    defer th_a.join();
+    var released = false;
+    defer if (!released) {
+        conveyor.test_seams.hold_member_ino.store(0, .release);
+        conveyor.test_seams.hold_next_apply.store(0, .release);
+        conveyor.test_seams.apply_release.notifyWaiters(be.io);
+    };
+    const held = switch (arm) {
+        .self => &conveyor.test_seams.member_held,
+        .venue => &conveyor.test_seams.apply_held,
+    };
+    while (held.load(.acquire) == 0) std.Thread.yield() catch {};
+    held.store(0, .release);
+    const cs = be.conveyorStats();
+    const waits0 = cs.resident_waits.load();
+    var ino_b: u64 = 0;
+    var out_b: ?anyerror = error.TestNotRun;
+    var done_b = std.atomic.Value(u32).init(0);
+    const th_b = try std.Thread.spawn(.{}, Committer.create, .{ be, "b", &ino_b, &out_b, &done_b });
+    defer th_b.join();
+    defer if (!released) {
+        conveyor.test_seams.hold_member_ino.store(0, .release);
+        conveyor.test_seams.hold_next_apply.store(0, .release);
+        conveyor.test_seams.apply_release.notifyWaiters(be.io);
+        released = true;
+    };
+    // B is answered while A applies (a bound against the hang only: the
+    // answer takes microseconds once B applied).
+    const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (done_b.load(.acquire) == 0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 1), done_b.load(.acquire));
+    try testing.expectEqual(@as(?anyerror, null), out_b);
+    try testing.expectEqual(waits0, cs.resident_waits.load());
+    try testing.expectEqual(@as(u32, 0), done_a.load(.acquire));
+    // A death now: the replay runs through A's entry to B's.
+    const j0 = try judgeDeath(v, be);
+    try testing.expectEqual(@as(u32, 0), j0.past_hole);
+    conveyor.test_seams.hold_member_ino.store(0, .release);
+    conveyor.test_seams.hold_next_apply.store(0, .release);
+    conveyor.test_seams.apply_release.notifyWaiters(be.io);
+    released = true;
+    while (done_a.load(.acquire) == 0) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(?anyerror, null), out_a);
+    const j = try judgeDeath(v, be);
+    try testing.expectEqual(@as(u32, 0), j.past_hole);
+    journal_lane.test_seams.delay_issue.store(0, .release);
+    try be.fsync();
+    try testing.expect(try present(be, ino_a));
+    try testing.expect(try present(be, ino_b));
+}
+
+test "§BX.7 an answer never waits for an earlier member's APPLY (self-apply): A's member held inside its apply — its entry in the tail since its turn — and B, a later window, is answered at its own apply without parking; the death replay runs through A to B; released, both answered and kept (red: the entry claimed after the apply, B parked behind A's apply — the convoy)" {
+    const v = try TestVol.create(testing.allocator, "turn-claim-self", "600000");
+    defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_APPLY", "self");
+    const be = try v.open();
+    defer be.close();
+    try turnClaimRow(v, be, .self);
+}
+
+test "§BX.7 the venue arm: W1's image in the tail at its window's start, its applier held inside the apply; W2, applied by another applier, is answered without parking; the death replay runs through W1 to W2 (red: the image claimed after the apply)" {
+    const v = try TestVol.create(testing.allocator, "turn-claim-venue", "600000");
+    defer v.destroy();
+    try v.env.put("SQUEEZEFS_META_APPLY", "venue");
+    const be = try v.open();
+    defer be.close();
+    try turnClaimRow(v, be, .venue);
+}
+
 test "§BB.5 a journal write that fails AFTER its window was acked: the commit returned Ok and its record STANDS (no rollback), the volume latches FAILED at once (one loud line), the tail still holds the window for the supervisor's replay" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "acked-fail", "600000");

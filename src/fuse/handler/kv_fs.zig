@@ -5736,6 +5736,11 @@ pub const MemStore = struct {
     pub fn lookupView(self: *MemStore, _: Allocator, kind: u8, k: []const u8, comptime T: type, ctx: anytype, comptime visit: fn (@TypeOf(ctx), []const u8) T) StoreError!?T {
         self.lock.lock();
         defer self.lock.unlock();
+        // The set's view descends like its lookup: a try-only miss refuses.
+        if (node_cache.try_only and self.try_only_refusals > 0) {
+            self.try_only_refusals -= 1;
+            return self.try_only_refusal;
+        }
         self.reads += 1;
         const f = self.find(kind, k);
         if (!f.hit) return null;
@@ -9179,6 +9184,22 @@ test "POSIX: xattrs — set/get/list/remove, the size probe, ERANGE, CREATE/REPL
     try testing.expectEqual(linux.E.NODATA, h.call(.{ .getxattr = .{ .name = "user.a", .size = 0 } }, f).errno().?);
     // The data record is untouched by the xattr traffic.
     try testing.expectEqualStrings("data", h.read(f, 0, 64).body);
+}
+
+test "an inode read decodes the borrowed record — no copy, no allocation: with the filesystem's allocator refusing every request the read of a present inode serves its value and an absent one null" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const f = try h.create(1, "f", 0o640);
+    h.release(f);
+    var refusing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const gpa0 = h.fs.gpa;
+    h.fs.gpa = refusing.allocator();
+    defer h.fs.gpa = gpa0;
+    const v = (try h.fs.readInodeOpt(try Harness.Fs.localOf(f))) orelse return error.TestExpectedInode;
+    try testing.expectEqual(@as(u32, S.IFREG | 0o640), v.mode);
+    try testing.expectEqual(@as(?InodeValue, null), try h.fs.readInodeOpt(try Harness.Fs.localOf(f) + 1000));
+    try testing.expectEqual(@as(usize, 0), refusing.allocations);
 }
 
 // ---------------------------------------------------------------------------

@@ -92,3 +92,22 @@ spin's 560–637 k fall-throughs per 640 k ops on driven FUSE lanes; the reclaim
 `self` windows' journal pad (67–95 B/op against 28–30); and §BB's crash law has a narrow hole in BOTH arms — a
 member (`self`) or a window (`venue`, §AW.4) answered while an earlier one has not yet claimed its tail slot lies
 past a hole if the daemon dies in that span, and the judged death replay drops it though it was acked.
+
+## The A-B-B-A against v0.1.0 (2026-10-26, quiet host, the RAM-NVMe perf mount, dist builds)
+
+`mpirun mdtest -n 10000 -u -i 1`, legs v0.1.0 → ino windows (`86926fb`) → `9962f5d` (self, the
+default) → `9962f5d` with `SQUEEZEFS_META_APPLY=venue`, then reversed; 16 runs, fsck clean after
+every one; `tctl_c` 53–67 °C. k ops/s, leg 1 / leg 2:
+
+| -np 32 | v0.1.0 | ino windows | + self | + venue | best ÷ v0.1.0 |
+|---|---|---|---|---|---|
+| file creation | 91 / 93 | 115 / 114 | 156 / 183 | 128 / 129 | 1.84× |
+| file removal | 92 / 100 | 126 / 125 | 219 / 232 | 140 / 141 | 2.35× |
+| directory creation | 81 / 81 | 120 / 120 | 191 / 190 | 124 / 127 | 2.35× |
+| directory removal | 57 / 60 | 60 / 59 | 48 / 48 | 61 / 61 | 0.82× (self) |
+
+-np 64: file creation 1.96×, removal 2.18×, directory creation 2.25×, directory removal 0.89× under
+`self` (0.98× under venue). The ino windows (§BV) give 1.24–1.48× alone; self-apply on top doubles
+the rows against v0.1.0. **Directory removal under `self` is the one regression** (48 k against 55–60 k)
+— the follow-up (`perf/self-apply-followups`) owns it; `08d33fb` (the default) is one commit to
+revert if it cannot be closed. Sessions: `/build/perf/create-abba/`.

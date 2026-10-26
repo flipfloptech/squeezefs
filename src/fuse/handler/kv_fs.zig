@@ -1226,9 +1226,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 self.pending.fold(ino, &v);
                 return v;
             }
-            const bytes = (self.store.lookup(self.gpa, key.TREE_INODES, &key.inodeKey(ino)) catch |e| return storeErr(e)) orelse return null;
-            defer self.gpa.free(bytes);
-            var v = InodeValue.decode(bytes) catch return error.InputOutput;
+            // Decoded off the borrowed value: no copy per inode read.
+            const Decode = struct {
+                fn of(_: void, bytes: []const u8) ?InodeValue {
+                    return InodeValue.decode(bytes) catch null;
+                }
+            };
+            const got = (self.store.lookupView(self.gpa, key.TREE_INODES, &key.inodeKey(ino), ?InodeValue, {}, Decode.of) catch |e| return storeErr(e)) orelse return null;
+            var v = got orelse return error.InputOutput;
             self.pending.fold(ino, &v);
             return v;
         }

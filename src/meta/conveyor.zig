@@ -5547,6 +5547,113 @@ test "THE TAIL GATE (§BV): under self-apply every member answered at the apply 
     try testing.expectEqual(@as(u32, 0), tail.used.load(.acquire));
 }
 
+test "a self-applied window's arenas are recycled (§BV, the idle-RSS law): 48 creates, each from its own committer thread, every window landed by another — once 16 have landed, the only block of the conveyor's allocator a window's landing frees on another thread than the one that allocated it is its `Window`: its own arena, its member's part and its image come back from the pools (smp_allocator parks a freed block on the FREEING thread's list and maps a fresh slab for a thread whose own list is empty: +127 MiB resident after 10,000 creates under a 64 MiB budget)" {
+    // Counts the frees of a block on another thread than its allocation's.
+    const Crossing = struct {
+        child: Allocator,
+        lock: jc.SpinLock = .{},
+        owner: std.AutoHashMapUnmanaged(usize, std.Thread.Id) = .empty,
+        crossed: usize = 0,
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const p = self.child.rawAlloc(len, a, ra) orelse return null;
+            self.lock.lock();
+            defer self.lock.unlock();
+            self.owner.put(self.child, @intFromPtr(p), std.Thread.getCurrentId()) catch {
+                self.child.rawFree(p[0..len], a, ra);
+                return null;
+            };
+            return p;
+        }
+        fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawResize(m, a, new_len, ra);
+        }
+        fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const p = self.child.rawRemap(m, a, new_len, ra) orelse return null;
+            self.lock.lock();
+            defer self.lock.unlock();
+            const tid = (self.owner.fetchRemove(@intFromPtr(m.ptr)) orelse unreachable).value;
+            self.owner.putAssumeCapacity(@intFromPtr(p), tid);
+            return p;
+        }
+        fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            {
+                self.lock.lock();
+                defer self.lock.unlock();
+                const tid = (self.owner.fetchRemove(@intFromPtr(m.ptr)) orelse unreachable).value;
+                if (tid != std.Thread.getCurrentId()) self.crossed += 1;
+            }
+            self.child.rawFree(m, a, ra);
+        }
+        fn crossings(self: *@This()) usize {
+            self.lock.lock();
+            defer self.lock.unlock();
+            return self.crossed;
+        }
+    };
+    var crossing: Crossing = .{ .child = testing.allocator };
+    defer crossing.owner.deinit(testing.allocator);
+    const h = try Harness.createWithGpa(.{}, null, false, crossing.allocator());
+    defer h.destroy();
+    const io = testing.io;
+    h.cv.deps.self_apply = true;
+    h.lane.hold = true;
+    h.threaded_pass = true;
+    const pass_thread = try std.Thread.spawn(.{}, Harness.passThreadMain, .{h});
+    defer {
+        while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
+        h.cv.quiesce();
+        h.pass_stop.store(true, .release);
+        h.pass_wake.notifyOne(io);
+        pass_thread.join();
+    }
+    const Committer = struct {
+        fn run(hh: *Harness, ino: *u64, out: *?anyerror, done: *std.atomic.Value(bool)) void {
+            defer done.store(true, .release);
+            const t = hh.gpa.create(tx.KvTx) catch unreachable;
+            defer hh.gpa.destroy(t);
+            t.* = tx.KvTx.init(hh.gpa, @src());
+            var nb: [16]u8 = undefined;
+            ino.* = hh.stageCreate(t, std.fmt.bufPrint(&nb, "ar-{d}", .{hh.inos.snapshot()}) catch unreachable) catch unreachable;
+            hh.cv.commit(t) catch |e| {
+                out.* = e;
+                return;
+            };
+            out.* = null;
+        }
+    };
+    const warm = 16;
+    const n = 48;
+    var inos: [n]u64 = undefined;
+    var results: [n]?anyerror = @splat(error.TestNotRun);
+    var crossed_warm: usize = 0;
+    var windows_warm: u64 = 0;
+    for (0..n) |i| {
+        if (i == warm) {
+            crossed_warm = crossing.crossings();
+            windows_warm = h.cv.stats.self_handoffs.load();
+        }
+        var done: std.atomic.Value(bool) = .init(false);
+        const th = try std.Thread.spawn(.{}, Committer.run, .{ h, &inos[i], &results[i], &done });
+        // This thread is the lane: it lands the window the committer waits on.
+        while (!done.load(.acquire)) {
+            if (!h.lane.landDue(0)) std.Thread.yield() catch {};
+        }
+        th.join();
+        try testing.expectEqual(@as(?anyerror, null), results[i]);
+    }
+    const windows = h.cv.stats.self_handoffs.load() - windows_warm;
+    try testing.expectEqual(@as(u64, n - warm), windows);
+    try testing.expectEqual(@as(usize, @intCast(windows)), crossing.crossings() - crossed_warm);
+    for (inos) |ino| try testing.expect(try h.present(ino));
+}
+
 test "THE COMMITTER BURST: with the pass parked at the window gate (the one window it may fly held un-landed, the next batch drained) and every queue cell taken, 16 committers more are none of them refused — each parks for room (never ConveyorFull, never EAGAIN) and the drain that frees room wakes it; every create acked and present" {
     const h = try Harness.create(.{ .ring_pages = 120 }, null, false);
     defer h.destroy();

@@ -235,6 +235,15 @@ Park)`; granted ⇒ pushed on the rotor under its one-writer mutex (`rotor_updat
 `Overflow ⇒ nothing here` (the overflow arm counts). Closure: `affinity_mints + rotor_mints +
 dir_gather_mints ≡ mints` (`slot_lease.rs:321–325`).
 
+**The port's additions (decision 0003 §BV, 2026-10-26; not in the reference).** Ties in steps 2–3
+go to the first candidate at or after the rr cursor, cyclically. Beside another active minting
+stream (the FUSE caller, else the thread), steps 2–3 run once per MINT WINDOW: the pick skips trees
+other streams' windows claim (the over-cap verdict reads every tree) and the stream claims the tree
+it took for `windowMints(node_size)` mints or one checkpoint age; step 1 yields to another stream's
+window on the parent's tree (`slots/mint_window.zig`). Every mint whose decision took a leased slot is KEPT only if, after the
+cursor's `fetch_add`, the slot still names this mount at the decision's generation and is not
+releasing — else burned (`mint_burns`), so the closure reads `≡ mints + mint_burns`.
+
 **`gather`** (`GATHER_XATTR = "user.squeezefs.gather"` `lib.rs:1232–1243`; `gather_xattr_opts_in`
 — the bool-knob vocabulary `1/true/yes/on`, trimmed, case-insensitive — `:1247–1253`): the ONE
 user-settable name inside the reserved `user.squeezefs.` family, admitted BY NAME (`xattr_name_

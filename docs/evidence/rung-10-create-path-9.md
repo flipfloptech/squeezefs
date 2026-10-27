@@ -59,3 +59,17 @@ slot-move epoch (a slot that leaves and returns reloads leaves without a bump); 
 The publish's old-snapshot destroy (1.1 µs) and the run edit's spine retains (0.8 µs) are cross-core
 refcount traffic under the hold — a deferred release needs an `ArcSwap` exchange (a modelled core).
 The journal thread (pass + lane) is ≈ 70 % busy per create phase — the queue wait's server.
+
+## The A-B-B-A (2026-10-26, quiet host, the RAM-NVMe perf mount, dist builds)
+
+`dev` `6992a4c` against `e945e13` (the six cuts), legs A B B A, `mpirun mdtest -n 10000 -u -i 1`,
+gate lock and every build slot held, tctl ≤ 64 °C, fsck clean after all 8 runs; k ops/s:
+
+| | -np 32 dev | -np 32 cuts | Δ | -np 64 dev | -np 64 cuts | Δ |
+|---|---|---|---|---|---|---|
+| file creation | 166 / 172 | 192 / 189 | +12.7 % | 166 / 161 | 177 / 178 | +8.7 % |
+| file removal | 231 / 244 | 244 / 231 | ±0 % | 192 / 204 | 239 / 233 | +19.2 % |
+| directory creation | 189 / 192 | 199 / 195 | +3.4 % | 186 / 189 | 194 / 207 | +7.0 % |
+| directory removal | 182 / 185 | 212 / 211 | +15.1 % | 195 / 180 | 210 / 194 | +7.9 % |
+
+Landed (gate 150 green, 75/75). Sessions: `/build/perf/cw-abba/`.

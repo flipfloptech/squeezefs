@@ -782,6 +782,15 @@ pub const Stats = struct {
     /// prefix stopped at a reservation no window in flight holds — an SMO's
     /// entry, resident only by its landing.
     resident_smo_waits: counters.ShardedCounter = .{},
+    /// §BX.12: `meta_conveyor_pass_claims_on` (0/1), `_switches`, the
+    /// share of recent windows whose last turn started late
+    /// (`meta_conveyor_turn_late_permille`, the signal) and the entries the
+    /// pass claimed after a window's first turn (its CAS won,
+    /// `meta_conveyor_pass_claimed_members`).
+    pass_claims_on: counters.Gauge = .{},
+    pass_claims_switches: counters.ShardedCounter = .{},
+    turn_late_permille: counters.Gauge = .{},
+    pass_claimed_members: counters.ShardedCounter = .{},
     /// `meta_conveyor_pad_landings`: rolled-out members whose PAD found the
     /// tail's table full — the entry stays and the error is answered at
     /// the landing (§BX).
@@ -877,6 +886,9 @@ pub const Stats = struct {
     /// `meta_handout_claims`: the pass's claims of a self-applied window's
     /// still-unclaimed entries right after its first turn (§BX), per window.
     handout_claims: counters.ShardedLatencyHistogram = .{},
+    /// `meta_turn_lag`: per self-applied window, its last member's turn
+    /// starting after the handout (§BX.12's signal).
+    turn_lag: counters.ShardedLatencyHistogram = .{},
 
     pub fn writeJson(self: *const Stats, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("{{\"meta_commit_group_size\":{{", .{});
@@ -919,6 +931,7 @@ pub const Stats = struct {
         });
         try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_tail_gate_parks\":{d},\"meta_conveyor_resident_waits\":{d},\"meta_conveyor_resident_landings\":{d},\"meta_conveyor_pad_landings\":{d},\"meta_conveyor_resident_helps\":{d},\"meta_conveyor_resident_smo_waits\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.tail_gate_parks.load(), self.resident_waits.load(), self.resident_landings.load(), self.pad_landings.load(), self.resident_helps.load(), self.resident_smo_waits.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
         try w.print(",\"meta_conveyor_undo_keys\":{d}", .{self.undo_keys.load()});
+        try w.print(",\"meta_conveyor_pass_claims_on\":{d},\"meta_conveyor_pass_claims_switches\":{d},\"meta_conveyor_turn_late_permille\":{d},\"meta_conveyor_pass_claimed_members\":{d}", .{ self.pass_claims_on.load(), self.pass_claims_switches.load(), self.turn_late_permille.load(), self.pass_claimed_members.load() });
         try w.print(",\"meta_conveyor_window_gate_parks\":{d},\"meta_conveyor_room_parks\":{d},\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
             self.window_gate_parks.load(),
             self.commit_room_parks.load(),
@@ -967,6 +980,8 @@ pub const Stats = struct {
         try self.resident_wait.snapshot().writeJson(w);
         try w.writeAll(",\"meta_handout_claims\":");
         try self.handout_claims.snapshot().writeJson(w);
+        try w.writeAll(",\"meta_turn_lag\":");
+        try self.turn_lag.snapshot().writeJson(w);
         try w.writeAll("}");
     }
 };
@@ -1362,6 +1377,8 @@ pub const Window = struct {
         undo: []tx.UndoKey = &.{},
         tail_slot: ?u32 = null,
         answered: bool = false,
+        /// §BX.12: the member's turn ran (`applyOwn`): the turn lag's sample.
+        t_start_ns: u64 = 0,
         /// §BX: its entry's claim — `.done` publishes `ops`,
         /// `header_bytes`, `tail_slot` and `encode_err` (release).
         claim_state: std.atomic.Value(ClaimState) = .init(.open),
@@ -1659,7 +1676,13 @@ pub const Deps = struct {
     /// hop, per-tx leaf locks); false = the applier venue (§AW; the
     /// portable contracts' default, `SQUEEZEFS_META_APPLY=venue`).
     self_apply: bool = false,
+    /// §BX.12: whether the pass claims a self-applied window's entries
+    /// after its first turn (`SQUEEZEFS_META_PASS_CLAIMS`).
+    pass_claims: PassClaims = .never,
 };
+
+/// `SQUEEZEFS_META_PASS_CLAIMS`.
+pub const PassClaims = enum { auto, always, never };
 
 /// The committer's thread as the ack spin sees it (the backend binds the
 /// lane's two reads).
@@ -1721,6 +1744,11 @@ pub const Conveyor = struct {
     /// after its slots went back, then notifies `tail_freed`.
     tail_members: std.atomic.Value(u32) = .init(0),
     tail_freed: sync.Notify = .init,
+    /// §BX.12 (`auto`): the share of recent windows whose last turn started
+    /// late (an EWMA in 1/65536ths), and whether the pass claims after a
+    /// window's first turn (switched with hysteresis).
+    turn_late_frac: std.atomic.Value(u32) = .init(0),
+    claims_on: std.atomic.Value(bool) = .init(false),
     /// §BX.8: the PADs standing in the tail over rolled-back windows'
     /// ranges until a durable ledger lies past them (`sweepHeldPads`); a
     /// self-applied window's keeps one of its own window's `tail_members`.
@@ -1775,6 +1803,17 @@ pub const Conveyor = struct {
     /// window in flight), recycled (`ArenaPool`).
     window_arenas: ArenaPool,
     part_arenas: ArenaPool,
+
+    /// §BX.12: a window's last turn is late past the apply's ~8 µs
+    /// (`meta_apply_total`, creates and rmdirs at -np 32 and 64): a member
+    /// starting later than a sibling's whole apply holds that sibling's answer.
+    const TURN_LATE_NS: u64 = 8 * std.time.ns_per_us;
+    /// The hysteresis on the late share (1/65536ths), from the measured
+    /// shares of late windows: -np 32 17–37 % (23–46 % with the pass
+    /// claiming), -np 64 69–84 % (90–96 % claiming) — each arm stays on
+    /// its side in either mode.
+    const LATE_ON: u32 = 62 * 65536 / 100;
+    const LATE_OFF: u32 = 50 * 65536 / 100;
 
     /// A held PAD's slot, the end of the range it stands over, and whether
     /// it holds a unit of `tail_members`.
@@ -3006,20 +3045,79 @@ pub const Conveyor = struct {
         // one send per batch and the fan-out's depth is log₂ n (at 64 ranks
         // a serial fan-out on the lane fiber took 254 µs of every member's
         // queue wait and parked every spinner past its bound).
-        // §BX: then the pass claims every member still unclaimed, in turn
-        // order, as a helper does (the claim's CAS; one never waits) — the
-        // turns are not held for it, and a member whose thread is busy,
-        // descheduled or not yet woken holds no answer behind its turn. The
-        // pass holds a party: the members may finish the window meanwhile.
-        const claims = self.deps.ack_at_apply and self.deps.tail != null;
+        // §BX: then the pass claims the entries still unclaimed of the
+        // members it claims for (`passClaims`), in turn order, as a helper
+        // does (the claim's CAS; one never waits) — the turns are not held
+        // for it, and a member whose thread is busy, descheduled or not yet
+        // woken holds no answer behind its turn. The pass holds a party:
+        // the members may finish the window meanwhile.
+        const claims = self.deps.ack_at_apply and self.deps.tail != null and self.passClaims();
         if (claims) _ = w.parties.fetchAdd(1, .acq_rel);
         self.relayTurn(w, 0);
         if (claims) {
             const t_claims = clock.monotonicNs();
-            for (0..n) |i| self.claimMemberOnce(w, @intCast(i));
+            for (0..n) |i| {
+                if (self.claimMemberOnce(w, @intCast(i))) self.stats.pass_claimed_members.inc();
+            }
             self.stats.handout_claims.record(clock.monotonicNs() -| t_claims);
             w.release();
         }
+    }
+
+    /// §BX.12: does the pass claim this window's entries after its first
+    /// turn? `auto`: while the turns run late (`noteTurnLag`).
+    fn passClaims(self: *const Conveyor) bool {
+        return switch (self.deps.pass_claims) {
+            .always => true,
+            .never => false,
+            // monotonic: a heuristic's flag; a stale read decides one window.
+            .auto => self.claims_on.load(.monotonic),
+        };
+    }
+
+    /// §BX.12's signal, sampled by a window's last member
+    /// (`submitSelfApplied`): did its last member's turn start late after
+    /// the handout (`meta_turn_lag`)? A turn delivered to a thread busy
+    /// with other committers runs late, and a member that has not run is
+    /// one whose entry later answers wait for: the pass's claims pay
+    /// exactly then; on prompt turns they only add the pass's encode to the
+    /// lane's thread. The share of late windows is an EWMA over 1024
+    /// windows (10–20 ms at these rates: shorter averages followed a load's
+    /// bursts — a -np 32 rmdir storm's late bursts and a -np 64 mkdir
+    /// storm's prompt ones flipped a 128-window average dozens of times a
+    /// phase), switched with hysteresis: on above `LATE_ON`, off below
+    /// `LATE_OFF`. The decision reads only what lags the turns, never the
+    /// parks the claims remove, so claiming does not switch itself off.
+    /// Read and written monotonic by whichever member submits: concurrent
+    /// windows may lose a sample, and each window resamples.
+    fn noteTurnLag(self: *Conveyor, w: *const Window) void {
+        var last: u64 = 0;
+        for (w.parts) |p| last = @max(last, p.t_start_ns);
+        if (last == 0) return;
+        const lag = last -| w.t_turns_ns;
+        self.stats.turn_lag.record(lag);
+        const frac = lateShareStep(self.turn_late_frac.load(.monotonic), lag > TURN_LATE_NS);
+        self.turn_late_frac.store(frac, .monotonic);
+        self.stats.turn_late_permille.set((@as(u64, frac) * 1000) >> 16);
+        if (self.deps.pass_claims != .auto) return;
+        const on = self.claims_on.load(.monotonic);
+        if (claimsNext(on, frac) == on) return;
+        self.claims_on.store(!on, .monotonic);
+        self.stats.pass_claims_on.set(@intFromBool(!on));
+        self.stats.pass_claims_switches.inc();
+    }
+
+    /// §BX.12: one window's step of the late share's EWMA (1/65536ths,
+    /// over 1024 windows).
+    fn lateShareStep(prev: u32, late: bool) u32 {
+        const p: i64 = prev;
+        const x: i64 = if (late) 1 << 16 else 0;
+        return @intCast(p + @divTrunc(x - p, 1024));
+    }
+
+    /// §BX.12: the claims' switch on the late share, with hysteresis.
+    fn claimsNext(on: bool, share: u32) bool {
+        return if (on) share >= LATE_OFF else share > LATE_ON;
     }
 
     /// Hand member `idx` its turn; a member whose committer is gone (it
@@ -3044,6 +3142,7 @@ pub const Conveyor = struct {
     /// is the last member. A served verb, a control record or a tool waits
     /// for the landing. Returns the member's terminal outcome.
     pub fn applyOwn(self: *Conveyor, w: *Window, idx: u32) Outcome {
+        w.parts[idx].t_start_ns = clock.monotonicNs();
         // The fan-out's next level first: two siblings start while we apply.
         self.relayTurn(w, 2 * idx + 1);
         self.relayTurn(w, 2 * idx + 2);
@@ -3060,7 +3159,7 @@ pub const Conveyor = struct {
         // its apply (its records are stamped and final): the resident prefix
         // advances in turn order, never behind a sibling's apply. An entry
         // that cannot be encoded fails the member unapplied.
-        self.claimMemberOnce(w, idx);
+        _ = self.claimMemberOnce(w, idx);
         awaitClaimed(&p.claim_state);
         if (p.encode_err) |e| failed[0] = e;
         self.holdMemberForTest(m, .apply);
@@ -3124,16 +3223,17 @@ pub const Conveyor = struct {
     }
 
     /// §BX: member `idx`'s entry into the tail and its window's claim
-    /// prefix, ONCE — by its owner at its turn or by a parked answer
-    /// helping (`helpBelow`); under the apply ack, whoever the member
-    /// answers (a range missing from the tail is a hole the death replay
-    /// stops at). Its records are stamped and final from the handout; the
-    /// part's arena is thread-safe. Nothing between the CAS and `.done`
-    /// parks, so an owner waiting on a helper on its own thread never
-    /// waits on a parked fiber; the prefix's advance (which may) follows.
-    fn claimMemberOnce(self: *Conveyor, w: *Window, idx: u32) void {
+    /// prefix, ONCE — by its owner at its turn, by the pass after the
+    /// window's first turn, or by a parked answer helping (`helpBelow`);
+    /// under the apply ack, whoever the member answers (a range missing
+    /// from the tail is a hole the death replay stops at). Its records are
+    /// stamped and final from the handout; the part's arena is thread-safe.
+    /// Nothing between the CAS and `.done` parks, so an owner waiting on a
+    /// helper on its own thread never waits on a parked fiber; the prefix's
+    /// advance (which may) follows. True when this caller's CAS won.
+    fn claimMemberOnce(self: *Conveyor, w: *Window, idx: u32) bool {
         const p = &w.parts[idx];
-        if (p.claim_state.cmpxchgStrong(.open, .claiming, .acq_rel, .acquire) != null) return;
+        if (p.claim_state.cmpxchgStrong(.open, .claiming, .acq_rel, .acquire) != null) return false;
         const m = &w.members[idx];
         var ops: std.ArrayList(journal.WriteOp) = .empty;
         const encoded: Error!u64 = blk: {
@@ -3154,6 +3254,7 @@ pub const Conveyor = struct {
         const claimed = p.tail_slot != null;
         p.claim_state.store(.done, .release);
         if (claimed) self.noteClaimed(w, idx);
+        return true;
     }
 
     /// The venue's twin: the window's image as if every member survives,
@@ -3458,6 +3559,7 @@ pub const Conveyor = struct {
     /// §BC: every member applied (or rolled out) — the window's image from
     /// their ops, the handoff to the lane. Runs on the last member's thread.
     fn submitSelfApplied(self: *Conveyor, w: *Window) void {
+        self.noteTurnLag(w);
         const gpa = self.deps.gpa;
         const wa = w.arena.allocator();
         var entry_bytes: u64 = 0;
@@ -3808,14 +3910,20 @@ pub const Conveyor = struct {
     /// entry — true: no window holds it —, a window still being handed out)
     /// or one whose owner is mid-claim: that claim's own advance wakes it.
     fn helpBelow(self: *Conveyor, w: *Window, idx: ?u32) bool {
-        if (idx) |i| for (0..i) |j| self.claimMemberOnce(w, @intCast(j));
+        if (idx) |i| {
+            for (0..i) |j| {
+                _ = self.claimMemberOnce(w, @intCast(j));
+            }
+        }
         while (true) {
             const upto = self.deps.reg.residentUpto();
             if (upto >= w.res.start) return false;
             const front = self.pinInflight(upto) orelse return true;
             defer front.release();
             switch (front.helpable.load(.acquire)) {
-                .self => for (0..front.parts.len) |j| self.claimMemberOnce(front, @intCast(j)),
+                .self => for (0..front.parts.len) |j| {
+                    _ = self.claimMemberOnce(front, @intCast(j));
+                },
                 .venue => self.claimWindowOnce(front),
                 .no => return false,
             }
@@ -6361,6 +6469,7 @@ test "§BX the pass claims every member's entry right after the window's first t
     var tail: Tail = .{};
     h.cv.deps.self_apply = true;
     h.cv.deps.ack_at_apply = true;
+    h.cv.deps.pass_claims = .always;
     h.cv.deps.tail = .{ .ctx = &tail, .claim = Tail.claim, .release = Tail.release, .slots = Tail.slots };
     h.lane.hold = true;
     h.threaded_pass = true;
@@ -6425,6 +6534,79 @@ test "§BX the pass claims every member's entry right after the window's first t
     try testing.expectEqual(@as(?anyerror, null), out);
     while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
     try testing.expect(try h.present(ino));
+}
+
+test "§BX.12 the pass's claims switch on the share of late turns, with hysteresis: a turn is late past the apply's 8 µs; a steady load of 40 % late windows never switches them on, one of 70 % switches them on within 2,500 windows (the 1024-window average) and holds them on; once on, 55 % late holds them on and 40 % switches them off within 1,500 windows; from off, 55 % holds them off" {
+    const Run = struct {
+        fn run(on0: bool, frac0: u32, late_permille: u32, windows: u32) struct { on: bool, frac: u32, flips: u32 } {
+            var on = on0;
+            var frac = frac0;
+            var flips: u32 = 0;
+            var acc: u32 = 0;
+            for (0..windows) |_| {
+                acc += late_permille;
+                const late = acc >= 1000;
+                if (late) acc -= 1000;
+                frac = Conveyor.lateShareStep(frac, late);
+                const next = Conveyor.claimsNext(on, frac);
+                if (next != on) flips += 1;
+                on = next;
+            }
+            return .{ .on = on, .frac = frac, .flips = flips };
+        }
+    };
+    try testing.expectEqual(8 * std.time.ns_per_us, Conveyor.TURN_LATE_NS);
+    const quiet = Run.run(false, 0, 400, 20_000);
+    try testing.expect(!quiet.on);
+    try testing.expectEqual(@as(u32, 0), quiet.flips);
+    const busy = Run.run(false, 0, 700, 2_500);
+    try testing.expect(busy.on);
+    const busy_on = Run.run(true, busy.frac, 700, 20_000);
+    try testing.expect(busy_on.on);
+    try testing.expectEqual(@as(u32, 0), busy_on.flips);
+    const mid_on = Run.run(true, busy.frac, 550, 20_000);
+    try testing.expect(mid_on.on);
+    const calm = Run.run(true, busy.frac, 400, 1_500);
+    try testing.expect(!calm.on);
+    const mid_off = Run.run(false, 0, 550, 20_000);
+    try testing.expect(!mid_off.on);
+    try testing.expectEqual(@as(u32, 0), mid_off.flips);
+}
+
+test "§BX.12 the pass claims after the first turn as its mode says: `never` and `auto` switched off leave every entry to its owner (no handout claims), `always` and `auto` switched on claim — each create answered at its apply either way" {
+    const Tail = struct {
+        claims: std.atomic.Value(u32) = .init(0),
+        fn claim(ctx: *anyopaque, _: u64, _: u64, _: []const journal.WriteOp) ?u32 {
+            const t: *@This() = @ptrCast(@alignCast(ctx));
+            return t.claims.fetchAdd(1, .acq_rel);
+        }
+        fn release(_: *anyopaque, _: u32) void {}
+        fn slots(_: *anyopaque) u32 {
+            return 1 << 20;
+        }
+    };
+    inline for (.{ .{ PassClaims.never, false, false }, .{ PassClaims.auto, false, false }, .{ PassClaims.auto, true, true }, .{ PassClaims.always, false, true } }) |arm| {
+        const h = try Harness.create(.{}, null, false);
+        defer h.destroy();
+        var tail: Tail = .{};
+        h.cv.deps.self_apply = true;
+        h.cv.deps.ack_at_apply = true;
+        h.cv.deps.tail = .{ .ctx = &tail, .claim = Tail.claim, .release = Tail.release, .slots = Tail.slots };
+        h.cv.deps.pass_claims = arm[0];
+        h.cv.claims_on.store(arm[1], .monotonic);
+        const claims0 = h.cv.stats.handout_claims.snapshot().count;
+        const acks0 = h.cv.stats.acks_at_apply.load();
+        const t = try h.gpa.create(tx.KvTx);
+        defer h.gpa.destroy(t);
+        t.* = tx.KvTx.init(h.gpa, @src());
+        t.kernel_origin = true;
+        const ino = try h.stageCreate(t, "mode");
+        try h.cv.commit(t);
+        try testing.expectEqual(acks0 + 1, h.cv.stats.acks_at_apply.load());
+        try testing.expectEqual(claims0 + @intFromBool(arm[2]), h.cv.stats.handout_claims.snapshot().count);
+        while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
+        try testing.expect(try h.present(ino));
+    }
 }
 
 test "§BX a member whose apply fails re-claims its range as a PAD before its error is answered: its entry, claimed at its turn, is released only once a PAD's slot holds the same range — the death replay never applies an op answered as failed, and the range is never a hole" {
@@ -6914,13 +7096,13 @@ test "the stats JSON names every conveyor face" {
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w);
     const out = w.buffered();
-    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves", "meta_conveyor_pass_yields", "meta_conveyor_tail_gate_parks", "meta_conveyor_resident_waits", "meta_conveyor_resident_landings", "meta_conveyor_pad_landings", "meta_conveyor_resident_helps", "meta_conveyor_resident_smo_waits" }) |name| {
+    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves", "meta_conveyor_pass_yields", "meta_conveyor_tail_gate_parks", "meta_conveyor_resident_waits", "meta_conveyor_resident_landings", "meta_conveyor_pad_landings", "meta_conveyor_resident_helps", "meta_conveyor_resident_smo_waits", "meta_conveyor_pass_claims_on", "meta_conveyor_pass_claims_switches", "meta_conveyor_turn_late_permille", "meta_conveyor_pass_claimed_members" }) |name| {
         try testing.expect(std.mem.indexOf(u8, out, name) != null);
     }
     var pb: [16384]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&pb);
     try s.writePhasesJson(&pw);
-    for ([_][]const u8{ "meta_pass_hold", "leafwise_leaf_hold", "meta_leafwise_apply", "meta_self_window_span", "meta_resident_wait", "meta_handout_claims" }) |name| {
+    for ([_][]const u8{ "meta_pass_hold", "leafwise_leaf_hold", "meta_leafwise_apply", "meta_self_window_span", "meta_resident_wait", "meta_handout_claims", "meta_turn_lag" }) |name| {
         try testing.expect(std.mem.indexOf(u8, pw.buffered(), name) != null);
     }
 }

@@ -1939,6 +1939,10 @@ fn TailSlots(comptime weakening: Weakening) type {
     };
 }
 
+/// Model 14's pass after the window's first turn: claiming for no member,
+/// both, or switched mid-window — on for M0 then off, off for M0 then on.
+const PassPattern = enum { none, both, first, second };
+
 /// Model 14 (§BX): an answer ahead of the landing lies inside the resident
 /// prefix — every reservation below it held by the journal tail or landed,
 /// so a death replay (which stops at the first hole) carries it — and never
@@ -1960,20 +1964,29 @@ fn TailSlots(comptime weakening: Weakening) type {
 /// a member answered as failed has only its PAD there (with both slots
 /// written the replay may apply either); a parked answer never waits on a
 /// sibling inside its apply with nothing in the tail. Final: both answered,
-/// W's prefix complete.
-fn ResidentAnswers(comptime weakening: Weakening, comptime m0_fails: bool) type {
+/// W's prefix complete. The PASS (§BX.11–12), right after the window's
+/// first turn, claims for the members its switch names (`PassPattern`:
+/// none, both, or switched mid-window): by the same CAS (open → claiming,
+/// the slot, `.done`, its own flag and advance); an owner whose CAS lost
+/// waits for `.done` and applies. The law holds in every pattern.
+fn ResidentAnswers(comptime weakening: Weakening, comptime m0_fails: bool, comptime pass: PassPattern) type {
     return struct {
         const Self = @This();
-        pub const thread_count: usize = 3;
+        pub const thread_count: usize = 4;
         const lane_t = 2;
+        const pass_t = 3;
         const n: u8 = 2;
         const late_claim = weakening == .claim_after_apply;
 
         const Slot = enum(u8) { none, entry, both, pad };
-        const Mpc = enum(u8) { claim, flag, fence, adv_load, adv_flag, adv_cas, mark, apply, pad_claim, pad_release, answer_err, submit, check, register, recheck, parked, done };
+        const State = enum(u8) { open, claiming, done };
+        const Ppc = enum(u8) { cas, slot, publish, flag, fence, adv_load, adv_flag, adv_cas, mark, done };
+        const Mpc = enum(u8) { cas, claim, publish, await_done, flag, fence, adv_load, adv_flag, adv_cas, mark, apply, pad_claim, pad_release, answer_err, submit, check, register, recheck, parked, done };
         const Lpc = enum(u8) { land_p, land_w, done };
 
         slot: [2]Slot = @splat(.none),
+        /// The part's claim state (the claim's CAS: owner, pass).
+        cs: [2]State = @splat(.open),
         flag: [2]bool = @splat(false),
         /// The flag's store in its member's store buffer.
         pend: [2]bool = @splat(false),
@@ -1987,23 +2000,33 @@ fn ResidentAnswers(comptime weakening: Weakening, comptime m0_fails: bool) type 
         failed: [2]bool = @splat(false),
         /// A notify since the member registered.
         woken: [2]bool = @splat(false),
-        mpc: [2]Mpc = @splat(if (late_claim) .apply else .claim),
+        mpc: [2]Mpc = @splat(if (late_claim) .apply else .cas),
         /// The prefix value the member's advance loop holds.
         k: [2]u8 = @splat(0),
         lpc: Lpc = .land_p,
+        /// The pass: the member it claims for, its program counter, its
+        /// prefix register, the flag in its store buffer.
+        pi: u8 = switch (pass) {
+            .second => 1,
+            else => 0,
+        },
+        ppc: Ppc = if (pass == .none) .done else .cas,
+        pk: u8 = 0,
+        ppend: ?u8 = null,
 
         pub fn init() Self {
             return .{};
         }
 
         fn quiescent(self: *const Self) bool {
-            if (self.lpc != .done) return false;
+            if (self.lpc != .done or self.ppc != .done) return false;
             for (self.mpc) |pc| if (pc != .done and pc != .parked) return false;
             return true;
         }
 
         pub fn done(self: *const Self, t: usize) bool {
             if (t == lane_t) return self.lpc == .done;
+            if (t == pass_t) return self.ppc == .done;
             return self.mpc[t] == .done or (self.mpc[t] == .parked and !self.woken[t] and self.quiescent());
         }
 
@@ -2048,11 +2071,101 @@ fn ResidentAnswers(comptime weakening: Weakening, comptime m0_fails: bool) type 
             return if (self.failed[i]) .answer_err else .submit;
         }
 
+        /// Whether the pass claims for member `i` (its switch read per
+        /// member: `first`/`second` switch it mid-window).
+        fn passClaimsFor(i: usize) bool {
+            return switch (pass) {
+                .none => false,
+                .both => true,
+                .first => i == 0,
+                .second => i == 1,
+            };
+        }
+
+        fn passNext(self: *Self) void {
+            self.pi += 1;
+            while (self.pi < n and !passClaimsFor(self.pi)) self.pi += 1;
+            self.ppc = if (self.pi < n) .cas else .done;
+        }
+
+        fn passFlagSeen(self: *const Self, at: usize) bool {
+            return self.flag[at] or (if (self.ppend) |j| j == at else false);
+        }
+
+        fn passDrain(self: *Self) void {
+            if (self.ppend) |j| self.flag[j] = true;
+            self.ppend = null;
+        }
+
+        fn stepPass(self: *Self) void {
+            const i = self.pi;
+            switch (self.ppc) {
+                .cas => if (self.cs[i] == .open) {
+                    self.cs[i] = .claiming;
+                    self.ppc = .slot;
+                } else self.passNext(),
+                .slot => {
+                    self.slot[i] = .entry;
+                    self.ppc = .publish;
+                },
+                .publish => {
+                    self.cs[i] = .done;
+                    self.ppc = .flag;
+                },
+                .flag => {
+                    self.ppend = i;
+                    self.ppc = .fence;
+                },
+                .fence => {
+                    self.passDrain();
+                    self.ppc = .adv_load;
+                },
+                .adv_load => {
+                    self.pk = self.prefix;
+                    self.ppc = .adv_flag;
+                },
+                .adv_flag => if (self.pk < n and self.passFlagSeen(self.pk)) {
+                    self.ppc = .adv_cas;
+                } else self.passNext(),
+                .adv_cas => {
+                    self.passDrain();
+                    if (self.prefix == self.pk) {
+                        self.prefix += 1;
+                        self.notify();
+                        self.pk = self.prefix;
+                        self.ppc = if (self.prefix == n) .mark else .adv_flag;
+                    } else {
+                        self.pk = self.prefix;
+                        self.ppc = .adv_flag;
+                    }
+                },
+                .mark => {
+                    self.w_marked = true;
+                    self.notify();
+                    self.passNext();
+                },
+                .done => unreachable,
+            }
+        }
+
         fn stepMember(self: *Self, i: usize) void {
             switch (self.mpc[i]) {
+                .cas => if (self.cs[i] == .open) {
+                    self.cs[i] = .claiming;
+                    self.mpc[i] = .claim;
+                } else {
+                    self.mpc[i] = .await_done;
+                },
                 .claim => {
                     self.slot[i] = if (self.failed[i]) .pad else .entry;
+                    self.mpc[i] = .publish;
+                },
+                .publish => {
+                    self.cs[i] = .done;
                     self.mpc[i] = .flag;
+                },
+                .await_done => if (self.cs[i] == .done) {
+                    self.mpc[i] = self.afterClaim(i);
                 },
                 .flag => {
                     self.pend[i] = true;
@@ -2090,7 +2203,7 @@ fn ResidentAnswers(comptime weakening: Weakening, comptime m0_fails: bool) type 
                 .apply => {
                     self.failed[i] = m0_fails and i == 0;
                     if (late_claim) {
-                        self.mpc[i] = .claim;
+                        self.mpc[i] = .cas;
                     } else if (self.failed[i]) {
                         self.mpc[i] = if (weakening == .error_before_pad) .answer_err else .pad_claim;
                     } else self.mpc[i] = .submit;
@@ -2153,6 +2266,7 @@ fn ResidentAnswers(comptime weakening: Weakening, comptime m0_fails: bool) type 
 
         pub fn step(self: *Self, t: usize) void {
             if (t == lane_t) return self.stepLane();
+            if (t == pass_t) return self.stepPass();
             self.stepMember(t);
         }
 
@@ -2297,12 +2411,12 @@ fn HelpedClaim(comptime weakening: Weakening, comptime helpers: usize) type {
 
 /// Model 16 (§BX): a member whose committer is gone at its turn never
 /// applies, while the pass (right after the window's first turn) may be
-/// claiming its entry. The roll-out takes the claim by the same CAS when it
+/// claiming its entry (`pass_claims`; its switch off, it does not). The roll-out takes the claim by the same CAS when it
 /// is still open and writes a PAD in it; else it waits for the claimer's
 /// `.done`, claims a PAD and releases the entry the claimer wrote. Final
 /// (the member answered nothing and applied nothing): no live entry for it
 /// — the death replay would apply an op that never ran — and a PAD there.
-fn GoneRollOut(comptime weakening: Weakening) type {
+fn GoneRollOut(comptime weakening: Weakening, comptime pass_claims: bool) type {
     return struct {
         const Self = @This();
         pub const thread_count: usize = 2;
@@ -2315,7 +2429,7 @@ fn GoneRollOut(comptime weakening: Weakening) type {
         state: State = .open,
         entries: u8 = 0,
         pads: u8 = 0,
-        ppc: Ppc = .cas,
+        ppc: Ppc = if (pass_claims) .cas else .done,
         rpc: Rpc = .cas,
 
         pub fn init() Self {
@@ -2477,14 +2591,16 @@ test "conveyor_tail_gate_never_meets_a_full_table (§BW): holds (register, read 
 }
 
 // The state counts the evidence note records.
-test "conveyor_resident_answers_lie_inside_the_resident_prefix (§BX): holds with M0's apply succeeding and failing (the entry claimed at the turn — slot, seq_cst flag, the prefix advanced by CAS and marked resident by the CAS that completes it — then the apply; a success answers once the registry's resident prefix reaches the window and its own prefix is claimed, else register, re-check, park; a failure claims its PAD, releases its entry, then answers); answering on the member's own claim and reading the window's prefix alone answer past a hole; a failure answered before its PAD leaves its entry replayable; the claim after the apply parks an answer behind a sibling's apply; the claim flag unfenced stalls the cursor" {
-    try explorer.expectHolds(ResidentAnswers(.none, false), .{});
-    try explorer.expectHolds(ResidentAnswers(.none, true), .{});
-    try explorer.expectFails(ResidentAnswers(.answer_on_own_claim, false), .{}, error.InvariantViolated);
-    try explorer.expectFails(ResidentAnswers(.window_prefix_only, false), .{}, error.InvariantViolated);
-    try explorer.expectFails(ResidentAnswers(.error_before_pad, true), .{}, error.InvariantViolated);
-    try explorer.expectFails(ResidentAnswers(.claim_after_apply, false), .{}, error.InvariantViolated);
-    try explorer.expectFails(ResidentAnswers(.claim_flag_unfenced, false), .{}, error.FinalViolated);
+test "conveyor_resident_answers_lie_inside_the_resident_prefix (§BX): holds with the pass claiming for no member, both, or switched mid-window (on for M0 then off, off for M0 then on), and in each of those holds with M0's apply succeeding and failing (the entry claimed at the turn — slot, seq_cst flag, the prefix advanced by CAS and marked resident by the CAS that completes it — then the apply; a success answers once the registry's resident prefix reaches the window and its own prefix is claimed, else register, re-check, park; a failure claims its PAD, releases its entry, then answers); answering on the member's own claim and reading the window's prefix alone answer past a hole; a failure answered before its PAD leaves its entry replayable; the claim after the apply parks an answer behind a sibling's apply; the claim flag unfenced stalls the cursor" {
+    inline for (.{ PassPattern.none, PassPattern.both, PassPattern.first, PassPattern.second }) |pass| {
+        try explorer.expectHolds(ResidentAnswers(.none, false, pass), .{});
+        try explorer.expectHolds(ResidentAnswers(.none, true, pass), .{});
+        try explorer.expectFails(ResidentAnswers(.answer_on_own_claim, false, pass), .{}, error.InvariantViolated);
+        try explorer.expectFails(ResidentAnswers(.window_prefix_only, false, pass), .{}, error.InvariantViolated);
+        try explorer.expectFails(ResidentAnswers(.error_before_pad, true, pass), .{}, error.InvariantViolated);
+    }
+    try explorer.expectFails(ResidentAnswers(.claim_after_apply, false, .none), .{}, error.InvariantViolated);
+    try explorer.expectFails(ResidentAnswers(.claim_flag_unfenced, false, .none), .{}, error.FinalViolated);
 }
 
 test "conveyor_a_helped_claim_is_claimed_once (§BX.7): holds with one helper and with two — the pass after the window's first turn and a parked answer — (the claim's CAS, the owner waiting for `.done` before it reads its slot, then the PAD claimed and the named slot released before the error); the helper without the CAS writes two entries (the PAD replaces one, the other replays after the error); the owner reading its slot before the helper's `.done` releases nothing" {
@@ -2496,12 +2612,13 @@ test "conveyor_a_helped_claim_is_claimed_once (§BX.7): holds with one helper an
 }
 
 test "conveyor_a_gone_member_never_replays (§BX): holds (the roll-out takes the claim by its CAS and writes a PAD in it, or waits for the pass's `.done`, claims a PAD and releases the pass's entry); the roll-out without the CAS leaves the pass's entry live for a member that never ran" {
-    try explorer.expectHolds(GoneRollOut(.none), .{});
-    try explorer.expectFails(GoneRollOut(.rollout_without_cas), .{}, error.FinalViolated);
+    try explorer.expectHolds(GoneRollOut(.none, true), .{});
+    try explorer.expectHolds(GoneRollOut(.none, false), .{});
+    try explorer.expectFails(GoneRollOut(.rollout_without_cas, true), .{}, error.FinalViolated);
 }
 
 test "conveyor models: exhaustive within the explorer's default limits" {
-    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none), LeafwiseDestroy(.none), TailSlots(.none), ResidentAnswers(.none, false), ResidentAnswers(.none, true), HelpedClaim(.none, 1), HelpedClaim(.none, 2), GoneRollOut(.none) }) |Model| {
+    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2), WindowCells(.none), RoomPark(.none), FsyncInbox(.none), LeafwiseDestroy(.none), TailSlots(.none), ResidentAnswers(.none, false, .none), ResidentAnswers(.none, true, .none), HelpedClaim(.none, 1), HelpedClaim(.none, 2), GoneRollOut(.none, true), GoneRollOut(.none, false) }) |Model| {
         var report: explorer.Report = undefined;
         try explorer.explore(Model, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

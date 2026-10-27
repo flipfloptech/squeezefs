@@ -835,6 +835,7 @@ pub const KvBackend = struct {
             .ack_at_apply = ackAtApply(opts.env, flush_ms),
             .tail = be.tailSeam(),
             .self_apply = std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_META_APPLY", opts.env), "self"),
+            .pass_claims = std.meta.stringToEnum(conveyor.PassClaims, knobs.enumKnob("SQUEEZEFS_META_PASS_CLAIMS", opts.env)).?,
         });
         errdefer be.cv.deinit();
         be.smo_journal.tail = be.smoTailHook();
@@ -1232,6 +1233,7 @@ pub const KvBackend = struct {
             .ack_at_apply = ackAtApply(opts.env, flush_ms),
             .tail = be.tailSeam(),
             .self_apply = std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_META_APPLY", opts.env), "self"),
+            .pass_claims = std.meta.stringToEnum(conveyor.PassClaims, knobs.enumKnob("SQUEEZEFS_META_PASS_CLAIMS", opts.env)).?,
         });
         errdefer be.cv.deinit();
         be.smo_journal.tail = be.smoTailHook();
@@ -4619,6 +4621,7 @@ test "§BX an answer at the apply never waits on an earlier member's TURN (self-
     const v = try TestVol.create(testing.allocator, "resident-self", "600000");
     defer v.destroy();
     try v.env.put("SQUEEZEFS_META_APPLY", "self");
+    try v.env.put("SQUEEZEFS_META_PASS_CLAIMS", "always");
     const be = try v.open();
     defer be.close();
     try residentAnswerRow(v, be, .self);

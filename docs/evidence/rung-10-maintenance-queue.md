@@ -68,3 +68,17 @@ the levers (a bounded flush pass, an O(1) freeze off the lock, pipelined appends
 Unit: smo 216, leaf_merge 49, tree 168, node_cache 77, checkpoint 121, conveyor 116, meta.backend 87, §BX 55, §BW 50,
 journal_tail 51, model 209 — green; rails 18/18; `zig fmt --check` clean. Smoke and xfstests: see the report.
 Sessions: `~/tmp/create-work/runs/{base,fix}-np32b`, `{base,fix}-np64`, `base-np32` (perf), `fix-np32` (perf).
+
+## The A-B-B-A (2026-10-27, quiet host on AC, the RAM-NVMe perf mount, dist builds)
+
+`dev` `a4b0345` against `4b2627c`, legs A B B A, `mpirun mdtest -n 10000 -u -i 1`, gate lock and every build
+slot held, tctl ≤ 62 °C, fsck clean after all 8 runs; k ops/s (leg 1 / leg 2):
+
+| | -np 32 dev | -np 32 fix | Δ | -np 64 dev | -np 64 fix | Δ |
+|---|---|---|---|---|---|---|
+| file creation | 181 / 181 | 198 / 199 | +9.9 % | 168 / 186 | 180 / 199 | +7.0 % |
+| file removal | 226 / 243 | 264 / 262 | +12.1 % | 239 / 253 | 252 / 248 | +1.7 % |
+| directory creation | 219 / 194 | 208 / 213 | +1.9 % | 205 / 203 | 202 / 206 | −0.1 % |
+| directory removal | 201 / 209 | 237 / 232 | +14.2 % | 207 / 202 | 216 / 212 | +4.6 % |
+
+Landed (gate 155 green, 75/75). Sessions: `/build/perf/mq-abba/`.

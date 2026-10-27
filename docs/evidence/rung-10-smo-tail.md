@@ -20,7 +20,7 @@ reserved for it, and the tail gate counts the rest of the table.
 | -np 64: wait per answer | 24.9 / 27.2 / 20.5 / 25.1 µs | 21.5 / 25.9 / 14.0 / 19.1 µs |
 
 The rest of the parks are the turn-time claims' own: a sibling's turn not yet run. The handout claims address
-those (§BX's next rows). `meta_conveyor_tail_slot_misses` was 0 in every run. Red `29a630a` (backend "§BX an
+those (§BX's next rows). `meta_conveyor_tail_slot_misses` was 0 in every run. Red `02211d8` (backend "§BX an
 SMO's entry rides the journal tail from its build to its landing"): B was not answered while a threshold drain's
 entry was held before its write. With the fix, B is answered without parking, and a death replays through the
 SMO's entry to B with `past_hole` 0. Model 13 holds with the structural slot, and a gate that counts the whole

@@ -1,6 +1,6 @@
 # Rung 10 — the pass claims every member's entry right after the first turn (2026-10-26)
 
-Decision 0003 §BX.11. Branch `perf/handout-claims` (revised) on `perf/smo-tail` (`5d12737`). **No benchmark was
+Decision 0003 §BX.11. Branch `perf/handout-claims` (revised) on `perf/smo-tail` (`968e1dc`). **No benchmark was
 run**. These are correctness runs only: 2 MDT + 2 OST, `mdtest -n 10000 -u`, phases settled, a `.stats` delta and
 the `sqz-jrnl*` threads' on-CPU time per phase, fsck clean after every run. The owner's A-B-B-A judges the rates.
 
@@ -45,12 +45,12 @@ The pass's claims take 2.2–2.7 µs per window at -np 32 and 3.4–6.0 µs at -
 2.6–3.6 µs in all three arms. `meta_conveyor_tail_slot_misses` was 0.
 
 **Models.** Model 15 now runs with two helpers (the pass and a parked answer). Model 16 (GoneRollOut): a gone
-committer's roll-out against the pass's claim holds, and fails without the CAS. **Red** `0679695`: a member
+committer's roll-out against the pass's claim holds, and fails without the CAS. **Red** `370fd4e`: a member
 held at its turn never got its entry into the tail, and B parked behind A held at its turn.
 
 ## §BX.12 — claim only while the turns run late (`SQUEEZEFS_META_PASS_CLAIMS=auto`)
 
-The owner's A-B-B-A of `8d2f2d9` (vs dev `d0cf1f3`): every -np 64 row was up (+6.6 / +7.0 / +7.1 / +9.6 %),
+The owner's A-B-B-A of `3216d71` (vs dev `d0cf1f3`): every -np 64 row was up (+6.6 / +7.0 / +7.1 / +9.6 %),
 and every -np 32 row was down (−7.2 / −5.6 / −3.0 / −2.7 %). The claims pay only where the profile's
 expensive parks live: owners descheduled inside their claim, because a turn was delivered to a thread busy
 with other committers.
@@ -60,7 +60,7 @@ turn started (`meta_turn_lag`), and an EWMA over 1024 windows tracks the share o
 Claims switch on above 62 % and off below 50 %. Before the host's reboot, the shares were 17–37 % at -np 32
 (23–46 % with claims) and 69–84 % at -np 64 (90–96 % with claims).
 
-Correctness runs on `753db9f` give these counters for never / auto / always, per phase fc / fr / dc / dr:
+Correctness runs on `d60162b` give these counters for never / auto / always, per phase fc / fr / dc / dr:
 
 | | never: parks, wait/answer | auto: windows claimed, parks | always: parks |
 |---|---|---|---|

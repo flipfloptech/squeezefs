@@ -874,6 +874,9 @@ pub const Stats = struct {
     /// (§BC) — how long its slowest member keeps the reservation, and so
     /// the completed prefix every later window's verdict waits on, open.
     self_window_span: counters.ShardedLatencyHistogram = .{},
+    /// `meta_handout_claims`: the pass's claims of a self-applied window's
+    /// still-unclaimed entries right after its first turn (§BX), per window.
+    handout_claims: counters.ShardedLatencyHistogram = .{},
 
     pub fn writeJson(self: *const Stats, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("{{\"meta_commit_group_size\":{{", .{});
@@ -962,6 +965,8 @@ pub const Stats = struct {
         try self.self_window_span.snapshot().writeJson(w);
         try w.writeAll(",\"meta_resident_wait\":");
         try self.resident_wait.snapshot().writeJson(w);
+        try w.writeAll(",\"meta_handout_claims\":");
+        try self.handout_claims.snapshot().writeJson(w);
         try w.writeAll("}");
     }
 };
@@ -3001,7 +3006,20 @@ pub const Conveyor = struct {
         // one send per batch and the fan-out's depth is log₂ n (at 64 ranks
         // a serial fan-out on the lane fiber took 254 µs of every member's
         // queue wait and parked every spinner past its bound).
+        // §BX: then the pass claims every member still unclaimed, in turn
+        // order, as a helper does (the claim's CAS; one never waits) — the
+        // turns are not held for it, and a member whose thread is busy,
+        // descheduled or not yet woken holds no answer behind its turn. The
+        // pass holds a party: the members may finish the window meanwhile.
+        const claims = self.deps.ack_at_apply and self.deps.tail != null;
+        if (claims) _ = w.parties.fetchAdd(1, .acq_rel);
         self.relayTurn(w, 0);
+        if (claims) {
+            const t_claims = clock.monotonicNs();
+            for (0..n) |i| self.claimMemberOnce(w, @intCast(i));
+            self.stats.handout_claims.record(clock.monotonicNs() -| t_claims);
+            w.release();
+        }
     }
 
     /// Hand member `idx` its turn; a member whose committer is gone (it
@@ -3011,6 +3029,7 @@ pub const Conveyor = struct {
         if (idx >= w.members.len) return;
         w.members[idx].done.sendTurn(self.deps.io, w, idx) catch {
             w.failed[idx] = error.Corrupt;
+            self.rollOutGone(w, idx);
             self.relayTurn(w, 2 * idx + 1);
             self.relayTurn(w, 2 * idx + 2);
             if (w.pending.fetchSub(1, .acq_rel) == 1) self.submitSelfApplied(w);
@@ -3037,7 +3056,6 @@ pub const Conveyor = struct {
         const done = m.done;
         const kernel_origin = m.q.kernel_origin;
         const len = m.q.len;
-        const sub = Reservation.unpadded(p.start, len);
         // §BX: the member's entry rides the journal tail AT ITS TURN, before
         // its apply (its records are stamped and final): the resident prefix
         // advances in turn order, never behind a sibling's apply. An entry
@@ -3063,14 +3081,8 @@ pub const Conveyor = struct {
         }
         self.stats.pass_leaf_locks.record(clock.monotonicNs() -| t_apply);
         // A rolled-out member: a PAD over its range, in the tail BEFORE its
-        // error is answered (`padMember`).
-        var pad_held = true;
-        if (failed[0] != null) {
-            var pad_ops: std.ArrayList(journal.WriteOp) = .empty;
-            p.header_bytes = journal.partOps(a, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, .{ .res = sub, .records = &.{}, .pad = true }, &pad_ops) catch 0;
-            p.ops = pad_ops.items;
-            pad_held = self.padMember(w, idx);
-        }
+        // error is answered.
+        const pad_held = if (failed[0] != null) self.padOut(w, idx) else true;
         if (self.deps.door) |d| d.frontier(d.ctx, &m.q.door, p.start + len);
         self.stats.apply_total.record(clock.monotonicNs() -| t_apply);
         // The ack ahead of the landing (§BB.1): this mount's kernel's own
@@ -3185,6 +3197,41 @@ pub const Conveyor = struct {
             // A yield every 64 hints: the helper's encode-and-claim is a few µs.
             if (spins % 64 == 63) std.Thread.yield() catch {} else std.atomic.spinLoopHint();
         }
+    }
+
+    /// §BX: a member that will not land — its apply failed, its committer
+    /// is gone — is a PAD over its range: in the window's image (its ops)
+    /// and, before its error is answered, in the tail (`padMember`).
+    fn padOut(self: *Conveyor, w: *Window, idx: u32) bool {
+        const p = &w.parts[idx];
+        var pad_ops: std.ArrayList(journal.WriteOp) = .empty;
+        p.header_bytes = journal.partOps(p.arena.allocator(), self.deps.ring_layout, self.deps.geo, self.deps.appender_id, .{ .res = Reservation.unpadded(p.start, p.len), .records = &.{}, .pad = true }, &pad_ops) catch 0;
+        p.ops = pad_ops.items;
+        return self.padMember(w, idx);
+    }
+
+    /// A member whose committer is gone at its turn (it cannot be: the park
+    /// is uncancelable) never applies, and the pass or a helper may be
+    /// claiming for it: its range is a PAD — in its own claim when nobody
+    /// has claimed it yet, so its entry never reaches the tail, else
+    /// replacing the entry a claimer put there (`padOut`).
+    fn rollOutGone(self: *Conveyor, w: *Window, idx: u32) void {
+        const p = &w.parts[idx];
+        if (p.claim_state.cmpxchgStrong(.open, .claiming, .acq_rel, .acquire) != null) {
+            awaitClaimed(&p.claim_state);
+            _ = self.padOut(w, idx);
+            return;
+        }
+        var pad_ops: std.ArrayList(journal.WriteOp) = .empty;
+        p.header_bytes = journal.partOps(p.arena.allocator(), self.deps.ring_layout, self.deps.geo, self.deps.appender_id, .{ .res = Reservation.unpadded(p.start, p.len), .records = &.{}, .pad = true }, &pad_ops) catch 0;
+        p.ops = pad_ops.items;
+        if (self.deps.ack_at_apply and p.ops.len != 0) if (self.deps.tail) |t| {
+            p.tail_slot = t.claim(t.ctx, p.seq, p.start, p.ops);
+            if (p.tail_slot == null) self.stats.pad_landings.inc();
+        };
+        const claimed = p.tail_slot != null;
+        p.claim_state.store(.done, .release);
+        if (claimed) self.noteClaimed(w, idx);
     }
 
     /// §BX: a rolled-out member's PAD replaces its entry in the tail — the
@@ -6870,10 +6917,10 @@ test "the stats JSON names every conveyor face" {
     for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns", "meta_conveyor_leafwise_applies", "meta_conveyor_leafwise_leaves", "meta_conveyor_pass_yields", "meta_conveyor_tail_gate_parks", "meta_conveyor_resident_waits", "meta_conveyor_resident_landings", "meta_conveyor_pad_landings", "meta_conveyor_resident_helps", "meta_conveyor_resident_smo_waits" }) |name| {
         try testing.expect(std.mem.indexOf(u8, out, name) != null);
     }
-    var pb: [8192]u8 = undefined;
+    var pb: [16384]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&pb);
     try s.writePhasesJson(&pw);
-    for ([_][]const u8{ "meta_pass_hold", "leafwise_leaf_hold", "meta_leafwise_apply", "meta_self_window_span", "meta_resident_wait" }) |name| {
+    for ([_][]const u8{ "meta_pass_hold", "leafwise_leaf_hold", "meta_leafwise_apply", "meta_self_window_span", "meta_resident_wait", "meta_handout_claims" }) |name| {
         try testing.expect(std.mem.indexOf(u8, pw.buffered(), name) != null);
     }
 }

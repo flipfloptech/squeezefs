@@ -1,8 +1,10 @@
 # Directories spread by depth: both MDTs under one subtree (2026-10-27)
 
 **What changed.** Charter §5.4's mint spread, amended under the owner's ruling (decision 0003 §BZ): a new
-DIRECTORY at depth ≤ `D` (the root's children are depth 1) is homed on the next healthy member of the set's
-round-robin; a directory deeper than `D`, and every file, follows its parent's member as §AA.1 says. `D` is
+DIRECTORY at depth ≤ `D` (the root's children are depth 1) is homed by the member pick over the healthy band
+at its ordinal under its parent (the parent's member + the directories placed under it: the first child
+beside its parent, the siblings split evenly — §BZ.1); a directory deeper than `D`, and every file,
+follows its parent's member as §AA.1 says. `D` is
 the set's: `squeezefs format --dir-spread-depth N` (default 3, range 0 … 254; 0 = §AA.1 alone), stored in the
 `set_config` record (byte 39), changed by `squeezefs config set-dir-spread-depth N sqmeta://…` (offline; in
 force at the next mount of each member; existing directories never move), read by every mount of the set and
@@ -68,6 +70,21 @@ this binary (the subset variable did not cross `scripts/venue`'s sudo) passed it
 stopped at generic/323 — the daemon unresponsive 41 s under 100 AIO threads WHILE the -np 64 rig and the
 smoke rows ran beside it; alone, 323 passed in 148 s as it does on `dev` (122 s on 2026-10-24's runs). A
 load sensitivity of the supervisor's 41 s stat watchdog, not a placement defect.
+
+**The follow-up (§BZ.9).** The owner's 1 MDT + 2 OST A-B-B-A read directory creation at -np 32 at
+−2.3 / −4.6 / −3.0 % with every other row flat: the first build read the logical parent's record before
+every mkdir for its depth. Now a set that cannot spread (`dirsMaySpread`: one healthy member or `D = 0`)
+does nothing for the rule on the mkdir path — the child's byte comes off the guarded parent read every
+create does; a set that can spread takes the parent's depth and ordinal from the directory memo (one
+record read per parent per mount, `/` included). Counters `fuse_dir_depth_memo_hits` / `_reads`; the
+`kv_fs` test holds the reads at 0 on a one-member set. Found on the way: the shared round-robin word
+correlates with a tree's creation order (`r0, r0/s, r1, r1/s, …` put every `r` on one member and every
+`s` on the other — the two-member smoke row's files 2000 / 0); the pick is now the per-parent ordinal
+(`dir_place.pickOrdinal`; tie test with the interleaving 4/4 per level). Re-measured with the ordinal
+pick (fsck clean, tripwires 0): -np 32 50.0 / 50.0 % in every phase, intents 16 / 16 / 17 / 17 (the
+remote rank directories at setup and their teardown; `#test-dir.0` now sits beside `md`), 0 over the
+timed ops; -np 64 50.0 / 50.0 %, intents 32 / 32 / 33 / 33, 0 timed; `tar -x` of `fs/`: 38 intents of
+2,452 entries, files 55 / 45 % (its subtrees are uneven).
 
 **Follow-ups (not in this task).** A per-directory override (Lustre's `lfs setdirstripe -D` on one
 directory: `user.squeezefs.dir_spread_depth` on the parent, inherited); cross-volume striping of ONE hot

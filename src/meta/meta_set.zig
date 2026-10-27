@@ -690,6 +690,18 @@ pub const MetaSet = struct {
         return self.dir_spread_depth.load(.monotonic);
     }
 
+    /// Can a directory's depth change its member on this set: a spread
+    /// depth ≥ 1 and more than one healthy member? The mkdir path asks
+    /// this BEFORE it reads a parent's depth, so a one-member set, a set at
+    /// `D = 0` and a set down to one healthy member do no work for the
+    /// rule — two atomic words and each member's FAILED latch.
+    pub fn dirsMaySpread(self: *const MetaSet) bool {
+        if (self.volumes.len < 2 or self.dirSpreadDepth() == 0) return false;
+        var healthy: usize = 0;
+        for (self.volumes) |be| healthy += @intFromBool(!be.isFailed());
+        return healthy > 1;
+    }
+
     /// The health vector the mint pick reads: `min(1000, free/total ×
     /// 1000)` from each member's allocator (a RAM word, never a probe);
     /// a FAILED member is disabled.
@@ -714,20 +726,25 @@ pub const MetaSet = struct {
     /// the most headroom, an overflow rotor past the cap — else the
     /// member's rotor. `prefer_parent` keeps the mint on the parent's
     /// member (a rename's whiteout: the op stays on two members at most).
-    /// `child_depth` is the directory depth the child will record (0 = a
-    /// file, a stripe; `dir_place.childDepth`). The child's slot takes its
-    /// door token at the commit (the record names it). Returns the child's
-    /// EFFECTIVE (key) ino; `globalIno` inverts it. `caller` is the minting
-    /// stream (the FUSE request's pid; 0 = none: the calling thread) whose
-    /// mint window a rotor mint rides (decision 0003 §BV).
-    pub fn allocateIno(self: *MetaSet, parent_eff: u64, prefer_parent: bool, gather: bool, caller: u32, child_depth: u8) Error!u64 {
+    /// `child` says a file or a directory at the depth it will record
+    /// (`dir_place.Child`, `dir_place.childDepth`). The child's slot takes
+    /// its door token at the commit (the record names it). Returns the
+    /// child's EFFECTIVE (key) ino; `globalIno` inverts it. `caller` is the
+    /// minting stream (the FUSE request's pid; 0 = none: the calling
+    /// thread) whose mint window a rotor mint rides (decision 0003 §BV).
+    pub fn allocateIno(self: *MetaSet, parent_eff: u64, prefer_parent: bool, gather: bool, caller: u32, child: dir_place.Child) Error!u64 {
         if (self.posture == .reader) return error.PartitionRefused;
         const parent_v = self.route.volumeOfEffective(parent_eff);
         const parent_slot = route_table.slotOfEffective(parent_eff);
-        const is_dir = child_depth != 0;
-        const home = prefer_parent or self.volumes.len == 1 or (self.volumes[parent_v].slots.homesChildren(parent_slot) and !dir_place.spreads(child_depth, self.dirSpreadDepth()));
+        const is_dir = child == .dir;
+        const home = prefer_parent or self.volumes.len == 1 or (self.volumes[parent_v].slots.homesChildren(parent_slot) and !dir_place.spreads(child.depth(), self.dirSpreadDepth()));
         var hb: [route_table.MAX_VOLUMES]?u32 = undefined;
-        const v: route_table.VolumeIndex = if (home) parent_v else @intCast(router.pickMintVolume(parent_v, self.healths(hb[0..self.volumes.len]), &self.mint_rr));
+        // A directory walks the band by its ordinal under its parent
+        // (`dir_place.pickOrdinal`); a file takes the shared round-robin.
+        const v: route_table.VolumeIndex = if (home) parent_v else switch (child) {
+            .file => @intCast(router.pickMintVolume(parent_v, self.healths(hb[0..self.volumes.len]), &self.mint_rr)),
+            .dir => |d| @intCast(router.pickMintVolumeAt(parent_v, self.healths(hb[0..self.volumes.len]), dir_place.pickOrdinal(parent_v, d.ordinal))),
+        };
         if (v != parent_v) rstats.routing_mint_volume_picks.inc();
         if (is_dir) {
             if (!home) rstats.routing_dir_place_rotor.inc();
@@ -1123,7 +1140,9 @@ pub fn createChild(set: *MetaSet, parent_global: u64, name: []const u8, mode: u3
     const pv = try record.InodeValue.decode(pv_bytes);
     const depth: u8 = if (economy.isDirMode(mode)) dir_place.childDepth(parent_global == inos.ROOT_INO, pv.dirDepth()) else 0;
     const flags2 = record.InodeValue.flags2ForDepth(depth);
-    const child = try set.allocateIno(parent, false, false, 0, depth);
+    // The ordinal as the handler keeps it: the directories already under
+    // the parent (`nlink − 2` on a serial harness).
+    const child = try set.allocateIno(parent, false, false, 0, if (depth != 0) .{ .dir = .{ .depth = depth, .ordinal = pv.nlink -| 2 } } else .file);
     const global = set.globalIno(child);
     const parent_slot = route_table.slotOfEffective(parent);
     if (set.volumeIndexOfSlot(parent_slot) != set.volumeIndexOfSlot(route_table.slotOf(global))) {
@@ -1226,25 +1245,25 @@ test "the mint window follows its CALLER, not the thread (decision 0003 §BV): a
     }.of;
     // A lone caller: no window, the per-mint spread (two mints, two trees).
     const g0 = routing_slots.mint_window.stats.mint_window_grants.load();
-    const l0 = slotOfEff(set, try set.allocateIno(root, false, false, 900, 0));
-    const l1 = slotOfEff(set, try set.allocateIno(root, false, false, 900, 0));
+    const l0 = slotOfEff(set, try set.allocateIno(root, false, false, 900, .file));
+    const l1 = slotOfEff(set, try set.allocateIno(root, false, false, 900, .file));
     try testing.expect(l0 != l1);
     // A one-off caller beside it (a `mkdir`): it takes a window of its own
     // (its mint off the creator's trees) and never makes the creator
     // concurrent — the creator's spread goes on.
-    const off = slotOfEff(set, try set.allocateIno(root, false, false, 7, 0));
+    const off = slotOfEff(set, try set.allocateIno(root, false, false, 7, .file));
     try testing.expectEqual(g0 + 1, routing_slots.mint_window.stats.mint_window_grants.load());
-    const l2 = slotOfEff(set, try set.allocateIno(root, false, false, 900, 0));
+    const l2 = slotOfEff(set, try set.allocateIno(root, false, false, 900, .file));
     try testing.expect(l2 != l1 and l2 != off);
     try testing.expectEqual(g0 + 1, routing_slots.mint_window.stats.mint_window_grants.load());
     // A second caller: its first decision opens its window beside the
     // active creator, on a tree no window claims.
-    const t2 = slotOfEff(set, try set.allocateIno(root, false, false, 1002, 0));
+    const t2 = slotOfEff(set, try set.allocateIno(root, false, false, 1002, .file));
     try testing.expectEqual(g0 + 2, routing_slots.mint_window.stats.mint_window_grants.load());
     try testing.expect(t2 != off);
     // The creator's census skips both windows' trees.
     for (0..4) |_| {
-        const l = slotOfEff(set, try set.allocateIno(root, false, false, 900, 0));
+        const l = slotOfEff(set, try set.allocateIno(root, false, false, 900, .file));
         try testing.expect(l != t2 and l != off);
     }
     // Caller 1002 from another thread (the rank moved CPUs) stays in its
@@ -1252,7 +1271,7 @@ test "the mint window follows its CALLER, not the thread (decision 0003 §BV): a
     // worker serves) takes a tree of its own and stays there.
     const Other = struct {
         fn run(st: *MetaSet, r: u64, out: *[8]u16, err: *?anyerror) void {
-            for (out) |*o| o.* = route_table.slotOf(st.globalIno(st.allocateIno(r, false, false, 1002, 0) catch |e| {
+            for (out) |*o| o.* = route_table.slotOf(st.globalIno(st.allocateIno(r, false, false, 1002, .file) catch |e| {
                 err.* = e;
                 return;
             }));
@@ -1264,9 +1283,9 @@ test "the mint window follows its CALLER, not the thread (decision 0003 §BV): a
     th.join();
     if (err) |e| return e;
     for (moved) |sl| try testing.expectEqual(t2, sl);
-    const t3 = slotOfEff(set, try set.allocateIno(root, false, false, 1003, 0));
+    const t3 = slotOfEff(set, try set.allocateIno(root, false, false, 1003, .file));
     try testing.expect(t3 != t2 and t3 != off);
-    for (0..8) |_| try testing.expectEqual(t3, slotOfEff(set, try set.allocateIno(root, false, false, 1003, 0)));
+    for (0..8) |_| try testing.expectEqual(t3, slotOfEff(set, try set.allocateIno(root, false, false, 1003, .file)));
     try testing.expectEqual(g0 + 3, routing_slots.mint_window.stats.mint_window_grants.load());
 }
 
@@ -1492,7 +1511,7 @@ test "the spread depth is the set's dial (decision 0003 §BZ): raised 3 → 10 o
     for (chain, 1..) |c, lvl| try testing.expectEqual(@as(u8, @intCast(lvl)), try depthOf(set, c));
     // A legacy directory (no depth byte — made before the field): its
     // children record SATURATED and sit on its member whatever D is.
-    const legacy_local = try set.allocateIno(set.effectiveIno(chain[0]), true, false, 0, 0);
+    const legacy_local = try set.allocateIno(set.effectiveIno(chain[0]), true, false, 0, .{ .dir = .{ .depth = dir_place.SATURATED } });
     const legacy = set.globalIno(legacy_local);
     {
         const t = try set.begin(@src());

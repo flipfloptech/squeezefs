@@ -39,6 +39,39 @@ pub fn depthValid(depth: u64) bool {
     return depth <= DEPTH_MAX;
 }
 
+/// A directory child as the mint sees it: the depth it will record —
+/// `SATURATED` when the caller did not read it because the set cannot
+/// spread (`dirsMaySpread`): the rule's answer is the same and the
+/// directory still counts as one — and its ORDINAL among the directories
+/// placed under its parent (`pickOrdinal`).
+pub const Dir = struct { depth: u8, ordinal: u32 = 0 };
+
+/// What the mint (`MetaSet.allocateIno`) is told about the child: a file
+/// (a stripe, a whiteout) or a directory.
+pub const Child = union(enum) {
+    file,
+    dir: Dir,
+
+    pub fn depth(self: Child) u8 {
+        return switch (self) {
+            .file => 0,
+            .dir => |d| d.depth,
+        };
+    }
+};
+
+/// The member pick's ordinal for a directory (`router.pickMintVolumeAt`):
+/// a parent's directory children walk the healthy band from the parent's
+/// OWN member — the first child beside its parent (a lone chain of
+/// directories costs no intent), the next on the following member, and
+/// so on — so siblings split evenly whatever else the set places
+/// meanwhile, and a tree whose creation interleaves levels (each
+/// directory, then its one subdirectory) never lands a whole level on one
+/// member, as a counter shared by every pick did.
+pub fn pickOrdinal(parent_member: u32, ordinal: u32) u64 {
+    return @as(u64, parent_member) + ordinal;
+}
+
 /// The depth a NEW DIRECTORY records: the root's children 1; a parent at
 /// `p ≥ 1` gives `min(p + 1, SATURATED)`; a parent whose depth is 0 — a
 /// directory made before the field existed — gives `SATURATED` (its
@@ -137,4 +170,39 @@ test "the whole law: a native or foreign parent is never homed on; a leased pare
     try testing.expect(!homesOnParent(false, true, 3, 3));
     try testing.expect(!homesOnParent(false, true, 10, 10));
     try testing.expect(homesOnParent(false, true, 11, 10));
+}
+
+test "the pick's ordinal: a parent's first directory child sits beside it and the next ones alternate; 32 siblings split 16/16 from either parent; a lone chain stays on one member; the `a, a/s, b, b/s` interleaving splits every level (the shared counter put each level on one member)" {
+    // Two equal members: the ordinal mod 2 is the member.
+    for ([_]u32{ 0, 1 }) |parent| {
+        var on: [2]u32 = @splat(0);
+        for (0..32) |n| on[@intCast(pickOrdinal(parent, @intCast(n)) % 2)] += 1;
+        try testing.expectEqual(@as(u32, 16), on[0]);
+        try testing.expectEqual(@as(u32, 16), on[1]);
+        try testing.expectEqual(parent, @as(u32, @intCast(pickOrdinal(parent, 0) % 2)));
+    }
+    // A chain /a/b/c/d of first children: every level on member 0, no intent.
+    var m: u32 = 0;
+    for (0..8) |_| m = @intCast(pickOrdinal(m, 0) % 2);
+    try testing.expectEqual(@as(u32, 0), m);
+    // `r0, r0/s, r1, r1/s, …` under `/` on member 0: the r's alternate (their
+    // ordinals 0, 1, 2 …) and each `s` sits beside its parent — 4/4 per level.
+    var level1: [2]u32 = @splat(0);
+    var level2: [2]u32 = @splat(0);
+    for (0..8) |n| {
+        const r: u32 = @intCast(pickOrdinal(0, @intCast(n)) % 2);
+        level1[r] += 1;
+        level2[@intCast(pickOrdinal(r, 0) % 2)] += 1;
+    }
+    try testing.expectEqual(@as(u32, 4), level1[0]);
+    try testing.expectEqual(@as(u32, 4), level2[0]);
+    // A shared counter stepped once per pick: r's at the even steps, s's at
+    // the odd — one member per level.
+    var shared: [2]u32 = @splat(0);
+    var step: u64 = 0;
+    for (0..8) |_| {
+        shared[@intCast(step % 2)] += 1;
+        step += 2;
+    }
+    try testing.expectEqual(@as(u32, 8), shared[0]);
 }

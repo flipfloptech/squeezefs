@@ -1238,7 +1238,12 @@ const routing_files_per_dir: usize = 250;
 fn routingTreeScript(gpa: std.mem.Allocator) ![]u8 {
     var w: std.Io.Writer.Allocating = .init(gpa);
     errdefer w.deinit();
-    try w.writer.print("for d in $(seq 0 {d}); do mkdir -p r$d; for i in $(seq 1 {d}); do echo \"$d-$i\" > r$d/f$i; done; done; find . -path ./.stats -prune -o -type f -print | wc -l", .{ routing_dirs - 1, routing_files_per_dir });
+    // `r$d/s` (depth 2): a mkdir whose depth the rule needs — served off the
+    // directory memo (`r$d` was made this session), never a record read. Its
+    // own `mkdir` process: a one-off caller with ONE decision (a caller
+    // with two is an active stream and would open the shell's mint window,
+    // decision 0003 §BV.4 — the row's spread premise is the lone shell).
+    try w.writer.print("for d in $(seq 0 {d}); do mkdir -p r$d; mkdir r$d/s; for i in $(seq 1 {d}); do echo \"$d-$i\" > r$d/f$i; done; done; find . -path ./.stats -prune -o -type f -print | wc -l", .{ routing_dirs - 1, routing_files_per_dir });
     return w.toOwnedSlice();
 }
 
@@ -1295,6 +1300,18 @@ test "smoke: a TWO-MEMBER metadata set through the binary — format sqmeta://a,
         // (member 0: 63 guests + the native slot; member 1: 64 guests).
         try testing.expect((numberAfter(tail, "\"routing_guest_trees_minted\":") orelse 0) >= 2 * 63);
         try testing.expect((numberAfter(tail, "\"routing_mint_volume_picks\":") orelse 0) > 0);
+        // Directory placement (decision 0003 §BZ): the eight `r$d` are `/`'s
+        // children and the eight `r$d/s` depth-2 rotor decisions; every
+        // parent's depth and ordinal came off the directory memo but `/`'s
+        // own, read ONCE per mount — no other mkdir read a parent record.
+        try testing.expectEqual(@as(?u64, 2 * routing_dirs), numberAfter(tail, "\"routing_dir_place_rotor\":"));
+        try testing.expectEqual(@as(?u64, 2 * routing_dirs - 1), numberAfter(tail, "\"fuse_dir_depth_memo_hits\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tail, "\"fuse_dir_depth_reads\":"));
+        try testing.expectEqual(@as(?u64, 3), numberAfter(tail, "\"routing_dir_spread_depth\":"));
+        // Each `r$d/s` sits beside its parent (a first child, the ordinal
+        // pick) and the r's alternate: 4 of 16 placements remote, the
+        // files, local to the r's, 1000 / 1000.
+        try testing.expectEqual(@as(?u64, routing_dirs / 2), numberAfter(tail, "\"routing_dir_place_remote\":"));
         // Cross-member creates are intents now (never a split commit):
         // minted ≡ retired + open, nothing left open.
         const minted = numberAfter(tail, "\"xv_cross_owner_intents_minted\":") orelse 0;

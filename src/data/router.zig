@@ -412,6 +412,20 @@ pub fn volumeHealth(free_extents: u64, total_extents: u64, enabled: bool) u32 {
 pub fn pickMintVolume(parent_v: u32, healths: []const ?u32, rr: *std.atomic.Value(u64)) u32 {
     assert(healths.len >= 1);
     if (healths.len == 1) return 0;
+    return pickMintVolumeAt(parent_v, healths, rr.fetchAdd(1, .monotonic));
+}
+
+/// `pickMintVolume` at a caller-chosen ORDINAL instead of the shared
+/// round-robin word: the `ordinal mod |band|`-th member of the healthy
+/// 9/10 band in index order. The directory placement rule (decision 0003
+/// §BZ) passes `parent's member + the directories placed under the
+/// parent`, so a parent's directory children walk the band from its own
+/// member — a shared counter stepped by every pick made a tree whose
+/// creation interleaves levels regularly (each directory, then its one
+/// subdirectory) land every directory of one level on one member.
+pub fn pickMintVolumeAt(parent_v: u32, healths: []const ?u32, ordinal: u64) u32 {
+    assert(healths.len >= 1);
+    if (healths.len == 1) return 0;
     var max: u32 = 0;
     var enabled: u32 = 0;
     for (healths) |h| if (h) |v| {
@@ -424,7 +438,7 @@ pub fn pickMintVolume(parent_v: u32, healths: []const ?u32, rr: *std.atomic.Valu
     for (healths) |h| if (h) |v| if (v >= floor) {
         top += 1;
     };
-    const k = rr.fetchAdd(1, .monotonic) % top;
+    const k = ordinal % top;
     var seen: u64 = 0;
     for (healths, 0..) |h, i| if (h) |v| if (v >= floor) {
         if (seen == k) {

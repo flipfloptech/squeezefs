@@ -58,7 +58,7 @@ const Dir = struct {
         var d: Dir = .{ .shape = shape, .dir = try meta_set.createChild(set, inos.ROOT_INO, @tagName(shape), economy.S.IFDIR | 0o755) };
         if (shape == .flat) return d;
         const dir_eff = set.effectiveIno(d.dir);
-        for (&d.stripes) |*s| s.* = set.globalIno(try set.allocateIno(dir_eff, false, false, 0, 0));
+        for (&d.stripes) |*s| s.* = set.globalIno(try set.allocateIno(dir_eff, false, false, 0, .file));
         try stripe.writeStripeRecords(meta_set.MetaSet, set, &d.stripes, .{ .mode = economy.S.IFDIR | 0o755, .uid = 0, .gid = 0, .ts_ns = 1000 });
         const t = try set.begin(@src());
         {
@@ -99,7 +99,7 @@ const Dir = struct {
                 const parent_eff = set.effectiveIno(parent);
                 const pv_bytes = (try set.lookup(set.gpa, key.TREE_INODES, &key.inodeKey(parent_eff))) orelse return error.ParentMissing;
                 defer set.gpa.free(pv_bytes);
-                const child = try set.allocateIno(parent_eff, false, false, 0, 0);
+                const child = try set.allocateIno(parent_eff, false, false, 0, .file);
                 _ = try economy.stageCreate(t, .{ .name_key = set.nameKey(), .now = 1000, .parent = parent_eff, .parent_value = try record.InodeValue.decode(pv_bytes), .name = nm, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = child, .global_ino = set.globalIno(child) });
             }
             owned = false;

@@ -193,6 +193,15 @@ pub const killSuidgidMode = economy.killSuidgidMode;
 /// the ancestry walk cannot confirm through it, until its next lookup
 /// records it.
 pub var fuse_parent_memo_drops: counters.ShardedCounter = .{};
+/// A mkdir on a set that can spread (`dirsMaySpread`) needs its logical
+/// parent's depth and its ordinal under it BEFORE the mint:
+/// `fuse_dir_depth_memo_hits` served them off the directory memo (a parent
+/// this daemon made or already read), `fuse_dir_depth_reads` read the
+/// parent's record for them (once per parent per mount; `/` included). A
+/// set that cannot spread reads nothing here (the depth rides the guarded
+/// parent read every create does).
+pub var fuse_dir_depth_memo_hits: counters.ShardedCounter = .{};
+pub var fuse_dir_depth_reads: counters.ShardedCounter = .{};
 /// `fuse_write_no_data_volume_refused`: a WRITE/truncate past `inline_max`
 /// on a set with NO data volumes answered EFBIG — the set's honest
 /// capacity, not a stopgap (a set with volumes never refuses here).
@@ -682,6 +691,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The `..` memo (module doc).
         parents_lock: jc.SpinLock = .{},
         parents: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+        /// A directory's depth byte (decision 0003 §BZ) and the count of
+        /// directories this mount placed under it (the pick's ordinal,
+        /// seeded from its `nlink − 2` at the first read after a mount),
+        /// beside the parent memo: written at its mkdir and at a depth
+        /// read, dropped with the parent memo; never written by a rename
+        /// (the byte is the birth's).
+        depths: std.AutoHashMapUnmanaged(u64, DepthMemo) = .empty,
         /// The entry generation (charter §4 `FUSE_EXPORT_SUPPORT`): the
         /// kernel packs `(nodeid, i_generation)` into every file handle and
         /// a decode after the inode left its cache compares the generation
@@ -784,6 +800,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.virtuals.deinit();
             self.reclaim.deinit(self.gpa);
             self.parents.deinit(self.gpa);
+            self.depths.deinit(self.gpa);
             self.locks.deinit();
             self.pending.deinit();
             self.* = undefined;
@@ -1648,6 +1665,50 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.parents_lock.lock();
             defer self.parents_lock.unlock();
             _ = self.parents.remove(dir);
+            _ = self.depths.remove(dir);
+        }
+
+        const DepthMemo = struct { depth: u8, placed: u32 };
+
+        /// A fresh directory: its byte, no child placed yet.
+        fn rememberDepth(self: *Self, dir: u64, depth: u8) void {
+            self.parents_lock.lock();
+            defer self.parents_lock.unlock();
+            self.depths.put(self.gpa, dir, .{ .depth = depth, .placed = 0 }) catch fuse_parent_memo_drops.inc();
+        }
+
+        fn memoDepth(self: *Self, dir: u64) ?u8 {
+            self.parents_lock.lock();
+            defer self.parents_lock.unlock();
+            return if (self.depths.get(dir)) |m| m.depth else null;
+        }
+
+        /// The parent's byte and the ordinal of the directory about to be
+        /// placed under it (the count stepped); null = not in the memo.
+        fn takeOrdinal(self: *Self, dir: u64) ?DepthMemo {
+            self.parents_lock.lock();
+            defer self.parents_lock.unlock();
+            const m = self.depths.getPtr(dir) orelse return null;
+            const out = m.*;
+            m.placed +|= 1;
+            return out;
+        }
+
+        /// The memo seeded from the record (`placed = nlink − 2`, the
+        /// directories already under it), then `takeOrdinal`; a drop for
+        /// memory answers this placement off the record alone.
+        fn seedOrdinal(self: *Self, dir: u64, pv: InodeValue) DepthMemo {
+            const seed: DepthMemo = .{ .depth = pv.dirDepth(), .placed = pv.nlink -| 2 };
+            self.parents_lock.lock();
+            defer self.parents_lock.unlock();
+            const got = self.depths.getOrPut(self.gpa, dir) catch {
+                fuse_parent_memo_drops.inc();
+                return seed;
+            };
+            if (!got.found_existing) got.value_ptr.* = seed;
+            const out = got.value_ptr.*;
+            got.value_ptr.placed +|= 1;
+            return out;
         }
 
         fn regularOpenFlags(self: *const Self) u32 {
@@ -3134,14 +3195,20 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn createChildAt(self: *Self, c: *Ctx, parent_global: u64, logical_parent: u64, name: []const u8, child: NewChild) Error!filesystem.Entry {
             const is_dir = economy.isDirMode(child.mode);
             const parent = try localOf(parent_global);
-            // A directory's depth (charter §5.4; decision 0003 §BZ) is read
-            // off its LOGICAL parent before the mint: it decides the member.
-            const depth: u8 = if (is_dir) try self.childDirDepth(logical_parent) else 0;
+            // A directory's depth (charter §5.4; decision 0003 §BZ) decides
+            // its member, so a set that CAN spread learns it before the
+            // mint (the memo, else the logical parent's record); any other
+            // set reads nothing here — the record's byte comes off the
+            // guarded parent read below (`recordDepth`).
+            const may_spread = is_dir and self.store.dirsMaySpread();
+            const place: dir_place.Dir = if (may_spread) try self.childDirPlace(logical_parent) else .{ .depth = 0 };
+            const depth = place.depth;
+            const kind: dir_place.Child = if (!is_dir) .file else .{ .dir = if (may_spread) place else .{ .depth = dir_place.SATURATED } };
             // The mint first: the child's home decides the arm (a foreign
             // parent or a rotor on another member ⇒ ONE intent). A re-issue
             // reuses the ino its first attempt minted (decision 0003 §X.2).
             const reused: ?u64 = if (c.move) |m| m.subject else null;
-            const local = if (reused) |g| try localOf(g) else self.store.allocateIno(parent, false, try self.gatherOptIn(parent), c.pid, depth) catch |e| return storeErr(e);
+            const local = if (reused) |g| try localOf(g) else self.store.allocateIno(parent, false, try self.gatherOptIn(parent), c.pid, kind) catch |e| return storeErr(e);
             const global = globalOf(local);
             noteSubjects(c, global, null);
             if (self.needsIntent(&.{ parent_global, global })) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global, depth);
@@ -3170,6 +3237,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 return error.PathAlreadyExists;
             }
             const stamp = now();
+            const rec_depth: u8 = if (is_dir) try self.recordDepth(depth, parent_global, logical_parent, pv) else 0;
             const out = if (child.target) |target|
                 economy.stageSymlink(t, .{ .name_key = self.store.nameKey(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .uid = c.uid, .gid = c.gid, .local_ino = local, .global_ino = global, .target = target, .chain = chain.slice(), .park_parent_times = self.times_park }) catch |e| return switch (e) {
                     error.SymlinkTargetTooLong, error.NameTooLong => error.NameTooLong,
@@ -3177,7 +3245,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     error.OutOfMemory => error.OutOfMemory,
                 }
             else
-                economy.stageCreate(t, .{ .name_key = self.store.nameKey(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .mode = child.mode, .uid = c.uid, .gid = c.gid, .rdev = child.rdev, .local_ino = local, .global_ino = global, .chain = chain.slice(), .park_parent_times = self.times_park, .flags2 = InodeValue.flags2ForDepth(depth) }) catch |e| return switch (e) {
+                economy.stageCreate(t, .{ .name_key = self.store.nameKey(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .mode = child.mode, .uid = c.uid, .gid = c.gid, .rdev = child.rdev, .local_ino = local, .global_ino = global, .chain = chain.slice(), .park_parent_times = self.times_park, .flags2 = InodeValue.flags2ForDepth(rec_depth) }) catch |e| return switch (e) {
                     error.NameTooLong => error.NameTooLong,
                     error.DentryChainOverflow => error.NoSpaceLeft,
                     error.OutOfMemory => error.OutOfMemory,
@@ -3191,21 +3259,48 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 if (self.redispatches(e)) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global, depth);
                 return e;
             };
-            if (is_dir) self.rememberParent(global, logical_parent);
+            if (is_dir) {
+                self.rememberParent(global, logical_parent);
+                self.rememberDepth(global, rec_depth);
+            }
             if (child.mode & S.IFMT == S.IFREG) self.data.noteShape(local, 0, .inline_);
             return self.entryOf(global, out.child);
         }
 
         /// The depth a new directory under `logical_parent` records
-        /// (`dir_place.childDepth`): `/`'s children 1, else one below the
-        /// parent's own byte (a token read for a foreign parent; a parent
+        /// (`dir_place.childDepth`) and its ordinal under the parent, learned
+        /// BEFORE the mint on a set that can spread: `/`'s children are
+        /// depth 1, else one below the parent's own byte — off the
+        /// directory memo when this daemon made or already read the parent,
+        /// else its record (a token read for a foreign parent; a parent
         /// without a byte — made before the field — makes a saturated
         /// child, whose subtree stays on its member). A striped parent's
         /// depth is the directory's, never the stripe's.
-        fn childDirDepth(self: *Self, logical_parent: u64) Error!u8 {
-            if (logical_parent == inos.ROOT_INO) return dir_place.childDepth(true, 0);
+        fn childDirPlace(self: *Self, logical_parent: u64) Error!dir_place.Dir {
+            const is_root = logical_parent == inos.ROOT_INO;
+            if (self.takeOrdinal(logical_parent)) |m| {
+                fuse_dir_depth_memo_hits.inc();
+                return .{ .depth = dir_place.childDepth(is_root, m.depth), .ordinal = m.placed };
+            }
+            fuse_dir_depth_reads.inc();
             const pv = (try self.readInodeOpt(try localOf(logical_parent))) orelse return error.FileNotFound;
-            return dir_place.childDepth(false, pv.dirDepth());
+            const m = self.seedOrdinal(logical_parent, pv);
+            return .{ .depth = dir_place.childDepth(is_root, m.depth), .ordinal = m.placed };
+        }
+
+        /// The byte the new directory's record carries: `pre` when the
+        /// mint needed it; else — a set that cannot spread — off the key
+        /// parent's record already in hand (`pv`) when that is the logical
+        /// parent, else the logical parent's (a striped parent: `pv` is the
+        /// stripe's). The depth is recorded whatever `D` is: a later
+        /// `set-dir-spread-depth` reads it.
+        fn recordDepth(self: *Self, pre: u8, key_parent: u64, logical_parent: u64, pv: InodeValue) Error!u8 {
+            if (pre != 0) return pre;
+            if (logical_parent == inos.ROOT_INO) return dir_place.childDepth(true, 0);
+            if (key_parent == logical_parent) return dir_place.childDepth(false, pv.dirDepth());
+            if (self.memoDepth(logical_parent)) |d| return dir_place.childDepth(false, d);
+            const lv = (try self.readInodeOpt(try localOf(logical_parent))) orelse return error.FileNotFound;
+            return dir_place.childDepth(false, lv.dirDepth());
         }
 
         /// The cross-owner create: the EEXIST probe through the divert, the
@@ -3255,9 +3350,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 t_owned = false;
                 try self.commit(c, t);
             }
-            const plan = sym_xv.steps.planCreate(.{ .parent = parent_global, .name = name, .child = global, .mode = mode, .uid = c.uid, .gid = gid, .rdev = child.rdev, .size = size, .now = now(), .flags2 = InodeValue.flags2ForDepth(depth) });
+            const rec_depth: u8 = if (economy.isDirMode(mode)) try self.recordDepth(depth, parent_global, logical_parent, pv) else 0;
+            const plan = sym_xv.steps.planCreate(.{ .parent = parent_global, .name = name, .child = global, .mode = mode, .uid = c.uid, .gid = gid, .rdev = child.rdev, .size = size, .now = now(), .flags2 = InodeValue.flags2ForDepth(rec_depth) });
             const done = try self.runPlan(c, &plan);
-            if (economy.isDirMode(mode)) self.rememberParent(global, logical_parent);
+            if (economy.isDirMode(mode)) {
+                self.rememberParent(global, logical_parent);
+                self.rememberDepth(global, rec_depth);
+            }
             if (mode & S.IFMT == S.IFREG) self.data.noteShape(local, 0, .inline_);
             return self.entryOf(global, done.inode(0) orelse return error.InputOutput);
         }
@@ -3454,7 +3553,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (whiteout) {
                 // On the old parent's member: the op stays on two members
                 // at most (the dentries' and the moved inode's).
-                const l = self.store.allocateIno(old_parent, true, false, c.pid, 0) catch |e| return storeErr(e);
+                const l = self.store.allocateIno(old_parent, true, false, c.pid, .file) catch |e| return storeErr(e);
                 wo = .{ .local = l, .global = globalOf(l) };
             }
             _ = economy.stageRename(t, .{
@@ -3556,7 +3655,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (new0) |n| dest = .{ .ino = n.global, .value = (try self.readInodeOpt(n.local)) orelse return error.FileNotFound };
             var wo: ?u64 = null;
             if (whiteout) {
-                const l = self.store.allocateIno(try localOf(a.parent), true, false, c.pid, 0) catch |e| return storeErr(e);
+                const l = self.store.allocateIno(try localOf(a.parent), true, false, c.pid, .file) catch |e| return storeErr(e);
                 wo = globalOf(l);
             }
             const plan = sym_xv.steps.planRename(.{ .old_parent = a.parent, .old_name = a.name, .new_parent = a.newparent, .new_name = a.newname, .child = old0.global, .child_mode = cv.mode, .dest = if (dest) |d| .{ .ino = d.ino, .value = d.value } else null, .whiteout = wo, .now = stamp });
@@ -5790,7 +5889,11 @@ pub const MemStore = struct {
     /// One store, one keyspace: the parent, the mint decision and the
     /// minting stream are the set facade's concerns; every mint is slot
     /// 0's.
-    pub fn allocateIno(self: *MemStore, _: u64, _: bool, _: bool, _: u32, _: u8) StoreError!u64 {
+    pub fn dirsMaySpread(_: *MemStore) bool {
+        return false;
+    }
+
+    pub fn allocateIno(self: *MemStore, _: u64, _: bool, _: bool, _: u32, _: dir_place.Child) StoreError!u64 {
         self.lock.lock();
         defer self.lock.unlock();
         const i = self.next_ino;
@@ -6764,6 +6867,40 @@ test "the corpse destroy settles the write-side custody BEFORE it reads the layo
     try testing.expectEqual(@as(u32, 1), h.data.base.layout_locks_taken);
     try testing.expectEqual(@as(u32, 0), h.data.base.layout_lock_held);
     try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+}
+
+test "a mkdir on a set that cannot spread (one member, D = 0, one healthy member) reads NO parent record for its depth and asks the mint for a directory at the saturated depth; the child still records its depth off the guarded parent read — /a 1, /a/b 2, /a/b/c 3 — and a legacy parent's child records 255 (decision 0003 §BZ)" {
+    const H = HarnessOf(NoData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    const reads0 = fuse_dir_depth_reads.load();
+    const hits0 = fuse_dir_depth_memo_hits.load();
+    const a = try h.mkdir(1, "a");
+    const b = try h.mkdir(a, "b");
+    const c = try h.mkdir(b, "c");
+    _ = try h.create(c, "f", 0o644);
+    try testing.expectEqual(reads0, fuse_dir_depth_reads.load());
+    try testing.expectEqual(hits0, fuse_dir_depth_memo_hits.load());
+    try testing.expectEqual(@as(u8, 1), (try h.fs.readInodeStored(try H.Fs.localOf(a))).?.dirDepth());
+    try testing.expectEqual(@as(u8, 2), (try h.fs.readInodeStored(try H.Fs.localOf(b))).?.dirDepth());
+    try testing.expectEqual(@as(u8, 3), (try h.fs.readInodeStored(try H.Fs.localOf(c))).?.dirDepth());
+    try testing.expectEqual(@as(u8, 3), h.fs.memoDepth(c).?);
+    // A directory made before the field (no byte): its child saturates.
+    {
+        const l = try H.Fs.localOf(b);
+        var v = (try h.fs.readInodeStored(l)).?;
+        v.flags2 = 0;
+        const t = try h.store.begin(@src());
+        try t.stagePut(key.TREE_INODES, &key.inodeKey(l), &v.encode());
+        try h.store.commit(t);
+    }
+    const legacy_child = try h.mkdir(b, "d");
+    try testing.expectEqual(dir_place.SATURATED, (try h.fs.readInodeStored(try H.Fs.localOf(legacy_child))).?.dirDepth());
+    try testing.expectEqual(reads0, fuse_dir_depth_reads.load());
+    // rmdir drops the memo with the parent's.
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .rmdir = .{ .name = "d" } }, b).errno());
+    try testing.expectEqual(@as(?u8, null), h.fs.memoDepth(legacy_child));
 }
 
 test "a FORGET whose corpse judgement would park the drain worker (the inode read refused try-only: a demand page, a load a fiber of its own lane leads) defers the judgement to the gather: the cadence re-judges nlink there, destroys the corpse and leaves the live inode" {

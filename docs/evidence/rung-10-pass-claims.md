@@ -6,7 +6,7 @@ the `sqz-jrnl*` threads' on-CPU time per phase, fsck clean after every run. The 
 
 ## Why the handout cost directory removal at -np 32
 
-The owner's bisect put the handout alone (`d230542`: every entry claimed before the first turn) at −5.2 % on
+The owner's bisect put the handout alone (every entry claimed before the first turn; the unlanded variant, kept locally as `perf/handout-at-pass`) at −5.2 % on
 directory removal at -np 32. Counters from the rmdir phase at -np 32, without and with the handout (two runs
 each):
 

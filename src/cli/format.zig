@@ -315,7 +315,7 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
     }
 
     // The record (its cap is the per-volume record-value cap).
-    var cfg = set_config.birth(p.gpa, set.set_uuid, tcfg, key_ref, records[0..n_data]) catch {
+    var cfg = set_config.birth(p.gpa, set.set_uuid, tcfg, key_ref, records[0..n_data], f.dir_spread_depth) catch {
         p.stderr.writeAll("squeezefs format: out of memory\n") catch {};
         return cli.exit_failed;
     };

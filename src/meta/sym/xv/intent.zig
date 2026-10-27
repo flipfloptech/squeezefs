@@ -216,7 +216,8 @@ pub fn stepWordsAdmissible(w: StepWire) bool {
         .set_nlink => w.b == 0 and w.w2 == 0 and w.w3 == 0 and w.ft_bits == 0 and w.parent_update == 0 and (w.flags & verbs.STEP_FLAG_HAS_CTIME != 0 or w.c == 0),
         .touch_ctime => w.b == 0 and w.w0 == 0 and w.w1 == 0 and w.w2 == 0 and w.w3 == 0 and w.ft_bits == 0 and w.parent_update == 0 and w.flags == 0,
         .mint_inode => w.b == 0 and w.c == 0 and w.ft_bits == 0 and w.parent_update == 0 and w.flags == 0,
-        .create_inode => w.ft_bits == 0 and w.parent_update == 0 and w.flags == 0,
+        // `ft_bits` carries the child's `flags2`: the depth byte alone.
+        .create_inode => w.ft_bits & ~record.INODE_DEPTH_MASK == 0 and w.parent_update == 0 and w.flags == 0,
     };
 }
 

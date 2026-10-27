@@ -1125,7 +1125,7 @@ test "linux: A MINT RACING THE HANDOVER OF ITS SLOT keeps no ino the receiver mi
     be0.slots.mint_seam.armed.store(true, .release);
     const Minter = struct {
         fn run(st: *MetaSet, out: *(meta_set.Error!u64)) void {
-            out.* = st.allocateIno(st.effectiveIno(inos.ROOT_INO), false, false, 0);
+            out.* = st.allocateIno(st.effectiveIno(inos.ROOT_INO), false, false, 0, 0);
         }
     };
     var minted: meta_set.Error!u64 = error.Io;
@@ -1195,7 +1195,7 @@ test "linux: CONCURRENT MINTERS NEVER MINT ONE INO TWICE, across window refills 
 
         fn mintPhase(self: *@This()) void {
             for (0..self.sh.per_phase) |_| {
-                const eff = self.sh.set.allocateIno(self.sh.set.effectiveIno(inos.ROOT_INO), false, false, 0) catch {
+                const eff = self.sh.set.allocateIno(self.sh.set.effectiveIno(inos.ROOT_INO), false, false, 0, 0) catch {
                     self.sh.failed.store(true, .release);
                     return;
                 };

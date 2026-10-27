@@ -33,6 +33,7 @@ const std = @import("std");
 const fuzzkit = @import("../../core/fuzzkit.zig");
 const Allocator = std.mem.Allocator;
 const set_config = @import("../../data/set_config.zig");
+const dir_place = @import("../../meta/routing/dir_place.zig");
 const router = @import("../../data/router.zig");
 const records = @import("../jobs/records.zig");
 const rebalance = @import("../jobs/rebalance.zig");
@@ -386,7 +387,7 @@ const set_uuid: [16]u8 = "lifecycle-set-01".*;
 
 fn birthWorld(gpa: Allocator) !RamWorld {
     const d0: DataVolume = .{ .vol_tag = 0x1111, .state = .active, .device_uuid = @splat(1), .added_ts = 1, .capacity_blocks = 1000, .volume_len = 1 << 32, .uri = "/dev/d0" };
-    const cfg = try set_config.birth(gpa, set_uuid, .{ .compression = .none, .encryption = .none, .block_size = 4 << 20 }, null, &.{d0});
+    const cfg = try set_config.birth(gpa, set_uuid, .{ .compression = .none, .encryption = .none, .block_size = 4 << 20 }, null, &.{d0}, dir_place.DEFAULT_DEPTH);
     var w = RamWorld.init(gpa, cfg);
     try w.devices.put(gpa, @splat(1), 0x1111);
     try w.placement.put(gpa, 0x1111, .active);

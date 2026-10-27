@@ -121,6 +121,7 @@ const lease_epoch = @import("../../data/lease_epoch.zig");
 const inos = @import("../../meta/inos.zig");
 const jc = @import("../../meta/journal_core.zig");
 const route_table = @import("../../meta/routing/route_table.zig");
+const dir_place = @import("../../meta/routing/dir_place.zig");
 const sym_handover = @import("../../meta/sym/slots/handover.zig");
 const sym_acquire = @import("../../meta/sym/slots/acquire.zig");
 const read_divert = @import("../../meta/sym/tokens/read_divert.zig");
@@ -3133,14 +3134,17 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn createChildAt(self: *Self, c: *Ctx, parent_global: u64, logical_parent: u64, name: []const u8, child: NewChild) Error!filesystem.Entry {
             const is_dir = economy.isDirMode(child.mode);
             const parent = try localOf(parent_global);
+            // A directory's depth (charter §5.4; decision 0003 §BZ) is read
+            // off its LOGICAL parent before the mint: it decides the member.
+            const depth: u8 = if (is_dir) try self.childDirDepth(logical_parent) else 0;
             // The mint first: the child's home decides the arm (a foreign
             // parent or a rotor on another member ⇒ ONE intent). A re-issue
             // reuses the ino its first attempt minted (decision 0003 §X.2).
             const reused: ?u64 = if (c.move) |m| m.subject else null;
-            const local = if (reused) |g| try localOf(g) else self.store.allocateIno(parent, false, try self.gatherOptIn(parent), c.pid) catch |e| return storeErr(e);
+            const local = if (reused) |g| try localOf(g) else self.store.allocateIno(parent, false, try self.gatherOptIn(parent), c.pid, depth) catch |e| return storeErr(e);
             const global = globalOf(local);
             noteSubjects(c, global, null);
-            if (self.needsIntent(&.{ parent_global, global })) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global);
+            if (self.needsIntent(&.{ parent_global, global })) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global, depth);
             var plan: economy.GuardPlan = .{};
             plan.inode_reqs[0] = .{ .ino = parent, .mode = if (is_dir) .exclusive else .shared };
             plan.inode_len = 1;
@@ -3173,7 +3177,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     error.OutOfMemory => error.OutOfMemory,
                 }
             else
-                economy.stageCreate(t, .{ .name_key = self.store.nameKey(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .mode = child.mode, .uid = c.uid, .gid = c.gid, .rdev = child.rdev, .local_ino = local, .global_ino = global, .chain = chain.slice(), .park_parent_times = self.times_park }) catch |e| return switch (e) {
+                economy.stageCreate(t, .{ .name_key = self.store.nameKey(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .mode = child.mode, .uid = c.uid, .gid = c.gid, .rdev = child.rdev, .local_ino = local, .global_ino = global, .chain = chain.slice(), .park_parent_times = self.times_park, .flags2 = InodeValue.flags2ForDepth(depth) }) catch |e| return switch (e) {
                     error.NameTooLong => error.NameTooLong,
                     error.DentryChainOverflow => error.NoSpaceLeft,
                     error.OutOfMemory => error.OutOfMemory,
@@ -3184,12 +3188,24 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (is_dir) try self.stageParentRecord(t, local, logical_parent, true);
             t_owned = false;
             self.commit(c, t) catch |e| {
-                if (self.redispatches(e)) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global);
+                if (self.redispatches(e)) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global, depth);
                 return e;
             };
             if (is_dir) self.rememberParent(global, logical_parent);
             if (child.mode & S.IFMT == S.IFREG) self.data.noteShape(local, 0, .inline_);
             return self.entryOf(global, out.child);
+        }
+
+        /// The depth a new directory under `logical_parent` records
+        /// (`dir_place.childDepth`): `/`'s children 1, else one below the
+        /// parent's own byte (a token read for a foreign parent; a parent
+        /// without a byte — made before the field — makes a saturated
+        /// child, whose subtree stays on its member). A striped parent's
+        /// depth is the directory's, never the stripe's.
+        fn childDirDepth(self: *Self, logical_parent: u64) Error!u8 {
+            if (logical_parent == inos.ROOT_INO) return dir_place.childDepth(true, 0);
+            const pv = (try self.readInodeOpt(try localOf(logical_parent))) orelse return error.FileNotFound;
+            return dir_place.childDepth(false, pv.dirDepth());
         }
 
         /// The cross-owner create: the EEXIST probe through the divert, the
@@ -3198,7 +3214,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// own entry on the child's slot BEFORE the intent (a crash between
         /// leaves an xattr no inode owns: fsck's orphan-xattr class, never a
         /// symlink without its target).
-        fn xvCreate(self: *Self, c: *Ctx, parent_global: u64, logical_parent: u64, name: []const u8, child: NewChild, local: u64, global: u64) Error!filesystem.Entry {
+        fn xvCreate(self: *Self, c: *Ctx, parent_global: u64, logical_parent: u64, name: []const u8, child: NewChild, local: u64, global: u64, depth: u8) Error!filesystem.Entry {
             const parent = try localOf(parent_global);
             const pv = try self.readDir(parent);
             if (pv.nlink == 0) return error.FileNotFound;
@@ -3239,7 +3255,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 t_owned = false;
                 try self.commit(c, t);
             }
-            const plan = sym_xv.steps.planCreate(.{ .parent = parent_global, .name = name, .child = global, .mode = mode, .uid = c.uid, .gid = gid, .rdev = child.rdev, .size = size, .now = now() });
+            const plan = sym_xv.steps.planCreate(.{ .parent = parent_global, .name = name, .child = global, .mode = mode, .uid = c.uid, .gid = gid, .rdev = child.rdev, .size = size, .now = now(), .flags2 = InodeValue.flags2ForDepth(depth) });
             const done = try self.runPlan(c, &plan);
             if (economy.isDirMode(mode)) self.rememberParent(global, logical_parent);
             if (mode & S.IFMT == S.IFREG) self.data.noteShape(local, 0, .inline_);
@@ -3438,7 +3454,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (whiteout) {
                 // On the old parent's member: the op stays on two members
                 // at most (the dentries' and the moved inode's).
-                const l = self.store.allocateIno(old_parent, true, false, c.pid) catch |e| return storeErr(e);
+                const l = self.store.allocateIno(old_parent, true, false, c.pid, 0) catch |e| return storeErr(e);
                 wo = .{ .local = l, .global = globalOf(l) };
             }
             _ = economy.stageRename(t, .{
@@ -3540,7 +3556,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (new0) |n| dest = .{ .ino = n.global, .value = (try self.readInodeOpt(n.local)) orelse return error.FileNotFound };
             var wo: ?u64 = null;
             if (whiteout) {
-                const l = self.store.allocateIno(try localOf(a.parent), true, false, c.pid) catch |e| return storeErr(e);
+                const l = self.store.allocateIno(try localOf(a.parent), true, false, c.pid, 0) catch |e| return storeErr(e);
                 wo = globalOf(l);
             }
             const plan = sym_xv.steps.planRename(.{ .old_parent = a.parent, .old_name = a.name, .new_parent = a.newparent, .new_name = a.newname, .child = old0.global, .child_mode = cv.mode, .dest = if (dest) |d| .{ .ino = d.ino, .value = d.value } else null, .whiteout = wo, .now = stamp });
@@ -5774,7 +5790,7 @@ pub const MemStore = struct {
     /// One store, one keyspace: the parent, the mint decision and the
     /// minting stream are the set facade's concerns; every mint is slot
     /// 0's.
-    pub fn allocateIno(self: *MemStore, _: u64, _: bool, _: bool, _: u32) StoreError!u64 {
+    pub fn allocateIno(self: *MemStore, _: u64, _: bool, _: bool, _: u32, _: u8) StoreError!u64 {
         self.lock.lock();
         defer self.lock.unlock();
         const i = self.next_ino;

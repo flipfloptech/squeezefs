@@ -42,6 +42,7 @@ const std = @import("std");
 const fuzzkit = @import("../core/fuzzkit.zig");
 const checksum = @import("../core/checksum.zig");
 const transform = @import("transform.zig");
+const dir_place = @import("../meta/routing/dir_place.zig");
 
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -270,7 +271,13 @@ pub const HeadWire = extern struct {
     encryption: u8,
     /// 0 none, 2 = hkdf-sha256/aead-kw/v2.
     key_scheme: u8,
-    reserved1: u8,
+    /// The set's directory spread depth `D` (`dir_place.zig`; charter
+    /// §5.4; decision 0003 §BZ): new directories at depth ≤ D round-robin
+    /// over the members; 0 = never below the root's children (§AA.1's
+    /// behaviour, and what every record written before the field reads
+    /// — those sets' directories carry no depth; `config
+    /// set-dir-spread-depth` arms them). `0 … dir_place.DEPTH_MAX`.
+    dir_spread_depth: u8,
     /// Zero when `encryption == none`.
     kdf_salt: [transform.KDF_SALT_LEN]u8,
     key_id: [transform.KEY_ID_LEN]u8,
@@ -360,6 +367,8 @@ pub const Config = struct {
     key_id: [transform.KEY_ID_LEN]u8,
     nonce_floor: u64,
     inline_max: u32,
+    /// `HeadWire.dir_spread_depth`.
+    dir_spread_depth: u8,
     /// The open rotation window's NEXT key (`FLAG_REKEY_WINDOW`); null =
     /// no window. New writes wrap under it; reads unwrap under it or the
     /// primary; `closeRekey` makes it the primary.
@@ -449,7 +458,7 @@ pub const Config = struct {
         try w.print("\",\"config_generation\":{d},\"block_size\":{d},\"chunk_size\":{d},\"capacity_bytes\":{d},\"compression\":\"{s}\",\"encryption\":\"{s}\"", .{ self.config_generation, self.block_size, self.chunk_size, self.capacity, @tagName(self.compression), self.encryption.name() });
         if (self.encryption != .none) try w.print(",\"key_id\":\"{x}\"", .{&self.key_id});
         if (self.next_key) |nk| try w.print(",\"key_id_next\":\"{x}\"", .{&nk.key_id});
-        try w.print(",\"inline_max\":{d},\"lifecycle_diverged\":{},\"data\":[", .{ self.inline_max, self.lifecycleDiverged() });
+        try w.print(",\"inline_max\":{d},\"dir_spread_depth\":{d},\"lifecycle_diverged\":{},\"data\":[", .{ self.inline_max, self.dir_spread_depth, self.lifecycleDiverged() });
         for (self.data, 0..) |d, i| {
             if (i != 0) try w.writeByte(',');
             try w.print("{{\"vol_tag\":\"vol-{x:0>16}\",\"state\":\"{s}\",\"device_uuid\":\"", .{ d.vol_tag, d.state.name() });
@@ -472,6 +481,8 @@ pub const Config = struct {
             if (self.next_key) |nk| try w.print("; ROTATION WINDOW OPEN: next key id {x} ({s}/{x}.key; `defrag --rekey` sweeps every block onto it and flips the primary last)", .{ &nk.key_id, transform.KEY_DIR, &nk.key_id });
         }
         if (self.inline_max != 0) try w.print("; inline_max override {d}", .{self.inline_max});
+        try w.print("; dir spread depth {d}", .{self.dir_spread_depth});
+        if (self.dir_spread_depth == 0) try w.writeAll(" (directories follow their parent's member; `config set-dir-spread-depth N` spreads the top N levels)");
         try w.print("\n  data volumes {d}", .{self.data.len});
         if (self.lifecycleDiverged()) try w.writeAll(" (VOLUME_LIFECYCLE: the set has diverged from its birth state)");
         try w.writeAll("\n");
@@ -555,7 +566,7 @@ pub fn encode(gpa: Allocator, cfg: *const Config, cap: usize) EncodeError![]u8 {
     h.compression = @backingInt(cfg.compression);
     h.encryption = @backingInt(cfg.encryption);
     h.key_scheme = cfg.key_scheme;
-    h.reserved1 = 0;
+    h.dir_spread_depth = cfg.dir_spread_depth;
     h.kdf_salt = cfg.kdf_salt;
     h.key_id = cfg.key_id;
     h.set_uuid = cfg.set_uuid;
@@ -623,6 +634,8 @@ pub const DecodeError = error{
     BadRecord,
     /// The record names disk cache paths (a pre-write-cache format).
     CachePaths,
+    /// A directory spread depth past `dir_place.DEPTH_MAX`.
+    BadDirSpreadDepth,
     OutOfMemory,
 };
 
@@ -643,6 +656,7 @@ pub const Refusal = union(enum) {
     /// before 2026-10-21; the write cache needs none and the file-backed
     /// ring is gone: reformat.
     cache_paths: usize,
+    bad_dir_spread_depth: u8,
 
     pub fn write(self: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
@@ -659,6 +673,7 @@ pub const Refusal = union(enum) {
             .trailing_bytes => try w.writeAll("set_config record has bytes after its declared structure"),
             .bad_record => |i| try w.print("set_config data volume record {d} is malformed (uri not absolute, a NUL, a retired record with a uri, or a duplicate tag/device)", .{i}),
             .cache_paths => |n| try w.print("set_config record declares {d} disk cache path(s) — a set formatted before the write cache (2026-10-21); disk-based caching is gone: reformat the set", .{n}),
+            .bad_dir_spread_depth => |d| try w.print("set_config record names directory spread depth {d}; the range is 0 … {d}", .{ d, dir_place.DEPTH_MAX }),
         }
     }
 };
@@ -679,6 +694,7 @@ fn refuse(diag: ?*Refusal, r: Refusal) DecodeError {
         .trailing_bytes => error.TrailingBytes,
         .bad_record => error.BadRecord,
         .cache_paths => error.CachePaths,
+        .bad_dir_spread_depth => error.BadDirSpreadDepth,
     };
 }
 
@@ -740,7 +756,8 @@ pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Co
     if (!checksum.verify(bytes, sum_off)) return refuse(diag, .checksum_mismatch);
     const h = std.mem.bytesToValue(HeadWire, bytes[0..HEAD_LEN]);
     const flags = std.mem.readInt(u16, &h.flags_le, .little);
-    if (flags & ~FLAGS_KNOWN != 0 or h.reserved1 != 0 or !std.mem.allEqual(u8, &h.reserved, 0)) return refuse(diag, .reserved_not_zero);
+    if (flags & ~FLAGS_KNOWN != 0 or !std.mem.allEqual(u8, &h.reserved, 0)) return refuse(diag, .reserved_not_zero);
+    if (!dir_place.depthValid(h.dir_spread_depth)) return refuse(diag, .{ .bad_dir_spread_depth = h.dir_spread_depth });
     const compression = Compression.fromWire(h.compression) orelse return refuse(diag, .bad_mode);
     const encryption = Encryption.fromWire(h.encryption) orelse return refuse(diag, .bad_mode);
     if (h.key_scheme != 0 and h.key_scheme != transform.KEY_WRAP_SCHEME_V2) return refuse(diag, .{ .bad_key_scheme = h.key_scheme });
@@ -773,6 +790,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Co
         .key_id = h.key_id,
         .nonce_floor = std.mem.readInt(u64, &h.nonce_floor_le, .little),
         .inline_max = std.mem.readInt(u32, &h.inline_max_le, .little),
+        .dir_spread_depth = h.dir_spread_depth,
         .data = &.{},
     };
     const data = try gpa.alloc(DataVolume, n_data);
@@ -853,8 +871,9 @@ pub const KeyRef = struct {
 
 /// The record of a fresh set: generation 1, every data volume `active`,
 /// capacity Σ usable bytes, the key ref iff encrypted. `data` is copied.
-pub fn birth(gpa: Allocator, set_uuid: [16]u8, tcfg: transform.VolumeTransform, key: ?KeyRef, data: []const DataVolume) Allocator.Error!Config {
+pub fn birth(gpa: Allocator, set_uuid: [16]u8, tcfg: transform.VolumeTransform, key: ?KeyRef, data: []const DataVolume, dir_spread_depth: u8) Allocator.Error!Config {
     assert((key != null) == (tcfg.encryption != .none));
+    assert(dir_place.depthValid(dir_spread_depth));
     var cfg: Config = .{
         .config_generation = 1,
         .set_uuid = set_uuid,
@@ -868,6 +887,7 @@ pub fn birth(gpa: Allocator, set_uuid: [16]u8, tcfg: transform.VolumeTransform, 
         .key_id = if (key) |k| k.key_id else @splat(0),
         .nonce_floor = 0,
         .inline_max = 0,
+        .dir_spread_depth = dir_spread_depth,
         .data = @constCast(data),
     };
     // `clone` only reads the borrowed slices; the result owns its own.
@@ -901,6 +921,8 @@ pub const VerbError = error{
     /// A fabric endpoint whose subnqn or transport/adrfam shape is not one
     /// the record represents.
     BadFabricEndpoint,
+    /// A directory spread depth past `dir_place.DEPTH_MAX`.
+    BadDirSpreadDepth,
 };
 
 fn finish(prev: *const Config, next: Config) Mutation {
@@ -969,6 +991,18 @@ pub fn setFabricEndpoint(gpa: Allocator, prev: *const Config, vol_tag: u64, ep: 
     if (d.fabric) |f| freeEndpoint(gpa, f);
     d.fabric = null;
     if (ep) |e| d.fabric = try cloneEndpoint(gpa, e);
+    return finish(prev, next);
+}
+
+/// `config set-dir-spread-depth`: the set's directory spread depth for
+/// every directory made from the next mount on (existing directories keep
+/// their homes; a running fleet never sees the change — the verb runs
+/// under the offline guard). Refused past `dir_place.DEPTH_MAX`.
+pub fn setDirSpreadDepth(gpa: Allocator, prev: *const Config, depth: u64) VerbError!Mutation {
+    if (!dir_place.depthValid(depth)) return error.BadDirSpreadDepth;
+    var next = try prev.clone(gpa);
+    errdefer next.deinit(gpa);
+    next.dir_spread_depth = @intCast(depth);
     return finish(prev, next);
 }
 
@@ -1195,7 +1229,7 @@ fn fixture(gpa: Allocator) !Config {
         .{ .vol_tag = 0x1111_2222_3333_4444, .state = .active, .device_uuid = @splat(1), .added_ts = 1_700_000_000, .capacity_blocks = 254, .volume_len = 1 << 30, .uri = "/dev/nvme0n1" },
         .{ .vol_tag = 0x5555_6666_7777_8888, .state = .active, .device_uuid = @splat(2), .added_ts = 1_700_000_001, .capacity_blocks = 510, .volume_len = 2 << 30, .uri = "/build/tmp/d1.img" },
     };
-    return birth(gpa, test_set_uuid, .{ .compression = .lz4, .encryption = .aes256gcm, .block_size = 4 << 20 }, .{ .kdf_salt = @splat(0x55), .key_id = .{ 1, 2, 3, 4, 5, 6, 7, 8 } }, &vols);
+    return birth(gpa, test_set_uuid, .{ .compression = .lz4, .encryption = .aes256gcm, .block_size = 4 << 20 }, .{ .kdf_salt = @splat(0x55), .key_id = .{ 1, 2, 3, 4, 5, 6, 7, 8 } }, &vols, dir_place.DEFAULT_DEPTH);
 }
 
 test "the head is 128 B and the record fixed part 64 B at the spec's offsets; birth: generation 1, every volume active, capacity Σ usable; encode∘decode = id; the record is small (≈ 300 B for two volumes)" {
@@ -1249,7 +1283,7 @@ test "the head is 128 B and the record fixed part 64 B at the spec's offsets; bi
     try testing.expectEqualSlices(u8, bytes, again);
     // A one-member plaintext set has not diverged and carries no key.
     const one = [_]DataVolume{cfg.data[0]};
-    var solo = try birth(gpa, test_set_uuid, .{ .block_size = 1 << 20 }, null, &one);
+    var solo = try birth(gpa, test_set_uuid, .{ .block_size = 1 << 20 }, null, &one, dir_place.DEFAULT_DEPTH);
     defer solo.deinit(gpa);
     try testing.expect(!solo.lifecycleDiverged());
     try testing.expectEqual(@as(u8, 0), solo.key_scheme);
@@ -1260,6 +1294,77 @@ test "the head is 128 B and the record fixed part 64 B at the spec's offsets; bi
     try testing.expect(std.mem.indexOf(u8, out.written(), "vol-1111222233334444 active /dev/nvme0n1 254 blocks") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "aes-256-gcm") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "/etc/squeezefs/keys/0102030405060708.key") != null);
+}
+
+test "the directory spread depth (decision 0003 §BZ): born at the format's value and round-tripped at head byte 39; a record written before the field (byte 0) reads 0 = §AA.1; 255 refuses by name; `set-dir-spread-depth` steps the generation, flips no lifecycle bit, refuses past the ceiling; the summary and the JSON name it" {
+    const gpa = testing.allocator;
+    var cfg = try fixture(gpa);
+    defer cfg.deinit(gpa);
+    try testing.expectEqual(dir_place.DEFAULT_DEPTH, cfg.dir_spread_depth);
+    const bytes = try encode(gpa, &cfg, test_cap);
+    defer gpa.free(bytes);
+    try testing.expectEqual(@as(usize, 39), @offsetOf(HeadWire, "dir_spread_depth"));
+    try testing.expectEqual(dir_place.DEFAULT_DEPTH, bytes[39]);
+    {
+        var back = try decode(gpa, bytes, null);
+        defer back.deinit(gpa);
+        try testing.expectEqual(dir_place.DEFAULT_DEPTH, back.dir_spread_depth);
+    }
+    // The record every set formatted before the field carries: byte 39 was
+    // `reserved1 = 0` — it reads depth 0, the policy those sets ran under.
+    {
+        const old = try gpa.dupe(u8, bytes);
+        defer gpa.free(old);
+        old[39] = 0;
+        checksum.stamp(old, old.len - CHECKSUM_LEN);
+        var back = try decode(gpa, old, null);
+        defer back.deinit(gpa);
+        try testing.expectEqual(@as(u8, 0), back.dir_spread_depth);
+    }
+    // The ceiling: 254 decodes, 255 (the inode byte's saturation) refuses.
+    for ([_]u8{ 1, 10, dir_place.DEPTH_MAX }) |d| {
+        const edited = try gpa.dupe(u8, bytes);
+        defer gpa.free(edited);
+        edited[39] = d;
+        checksum.stamp(edited, edited.len - CHECKSUM_LEN);
+        var back = try decode(gpa, edited, null);
+        defer back.deinit(gpa);
+        try testing.expectEqual(d, back.dir_spread_depth);
+    }
+    {
+        const bad = try gpa.dupe(u8, bytes);
+        defer gpa.free(bad);
+        bad[39] = dir_place.SATURATED;
+        checksum.stamp(bad, bad.len - CHECKSUM_LEN);
+        var diag: Refusal = undefined;
+        try testing.expectError(error.BadDirSpreadDepth, decode(gpa, bad, &diag));
+        try testing.expect(diag == .bad_dir_spread_depth);
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try diag.write(&out.writer);
+        try testing.expect(std.mem.indexOf(u8, out.written(), "directory spread depth 255; the range is 0 … 254") != null);
+    }
+    // The verb's mutation.
+    var m = try setDirSpreadDepth(gpa, &cfg, 10);
+    defer m.next.deinit(gpa);
+    try testing.expectEqual(@as(u8, 10), m.next.dir_spread_depth);
+    try testing.expectEqual(cfg.config_generation + 1, m.next.config_generation);
+    try testing.expect(!m.lifecycle_bit_needed);
+    try testing.expectError(error.BadDirSpreadDepth, setDirSpreadDepth(gpa, &cfg, dir_place.SATURATED));
+    try testing.expectError(error.BadDirSpreadDepth, setDirSpreadDepth(gpa, &cfg, 1 << 20));
+    var zero = try setDirSpreadDepth(gpa, &cfg, 0);
+    defer zero.next.deinit(gpa);
+    try testing.expectEqual(@as(u8, 0), zero.next.dir_spread_depth);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.next.writeSummary(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "; dir spread depth 10\n") != null);
+    out.clearRetainingCapacity();
+    try zero.next.writeSummary(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "; dir spread depth 0 (directories follow their parent's member") != null);
+    out.clearRetainingCapacity();
+    try m.next.writeJson(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "\"dir_spread_depth\":10,") != null);
 }
 
 fn v4Path(a: u8, b: u8, c: u8, d: u8, port: u16) FabricPath {
@@ -1477,7 +1582,7 @@ test "the rotation window: openRekey sets the head flag and a 40 B tail that rou
     var same = try openRekey(gpa, &opened.next, nk);
     defer same.next.deinit(gpa);
     try testing.expectEqual(@as(u64, 3), same.next.config_generation);
-    var plaintext = try birth(gpa, test_set_uuid, .{ .compression = .none, .encryption = .none, .block_size = 1 << 20 }, null, &.{});
+    var plaintext = try birth(gpa, test_set_uuid, .{ .compression = .none, .encryption = .none, .block_size = 1 << 20 }, null, &.{}, dir_place.DEFAULT_DEPTH);
     defer plaintext.deinit(gpa);
     try testing.expectError(error.IllegalTransition, openRekey(gpa, &plaintext, nk));
     try testing.expectError(error.IllegalTransition, closeRekey(gpa, &cfg));
@@ -1523,14 +1628,14 @@ test "writeJson names exactly the registered volumes with their tags, states, de
         .{ .vol_tag = 0xfeed, .state = .active, .device_uuid = @splat(1), .added_ts = 0, .capacity_blocks = 10, .volume_len = 1 << 30, .uri = "/dev/d0" },
         .{ .vol_tag = 0xbeef, .state = .active, .device_uuid = @splat(2), .added_ts = 0, .capacity_blocks = 20, .volume_len = 2 << 30, .uri = "/dev/d1" },
     };
-    var cfg = try birth(std.testing.allocator, @splat(7), .{ .compression = .lz4, .block_size = 1 << 20 }, null, &vols);
+    var cfg = try birth(std.testing.allocator, @splat(7), .{ .compression = .lz4, .block_size = 1 << 20 }, null, &vols, dir_place.DEFAULT_DEPTH);
     defer cfg.deinit(std.testing.allocator);
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try cfg.writeJson(&out.writer);
     const text = out.written();
     try std.testing.expect(std.mem.startsWith(u8, text, "{\"set_uuid\":\"07070707-0707-0707-0707-070707070707\",\"config_generation\":1,\"block_size\":1048576,"));
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"compression\":\"lz4\",\"encryption\":\"none\",\"inline_max\":0,\"lifecycle_diverged\":true,\"data\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"compression\":\"lz4\",\"encryption\":\"none\",\"inline_max\":0,\"dir_spread_depth\":3,\"lifecycle_diverged\":true,\"data\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "{\"vol_tag\":\"vol-000000000000feed\",\"state\":\"active\",\"device_uuid\":\"01010101-0101-0101-0101-010101010101\",\"uri\":\"/dev/d0\",\"capacity_blocks\":10,\"volume_len\":1073741824}") != null);
     // `birth` stamps every member active; a later transition shows by name.
     try std.testing.expect(std.mem.indexOf(u8, text, "\"vol_tag\":\"vol-000000000000beef\",\"state\":\"active\"") != null);
@@ -1678,7 +1783,7 @@ test "fuzz: the set_config decoder is total on arbitrary bytes" {
 test "verbs: add-data (duplicates refused; the second member needs the bit), the lifecycle state machine (retired terminal, uri cleared), generation strictly monotone, capacity recomputed, the nonce floor never lowers" {
     const gpa = testing.allocator;
     const one = [_]DataVolume{.{ .vol_tag = 0xaaaa, .state = .active, .device_uuid = @splat(0xa), .added_ts = 1, .capacity_blocks = 100, .volume_len = 1 << 30, .uri = "/dev/a" }};
-    var c0 = try birth(gpa, test_set_uuid, .{ .compression = .zstd, .block_size = 1 << 20 }, null, &one);
+    var c0 = try birth(gpa, test_set_uuid, .{ .compression = .zstd, .block_size = 1 << 20 }, null, &one, dir_place.DEFAULT_DEPTH);
     defer c0.deinit(gpa);
     try testing.expect(!c0.lifecycleDiverged());
     // A mutation with no lifecycle change of its own: generation +1, no bit.

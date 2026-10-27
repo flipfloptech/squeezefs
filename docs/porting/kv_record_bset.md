@@ -210,6 +210,15 @@ The cookie payload IS the dentry key's `[8..16)` word — stable across concurre
 Total **57 B** = 1 + 6×4 + 4×8 (pinned by `inode_value_roundtrips_with_leading_version_varint`).
 Decode: varint → fixed fields via bounds-checked `Reader` → `finish()` refuses trailing bytes.
 
+**The port's value is 68 B** (`record.zig` `InodeValueWire`, format v4/v5, decision 0002 row 4: `mode,
+uid, gid, nlink, flags u32 ‖ rdev u64 ‖ size u64 ‖ atime, mtime, ctime i64 ns ‖ flags2 u32 ‖ reserved[4] = 0`).
+`flags2` bits 0..7 (2026-10-27, decision 0003 §BZ, charter §5.4) are a DIRECTORY's depth below the root
+— the root's children 1, each level one deeper, saturating at 255 = "deeper than any spread depth"; 0 on
+every file, on a stripe, and on a directory made before the field (whose children then record 255 and
+stay on its member). Set at mkdir from the parent's byte (`routing/dir_place.zig` `childDepth`);
+informational after birth — a rename keeps it, so a moved directory keeps its member and its subtree's
+placement. Bits 8..31 stay reserved.
+
 ### 2.2 Dentry value (`record.rs:746-793`)
 
 ```

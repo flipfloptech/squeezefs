@@ -14,7 +14,12 @@
 //!   SetNlink{ino, pre, post, ctime?}          nlink == pre (CAS)            │ nlink == post ∧ pre ≠ post = done │ else foreign
 //!   TouchCtime{ino, ctime}                    — (a monotone Δ)              │ — │ no record = foreign
 //!   MintInode{ino, mode, uid, gid, rdev}      no record                     │ present = done │ —
-//!   CreateInode{ino, …, size, ts_ns}          no record                     │ present = done (its record answered) │ —
+//!   CreateInode{ino, …, size, ts_ns, flags2}  no record                     │ present = done (its record answered) │ —
+//!
+//! `CreateInode.flags2` (a directory's depth byte, decision 0003 §BZ) rides
+//! the wire word's `ft_bits` — a word that kind never used; an intent
+//! recorded before the field reads 0 there (a directory whose depth is
+//! unknown: its subtree stays local, `dir_place.childDepth`).
 
 const std = @import("std");
 const verbs = @import("../../../wire/verbs.zig");
@@ -38,7 +43,7 @@ pub const Step = union(Kind) {
     set_nlink: struct { ino: u64, pre: u32, post: u32, ctime: ?u64 },
     touch_ctime: struct { ino: u64, ctime: u64 },
     mint_inode: struct { ino: u64, mode: u32, uid: u32, gid: u32, rdev: u32 },
-    create_inode: struct { ino: u64, mode: u32, uid: u32, gid: u32, rdev: u32, size: u64, ts_ns: u64 },
+    create_inode: struct { ino: u64, mode: u32, uid: u32, gid: u32, rdev: u32, size: u64, ts_ns: u64, flags2: u32 = 0 },
 
     /// The GLOBAL ino whose slot HOMES the step (the key ino of every
     /// record it stages): the parent of a dentry step, the inode else.
@@ -107,6 +112,7 @@ pub const Step = union(Kind) {
                 w.w1 = s.uid;
                 w.w2 = s.gid;
                 w.w3 = s.rdev;
+                w.ft_bits = s.flags2;
             },
         }
         assert(w.check() and intent.stepWordsAdmissible(w));
@@ -123,7 +129,7 @@ pub const Step = union(Kind) {
             .set_nlink => .{ .set_nlink = .{ .ino = w.a, .pre = w.w0, .post = w.w1, .ctime = if (w.flags & verbs.STEP_FLAG_HAS_CTIME != 0) w.c else null } },
             .touch_ctime => .{ .touch_ctime = .{ .ino = w.a, .ctime = w.c } },
             .mint_inode => .{ .mint_inode = .{ .ino = w.a, .mode = w.w0, .uid = w.w1, .gid = w.w2, .rdev = w.w3 } },
-            .create_inode => .{ .create_inode = .{ .ino = w.a, .mode = w.w0, .uid = w.w1, .gid = w.w2, .rdev = w.w3, .size = w.b, .ts_ns = w.c } },
+            .create_inode => .{ .create_inode = .{ .ino = w.a, .mode = w.w0, .uid = w.w1, .gid = w.w2, .rdev = w.w3, .size = w.b, .ts_ns = w.c, .flags2 = w.ft_bits } },
         };
     }
 
@@ -199,6 +205,8 @@ pub const CreateArgs = struct {
     rdev: u32 = 0,
     size: u64 = 0,
     now: u64,
+    /// The child's `flags2` (a directory's depth byte; 0 for a file).
+    flags2: u32 = 0,
 };
 
 /// `create`/`mkdir`/`mknod`/`symlink` under a FOREIGN directory: the
@@ -206,7 +214,7 @@ pub const CreateArgs = struct {
 /// ring), the shipped insert second.
 pub fn planCreate(a: CreateArgs) Plan {
     var p: Plan = .{ .op = .create };
-    p.push(.{ .create_inode = .{ .ino = a.child, .mode = a.mode, .uid = a.uid, .gid = a.gid, .rdev = a.rdev, .size = a.size, .ts_ns = a.now } });
+    p.push(.{ .create_inode = .{ .ino = a.child, .mode = a.mode, .uid = a.uid, .gid = a.gid, .rdev = a.rdev, .size = a.size, .ts_ns = a.now, .flags2 = a.flags2 } });
     p.push(.{ .insert_dentry = .{ .parent = a.parent, .name = a.name, .child = a.child, .ft_bits = a.mode & S.IFMT, .parent_update = parentUpdateFor(a.mode) } });
     return p;
 }

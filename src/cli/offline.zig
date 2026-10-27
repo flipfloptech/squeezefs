@@ -136,6 +136,7 @@ fn main(ctx: *Ctx) u8 {
         return ctx.failed("{s}: {s}", .{ ctx.meta_uri, w.buffered() });
     };
     defer cfg.deinit(gpa);
+    be.setDirSpreadDepth(cfg.dir_spread_depth);
     var set: Set = .{ .gpa = gpa, .io = io, .env = p.env, .paths = ctx.paths, .be = be, .cfg = &cfg, .plane = null, .fs = null, .uid = std.os.linux.geteuid(), .gid = std.os.linux.getegid() };
     if (!ctx.opts.with_plane) return ctx.body.run(ctx.body.ctx, &set);
 

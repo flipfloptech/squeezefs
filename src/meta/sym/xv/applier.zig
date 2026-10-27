@@ -334,7 +334,7 @@ pub fn Applier(comptime Store: type) type {
                     // "Never EEXIST": a replayed create answers the stored
                     // record — times = ts_ns, so every apply answers the same.
                     if (try self.readInodeKey(k)) |v| return .{ .status = .already_applied, .inode = v };
-                    const v: InodeValue = .{ .mode = s.mode, .uid = s.uid, .gid = s.gid, .nlink = if (economy.isDirMode(s.mode)) 2 else 1, .rdev = s.rdev, .size = s.size, .atime = s.ts_ns, .mtime = s.ts_ns, .ctime = s.ts_ns };
+                    const v: InodeValue = .{ .mode = s.mode, .uid = s.uid, .gid = s.gid, .nlink = if (economy.isDirMode(s.mode)) 2 else 1, .rdev = s.rdev, .size = s.size, .atime = s.ts_ns, .mtime = s.ts_ns, .ctime = s.ts_ns, .flags2 = s.flags2 };
                     try t.stagePut(key.TREE_INODES, &key.inodeKey(k), &v.encode());
                     return .{ .status = .applied, .inode = v };
                 },

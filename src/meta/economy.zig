@@ -407,6 +407,9 @@ pub const Create = struct {
     /// .parked_times`), never a record of this entry; strict mode and a
     /// directory child's nlink shift stage as before.
     park_parent_times: bool = false,
+    /// The child's `flags2` word: a directory's depth byte
+    /// (`record.INODE_DEPTH_MASK`, `InodeValue.flags2ForDepth`); 0 for a file.
+    flags2: u32 = 0,
 };
 
 pub const CreateOutcome = struct {
@@ -442,6 +445,7 @@ pub fn stageCreate(t: *tx.KvTx, p: Create) DentryError!CreateOutcome {
         .atime = p.now,
         .mtime = p.now,
         .ctime = p.now,
+        .flags2 = p.flags2,
     };
     try t.stagePut(key.TREE_INODES, &key.inodeKey(p.local_ino), &child.encode());
     _ = try stageDentryPut(t, p.name_key, p.parent, p.name, p.chain, p.global_ino, ftByte(mode));
@@ -1786,6 +1790,14 @@ test "rename (cross dir, regular file): both parents' Δtimes, both SHARED; a di
     try testing.expectEqual(@as(u32, 3), np.nlink);
     try testing.expectEqual(t_now, np.ctime);
     _ = try stagedDelta(&t2, 4, 60, record.DELTA_CTIME);
+    // The moved directory's record changes in ctime ALONE: its depth byte
+    // (decision 0003 §BZ — informational after birth) folds through unchanged,
+    // so a renamed directory keeps its member and its subtree's placement.
+    var moved = dirValue(2);
+    moved.flags2 = InodeValue.flags2ForDepth(4);
+    const moved_after = (try foldInode(&t2, 60, moved)).?;
+    try testing.expectEqual(@as(u8, 4), moved_after.dirDepth());
+    try testing.expectEqual(t_now, moved_after.ctime);
     try testing.expectEqual(dlm.Mode.exclusive, o2.guards.inodeMode(1).?);
     try testing.expectEqual(dlm.Mode.exclusive, o2.guards.inodeMode(2).?);
     try testing.expectEqual(dlm.Mode.exclusive, o2.guards.inodeMode(60).?);

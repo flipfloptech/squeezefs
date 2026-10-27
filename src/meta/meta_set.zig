@@ -55,6 +55,7 @@ const router = @import("../data/router.zig");
 
 const route_table = routing.route_table;
 const discovery = routing.discovery;
+const dir_place = routing.dir_place;
 const rstats = routing.stats.stats;
 
 comptime {
@@ -98,6 +99,12 @@ pub const OpenOptions = struct {
     join: ?backend.JoinOptions = null,
 };
 
+/// A member's mints by kind (`MetaSet.mints`).
+pub const VolumeMints = struct {
+    files: counters.ShardedCounter = .{},
+    dirs: counters.ShardedCounter = .{},
+};
+
 pub const MetaSet = struct {
     gpa: Allocator,
     io: Io,
@@ -109,7 +116,15 @@ pub const MetaSet = struct {
     route: route_table.Published,
     /// Per volume: the mint set (its first ≤ 64 hosted slots) and rotor.
     rotors: []router.MintRotor,
+    /// Per volume: the mints by kind (`.stats` `mint_files` / `mint_dirs`
+    /// under each member — a phase's share of the namespace per member).
+    mints: []VolumeMints,
     mint_rr: std.atomic.Value(u64) = .init(0),
+    /// The set's directory spread depth `D` (`routing/dir_place.zig`;
+    /// `set_config.dir_spread_depth`, read by the mount after the record
+    /// and stored here before the FUSE session arms; 0 until then and on
+    /// every harness that sets none = §AA.1's placement).
+    dir_spread_depth: std.atomic.Value(u8) = .init(0),
     /// The slot decision's tie-break cursor (apart from the member pick's).
     slot_rr: std.atomic.Value(u64) = .init(0),
     set_uuid: [16]u8,
@@ -257,6 +272,9 @@ pub const MetaSet = struct {
         }
         const rotors = try gpa.alloc(router.MintRotor, paths.len);
         errdefer gpa.free(rotors);
+        const mints = try gpa.alloc(VolumeMints, paths.len);
+        errdefer gpa.free(mints);
+        @memset(mints, .{});
         const initial = disc.table();
         for (rotors, 0..) |*r, v| {
             var buf: [router.MINT_SPREAD]u16 = undefined;
@@ -271,6 +289,7 @@ pub const MetaSet = struct {
             .pool_owned = opts.pool == null,
             .route = try route_table.Published.init(gpa, initial),
             .rotors = rotors,
+            .mints = mints,
             .set_uuid = disc.set_uuid,
             .hash_seed = disc.hash_seed,
             .name_key = .init(disc.hash_seed),
@@ -332,6 +351,7 @@ pub const MetaSet = struct {
         if (self.tee) |t| t.deinit();
         self.route.deinit();
         gpa.free(self.rotors);
+        gpa.free(self.mints);
         gpa.free(self.volumes);
         if (self.pool_owned) self.pool.deinit();
         gpa.destroy(self);
@@ -657,6 +677,19 @@ pub const MetaSet = struct {
 
     // ---- mints ----
 
+    /// The set's directory spread depth (`set_config.dir_spread_depth`):
+    /// the mount stores it once the record is read, before the FUSE
+    /// session arms; `.stats` `routing_dir_spread_depth` publishes it.
+    pub fn setDirSpreadDepth(self: *MetaSet, depth: u8) void {
+        std.debug.assert(dir_place.depthValid(depth));
+        self.dir_spread_depth.store(depth, .monotonic);
+        rstats.routing_dir_spread_depth.set(depth);
+    }
+
+    pub fn dirSpreadDepth(self: *const MetaSet) u8 {
+        return self.dir_spread_depth.load(.monotonic);
+    }
+
     /// The health vector the mint pick reads: `min(1000, free/total ×
     /// 1000)` from each member's allocator (a RAM word, never a probe);
     /// a FAILED member is disabled.
@@ -669,28 +702,38 @@ pub const MetaSet = struct {
         return out[0..self.volumes.len];
     }
 
-    /// Mint a child of `parent_eff` (charter §5.5 "Slot acquisition and
-    /// minting" first: a child of a directory this mount leases outside the
-    /// native slot stays on its parent's member — `Plane.homesChildren`,
-    /// decision 0003 §AA.1; else charter §5.4 "Mint spread": round-robin
-    /// over the healthy members. On an armed member the plane's decision —
-    /// `gather`, the parent's slot under the affinity ceiling, else the
-    /// rotor tree with the most headroom, an overflow rotor past the cap —
-    /// else the member's rotor). `prefer_parent` keeps the mint on the
-    /// parent's member (a rename's whiteout: the op stays on two members at
-    /// most). The child's slot takes its door token at the commit (the
-    /// record names it). Returns the child's EFFECTIVE (key) ino;
-    /// `globalIno` inverts it. `caller` is the minting stream (the FUSE
-    /// request's pid; 0 = none: the calling thread) whose mint window a
-    /// rotor mint rides (decision 0003 §BV).
-    pub fn allocateIno(self: *MetaSet, parent_eff: u64, prefer_parent: bool, gather: bool, caller: u32) Error!u64 {
+    /// Mint a child of `parent_eff`. The member first (charter §5.4 "Mint
+    /// spread", decision 0003 §AA.1 and §BZ — `dir_place.homesOnParent`):
+    /// a child of a directory this mount leases outside the native slot
+    /// stays on its parent's member (`Plane.homesChildren`) UNLESS it is a
+    /// directory at depth ≤ the set's spread depth, which — like every
+    /// child of `/` and of a foreign directory — takes the health-weighted
+    /// round-robin over the members (`router.pickMintVolume`). Then the
+    /// slot on that member: on an armed plane its decision — `gather`, the
+    /// parent's slot under the affinity ceiling, else the rotor tree with
+    /// the most headroom, an overflow rotor past the cap — else the
+    /// member's rotor. `prefer_parent` keeps the mint on the parent's
+    /// member (a rename's whiteout: the op stays on two members at most).
+    /// `child_depth` is the directory depth the child will record (0 = a
+    /// file, a stripe; `dir_place.childDepth`). The child's slot takes its
+    /// door token at the commit (the record names it). Returns the child's
+    /// EFFECTIVE (key) ino; `globalIno` inverts it. `caller` is the minting
+    /// stream (the FUSE request's pid; 0 = none: the calling thread) whose
+    /// mint window a rotor mint rides (decision 0003 §BV).
+    pub fn allocateIno(self: *MetaSet, parent_eff: u64, prefer_parent: bool, gather: bool, caller: u32, child_depth: u8) Error!u64 {
         if (self.posture == .reader) return error.PartitionRefused;
         const parent_v = self.route.volumeOfEffective(parent_eff);
         const parent_slot = route_table.slotOfEffective(parent_eff);
-        const home = prefer_parent or self.volumes.len == 1 or self.volumes[parent_v].slots.homesChildren(parent_slot);
+        const is_dir = child_depth != 0;
+        const home = prefer_parent or self.volumes.len == 1 or (self.volumes[parent_v].slots.homesChildren(parent_slot) and !dir_place.spreads(child_depth, self.dirSpreadDepth()));
         var hb: [route_table.MAX_VOLUMES]?u32 = undefined;
         const v: route_table.VolumeIndex = if (home) parent_v else @intCast(router.pickMintVolume(parent_v, self.healths(hb[0..self.volumes.len]), &self.mint_rr));
         if (v != parent_v) rstats.routing_mint_volume_picks.inc();
+        if (is_dir) {
+            if (!home) rstats.routing_dir_place_rotor.inc();
+            if (v != parent_v) rstats.routing_dir_place_remote.inc() else rstats.routing_dir_place_local.inc();
+            self.mints[v].dirs.inc();
+        } else self.mints[v].files.inc();
         const plane = self.volumes[v].slots;
         const minter = routing_slots.mint_window.minterToken(caller);
         var burns: u64 = 0;
@@ -937,7 +980,7 @@ pub const MetaSet = struct {
             // images = allocated extents less the retirements awaiting their
             // covering barrier.
             const census = be.residentNodeCensus();
-            try w.print(",\"heap_total_extents\":{d},\"heap_free_extents\":{d},\"heap_pending_free\":{d},\"resident_leaves\":{d},\"resident_interior\":{d}", .{ be.alloc.totalExtents(), be.alloc.freeExtents(), be.alloc.pendingCount(), census.leaves, census.interior });
+            try w.print(",\"heap_total_extents\":{d},\"heap_free_extents\":{d},\"heap_pending_free\":{d},\"resident_leaves\":{d},\"resident_interior\":{d},\"mint_files\":{d},\"mint_dirs\":{d}", .{ be.alloc.totalExtents(), be.alloc.freeExtents(), be.alloc.pendingCount(), census.leaves, census.interior, self.mints[i].files.load(), self.mints[i].dirs.load() });
             try w.writeAll(",\"checkpointer\":");
             try counters.writeFieldsJson(&be.cp, w);
             if (be.guard) |g| {
@@ -1070,13 +1113,17 @@ pub fn createFile(set: *MetaSet, parent_global: u64, name: []const u8) !u64 {
     return createChild(set, parent_global, name, economy.S.IFREG | 0o644);
 }
 
-/// `createFile` for any mode (a directory parent for the mint-placement rows).
+/// `createFile` for any mode (a directory parent for the mint-placement
+/// rows): a directory child records its depth off the parent's record,
+/// exactly as `kv_fs.createChildAt` does.
 pub fn createChild(set: *MetaSet, parent_global: u64, name: []const u8, mode: u32) !u64 {
     const parent = set.effectiveIno(parent_global);
     const pv_bytes = (try set.lookup(set.gpa, key.TREE_INODES, &key.inodeKey(parent))) orelse return error.ParentMissing;
     defer set.gpa.free(pv_bytes);
     const pv = try record.InodeValue.decode(pv_bytes);
-    const child = try set.allocateIno(parent, false, false, 0);
+    const depth: u8 = if (economy.isDirMode(mode)) dir_place.childDepth(parent_global == inos.ROOT_INO, pv.dirDepth()) else 0;
+    const flags2 = record.InodeValue.flags2ForDepth(depth);
+    const child = try set.allocateIno(parent, false, false, 0, depth);
     const global = set.globalIno(child);
     const parent_slot = route_table.slotOfEffective(parent);
     if (set.volumeIndexOfSlot(parent_slot) != set.volumeIndexOfSlot(route_table.slotOf(global))) {
@@ -1084,7 +1131,7 @@ pub fn createChild(set: *MetaSet, parent_global: u64, name: []const u8, mode: u3
         defer locks.deinit();
         const bound = try xv.set_bind.Bound.create(set.gpa, set.io, set, &locks, set.env);
         defer bound.destroy(set.gpa);
-        const plan = xv.steps.planCreate(.{ .parent = parent_global, .name = name, .child = global, .mode = mode, .uid = 0, .gid = 0, .now = 1000 });
+        const plan = xv.steps.planCreate(.{ .parent = parent_global, .name = name, .child = global, .mode = mode, .uid = 0, .gid = 0, .now = 1000, .flags2 = flags2 });
         const scope = bound.plane.mintScope();
         var held = try bound.plane.acquirePlanGuards(&plan, scope, false);
         defer held.release(set.gpa);
@@ -1093,7 +1140,7 @@ pub fn createChild(set: *MetaSet, parent_global: u64, name: []const u8, mode: u3
         return global;
     }
     const t = try set.begin(@src());
-    _ = economy.stageCreate(t, .{ .name_key = set.nameKey(), .now = 1000, .parent = parent, .parent_value = pv, .name = name, .mode = mode, .uid = 0, .gid = 0, .local_ino = child, .global_ino = global }) catch |e| {
+    _ = economy.stageCreate(t, .{ .name_key = set.nameKey(), .now = 1000, .parent = parent, .parent_value = pv, .name = name, .mode = mode, .uid = 0, .gid = 0, .local_ino = child, .global_ino = global, .flags2 = flags2 }) catch |e| {
         set.abandon(t);
         return e;
     };
@@ -1179,25 +1226,25 @@ test "the mint window follows its CALLER, not the thread (decision 0003 §BV): a
     }.of;
     // A lone caller: no window, the per-mint spread (two mints, two trees).
     const g0 = routing_slots.mint_window.stats.mint_window_grants.load();
-    const l0 = slotOfEff(set, try set.allocateIno(root, false, false, 900));
-    const l1 = slotOfEff(set, try set.allocateIno(root, false, false, 900));
+    const l0 = slotOfEff(set, try set.allocateIno(root, false, false, 900, 0));
+    const l1 = slotOfEff(set, try set.allocateIno(root, false, false, 900, 0));
     try testing.expect(l0 != l1);
     // A one-off caller beside it (a `mkdir`): it takes a window of its own
     // (its mint off the creator's trees) and never makes the creator
     // concurrent — the creator's spread goes on.
-    const off = slotOfEff(set, try set.allocateIno(root, false, false, 7));
+    const off = slotOfEff(set, try set.allocateIno(root, false, false, 7, 0));
     try testing.expectEqual(g0 + 1, routing_slots.mint_window.stats.mint_window_grants.load());
-    const l2 = slotOfEff(set, try set.allocateIno(root, false, false, 900));
+    const l2 = slotOfEff(set, try set.allocateIno(root, false, false, 900, 0));
     try testing.expect(l2 != l1 and l2 != off);
     try testing.expectEqual(g0 + 1, routing_slots.mint_window.stats.mint_window_grants.load());
     // A second caller: its first decision opens its window beside the
     // active creator, on a tree no window claims.
-    const t2 = slotOfEff(set, try set.allocateIno(root, false, false, 1002));
+    const t2 = slotOfEff(set, try set.allocateIno(root, false, false, 1002, 0));
     try testing.expectEqual(g0 + 2, routing_slots.mint_window.stats.mint_window_grants.load());
     try testing.expect(t2 != off);
     // The creator's census skips both windows' trees.
     for (0..4) |_| {
-        const l = slotOfEff(set, try set.allocateIno(root, false, false, 900));
+        const l = slotOfEff(set, try set.allocateIno(root, false, false, 900, 0));
         try testing.expect(l != t2 and l != off);
     }
     // Caller 1002 from another thread (the rank moved CPUs) stays in its
@@ -1205,7 +1252,7 @@ test "the mint window follows its CALLER, not the thread (decision 0003 §BV): a
     // worker serves) takes a tree of its own and stays there.
     const Other = struct {
         fn run(st: *MetaSet, r: u64, out: *[8]u16, err: *?anyerror) void {
-            for (out) |*o| o.* = route_table.slotOf(st.globalIno(st.allocateIno(r, false, false, 1002) catch |e| {
+            for (out) |*o| o.* = route_table.slotOf(st.globalIno(st.allocateIno(r, false, false, 1002, 0) catch |e| {
                 err.* = e;
                 return;
             }));
@@ -1217,9 +1264,9 @@ test "the mint window follows its CALLER, not the thread (decision 0003 §BV): a
     th.join();
     if (err) |e| return e;
     for (moved) |sl| try testing.expectEqual(t2, sl);
-    const t3 = slotOfEff(set, try set.allocateIno(root, false, false, 1003));
+    const t3 = slotOfEff(set, try set.allocateIno(root, false, false, 1003, 0));
     try testing.expect(t3 != t2 and t3 != off);
-    for (0..8) |_| try testing.expectEqual(t3, slotOfEff(set, try set.allocateIno(root, false, false, 1003)));
+    for (0..8) |_| try testing.expectEqual(t3, slotOfEff(set, try set.allocateIno(root, false, false, 1003, 0)));
     try testing.expectEqual(g0 + 3, routing_slots.mint_window.stats.mint_window_grants.load());
 }
 
@@ -1333,6 +1380,137 @@ test "a child of a directory this mount leases outside the native slot mints on 
         }
     }
     try testing.expectEqual(minted0, xv.intent.stats.xv_cross_owner_intents_minted.load());
+}
+
+fn depthOf(set: *MetaSet, global: u64) !u8 {
+    const bytes = (try set.lookup(testing.allocator, key.TREE_INODES, &key.inodeKey(set.effectiveIno(global)))) orelse return error.Absent;
+    defer testing.allocator.free(bytes);
+    return (try record.InodeValue.decode(bytes)).dirDepth();
+}
+
+test "mdtest's shape on a two-member set (decision 0003 §BZ; RED on §AA.1 alone — 100 % on one member): `md/#test-dir.0/mdtest_tree.N.0` at the set's default depth 3 puts the 32 rank directories 16/16 over the members; each rank's files and directories (depth 4) stay on ITS member — 0 intents over the timed phases; every record carries its depth; at depth 0 (the control arm) the whole tree sits on `md`'s member" {
+    const gpa = testing.allocator;
+    const s = try TestSet.create(gpa, "mdtest-shape", 2);
+    defer s.destroy();
+    const set = try s.open();
+    defer set.close();
+    var nb: [32]u8 = undefined;
+    const ranks = 32;
+    // The default depth, as a `format` without the flag stamps it.
+    set.setDirSpreadDepth(dir_place.DEFAULT_DEPTH);
+    try testing.expectEqual(@as(u8, 3), set.dirSpreadDepth());
+    const md = try createChild(set, inos.ROOT_INO, "md", economy.S.IFDIR | 0o755);
+    const tdir = try createChild(set, md, "#test-dir.0", economy.S.IFDIR | 0o755);
+    try testing.expectEqual(@as(u8, 1), try depthOf(set, md));
+    try testing.expectEqual(@as(u8, 2), try depthOf(set, tdir));
+    var rank_dirs: [ranks]u64 = undefined;
+    var on: [2]u32 = @splat(0);
+    const rotor0 = rstats.routing_dir_place_rotor.load();
+    for (&rank_dirs, 0..) |*d, r| {
+        d.* = try createChild(set, tdir, try std.fmt.bufPrint(&nb, "mdtest_tree.{d}.0", .{r}), economy.S.IFDIR | 0o755);
+        try testing.expectEqual(@as(u8, 3), try depthOf(set, d.*));
+        on[set.volumeIndexOfSlot(route_table.slotOf(d.*))] += 1;
+    }
+    // The setup spreads: the round-robin over two equal members alternates.
+    try testing.expectEqual(@as(u32, ranks / 2), on[0]);
+    try testing.expectEqual(@as(u32, ranks / 2), on[1]);
+    try testing.expectEqual(rotor0 + ranks, rstats.routing_dir_place_rotor.load());
+    // The timed phases: every rank's children on the rank's member, no intent.
+    const minted0 = xv.intent.stats.xv_cross_owner_intents_minted.load();
+    const remote0 = rstats.routing_dir_place_remote.load();
+    const local0 = rstats.routing_dir_place_local.load();
+    var per_member_children: [2]u32 = @splat(0);
+    for (rank_dirs, 0..) |d, r| {
+        const home = set.volumeIndexOfSlot(route_table.slotOf(d));
+        for (0..4) |i| {
+            const sub = try createChild(set, d, try std.fmt.bufPrint(&nb, "dir.mdtest.{d}.{d}", .{ r, i }), economy.S.IFDIR | 0o755);
+            try testing.expectEqual(home, set.volumeIndexOfSlot(route_table.slotOf(sub)));
+            try testing.expectEqual(@as(u8, 4), try depthOf(set, sub));
+            const f = try createFile(set, d, try std.fmt.bufPrint(&nb, "file.mdtest.{d}.{d}", .{ r, i }));
+            try testing.expectEqual(home, set.volumeIndexOfSlot(route_table.slotOf(f)));
+            try testing.expectEqual(@as(u8, 0), try depthOf(set, f));
+            per_member_children[home] += 2;
+        }
+    }
+    try testing.expectEqual(minted0, xv.intent.stats.xv_cross_owner_intents_minted.load());
+    try testing.expectEqual(remote0, rstats.routing_dir_place_remote.load());
+    try testing.expectEqual(local0 + ranks * 4, rstats.routing_dir_place_local.load());
+    try testing.expectEqual(per_member_children[0], per_member_children[1]);
+    try testing.expectEqual(set.mints[0].dirs.load() + set.mints[1].dirs.load(), @as(u64, 2 + ranks + ranks * 4));
+    // The control arm (`--dir-spread-depth 0` = §AA.1): a second tree
+    // sits whole on its top directory's member.
+    set.setDirSpreadDepth(0);
+    const md0 = try createChild(set, inos.ROOT_INO, "md0", economy.S.IFDIR | 0o755);
+    const t0 = try createChild(set, md0, "#test-dir.0", economy.S.IFDIR | 0o755);
+    const home0 = set.volumeIndexOfSlot(route_table.slotOf(md0));
+    try testing.expectEqual(home0, set.volumeIndexOfSlot(route_table.slotOf(t0)));
+    for (0..ranks) |r| {
+        const d = try createChild(set, t0, try std.fmt.bufPrint(&nb, "mdtest_tree.{d}.0", .{r}), economy.S.IFDIR | 0o755);
+        try testing.expectEqual(home0, set.volumeIndexOfSlot(route_table.slotOf(d)));
+        // The depth is recorded whatever D is: a later `set-dir-spread-depth` reads it.
+        try testing.expectEqual(@as(u8, 3), try depthOf(set, d));
+    }
+}
+
+test "the spread depth is the set's dial (decision 0003 §BZ): raised 3 → 10 on a live tree, new directories at depths 4 … 10 take the rotor and depth 11 stays local; a directory made before the field (depth byte 0) roots a subtree that never spreads (its children record 255); a saturated chain stays saturated" {
+    const gpa = testing.allocator;
+    const s = try TestSet.create(gpa, "spread-dial", 2);
+    defer s.destroy();
+    const set = try s.open();
+    defer set.close();
+    var nb: [32]u8 = undefined;
+    set.setDirSpreadDepth(3);
+    // A chain /l1/l2/…/l12 at D = 3: levels 4 … 12 on level 3's member.
+    var chain: [12]u64 = undefined;
+    var parent: u64 = inos.ROOT_INO;
+    for (&chain, 1..) |*c, lvl| {
+        c.* = try createChild(set, parent, try std.fmt.bufPrint(&nb, "l{d}", .{lvl}), economy.S.IFDIR | 0o755);
+        try testing.expectEqual(@as(u8, @intCast(lvl)), try depthOf(set, c.*));
+        if (lvl > 3) try testing.expectEqual(set.volumeIndexOfSlot(route_table.slotOf(chain[2])), set.volumeIndexOfSlot(route_table.slotOf(c.*)));
+        parent = c.*;
+    }
+    // The dial turned to 10 (the verb's effect at the next mount): new
+    // siblings at depths 4 … 10 alternate members, 11 and 12 stay put.
+    set.setDirSpreadDepth(10);
+    for (chain[2..], 3..) |p, parent_lvl| {
+        const lvl = parent_lvl + 1;
+        var on: [2]u32 = @splat(0);
+        for (0..4) |i| {
+            const d = try createChild(set, p, try std.fmt.bufPrint(&nb, "n{d}.{d}", .{ lvl, i }), economy.S.IFDIR | 0o755);
+            try testing.expectEqual(@as(u8, @intCast(lvl)), try depthOf(set, d));
+            on[set.volumeIndexOfSlot(route_table.slotOf(d))] += 1;
+        }
+        const parent_home = set.volumeIndexOfSlot(route_table.slotOf(p));
+        if (lvl <= 10) {
+            try testing.expectEqual(@as(u32, 2), on[0]);
+            try testing.expectEqual(@as(u32, 2), on[1]);
+        } else {
+            try testing.expectEqual(@as(u32, 4), on[parent_home]);
+        }
+    }
+    // The old homes stand: the chain's records are what they were.
+    for (chain, 1..) |c, lvl| try testing.expectEqual(@as(u8, @intCast(lvl)), try depthOf(set, c));
+    // A legacy directory (no depth byte — made before the field): its
+    // children record SATURATED and sit on its member whatever D is.
+    const legacy_local = try set.allocateIno(set.effectiveIno(chain[0]), true, false, 0, 0);
+    const legacy = set.globalIno(legacy_local);
+    {
+        const t = try set.begin(@src());
+        const pv_bytes = (try set.lookup(gpa, key.TREE_INODES, &key.inodeKey(set.effectiveIno(chain[0])))).?;
+        defer gpa.free(pv_bytes);
+        const pv = try record.InodeValue.decode(pv_bytes);
+        _ = try economy.stageCreate(t, .{ .name_key = set.nameKey(), .now = 1000, .parent = set.effectiveIno(chain[0]), .parent_value = pv, .name = "legacy", .mode = economy.S.IFDIR | 0o755, .uid = 0, .gid = 0, .local_ino = legacy_local, .global_ino = legacy });
+        try set.commit(t);
+    }
+    try testing.expectEqual(@as(u8, 0), try depthOf(set, legacy));
+    const legacy_home = set.volumeIndexOfSlot(route_table.slotOf(legacy));
+    set.setDirSpreadDepth(dir_place.DEPTH_MAX);
+    var under = legacy;
+    for (0..3) |i| {
+        under = try createChild(set, under, try std.fmt.bufPrint(&nb, "u{d}", .{i}), economy.S.IFDIR | 0o755);
+        try testing.expectEqual(dir_place.SATURATED, try depthOf(set, under));
+        try testing.expectEqual(legacy_home, set.volumeIndexOfSlot(route_table.slotOf(under)));
+    }
 }
 
 test "a refs range always merges every slot tree: one volume's references owned by inos in three slots on two members come back together, in key order, through the volume range and through one block's range" {

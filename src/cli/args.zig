@@ -15,6 +15,7 @@ const fuzzkit = @import("../core/fuzzkit.zig");
 const knobs = @import("../core/knobs.zig");
 const meta_geometry = @import("../meta/geometry.zig");
 const transform = @import("../data/transform.zig");
+const dir_place = @import("../meta/routing/dir_place.zig");
 const set_config = @import("../data/set_config.zig");
 const uri = @import("uri.zig");
 
@@ -54,6 +55,11 @@ pub const Format = struct {
     encryption: transform.Encryption = .none,
     /// `--encrypt-key PATH|-`: the operator key file (stdin as `-`).
     encrypt_key: ?[]const u8 = null,
+    /// `--dir-spread-depth N` (`0 … dir_place.DEPTH_MAX`): the set's
+    /// directory spread depth (charter §5.4; decision 0003 §BZ) — the
+    /// Lustre `lfs setdirstripe -D -i -1 --max-inherit-rr=N` of this
+    /// format; `config set-dir-spread-depth` changes it later.
+    dir_spread_depth: u8 = dir_place.DEFAULT_DEPTH,
 };
 
 pub const Mount = struct {
@@ -202,6 +208,9 @@ pub const Config = union(enum) {
     /// inside `set_config` — one subsystem, one or more paths).
     set_fabric_endpoints: struct { target: Target, specs: RepeatList },
     get_fabric_endpoints: struct { target: Target, json: bool = false },
+    /// `set-dir-spread-depth N <sqmeta-uri>`: the set's directory spread
+    /// depth for every directory made from the next mount on.
+    set_dir_spread_depth: struct { target: Target, depth: u8 },
 };
 
 pub const ClaimClear = struct {
@@ -402,6 +411,7 @@ pub const Refusal = union(enum) {
     daemon_without_log_file,
     /// `--block-size` outside the power-of-two window.
     bad_block_size: u64,
+    bad_dir_spread_depth: []const u8,
     bad_compression: []const u8,
     bad_encryption: []const u8,
     /// `--encrypt` names an algorithm but no `--encrypt-key` was given.
@@ -457,6 +467,7 @@ pub const Refusal = union(enum) {
             .log_file_without_daemon => try w.writeAll("mount: --log-file requires --daemon (a foreground mount logs to stderr)"),
             .daemon_without_log_file => try w.writeAll("mount: --daemon requires --log-file PATH (a detached daemon must log somewhere; the invoking shell's streams are released at ready)"),
             .bad_block_size => |b| try w.print("format: --block-size {d} is not a power of two in [{d}, {d}]", .{ b, transform.MIN_BLOCK_SIZE, transform.MAX_BLOCK_SIZE }),
+            .bad_dir_spread_depth => |w0| try w.print("config set-dir-spread-depth: '{s}' is not a depth in 0 … {d}", .{ w0, dir_place.DEPTH_MAX }),
             .bad_compression => |c| try w.print("format: --compress '{s}' is not one of none|lz4|zstd", .{c}),
             .bad_encryption => |e| try w.print("format: --encrypt '{s}' is not one of none|aes-256-gcm|chacha20-poly1305", .{e}),
             .encrypt_without_key => try w.writeAll("format: --encrypt names an algorithm but no key was given — pass --encrypt-key <path|-> (≥ 32 bytes of key material, mode 0600)"),
@@ -500,7 +511,7 @@ pub const Error = error{Refused};
 pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
     const all =
         \\usage: squeezefs <verb> [flags] …
-        \\  squeezefs format [--single-writer] [--meta-node-kib N] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--force] sqmeta://<path> [sqdata://<path>…]
+        \\  squeezefs format [--single-writer] [--meta-node-kib N] [--meta-journal-mb N] [--dir-spread-depth N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--force] sqmeta://<path> [sqdata://<path>…]
         \\  squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] [--encrypt-key PATH|-] sqmeta://<path> <mountpoint>
         \\  squeezefs umount [--lazy|-l] <mountpoint>
         \\  squeezefs status sqmeta://<path>|<mountpoint>
@@ -509,6 +520,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs clone sqmeta://<path>|<mountpoint> /src/file /dest/file
         \\  squeezefs tune [--apply]
         \\  squeezefs config show [--json] sqmeta://<path>|<mountpoint>
+        \\  squeezefs config set-dir-spread-depth N sqmeta://<path>
         \\  squeezefs claim clear sqmeta://<path>
         \\  squeezefs appenders [--json] sqmeta://<path>
         \\  squeezefs appender clear sqmeta://<path> <id>
@@ -555,7 +567,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
     ;
     const v = verb orelse return all;
     return switch (v) {
-        .format => "usage: squeezefs format [--single-writer] [--meta-node-kib 64|128|256|512|1024] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--force] sqmeta://<path> [sqdata://<path>…]\n",
+        .format => "usage: squeezefs format [--single-writer] [--meta-node-kib 64|128|256|512|1024] [--meta-journal-mb N] [--dir-spread-depth 0…254] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--force] sqmeta://<path> [sqdata://<path>…]\n",
         .mount => "usage: squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] [--encrypt-key PATH|-] sqmeta://<path> <mountpoint>\n",
         .nvmeof => "usage: squeezefs nvmeof share [--subnqn NQN] [--transport tcp|loop] [--ip ADDR]… [--port N] [--allow-host NQN]… [--create-size SIZE] [--ns-uuid UUID] <backing>\n       squeezefs nvmeof unshare <subnqn>\n       squeezefs nvmeof list [--json]\n       squeezefs nvmeof status [--json]\n       squeezefs nvmeof restore\n       squeezefs nvmeof adopt <subnqn>\n       squeezefs nvmeof target status [--json] | setup | systemd-unit | stop\n       squeezefs nvmeof connect [--transport tcp|loop] [--ip ADDR] [--port N] [--hostnqn NQN --hostid UUID] [--host-traddr ADDR] [--host-iface IF] [--nr-io-queues N] [--ns-uuid UUID] <subnqn>\n       squeezefs nvmeof disconnect [--identity-only [--hostnqn NQN --hostid UUID]] <subnqn>\n       squeezefs nvmeof resv-report [--json] [--pr-matrix --peer <dev> [--force]] <dev>\n",
         .storage => "usage: squeezefs storage list [--json]\n       squeezefs storage validate <path>\n",
@@ -567,7 +579,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .df => "usage: squeezefs df [--json] sqmeta://<path>|<mountpoint>\n",
         .clone => "usage: squeezefs clone sqmeta://<path>|<mountpoint> /src/file /dest/file\n",
         .tune => "usage: squeezefs tune [--apply]\n",
-        .config => "usage: squeezefs config show [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-fabric-endpoints sqmeta://<path> vol-<tag>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>[,<path>…]…\n       squeezefs config get-fabric-endpoints [--json] sqmeta://<path>|<mountpoint>\n",
+        .config => "usage: squeezefs config show [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-fabric-endpoints sqmeta://<path> vol-<tag>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>[,<path>…]…\n       squeezefs config get-fabric-endpoints [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-dir-spread-depth 0…254 sqmeta://<path>   (directories at depth ≤ N round-robin over the members; 0 = never below /'s children; the set must be unmounted; takes effect at the next mount)\n",
         .claim_clear => "usage: squeezefs claim clear sqmeta://<path>\n",
         .appenders => "usage: squeezefs appenders [--json] sqmeta://<path>\n",
         .appender_clear => "usage: squeezefs appender clear sqmeta://<path> <id>\n",
@@ -1250,6 +1262,32 @@ fn parseConfig(words: []const []const u8, diag: *Refusal) Error!Verb {
         }
         return .{ .config = .{ .set_fabric_endpoints = .{ .target = pos[0], .specs = specs } } };
     }
+    if (std.mem.eql(u8, sub, "set-dir-spread-depth")) {
+        var c: Cursor = .{ .verb = "config set-dir-spread-depth", .words = rest, .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        const pos = c.pos();
+        if (pos.len < 1) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the depth (0 … 254)" } };
+            return error.Refused;
+        }
+        const depth = switch (knobs.parseIntIn(u8, "depth", pos[0], 0, dir_place.DEPTH_MAX)) {
+            .value => |v| v,
+            .absent, .invalid => {
+                diag.* = .{ .bad_dir_spread_depth = pos[0] };
+                return error.Refused;
+            },
+        };
+        if (pos.len < 2) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the sqmeta:// volume" } };
+            return error.Refused;
+        }
+        try checkUri(.meta, pos[1], diag);
+        if (pos.len > 2) {
+            diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = pos[2] } };
+            return error.Refused;
+        }
+        return .{ .config = .{ .set_dir_spread_depth = .{ .target = pos[1], .depth = depth } } };
+    }
     if (std.mem.eql(u8, sub, "get-fabric-endpoints")) {
         var c: Cursor = .{ .verb = "config get-fabric-endpoints", .words = rest, .diag = diag };
         var json = false;
@@ -1816,6 +1854,8 @@ fn parseFormat(words: []const []const u8, diag: *Refusal) Error!Verb {
             out.node_size = nk.bytes;
         } else if (std.mem.eql(u8, f.name, "--meta-journal-mb")) {
             out.journal_len = @as(u64, try parseIntFlag(&c, f, u32, JOURNAL_MB_MIN, JOURNAL_MB_MAX)) << 20;
+        } else if (std.mem.eql(u8, f.name, "--dir-spread-depth")) {
+            out.dir_spread_depth = try parseIntFlag(&c, f, u8, 0, dir_place.DEPTH_MAX);
         } else if (std.mem.eql(u8, f.name, "--block-size")) {
             const b = try parseIntFlag(&c, f, u64, transform.MIN_BLOCK_SIZE, transform.MAX_BLOCK_SIZE);
             if (!transform.blockSizeValid(b)) {
@@ -2013,9 +2053,46 @@ test "format: flags in any order, --k=v and --k v, --meta-node-kib validated aga
     try testing.expectEqualStrings("sqdata:///dev/b,/dev/c", v.format.data_uris[1]);
     const plain = try parse(av(&.{ "format", "sqmeta:///dev/nvme0n1" }), &d);
     try testing.expect(!plain.format.force and plain.format.node_size == null and plain.format.journal_len == null and plain.format.data_uris.len == 0);
+    try testing.expectEqual(dir_place.DEFAULT_DEPTH, plain.format.dir_spread_depth);
     // `--` ends the flags.
     const dashed = try parse(av(&.{ "format", "--", "sqmeta:///x" }), &d);
     try testing.expectEqualStrings("sqmeta:///x", dashed.format.meta_uri);
+}
+
+test "the directory spread depth (decision 0003 §BZ): `format --dir-spread-depth` 0, 10 and the ceiling 254 parse, 255 and junk refuse; `config set-dir-spread-depth N sqmeta://…` parses, refuses a bad depth, a missing URI and an extra word" {
+    var d: Refusal = undefined;
+    var buf: [512]u8 = undefined;
+    inline for (.{ "0", "10", "254" }, [_]u8{ 0, 10, dir_place.DEPTH_MAX }) |word, want| {
+        const v = try parse(av(&.{ "format", "--dir-spread-depth", word, "sqmeta:///x" }), &d);
+        try testing.expectEqual(want, v.format.dir_spread_depth);
+    }
+    const eq = try parse(av(&.{ "format", "--dir-spread-depth=10", "sqmeta:///x" }), &d);
+    try testing.expectEqual(@as(u8, 10), eq.format.dir_spread_depth);
+    var r = try refusal(av(&.{ "format", "--dir-spread-depth", "255", "sqmeta:///x" }));
+    try testing.expect(r == .bad_int);
+    try testing.expect(std.mem.indexOf(u8, text(&buf, r), "0..=254") != null);
+    r = try refusal(av(&.{ "format", "--dir-spread-depth", "deep", "sqmeta:///x" }));
+    try testing.expect(r == .bad_int);
+    const c = try parse(av(&.{ "config", "set-dir-spread-depth", "10", "sqmeta:///build/tmp/m.img" }), &d);
+    try testing.expectEqual(@as(u8, 10), c.config.set_dir_spread_depth.depth);
+    try testing.expectEqualStrings("sqmeta:///build/tmp/m.img", c.config.set_dir_spread_depth.target);
+    const zero = try parse(av(&.{ "config", "set-dir-spread-depth", "0", "sqmeta:///m" }), &d);
+    try testing.expectEqual(@as(u8, 0), zero.config.set_dir_spread_depth.depth);
+    r = try refusal(av(&.{ "config", "set-dir-spread-depth", "255", "sqmeta:///m" }));
+    try testing.expect(r == .bad_dir_spread_depth);
+    try testing.expect(std.mem.indexOf(u8, text(&buf, r), "'255' is not a depth in 0 … 254") != null);
+    r = try refusal(av(&.{ "config", "set-dir-spread-depth", "three", "sqmeta:///m" }));
+    try testing.expect(r == .bad_dir_spread_depth);
+    r = try refusal(av(&.{ "config", "set-dir-spread-depth", "3" }));
+    try testing.expect(r == .missing_positional);
+    r = try refusal(av(&.{ "config", "set-dir-spread-depth" }));
+    try testing.expect(r == .missing_positional);
+    r = try refusal(av(&.{ "config", "set-dir-spread-depth", "3", "sqmeta:///m", "extra" }));
+    try testing.expect(r == .extra_positional);
+    r = try refusal(av(&.{ "config", "set-dir-spread-depth", "3", "/mnt/x" }));
+    try testing.expect(r == .bad_uri);
+    try testing.expect(std.mem.indexOf(u8, usage(.config), "set-dir-spread-depth 0…254") != null);
+    try testing.expect(std.mem.indexOf(u8, usage(.format), "--dir-spread-depth 0…254") != null);
 }
 
 test "format refusals: a sixth node size, an out-of-range journal, junk integers, two metadata URIs, a relative path, a data URI before the metadata one or followed by a flag, no URI" {

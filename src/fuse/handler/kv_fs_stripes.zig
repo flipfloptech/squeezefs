@@ -159,7 +159,7 @@ pub fn Stripes(comptime Fs: type) type {
         /// to a directory it does not hold, so its rotor).
         fn mintFn(ctx: *anyopaque, dir: u64) ?u64 {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            const local = self.fs.store.allocateIno(Fs.localOf(dir) catch return null, true, false, 0) catch return null;
+            const local = self.fs.store.allocateIno(Fs.localOf(dir) catch return null, true, false, 0, 0) catch return null;
             return Fs.globalOf(local);
         }
 

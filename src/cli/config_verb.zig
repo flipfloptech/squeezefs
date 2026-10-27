@@ -1,8 +1,11 @@
-//! `squeezefs config show [--json] <target>` and the fabric-endpoint verbs
-//! (charter §8; `docs/porting/stats_cli.md` §4.3): the set's ONE control
-//! record (`set_config`, tree 0 of member 0). `show` reads it OFFLINE at
-//! the newest checkpoint (the `status` pattern; a mountpoint resolves
-//! through `.config`). Linux only. (`set-cache-paths` went with disk-based
+//! `squeezefs config show [--json] <target>`, the fabric-endpoint verbs and
+//! `set-dir-spread-depth` (charter §8; `docs/porting/stats_cli.md` §4.3):
+//! the set's ONE control record (`set_config`, tree 0 of member 0). `show`
+//! reads it OFFLINE at the newest checkpoint (the `status` pattern; a
+//! mountpoint resolves through `.config`); the setters rewrite it under
+//! the offline guard (a live mount refuses the verb by name), so a change
+//! takes effect at the NEXT mount of each member and a running fleet never
+//! sees two values. Linux only. (`set-cache-paths` went with disk-based
 //! caching, 2026-10-21: the write cache needs no path.)
 
 const std = @import("std");
@@ -29,7 +32,68 @@ pub fn run(p: cli.Process, c: args.Config) u8 {
         .show => |s| show(p, s.target, s.json),
         .set_fabric_endpoints => |s| setFabricEndpoints(p, s.target, s.specs.slice()),
         .get_fabric_endpoints => |g| getFabricEndpoints(p, g.target, g.json),
+        .set_dir_spread_depth => |s| setDirSpreadDepth(p, s.target, s.depth),
     };
+}
+
+// ---------------------------------------------------------------------------
+// `set-dir-spread-depth` (charter §5.4; decision 0003 §BZ): the set's
+// directory spread depth, for every directory made from the next mount on.
+// Existing directories keep their homes (their depth byte is theirs).
+// ---------------------------------------------------------------------------
+
+const DepthBody = struct {
+    p: cli.Process,
+    depth: u8,
+
+    fn run(ctx: *anyopaque, set: *offline.Set) u8 {
+        const self: *DepthBody = @ptrCast(@alignCast(ctx));
+        const p = self.p;
+        const was = set.cfg.dir_spread_depth;
+        var m = set_config.setDirSpreadDepth(p.gpa, set.cfg, self.depth) catch |e| {
+            p.stderr.print("squeezefs config set-dir-spread-depth: {s}\n", .{switch (e) {
+                error.BadDirSpreadDepth => "the depth is past the ceiling (0 … 254)",
+                else => @errorName(e),
+            }}) catch {};
+            return cli.exit_failed;
+        };
+        defer m.next.deinit(p.gpa);
+        const bytes = set_config.encode(p.gpa, &m.next, @intCast(geometry.recordValueCap(set.be.nodeSize()))) catch |e| {
+            p.stderr.print("squeezefs config set-dir-spread-depth: the record would not encode: {s}\n", .{@errorName(e)}) catch {};
+            return cli.exit_failed;
+        };
+        defer p.gpa.free(bytes);
+        const t = set.be.begin(@src()) catch {
+            p.stderr.writeAll("squeezefs config set-dir-spread-depth: out of memory\n") catch {};
+            return cli.exit_failed;
+        };
+        t.stagePut(key.TREE_CONTROL, set_config.CONTROL_KEY, bytes) catch {
+            set.be.abandon(t);
+            p.stderr.writeAll("squeezefs config set-dir-spread-depth: out of memory\n") catch {};
+            return cli.exit_failed;
+        };
+        set.be.commit(t) catch |e| {
+            p.stderr.print("squeezefs config set-dir-spread-depth: the record commit failed: {t}\n", .{e}) catch {};
+            return cli.exit_failed;
+        };
+        set.be.fsync() catch |e| {
+            p.stderr.print("squeezefs config set-dir-spread-depth: the durability barrier failed: {t}\n", .{e}) catch {};
+            return cli.exit_failed;
+        };
+        p.stdout.print("dir spread depth {d} → {d} (config generation {d}): directories at depth ≤ {d} round-robin over the members from the next mount on; existing directories keep their homes\n", .{ was, m.next.dir_spread_depth, m.next.config_generation, m.next.dir_spread_depth }) catch {};
+        p.stdout.flush() catch {};
+        return cli.exit_ok;
+    }
+};
+
+fn setDirSpreadDepth(p: cli.Process, tgt: args.Target, depth: u8) u8 {
+    var resolved = target.resolve(p.gpa, p.io, tgt) catch |e| {
+        target.writeRefusal(p.stderr, "config set-dir-spread-depth", tgt, e) catch {};
+        return cli.exit_failed;
+    };
+    defer resolved.deinit(p.gpa);
+    var body: DepthBody = .{ .p = p, .depth = depth };
+    return offline.withSet(p, resolved.meta_uri, .{ .with_plane = false, .verb = "config set-dir-spread-depth" }, .{ .ctx = &body, .run = DepthBody.run });
 }
 
 // ---------------------------------------------------------------------------

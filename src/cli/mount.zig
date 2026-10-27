@@ -484,6 +484,9 @@ fn mountMain(ctx: *Ctx) u8 {
     //     gate on an encrypted set.
     var cfg = loadSetConfig(ctx, be) orelse return cli.exit_failed;
     defer cfg.deinit(gpa);
+    // The set's directory spread depth (charter §5.4; decision 0003 §BZ):
+    // the record's word, before anything can mint.
+    be.setDirSpreadDepth(cfg.dir_spread_depth);
     const data_uri = dataUriOf(gpa, &cfg) catch return ctx.failed("out of memory (data uri)", .{});
     defer gpa.free(data_uri);
     ctx.data_uri = data_uri;

@@ -2,7 +2,8 @@
 //! the slot → volume map and the effective-ino law (`route_table`), the
 //! order-independent discovery with its refusals (`discovery`), the delta
 //! tee the conveyor pass feeds (`migration_tee`), the per-volume runtime
-//! stamp with its guest-cursor cells (`stamp_cell`), the online
+//! stamp with its guest-cursor cells (`stamp_cell`), the depth rule of
+//! directory placement (`dir_place`), the online
 //! `migrate-meta-slot` engine (`migrate`, Linux), the offline set verbs
 //! (`offline`, Linux) and the instruments (`stats`). The multi-volume
 //! facade the filesystem binds to is `meta/meta_set.zig`. The per-slot
@@ -16,6 +17,7 @@ pub const discovery = @import("routing/discovery.zig");
 pub const migration_tee = @import("routing/migration_tee.zig");
 pub const stamp_cell = @import("routing/stamp_cell.zig");
 pub const slot_state = @import("routing/slot_state.zig");
+pub const dir_place = @import("routing/dir_place.zig");
 pub const stats = @import("routing/stats.zig");
 pub const migrate = if (builtin.os.tag == .linux) @import("routing/migrate.zig") else struct {};
 pub const offline = if (builtin.os.tag == .linux) @import("routing/offline.zig") else struct {};
@@ -26,6 +28,7 @@ test {
     _ = migration_tee;
     _ = stamp_cell;
     _ = slot_state;
+    _ = dir_place;
     _ = stats;
     if (builtin.os.tag == .linux) _ = migrate;
     if (builtin.os.tag == .linux) _ = offline;

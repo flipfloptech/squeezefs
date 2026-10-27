@@ -55,6 +55,18 @@ pub const stats = struct {
     pub var routing_mint_volume_picks: counters.ShardedCounter = .{};
     /// `routing_guest_trees_minted`: slot trees created on first touch.
     pub var routing_guest_trees_minted: counters.ShardedCounter = .{};
+    /// Directory placement (`dir_place.zig`; decision 0003 §BZ):
+    /// `routing_dir_place_rotor` directories the member pick decided (a
+    /// child of `/`, of a foreign directory, or at depth ≤ the spread
+    /// depth); `routing_dir_place_remote` directories homed on another
+    /// member than their parent (each a cross-owner intent);
+    /// `routing_dir_place_local` directories on their parent's member.
+    /// `rotor ≤ local + remote ≡ directories minted`.
+    pub var routing_dir_place_rotor: counters.ShardedCounter = .{};
+    pub var routing_dir_place_remote: counters.ShardedCounter = .{};
+    pub var routing_dir_place_local: counters.ShardedCounter = .{};
+    /// `routing_dir_spread_depth`: the set's `D` in force on this mount.
+    pub var routing_dir_spread_depth: counters.Gauge = .{};
     /// `routing_joined_opens`: sets opened through the join door (volume
     /// 0's D0 ladder lost to a live manager; charter §5.7).
     pub var routing_joined_opens: counters.ShardedCounter = .{};
@@ -80,10 +92,10 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "routing_gate_parks", "routing_dual_claims_converged", "routing_mint_volume_picks", "routing_guest_trees_minted", "routing_joined_opens", "migrate_slots_completed", "migrate_slots_aborted", "migrate_records_copied", "migrate_delta_keys", "migrate_delta_overflows", "migrate_cutover_retries", "staging_rebind_barriers" }) |name| {
+    inline for (.{ "routing_gate_parks", "routing_dual_claims_converged", "routing_mint_volume_picks", "routing_guest_trees_minted", "routing_dir_place_rotor", "routing_dir_place_remote", "routing_dir_place_local", "routing_joined_opens", "migrate_slots_completed", "migrate_slots_aborted", "migrate_records_copied", "migrate_delta_keys", "migrate_delta_overflows", "migrate_cutover_retries", "staging_rebind_barriers" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "routing_gate_armed", "routing_stamp_runs_max", "routing_stamp_cursors_max" }) |name| {
+    inline for (.{ "routing_gate_armed", "routing_stamp_runs_max", "routing_stamp_cursors_max", "routing_dir_spread_depth" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"routing_same_epoch_dual_claim\":{d},", .{counters.tripwireCount("routing_same_epoch_dual_claim")});
@@ -164,5 +176,7 @@ test "the cutover phase family is exact-sum: Σ legs ≡ total on a full window 
     try writeStatsJson(&w);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"migrate_cutover_phase_ns\":{\"drain\":") != null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"routing_gate_armed\":") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"routing_dir_place_remote\":") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"routing_dir_spread_depth\":") != null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"routing_same_epoch_dual_claim\":") != null);
 }

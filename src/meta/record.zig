@@ -173,6 +173,15 @@ pub const INODE_FLAG_APPEND: u32 = 1 << 2;
 /// is the format's own and never theirs to touch.
 pub const INODE_FLAGS_ATTR: u32 = INODE_FLAG_IMMUTABLE | INODE_FLAG_APPEND;
 
+/// `InodeValue.flags2` bits 0..7: a DIRECTORY's depth below the root (the
+/// root's children 1, each level one deeper, saturating at 255 = deeper
+/// than any spread depth; `routing/dir_place.zig`, charter §5.4, decision
+/// 0003 §BZ). 0 on every file, on a stripe, and on a directory made
+/// before the field existed (whose children then record 255). Set at
+/// mkdir; informational after birth (a rename keeps it). Bits 8..31 are
+/// still reserved (must read 0).
+pub const INODE_DEPTH_MASK: u32 = 0xFF;
+
 pub const InodeValue = struct {
     mode: u32 = 0,
     uid: u32 = 0,
@@ -198,6 +207,16 @@ pub const InodeValue = struct {
     /// refuse (unlink, rename, link, xattr changes, mode/owner changes).
     pub fn isRestricted(self: InodeValue) bool {
         return self.flags & INODE_FLAGS_ATTR != 0;
+    }
+
+    /// The directory depth byte (`INODE_DEPTH_MASK`); 0 = none recorded.
+    pub fn dirDepth(self: InodeValue) u8 {
+        return @intCast(self.flags2 & INODE_DEPTH_MASK);
+    }
+
+    /// The `flags2` word a directory at `depth` is born with.
+    pub fn flags2ForDepth(depth: u8) u32 {
+        return depth;
     }
 
     pub fn encode(self: InodeValue) [INODE_VALUE_LEN]u8 {
@@ -1662,6 +1681,18 @@ test "inode value is 68 B fixed width: 5×u32 ‖ rdev u64 ‖ size u64 ‖ 3×i
     try testing.expectError(error.Corrupt, InodeValue.decode(&legacy));
     const legacy_noncanonical = [_]u8{ 0x81, 0x00 } ++ @as([56]u8, @splat(0));
     try testing.expectError(error.Corrupt, InodeValue.decode(&legacy_noncanonical));
+}
+
+test "the directory depth rides flags2's low byte: born at a depth, read back after the codec; a record without one (a file, a pre-field directory) reads 0; bits 8..31 are untouched by it" {
+    var d: InodeValue = .{ .mode = 0o40755, .nlink = 2, .flags2 = InodeValue.flags2ForDepth(3) };
+    try testing.expectEqual(@as(u8, 3), d.dirDepth());
+    try testing.expectEqual(@as(u8, 3), (try InodeValue.decode(&d.encode())).dirDepth());
+    d.flags2 = InodeValue.flags2ForDepth(255);
+    try testing.expectEqual(@as(u8, 255), (try InodeValue.decode(&d.encode())).dirDepth());
+    try testing.expectEqual(@as(u8, 0), (InodeValue{ .mode = 0o100644, .nlink = 1 }).dirDepth());
+    try testing.expectEqual(@as(u8, 0), (InodeValue{ .mode = 0o40755, .nlink = 2 }).dirDepth());
+    try testing.expectEqual(@as(u32, 0x100 | 9), InodeValue.flags2ForDepth(9) | 0x100);
+    try testing.expectEqual(@as(u8, 9), (InodeValue{ .flags2 = 0x100 | 9 }).dirDepth());
 }
 
 test "the inode field table is derived from the wire struct: 11 fields, bit i = field i, widths = wire widths; the delta mask covers exactly them" {

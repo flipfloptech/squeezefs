@@ -492,7 +492,14 @@ VolumeSetConfigWire (fixed head, extern struct, 128 B):
   config_generation u64        (monotone; +1 per committed mutation; the live mirror's compare word)
   block_size u32 ‖ chunk_size u32           (chunk = block + headroom(transform); §4)
   capacity u64                 (formatted capacity ≤ Σ physical at format; §5.5)
-  compression u8 ‖ encryption u8 ‖ key_scheme u8 (0 none, 2 = hkdf-sha256/aead-kw/v2) ‖ reserved u8
+  compression u8 ‖ encryption u8 ‖ key_scheme u8 (0 none, 2 = hkdf-sha256/aead-kw/v2) ‖
+  dir_spread_depth u8          (byte 39; 0 … 254 — the set's directory spread depth D, charter §5.4,
+                                decision 0003 §BZ: new directories at depth ≤ D round-robin over the
+                                members, deeper ones and every file follow their parent's member;
+                                `format --dir-spread-depth N` default 3 = Lustre's `--max-inherit-rr`;
+                                `config set-dir-spread-depth N` rewrites it offline; the byte was
+                                `reserved = 0` before 2026-10-27, so an older record reads 0 = the
+                                §AA.1 placement it was formatted under — its directories carry no depth)
   kdf_salt[32] ‖ key_id[8]     (zero when encryption == 0)
   n_data u16 ‖ n_cache_paths u16 ‖ reserved[4]
   reserved[32] = 0

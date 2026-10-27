@@ -258,6 +258,9 @@ const UnmountCtx = struct {
 };
 
 pub fn run(p: cli.Process, m: args.Mount) u8 {
+    // `cli.run` lifted RLIMIT_RTTIME; a hard limit it could not raise is
+    // a SIGKILL waiting for the first boosted thread (`rt_limit`).
+    if (cli.rt_limit.lift()) |us| log.warn("RLIMIT_RTTIME is {d} µs and this process may not raise it: a daemon thread the kernel boosts to real time (an RCU reader preempted under load) is SIGKILLed past it — raise it before mounting (`ulimit -R unlimited` as root, `LimitRTTIME=infinity` in a unit)", .{us});
     // The URI: every member of the set, in any order (discovery orders
     // them by their stamps).
     var members: [uri.MAX_MEMBERS][]const u8 = undefined;

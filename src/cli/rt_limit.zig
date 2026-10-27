@@ -21,12 +21,18 @@ comptime {
     if (builtin.os.tag != .linux) @compileError("cli/rt_limit is Linux only (charter §1.2); gate the import on builtin.os.tag");
 }
 
-/// The hard `RLIMIT_RTTIME` this process runs under, in µs (null:
-/// unlimited).
+/// Lift `RLIMIT_RTTIME` to unlimited — this process's real-time time is
+/// only ever the kernel's boost, never a policy it asked for. A hard limit
+/// it may not raise (no CAP_SYS_RESOURCE) stands, with the soft limit at
+/// it; that limit is returned in µs (null: unlimited now).
 pub fn lift() ?u64 {
     var lim: linux.rlimit = undefined;
     if (linux.errno(linux.getrlimit(.RTTIME, &lim)) != .SUCCESS) return null;
-    if (lim.max == linux.RLIM.INFINITY) return null;
+    if (lim.cur == linux.RLIM.INFINITY and lim.max == linux.RLIM.INFINITY) return null;
+    const open: linux.rlimit = .{ .cur = linux.RLIM.INFINITY, .max = linux.RLIM.INFINITY };
+    if (linux.errno(linux.setrlimit(.RTTIME, &open)) == .SUCCESS) return null;
+    const at_hard: linux.rlimit = .{ .cur = lim.max, .max = lim.max };
+    _ = linux.setrlimit(.RTTIME, &at_hard);
     return lim.max;
 }
 

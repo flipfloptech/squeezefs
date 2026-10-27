@@ -85,6 +85,9 @@ pub const Process = struct {
 /// Parse and dispatch; returns the exit code. A usage refusal prints the
 /// diagnostic and the verb's usage on stderr.
 pub fn run(p: Process) u8 {
+    // Before any thread: every thread of every verb (the daemon and its
+    // supervisor are forks of `mount`) inherits the lifted limit.
+    if (is_linux) _ = rt_limit.lift();
     var diag: args.Refusal = undefined;
     const verb = args.parse(p.argv, &diag) catch {
         p.stderr.print("squeezefs: {f}\n{s}", .{ diag, args.usage(verbOf(p.argv)) }) catch {};

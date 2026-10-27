@@ -49,9 +49,11 @@
 //!                                                 while the destroy waits for its second
 //!  13 tail_gate_never_meets_a_full_table           — no gate (a member finds the tail's table
 //!                                                 full); the lane drops the window's count BEFORE
-//!                                                 its slots go back (the same); the gate checking
-//!                                                 before it registers (the parked pass outlives
-//!                                                 the landing that made room)
+//!                                                 its slots go back (the same); the gate counting
+//!                                                 the whole table beside an SMO's structural slot
+//!                                                 (the same); the gate checking before it
+//!                                                 registers (the parked pass outlives the landing
+//!                                                 that made room)
 //!  14 resident_answers_lie_inside_the_resident_prefix — a member answered on its own claim (the
 //!                                                 death replay's hole below it: the original
 //!                                                 defect); a member that reads its window's
@@ -133,6 +135,9 @@ const Weakening = enum {
     tail_count_before_release,
     /// The tail gate reads the count BEFORE it registers on `tail_freed`.
     tail_gate_check_before_register,
+    /// The tail gate counts the whole table: the structural slot an SMO's
+    /// entry rides is the members' too.
+    structural_slot_shared,
     /// A member answers once its own slot is written (no residency check).
     answer_on_own_claim,
     /// A member checks its window's claim prefix alone, not the registry's
@@ -1730,22 +1735,28 @@ fn LeafwiseDestroy(comptime weakening: Weakening) type {
 
 /// Model 13 (§BW): the journal tail's slots under self-apply — every member
 /// acked at the apply claims a slot, released at its window's landing. A
-/// table of 3 slots, windows of 2 members, 3 windows: the pass reserves a
+/// table of 4 slots, windows of 2 members, 3 windows: the pass reserves a
 /// window only while the members of the windows it tracks plus the batch
-/// fit the table (register on `tail_freed`, read, park), counting them at
-/// `track`; the members claim their slots after the handoff; the lane, at a
-/// window's terminal outcome, gives the slots back, THEN drops the count,
-/// THEN notifies. Invariant: no member finds the table full (the tripwire
+/// fit the conveyor's share of the table — every slot but the structural
+/// one (register on `tail_freed`, read, park), counting them at `track`;
+/// the members claim their slots after the handoff; the lane, at a window's
+/// terminal outcome, gives the slots back, THEN drops the count, THEN
+/// notifies. An SMO's entry (§BX) takes the structural slot under its CAS'd
+/// flag, or rides nothing if the table refuses it, and gives it back at its
+/// landing. Invariant: no member finds the table full (the tripwire
 /// `meta_conveyor_tail_slot_misses`), and the parked pass never outlives
 /// the landing that made room. Final: every window landed, every slot back.
 fn TailSlots(comptime weakening: Weakening) type {
     return struct {
         const Self = @This();
-        pub const thread_count: usize = 3;
+        pub const thread_count: usize = 4;
         const pass_t = 0;
         const member_t = 1;
         const lane_t = 2;
-        const slots: u8 = 3;
+        const smo_t = 3;
+        const table: u8 = 4;
+        /// The tail gate's capacity: the conveyor's share of the table.
+        const gate_cap: u8 = if (weakening == .structural_slot_shared) table else table - 1;
         const per_window: u8 = 2;
         const windows: u8 = 3;
         const check_first = weakening == .tail_gate_check_before_register;
@@ -1753,8 +1764,12 @@ fn TailSlots(comptime weakening: Weakening) type {
 
         const Ppc = enum(u8) { register, check, park, parked, track, done };
         const Lpc = enum(u8) { idle, release, drop, notify };
+        const Spc = enum(u8) { cas, claim, release, clear, done };
 
-        free: u8 = slots,
+        free: u8 = table,
+        /// The structural slot's flag (`SmoJournal.tail_busy`).
+        busy: bool = false,
+        spc: Spc = .cas,
         /// Members of the tracked windows (`Conveyor.tail_members`).
         counted: u8 = 0,
         /// Windows tracked and handed to their members.
@@ -1787,6 +1802,7 @@ fn TailSlots(comptime weakening: Weakening) type {
                 pass_t => self.ppc == .done or self.stuck(),
                 member_t => self.claimed == self.handed and (self.ppc == .done or self.stuck()),
                 lane_t => self.lpc == .idle and self.landed == self.claimed and (self.ppc == .done or self.stuck()),
+                smo_t => self.spc == .done,
                 else => unreachable,
             };
         }
@@ -1802,7 +1818,7 @@ fn TailSlots(comptime weakening: Weakening) type {
                     self.ppc = if (check_first) .park else .check;
                 },
                 .check => {
-                    if (weakening == .no_tail_gate or self.counted + per_window <= slots) {
+                    if (weakening == .no_tail_gate or self.counted + per_window <= gate_cap) {
                         self.ppc = .track;
                     } else self.ppc = if (check_first) .register else .park;
                 },
@@ -1865,24 +1881,54 @@ fn TailSlots(comptime weakening: Weakening) type {
             }
         }
 
+        /// An SMO's entry: the flag's CAS, the slot (refused when none is
+        /// free: the entry is resident only at its landing), its landing.
+        fn stepSmo(self: *Self) void {
+            switch (self.spc) {
+                .cas => if (self.busy) {
+                    self.spc = .done;
+                } else {
+                    self.busy = true;
+                    self.spc = .claim;
+                },
+                .claim => if (self.free == 0) {
+                    self.busy = false;
+                    self.spc = .done;
+                } else {
+                    self.free -= 1;
+                    self.spc = .release;
+                },
+                .release => {
+                    self.free += 1;
+                    self.spc = .clear;
+                },
+                .clear => {
+                    self.busy = false;
+                    self.spc = .done;
+                },
+                .done => unreachable,
+            }
+        }
+
         pub fn step(self: *Self, t: usize) void {
             switch (t) {
                 pass_t => self.stepPass(),
                 member_t => self.stepMember(),
                 lane_t => self.stepLane(),
+                smo_t => self.stepSmo(),
                 else => unreachable,
             }
         }
 
         pub fn invariant(self: *const Self) !void {
             if (self.met_full) return error.MemberMetAFullTail;
-            if (self.stuck() and self.counted + per_window <= slots) return error.GateOutlivedTheLanding;
+            if (self.stuck() and self.counted + per_window <= gate_cap) return error.GateOutlivedTheLanding;
         }
 
         pub fn final(self: *const Self) !void {
             if (self.ppc != .done) return error.WindowNeverReserved;
             if (self.landed != windows or self.counted != 0) return error.WindowLeftInFlight;
-            if (self.free != slots) return error.SlotNotReturned;
+            if (self.free != table) return error.SlotNotReturned;
         }
     };
 }
@@ -2317,10 +2363,11 @@ test "conveyor_leafwise_destroy_never_waits_holding_a_leaf (§BW): holds (one le
     try explorer.expectFails(LeafwiseDestroy(.destroy_union_hold), .{}, error.InvariantViolated);
 }
 
-test "conveyor_tail_gate_never_meets_a_full_table (§BW): holds (register, read the members in flight, park; count at track; the lane gives the slots back, then drops the count, then notifies); no gate and the count dropped before the slots went back each let a member meet a full table; checking before registering strands the parked pass with room" {
+test "conveyor_tail_gate_never_meets_a_full_table (§BW): holds (register, read the members in flight against the table less the structural slot, park; count at track; the lane gives the slots back, then drops the count, then notifies; an SMO's entry takes the structural slot under its flag or rides nothing); no gate, the count dropped before the slots went back, and a gate counting the whole table beside an SMO's slot each let a member meet a full table; checking before registering strands the parked pass with room" {
     try explorer.expectHolds(TailSlots(.none), .{});
     try explorer.expectFails(TailSlots(.no_tail_gate), .{}, error.InvariantViolated);
     try explorer.expectFails(TailSlots(.tail_count_before_release), .{}, error.InvariantViolated);
+    try explorer.expectFails(TailSlots(.structural_slot_shared), .{}, error.InvariantViolated);
     try explorer.expectFails(TailSlots(.tail_gate_check_before_register), .{}, error.InvariantViolated);
 }
 

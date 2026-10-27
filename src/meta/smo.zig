@@ -142,6 +142,15 @@ pub const DeviceHooks = struct {
     completed: *const fn (ctx: *anyopaque) void,
 };
 
+/// §BX: the journal tail an SMO's entry rides from its build to its
+/// landing (the backend's, bound under the apply ack): `claim` copies the
+/// entry's ops into a slot (null: refused), `release` frees it.
+pub const TailHook = struct {
+    ctx: *anyopaque,
+    claim: *const fn (ctx: *anyopaque, seq_base: u64, pos_base: u64, ops: []const journal.WriteOp) ?u32,
+    release: *const fn (ctx: *anyopaque, slot: u32) void,
+};
+
 /// The SMO task's journal: a ring image + the reservation core + the
 /// in-flight registry, admission from the CHECKPOINT class, the entry write
 /// (`journal.buildEntryWrite` landed on the image, or on the device through
@@ -171,6 +180,12 @@ pub const SmoJournal = struct {
     /// run the checkpointer's `syncDevice` feeds); null in the standalone tests.
     latch: ?*journal.FailureLatch = null,
     device: ?DeviceHooks = null,
+    /// §BX: an SMO's entry in the journal tail from its build to its
+    /// landing (`commitResident`); null: none (no answer is given ahead of
+    /// the landing). The table's one structural slot — the conveyor's tail
+    /// gate counts the others — is held while `tail_busy` is set.
+    tail: ?TailHook = null,
+    tail_busy: std.atomic.Value(bool) = .init(false),
     barriers: std.atomic.Value(u64) = .init(0),
     stats: journal.RingStats = .{},
     /// The last SMO entry this seam committed (the tear harness's target).
@@ -205,22 +220,65 @@ pub const SmoJournal = struct {
     /// watermark; replay's checksum walk drops it). A device write failure
     /// is `error.Corrupt` to the caller's crash-equivalent-hole arm.
     pub fn commitEntry(self: *SmoJournal, res: Reservation, frames: []const journal.RecordFrame) journal.Error!void {
-        const written = self.writeEntry(res, frames);
+        return self.commitWith(res, frames, false);
+    }
+
+    /// An SMO's entry (`writeEntryAfterRelease`): `commitEntry` with the
+    /// entry's image in the journal tail from its build to its landing
+    /// (§BX), so the reservation it took inside the lock window is resident
+    /// microseconds later, not a structural write's round trip later — an
+    /// answer ahead of the landing above it waits for neither. A write that
+    /// fails leaves the slot written (and the structural slot held): the
+    /// death replay carries the entry, as it carries an acked window's
+    /// (§BB.5). The slot refused (another structural entry holds it), the
+    /// entry is resident at its landing, as before.
+    pub fn commitResident(self: *SmoJournal, res: Reservation, frames: []const journal.RecordFrame) journal.Error!void {
+        return self.commitWith(res, frames, true);
+    }
+
+    fn commitWith(self: *SmoJournal, res: Reservation, frames: []const journal.RecordFrame, resident: bool) journal.Error!void {
+        const written = self.writeEntry(res, frames, resident);
         self.reg.complete(self.core, res);
         if (self.device) |d| d.completed(d.ctx);
         return written;
     }
 
-    fn writeEntry(self: *SmoJournal, res: Reservation, frames: []const journal.RecordFrame) journal.Error!void {
+    fn writeEntry(self: *SmoJournal, res: Reservation, frames: []const journal.RecordFrame, resident: bool) journal.Error!void {
         var img = try journal.buildEntryWrite(self.gpa, self.layout, self.geo, self.appender_id, res, frames);
         defer img.deinit();
+        const slot = if (resident and frames.len != 0) self.claimTail(res, frames[0].seq, img.ops) else null;
         if (self.device) |d| {
             d.write(d.ctx, img.ops) catch return error.Corrupt;
         } else {
             journal.applyOps(self.image, self.layout.base, img.ops);
         }
+        if (slot) |sl| self.releaseTail(sl);
         self.stats.noteWritten(img.acct, 1);
         self.last_entry = res;
+    }
+
+    /// The structural slot, then the entry's copy in it, then the
+    /// registry's resident mark (the prefix's advance wakes the answers it
+    /// covers).
+    fn claimTail(self: *SmoJournal, res: Reservation, seq_base: u64, ops: []const journal.WriteOp) ?u32 {
+        const t = self.tail orelse return null;
+        // acquire: paired with `releaseTail`'s release store — the previous
+        // holder's slot is free before this one claims.
+        if (self.tail_busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return null;
+        const slot = t.claim(t.ctx, seq_base, res.start, ops) orelse {
+            self.tail_busy.store(false, .release);
+            return null;
+        };
+        self.reg.markResident(res.start);
+        return slot;
+    }
+
+    /// The entry landed: its slot goes back, then the structural slot.
+    fn releaseTail(self: *SmoJournal, slot: u32) void {
+        const t = self.tail.?;
+        t.release(t.ctx, slot);
+        // release: paired with `claimTail`'s acquire CAS.
+        self.tail_busy.store(false, .release);
     }
 
     /// Abandon a reservation whose write did not happen: it still completes
@@ -666,17 +724,20 @@ pub fn reserveInWindow(j: *SmoJournal, prep: *PreparedEntry) Allocator.Error!jc.
     return r;
 }
 
-/// P4: write the entry after release; the gate is the LAST record's
-/// position. A failed write is the crash-equivalent hole — the swap
-/// already happened and RAM is authoritative; replay folds to the pre-SMO
-/// state plus the by-key window, which is consistent. Infallible: the
-/// frames were built before the lock window.
+/// P4: write the entry after release (from its build to its landing in
+/// the journal tail, §BX); the gate is the LAST record's position. A failed
+/// write is the crash-equivalent hole — the swap already happened and RAM
+/// is authoritative; replay folds to the pre-SMO state plus the by-key
+/// window, which is consistent (a daemon's death replay writes the tail's
+/// copy first: the post-SMO state, as consistent — the successors were
+/// barriered before the swap). Infallible: the frames were built before
+/// the lock window.
 pub fn writeEntryAfterRelease(j: *SmoJournal, r: jc.InflightRegistry.Registered, prep: *const PreparedEntry, what: []const u8) u64 {
     const gate = r.res.recordGate(prep.recs.len() - 1);
     const written: journal.Error!void = if (j.testFailArmed()) blk: {
         j.abandonEntry(r.res);
         break :blk error.Corrupt;
-    } else j.commitEntry(r.res, prep.frames);
+    } else j.commitResident(r.res, prep.frames);
     written catch |e| {
         stats.meta_kv_smo_entry_write_failures.inc();
         log.warn("{s} SMO journal entry write failed at position {d} ({s}): a crash-equivalent hole; state stays RAM-consistent", .{ what, r.res.start, @errorName(e) });

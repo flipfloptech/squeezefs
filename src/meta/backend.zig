@@ -837,6 +837,7 @@ pub const KvBackend = struct {
             .self_apply = std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_META_APPLY", opts.env), "self"),
         });
         errdefer be.cv.deinit();
+        be.smo_journal.tail = be.smoTailHook();
         try be.startPass();
         errdefer be.stopPass();
 
@@ -1233,6 +1234,7 @@ pub const KvBackend = struct {
             .self_apply = std.mem.eql(u8, knobs.enumKnob("SQUEEZEFS_META_APPLY", opts.env), "self"),
         });
         errdefer be.cv.deinit();
+        be.smo_journal.tail = be.smoTailHook();
         try be.startPass();
         errdefer be.stopPass();
 
@@ -2167,9 +2169,19 @@ pub const KvBackend = struct {
         return .{ .ctx = be, .claim = tailClaim, .release = tailRelease, .slots = tailSlots };
     }
 
+    /// The conveyor's share of the tail's table (its tail gate counts
+    /// them): every slot but the structural one an SMO's entry rides
+    /// (`smoTailHook`).
     fn tailSlots(ctx: *anyopaque) u32 {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
-        return be.tail.?.image.header().n_slots;
+        return be.tail.?.image.header().n_slots - 1;
+    }
+
+    /// §BX: an SMO's entry rides the tail from its build to its landing
+    /// whenever answers are given ahead of the landing.
+    fn smoTailHook(be: *KvBackend) ?smo.TailHook {
+        if (be.tail == null or !be.cv.deps.ack_at_apply) return null;
+        return .{ .ctx = be, .claim = tailClaim, .release = tailRelease };
     }
 
     fn tailClaim(ctx: *anyopaque, seq_base: u64, pos_base: u64, ops: []const journal.WriteOp) ?u32 {

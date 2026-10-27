@@ -74,6 +74,9 @@ pub const stats = struct {
     /// node stays dirty and the checkpoint's dirty walk flushes it (a
     /// counted deferral, never a loss).
     pub var meta_kv_maintenance_queue_full: counters.ShardedCounter = .{};
+    /// Threshold crossings handed to `enqueueMaintenance` (every apply
+    /// that left a leaf's open delta at or past the writeback threshold).
+    pub var meta_kv_maintenance_enqueues: counters.ShardedCounter = .{};
 };
 
 // ---------------------------------------------------------------------------
@@ -300,6 +303,12 @@ pub const MaintenanceQueue = struct {
     /// Whether anything is queued (a snapshot; the SMO task's wake test).
     pub fn isEmpty(self: *const MaintenanceQueue) bool {
         return self.tail.load(.acquire) >= self.head.load(.acquire);
+    }
+
+    /// Entries queued (a snapshot: the depth gauge's input).
+    pub fn depth(self: *const MaintenanceQueue) usize {
+        const tail = self.tail.load(.acquire);
+        return self.head.load(.acquire) -| tail;
     }
 };
 
@@ -657,14 +666,31 @@ pub const KvTree = struct {
         return !self.maintenance.isEmpty();
     }
 
-    /// Enqueue a node for the next maintenance pass (duplicates benign; a
-    /// full queue is a counted deferral the dirty walk covers).
-    pub fn enqueueMaintenance(self: *KvTree, addr: u64) void {
-        if (!self.maintenance.push(addr)) stats.meta_kv_maintenance_queue_full.inc();
+    /// A threshold crossing on `n`: queue it for the next maintenance pass
+    /// (duplicates benign; a full queue is a counted deferral the dirty
+    /// walk covers).
+    pub fn enqueueMaintenance(self: *KvTree, n: *CachedNode) void {
+        stats.meta_kv_maintenance_enqueues.inc();
+        n.noteMaintenanceQueued();
+        if (!self.maintenance.push(n.addr)) stats.meta_kv_maintenance_queue_full.inc();
+    }
+
+    /// `enqueueMaintenance` for a caller holding only the address (a
+    /// deferred item's requeue, the dirty walk); a node the cache no
+    /// longer maps has nothing left to maintain.
+    pub fn enqueueMaintenanceAddr(self: *KvTree, addr: u64) void {
+        const n = self.cache.tryGet(addr) orelse return;
+        defer n.release();
+        self.enqueueMaintenance(n);
     }
 
     pub fn popMaintenance(self: *KvTree) ?u64 {
         return self.maintenance.pop();
+    }
+
+    /// Entries queued on this tree.
+    pub fn maintenanceDepth(self: *const KvTree) usize {
+        return self.maintenance.depth();
     }
 
     // ---- latch-free traversal ----
@@ -874,7 +900,7 @@ pub const KvTree = struct {
         };
         const over_threshold = d.overlayBytes() >= self.cache.cfg.writeback_delta_bytes;
         leaf.unlockWrite(io);
-        if (over_threshold) self.enqueueMaintenance(leaf.addr);
+        if (over_threshold) self.enqueueMaintenance(leaf);
         return .applied;
     }
 

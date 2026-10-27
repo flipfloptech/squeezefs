@@ -664,6 +664,9 @@ pub const CachedNode = struct {
     dirty_floor: std.atomic.Value(u64),
     /// The slot tree this node belongs to on a forest volume (RAM-only).
     forest_slot: std.atomic.Value(u32),
+    /// `clock.monotonicNs()` of the crossing that queued the node (0 =
+    /// none): the freeze that takes it records `meta_kv_threshold_to_freeze`.
+    maintenance_queued_ns: std.atomic.Value(u64),
 
     /// Build from a verified extent (`loaded` borrows `buf`; both are
     /// consumed). Born clean with one reference, the caller's.
@@ -731,6 +734,7 @@ pub const CachedNode = struct {
             .pinned = .init(pinned),
             .dirty_floor = .init(no_floor),
             .forest_slot = .init(no_forest_slot),
+            .maintenance_queued_ns = .init(0),
         };
         if (pinned) cache.pinned_nodes.add(1);
         // The extent buffer's own reference: the sources hold theirs.
@@ -802,6 +806,17 @@ pub const CachedNode = struct {
 
     pub fn isPinned(self: *const CachedNode) bool {
         return self.pinned.load(.acquire);
+    }
+
+    /// A threshold crossing queued the node: the first since the last
+    /// freeze stamps it.
+    pub fn noteMaintenanceQueued(self: *CachedNode) void {
+        _ = self.maintenance_queued_ns.cmpxchgStrong(0, clock.monotonicNs(), .monotonic, .monotonic);
+    }
+
+    /// The crossing stamp, taken by the freeze (0 = the node was not queued).
+    pub fn takeMaintenanceQueuedNs(self: *CachedNode) u64 {
+        return self.maintenance_queued_ns.swap(0, .monotonic);
     }
 
     fn touch(self: *CachedNode) void {

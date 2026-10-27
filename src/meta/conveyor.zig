@@ -3397,7 +3397,7 @@ pub const Conveyor = struct {
             for (r.lock_set, dirties) |n, d| {
                 if (d.overlayBytes() >= self.deps.cache.cfg.writeback_delta_bytes) {
                     if (self.treeOf(n)) |t| {
-                        t.enqueueMaintenance(n.addr);
+                        t.enqueueMaintenance(n);
                         threshold_crossed = true;
                     }
                 }
@@ -3515,7 +3515,7 @@ pub const Conveyor = struct {
                 break :blk null;
             };
             const threshold = applied == null and dirty.overlayBytes() >= self.deps.cache.cfg.writeback_delta_bytes;
-            if (threshold) if (self.treeOf(leaf)) |t| t.enqueueMaintenance(leaf.addr);
+            if (threshold) if (self.treeOf(leaf)) |t| t.enqueueMaintenance(leaf);
             leaf.unlockWrite(io);
             self.stats.leafwise_leaf_hold.record(clock.monotonicNs() -| t_held);
             if (applied) |e| break e;
@@ -3707,7 +3707,7 @@ pub const Conveyor = struct {
             for (r.lock_set, dirties) |n, d| {
                 if (d.overlayBytes() >= self.deps.cache.cfg.writeback_delta_bytes) {
                     if (self.treeOf(n)) |t| {
-                        t.enqueueMaintenance(n.addr);
+                        t.enqueueMaintenance(n);
                         threshold_crossed = true;
                     }
                 }

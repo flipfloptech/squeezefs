@@ -240,12 +240,14 @@ pub const MaintenanceSource = struct {
     pop: *const fn (ctx: *anyopaque) ?u64,
     /// Whether anything is queued (the task's re-arm test).
     pending: *const fn (ctx: *anyopaque) bool,
-    /// Queue `addr` again for the next drain (a reserve deferral's retry).
-    requeue: *const fn (ctx: *anyopaque, addr: u64) void,
+    /// Entries queued across the source's queues (the depth gauge).
+    depth: *const fn (ctx: *anyopaque) u64,
+    /// Queue `n` again for the next drain (a reserve deferral's retry).
+    requeue: *const fn (ctx: *anyopaque, n: *CachedNode) void,
 
     /// One `tree.MaintenanceQueue` as the source (tests, a one-tree volume).
     pub fn ofQueue(q: *tree.MaintenanceQueue) MaintenanceSource {
-        return .{ .ctx = q, .pop = queuePop, .pending = queuePending, .requeue = queueRequeue };
+        return .{ .ctx = q, .pop = queuePop, .pending = queuePending, .depth = queueDepth, .requeue = queueRequeue };
     }
 
     fn queuePop(ctx: *anyopaque) ?u64 {
@@ -258,9 +260,15 @@ pub const MaintenanceSource = struct {
         return !q.isEmpty();
     }
 
-    fn queueRequeue(ctx: *anyopaque, addr: u64) void {
+    fn queueDepth(ctx: *anyopaque) u64 {
         const q: *tree.MaintenanceQueue = @ptrCast(@alignCast(ctx));
-        if (!q.push(addr)) tree.stats.meta_kv_maintenance_queue_full.inc();
+        return q.depth();
+    }
+
+    fn queueRequeue(ctx: *anyopaque, n: *CachedNode) void {
+        const q: *tree.MaintenanceQueue = @ptrCast(@alignCast(ctx));
+        n.noteMaintenanceQueued();
+        if (!q.push(n.addr)) tree.stats.meta_kv_maintenance_queue_full.inc();
     }
 };
 
@@ -341,9 +349,13 @@ pub const CacheFlusher = struct {
         // The lock window: freeze (or get the parked delta back); the
         // checkpoint pass takes the floor here, in the same window.
         var taken: ?u64 = null;
+        // The open delta's bytes when the freeze takes it (a parked frozen
+        // delta comes back instead and the open one stays).
+        var open_bytes: u64 = 0;
         const frozen = blk: {
             const d = n.lockWrite(io);
             defer n.unlockWrite(io);
+            if (!d.hasFrozen()) open_bytes = d.overlayBytes();
             switch (opts.mode) {
                 .checkpoint => {
                     const ff = n.flushFreezeLocked(d, layout) catch |e| return freezeFailure(e);
@@ -354,6 +366,20 @@ pub const CacheFlusher = struct {
             }
         };
         if (!frozen) return .{ .disposition = .discharged };
+        if (open_bytes != 0) {
+            switch (opts.mode) {
+                .threshold => {
+                    ckpt.stats.meta_kv_freezes_threshold.inc();
+                    ckpt.stats.meta_kv_freeze_bytes_threshold.add(open_bytes);
+                },
+                .checkpoint => {
+                    ckpt.stats.meta_kv_freezes_checkpoint.inc();
+                    ckpt.stats.meta_kv_freeze_bytes_checkpoint.add(open_bytes);
+                },
+            }
+            const crossed_ns = n.takeMaintenanceQueuedNs();
+            if (crossed_ns != 0) ckpt.stats.meta_kv_threshold_to_freeze.record(clock.monotonicNs() -| crossed_ns);
+        }
         const appended = self.cache.appendFrozen(n) catch |e| {
             if (taken) |f| n.restoreDirtyFloor(f);
             return .{ .disposition = .failed, .failure = switch (e) {
@@ -494,6 +520,10 @@ pub const Checkpointer = struct {
     /// `meta_kv_dirty_nodes`: the dirty count as the cadence tick last read it
     /// (the stats faces and the tape read this word, never a cache walk).
     dirty_nodes: counters.Gauge = .{},
+    /// The maintenance queues' depth as the last drain pass started, and
+    /// the deepest any pass has seen.
+    maintenance_depth: counters.Gauge = .{},
+    maintenance_depth_max: counters.Gauge = .{},
 
     // ---- space ----
     audit: alloc_core.SpaceAudit = .{},
@@ -1139,14 +1169,22 @@ pub const Checkpointer = struct {
         const src = self.deps.maintenance;
         var budget = budget_in;
         var sample: ckpt.FlushPassSample = .{};
+        const depth = src.depth(src.ctx);
+        self.maintenance_depth.set(depth);
+        self.maintenance_depth_max.raise(depth);
         while (budget.admits(clock.monotonicNs())) {
             const addr = src.pop(src.ctx) orelse break;
             const n = self.deps.cache.tryGet(addr) orelse continue;
             defer n.release();
             const t0 = clock.monotonicNs();
             const r = self.deps.flush.flush(self.deps.flush.ctx, n, .{ .mode = .threshold });
-            sample.note(clock.monotonicNs() -| t0, r.images);
+            const wall = clock.monotonicNs() -| t0;
             ckpt.stats.meta_kv_maintenance_items.inc();
+            ckpt.stats.meta_kv_maintenance_item.record(wall);
+            // A pop whose node had nothing to freeze (an entry behind the
+            // one that froze it).
+            if (r.disposition == .discharged) ckpt.stats.meta_kv_maintenance_idle_pops.inc();
+            sample.note(wall, r.images);
             switch (r.disposition) {
                 .deferred_reserve, .deferred_pending_free => {
                     if (self.reserve_deferred_addr == addr) {
@@ -1156,7 +1194,7 @@ pub const Checkpointer = struct {
                     }
                     self.reserve_deferred_addr = addr;
                     try self.checkpointCycle(true);
-                    src.requeue(src.ctx, addr);
+                    src.requeue(src.ctx, n);
                 },
                 .deferred_space => _ = self.posture.enter(self.cfg.volume, "threshold maintenance: the SMO could not claim an extent", self.spaceSnapshot()),
                 .failed => return failureError(r.failure),

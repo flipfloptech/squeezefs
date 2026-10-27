@@ -992,7 +992,7 @@ pub fn requeueIfOverThreshold(t: *KvTree, parent: *CachedNode) void {
     const d = parent.lockRead(t.cache.io);
     const re = d.overlayBytes() >= t.cache.cfg.writeback_delta_bytes;
     parent.unlockRead(t.cache.io);
-    if (re) t.enqueueMaintenance(parent.addr);
+    if (re) t.enqueueMaintenance(parent);
 }
 
 // ---------------------------------------------------------------------------
@@ -1288,13 +1288,11 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
 // Writeback and the maintenance drain.
 // ---------------------------------------------------------------------------
 
-/// Writeback / SMO for one node: freeze under the lock, append outside it;
-/// a full log compacts; an oversized fold splits. Threshold posture: the
-/// §4.7 FIFO valve applies.
-pub fn maintainNode(t: *KvTree, ctx: *SmoContext, addr: u64, out: *MaintenanceOutcome) Error!void {
+/// Writeback / SMO for one popped node: freeze under the lock, append
+/// outside it; a full log compacts; an oversized fold splits. Threshold
+/// posture: the §4.7 FIFO valve applies.
+pub fn maintainNode(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *MaintenanceOutcome) Error!void {
     const cache = t.cache;
-    const n = cache.tryGet(addr) orelse return; // evicted/retired since enqueue
-    defer n.release();
     if (n.state.isSuperseded() or !t.owns(n)) return;
     const frozen = blk: {
         const d = n.lockWrite(cache.io);
@@ -1312,6 +1310,16 @@ pub fn maintainNode(t: *KvTree, ctx: *SmoContext, addr: u64, out: *MaintenanceOu
     try smoReplace(t, ctx, n, out, false);
 }
 
+/// Pop the next queued node of `t` (retained); null when the queue is
+/// empty. Addresses the cache no longer maps are skipped.
+pub fn popMaintenanceNode(t: *KvTree) ?*CachedNode {
+    while (t.popMaintenance()) |addr| {
+        const n = t.cache.tryGet(addr) orelse continue; // evicted/retired since enqueue
+        return n;
+    }
+    return null;
+}
+
 /// Drain the maintenance queue under a pass deadline (monotonic ns; null =
 /// unbounded): the first item always runs (every pass makes progress),
 /// every later one only inside the deadline — a storm that re-enqueues
@@ -1321,15 +1329,16 @@ pub fn maintainNode(t: *KvTree, ctx: *SmoContext, addr: u64, out: *MaintenanceOu
 pub fn runMaintenanceUntil(t: *KvTree, ctx: *SmoContext, deadline: ?u64) Error!MaintenanceOutcome {
     var out: MaintenanceOutcome = .{};
     var progressed = false;
-    while (t.popMaintenance()) |addr| {
+    while (popMaintenanceNode(t)) |n| {
+        defer n.release();
         if (progressed) {
             if (deadline) |d| if (clock.monotonicNs() >= d) {
-                t.enqueueMaintenance(addr);
+                t.enqueueMaintenance(n);
                 break;
             };
         }
         progressed = true;
-        try maintainNode(t, ctx, addr, &out);
+        try maintainNode(t, ctx, n, &out);
     }
     return out;
 }
@@ -1365,7 +1374,7 @@ pub fn flushDirty(t: *KvTree, ctx: *SmoContext) Error!MaintenanceOutcome {
         t.cache.forEachNode(&c, DirtyCollector.visit);
         if (c.failed) return error.OutOfMemory;
         if (dirty.items.len == 0 and !t.maintenancePending()) return out;
-        for (dirty.items) |a| t.enqueueMaintenance(a);
+        for (dirty.items) |a| t.enqueueMaintenanceAddr(a);
         out.add(try runMaintenance(t, ctx));
     }
     log.err("tree {d}: flushDirty never converged (writeback keeps re-dirtying — SMO bug)", .{t.tree_id});
@@ -2806,16 +2815,87 @@ test "runMaintenanceUntil: an expired deadline still runs the first item (the pr
     const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     for (0..20) |i| try t.insert(&ikey(i), tree.testValue(i, 24, &buf));
-    const addr = t.rootPtr().addr;
-    t.enqueueMaintenance(addr);
-    t.enqueueMaintenance(addr);
-    t.enqueueMaintenance(addr);
+    const root = try vol.cache.get(t.rootPtr().addr);
+    defer root.release();
+    t.enqueueMaintenance(root);
+    t.enqueueMaintenance(root);
+    t.enqueueMaintenance(root);
     const out = try runMaintenanceUntil(t, &vol.ctx, clock.monotonicNs());
     try testing.expectEqual(@as(u64, 1), out.appends);
     try testing.expect(t.maintenancePending());
     const rest = try runMaintenance(t, &vol.ctx);
     try testing.expectEqual(@as(u64, 0), rest.appends); // spurious re-enqueues
     try testing.expect(!t.maintenancePending());
+}
+
+test "the maintenance queue coalesces a leaf's crossings into ONE entry: a hot leaf past the threshold never fills its tree's queue, a cold leaf's one crossing is queued behind it and frozen by the drain, and a crossing after the pop queues the leaf again" {
+    const gpa = testing.allocator;
+    // Eight nodes of budget: the queue is at its 64-entry floor.
+    var vol = try TestVolume.init(gpa, .{ .budget_nodes = 8 });
+    defer vol.deinit();
+    const t = try vol.createTree(.native);
+    try testing.expectEqual(@as(usize, 64), t.maintenance.slots.len);
+    const threshold = vol.cache.cfg.writeback_delta_bytes;
+    var buf: [64]u8 = undefined;
+    // Two leaves: unique keys until the root splits.
+    const s0 = stats.meta_kv_node_splits.load();
+    var n: u64 = 1000;
+    while (stats.meta_kv_node_splits.load() == s0) {
+        for (0..64) |_| {
+            try t.insert(&ikey(n), tree.testValue(n, 40, &buf));
+            n += 1;
+        }
+        _ = try vol.drain(t);
+        try testing.expect(n < 1_000_000);
+    }
+    _ = try vol.drain(t);
+    try vol.flushDirty(t);
+    try testing.expect(!t.maintenancePending());
+    const hot = try t.resolveLeaf(&ikey(0));
+    defer hot.release();
+    const cold = try t.resolveLeaf(&ikey(n + 1000));
+    defer cold.release();
+    try testing.expect(hot.addr != cold.addr);
+
+    // The hot leaf: 200 inserts of ~45 B, past the 4 KiB threshold after
+    // ~90 of them, so > 64 crossings — more than the queue holds.
+    const full0 = tree.stats.meta_kv_maintenance_queue_full.load();
+    const enq0 = tree.stats.meta_kv_maintenance_enqueues.load();
+    for (0..200) |i| try t.insert(&ikey(i), tree.testValue(i, 24, &buf));
+    const crossings = tree.stats.meta_kv_maintenance_enqueues.load() - enq0;
+    try testing.expect(crossings > 64);
+    try testing.expectEqual(@as(usize, 1), t.maintenanceDepth());
+    try testing.expectEqual(full0, tree.stats.meta_kv_maintenance_queue_full.load());
+
+    // The cold leaf crosses once, behind the hot leaf's entry.
+    for (0..100) |i| try t.insert(&ikey(n + 1000 + i), tree.testValue(i, 24, &buf));
+    {
+        const d = cold.lockRead(vol.cache.io);
+        defer cold.unlockRead(vol.cache.io);
+        try testing.expect(d.overlayBytes() >= threshold);
+    }
+    try testing.expectEqual(@as(usize, 2), t.maintenanceDepth());
+    try testing.expectEqual(full0, tree.stats.meta_kv_maintenance_queue_full.load());
+
+    // The drain: one freeze and append per leaf, the cold leaf's included.
+    const out = try vol.drain(t);
+    try testing.expectEqual(@as(u64, 2), out.appends);
+    try testing.expect(!t.maintenancePending());
+    {
+        const d = cold.lockRead(vol.cache.io);
+        defer cold.unlockRead(vol.cache.io);
+        try testing.expectEqual(@as(usize, 0), d.overlayBytes());
+    }
+
+    // The pop cleared the hot leaf's word: a crossing after it queues the
+    // leaf again.
+    for (200..400) |i| try t.insert(&ikey(i), tree.testValue(i, 24, &buf));
+    try testing.expectEqual(@as(usize, 1), t.maintenanceDepth());
+    try testing.expectEqual(@as(u64, 1), (try vol.drain(t)).appends);
+    try testing.expectEqual(full0, tree.stats.meta_kv_maintenance_queue_full.load());
+    for ([_]u64{ 0, 199, 200, 399 }) |p| try expectLookup(t, &ikey(p), tree.testValue(p, 24, &buf));
+    try expectLookup(t, &ikey(1000), tree.testValue(1000, 40, &buf));
+    try expectLookup(t, &ikey(n + 1099), tree.testValue(99, 24, &buf));
 }
 
 test "CheckpointSeam: the checkpoint's CacheFlusher appends in place, hands a full node to smoReplace (replaced with its image count, the floor taken), declines a foreign tree's node, and sweeps the volume lap" {

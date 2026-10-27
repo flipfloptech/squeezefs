@@ -799,7 +799,7 @@ pub const KvBackend = struct {
             .pages = .{ .ctx = be, .writePage = bitmapPageHook },
             .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook, .unpublishedGuestFloor = unpublishedGuestFloor, .appenderPages = if (sb.symmetricPlaneStamped()) appenderPagesHook else null, .dataPages = if (sb.symmetricPlaneStamped()) dataPagesHook else null },
             .smo = be.ckpt_seam.seam(),
-            .maintenance = .{ .ctx = be, .pop = popMaintenance, .pending = maintenancePending, .requeue = requeueMaintenance },
+            .maintenance = .{ .ctx = be, .pop = popMaintenance, .pending = maintenancePending, .depth = maintenanceDepth, .requeue = requeueMaintenance },
         });
         errdefer be.cp.deinit();
         be.smo_ctx.space_retry = be.cp.spaceRetryHold();
@@ -1191,7 +1191,7 @@ pub const KvBackend = struct {
             .pages = null,
             .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook, .unpublishedGuestFloor = unpublishedGuestFloor, .appenderPages = joinedPagesHook },
             .smo = be.ckpt_seam.seam(),
-            .maintenance = .{ .ctx = be, .pop = popMaintenance, .pending = maintenancePending, .requeue = requeueMaintenance },
+            .maintenance = .{ .ctx = be, .pop = popMaintenance, .pending = maintenancePending, .depth = maintenanceDepth, .requeue = requeueMaintenance },
         });
         errdefer be.cp.deinit();
         be.smo_ctx.space_retry = be.cp.spaceRetryHold();
@@ -1996,15 +1996,19 @@ pub const KvBackend = struct {
         return false;
     }
 
-    /// A deferred item goes back on its owner's queue; a node the cache no
-    /// longer maps has nothing left to maintain.
-    fn requeueMaintenance(ctx: *anyopaque, addr: u64) void {
+    fn maintenanceDepth(ctx: *anyopaque) u64 {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
-        const n = be.cache.tryGet(addr) orelse return;
-        defer n.release();
+        var depth: u64 = 0;
+        for (be.trees.load()) |t| depth += t.maintenanceDepth();
+        return depth;
+    }
+
+    /// A deferred item goes back on its owner's queue.
+    fn requeueMaintenance(ctx: *anyopaque, n: *node_cache.CachedNode) void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
         for (be.trees.load()) |t| {
             if (t.owns(n)) {
-                t.enqueueMaintenance(addr);
+                t.enqueueMaintenance(n);
                 return;
             }
         }

@@ -596,6 +596,22 @@ pub const stats = struct {
     pub var meta_kv_checkpoint_park_cycles: counters.ShardedCounter = .{};
     /// Threshold-maintenance items drained outside a cycle.
     pub var meta_kv_maintenance_items: counters.ShardedCounter = .{};
+    /// Drained items whose node was back below the threshold with nothing
+    /// frozen (the cycle's flush pass took the crossing first): nothing
+    /// written.
+    pub var meta_kv_maintenance_idle_pops: counters.ShardedCounter = .{};
+    /// One drained item's wall (the pop's node through its freeze, append
+    /// or SMO).
+    pub var meta_kv_maintenance_item: counters.ShardedLatencyHistogram = .{};
+    /// From a leaf's threshold crossing (the enqueue that queued it) to the
+    /// freeze that took its delta — the drain's or the cycle's.
+    pub var meta_kv_threshold_to_freeze: counters.ShardedLatencyHistogram = .{};
+    /// Freezes that found an open delta, by who ran them, and the delta
+    /// bytes they took: the delta size at freeze is `bytes / freezes`.
+    pub var meta_kv_freezes_threshold: counters.ShardedCounter = .{};
+    pub var meta_kv_freezes_checkpoint: counters.ShardedCounter = .{};
+    pub var meta_kv_freeze_bytes_threshold: counters.ShardedCounter = .{};
+    pub var meta_kv_freeze_bytes_checkpoint: counters.ShardedCounter = .{};
     /// Bounded heap-full sweep calls from the cycle's arm.
     pub var meta_kv_merge_sweeps: counters.ShardedCounter = .{};
     /// Cadence/shutdown ticks and threshold maintenance passes that failed

@@ -47,3 +47,37 @@ The pass's claims take 2.2–2.7 µs per window at -np 32 and 3.4–6.0 µs at -
 **Models.** Model 15 now runs with two helpers (the pass and a parked answer). Model 16 (GoneRollOut): a gone
 committer's roll-out against the pass's claim holds, and fails without the CAS. **Red** `0679695`: a member
 held at its turn never got its entry into the tail, and B parked behind A held at its turn.
+
+## §BX.12 — claim only while the turns run late (`SQUEEZEFS_META_PASS_CLAIMS=auto`)
+
+The owner's A-B-B-A of `8d2f2d9` (vs dev `d0cf1f3`): every -np 64 row was up (+6.6 / +7.0 / +7.1 / +9.6 %),
+and every -np 32 row was down (−7.2 / −5.6 / −3.0 / −2.7 %). The claims pay only where the profile's
+expensive parks live: owners descheduled inside their claim, because a turn was delivered to a thread busy
+with other committers.
+
+The signal is the late turn itself. For each window, it records how long after the handout the last member's
+turn started (`meta_turn_lag`), and an EWMA over 1024 windows tracks the share of windows late past 8 µs.
+Claims switch on above 62 % and off below 50 %. Before the host's reboot, the shares were 17–37 % at -np 32
+(23–46 % with claims) and 69–84 % at -np 64 (90–96 % with claims).
+
+Correctness runs on `753db9f` give these counters for never / auto / always, per phase fc / fr / dc / dr:
+
+| | never: parks, wait/answer | auto: windows claimed, parks | always: parks |
+|---|---|---|---|
+| -np 16 | 3.2–5.5 %, 0.7–1.0 µs | 0 / 0 / 0 / 0 %, 3.9–5.7 % | 0.3–0.8 % |
+| -np 32 | 12.7–22.4 %, 3.2–5.4 µs | 0 / 0 / 0 / 1.1 %, 11.4–17.0 % (2 switches) | 0.17–0.51 % |
+| -np 64 | 22.0–29.5 %, 11.5–24.0 µs | 99.0 / 94.8 / 98.7 / 100 %, 0.04–0.40 % (≤ 3 switches a phase) | 0.04–0.15 % |
+
+With auto, the pass's handout histogram at -np 32 is about dev's (0–1.1 % of windows). At -np 64 auto claims
+94.8–100 % of windows and parks stay at or under 0.4 %.
+
+The host was rebooted mid-round and came back on the `powersave` governor (platform profile `balanced`).
+-np 32 creates fell from 247k to 136k ops/s. In some runs the -np 32 late share rose to 53–79 %, and `auto`
+then claimed at -np 32 as well (that run's never → auto rates, hints only, rose 136 → 150k, 143 → 175k,
+91 → 122k and 133 → 142k). The decision follows the turns, not the rank count. The rates are the owner's to
+measure on a quiet host.
+
+**Models.** Model 14 holds with the pass as a claimer beside the owners in every switch pattern: none, both,
+on for M0 then off, and off for M0 then on. The residency weakenings fail in each pattern. Model 16 holds with
+the pass's switch on and off. Unit tests cover the hysteresis and the four mode arms. Smoke and xfstests pass:
+generic/001, 013, 074 and 753.

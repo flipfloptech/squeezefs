@@ -6139,6 +6139,141 @@ test "THE TAIL GATE (§BW): under self-apply every member answered at the apply 
     try testing.expectEqual(@as(u32, 0), tail.used.load(.acquire));
 }
 
+test "§BX.8 which windows roll back: a self-applied window rolls back RAM only when no member was answered — every member of it answered at its landing, its undo captured — and a window with a member answered at its apply never does. A window whose only member is a landing-acked create, its write failed: rolled back (the create absent in RAM), its own tail slots gone before its error is answered. Then ONE window of two members — this mount's kernel's create (answered at its apply) and a landing-acked create — its write failed: nothing rolled back, the answered create stands, its slots stay for the supervisor's replay, the volume FAILED, the landing member answered the failure" {
+    const h = try Harness.create(.{}, null, false);
+    defer h.destroy();
+    // A tail that counts its written slots.
+    const Tail = struct {
+        lock: jc.SpinLock = .{},
+        live: [32]bool = @splat(false),
+        claims: u32 = 0,
+        fn claim(ctx: *anyopaque, _: u64, _: u64, _: []const journal.WriteOp) ?u32 {
+            const t: *@This() = @ptrCast(@alignCast(ctx));
+            t.lock.lock();
+            defer t.lock.unlock();
+            if (t.claims == t.live.len) return null;
+            const i = t.claims;
+            t.live[i] = true;
+            t.claims += 1;
+            return i;
+        }
+        fn release(ctx: *anyopaque, slot: u32) void {
+            const t: *@This() = @ptrCast(@alignCast(ctx));
+            t.lock.lock();
+            defer t.lock.unlock();
+            t.live[slot] = false;
+        }
+        fn slots(_: *anyopaque) u32 {
+            return 32;
+        }
+        fn liveCount(t: *@This()) u32 {
+            t.lock.lock();
+            defer t.lock.unlock();
+            var n: u32 = 0;
+            for (t.live[0..t.claims]) |l| n += @intFromBool(l);
+            return n;
+        }
+    };
+    var tail: Tail = .{};
+    h.cv.deps.self_apply = true;
+    h.cv.deps.ack_at_apply = true;
+    h.cv.deps.tail = .{ .ctx = &tail, .claim = Tail.claim, .release = Tail.release, .slots = Tail.slots };
+    h.threaded_pass = true;
+    const Committer = struct {
+        fn run(hh: *Harness, kernel: bool, name: []const u8, ino: *u64, out: *?anyerror) void {
+            const t = hh.gpa.create(tx.KvTx) catch unreachable;
+            defer hh.gpa.destroy(t);
+            t.* = tx.KvTx.init(hh.gpa, @src());
+            t.kernel_origin = kernel;
+            ino.* = hh.stageCreate(t, name) catch unreachable;
+            out.* = if (hh.cv.commit(t)) |_| null else |e| e;
+        }
+    };
+    const Pass = struct {
+        fn stop(hh: *Harness, th: std.Thread) void {
+            hh.pass_stop.store(true, .release);
+            hh.pass_wake.notifyOne(testing.io);
+            th.join();
+            hh.pass_stop.store(false, .release);
+        }
+    };
+    const InQueue = struct {
+        cv: *Conveyor,
+        n: usize,
+        fn ready(s: @This()) bool {
+            return s.cv.pending() == s.n;
+        }
+    };
+    const rollbacks0 = h.cv.stats.rollbacks.load();
+    const acked_failures0 = h.cv.stats.acked_write_failures.load();
+
+    // The landing-acked window: rolled back whole.
+    h.lane.fail_next = 1;
+    var ino0: u64 = 0;
+    var out0: ?anyerror = error.TestNotRun;
+    {
+        const th = try std.Thread.spawn(.{}, Committer.run, .{ h, false, "landing-only", &ino0, &out0 });
+        if (!awaitObservable(InQueue{ .cv = h.cv, .n = 1 })) return error.CommitterNeverQueued;
+        const pass = try std.Thread.spawn(.{}, Harness.passThreadMain, .{h});
+        th.join();
+        Pass.stop(h, pass);
+    }
+    try testing.expect(out0 != null);
+    try testing.expectEqual(rollbacks0 + 1, h.cv.stats.rollbacks.load());
+    try testing.expect(!try h.present(ino0));
+    // Its member's entry and its PAD left the tail before the answer; at
+    // most the PAD over its range stands (no durable ledger past it).
+    try testing.expect(tail.liveCount() <= 1);
+    const live_before = tail.liveCount();
+
+    // ONE window of both: the pass starts once both are queued; the lane
+    // holds the window, and its failed landing runs on this thread.
+    const handoffs0 = h.cv.stats.self_handoffs.load();
+    h.lane.hold = true;
+    const Held = struct {
+        lane: *RamLane,
+        fn ready(s: @This()) bool {
+            s.lane.mutex.lockUncancelable(testing.io);
+            defer s.lane.mutex.unlock(testing.io);
+            return s.lane.held.items.len == 1;
+        }
+    };
+    var ino_a: u64 = 0;
+    var ino_b: u64 = 0;
+    var out_a: ?anyerror = error.TestNotRun;
+    var out_b: ?anyerror = error.TestNotRun;
+    {
+        const ta = try std.Thread.spawn(.{}, Committer.run, .{ h, true, "at-apply", &ino_a, &out_a });
+        const tb = try std.Thread.spawn(.{}, Committer.run, .{ h, false, "at-landing", &ino_b, &out_b });
+        if (!awaitObservable(InQueue{ .cv = h.cv, .n = 2 })) return error.CommittersNeverQueued;
+        const pass = try std.Thread.spawn(.{}, Harness.passThreadMain, .{h});
+        // The kernel's create is answered at its apply, before any landing.
+        ta.join();
+        if (!awaitObservable(Held{ .lane = &h.lane })) return error.WindowNeverSubmitted;
+        log.testing.expectErrorLogs(1);
+        {
+            h.lane.mutex.lockUncancelable(testing.io);
+            defer h.lane.mutex.unlock(testing.io);
+            h.lane.failWindow(0);
+            h.lane.pump();
+            h.lane.publishHead();
+        }
+        try log.testing.expectAllFired();
+        tb.join();
+        Pass.stop(h, pass);
+    }
+    try testing.expectEqual(handoffs0 + 1, h.cv.stats.self_handoffs.load());
+    try testing.expectEqual(@as(?anyerror, null), out_a);
+    try testing.expect(out_b != null);
+    try testing.expectEqual(rollbacks0 + 1, h.cv.stats.rollbacks.load());
+    try testing.expectEqual(acked_failures0 + 1, h.cv.stats.acked_write_failures.load());
+    try testing.expect(h.latch.isFailed());
+    try testing.expect(try h.present(ino_a));
+    // Both members' entries stay written (and the window's PAD, on a
+    // padded ring).
+    try testing.expect(tail.liveCount() >= live_before + 2);
+}
+
 test "§BX a member whose apply fails re-claims its range as a PAD before its error is answered: its entry, claimed at its turn, is released only once a PAD's slot holds the same range — the death replay never applies an op answered as failed, and the range is never a hole" {
     const h = try Harness.create(.{}, null, false);
     defer h.destroy();

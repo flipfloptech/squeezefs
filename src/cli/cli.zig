@@ -22,6 +22,7 @@ pub const format = if (is_linux) @import("format.zig") else struct {};
 pub const status = if (is_linux) @import("status.zig") else struct {};
 pub const umount = if (is_linux) @import("umount.zig") else struct {};
 pub const holders = if (is_linux) @import("holders.zig") else struct {};
+pub const rt_limit = if (is_linux) @import("rt_limit.zig") else struct {};
 pub const fusermount = if (is_linux) @import("fusermount.zig") else struct {};
 pub const daemon = if (is_linux) @import("daemon.zig") else struct {};
 pub const mount = if (is_linux) @import("mount.zig") else struct {};
@@ -149,6 +150,7 @@ test {
         _ = status;
         _ = umount;
         _ = holders;
+        _ = rt_limit;
         _ = fusermount;
         _ = daemon;
         _ = mount;

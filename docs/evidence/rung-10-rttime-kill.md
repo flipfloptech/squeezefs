@@ -18,17 +18,19 @@ same way, or the `squeezefs umount` verb itself ended "terminated with signal KI
 
 The tracefs event `signal_generate` was filtered to `sig == 9` with a stack trigger. Every kill was
 `code=SI_KERNEL`, sent by the victim to itself from `posix_cpu_timers_work`: a CPU-timer rlimit at its hard
-limit. Every process started from this desktop has `RLIMIT_RTTIME` 0/0. Systemd and Hyprland have it unlimited;
-quickshell sets 0, and it passes to foot, the shells and the agents. `sudo` keeps it, so it reaches every
-venue command.
+limit. Every process started from this desktop has `RLIMIT_RTTIME` 0/0. `/proc/<pid>/limits` along the chain:
+systemd (1), the user manager, Hyprland and uwsm are unlimited; quickshell (the Omarchy shell) is 0/0, and so are
+foot, fish and grok under it, and every agent's bash. `sudo` keeps the limit, so it reached every venue command,
+the gate train's included.
 
 `RLIMIT_RTTIME` bounds a real-time thread's CPU time between blocking calls. A CFS thread counts as real time
 while the kernel boosts it: an RCU reader preempted past the boost delay (`rcub`, prio 98), or the owner of a
 PI lock. Under a gate's load, a boosted squeezefs thread takes one real-time tick. The RT watchdog then arms
 the CPU timer, and at a hard limit of 0 the process gets SIGKILL.
 
-A bpftrace run on `task_tick_rt` (policy 0 only) and `posix_cpu_timers_work` during the 16 × 8 dev loop
-recorded 4 boosted ticks at prio 98 (`sqz-fuse-ur3`, `sqz-fuse-ur27`, two `squeezefs` main threads). Each tick
+The bpftrace probe: `kprobe:task_tick_rt` printing the task (arg1) when its policy is 0 (a CFS task ticking
+in the RT class, i.e. boosted), and `kprobe:posix_cpu_timers_work` printing the current task. During the
+16 × 8 dev loop it recorded 4 boosted ticks at prio 98 (`sqz-fuse-ur3`, `sqz-fuse-ur27`, two `squeezefs` main threads). Each tick
 was followed by one CPU-timer work and one SIGKILL. That loop had exactly 4 failed runs. Nothing in
 `conveyor`/`smo` takes part.
 
@@ -39,7 +41,10 @@ was followed by one CPU-timer work and one SIGKILL. That loop had exactly 4 fail
   CAP_SYS_RESOURCE, a finite hard limit stays in place: the soft limit is raised to it, and `mount` warns with
   the value.
 - **`scripts/venue` local.** Every command, and the interactive shell, runs under `ulimit -R unlimited`. This
-  covers the test runner, its shells and zig, which the same boost can kill.
+  covers the test runner, its shells and zig, which the same boost can kill. The lift runs inside `sudo`'s
+  root shell, because an unprivileged shell under a hard 0 cannot raise it. If the kernel refuses the lift
+  (root without CAP_SYS_RESOURCE), the command prints `venue: WARNING: RLIMIT_RTTIME stays at …` and still
+  runs. Both cases were checked: from this desktop's shell, and under `capsh --drop=cap_sys_resource`.
 
 **Red** (cli "every squeezefs process lifts RLIMIT_RTTIME …", `05fbf6e`). A forked child starts at 0/0, and
 another at a finite soft limit under an unlimited hard one. Both must end unlimited. The test was red before

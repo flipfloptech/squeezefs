@@ -51,6 +51,12 @@ case $ROOT in *[[:space:]]* | [!/]*) echo "venue: SQZ_BUILD_ROOT '$ROOT' must be
 # macOS through the mount, and a Linux binary must never overwrite the host's.
 ZIG_CACHE_ARGS=(--cache-dir "$ROOT/zig-cache-v2" --prefix zig-out-linux)
 export_cache="export SQZ_BUILD_ROOT=$ROOT ZIG_GLOBAL_CACHE_DIR=$ROOT/zig-global-cache"
+# The local venue's RLIMIT_RTTIME lift, run as root AFTER sudo (an unprivileged shell under a
+# hard 0 cannot raise it): a desktop session hands its terminals 0 µs, and at 0 a process whose
+# thread the kernel boosts to real time (an RCU reader preempted under a gate's load) is
+# SIGKILLed at its first boosted tick — the daemons, the verbs, the test runner, its shells
+# (docs/evidence/rung-10-rttime-kill.md). A lift the kernel refuses is a warning; the command runs.
+lift_rttime='ulimit -R unlimited 2>/dev/null || echo "venue: WARNING: RLIMIT_RTTIME stays at $(ulimit -R) µs (hard $(ulimit -HR)): a process the kernel boosts to real time under load is SIGKILLed there (docs/evidence/rung-10-rttime-kill.md)" >&2'
 
 if [ -z "${SQZ_VENUE:-}" ] && [ "$(uname -s)" = Linux ]; then VENUE=local; else VENUE=${SQZ_VENUE:-vm}; fi
 case "$VENUE" in
@@ -180,12 +186,8 @@ run_in() {
     container exec -i ${tty[@]+"${tty[@]}"} "$NAME" bash -lc "$export_cache; cd '$REPO' && $cmd"
   elif [ "$VENUE" = local ]; then
     # Root, as in the container. Without a terminal, sudo must not wait for a password.
-    # RLIMIT_RTTIME lifted: a desktop session hands its terminals 0 µs, and at 0 a process
-    # whose thread the kernel boosts to real time (an RCU reader preempted under a gate's
-    # load) is SIGKILLed at its first boosted tick — the test runner and its shells too
-    # (docs/evidence/rung-10-rttime-kill.md).
     local nopw=(-n); [ -t 0 ] && nopw=()
-    sudo ${nopw[@]+"${nopw[@]}"} bash -lc "ulimit -R unlimited; $export_cache; cd '$REPO' && $cmd"
+    sudo ${nopw[@]+"${nopw[@]}"} bash -lc "$lift_rttime; $export_cache; cd '$REPO' && $cmd"
   else
     sync_tree
     # Root, as in the container: mount(2), fuse.enable_uring, nvmet configfs.
@@ -244,7 +246,7 @@ case "${1:-}" in
     if [ "$VENUE" = vm ]; then
       exec container exec -it "$NAME" bash -lc "cd '$REPO' && exec bash"
     fi
-    [ "$VENUE" = local ] && exec sudo bash -lc "ulimit -R unlimited; $export_cache; cd '$REPO' && exec bash"
+    [ "$VENUE" = local ] && exec sudo bash -lc "$lift_rttime; $export_cache; cd '$REPO' && exec bash"
     sync_tree
     exec "${SSH[@]}" -t "$SSH_HOST" "sudo bash -lc $(printf '%q' "cd '$REPO' && exec bash")"
     ;;

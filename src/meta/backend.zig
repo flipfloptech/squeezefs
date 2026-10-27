@@ -4512,11 +4512,13 @@ fn judgeDeath(v: *TestVol, be: *KvBackend) !journal_tail.linux_tail.Judged {
 }
 
 /// The answered-before-resident shape on either arm: A (window W1) held
-/// by `arm`'s seam before anything of it reaches the tail, B (W2, a later
-/// window) committed beside it. B is never answered while A's range is a
-/// hole the death replay would stop at: its parked answer claims A's entry
-/// (image) for A's held owner, then answers; released, A answers and the
-/// replay keeps both.
+/// by `arm`'s seam before its apply, B (W2, a later window) committed
+/// beside it. B is never answered while A's range is a hole the death
+/// replay would stop at. Self: the pass claimed A's entry right after its
+/// window's first turn, so B is answered at its own apply without parking —
+/// no answer waits on a sibling's turn. Venue: W1's image is its applier's to claim
+/// at the window's start; B's parked answer claims it for the held
+/// applier, then answers. Released, A answers and the replay keeps both.
 fn residentAnswerRow(v: *TestVol, be: *KvBackend, comptime arm: enum { self, venue }) !void {
     const Committer = struct {
         fn run(b: *KvBackend, t: *KvTx, out: *?anyerror, done: *std.atomic.Value(u32)) void {
@@ -4576,15 +4578,23 @@ fn residentAnswerRow(v: *TestVol, be: *KvBackend, comptime arm: enum { self, ven
         conveyor.test_seams.apply_release.notifyWaiters(be.io);
         released = true;
     };
-    while (done_b.load(.acquire) == 0 and cs.resident_waits.load() == waits0) std.Thread.yield() catch {};
-    // B is answered only once A is in the tail — A's owner held, B's
-    // parked answer claims A's entry (its image) itself (§BX.7's help) —
-    // so a death now replays both.
+    // B is answered only once A is in the tail, so a death now replays
+    // both (a bound against the hang only: the answer takes microseconds).
     const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
     while (done_b.load(.acquire) == 0 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
     try testing.expectEqual(@as(u32, 1), done_b.load(.acquire));
     try testing.expectEqual(@as(?anyerror, null), out_b);
-    try testing.expect(cs.resident_helps.load() > helps0);
+    switch (arm) {
+        // The pass claimed A's entry while A was held at its turn: B never
+        // parked and nothing was claimed for A by a parked answer.
+        .self => {
+            try testing.expectEqual(waits0, cs.resident_waits.load());
+            try testing.expectEqual(helps0, cs.resident_helps.load());
+        },
+        // W1's applier held before its window's start: B's parked answer
+        // claimed W1's image (§BX.7's help).
+        .venue => try testing.expect(cs.resident_helps.load() > helps0),
+    }
     {
         const j = try judgeDeath(v, be);
         try testing.expectEqual(@as(u32, 0), j.past_hole);
@@ -4605,7 +4615,7 @@ fn residentAnswerRow(v: *TestVol, be: *KvBackend, comptime arm: enum { self, ven
     try testing.expect(try present(be, ino_b));
 }
 
-test "§BX an answer at the apply waits until the journal tail holds every reservation below its window (self-apply): A's member held at its turn — nothing of A in the tail or RAM — and B, a later window, is answered only once A's entry is in the tail: B's parked answer claims it for A (§BX.7's help), so a death then replays both; released, A is answered too and the replay keeps both" {
+test "§BX an answer at the apply never waits on an earlier member's TURN (self-apply): A's member held at its turn — nothing of A in RAM, its entry claimed into the journal tail by the pass right after its window's first turn — and B, a later window, is answered at its own apply without parking and without claiming anything for A; a death then replays both; released, A is answered too and the replay keeps both (red: the entry claimed only at the member's turn — B parked and claimed A's entry for it)" {
     const v = try TestVol.create(testing.allocator, "resident-self", "600000");
     defer v.destroy();
     try v.env.put("SQUEEZEFS_META_APPLY", "self");

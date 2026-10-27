@@ -6281,6 +6281,105 @@ test "§BX.8 which windows roll back: a self-applied window rolls back RAM only 
     try testing.expect(tail.liveCount() >= live_before + 2);
 }
 
+test "§BX the pass claims every member's entry right after the window's first turn: a member held at its turn — its apply not begun, as if its lane's thread had not reached it — gets its entry in the journal tail without running, and its window becomes resident (the registry's resident prefix past it), so no later answer waits on its turn; released, it is answered at its apply and present" {
+    const h = try Harness.create(.{}, null, false);
+    defer h.destroy();
+    const io = testing.io;
+    // A tail that logs the position of every claim.
+    const Tail = struct {
+        lock: jc.SpinLock = .{},
+        pos: [8]u64 = @splat(0),
+        claims: u32 = 0,
+        fn claim(ctx: *anyopaque, _: u64, pos: u64, _: []const journal.WriteOp) ?u32 {
+            const t: *@This() = @ptrCast(@alignCast(ctx));
+            t.lock.lock();
+            defer t.lock.unlock();
+            if (t.claims == t.pos.len) return null;
+            const i = t.claims;
+            t.pos[i] = pos;
+            t.claims += 1;
+            return i;
+        }
+        fn release(_: *anyopaque, _: u32) void {}
+        fn slots(_: *anyopaque) u32 {
+            return 8;
+        }
+        fn holds(t: *@This(), pos: u64) bool {
+            t.lock.lock();
+            defer t.lock.unlock();
+            for (t.pos[0..t.claims]) |p| if (p == pos) return true;
+            return false;
+        }
+    };
+    var tail: Tail = .{};
+    h.cv.deps.self_apply = true;
+    h.cv.deps.ack_at_apply = true;
+    h.cv.deps.tail = .{ .ctx = &tail, .claim = Tail.claim, .release = Tail.release, .slots = Tail.slots };
+    h.lane.hold = true;
+    h.threaded_pass = true;
+    const pass_thread = try std.Thread.spawn(.{}, Harness.passThreadMain, .{h});
+    defer {
+        while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
+        h.cv.quiesce();
+        h.pass_stop.store(true, .release);
+        h.pass_wake.notifyOne(io);
+        pass_thread.join();
+    }
+    const Committer = struct {
+        fn run(hh: *Harness, t: *tx.KvTx, out: *?anyerror, done: *std.atomic.Value(u32)) void {
+            out.* = if (hh.cv.commit(t)) |_| null else |e| e;
+            done.store(1, .release);
+        }
+    };
+    const t = try h.gpa.create(tx.KvTx);
+    defer h.gpa.destroy(t);
+    t.* = tx.KvTx.init(h.gpa, @src());
+    t.kernel_origin = true;
+    const ino = try h.stageCreate(t, "held-at-turn");
+    test_seams.hold_at.store(.turn, .release);
+    test_seams.hold_member_ino.store(ino, .release);
+    var out: ?anyerror = error.TestNotRun;
+    var done = std.atomic.Value(u32).init(0);
+    const th = try std.Thread.spawn(.{}, Committer.run, .{ h, t, &out, &done });
+    defer th.join();
+    // Every exit releases the member before it joins (a red run leaves it held).
+    var released = false;
+    defer if (!released) {
+        test_seams.hold_member_ino.store(0, .release);
+        test_seams.apply_release.notifyWaiters(io);
+    };
+    const Held = struct {
+        fn ready(_: @This()) bool {
+            return test_seams.member_held.load(.acquire) != 0;
+        }
+    };
+    if (!awaitObservable(Held{})) return error.MemberNeverHeld;
+    test_seams.member_held.store(0, .release);
+    // Its window — the one reservation open — starts with its entry: the
+    // pass claims it while the member is held.
+    const Claimed = struct {
+        h: *Harness,
+        tail: *Tail,
+        fn ready(s: @This()) bool {
+            return s.tail.holds(s.h.cv.deps.reg.minInflightStart()) and s.h.cv.deps.reg.residentUpto() == std.math.maxInt(u64);
+        }
+    };
+    if (!awaitObservable(Claimed{ .h = h, .tail = &tail })) return error.EntryNeverClaimed;
+    test_seams.hold_member_ino.store(0, .release);
+    test_seams.apply_release.notifyWaiters(io);
+    released = true;
+    const Answered = struct {
+        d: *std.atomic.Value(u32),
+        fn ready(s: @This()) bool {
+            return s.d.load(.acquire) != 0;
+        }
+    };
+    if (!awaitObservable(Answered{ .d = &done })) return error.MemberNeverAnswered;
+    try testing.expectEqual(@as(?anyerror, null), out);
+    while (h.cv.windowsInflight() != 0) _ = h.lane.landDue(0);
+    try testing.expect(try h.present(ino));
+}
+
 test "§BX a member whose apply fails re-claims its range as a PAD before its error is answered: its entry, claimed at its turn, is released only once a PAD's slot holds the same range — the death replay never applies an op answered as failed, and the range is never a hole" {
     const h = try Harness.create(.{}, null, false);
     defer h.destroy();

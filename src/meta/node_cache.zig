@@ -664,6 +664,13 @@ pub const CachedNode = struct {
     dirty_floor: std.atomic.Value(u64),
     /// The slot tree this node belongs to on a forest volume (RAM-only).
     forest_slot: std.atomic.Value(u32),
+    /// The maintenance queue's coalescing word (`tree.KvTree.enqueueMaintenance`):
+    /// set by the threshold crossing that queued this address, so every
+    /// later crossing while it stands is the SAME request; cleared by the
+    /// drain at the pop, BEFORE it takes the node's lock, so a crossing the
+    /// drain's freeze does not see queues the node again
+    /// (`tree.MaintenanceCoalesceModel`).
+    maintenance_queued: std.atomic.Value(bool),
     /// `clock.monotonicNs()` of the crossing that queued the node (0 =
     /// none): the freeze that takes it records `meta_kv_threshold_to_freeze`.
     maintenance_queued_ns: std.atomic.Value(u64),
@@ -734,6 +741,7 @@ pub const CachedNode = struct {
             .pinned = .init(pinned),
             .dirty_floor = .init(no_floor),
             .forest_slot = .init(no_forest_slot),
+            .maintenance_queued = .init(false),
             .maintenance_queued_ns = .init(0),
         };
         if (pinned) cache.pinned_nodes.add(1);
@@ -808,10 +816,33 @@ pub const CachedNode = struct {
         return self.pinned.load(.acquire);
     }
 
-    /// A threshold crossing queued the node: the first since the last
-    /// freeze stamps it.
-    pub fn noteMaintenanceQueued(self: *CachedNode) void {
-        _ = self.maintenance_queued_ns.cmpxchgStrong(0, clock.monotonicNs(), .monotonic, .monotonic);
+    /// The pusher's half of the maintenance queue's coalescing protocol:
+    /// true when THIS crossing queues the node (the caller pushes its
+    /// address and stamps the crossing), false when an entry already
+    /// stands for it. acq_rel pairs with `maintenanceDequeued`'s release.
+    pub fn claimMaintenanceQueue(self: *CachedNode) bool {
+        if (self.maintenance_queued.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return false;
+        self.maintenance_queued_ns.store(clock.monotonicNs(), .monotonic);
+        return true;
+    }
+
+    /// A push the queue refused: the word goes back so the next crossing
+    /// tries again.
+    pub fn abandonMaintenanceClaim(self: *CachedNode) void {
+        self.maintenance_queued_ns.store(0, .monotonic);
+        self.maintenance_queued.store(false, .release);
+    }
+
+    /// The drain's half: the popped node's word is cleared BEFORE the drain
+    /// takes the node's lock. A committer applies under that lock, unlocks,
+    /// then claims: one that claims after this clear pushes again, and one
+    /// that found the word set applied before the drain's lock section,
+    /// which therefore freezes its records — no crossing is lost. Clearing
+    /// after the freeze is the weakening `tree.MaintenanceCoalesceModel`
+    /// fails (a crossing inside the drain's lock window is coalesced into an
+    /// entry that was already popped).
+    pub fn maintenanceDequeued(self: *CachedNode) void {
+        self.maintenance_queued.store(false, .release);
     }
 
     /// The crossing stamp, taken by the freeze (0 = the node was not queued).

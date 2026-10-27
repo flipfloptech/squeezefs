@@ -77,6 +77,10 @@ pub const stats = struct {
     /// Threshold crossings handed to `enqueueMaintenance` (every apply
     /// that left a leaf's open delta at or past the writeback threshold).
     pub var meta_kv_maintenance_enqueues: counters.ShardedCounter = .{};
+    /// Crossings coalesced into the entry already queued for the node
+    /// (`CachedNode.maintenance_queued`): one request per leaf, however
+    /// many commits land on it before the drain pops it.
+    pub var meta_kv_maintenance_coalesced: counters.ShardedCounter = .{};
 };
 
 // ---------------------------------------------------------------------------
@@ -199,9 +203,10 @@ pub const MAINTENANCE_QUEUE_FLOOR: u64 = 64;
 pub const MAINTENANCE_QUEUE_CAP: u64 = 1 << 20;
 
 /// `clamp(next_pow2(budget_nodes), 64, 2^20)`: every node the cache can
-/// hold queues once legitimately (an address is re-queued only after its
-/// pop); duplicates beyond that are benign to drop — the flush pass's
-/// dirty walk flushes what the queue could not name.
+/// hold queues once (`CachedNode.maintenance_queued` coalesces a node's
+/// crossings into the one entry standing for it until the drain pops it),
+/// so a queue this size refuses only a cache pinned past its budget — a
+/// counted deferral the flush pass's dirty walk covers.
 pub fn maintenanceQueueCapacity(budget_nodes: u64) usize {
     return @intCast(derive.clamp(derive.nextPow2(@max(budget_nodes, 1)), MAINTENANCE_QUEUE_FLOOR, MAINTENANCE_QUEUE_CAP));
 }
@@ -667,12 +672,21 @@ pub const KvTree = struct {
     }
 
     /// A threshold crossing on `n`: queue it for the next maintenance pass
-    /// (duplicates benign; a full queue is a counted deferral the dirty
-    /// walk covers).
+    /// unless an entry already stands for it (the node's coalescing word —
+    /// every commit past the threshold used to push the address again, so
+    /// a hot leaf filled its tree's queue with itself and the crossings of
+    /// every other leaf were refused). A full queue is a counted deferral
+    /// the dirty walk covers.
     pub fn enqueueMaintenance(self: *KvTree, n: *CachedNode) void {
         stats.meta_kv_maintenance_enqueues.inc();
-        n.noteMaintenanceQueued();
-        if (!self.maintenance.push(n.addr)) stats.meta_kv_maintenance_queue_full.inc();
+        if (!n.claimMaintenanceQueue()) {
+            stats.meta_kv_maintenance_coalesced.inc();
+            return;
+        }
+        if (!self.maintenance.push(n.addr)) {
+            n.abandonMaintenanceClaim();
+            stats.meta_kv_maintenance_queue_full.inc();
+        }
     }
 
     /// `enqueueMaintenance` for a caller holding only the address (a
@@ -684,6 +698,9 @@ pub const KvTree = struct {
         self.enqueueMaintenance(n);
     }
 
+    /// The next queued address. The popper clears the node's coalescing
+    /// word (`CachedNode.maintenanceDequeued`) once it holds the node and
+    /// before it takes the node's lock.
     pub fn popMaintenance(self: *KvTree) ?u64 {
         return self.maintenance.pop();
     }
@@ -1474,6 +1491,99 @@ fn MaintenanceQueueModel(comptime publish_before_payload: bool) type {
 test "model: the maintenance queue publishes each address exactly once; the stamp-before-payload weakening pops a stale slot" {
     try explorer.expectHolds(MaintenanceQueueModel(false), .{});
     try explorer.expectFails(MaintenanceQueueModel(true), .{}, error.InvariantViolated);
+}
+
+/// The coalescing word's MODEL (charter §9): two committers, one drain,
+/// one leaf. A committer's crossing is its apply (`delta += 1`, under the
+/// leaf lock: one step) then the CAS on the word — a win pushes the ONE
+/// entry, a loss is coalesced. The drain pops, clears the word, freezes
+/// (`delta = 0`, under the lock: one step), and leaves once the queue is
+/// empty and every committer is done. The queue is the entry count (its
+/// own protocol is `MaintenanceQueueModel`). Holds: at most ONE entry ever
+/// stands for the leaf, and no crossing is lost — every applied record is
+/// frozen by the end. `clear_after_freeze` is the WEAKENING: the drain
+/// clears the word after its freeze, so a crossing applied after the
+/// freeze and claimed before the clear is coalesced into an entry already
+/// popped, and its delta is still open when everything is quiet.
+fn MaintenanceCoalesceModel(comptime clear_after_freeze: bool) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 3;
+        const crossings: u8 = 2;
+
+        delta: u8 = 0,
+        queued_word: bool = false,
+        queued: u8 = 0,
+        pc: [3]u8 = @splat(0),
+        left: [2]u8 = .{ crossings, crossings },
+        too_many: bool = false,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return self.pc[t] == 255;
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            if (t < 2) {
+                // Committer: 0 apply; 1 CAS the word (a win pushes).
+                switch (self.pc[t]) {
+                    0 => {
+                        self.delta += 1;
+                        self.pc[t] = 1;
+                    },
+                    1 => {
+                        if (!self.queued_word) {
+                            self.queued_word = true;
+                            self.queued += 1;
+                            if (self.queued > 1) self.too_many = true;
+                        }
+                        self.left[t] -= 1;
+                        self.pc[t] = if (self.left[t] == 0) 255 else 0;
+                    },
+                    else => unreachable,
+                }
+                return;
+            }
+            // Drain: 0 pop (or leave); 1 and 2 the clear and the freeze, in
+            // the order the weakening selects.
+            switch (self.pc[t]) {
+                0 => {
+                    if (self.queued > 0) {
+                        self.queued -= 1;
+                        self.pc[t] = 1;
+                    } else if (self.pc[0] == 255 and self.pc[1] == 255) {
+                        self.pc[t] = 255;
+                    }
+                },
+                1 => {
+                    if (clear_after_freeze) self.delta = 0 else self.queued_word = false;
+                    self.pc[t] = 2;
+                },
+                2 => {
+                    if (clear_after_freeze) self.queued_word = false else self.delta = 0;
+                    self.pc[t] = 0;
+                },
+                else => unreachable,
+            }
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            if (self.too_many) return error.TwoEntriesForOneLeaf;
+        }
+
+        pub fn final(self: *const Self) !void {
+            if (self.delta != 0) return error.LostCrossing;
+            if (self.queued != 0) return error.NotDrained;
+        }
+    };
+}
+
+test "model: the coalescing word queues a leaf once and loses no crossing; clearing it after the freeze leaves a crossing open with nothing queued" {
+    try explorer.expectHolds(MaintenanceCoalesceModel(false), .{});
+    try explorer.expectFails(MaintenanceCoalesceModel(true), .{}, error.FinalViolated);
 }
 
 test "interior value roundtrip and bounds (the traversal's pointer format)" {

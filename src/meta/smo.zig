@@ -1288,18 +1288,30 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
 // Writeback and the maintenance drain.
 // ---------------------------------------------------------------------------
 
+/// What a popped node below the writeback threshold gets.
+pub const MaintainPosture = enum {
+    /// The threshold drain's: a node whose open delta is back below the
+    /// threshold with nothing frozen (the checkpoint's flush pass took the
+    /// crossing first) is left alone — a frame for a few records would
+    /// spend a 4 KiB page of its log on padding.
+    threshold,
+    /// `flushDirty`'s: whatever is open is frozen and written.
+    forced,
+};
+
 /// Writeback / SMO for one popped node: freeze under the lock, append
 /// outside it; a full log compacts; an oversized fold splits. Threshold
 /// posture: the §4.7 FIFO valve applies.
-pub fn maintainNode(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *MaintenanceOutcome) Error!void {
+pub fn maintainNode(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *MaintenanceOutcome, posture: MaintainPosture) Error!void {
     const cache = t.cache;
     if (n.state.isSuperseded() or !t.owns(n)) return;
     const frozen = blk: {
         const d = n.lockWrite(cache.io);
         defer n.unlockWrite(cache.io);
+        if (posture == .threshold and !d.hasFrozen() and d.overlayBytes() < cache.cfg.writeback_delta_bytes) break :blk false;
         break :blk (try n.freezeLocked(d, cache.cfg.layout)) != null;
     };
-    if (!frozen) return; // spurious enqueue
+    if (!frozen) return;
     if (try cache.appendFrozen(n)) {
         out.appends += 1;
         // Re-enqueue if commits re-dirtied past the threshold while the
@@ -1310,11 +1322,14 @@ pub fn maintainNode(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintena
     try smoReplace(t, ctx, n, out, false);
 }
 
-/// Pop the next queued node of `t` (retained); null when the queue is
-/// empty. Addresses the cache no longer maps are skipped.
+/// Pop the next queued node of `t`: the retained node with its coalescing
+/// word cleared (`CachedNode.maintenanceDequeued` — before any lock, so a
+/// crossing from here on queues it again); null when the queue is empty.
+/// Addresses the cache no longer maps are skipped.
 pub fn popMaintenanceNode(t: *KvTree) ?*CachedNode {
     while (t.popMaintenance()) |addr| {
         const n = t.cache.tryGet(addr) orelse continue; // evicted/retired since enqueue
+        n.maintenanceDequeued();
         return n;
     }
     return null;
@@ -1338,7 +1353,7 @@ pub fn runMaintenanceUntil(t: *KvTree, ctx: *SmoContext, deadline: ?u64) Error!M
             };
         }
         progressed = true;
-        try maintainNode(t, ctx, n, &out);
+        try maintainNode(t, ctx, n, &out, .threshold);
     }
     return out;
 }
@@ -1375,7 +1390,10 @@ pub fn flushDirty(t: *KvTree, ctx: *SmoContext) Error!MaintenanceOutcome {
         if (c.failed) return error.OutOfMemory;
         if (dirty.items.len == 0 and !t.maintenancePending()) return out;
         for (dirty.items) |a| t.enqueueMaintenanceAddr(a);
-        out.add(try runMaintenance(t, ctx));
+        while (popMaintenanceNode(t)) |n| {
+            defer n.release();
+            try maintainNode(t, ctx, n, &out, .forced);
+        }
     }
     log.err("tree {d}: flushDirty never converged (writeback keeps re-dirtying — SMO bug)", .{t.tree_id});
     return error.RetryBudgetExhausted;
@@ -2814,17 +2832,19 @@ test "runMaintenanceUntil: an expired deadline still runs the first item (the pr
     defer vol.deinit();
     const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
-    for (0..20) |i| try t.insert(&ikey(i), tree.testValue(i, 24, &buf));
-    const root = try vol.cache.get(t.rootPtr().addr);
-    defer root.release();
-    t.enqueueMaintenance(root);
-    t.enqueueMaintenance(root);
-    t.enqueueMaintenance(root);
+    // Past the threshold: the inserts queue the root leaf once (coalesced).
+    for (0..200) |i| try t.insert(&ikey(i), tree.testValue(i, 24, &buf));
+    try testing.expectEqual(@as(usize, 1), t.maintenanceDepth());
+    // Two more entries for the same leaf, pushed raw (the shape of a
+    // requeue racing the pop): the rest the expired deadline hands back.
+    const addr = t.rootPtr().addr;
+    try testing.expect(t.maintenance.push(addr));
+    try testing.expect(t.maintenance.push(addr));
     const out = try runMaintenanceUntil(t, &vol.ctx, clock.monotonicNs());
     try testing.expectEqual(@as(u64, 1), out.appends);
     try testing.expect(t.maintenancePending());
     const rest = try runMaintenance(t, &vol.ctx);
-    try testing.expectEqual(@as(u64, 0), rest.appends); // spurious re-enqueues
+    try testing.expectEqual(@as(u64, 0), rest.appends); // the leaf is below the threshold again: left alone
     try testing.expect(!t.maintenancePending());
 }
 
@@ -2861,9 +2881,11 @@ test "the maintenance queue coalesces a leaf's crossings into ONE entry: a hot l
     // ~90 of them, so > 64 crossings — more than the queue holds.
     const full0 = tree.stats.meta_kv_maintenance_queue_full.load();
     const enq0 = tree.stats.meta_kv_maintenance_enqueues.load();
+    const coalesced0 = tree.stats.meta_kv_maintenance_coalesced.load();
     for (0..200) |i| try t.insert(&ikey(i), tree.testValue(i, 24, &buf));
     const crossings = tree.stats.meta_kv_maintenance_enqueues.load() - enq0;
     try testing.expect(crossings > 64);
+    try testing.expectEqual(crossings - 1, tree.stats.meta_kv_maintenance_coalesced.load() - coalesced0);
     try testing.expectEqual(@as(usize, 1), t.maintenanceDepth());
     try testing.expectEqual(full0, tree.stats.meta_kv_maintenance_queue_full.load());
 

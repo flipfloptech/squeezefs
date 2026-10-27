@@ -168,6 +168,11 @@ pub const FlushDisposition = enum {
     /// The node was superseded between collection and its lock (its floor
     /// travelled with the dying floors).
     skipped,
+    /// A threshold pop found the node below the threshold with nothing
+    /// frozen: the cycle's flush pass took its crossing. Nothing written —
+    /// a frame for the few records since would spend a 4 KiB page of the
+    /// node's log on padding.
+    idle,
     /// SMO reserve exhausted: floor restored, next cycle (never a park).
     deferred_reserve,
     /// A threshold SMO found no pending-free FIFO headroom (the §4.7
@@ -236,7 +241,9 @@ pub const SmoOutcome = union(enum) {
 /// writeback threshold inert on every mounted volume.
 pub const MaintenanceSource = struct {
     ctx: *anyopaque,
-    /// The next queued address, or null when every queue is empty.
+    /// The next queued address, or null when every queue is empty. The
+    /// popper clears the node's coalescing word once it holds the node
+    /// (`CachedNode.maintenanceDequeued`), before any lock.
     pop: *const fn (ctx: *anyopaque) ?u64,
     /// Whether anything is queued (the task's re-arm test).
     pending: *const fn (ctx: *anyopaque) bool,
@@ -267,8 +274,11 @@ pub const MaintenanceSource = struct {
 
     fn queueRequeue(ctx: *anyopaque, n: *CachedNode) void {
         const q: *tree.MaintenanceQueue = @ptrCast(@alignCast(ctx));
-        n.noteMaintenanceQueued();
-        if (!q.push(n.addr)) tree.stats.meta_kv_maintenance_queue_full.inc();
+        if (!n.claimMaintenanceQueue()) return;
+        if (!q.push(n.addr)) {
+            n.abandonMaintenanceClaim();
+            tree.stats.meta_kv_maintenance_queue_full.inc();
+        }
     }
 };
 
@@ -362,7 +372,10 @@ pub const CacheFlusher = struct {
                     taken = ff.floor;
                     break :blk ff.frozen;
                 },
-                .threshold => break :blk (n.freezeLocked(d, layout) catch |e| return freezeFailure(e)) != null,
+                .threshold => {
+                    if (!d.hasFrozen() and open_bytes < self.cache.config().writeback_delta_bytes) return .{ .disposition = .idle };
+                    break :blk (n.freezeLocked(d, layout) catch |e| return freezeFailure(e)) != null;
+                },
             }
         };
         if (!frozen) return .{ .disposition = .discharged };
@@ -867,6 +880,8 @@ pub const Checkpointer = struct {
                     log.err("checkpoint: the flush pass's forced SMO at node 0x{x} answered PendingFreeFull — the §4.7 cycle-break is broken; the cycle fails", .{n.addr});
                     return error.Corrupt;
                 },
+                // The checkpoint mode freezes whatever is open.
+                .idle => unreachable,
                 .failed => return failureError(r.failure),
             }
         }
@@ -1176,14 +1191,19 @@ pub const Checkpointer = struct {
             const addr = src.pop(src.ctx) orelse break;
             const n = self.deps.cache.tryGet(addr) orelse continue;
             defer n.release();
+            // The coalescing word goes back before the node's lock is
+            // taken: a crossing from here on queues the node again.
+            n.maintenanceDequeued();
             const t0 = clock.monotonicNs();
             const r = self.deps.flush.flush(self.deps.flush.ctx, n, .{ .mode = .threshold });
             const wall = clock.monotonicNs() -| t0;
             ckpt.stats.meta_kv_maintenance_items.inc();
             ckpt.stats.meta_kv_maintenance_item.record(wall);
-            // A pop whose node had nothing to freeze (an entry behind the
-            // one that froze it).
-            if (r.disposition == .discharged) ckpt.stats.meta_kv_maintenance_idle_pops.inc();
+            if (r.disposition == .idle) {
+                ckpt.stats.meta_kv_maintenance_idle_pops.inc();
+                self.reserve_deferred_addr = null;
+                continue;
+            }
             sample.note(wall, r.images);
             switch (r.disposition) {
                 .deferred_reserve, .deferred_pending_free => {
@@ -1199,6 +1219,7 @@ pub const Checkpointer = struct {
                 .deferred_space => _ = self.posture.enter(self.cfg.volume, "threshold maintenance: the SMO could not claim an extent", self.spaceSnapshot()),
                 .failed => return failureError(r.failure),
                 .discharged, .appended, .replaced, .skipped, .deferred_grant, .declined => self.reserve_deferred_addr = null,
+                .idle => unreachable,
             }
         }
         self.noteFlushPass(sample);
@@ -1447,7 +1468,9 @@ const TestVol = struct {
         v.ram = try node_cache.RamLoader.init(gpa, @intCast(EXTENTS * NODE_SIZE));
         errdefer v.ram.deinit(gpa);
         v.layout = try node.NodeLayout.new(NODE_SIZE, null);
-        v.cache = try NodeCache.init(gpa, testing.io, .{ .layout = v.layout, .heap_base = 0, .budget_bytes = EXTENTS * NODE_SIZE, .writeback_delta_bytes = std.math.maxInt(usize) }, v.ram.loader());
+        // The harness queues nodes by hand (`v.maintenance.push`), each push
+        // standing for a crossing: any open record is over the threshold.
+        v.cache = try NodeCache.init(gpa, testing.io, .{ .layout = v.layout, .heap_base = 0, .budget_bytes = EXTENTS * NODE_SIZE, .writeback_delta_bytes = 1 }, v.ram.loader());
         errdefer v.cache.deinit();
         v.core = jc.JournalCore.init(.{ .page_data_len = 4072, .pages = RING_PAGES, .reserve_bytes = 4072 * 4, .grain = 1 }, 0, 0);
         v.inflight = try jc.InflightRegistry.init(gpa, 0, 16);

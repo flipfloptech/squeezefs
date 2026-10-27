@@ -81,3 +81,24 @@ measure on a quiet host.
 on for M0 then off, and off for M0 then on. The residency weakenings fail in each pattern. Model 16 holds with
 the pass's switch on and off. Unit tests cover the hysteresis and the four mode arms. Smoke and xfstests pass:
 generic/001, 013, 074 and 753.
+
+## The A-B-B-A (2026-10-27, quiet host on AC power, the RAM-NVMe perf mount, dist builds)
+
+`dev` `d0cf1f3` against the adaptive branch (`SQUEEZEFS_META_PASS_CLAIMS=auto`, the code of `d60162b`), two
+A-B-B-A rounds (four legs per arm), `mpirun mdtest -n 10000 -u -i 1`, gate lock and every build slot held,
+tctl ≤ 64 °C, fsck clean after all 16 runs; k ops/s, the mean of the four legs:
+
+| | -np 32 dev | -np 32 auto | Δ | -np 64 dev | -np 64 auto | Δ |
+|---|---|---|---|---|---|---|
+| file creation | 184 | 189 | +2.3 % | 176 | 190 | +8.3 % |
+| file removal | 230 | 231 | +0.7 % | 220 | 256 | +16.1 % |
+| directory creation | 203 | 202 | −0.7 % | 198 | 193 | −2.6 % |
+| directory removal | 210 | 207 | −1.2 % | 209 | 219 | +4.4 % |
+
+The three minus signs sit inside the spread of `dev`'s own legs (191–222 k on directory removal at -np 64),
+so -np 32 is neutral and -np 64 gains on the file rows. For the record, the arms that did NOT land: the
+unconditional pass claims (`always`) read −7.2 / −5.6 / −3.0 / −2.7 % at -np 32 and +6.6 / +7.0 / +7.1 / +9.6 %
+at -np 64; the SMO entry in the tail alone (`perf/smo-tail`) read noise (−7.4 … +5.3 %); the handout before
+the first turn alone read −3.0 / +2.9 / +3.2 / −5.2 % and +0.2 / +9.4 / −7.8 / +3.6 %. Landed (gate 154 green,
+75/75). Sessions: `/build/perf/hc4-abba/`, `/build/perf/hc5-abba/` (auto), `hc-abba/`, `hc2-abba/`, `hc3-abba/`,
+`hc-bisect/`, `st-abba/` (the arms that did not land).

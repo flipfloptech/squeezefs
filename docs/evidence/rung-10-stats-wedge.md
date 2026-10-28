@@ -43,11 +43,16 @@ the budget's sampled gauges, the renderer's sampler law, the seqlock model.
 
 **The counts** (the fix, supervised, mdtest -np 32 in a loop beside the readers, 10 min each).
 
-| readers | reads | p50 | p99 | max read | longest worker pass | probe misses | watchdog / tripwires |
-|---|---|---|---|---|---|---|---|
-| 32 | 1,910,198 | 6 ms | 20 ms | 95 ms | (gauge predates the run) | 0 | 0 / 0 |
-| 64 | see `~/tmp/stats-wedge/f64` | | | | | 0 | 0 / 0 |
-| 128 | see `~/tmp/stats-wedge/f128` | | | | | 0 | 0 / 0 |
+| readers | reads | p50 | p99 | max read | longest worker pass | probe misses | watchdog / tripwires | mdtest runs |
+|---|---|---|---|---|---|---|---|---|
+| 32 | 1,910,198 | 6 ms | 20 ms | 95 ms | (gauge predates the run) | 0 | 0 / 0 | 10 |
+| 64 | 1,958,465 | 12 ms | 72 ms | 210 ms | 32 ms | 0 | 0 / 0 | 7 |
+| 128 | 1,967,416 | 22 ms | 126 ms | 565 ms | 98 ms | 0 | 0 / 0 | 6 |
+
+No read failed in any run (the 0-byte reads of the dev runs were `ENOTCONN` on the aborted mount). The
+smoke rows that read `.stats`, the supervised and kill rows, xfstests generic/001 and 013 (fsck 0
+findings), the unit filters fuse / cli / stats / budget / exec / counters, `zig build rails` and `zig fmt`
+pass on the head.
 
 Idle box: one read 27 → 1–4 ms; 32 readers p50 4.7 s / max 21.5 s → p50 5 ms / max 36 ms; every
 `mincore` and `/proc` open on `sqz-membudget`, none on a lane.

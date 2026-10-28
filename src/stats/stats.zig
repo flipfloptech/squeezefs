@@ -213,8 +213,18 @@ const zero_cpu: SampledCpu = .{};
 pub const SampledCpu = struct {
     seq: std.atomic.Value(u32) = .init(0),
     sample: cpu_class.Sample = .{ .total_ns = 0, .by_class = @splat(0) },
+    /// `clock.monotonicNs()` of the last publish (0 = none): the age the
+    /// document prints beside the census (§CC.6).
+    at_ns: std.atomic.Value(u64) = .init(0),
+
+    /// Milliseconds since the last publish; 0 before the first.
+    pub fn ageMs(self: *const SampledCpu) u64 {
+        const at = self.at_ns.load(.monotonic);
+        return if (at == 0) 0 else (clock.monotonicNs() -| at) / std.time.ns_per_ms;
+    }
 
     pub fn publish(self: *SampledCpu, s: cpu_class.Sample) void {
+        self.at_ns.store(clock.monotonicNs(), .monotonic);
         const open = self.seq.load(.monotonic) + 1;
         // seq_cst: the odd word is ordered before every field store, so a
         // reader's even `before` and equal re-read bracket no field write
@@ -696,6 +706,9 @@ fn writeOps(_: *Sources, w: *Writer) Error!void {
 /// the daemon-owned associations (`mount_fabric.Plan`) render in the same
 /// object.
 fn writeNvmet(src: *Sources, w: *Writer) Error!void {
+    // The `fabric_*` gauges' age (§CC.6), stamped into the namespace's
+    // gauge so the generated writer carries it.
+    if (is_linux) nvmet_stats.fabric_sampled_age_ms.set(nvmet_initiator.sampledAgeMs());
     try w.writeByte('{');
     const any = try counters.writeNamespaceEntries(nvmet_stats, w);
     if (is_linux) if (src.fabric) |plan| {
@@ -733,10 +746,12 @@ fn writeJobs(_: *Sources, w: *Writer) Error!void {
 }
 
 /// The sampler's last CPU census (one consistent copy through the
-/// seqlock): the per-thread classes were read BEFORE the process total so
-/// `Σ classes ≤ total` (the sample's own law) holds for it.
+/// seqlock), its age beside it: the per-thread classes were read BEFORE
+/// the process total so `Σ classes ≤ total` (the sample's own law) holds.
 fn writeCpu(src: *Sources, w: *Writer) Error!void {
-    try src.cpu.read().writeJson(w);
+    try w.print("{{\"daemon_cpu_sampled_age_ms\":{d},", .{src.cpu.ageMs()});
+    try src.cpu.read().writeFields(w);
+    try w.writeByte('}');
 }
 
 /// The cluster wire's `cluster_wire_*` family (`wire/stats.zig`).
@@ -881,14 +896,12 @@ pub fn closure() Closure {
 // ---------------------------------------------------------------------------
 
 /// A rendered payload: the capacity the render reserved and the bytes it
-/// used (`bytes()`), freed whole, and how long the render took (the share
-/// window of the generation it becomes, `virtual_inodes.Owned.render_ns`).
-/// The payload ends with ONE `\n` and no padding (`finish_virtual_payload`'s
-/// law: `attr.size` is exactly the served bytes).
+/// used (`bytes()`), freed whole. The payload ends with ONE `\n` and no
+/// padding (`finish_virtual_payload`'s law: `attr.size` is exactly the
+/// served bytes).
 pub const Payload = struct {
     buf: []u8,
     len: usize,
-    render_ns: u64,
 
     pub fn bytes(self: Payload) []const u8 {
         return self.buf[0..self.len];
@@ -961,7 +974,6 @@ pub const Renderer = struct {
     /// The `.stats` document. One allocation when the hint holds
     /// (`stats_build_regrows` counts the renders it did not).
     pub fn render(self: *Renderer) Allocator.Error!Payload {
-        const t0 = clock.monotonicNs();
         // The snapshot pointer must follow the renderer (a moved Renderer).
         self.sources.cpu = &self.cpu_sample;
         var out: Writer.Allocating = try .initCapacity(self.gpa, capacityHint(self.last_len.load(.monotonic)));
@@ -970,12 +982,11 @@ pub const Renderer = struct {
         writeAll(&self.sources, &out.writer) catch return error.OutOfMemory;
         out.writer.writeByte('\n') catch return error.OutOfMemory;
         if (out.writer.buffer.len != cap) stats.stats_build_regrows.inc();
-        return self.finish(&out, t0, true);
+        return self.finish(&out, true);
     }
 
     /// `.config`: the live twin of `status`' set summary.
     pub fn renderConfig(self: *Renderer, write_set: *const fn (*anyopaque, *Writer) Error!void, ctx: *anyopaque) Allocator.Error!Payload {
-        const t0 = clock.monotonicNs();
         var out: Writer.Allocating = try .initCapacity(self.gpa, 4096);
         errdefer out.deinit();
         const w = &out.writer;
@@ -990,12 +1001,12 @@ pub const Renderer = struct {
         w.writeAll(",\"sqdata_uri\":") catch return error.OutOfMemory;
         writeJsonString(w, self.sources.mount.sqdata_uri) catch return error.OutOfMemory;
         w.writeAll("}\n") catch return error.OutOfMemory;
-        return self.finish(&out, t0, false);
+        return self.finish(&out, false);
     }
 
     /// `hint`: this render's length is the next `.stats` render's capacity
     /// hint (a `.config` payload is not).
-    fn finish(self: *Renderer, out: *Writer.Allocating, t0: u64, hint: bool) Payload {
+    fn finish(self: *Renderer, out: *Writer.Allocating, hint: bool) Payload {
         const len = out.writer.end;
         const buf = out.writer.buffer;
         out.writer.buffer = &.{};
@@ -1003,7 +1014,7 @@ pub const Renderer = struct {
         if (hint) self.last_len.store(len, .monotonic);
         stats.stats_builds.inc();
         if (len > stats.stats_build_bytes_max.load()) stats.stats_build_bytes_max.set(len);
-        return .{ .buf = buf, .len = len, .render_ns = clock.monotonicNs() -| t0 };
+        return .{ .buf = buf, .len = len };
     }
 };
 
@@ -1417,7 +1428,7 @@ test "renderConfig: build + mount + the set writer's object + the URIs, one newl
     try testing.expect(std.mem.indexOf(u8, p.bytes(), "\"set\":{\"block_size\":4194304},\"sqmeta_uri\":\"sqmeta:///dev/m\",\"sqdata_uri\":\"sqdata:///dev/d\"}\n") != null);
 }
 
-test "render: eight threads rendering ONE renderer concurrently beside a sampler thread (the CPU census walking /proc/self/task, published through the seqlock) — no render walks /proc (the ledger is the sampler's alone), every document parses, every CPU family read is a whole sample (Σ classes ≤ total), the classes never fall, and a render carries its duration" {
+test "render: eight threads rendering ONE renderer concurrently beside a sampler thread (the CPU census walking /proc/self/task, published through the seqlock) — no render walks /proc (the ledger is the sampler's alone), every document parses, every CPU family read is a whole sample (Σ classes ≤ total), the classes never fall" {
     if (!is_linux) return testkit.skip(@src(), .other_step, "the CPU ledger walks /proc/self/task");
     const Shared = struct {
         r: *Renderer,
@@ -1462,7 +1473,6 @@ test "render: eight threads rendering ONE renderer concurrently beside a sampler
     const p = try r.render();
     defer p.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, p.bytes(), "\"daemon_cpu_ns_by_class\":{") != null);
-    try testing.expect(p.render_ns > 0);
     // The sampler, not the render, moves the census: a render after the
     // sampler stopped reports the same total as the one before it.
     const total_before = r.cpu_sample.read().total_ns;

@@ -23,6 +23,7 @@ const builtin = @import("builtin");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
 const counters = @import("../core/counters.zig");
+const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
 const thread_name = @import("../core/thread_name.zig");
 
@@ -528,11 +529,14 @@ pub const Component = struct {
     trim: ?TrimFn = null,
     sheds: std.atomic.Value(u64) = .init(0),
     trims: std.atomic.Value(u64) = .init(0),
-    /// The gauge as the sampler's last tick read it: what the `.stats`
-    /// document reports (`sampled`). A `.func` source may be a syscall
-    /// walk (`mincore` over a 51 GiB slab, a `/proc` census), and the
-    /// render ran every one of them on a FUSE drain worker's thread per
-    /// `.stats` read (decision 0003 §CC.1); the tick is the one caller.
+    /// The source is a KERNEL WALK (`mincore` over a slab, a page-table
+    /// census) rather than a charge read from the component's own words:
+    /// the `.stats` document reports the sampler's last reading of it
+    /// (`last`, as old as the tick), where a charge is read at the render
+    /// (decision 0003 §CC.1, §CC.6). The render ran every walk on a FUSE
+    /// drain worker's thread per `.stats` read; the tick is their one caller.
+    kernel_walk: bool = false,
+    /// The gauge as the sampler's last tick read it (`sampled`).
     last: std.atomic.Value(u64) = .init(0),
 
     pub fn init(name: []const u8, floor: u64, weight: u64, source: Source, shed: ?ShedFn) Component {
@@ -543,6 +547,13 @@ pub const Component = struct {
     pub fn kernelReclaimable(self: Component) Component {
         var c = self;
         c.kernel_reclaimable = true;
+        return c;
+    }
+
+    /// Builder flag: the source walks the kernel (`kernel_walk`).
+    pub fn kernelWalk(self: Component) Component {
+        var c = self;
+        c.kernel_walk = true;
         return c;
     }
 
@@ -561,6 +572,12 @@ pub const Component = struct {
     /// The gauge as of the last tick (0 before the first).
     pub fn sampled(self: *const Component) u64 {
         return self.last.load(.monotonic);
+    }
+
+    /// What the `.stats` document reports: a charge now, a kernel walk as
+    /// the tick last read it.
+    pub fn reported(self: *const Component) u64 {
+        return if (self.kernel_walk) self.sampled() else self.current();
     }
 
     /// Shed calls received.
@@ -614,6 +631,9 @@ pub const MemBudget = struct {
     /// Ticks taken (the idle clock the pools stamp their frees with; one
     /// tick ≈ one sampler period).
     tick_count: std.atomic.Value(u64) = .init(0),
+    /// `clock.monotonicNs()` at the last tick's gauge pass (0 = none yet):
+    /// the age the document prints beside the kernel-walk readings.
+    sampled_at_ns: std.atomic.Value(u64) = .init(0),
     /// The effective cgroup cage of the last resolution (0 = uncapped).
     cgroup_cap: std.atomic.Value(u64) = .init(0),
     budget: std.atomic.Value(u64) = .init(0),
@@ -697,6 +717,12 @@ pub const MemBudget = struct {
     /// The sampler's tick count: the idle clock (`TrimFn`).
     pub fn ticks(self: *const MemBudget) u64 {
         return self.tick_count.load(.monotonic);
+    }
+    /// Milliseconds since the last tick read the gauges (0 before the first:
+    /// nothing sampled yet, the kernel-walk readings are their zero).
+    pub fn sampledAgeMs(self: *const MemBudget) u64 {
+        const at = self.sampled_at_ns.load(.monotonic);
+        return if (at == 0) 0 else (clock.monotonicNs() -| at) / std.time.ns_per_ms;
     }
     pub fn pressureBytes(self: *const MemBudget) u64 {
         return self.pressure.load(.monotonic);
@@ -787,6 +813,7 @@ pub const MemBudget = struct {
             gauge_sum +|= cur;
             if (!c.kernel_reclaimable) pressure_gauges +|= cur;
         }
+        self.sampled_at_ns.store(clock.monotonicNs(), .monotonic);
         self.gauge_sum.store(gauge_sum, .monotonic);
         const pressure_now = @max(pressure_gauges, rss_max, unreclaim_max);
         self.pressure.store(pressure_now, .monotonic);
@@ -1070,6 +1097,9 @@ pub const MemBudget = struct {
         try w.print("{{\"mem_budget_bytes\":{d},\"mem_budget_pressure_bytes\":{d},\"mem_budget_gauge_sum_bytes\":{d},\"mem_budget_level\":{d},", .{ self.budgetBytes(), self.pressureBytes(), self.gaugeSumBytes(), @backingInt(self.level()) });
         try w.print("\"mem_budget_yellow_events\":{d},\"mem_budget_red_events\":{d},\"mem_budget_floors_clamped\":{},\"mem_budget_unreclaimable_bytes\":{d},", .{ self.yellowEvents(), self.redEvents(), self.floorsClamped(), self.unreclaimableBytes() });
         try w.print("\"mem_budget_hard_backstops\":{d},\"mem_budget_backstop_active\":{},\"mem_budget_tier_publish_paused\":{},\"mem_budget_ticks\":{d},", .{ self.hardBackstops(), self.backstopActive(), self.tierPublishPaused(), self.ticks() });
+        // The kernel-walk components' `current` is the tick's reading, this
+        // old (§CC.6); a charge's is read now.
+        try w.print("\"mem_budget_sampled_age_ms\":{d},", .{self.sampledAgeMs()});
         try w.writeAll("\"mem_budget_components\":{");
         const comps = self.components();
         var first = true;
@@ -1085,7 +1115,7 @@ pub const MemBudget = struct {
             var trims: u64 = 0;
             for (comps[i..]) |*s| if (std.mem.eql(u8, s.name, c.name)) {
                 instances += 1;
-                current += s.sampled();
+                current += s.reported();
                 floor += s.floor;
                 weight += s.weight;
                 sheds += s.shedCount();
@@ -1093,7 +1123,7 @@ pub const MemBudget = struct {
             };
             if (!first) try w.writeByte(',');
             first = false;
-            try w.print("\"{s}\":{{\"instances\":{d},\"current\":{d},\"floor\":{d},\"weight\":{d},\"sheds\":{d},\"trims\":{d}}}", .{ c.name, instances, current, floor, weight, sheds, trims });
+            try w.print("\"{s}\":{{\"instances\":{d},\"current\":{d},\"floor\":{d},\"weight\":{d},\"sheds\":{d},\"trims\":{d},\"sampled\":{}}}", .{ c.name, instances, current, floor, weight, sheds, trims, c.kernel_walk });
         }
         try w.writeAll("}}");
     }
@@ -1789,10 +1819,12 @@ test "stats JSON carries every spec key with live values" {
     try testing.expectEqual(@as(i64, 0), hot.get("trims").?.integer);
 }
 
-test "stats JSON reads the SAMPLED gauges (decision 0003 §CC.1): a component whose source is a function is read by the tick alone — three documents after one tick call it zero more times and report the tick's reading; a tick with the gauge moved reports the new one; a sampler added to the budget runs once per tick, after the gauges" {
+test "stats JSON reads a CHARGE at the render and a KERNEL WALK from the tick (decision 0003 §CC.1, §CC.6): a charge source is read by every document (its bump shows at once); a kernel-walk source is read by the tick alone — three documents after one tick call it zero more times and report the tick's reading, the age beside it; a sampler added to the budget runs once per tick, after the gauges" {
     var b: MemBudget = .{};
-    var src: CountingSource = .{ .value = 4096 };
-    b.register(Component.init("counting", 0, 0, .{ .func = .{ .ctx = &src, .call = CountingSource.current } }, null));
+    var charge: CountingSource = .{ .value = 1024 };
+    var walk: CountingSource = .{ .value = 4096 };
+    b.register(Component.init("charge", 0, 0, .{ .func = .{ .ctx = &charge, .call = CountingSource.current } }, null));
+    b.register(Component.init("walk", 0, 0, .{ .func = .{ .ctx = &walk, .call = CountingSource.current } }, null).kernelWalk());
     const Probe = struct {
         runs: u32 = 0,
         seen_sampled: u64 = 0,
@@ -1800,15 +1832,17 @@ test "stats JSON reads the SAMPLED gauges (decision 0003 §CC.1): a component wh
         fn call(ctx: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.runs += 1;
-            self.seen_sampled = self.budget.components()[0].sampled();
+            self.seen_sampled = self.budget.components()[1].sampled();
         }
     };
     var probe: Probe = .{ .budget = &b };
     try testing.expect(b.addSampler(.{ .ctx = &probe, .call = Probe.call }));
-    try testing.expectEqual(@as(u64, 0), b.components()[0].sampled());
+    try testing.expectEqual(@as(u64, 0), b.components()[1].sampled());
+    try testing.expectEqual(@as(u64, 0), b.sampledAgeMs());
     b.tickInner(1 << 30, 0, 0);
     b.runSamplers();
-    try testing.expectEqual(@as(u64, 1), src.reads.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), walk.reads.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), charge.reads.load(.monotonic));
     try testing.expectEqual(@as(u32, 1), probe.runs);
     try testing.expectEqual(@as(u64, 4096), probe.seen_sampled);
     var buf: [4096]u8 = undefined;
@@ -1816,16 +1850,27 @@ test "stats JSON reads the SAMPLED gauges (decision 0003 §CC.1): a component wh
     while (i < 3) : (i += 1) {
         var w: std.Io.Writer = .fixed(&buf);
         try b.writeStatsJson(&w);
-        try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"counting\":{\"instances\":1,\"current\":4096,") != null);
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"walk\":{\"instances\":1,\"current\":4096,\"floor\":0,\"weight\":0,\"sheds\":0,\"trims\":0,\"sampled\":true}") != null);
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"charge\":{\"instances\":1,\"current\":1024,\"floor\":0,\"weight\":0,\"sheds\":0,\"trims\":0,\"sampled\":false}") != null);
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"mem_budget_sampled_age_ms\":") != null);
     }
-    try testing.expectEqual(@as(u64, 1), src.reads.load(.monotonic));
-    src.value = 8192;
+    try testing.expectEqual(@as(u64, 1), walk.reads.load(.monotonic));
+    try testing.expectEqual(@as(u64, 4), charge.reads.load(.monotonic));
+    // The charge moves at once; the walk only at the next tick.
+    charge.value = 2048;
+    walk.value = 8192;
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        try b.writeStatsJson(&w);
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"charge\":{\"instances\":1,\"current\":2048,") != null);
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"walk\":{\"instances\":1,\"current\":4096,") != null);
+    }
     b.tickInner(1 << 30, 0, 0);
-    try testing.expectEqual(@as(u64, 2), src.reads.load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), walk.reads.load(.monotonic));
     var w: std.Io.Writer = .fixed(&buf);
     try b.writeStatsJson(&w);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"current\":8192,") != null);
-    try testing.expectEqual(@as(u64, 2), src.reads.load(.monotonic));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"walk\":{\"instances\":1,\"current\":8192,") != null);
+    try testing.expectEqual(@as(u64, 2), walk.reads.load(.monotonic));
 }
 
 test "stats JSON: components registered under ONE name (a table per data volume, a cache per member) render as ONE entry — the instances counted, current / floor / weight / sheds / trims summed — so the document parses strictly (a strict parser refused `block_alloc_table` twice on a two-volume mount)" {

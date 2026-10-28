@@ -1039,6 +1039,7 @@ pub const Sampler = struct {
         stats.fabric_controllers.set(self.controllers);
         stats.fabric_ctrl_not_live.set(self.not_live);
         if (reconnects != 0) stats.fabric_ctrl_reconnects.add(reconnects);
+        sampled_at_ns.store(clock.monotonicNs(), .monotonic);
     }
 };
 
@@ -1059,8 +1060,19 @@ const process_sampler_gpa = std.heap.page_allocator;
 /// render can be measured over a fixture tree of controllers.
 pub var test_sysfs_root: ?[]const u8 = null;
 
-/// The process's sample off the real sysfs (the `.stats` render's cadence;
-/// a cold path). Takes no allocator: the render has nothing to lend.
+/// `clock.monotonicNs()` of the last finished sample (0 = none yet).
+var sampled_at_ns: std.atomic.Value(u64) = .init(0);
+
+/// Milliseconds since the last finished sample; 0 before the first. The
+/// `.stats` writer sets `fabric_sampled_age_ms` from it (§CC.6).
+pub fn sampledAgeMs() u64 {
+    const at = sampled_at_ns.load(.monotonic);
+    return if (at == 0) 0 else (clock.monotonicNs() -| at) / std.time.ns_per_ms;
+}
+
+/// The process's sample off the real sysfs (the budget sampler's cadence,
+/// `stats.Renderer.sample`; a cold path). Takes no allocator: the render
+/// has nothing to lend.
 pub fn sampleFabric() void {
     if (process_sampler_busy.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
     defer process_sampler_busy.store(false, .release);

@@ -385,7 +385,7 @@ pub var fuse_inode_flag_sets: counters.ShardedCounter = .{};
 /// cannot-happen).
 pub var fuse_reserved_xattr_refusals: counters.ShardedCounter = .{};
 /// `fuse_virtual_lookups`: `.stats`/`.config`/`.trace` lookups answered
-/// (a generation minted, or the newest one shared — `stats_generation_shares`).
+/// (a generation rendered, or the next render's shared — `stats_generation_shares`).
 pub var fuse_virtual_lookups: counters.ShardedCounter = .{};
 /// `fuse_readdir_entries`: dirents answered (READDIR + READDIRPLUS, the
 /// dot entries included) — the metadata read ledger's denominator for a
@@ -1062,23 +1062,19 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return a;
         }
 
-        /// `lookup(1, ".stats"|".config"|".trace")`: the class's newest
-        /// generation if this lookup falls inside its share window
-        /// (`virtual_inodes` module doc), else render ONCE and mint a
-        /// generation; reply with BOTH TTLs 0 (every walk revalidates — a
-        /// fresh generation per consumer, a prompt FORGET).
+        /// `lookup(1, ".stats"|".config"|".trace")`: ONE render in flight
+        /// per class, in arrival order (`virtual_inodes` module doc) — the
+        /// leader renders and mints, a lookup arriving meanwhile waits for
+        /// the next render and shares it; reply with BOTH TTLs 0 (every
+        /// walk revalidates — a fresh generation per consumer, a prompt
+        /// FORGET).
         fn lookupVirtual(self: *Self, c: *Ctx, class: virtual_inodes.Class) Error!filesystem.Entry {
             const face = self.virtual orelse return error.FileNotFound;
             c.stage(.meta_backend_start);
             defer c.stage(.meta_backend_done);
             fuse_virtual_lookups.inc();
-            if (self.virtuals.share(class, clock.monotonicNs())) |shared| {
-                return .{ .nodeid = shared.ino, .entry_ttl_ns = 0, .attr_ttl_ns = 0, .attr = self.virtualAttr(shared.ino, shared.len) };
-            }
-            const payload = try face.build(face.ctx, class, self.gpa);
-            errdefer self.gpa.free(payload.buf);
-            const ino = try self.virtuals.mint(class, payload, clock.monotonicNs());
-            return .{ .nodeid = ino, .entry_ttl_ns = 0, .attr_ttl_ns = 0, .attr = self.virtualAttr(ino, payload.len) };
+            const got = try self.virtuals.lookup(self.io, class, face.build, face.ctx, self.gpa);
+            return .{ .nodeid = got.ino, .entry_ttl_ns = 0, .attr_ttl_ns = 0, .attr = self.virtualAttr(got.ino, got.len) };
         }
 
         fn virtualGetattr(self: *Self, ino: u64) Error!filesystem.Attr {
@@ -9684,8 +9680,6 @@ test "the xattr allowlist: user.* yes (minus user.squeezefs.*), security.* and t
 /// A test renderer: a fixed payload per class, counting builds.
 const FakeVirtual = struct {
     builds: u32 = 0,
-    /// The render time the fake reports: 0 = instant, so no lookup shares.
-    render_ns: u64 = 0,
 
     fn build(ctx: *anyopaque, class: virtual_inodes.Class, gpa: Allocator) Allocator.Error!virtual_inodes.Owned {
         const self: *FakeVirtual = @ptrCast(@alignCast(ctx));
@@ -9696,7 +9690,7 @@ const FakeVirtual = struct {
         const buf = out.writer.buffer;
         const len = out.writer.end;
         out.writer.buffer = &.{};
-        return .{ .buf = buf, .len = len, .render_ns = self.render_ns };
+        return .{ .buf = buf, .len = len };
     }
 
     fn face(self: *FakeVirtual) VirtualFace {
@@ -9775,50 +9769,6 @@ test ".stats/.config/.trace: lookup-only generation inos (never listed, both TTL
     const sub = try h.create(d, ".stats", 0o644);
     try testing.expect(!virtual_inodes.isVirtualIno(sub));
     h.release(sub);
-}
-
-test ".stats share window through the FUSE path (decision 0003 §CC.2): with a render that takes a second, a second lookup of `.stats` inside it answers the SAME nodeid from ONE build (`stats_generation_shares` +1), a lookup of another class renders its own, and the evicting FORGET of the shared ino (the kernel's nlookup 2) retires it once the ring lets go; an instant render shares nothing" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    var fake: FakeVirtual = .{ .render_ns = std.time.ns_per_s };
-    h.fs.bindVirtual(fake.face());
-    const shares0 = virtual_inodes.stats.stats_generation_shares.load();
-    const e1 = try h.entry(h.lookup(1, ".stats"));
-    const e2 = try h.entry(h.lookup(1, ".stats"));
-    try testing.expectEqual(e1.nodeid, e2.nodeid);
-    try testing.expectEqual(e1.attr.size, e2.attr.size);
-    try testing.expectEqual(@as(u32, 1), fake.builds);
-    try testing.expectEqual(shares0 + 1, virtual_inodes.stats.stats_generation_shares.load());
-    const payload = "{\"class\":\"stats\",\"build\":1}\n";
-    try testing.expectEqualStrings(payload, h.read(e1.nodeid, 0, 4096).body);
-    // Another class renders its own generation inside the same second.
-    const c = try h.entry(h.lookup(1, ".config"));
-    try testing.expect(c.nodeid != e1.nodeid);
-    try testing.expectEqual(@as(u32, 2), fake.builds);
-    // The kernel holds the shared ino twice; its one FORGET carries both.
-    h.forget(e1.nodeid, 2);
-    try testing.expectEqual(@as(u64, payload.len), (try h.getattr(e1.nodeid)).size);
-    // The window is the NEWEST generation's: a third lookup inside e1's
-    // second shares it still, whatever a fresh render would report.
-    fake.render_ns = 0;
-    try testing.expectEqual(e1.nodeid, (try h.entry(h.lookup(1, ".stats"))).nodeid);
-    try testing.expectEqual(shares0 + 2, virtual_inodes.stats.stats_generation_shares.load());
-    h.forget(e1.nodeid, 1);
-    // Instant renders of another class: every lookup its own generation,
-    // and the ring's cap of them retires the shared one.
-    var i: usize = 0;
-    while (i < virtual_inodes.REGISTRY_CAP) : (i += 1) {
-        const e = try h.entry(h.lookup(1, ".trace"));
-        h.forget(e.nodeid, 1);
-    }
-    try testing.expectEqual(linux.E.STALE, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, e1.nodeid).errno().?);
-    // With the shared generation gone and instant renders, `.stats`
-    // lookups mint their own again.
-    const f1 = try h.entry(h.lookup(1, ".stats"));
-    const f2 = try h.entry(h.lookup(1, ".stats"));
-    try testing.expect(f1.nodeid != f2.nodeid);
-    try testing.expectEqual(shares0 + 2, virtual_inodes.stats.stats_generation_shares.load());
 }
 
 test "clone: an inline source copies its bytes into a NEW inode; a striped source's dest carries an identical map and every binding a SHARED +ref on BOTH owners (refcount 2) with nothing copied; a staged source and a directory refuse" {

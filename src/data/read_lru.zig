@@ -207,7 +207,7 @@ pub const ReadLru = struct {
     }
 
     pub fn component(self: *ReadLru) budget.Component {
-        return budget.Component.init("read_lru", COMPONENT_FLOOR, COMPONENT_WEIGHT, .{ .func = .{ .ctx = self, .call = &gaugeFn } }, .{ .ctx = self, .call = &shedFn }).withTrim(.{ .ctx = self, .call = &trimFn });
+        return budget.Component.init("read_lru", COMPONENT_FLOOR, COMPONENT_WEIGHT, .{ .func = .{ .ctx = self, .call = &gaugeFn } }, .{ .ctx = self, .call = &shedFn }).withTrim(.{ .ctx = self, .call = &trimFn }).kernelWalk();
     }
 };
 

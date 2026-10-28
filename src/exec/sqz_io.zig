@@ -381,7 +381,7 @@ pub const SqzIo = struct {
         // Non-sheddable (the live frames are the handlers'), but the idle
         // slots' pages return under the idle-trim law; the gauge is the
         // measured residency, published for the stats at every read.
-        self.stack_component = mem_budget.Component.init("exec_fiber_stacks", 0, 0, .{ .func = .{ .ctx = self, .call = &residentStackBytesHook } }, null).withTrim(.{ .ctx = self, .call = &trimIdleStacksHook });
+        self.stack_component = mem_budget.Component.init("exec_fiber_stacks", 0, 0, .{ .func = .{ .ctx = self, .call = &residentStackBytesHook } }, null).withTrim(.{ .ctx = self, .call = &trimIdleStacksHook }).kernelWalk();
         if (options.budget) |b| b.register(self.stack_component);
         return self;
     }

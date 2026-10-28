@@ -12,17 +12,22 @@
 //! TTL 0 ⇒ every path walk revalidates ⇒ a fresh generation per consumer
 //! and a prompt FORGET.
 //!
-//! THE SHARE WINDOW (decision 0003 §CC.2): a lookup that arrives within one
-//! render-time of the class's newest generation is answered WITH it (the
-//! same nodeid, one more kernel reference) instead of minting. The kernel's
+//! ONE RENDER IN FLIGHT PER CLASS, IN ARRIVAL ORDER (decision 0003 §CC.2):
+//! a lookup that arrives while a render runs waits for the NEXT render,
+//! which serves every lookup that waited for it at once (the same nodeid,
+//! one kernel reference each); a lookup that arrives with no render in
+//! flight starts one. A completed generation is never reused and a render
+//! that began before a lookup arrived is never joined, so every `.stats`
+//! read reflects every effect that completed before its lookup arrived
+//! (§CC.6: read-your-own-effects), while N concurrent readers cost O(1)
+//! renders per render-time instead of O(N) each. WHY: the kernel's
 //! `__lookup_slow` revalidates the dentry a sibling's lookup just created,
 //! and a revalidation answered with a different nodeid invalidates it and
-//! retries — N concurrent readers of `.stats` livelocked in O(N) lookups
-//! per read (32 readers on an idle box: 2,179 renders for 55 reads, 21 s a
-//! read; the supervisor's probe in the same queue, so a SIGABRT). The
-//! window is the render's own measured duration: the staleness a sharing
-//! reader accepts equals the latency it saves, and a zero-cost render
-//! (the tests' fakes) shares nothing.
+//! retries — 32 readers of `.stats` on an idle box livelocked into 2,179
+//! renders for 55 reads, 21 s a read, the supervisor's probe in the same
+//! queue (a SIGABRT). A waiter parks on the class's `Notify` registered-
+//! first; the leader's mint completes the render under the registry lock
+//! and announces after it.
 //!
 //! THE GENERATION IS THE PIN: a generation holds one reference per LOOKUP
 //! answered with it (the kernel's, all dropped by the FORGET that evicts
@@ -43,8 +48,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const counters = @import("../../core/counters.zig");
 const jc = @import("../../meta/journal_core.zig");
+const notify = @import("../../sync/notify.zig");
 
 /// The class in the ino's low bits, so FORGET/GETATTR on a retired
 /// generation still knows which file it was.
@@ -140,26 +147,39 @@ pub const stats = struct {
     pub var stats_generations_evicted: counters.ShardedCounter = .{};
     /// Reads/opens/getattrs on a retired generation (ESTALE replies).
     pub var stats_generation_stale: counters.ShardedCounter = .{};
-    /// Lookups answered with the class's newest generation inside its
-    /// share window (module doc) instead of a render of their own.
+    /// Lookups that waited for a render in flight to finish and took the
+    /// next render's generation (module doc) instead of one of their own.
     pub var stats_generation_shares: counters.ShardedCounter = .{};
 };
 
 /// A rendered payload the registry takes ownership of: the capacity the
-/// renderer reserved and the bytes it wrote, and how long the render
-/// took — the share window a later lookup of the class may ride.
+/// renderer reserved and the bytes it wrote.
 pub const Owned = struct {
     buf: []u8,
     len: usize,
-    render_ns: u64 = 0,
 
     pub fn bytes(self: Owned) []const u8 {
         return self.buf[0..self.len];
     }
 };
 
-/// A lookup answered from the class's newest generation (`Registry.share`).
+/// A lookup's answer: the generation ino and its payload's length.
 pub const Shared = struct { ino: u64, len: u64 };
+
+/// The renderer a lookup calls (`kv_fs.VirtualFace.build`'s shape).
+pub const RenderFn = *const fn (ctx: *anyopaque, class: Class, gpa: Allocator) Allocator.Error!Owned;
+
+/// The class's render in flight and the lookups waiting for the next one
+/// (module doc). Under the registry lock; `done` announced after it.
+const Flight = struct {
+    rendering: bool = false,
+    /// Renders started (the index of the one in flight when `rendering`).
+    started: u64 = 0,
+    /// Renders completed; `last_seq` the generation of the newest.
+    completed: u64 = 0,
+    last_seq: u64 = Registry.no_seq,
+    done: notify.Notify = .init,
+};
 
 const Generation = struct {
     seq: u64,
@@ -168,12 +188,10 @@ const Generation = struct {
     /// kernel lookups + ring (1) + opens.
     refs: u32,
     /// The kernel's share of `refs`: one per LOOKUP answered with this
-    /// generation (the mint's and every share's).
+    /// generation (the leader's and every waiter's).
     kernel: u32,
     /// Still in the ring (the ring's reference is live).
     ringed: bool,
-    /// When the mint happened (the share window's origin).
-    minted_at_ns: u64,
 };
 
 pub const Registry = struct {
@@ -185,9 +203,7 @@ pub const Registry = struct {
     gens: std.AutoHashMapUnmanaged(u64, *Generation) = .empty,
     /// FIFO ring of the seqs holding a ring reference; `no_seq` = empty slot.
     ring: [REGISTRY_CAP]u64 = @splat(no_seq),
-    /// The newest generation of each class (`no_seq` = none yet): the one
-    /// a lookup inside its share window is answered with.
-    newest: [class_count]u64 = @splat(no_seq),
+    flights: [class_count]Flight = @splat(.{}),
 
     const no_seq = std.math.maxInt(u64);
     const class_count = @typeInfo(Class).@"enum".field_names.len;
@@ -207,18 +223,106 @@ pub const Registry = struct {
         self.* = undefined;
     }
 
-    /// Mint a generation owning `payload` at `now_ns`; the ring's oldest
-    /// loses its ring reference when the ring is full (evicted; freed when
-    /// nothing else pins it). Returns the generation ino.
-    pub fn mint(self: *Registry, class: Class, payload: Owned, now_ns: u64) Allocator.Error!u64 {
+    /// `lookup(1, <class name>)` (module doc): the leader renders through
+    /// `render(ctx, class, gpa)` and mints; a lookup that arrives while a
+    /// render runs waits for the next one and takes its generation. The
+    /// render's error is the leader's answer; the waiters go on without it.
+    pub fn lookup(self: *Registry, io: Io, class: Class, render: RenderFn, ctx: *anyopaque, gpa: Allocator) Allocator.Error!Shared {
+        var target: u64 = undefined;
+        var lead_now = false;
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const f = &self.flights[@backingInt(class)];
+            if (!f.rendering) {
+                f.rendering = true;
+                f.started += 1;
+                lead_now = true;
+            } else target = f.started + 1;
+        }
+        if (lead_now) return self.renderUnlocked(io, class, render, ctx, gpa);
+        while (true) {
+            // Registered first, the condition re-checked under the registry
+            // lock, then the park (notify's law): an announcement between
+            // the re-check and the park is never lost.
+            const f = &self.flights[@backingInt(class)];
+            var n = f.done.notified();
+            _ = n.enable(io);
+            var lead = false;
+            var took: ?Shared = null;
+            {
+                self.lock.lock();
+                defer self.lock.unlock();
+                if (f.completed >= target) {
+                    if (self.gens.get(f.last_seq)) |g| {
+                        g.refs += 1;
+                        g.kernel += 1;
+                        took = .{ .ino = inoOf(g.seq, class), .len = g.payload.len };
+                    } else {
+                        // The ring evicted it between the completion and this
+                        // wake (REGISTRY_CAP mints in between): render anew.
+                        target = f.completed + 1;
+                    }
+                }
+                if (took == null and !f.rendering and f.completed < target) {
+                    f.rendering = true;
+                    f.started += 1;
+                    lead = true;
+                }
+            }
+            if (took) |shared| {
+                n.cancel(io);
+                stats.stats_generation_shares.inc();
+                return shared;
+            }
+            if (lead) {
+                n.cancel(io);
+                return self.renderUnlocked(io, class, render, ctx, gpa);
+            }
+            n.waitUncancelable(io);
+        }
+    }
+
+    /// The leader's render: a mint completes the flight, a failure abandons
+    /// it; either way the waiters are announced to.
+    fn renderUnlocked(self: *Registry, io: Io, class: Class, render: RenderFn, ctx: *anyopaque, gpa: Allocator) Allocator.Error!Shared {
+        const f = &self.flights[@backingInt(class)];
+        defer f.done.notifyWaiters(io);
+        const payload = render(ctx, class, gpa) catch |e| {
+            self.abandon(class);
+            return e;
+        };
+        const ino = self.mint(class, payload) catch |e| {
+            gpa.free(payload.buf);
+            self.abandon(class);
+            return e;
+        };
+        return .{ .ino = ino, .len = payload.len };
+    }
+
+    /// The leader's render failed: the flight is open again (a waiter
+    /// starts the next render).
+    fn abandon(self: *Registry, class: Class) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.flights[@backingInt(class)].rendering = false;
+    }
+
+    /// Mint a generation owning `payload` — the leader's render completed
+    /// (the class's flight closes on it); the ring's oldest loses its ring
+    /// reference when the ring is full (evicted; freed when nothing else
+    /// pins it). Returns the generation ino; a failure leaves the flight
+    /// to the leader's `abandon`.
+    pub fn mint(self: *Registry, class: Class, payload: Owned) Allocator.Error!u64 {
         const g = try self.gpa.create(Generation);
         errdefer self.gpa.destroy(g);
         self.lock.lock();
         defer self.lock.unlock();
+        const f = &self.flights[@backingInt(class)];
         try self.gens.ensureUnusedCapacity(self.gpa, 1);
         const seq = self.next_seq;
         self.next_seq += 1;
-        g.* = .{ .seq = seq, .class = class, .payload = payload, .refs = 2, .kernel = 1, .ringed = true, .minted_at_ns = now_ns };
+        g.* = .{ .seq = seq, .class = class, .payload = payload, .refs = 2, .kernel = 1, .ringed = true };
         const slot = &self.ring[@intCast(seq % REGISTRY_CAP)];
         if (slot.* != no_seq) {
             if (self.gens.get(slot.*)) |old| {
@@ -231,26 +335,13 @@ pub const Registry = struct {
         }
         slot.* = seq;
         self.gens.putAssumeCapacity(seq, g);
-        self.newest[@backingInt(class)] = seq;
+        if (f.rendering) {
+            f.rendering = false;
+            f.completed = f.started;
+        }
+        f.last_seq = seq;
         stats.stats_generations_live.set(self.gens.count());
         return inoOf(seq, class);
-    }
-
-    /// The class's newest generation if `now_ns` is inside its share
-    /// window (module doc): one more kernel reference on it, or null when
-    /// the window has passed (or the class was never minted) and the
-    /// caller renders.
-    pub fn share(self: *Registry, class: Class, now_ns: u64) ?Shared {
-        self.lock.lock();
-        defer self.lock.unlock();
-        const seq = self.newest[@backingInt(class)];
-        if (seq == no_seq) return null;
-        const g = self.gens.get(seq) orelse return null;
-        if (now_ns -| g.minted_at_ns >= g.payload.render_ns) return null;
-        g.refs += 1;
-        g.kernel += 1;
-        stats.stats_generation_shares.inc();
-        return .{ .ino = inoOf(seq, class), .len = g.payload.len };
     }
 
     fn findLocked(self: *Registry, ino: u64) ?*Generation {
@@ -265,7 +356,6 @@ pub const Registry = struct {
         if (g.refs != 0) return;
         _ = self.gens.remove(g.seq);
         if (g.ringed) self.ring[@intCast(g.seq % REGISTRY_CAP)] = no_seq;
-        if (self.newest[@backingInt(g.class)] == g.seq) self.newest[@backingInt(g.class)] = no_seq;
         self.gpa.free(g.payload.buf);
         self.gpa.destroy(g);
         stats.stats_generations_live.set(self.gens.count());
@@ -348,13 +438,9 @@ pub const Registry = struct {
 const testing = std.testing;
 
 fn owned(gpa: Allocator, text: []const u8) !Owned {
-    return ownedRendered(gpa, text, 0);
-}
-
-fn ownedRendered(gpa: Allocator, text: []const u8, render_ns: u64) !Owned {
     const buf = try gpa.alloc(u8, text.len + 8);
     @memcpy(buf[0..text.len], text);
-    return .{ .buf = buf, .len = text.len, .render_ns = render_ns };
+    return .{ .buf = buf, .len = text.len };
 }
 
 test "the ino scheme: the range starts at 2^64 − 2^32 and is disjoint from the real ino space and the two canonical inos; the class rides the low 2 bits and survives any registry state" {
@@ -388,8 +474,8 @@ test "the ino scheme: the range starts at 2^64 − 2^32 and is disjoint from the
 test "two lookups mint two distinct frozen generations; reads slice the snapshot; the size is exact; the kernel ref + the fh pin + the ring ref each hold the payload" {
     var r = Registry.init(testing.allocator);
     defer r.deinit();
-    const a = try r.mint(.stats, try owned(testing.allocator, "{\"a\":1}\n"), 0);
-    const b = try r.mint(.stats, try owned(testing.allocator, "{\"a\":22}\n"), 0);
+    const a = try r.mint(.stats, try owned(testing.allocator, "{\"a\":1}\n"));
+    const b = try r.mint(.stats, try owned(testing.allocator, "{\"a\":22}\n"));
     try testing.expect(a != b);
     try testing.expectEqual(@as(?u64, 8), r.size(a));
     try testing.expectEqual(@as(?u64, 9), r.size(b));
@@ -416,14 +502,14 @@ test "the FIFO ring evicts in mint order at the cap; a retired generation is EST
     var first: u64 = 0;
     var i: usize = 0;
     while (i < REGISTRY_CAP) : (i += 1) {
-        const ino = try r.mint(.config, try owned(testing.allocator, "x"), 0);
+        const ino = try r.mint(.config, try owned(testing.allocator, "x"));
         if (i == 0) first = ino;
         r.forget(ino); // the kernel forgot every one: the ring alone holds them
     }
     try testing.expectEqual(REGISTRY_CAP, r.liveCount());
     try testing.expectEqual(@as(?u64, 1), r.size(first));
     // The 257th mint evicts the first (mint order), which frees it (no other ref).
-    const n = try r.mint(.config, try owned(testing.allocator, "yy"), 0);
+    const n = try r.mint(.config, try owned(testing.allocator, "yy"));
     try testing.expectEqual(REGISTRY_CAP, r.liveCount());
     try testing.expect(r.size(first) == null);
     try testing.expect(!r.pin(first));
@@ -433,11 +519,11 @@ test "the FIFO ring evicts in mint order at the cap; a retired generation is EST
     try testing.expectEqual(evicted0, stats.stats_generations_evicted.load()); // forgotten ⇒ not an eviction of a live kernel ref
     r.forget(n);
     // A generation the kernel still references AND has open survives the ring.
-    const held = try r.mint(.config, try owned(testing.allocator, "held"), 0);
+    const held = try r.mint(.config, try owned(testing.allocator, "held"));
     try testing.expect(r.pin(held));
     i = 0;
     while (i < REGISTRY_CAP) : (i += 1) {
-        const ino = try r.mint(.config, try owned(testing.allocator, "z"), 0);
+        const ino = try r.mint(.config, try owned(testing.allocator, "z"));
         r.forget(ino);
     }
     try testing.expectEqual(evicted0 + 1, stats.stats_generations_evicted.load());
@@ -452,45 +538,154 @@ test "the FIFO ring evicts in mint order at the cap; a retired generation is EST
     try testing.expect(r.size(inoOf(seqOf(n), .trace)) == null);
 }
 
-test "the share window (decision 0003 §CC.2): a lookup inside one render-time of the class's newest generation is answered with it — the same ino, one more kernel reference — a lookup at or past the window is not, another class never is, a zero-cost render shares nothing; the evicting FORGET returns every kernel reference (the mint's and the shares') at once and the ring's keeps the payload" {
+/// A test renderer: counts its builds, writes `value`'s current reading
+/// into the payload, and can hold a render open on `gate` so a lookup
+/// stays in flight while others arrive.
+const FlightRenderer = struct {
+    builds: std.atomic.Value(u32) = .init(0),
+    value: std.atomic.Value(u64) = .init(0),
+    gate: ?*Io.Event = null,
+    /// Set when a render is inside the gate (the test's synchronization).
+    inside: Io.Event = .unset,
+
+    fn render(ctx: *anyopaque, class: Class, gpa: Allocator) Allocator.Error!Owned {
+        const self: *FlightRenderer = @ptrCast(@alignCast(ctx));
+        _ = self.builds.fetchAdd(1, .monotonic);
+        const v = self.value.load(.seq_cst);
+        if (self.gate) |g| {
+            self.inside.set(testing.io);
+            g.wait(testing.io) catch unreachable;
+        }
+        var buf: [64]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{s}:{d}", .{ @tagName(class), v }) catch unreachable;
+        return owned(gpa, text);
+    }
+
+    fn valueOf(r: *Registry, shared: Shared) u64 {
+        var buf: [64]u8 = undefined;
+        const n = r.read(shared.ino, 0, &buf).?;
+        const text = buf[0..n];
+        return std.fmt.parseInt(u64, text[std.mem.indexOfScalar(u8, text, ':').? + 1 ..], 10) catch unreachable;
+    }
+};
+
+test "one render in flight per class, in arrival order (decision 0003 §CC.2): lookups that arrive while a render runs wait for the NEXT render and share its generation (one build for all of them, each a kernel reference), the leader keeps its own; sequential lookups mint distinct generations; another class renders on its own" {
+    const io = testing.io;
     var r = Registry.init(testing.allocator);
     defer r.deinit();
+    var gate: Io.Event = .unset;
+    var fr: FlightRenderer = .{ .gate = &gate };
     const shares0 = stats.stats_generation_shares.load();
-    // Rendered in 1 ms at t = 1 ms: shared until t = 2 ms (exclusive).
-    const g = try r.mint(.stats, try ownedRendered(testing.allocator, "{\"n\":1}\n", 1_000_000), 1_000_000);
-    const s1 = r.share(.stats, 1_000_001) orelse return error.TestExpectedShare;
-    try testing.expectEqual(g, s1.ino);
-    try testing.expectEqual(@as(u64, 8), s1.len);
-    const s2 = r.share(.stats, 1_999_999) orelse return error.TestExpectedShare;
-    try testing.expectEqual(g, s2.ino);
-    try testing.expect(r.share(.stats, 2_000_000) == null);
-    try testing.expect(r.share(.stats, 5_000_000) == null);
-    try testing.expect(r.share(.config, 1_000_001) == null);
-    try testing.expectEqual(shares0 + 2, stats.stats_generation_shares.load());
-    // The kernel holds 3 (the mint + two shares): the evicting FORGET
-    // returns them all at once and leaves the ring's; a second FORGET of
-    // a generation the kernel no longer holds changes nothing.
-    r.forget(g);
-    try testing.expectEqual(@as(?u64, 8), r.size(g));
-    r.forget(g);
-    try testing.expectEqual(@as(?u64, 8), r.size(g));
-    try testing.expectEqual(@as(usize, 1), r.liveCount());
-    // A newer mint of the class is the one shared from then on.
-    const g2 = try r.mint(.stats, try ownedRendered(testing.allocator, "{\"n\":22}\n", 1_000_000), 3_000_000);
-    try testing.expectEqual(g2, (r.share(.stats, 3_500_000) orelse return error.TestExpectedShare).ino);
-    r.forget(g2);
-    // A zero-duration render (the fakes') never shares, even at its own instant.
-    const z = try r.mint(.trace, try owned(testing.allocator, "z"), 7_000_000);
-    try testing.expect(r.share(.trace, 7_000_000) == null);
-    r.forget(z);
-    // A forgotten generation the ring then evicts is gone for good, and
-    // its class shares nothing until the next mint.
-    const o = try r.mint(.config, try ownedRendered(testing.allocator, "o", 10), 9_000_000);
-    try testing.expectEqual(@as(usize, 4), r.liveCount());
-    r.forget(o);
-    try testing.expectEqual(@as(?u64, 1), r.size(o));
-    var i: usize = 0;
-    while (i < REGISTRY_CAP) : (i += 1) r.forget(try r.mint(.trace, try owned(testing.allocator, "t"), 0));
-    try testing.expect(r.size(o) == null);
-    try testing.expect(r.share(.config, 9_000_001) == null);
+    const Leader = struct {
+        fn run(reg: *Registry, io_: Io, ctx: *FlightRenderer, out: *Shared) void {
+            out.* = reg.lookup(io_, .stats, FlightRenderer.render, ctx, testing.allocator) catch unreachable;
+        }
+    };
+    var lead: Shared = undefined;
+    const lt = try std.Thread.spawn(.{}, Leader.run, .{ &r, io, &fr, &lead });
+    try fr.inside.wait(io);
+    // Eight lookups arrive while the leader's render is held open.
+    var outs: [8]Shared = undefined;
+    var ts: [8]std.Thread = undefined;
+    for (&ts, &outs) |*t, *o| t.* = try std.Thread.spawn(.{}, Leader.run, .{ &r, io, &fr, o });
+    // The waiters are parked on the flight, not rendering: one build so far.
+    while (r.flights[0].done.waiters(io) < 8) try std.Thread.yield();
+    try testing.expectEqual(@as(u32, 1), fr.builds.load(.monotonic));
+    // Release the leader: its mint closes the flight; a waiter leads the
+    // next render (held open again), every other waiter takes it.
+    fr.inside.reset();
+    gate.set(io);
+    lt.join();
+    try fr.inside.wait(io);
+    try testing.expectEqual(@as(u32, 2), fr.builds.load(.monotonic));
+    fr.gate = null;
+    gate.set(io);
+    for (ts) |t| t.join();
+    try testing.expectEqual(@as(u32, 2), fr.builds.load(.monotonic));
+    for (outs) |o| {
+        try testing.expectEqual(outs[0].ino, o.ino);
+        try testing.expect(o.ino != lead.ino);
+    }
+    try testing.expectEqual(shares0 + 7, stats.stats_generation_shares.load());
+    try testing.expectEqual(@as(usize, 2), r.liveCount());
+    // The evicting FORGET of the shared ino returns all eight references.
+    r.forget(outs[0].ino);
+    try testing.expectEqual(@as(?u64, 7), r.size(outs[0].ino)); // the ring's reference keeps it
+    // Sequential lookups with nothing in flight: a render each, distinct.
+    const a = try r.lookup(io, .stats, FlightRenderer.render, &fr, testing.allocator);
+    const b = try r.lookup(io, .stats, FlightRenderer.render, &fr, testing.allocator);
+    try testing.expect(a.ino != b.ino);
+    try testing.expectEqual(@as(u32, 4), fr.builds.load(.monotonic));
+    // Another class is its own flight.
+    const c = try r.lookup(io, .config, FlightRenderer.render, &fr, testing.allocator);
+    try testing.expectEqual(Class.config, classOf(c.ino));
+    try testing.expectEqual(@as(u32, 5), fr.builds.load(.monotonic));
+    try testing.expectEqual(shares0 + 7, stats.stats_generation_shares.load());
+}
+
+test "read-your-own-effects under a herd (decision 0003 §CC.6): sixteen threads each bump a counter and look `.stats` up 50 times; every generation a lookup gets was rendered after the lookup arrived, so it carries that thread's bump (the value read ≥ the bump), while the herd shares renders (builds < lookups)" {
+    const io = testing.io;
+    var r = Registry.init(testing.allocator);
+    defer r.deinit();
+    var fr: FlightRenderer = .{};
+    const Herd = struct {
+        fn run(reg: *Registry, io_: Io, ctx: *FlightRenderer, failed: *std.atomic.Value(u32)) void {
+            var i: usize = 0;
+            while (i < 50) : (i += 1) {
+                const mine = ctx.value.fetchAdd(1, .seq_cst) + 1;
+                const got = reg.lookup(io_, .stats, FlightRenderer.render, ctx, testing.allocator) catch {
+                    _ = failed.fetchAdd(1, .monotonic);
+                    return;
+                };
+                if (FlightRenderer.valueOf(reg, got) < mine) _ = failed.fetchAdd(1, .monotonic);
+                reg.forget(got.ino);
+            }
+        }
+    };
+    var failed: std.atomic.Value(u32) = .init(0);
+    var ts: [16]std.Thread = undefined;
+    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Herd.run, .{ &r, io, &fr, &failed });
+    for (ts) |t| t.join();
+    try testing.expectEqual(@as(u32, 0), failed.load(.monotonic));
+    try testing.expect(fr.builds.load(.monotonic) <= 16 * 50);
+    try testing.expectEqual(@as(u64, 16 * 50), fr.value.load(.monotonic));
+}
+
+test "a render that fails abandons the flight: the waiters go on — one of them renders, the error is the leader's alone" {
+    const io = testing.io;
+    var r = Registry.init(testing.allocator);
+    defer r.deinit();
+    const Failing = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+        gate: Io.Event = .unset,
+        inside: Io.Event = .unset,
+        fn render(ctx: *anyopaque, class: Class, gpa: Allocator) Allocator.Error!Owned {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const n = self.calls.fetchAdd(1, .monotonic);
+            if (n == 0) {
+                self.inside.set(testing.io);
+                self.gate.wait(testing.io) catch unreachable;
+                return error.OutOfMemory;
+            }
+            return owned(gpa, @tagName(class));
+        }
+        fn lead(reg: *Registry, io_: Io, ctx: *@This(), out: *Allocator.Error!Shared) void {
+            out.* = reg.lookup(io_, .trace, @This().render, ctx, testing.allocator);
+        }
+    };
+    var f: Failing = .{};
+    var lead_out: Allocator.Error!Shared = undefined;
+    var wait_out: Allocator.Error!Shared = undefined;
+    const lt = try std.Thread.spawn(.{}, Failing.lead, .{ &r, io, &f, &lead_out });
+    try f.inside.wait(io);
+    const wt = try std.Thread.spawn(.{}, Failing.lead, .{ &r, io, &f, &wait_out });
+    while (r.flights[@backingInt(Class.trace)].done.waiters(io) < 1) try std.Thread.yield();
+    f.gate.set(io);
+    lt.join();
+    wt.join();
+    try testing.expectError(error.OutOfMemory, lead_out);
+    const got = try wait_out;
+    try testing.expectEqual(@as(?u64, 5), r.size(got.ino));
+    try testing.expectEqual(@as(u32, 2), f.calls.load(.monotonic));
+    try testing.expect(!r.flights[@backingInt(Class.trace)].rendering);
 }

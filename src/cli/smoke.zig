@@ -8889,7 +8889,7 @@ test "smoke: --daemon --supervise --log-file: the invoking process returns 0 onl
 /// lane's turn.
 const stats_herd_read_bound_ms: u64 = 2000;
 
-test "smoke: 32 CONCURRENT READERS OF .stats UNDER A CREATE STORM NEVER WEDGE THE MOUNT (decision 0003 §CC; rung-10-stats-wedge.md) — a `--daemon --supervise` set, 8 creators making files beside 32 `cat .stats` loops for 8 s: every read completes within 2 s (on bc569d4 a read took 5–27 s under the kernel's lookup livelock and the supervisor SIGABRTed the daemon), lookups inside one render-time share a generation, the control inode's probe misses nothing, the op watchdog is silent, every document parses" {
+test "smoke: 32 CONCURRENT READERS OF .stats UNDER A CREATE STORM NEVER WEDGE THE MOUNT (decision 0003 §CC; rung-10-stats-wedge.md) — a `--daemon --supervise` set, 8 creators making files beside 32 `cat .stats` loops for 8 s: every read completes within 2 s (on bc569d4 a read took 5–27 s under the kernel's lookup livelock and the supervisor SIGABRTed the daemon), lookups that arrive during a render share the next one (one render in flight per class), the control inode's probe misses nothing, no drain worker is held, the op watchdog is silent, every document parses" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;

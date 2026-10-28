@@ -403,7 +403,7 @@ pub const Pool = struct {
 
     /// The same shape under another registry name (the ranged bounce slab).
     pub fn componentNamed(self: *Pool, name: []const u8, floor: u64, weight: u64) budget.Component {
-        return budget.Component.init(name, floor, weight, .{ .func = .{ .ctx = self, .call = &gaugeFn } }, .{ .ctx = self, .call = &shedFn }).withTrim(.{ .ctx = self, .call = &trimFn });
+        return budget.Component.init(name, floor, weight, .{ .func = .{ .ctx = self, .call = &gaugeFn } }, .{ .ctx = self, .call = &shedFn }).withTrim(.{ .ctx = self, .call = &trimFn }).kernelWalk();
     }
 
     fn gaugeFn(ctx: *anyopaque) u64 {

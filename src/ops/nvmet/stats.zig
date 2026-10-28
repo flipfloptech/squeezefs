@@ -28,6 +28,10 @@ pub var nvmet_adopts: counters.ShardedCounter = .{};
 
 /// Controllers with `transport != pcie` (sampled off `/sys/class/nvme`).
 pub var fabric_controllers: counters.Gauge = .{};
+/// Milliseconds since the sampler's last `/sys/class/nvme` walk (0 before
+/// the first): the `fabric_*` gauges' age (decision 0003 §CC.6). Set by
+/// the document's writer from the sampler's stamp.
+pub var fabric_sampled_age_ms: counters.Gauge = .{};
 /// Fabric controllers whose `state != live`.
 pub var fabric_ctrl_not_live: counters.Gauge = .{};
 /// Observed not-live → live transitions per identity: a SAMPLED

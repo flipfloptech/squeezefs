@@ -18,9 +18,8 @@
 //!   `stats_cli.md` §7 Q19). `.config` and not `.stats` (decision 0003
 //!   §CC.3): a lookup of either renders its document, and the probe is a
 //!   liveness question, not a reader — `.config` is the daemon's smallest
-//!   document (the set summary, no census), and a probe's render of
-//!   `.stats` inside a reader's share window would hand that reader the
-//!   probe's snapshot.
+//!   document (the set summary, no census), and a `.stats` probe would
+//!   queue every 5 s behind the readers' renders in flight.
 //! - NOT ATTACHED (the daemon's own `umount2` landed and its teardown
 //!   runs; or `squeezefs umount --lazy` detached the mountpoint and the
 //!   daemon serves the holders left on the detached superblock until the

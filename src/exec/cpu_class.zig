@@ -125,12 +125,20 @@ pub const Sample = struct {
 
     /// `{"daemon_cpu_ns":N,"daemon_cpu_ns_by_class":{class:ns,…,"other":ns}}`.
     pub fn writeJson(self: Sample, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("{{\"daemon_cpu_ns\":{d},\"daemon_cpu_ns_by_class\":{{", .{self.total_ns});
+        try w.writeByte('{');
+        try self.writeFields(w);
+        try w.writeByte('}');
+    }
+
+    /// The object's members without the braces (a caller adds its own
+    /// beside them: the sample's age in the `.stats` document).
+    pub fn writeFields(self: Sample, w: *Io.Writer) Io.Writer.Error!void {
+        try w.print("\"daemon_cpu_ns\":{d},\"daemon_cpu_ns_by_class\":{{", .{self.total_ns});
         for (self.by_class, 0..) |ns, i| {
             if (i != 0) try w.writeByte(',');
             try w.print("\"{s}\":{d}", .{ className(i), ns });
         }
-        try w.writeAll("}}");
+        try w.writeByte('}');
     }
 };
 

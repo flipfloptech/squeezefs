@@ -2160,21 +2160,20 @@ const VirtualSource = struct {
         switch (class) {
             .stats => {
                 const p = try self.renderer.render();
-                return .{ .buf = p.buf, .len = p.len, .render_ns = p.render_ns };
+                return .{ .buf = p.buf, .len = p.len };
             },
             .config => {
                 const p = try self.renderer.renderConfig(writeSet, self);
-                return .{ .buf = p.buf, .len = p.len, .render_ns = p.render_ns };
+                return .{ .buf = p.buf, .len = p.len };
             },
             .trace => {
-                const t0 = clock.monotonicNs();
                 var out: Io.Writer.Allocating = .init(gpa);
                 errdefer out.deinit();
                 op_trace.writeTraceJson(gpa, &out.writer) catch return error.OutOfMemory;
                 const buf = out.writer.buffer;
                 const len = out.writer.end;
                 out.writer.buffer = &.{};
-                return .{ .buf = buf, .len = len, .render_ns = clock.monotonicNs() -| t0 };
+                return .{ .buf = buf, .len = len };
             },
         }
     }

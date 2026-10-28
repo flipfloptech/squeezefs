@@ -90,3 +90,37 @@ timed ops; -np 64 50.0 / 50.0 %, intents 32 / 32 / 33 / 33, 0 timed; `tar -x` of
 directory: `user.squeezefs.dir_spread_depth` on the parent, inherited); cross-volume striping of ONE hot
 directory (§BZ.5 (C)); the `CreateInode` wire word's new meaning is a wire change the train's full gate
 judges (never run here).
+
+## The A-B-B-A (2026-10-27/28, quiet host on AC, the RAM-NVMe perf mount, dist builds)
+
+`dev` `f2b6029` against `81469b3` (D = 3, the set formatted fresh by `perf_mount.sh`), legs A B B A,
+`mpirun mdtest -n 10000 -u -i 1 -d <mount>/mdtest` (the rank directories at depth 3), gate lock and every
+build slot held, tctl ≤ 58 °C, fsck clean after every run; k ops/s (leg 1 / leg 2).
+
+**2 MDT + 2 OST** (the second member idle before; 50 / 50 % of every phase after):
+
+| | -np 32 dev | -np 32 D=3 | Δ | -np 64 dev | -np 64 D=3 | Δ |
+|---|---|---|---|---|---|---|
+| file creation | 197 / 184 | 257 / 256 | +34.8 % | 197 / 205 | 261 / 239 | +24.4 % |
+| file removal | 270 / 261 | 327 / 329 | +23.5 % | 253 / 204 | 361 / 345 | +54.5 % |
+| directory creation | 223 / 214 | 277 / 291 | +30.0 % | 217 / 210 | 250 / 274 | +22.9 % |
+| directory removal | 244 / 242 | 283 / 282 | +16.3 % | 221 / 235 | 297 / 294 | +29.8 % |
+
+Two earlier rounds on the pre-§BZ.9 head `4eb35ee` read the same shape (+19 … +47 % on every row).
+
+**1 MDT + 2 OST** (one healthy member: every directory local — the rule's cost must be nil):
+
+| | -np 32 dev | -np 32 D=3 | Δ | -np 64 dev | -np 64 D=3 | Δ |
+|---|---|---|---|---|---|---|
+| file creation | 226 / 206 | 216 / 217 | +0.3 % | 221 / 208 | 212 / 216 | −0.3 % |
+| file removal | 291 / 281 | 292 / 279 | −0.1 % | 262 / 265 | 241 / 269 | −3.3 % |
+| directory creation | 212 / 207 | 222 / 208 | +2.4 % | 211 / 215 | 220 / 221 | +3.6 % |
+| directory removal | 222 / 225 | 227 / 240 | +4.3 % | 229 / 237 | 244 / 242 | +4.4 % |
+
+Before §BZ.9 the 1-MDT directory creation at -np 32 read −2.3 / −4.6 / −3.0 % over three rounds (one with
+the leg order reversed) with every other row flat — the parent-record read before every mkdir. Also seen:
+`dev` on 1 MDT is faster than `dev` on 2 MDT (file creation 213 k vs 181–200 k at -np 32): an idle member
+still costs its checkpoint and barrier work; with the rule that member carries half the load instead.
+tarx (`scripts/suites/tarx.sh`, 2,452 entries): PASSED on `4eb35ee` — B/S0 1.05–1.08 (law ≤ 1.10), wire
+0.0003–0.0012 verbs per entry (law < 0.05). Landed (gates 156 and 157 green, 75/75). Sessions:
+`/build/perf/dp-abba/`, `dp1-abba/`, `dp1b-abba/`, `dp1c-abba/` (4eb35ee), `dp2-abba/`, `dp3-abba/` (81469b3).

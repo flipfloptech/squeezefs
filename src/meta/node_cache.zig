@@ -4013,14 +4013,41 @@ test "R5 measure: the charge of N cached nodes with M records each — every nod
 /// cache's allocator saw across the applies alone.
 const ApplyWindow = struct { bytes: usize, largest: usize };
 
+/// The record shape of an apply window: an inode Put (≈ 100 B) or the
+/// inline layout record a new file's first write publishes (an xattr key,
+/// a 4 KiB payload and its header).
+const ApplyShape = enum { inode, inline_layout };
+
+/// The inline layout's value: `inline_max` (4 KiB derived) + the record's
+/// own header bytes.
+const INLINE_LAYOUT_VALUE_LEN: usize = 4096 + 48;
+
 fn applyWindow(live: *LiveBytes, leaf: *CachedNode, rnd: std.Random, seq: *u64, n: usize) !ApplyWindow {
+    return applyWindowShaped(live, leaf, rnd, seq, n, .inode);
+}
+
+fn applyWindowShaped(live: *LiveBytes, leaf: *CachedNode, rnd: std.Random, seq: *u64, n: usize, shape: ApplyShape) !ApplyWindow {
     const gpa = testing.allocator;
     var bytes: usize = 0;
     var largest: usize = 0;
+    var big: [INLINE_LAYOUT_VALUE_LEN]u8 = undefined;
     for (0..n) |_| {
-        const k = key.inodeKey(rnd.int(u48));
-        const v = iv(seq.*).encode();
-        var recs = [_]OwnedRec{try OwnedRec.fromRecordRef(gpa, .{ .key = &k, .seq = seq.*, .kind = .put, .value = &v })};
+        const ino = rnd.int(u48);
+        const ik = key.inodeKey(ino);
+        const xk = key.xattrKey(ino, 0x1a7, 0);
+        const small = iv(seq.*).encode();
+        const k: []const u8 = switch (shape) {
+            .inode => &ik,
+            .inline_layout => &xk,
+        };
+        const v: []const u8 = switch (shape) {
+            .inode => &small,
+            .inline_layout => blk: {
+                @memset(&big, @truncate(seq.*));
+                break :blk &big;
+            },
+        };
+        var recs = [_]OwnedRec{try OwnedRec.fromRecordRef(gpa, .{ .key = k, .seq = seq.*, .kind = .put, .value = v })};
         const d = leaf.lockWrite(testing.io);
         defer leaf.unlockWrite(testing.io);
         const before = live.allocated;
@@ -4082,6 +4109,58 @@ test "the RAM apply is O(records applied): on a hot leaf whose overlay has grown
     // The view is the overlay: the newest applied key is live with its value.
     const k = key.inodeKey(rnd.int(u48));
     const v = iv(seq).encode();
+    var recs = [_]OwnedRec{try OwnedRec.fromRecordRef(gpa, .{ .key = &k, .seq = seq, .kind = .put, .value = &v })};
+    {
+        const d = leaf.lockWrite(testing.io);
+        defer leaf.unlockWrite(testing.io);
+        try leaf.applyLocked(d, &recs, seq);
+    }
+    try expectLive(leaf, &k, &v);
+}
+
+test "the RAM apply stays inside smp_allocator's slab classes on the inline layout's shape (a new file's first 4 KiB write): a leaf taking 4 KiB records never allocates a block smp_allocator would map as pages — the chunk splits by bytes before its copy reaches the 32 KiB line (on the record-count bound alone a chunk of 32 such records was a 134 KiB arena: an mmap per apply under the leaf lock, a munmap with a TLB shootdown at the publish, every lane serialized on the process's mmap_lock — mdtest -w 4096 created at 25 k files/s against 241 k)" {
+    var live: LiveBytes = .{ .inner = testing.allocator };
+    const cgpa = live.allocator();
+    const gpa = testing.allocator;
+    var ram = try RamLoader.init(gpa, NODE_SIZE);
+    defer ram.deinit(gpa);
+    const layout = try NodeLayout.new(NODE_SIZE, null);
+    const cache = try NodeCache.init(cgpa, testing.io, .{ .layout = layout, .heap_base = 0, .budget_bytes = 64 * NODE_SIZE, .writeback_delta_bytes = std.math.maxInt(usize) }, ram.loader());
+    defer cache.deinit();
+    {
+        var w = try node.writeNode(gpa, layout, .{ .node_addr = 0, .node_seq = 1, .tree_id = key.KIND_INTERIOR, .level = 0, .min_key = "", .max_key = &key.KEY_SPACE_MAX }, &.{}, 0, null);
+        defer w.deinit(gpa);
+        ram.write(w.node_addr, w.image);
+    }
+    const leaf = (try cache.load(0)).?;
+    defer leaf.release();
+    var prng = std.Random.DefaultPrng.init(0x4c1b_0b1e);
+    const rnd = prng.random();
+    var seq: u64 = 1;
+    // Warm past one chunk's worth of 4 KiB records, then measure a window
+    // of applies: a chunk filled to the count bound would be copied whole
+    // on each of them.
+    _ = try applyWindowShaped(&live, leaf, rnd, &seq, 64, .inline_layout);
+    const w = try applyWindowShaped(&live, leaf, rnd, &seq, 256, .inline_layout);
+    const smp_largest_size_class: usize = 32 * 1024;
+    try testing.expect(w.largest < smp_largest_size_class);
+    // The overlay's chunks are bounded by bytes: no chunk's live arena is
+    // past the bound by more than the one record that crossed it.
+    {
+        const d = leaf.lockWrite(testing.io);
+        defer leaf.unlockWrite(testing.io);
+        try testing.expectEqual(@as(usize, 320), d.overlayLen());
+        for (d.overlay.value.slots) |s| {
+            const c = &s.chunk.value;
+            try testing.expect(c.len() > 0);
+            try testing.expect(c.liveBytes() <= snapshot.CHUNK_BYTES_MAX + key.XATTR_KEY_LEN + INLINE_LAYOUT_VALUE_LEN);
+        }
+    }
+    // The view is the overlay: a 4 KiB record applied last is live whole.
+    const ino = rnd.int(u48);
+    const k = key.xattrKey(ino, 0x1a7, 0);
+    var v: [INLINE_LAYOUT_VALUE_LEN]u8 = undefined;
+    @memset(&v, 0xa5);
     var recs = [_]OwnedRec{try OwnedRec.fromRecordRef(gpa, .{ .key = &k, .seq = seq, .kind = .put, .value = &v })};
     {
         const d = leaf.lockWrite(testing.io);

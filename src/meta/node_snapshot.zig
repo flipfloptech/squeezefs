@@ -859,6 +859,18 @@ pub const FoldMemo = struct {
 /// is ≈ 170 slots.
 pub const CHUNK_MAX: usize = 32;
 
+/// Live arena bytes per chunk: a chunk past it splits as one past
+/// `CHUNK_MAX` does. The count bound alone sized the copy for ≈ 100 B
+/// records; the inline layout record of a new file's first write carries
+/// its 4 KiB payload, and 32 of those were a 134 KiB arena — every apply's
+/// chunk copy an mmap under the leaf lock, the publish's free a munmap
+/// with a TLB shootdown, every lane serialized on the process's mmap_lock
+/// (mdtest `-w 4096`: 25 k files/s against 241 k). 16 KiB: the copy
+/// allocates `live + the record` ≤ 16 KiB + 4 KiB + header, inside the
+/// 32 KiB class; a record larger than the bound sits in a chunk of its own
+/// (an inline override, a large xattr) and maps pages as before.
+pub const CHUNK_BYTES_MAX: usize = 16 * 1024;
+
 /// The D7.a head of a chunk record. `none`: no head, or invalidated — the
 /// read falls back to the from-scratch fold. A live head's bytes live in
 /// the chunk's arena: a plain `Put`'s head IS the record's value
@@ -1024,6 +1036,39 @@ pub const Chunk = struct {
         return @as(usize, r.key_len) + r.val_len + head;
     }
 
+    /// The arena bytes the chunk's records reference (the arena may hold
+    /// more: cleared heads and a split's moved-out records until the next
+    /// copy).
+    pub fn liveBytes(self: *const Chunk) usize {
+        var n: usize = 0;
+        for (self.recs.items) |r| n += recBytes(r);
+        return n;
+    }
+
+    /// Whether the chunk is past either bound and has two records to split.
+    fn overFull(self: *const Chunk) bool {
+        const n = self.len();
+        if (n < 2) return false;
+        return n > CHUNK_MAX or self.liveBytes() > CHUNK_BYTES_MAX;
+    }
+
+    /// The split point of an over-full chunk: the first record index at
+    /// which the lower half's live bytes reach half of the whole's, kept
+    /// in `[1, len)` so both halves are non-empty — by bytes, so a chunk
+    /// of mixed shapes (an ino's inode, dentry and 4 KiB layout records are
+    /// neighbours in a slot tree) halves its arena, not its count.
+    fn splitPoint(self: *const Chunk) usize {
+        const n = self.len();
+        assert(n >= 2);
+        const total = self.liveBytes();
+        var acc: usize = 0;
+        for (self.recs.items, 0..) |r, i| {
+            acc += recBytes(r);
+            if (2 * acc >= total) return @max(1, @min(i + 1, n - 1));
+        }
+        return n - 1;
+    }
+
     /// Append `r`'s bytes and head to the arena (reserved by the caller);
     /// the record with the new offsets.
     fn placeAssumeCapacity(self: *Chunk, r: RecordRef, entry_floor: u64, head: HeadIn) ChunkRec {
@@ -1055,9 +1100,12 @@ pub const Chunk = struct {
     }
 
     /// Insert `r` at `at` (the chunk is the caller's alone). Nothing changes
-    /// when the reservation fails.
+    /// when the reservation fails. The arena grows to exactly what it holds
+    /// (a growth factor over a chunk near `CHUNK_BYTES_MAX` would carry the
+    /// block past the allocator's largest slab class; a same-class resize
+    /// is free, a class crossing one copy of at most the bound).
     fn insertRec(self: *Chunk, gpa: Allocator, at: usize, r: RecordRef, entry_floor: u64, head: HeadIn) Allocator.Error!void {
-        try self.bytes.ensureUnusedCapacity(gpa, r.key.len + r.value.len + head.extraBytes());
+        try self.bytes.ensureTotalCapacityPrecise(gpa, self.bytes.items.len + r.key.len + r.value.len + head.extraBytes());
         try self.recs.ensureUnusedCapacity(gpa, 1);
         const c = self.placeAssumeCapacity(r, entry_floor, head);
         self.recs.insertAssumeCapacity(at, c);
@@ -1127,7 +1175,9 @@ pub const Run = struct {
     /// chunk's in-place growth at most as much again), their boxes, the
     /// spine (chunks are at least half full after their split — the first
     /// grows from 1) and the run's box. Independent of the overlay length
-    /// but for the spine's one slot per chunk.
+    /// but for the spine's one slot per chunk. The spine term is the
+    /// count-bounded shape's (records small against `CHUNK_BYTES_MAX`);
+    /// records near the byte bound make more, smaller chunks.
     pub fn applyBytesBound(n: usize, rec_bytes: usize) usize {
         const chunk = (CHUNK_MAX + 1) * (@sizeOf(ChunkRec) + rec_bytes);
         const spine = (n / (CHUNK_MAX / 2) + 2) * @sizeOf(Slot);
@@ -1233,32 +1283,54 @@ pub const Run = struct {
         return out;
     }
 
-    /// A run over `recs`, already `(key asc, seq asc)`, in chunks of
-    /// `CHUNK_MAX` (their bytes copied; the slice stays the caller's, its
-    /// elements are consumed on every outcome).
+    /// The wire bytes of an owned record as a chunk stores it.
+    fn ownedBytes(r: *const OwnedRec) usize {
+        return r.key.len + r.value.len + HeadIn.of(r.folded).extraBytes();
+    }
+
+    /// The records of the next chunk off `recs`: up to `CHUNK_MAX`, cut
+    /// before the record that would carry the chunk past `CHUNK_BYTES_MAX`
+    /// (a chunk always takes one).
+    fn chunkTake(recs: []const OwnedRec) usize {
+        var take: usize = 0;
+        var bytes: usize = 0;
+        while (take < recs.len and take < CHUNK_MAX) : (take += 1) {
+            const b = ownedBytes(&recs[take]);
+            if (take > 0 and bytes + b > CHUNK_BYTES_MAX) break;
+            bytes += b;
+        }
+        return take;
+    }
+
+    /// A run over `recs`, already `(key asc, seq asc)`, in chunks of at
+    /// most `CHUNK_MAX` records and `CHUNK_BYTES_MAX` bytes (their bytes
+    /// copied; the slice stays the caller's, its elements are consumed on
+    /// every outcome).
     pub fn fromSorted(gpa: Allocator, recs: []OwnedRec) Allocator.Error!Run {
         defer for (recs) |*r| r.deinit();
-        const n_chunks = (recs.len + CHUNK_MAX - 1) / CHUNK_MAX;
-        if (n_chunks == 0) return .empty;
+        if (recs.len == 0) return .empty;
         var slots: std.ArrayListUnmanaged(Slot) = .empty;
         errdefer {
             for (slots.items) |s| s.chunk.release();
             slots.deinit(gpa);
         }
-        try slots.ensureTotalCapacityPrecise(gpa, n_chunks);
+        try slots.ensureTotalCapacity(gpa, (recs.len + CHUNK_MAX - 1) / CHUNK_MAX);
         var done: usize = 0;
         while (done < recs.len) {
-            const take = @min(CHUNK_MAX, recs.len - done);
+            const take = chunkTake(recs[done..]);
             var chunk: Chunk = .empty;
             errdefer chunk.deinit(gpa);
             var bytes: usize = 0;
-            for (recs[done..][0..take]) |*r| bytes += r.key.len + r.value.len + HeadIn.of(r.folded).extraBytes();
+            for (recs[done..][0..take]) |*r| bytes += ownedBytes(r);
             try chunk.recs.ensureTotalCapacityPrecise(gpa, take);
             try chunk.bytes.ensureTotalCapacityPrecise(gpa, bytes);
             for (recs[done..][0..take]) |*r| chunk.recs.appendAssumeCapacity(chunk.placeAssumeCapacity(r.recordRef(), r.entry_floor, HeadIn.of(r.folded)));
             const c = try Arc(Chunk).create(gpa, chunk);
             chunk = .empty;
-            slots.appendAssumeCapacity(.{ .chunk = c, .start = @intCast(done) });
+            slots.append(gpa, .{ .chunk = c, .start = @intCast(done) }) catch |e| {
+                c.release();
+                return e;
+            };
             done += take;
         }
         return .{ .slots = try slots.toOwnedSlice(gpa), .len = recs.len };
@@ -1332,8 +1404,9 @@ pub const RunEdit = struct {
     /// Insert `r` with `head` at run index `pos` (the caller's partition
     /// point; the bytes are copied). The chunk holding `pos` takes it — at
     /// a chunk boundary the chunk ENDING there, so a record and its same-key
-    /// predecessor share the one copy; a chunk past `CHUNK_MAX` splits in
-    /// half. Returns the head's charge.
+    /// predecessor share the one copy; a chunk past `CHUNK_MAX` records or
+    /// `CHUNK_BYTES_MAX` live bytes splits at its byte midpoint. Returns
+    /// the head's charge.
     pub fn insert(self: *RunEdit, gpa: Allocator, pos: usize, r: RecordRef, entry_floor: u64, head: HeadIn) Allocator.Error!usize {
         assert(pos <= self.len);
         const need = r.key.len + r.value.len + head.extraBytes();
@@ -1362,26 +1435,47 @@ pub const RunEdit = struct {
         for (self.slots.items[ci + 1 ..]) |*t| t.start += 1;
         // An over-full chunk splits; failing to (no memory) leaves a longer
         // chunk, never a wrong run — the next insert into it tries again.
-        if (s.chunk.value.len() > CHUNK_MAX) self.split(gpa, ci) catch {};
+        if (s.chunk.value.overFull()) self.splitOverFull(gpa, ci) catch {};
         return charge;
     }
 
-    /// Split the chunk at `ci` (owned alone) in half: the upper half is
-    /// copied into a fresh chunk, the lower keeps its arena (compacted at
-    /// its next copy). Every allocation precedes the first mutation, so a
-    /// failure leaves the chunk whole.
+    /// Split the chunk at `ci` and whichever of its halves is still over
+    /// full (a record larger than the byte bound leaves its neighbours'
+    /// half over full once more; a chunk of one record never splits).
+    fn splitOverFull(self: *RunEdit, gpa: Allocator, ci: usize) Allocator.Error!void {
+        var i = ci;
+        var end = ci + 1;
+        while (i < end) {
+            if (self.slots.items[i].chunk.value.overFull()) {
+                try self.split(gpa, i);
+                end += 1;
+            } else i += 1;
+        }
+    }
+
+    /// Split the chunk at `ci` (owned alone) at its byte midpoint: both
+    /// halves are compacted copies, so neither carries the other's bytes
+    /// in its arena — the lower half's next in-place growth starts from
+    /// its own live bytes, and its next copy is the verbatim one. Every
+    /// allocation precedes the first mutation, so a failure leaves the
+    /// chunk whole.
     fn split(self: *RunEdit, gpa: Allocator, ci: usize) Allocator.Error!void {
         assert(owned(self.slots.items[ci]));
         const whole = &self.slots.items[ci].chunk.value;
-        const half = whole.len() / 2;
-        var upper = try whole.copyRange(gpa, half, whole.len(), 0, 0);
-        const right = Arc(Chunk).create(gpa, upper) catch |e| {
-            upper.deinit(gpa);
-            return e;
-        };
+        const at = whole.splitPoint();
+        var lower = try whole.copyRange(gpa, 0, at, 0, 0);
+        errdefer lower.deinit(gpa);
+        var upper = try whole.copyRange(gpa, at, whole.len(), 0, 0);
+        errdefer upper.deinit(gpa);
+        const left = try Arc(Chunk).create(gpa, lower);
+        lower = .empty;
+        errdefer left.release();
+        const right = try Arc(Chunk).create(gpa, upper);
+        upper = .empty;
         errdefer right.release();
-        try self.slots.insert(gpa, ci + 1, .{ .chunk = right, .start = @intCast(self.slots.items[ci].start + half) });
-        self.slots.items[ci].chunk.value.recs.shrinkRetainingCapacity(half);
+        try self.slots.insert(gpa, ci + 1, .{ .chunk = right, .start = @intCast(self.slots.items[ci].start + at) });
+        self.slots.items[ci].chunk.release();
+        self.slots.items[ci].chunk = left;
     }
 };
 
@@ -2556,6 +2650,86 @@ test "a chunk copy is the compacted copy record for record: a chunk with no dead
     try testing.expectEqual(Check.liveBytes(&lower), lower_copy.bytes.items.len);
     try testing.expect(lower_copy.bytes.items.len < lower.bytes.items.len);
     try Check.sameRecords(&lower, &lower_copy);
+}
+
+test "a chunk is bounded by bytes as well as by records: 4 KiB values (the inline layout's shape) split the chunk at CHUNK_BYTES_MAX — every chunk's live bytes stay within the bound plus one record, both halves of a split are compacted (arena ≡ live bytes), the run reads as the flat array; fromSorted cuts by the same bound; a single record past the bound sits in a chunk of its own and is never split" {
+    const gpa = testing.allocator;
+    const VAL: usize = 4096 + 48;
+    var v: [VAL]u8 = undefined;
+    var cur = try Arc(Run).create(gpa, Run.empty);
+    defer cur.release();
+    const N: usize = 96;
+    for (0..N) |i| {
+        @memset(&v, @intCast(i));
+        const k = key.xattrKey(@intCast(i * 7 + 1), 0x1a7, 0);
+        const r = RecordRef{ .key = &k, .seq = i + 1, .kind = .put, .value = &v };
+        var edit = try RunEdit.begin(gpa, &cur.value);
+        _ = try edit.insert(gpa, i, r, i + 1, .own_value);
+        const next = try Arc(Run).create(gpa, try edit.finish(gpa));
+        cur.release();
+        cur = next;
+        // Every chunk: non-empty, within the byte bound plus the record
+        // that crossed it, and compact — the count bound never reached.
+        for (cur.value.slots) |s| {
+            const c = &s.chunk.value;
+            try testing.expect(c.len() > 0 and c.len() <= CHUNK_MAX);
+            try testing.expect(c.liveBytes() <= CHUNK_BYTES_MAX + key.XATTR_KEY_LEN + VAL);
+            // A chunk that was split or copied holds no dead bytes; the one
+            // that took this insert in place grew by exactly the record.
+            try testing.expectEqual(c.liveBytes(), c.bytes.items.len);
+            try testing.expectEqual(c.liveBytes(), c.bytes.capacity);
+        }
+    }
+    // 4 KiB records fill a 16 KiB chunk three deep: ≥ N / 4 chunks, every
+    // record at its index with its value.
+    const run = &cur.value;
+    try testing.expectEqual(N, run.len);
+    try testing.expect(run.slots.len >= N / 4);
+    for (0..N) |i| {
+        const got = run.at(i);
+        try testing.expectEqual(@as(u64, i + 1), got.seq());
+        try testing.expectEqual(@as(u8, @intCast(i)), got.value()[0]);
+        try testing.expectEqual(VAL, got.value().len);
+    }
+    // The flat round trip cuts by bytes too.
+    const flat = try run.flatten(gpa);
+    defer gpa.free(flat);
+    var rebuilt = try Run.fromSorted(gpa, flat);
+    defer rebuilt.deinit(gpa);
+    try testing.expectEqual(N, rebuilt.len);
+    try testing.expect(rebuilt.slots.len >= N / 4);
+    for (rebuilt.slots) |s| {
+        const c = &s.chunk.value;
+        try testing.expect(c.len() > 0);
+        try testing.expect(c.liveBytes() <= CHUNK_BYTES_MAX);
+    }
+    for (0..N) |i| try testing.expect(run.at(i).ref().eql(rebuilt.at(i).ref()));
+    // One record larger than the bound: alone in its chunk, its neighbours
+    // split away from it, never a split of a one-record chunk.
+    const huge = try gpa.alloc(u8, 3 * CHUNK_BYTES_MAX);
+    defer gpa.free(huge);
+    @memset(huge, 0xee);
+    const hk = key.xattrKey(5, 0x1a7, 0);
+    {
+        var edit = try RunEdit.begin(gpa, &cur.value);
+        const pos = edit.view().partitionPoint(RunCtx{ .k = &hk }, runKeyLess);
+        _ = try edit.insert(gpa, pos, .{ .key = &hk, .seq = N + 1, .kind = .put, .value = huge }, N + 1, .own_value);
+        _ = try edit.insert(gpa, pos, .{ .key = &hk, .seq = N + 1, .kind = .put, .value = huge }, N + 1, .own_value);
+        const next = try Arc(Run).create(gpa, try edit.finish(gpa));
+        cur.release();
+        cur = next;
+    }
+    var lone: usize = 0;
+    for (cur.value.slots) |s| {
+        const c = &s.chunk.value;
+        try testing.expect(c.len() > 0);
+        if (c.liveBytes() > CHUNK_BYTES_MAX + key.XATTR_KEY_LEN + VAL) {
+            try testing.expectEqual(@as(usize, 1), c.len());
+            lone += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), lone);
+    try testing.expectEqual(N + 2, cur.value.len);
 }
 
 test "Run.applyBytesBound tie: two chunk copies of CHUNK_MAX + 1 records and their arena with their boxes, one slot per half-full chunk plus two, the run's box; ChunkRec is 48 bytes" {

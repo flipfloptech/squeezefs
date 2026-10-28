@@ -86,7 +86,6 @@ const placement = @import("../exec/placement.zig");
 const cpu_class = @import("../exec/cpu_class.zig");
 const sqz_io = if (is_linux) @import("../exec/sqz_io.zig") else struct {};
 const tick = @import("../sync/tick.zig");
-const sync_mutex = @import("../sync/mutex.zig");
 const arc_swap = @import("../sync/arc_swap.zig");
 const lock_order = @import("../sync/lock_order.zig");
 const uring_fs = if (is_linux) @import("../io/uring_fs.zig") else struct {};
@@ -187,34 +186,60 @@ pub const Sources = struct {
     /// `fabric_daemon_bound` rows of the nvmet family.
     fabric: if (is_linux) ?*const nvmet_mount_fabric.Plan else ?*void = null,
     key_census: ?KeyCensus = null,
-    /// The CPU ledger (+ its allocator) and an `Io` for the `/proc/self/
-    /// task` walk; absent ⇒ zeros (every family stays present).
-    cpu: ?*cpu_class.Ledger = null,
+    /// The CPU census as the sampler last published it (`Renderer.sample`;
+    /// the render reads it, never walks `/proc` itself — decision 0003
+    /// §CC.1). Zeros before the first sample (every family stays present).
+    cpu: *const SampledCpu = &zero_cpu,
+    /// The allocator and `Io` of the `/proc/self/task` walk: the sampler's,
+    /// on the budget's thread; absent ⇒ the sample stays zero.
     gpa: ?Allocator = null,
     io: ?Io = null,
-    /// ONE render at a time over these sources: a document build is a
-    /// cold op that MUTATES its own state — the CPU ledger's hash map
-    /// (`cpu_class.sample`), the renderer's size hint — and two LOOKUPs of
-    /// `.stats` on two handler lanes (the supervisor's probe beside
-    /// `squeezefs umount`'s poll, or any two readers) raced in it:
-    /// `std.HashMap.getOrPut` reached unreachable code and the daemon
-    /// died mid-teardown (fstests generic/410, 2026-10-23; the
-    /// `finishPass` class-170 panic of the 10-21 handoff is the same
-    /// race). Held only when an `Io` is bound (the daemon); the portable
-    /// rows render single-threaded.
-    render_lock: sync_mutex.Mutex = .init,
 
     pub fn keyCensusArmed(self: *const Sources) bool {
         const env = self.env orelse return false;
         return knobs.boolKnob("SQUEEZEFS_STATS_KEY_CENSUS", env);
     }
+};
 
-    fn lockRender(self: *Sources) void {
-        if (self.io) |io| self.render_lock.lockUncancelable(io);
+const zero_cpu: SampledCpu = .{};
+
+/// The CPU census, published by ONE writer (the sampler) to any number of
+/// concurrent readers (the renders) through a seqlock: the writer bumps
+/// `seq` to odd, writes the sample, bumps it to even; a reader accepts a
+/// copy only when `seq` read even before and unchanged after. Σ classes ≤
+/// total holds for every accepted copy because it held for the write
+/// (`sampled_model.zig` proves the pairing and that a reader skipping the
+/// second read accepts a torn copy).
+pub const SampledCpu = struct {
+    seq: std.atomic.Value(u32) = .init(0),
+    sample: cpu_class.Sample = .{ .total_ns = 0, .by_class = @splat(0) },
+
+    pub fn publish(self: *SampledCpu, s: cpu_class.Sample) void {
+        const open = self.seq.load(.monotonic) + 1;
+        // seq_cst: the odd word is ordered before every field store, so a
+        // reader's even `before` and equal re-read bracket no field write
+        // (the model's one-action-per-step words).
+        self.seq.store(open, .seq_cst);
+        @atomicStore(u64, &self.sample.total_ns, s.total_ns, .monotonic);
+        for (&self.sample.by_class, s.by_class) |*dst, v| @atomicStore(u64, dst, v, .monotonic);
+        // seq_cst pairs with the reader's re-read: the even word follows
+        // every field store.
+        self.seq.store(open + 1, .seq_cst);
     }
 
-    fn unlockRender(self: *Sources) void {
-        if (self.io) |io| self.render_lock.unlock(io);
+    pub fn read(self: *const SampledCpu) cpu_class.Sample {
+        while (true) {
+            // seq_cst pairs with `publish`'s stores: a field loaded after
+            // an even `before` and before an equal re-read is the write's.
+            const before = self.seq.load(.seq_cst);
+            if (before & 1 != 0) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            var copy: cpu_class.Sample = .{ .total_ns = @atomicLoad(u64, &self.sample.total_ns, .monotonic), .by_class = undefined };
+            for (&copy.by_class, 0..) |*dst, i| dst.* = @atomicLoad(u64, &self.sample.by_class[i], .monotonic);
+            if (self.seq.load(.seq_cst) == before) return copy;
+        }
     }
 };
 
@@ -665,13 +690,12 @@ fn writeOps(_: *Sources, w: *Writer) Error!void {
 }
 
 /// The `nvmet_*` / `fabric_*` family; the fabric controllers are SAMPLED
-/// off `/sys/class/nvme` at every render (a cold path: the `.stats` build
-/// is the cadence, never an op). The sampler owns its tables for the
+/// off `/sys/class/nvme` by the sampler (`Renderer.sample`, the budget
+/// thread's tick), never by the render. The sampler owns its tables for the
 /// process's life and borrows nothing from the render (the allocation law);
 /// the daemon-owned associations (`mount_fabric.Plan`) render in the same
 /// object.
 fn writeNvmet(src: *Sources, w: *Writer) Error!void {
-    if (is_linux) nvmet_initiator.sampleFabric();
     try w.writeByte('{');
     const any = try counters.writeNamespaceEntries(nvmet_stats, w);
     if (is_linux) if (src.fabric) |plan| {
@@ -708,15 +732,11 @@ fn writeJobs(_: *Sources, w: *Writer) Error!void {
     try w.writeByte('}');
 }
 
-/// ONE sample per render: the per-thread classes BEFORE the process total
-/// so `Σ classes ≤ total` (the sample's own law).
+/// The sampler's last CPU census (one consistent copy through the
+/// seqlock): the per-thread classes were read BEFORE the process total so
+/// `Σ classes ≤ total` (the sample's own law) holds for it.
 fn writeCpu(src: *Sources, w: *Writer) Error!void {
-    const zero: cpu_class.Sample = .{ .total_ns = 0, .by_class = @splat(0) };
-    const ledger_ptr = src.cpu orelse return zero.writeJson(w);
-    const gpa = src.gpa orelse return zero.writeJson(w);
-    const io = src.io orelse return zero.writeJson(w);
-    const sample = cpu_class.sample(ledger_ptr, gpa, io, "/proc") catch zero;
-    try sample.writeJson(w);
+    try src.cpu.read().writeJson(w);
 }
 
 /// The cluster wire's `cluster_wire_*` family (`wire/stats.zig`).
@@ -861,12 +881,14 @@ pub fn closure() Closure {
 // ---------------------------------------------------------------------------
 
 /// A rendered payload: the capacity the render reserved and the bytes it
-/// used (`bytes()`), freed whole. The payload ends with ONE `\n` and no
-/// padding (`finish_virtual_payload`'s law: `attr.size` is exactly the
-/// served bytes).
+/// used (`bytes()`), freed whole, and how long the render took (the share
+/// window of the generation it becomes, `virtual_inodes.Owned.render_ns`).
+/// The payload ends with ONE `\n` and no padding (`finish_virtual_payload`'s
+/// law: `attr.size` is exactly the served bytes).
 pub const Payload = struct {
     buf: []u8,
     len: usize,
+    render_ns: u64,
 
     pub fn bytes(self: Payload) []const u8 {
         return self.buf[0..self.len];
@@ -888,11 +910,19 @@ pub fn capacityHint(last_len: usize) usize {
     return last_len + last_len / 8 + 4096;
 }
 
+/// Renders run CONCURRENTLY and on any thread (a `.stats` lookup's fiber
+/// hands its render to the blocking pool, `cli/mount.zig`): the document
+/// is written from atomics and sampled words alone, the size hint is a
+/// racy atomic, and the one piece of state a render used to mutate — the
+/// CPU ledger — belongs to `sample`, the budget sampler's thread, where
+/// every syscall walk lives (decision 0003 §CC.1; the 2026-10-23 render
+/// lock that serialized two lookups over the ledger is gone with the race).
 pub const Renderer = struct {
     gpa: Allocator,
     sources: Sources,
-    last_len: usize = 0,
+    last_len: std.atomic.Value(usize) = .init(0),
     cpu: cpu_class.Ledger,
+    cpu_sample: SampledCpu = .{},
 
     pub fn init(gpa: Allocator, src: Sources) Renderer {
         var r: Renderer = .{ .gpa = gpa, .sources = src, .cpu = .{} };
@@ -905,26 +935,47 @@ pub const Renderer = struct {
         self.* = undefined;
     }
 
+    /// The sampler's pass (the budget thread's tick; a test's call): the
+    /// CPU census over `/proc/self/task` into the ledger and published,
+    /// the fabric controllers off `/sys/class/nvme`. ONE caller at a time
+    /// (the ledger and the fabric tables are the sampler's own).
+    pub fn sample(self: *Renderer) void {
+        if (is_linux) nvmet_initiator.sampleFabric();
+        const gpa = self.sources.gpa orelse return;
+        const io = self.sources.io orelse return;
+        const s = cpu_class.sample(&self.cpu, gpa, io, "/proc") catch return;
+        self.cpu_sample.publish(s);
+    }
+
+    /// The budget's sampler hook over `self` (the renderer must outlive the
+    /// sampler thread: `cli/mount.zig` stops the sampler first).
+    pub fn sampler(self: *Renderer) mem_budget.Sampler {
+        return .{ .ctx = self, .call = &sampleHook };
+    }
+
+    fn sampleHook(ctx: *anyopaque) void {
+        const self: *Renderer = @ptrCast(@alignCast(ctx));
+        self.sample();
+    }
+
     /// The `.stats` document. One allocation when the hint holds
     /// (`stats_build_regrows` counts the renders it did not).
     pub fn render(self: *Renderer) Allocator.Error!Payload {
-        self.sources.lockRender();
-        defer self.sources.unlockRender();
-        // The ledger pointer must follow the renderer (a moved Renderer).
-        self.sources.cpu = &self.cpu;
-        var out: Writer.Allocating = try .initCapacity(self.gpa, capacityHint(self.last_len));
+        const t0 = clock.monotonicNs();
+        // The snapshot pointer must follow the renderer (a moved Renderer).
+        self.sources.cpu = &self.cpu_sample;
+        var out: Writer.Allocating = try .initCapacity(self.gpa, capacityHint(self.last_len.load(.monotonic)));
         errdefer out.deinit();
         const cap = out.writer.buffer.len;
         writeAll(&self.sources, &out.writer) catch return error.OutOfMemory;
         out.writer.writeByte('\n') catch return error.OutOfMemory;
         if (out.writer.buffer.len != cap) stats.stats_build_regrows.inc();
-        return self.finish(&out);
+        return self.finish(&out, t0, true);
     }
 
     /// `.config`: the live twin of `status`' set summary.
     pub fn renderConfig(self: *Renderer, write_set: *const fn (*anyopaque, *Writer) Error!void, ctx: *anyopaque) Allocator.Error!Payload {
-        self.sources.lockRender();
-        defer self.sources.unlockRender();
+        const t0 = clock.monotonicNs();
         var out: Writer.Allocating = try .initCapacity(self.gpa, 4096);
         errdefer out.deinit();
         const w = &out.writer;
@@ -939,26 +990,31 @@ pub const Renderer = struct {
         w.writeAll(",\"sqdata_uri\":") catch return error.OutOfMemory;
         writeJsonString(w, self.sources.mount.sqdata_uri) catch return error.OutOfMemory;
         w.writeAll("}\n") catch return error.OutOfMemory;
-        return self.finish(&out);
+        return self.finish(&out, t0, false);
     }
 
-    fn finish(self: *Renderer, out: *Writer.Allocating) Payload {
+    /// `hint`: this render's length is the next `.stats` render's capacity
+    /// hint (a `.config` payload is not).
+    fn finish(self: *Renderer, out: *Writer.Allocating, t0: u64, hint: bool) Payload {
         const len = out.writer.end;
         const buf = out.writer.buffer;
         out.writer.buffer = &.{};
         out.writer.end = 0;
-        self.last_len = len;
+        if (hint) self.last_len.store(len, .monotonic);
         stats.stats_builds.inc();
         if (len > stats.stats_build_bytes_max.load()) stats.stats_build_bytes_max.set(len);
-        return .{ .buf = buf, .len = len };
+        return .{ .buf = buf, .len = len, .render_ns = clock.monotonicNs() -| t0 };
     }
 };
 
 /// The SIGUSR1 dump: one log line per family (`stats <name>: {…}`), the
 /// daemon line last. The same writers as the inode — there is ONE source.
-pub fn logFamilies(src: *Sources, gpa: Allocator) void {
-    src.lockRender();
-    defer src.unlockRender();
+pub fn logFamilies(self: *Renderer) void {
+    self.sources.cpu = &self.cpu_sample;
+    logFamiliesOf(&self.sources, self.gpa);
+}
+
+fn logFamiliesOf(src: *Sources, gpa: Allocator) void {
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
     inline for (families) |f| {
@@ -1306,10 +1362,10 @@ test "allocation law: after the warm-up render a render is exactly ONE allocatio
     try testing.expectEqual(before.resizes, ca.resizes);
     try testing.expectEqual(before.remaps, ca.remaps);
     try testing.expect(p.buf.len >= p.len);
-    try testing.expectEqual(r.last_len, p.len);
+    try testing.expectEqual(r.last_len.load(.monotonic), p.len);
 }
 
-test "allocation law under fabric controllers (linux): with three fabric controllers in the sampled sysfs the sampler borrows nothing from the render — the render after the warm-up is still exactly ONE allocation, and the fabric gauges read the controllers" {
+test "allocation law under fabric controllers (linux): with three fabric controllers in the sampled sysfs the sampler borrows nothing from the render — the render after the warm-up is still exactly ONE allocation, and the fabric gauges read the controllers the SAMPLER saw (a render samples nothing)" {
     if (!is_linux) return testkit.skip(@src(), .no_linux, "the fabric sampler reads sysfs");
     var fx = nvmet_initiator.Fixture.init(testing.allocator, testing.io, "stats-law") catch return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
     defer fx.deinit();
@@ -1322,6 +1378,12 @@ test "allocation law under fabric controllers (linux): with three fabric control
     var ca: CountingAllocator = .{ .inner = testing.allocator };
     var r = Renderer.init(ca.allocator(), .{});
     defer r.deinit();
+    // A render before any sample reports no controller: the walk is the
+    // sampler's, never the render's.
+    const unsampled = try r.render();
+    try testing.expect(std.mem.indexOf(u8, unsampled.bytes(), "\"fabric_controllers\":3") == null);
+    unsampled.deinit(ca.allocator());
+    r.sample();
     const warm = try r.render();
     warm.deinit(ca.allocator());
     try testing.expectEqual(@as(u64, 3), nvmet_stats.fabric_controllers.load());
@@ -1355,12 +1417,13 @@ test "renderConfig: build + mount + the set writer's object + the URIs, one newl
     try testing.expect(std.mem.indexOf(u8, p.bytes(), "\"set\":{\"block_size\":4194304},\"sqmeta_uri\":\"sqmeta:///dev/m\",\"sqdata_uri\":\"sqdata:///dev/d\"}\n") != null);
 }
 
-test "render: concurrent renders of ONE renderer (eight threads, the CPU ledger walking /proc/self/task) serialize — every document parses, the ledger's classes never fall (the race corrupted the ledger's hash map and killed a daemon mid-teardown under fstests generic/410)" {
+test "render: eight threads rendering ONE renderer concurrently beside a sampler thread (the CPU census walking /proc/self/task, published through the seqlock) — no render walks /proc (the ledger is the sampler's alone), every document parses, every CPU family read is a whole sample (Σ classes ≤ total), the classes never fall, and a render carries its duration" {
     if (!is_linux) return testkit.skip(@src(), .other_step, "the CPU ledger walks /proc/self/task");
     const Shared = struct {
         r: *Renderer,
         failed: std.atomic.Value(u32) = .init(0),
-        fn run(s: *@This()) void {
+        stop: std.atomic.Value(bool) = .init(false),
+        fn render(s: *@This()) void {
             var i: usize = 0;
             while (i < 40) : (i += 1) {
                 const p = s.r.render() catch {
@@ -1374,20 +1437,39 @@ test "render: concurrent renders of ONE renderer (eight threads, the CPU ledger 
                     _ = s.failed.fetchAdd(1, .monotonic);
                     return;
                 };
+                const sample = s.r.cpu_sample.read();
+                var sum: u64 = 0;
+                for (sample.by_class) |n| sum += n;
+                if (sum > sample.total_ns) _ = s.failed.fetchAdd(1, .monotonic);
             }
+        }
+        fn sampleLoop(s: *@This()) void {
+            while (!s.stop.load(.acquire)) s.r.sample();
         }
     };
     var r = Renderer.init(testing.allocator, .{ .gpa = testing.allocator, .io = testing.io });
     defer r.deinit();
     var s: Shared = .{ .r = &r };
+    const sampler = try std.Thread.spawn(.{}, Shared.sampleLoop, .{&s});
     var threads: [8]std.Thread = undefined;
-    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Shared.run, .{&s});
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Shared.render, .{&s});
     for (threads) |t| t.join();
+    s.stop.store(true, .release);
+    sampler.join();
     try testing.expectEqual(@as(u32, 0), s.failed.load(.monotonic));
-    // The ledger is whole after the storm: a last single-threaded sample.
+    // The ledger is whole after the storm, and the document carries it.
+    r.sample();
     const p = try r.render();
     defer p.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, p.bytes(), "\"daemon_cpu_ns_by_class\":{") != null);
+    try testing.expect(p.render_ns > 0);
+    // The sampler, not the render, moves the census: a render after the
+    // sampler stopped reports the same total as the one before it.
+    const total_before = r.cpu_sample.read().total_ns;
+    const again = try r.render();
+    again.deinit(testing.allocator);
+    try testing.expectEqual(total_before, r.cpu_sample.read().total_ns);
+    try testing.expect(total_before > 0);
 }
 
 test "the family table: every name once; familyByName resolves" {

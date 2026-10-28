@@ -45,6 +45,7 @@ const fsv = @import("filesystem_vtable.zig");
 const worker = @import("worker.zig");
 const counters = @import("../../core/counters.zig");
 const clock = @import("../../core/clock.zig");
+const pass_stamps = @import("pass_stamps.zig");
 const log = @import("../../core/log.zig");
 const knobs = @import("../../core/knobs.zig");
 const derive = @import("../../core/derive.zig");
@@ -2477,6 +2478,11 @@ pub const Session = struct {
         try field(w, "transport_park_tick_late_cqes", worker.park_tick_late_cqes.load());
         try field(w, "transport_enters", worker.enters.load());
         try field(w, "transport_passes", worker.passes.load());
+        // The longest pass IN FLIGHT at this render (`pass_stamps`): a drain
+        // worker held inside one pass — by an op it runs inline — for this
+        // long; 0 when every worker is parked or between passes. The lane-
+        // hold reading the `.stats` herd row judges (decision 0003 §CC).
+        try field(w, "transport_pass_stalest_ms", if (pass_stamps.stalest(clock.monotonicNs())) |st| st.age_ns / std.time.ns_per_ms else 0);
         try field(w, "transport_owed_spins", worker.owed_spins.load());
         try field(w, "transport_owed_spin_hits", worker.owed_spin_hits.load());
         try field(w, "transport_owed_spin_falls", worker.owed_spin_falls.load());

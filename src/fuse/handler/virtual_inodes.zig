@@ -12,10 +12,24 @@
 //! TTL 0 ⇒ every path walk revalidates ⇒ a fresh generation per consumer
 //! and a prompt FORGET.
 //!
-//! THE GENERATION IS THE PIN: a generation holds one reference for the
-//! kernel (dropped by FORGET), one for the FIFO ring (dropped when the ring
-//! evicts it) and one per open fh (OPEN/RELEASE); the payload frees at zero
-//! and a retired generation answers `ESTALE`. There is no second table.
+//! THE SHARE WINDOW (decision 0003 §CC.2): a lookup that arrives within one
+//! render-time of the class's newest generation is answered WITH it (the
+//! same nodeid, one more kernel reference) instead of minting. The kernel's
+//! `__lookup_slow` revalidates the dentry a sibling's lookup just created,
+//! and a revalidation answered with a different nodeid invalidates it and
+//! retries — N concurrent readers of `.stats` livelocked in O(N) lookups
+//! per read (32 readers on an idle box: 2,179 renders for 55 reads, 21 s a
+//! read; the supervisor's probe in the same queue, so a SIGABRT). The
+//! window is the render's own measured duration: the staleness a sharing
+//! reader accepts equals the latency it saves, and a zero-cost render
+//! (the tests' fakes) shares nothing.
+//!
+//! THE GENERATION IS THE PIN: a generation holds one reference per LOOKUP
+//! answered with it (the kernel's, all dropped by the FORGET that evicts
+//! the ino from the lookup table — the kernel's `nlookup` may arrive in
+//! parts), one for the FIFO ring (dropped when the ring evicts it) and one
+//! per open fh (OPEN/RELEASE); the payload frees at zero and a retired
+//! generation answers `ESTALE`. There is no second table.
 //!
 //! Visibility: lookup-only — never listed by readdir (fstests generic/062:
 //! a recursive walk must not see fabricated files); the two reserved
@@ -126,27 +140,40 @@ pub const stats = struct {
     pub var stats_generations_evicted: counters.ShardedCounter = .{};
     /// Reads/opens/getattrs on a retired generation (ESTALE replies).
     pub var stats_generation_stale: counters.ShardedCounter = .{};
+    /// Lookups answered with the class's newest generation inside its
+    /// share window (module doc) instead of a render of their own.
+    pub var stats_generation_shares: counters.ShardedCounter = .{};
 };
 
 /// A rendered payload the registry takes ownership of: the capacity the
-/// renderer reserved and the bytes it wrote.
+/// renderer reserved and the bytes it wrote, and how long the render
+/// took — the share window a later lookup of the class may ride.
 pub const Owned = struct {
     buf: []u8,
     len: usize,
+    render_ns: u64 = 0,
 
     pub fn bytes(self: Owned) []const u8 {
         return self.buf[0..self.len];
     }
 };
 
+/// A lookup answered from the class's newest generation (`Registry.share`).
+pub const Shared = struct { ino: u64, len: u64 };
+
 const Generation = struct {
     seq: u64,
     class: Class,
     payload: Owned,
-    /// kernel (1) + ring (1) + opens.
+    /// kernel lookups + ring (1) + opens.
     refs: u32,
+    /// The kernel's share of `refs`: one per LOOKUP answered with this
+    /// generation (the mint's and every share's).
+    kernel: u32,
     /// Still in the ring (the ring's reference is live).
     ringed: bool,
+    /// When the mint happened (the share window's origin).
+    minted_at_ns: u64,
 };
 
 pub const Registry = struct {
@@ -158,8 +185,12 @@ pub const Registry = struct {
     gens: std.AutoHashMapUnmanaged(u64, *Generation) = .empty,
     /// FIFO ring of the seqs holding a ring reference; `no_seq` = empty slot.
     ring: [REGISTRY_CAP]u64 = @splat(no_seq),
+    /// The newest generation of each class (`no_seq` = none yet): the one
+    /// a lookup inside its share window is answered with.
+    newest: [class_count]u64 = @splat(no_seq),
 
     const no_seq = std.math.maxInt(u64);
+    const class_count = @typeInfo(Class).@"enum".field_names.len;
 
     pub fn init(gpa: Allocator) Registry {
         return .{ .gpa = gpa };
@@ -176,10 +207,10 @@ pub const Registry = struct {
         self.* = undefined;
     }
 
-    /// Mint a generation owning `payload`; the ring's oldest loses its ring
-    /// reference when the ring is full (evicted; freed when nothing else
-    /// pins it). Returns the generation ino.
-    pub fn mint(self: *Registry, class: Class, payload: Owned) Allocator.Error!u64 {
+    /// Mint a generation owning `payload` at `now_ns`; the ring's oldest
+    /// loses its ring reference when the ring is full (evicted; freed when
+    /// nothing else pins it). Returns the generation ino.
+    pub fn mint(self: *Registry, class: Class, payload: Owned, now_ns: u64) Allocator.Error!u64 {
         const g = try self.gpa.create(Generation);
         errdefer self.gpa.destroy(g);
         self.lock.lock();
@@ -187,7 +218,7 @@ pub const Registry = struct {
         try self.gens.ensureUnusedCapacity(self.gpa, 1);
         const seq = self.next_seq;
         self.next_seq += 1;
-        g.* = .{ .seq = seq, .class = class, .payload = payload, .refs = 2, .ringed = true };
+        g.* = .{ .seq = seq, .class = class, .payload = payload, .refs = 2, .kernel = 1, .ringed = true, .minted_at_ns = now_ns };
         const slot = &self.ring[@intCast(seq % REGISTRY_CAP)];
         if (slot.* != no_seq) {
             if (self.gens.get(slot.*)) |old| {
@@ -195,13 +226,31 @@ pub const Registry = struct {
                 // An eviction the kernel still references is the rail's
                 // engagement; a forgotten generation leaving is the norm.
                 if (old.refs > 1) stats.stats_generations_evicted.inc();
-                self.dropLocked(old);
+                self.dropLocked(old, 1);
             }
         }
         slot.* = seq;
         self.gens.putAssumeCapacity(seq, g);
+        self.newest[@backingInt(class)] = seq;
         stats.stats_generations_live.set(self.gens.count());
         return inoOf(seq, class);
+    }
+
+    /// The class's newest generation if `now_ns` is inside its share
+    /// window (module doc): one more kernel reference on it, or null when
+    /// the window has passed (or the class was never minted) and the
+    /// caller renders.
+    pub fn share(self: *Registry, class: Class, now_ns: u64) ?Shared {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const seq = self.newest[@backingInt(class)];
+        if (seq == no_seq) return null;
+        const g = self.gens.get(seq) orelse return null;
+        if (now_ns -| g.minted_at_ns >= g.payload.render_ns) return null;
+        g.refs += 1;
+        g.kernel += 1;
+        stats.stats_generation_shares.inc();
+        return .{ .ino = inoOf(seq, class), .len = g.payload.len };
     }
 
     fn findLocked(self: *Registry, ino: u64) ?*Generation {
@@ -210,12 +259,13 @@ pub const Registry = struct {
         return g;
     }
 
-    /// One reference down; frees at zero (under the lock).
-    fn dropLocked(self: *Registry, g: *Generation) void {
-        g.refs -= 1;
+    /// `n` references down (never below zero); frees at zero (under the lock).
+    fn dropLocked(self: *Registry, g: *Generation, n: u64) void {
+        g.refs -= @intCast(@min(n, g.refs));
         if (g.refs != 0) return;
         _ = self.gens.remove(g.seq);
         if (g.ringed) self.ring[@intCast(g.seq % REGISTRY_CAP)] = no_seq;
+        if (self.newest[@backingInt(g.class)] == g.seq) self.newest[@backingInt(g.class)] = no_seq;
         self.gpa.free(g.payload.buf);
         self.gpa.destroy(g);
         stats.stats_generations_live.set(self.gens.count());
@@ -249,12 +299,19 @@ pub const Registry = struct {
         self.lock.lock();
         defer self.lock.unlock();
         const g = self.findLocked(ino) orelse return;
-        self.dropLocked(g);
+        self.dropLocked(g, 1);
     }
 
-    /// FORGET: the kernel's reference dropped.
+    /// FORGET (the one that evicts the ino from the lookup table): every
+    /// kernel reference dropped — one per LOOKUP answered with this
+    /// generation, the mint's and every share's.
     pub fn forget(self: *Registry, ino: u64) void {
-        self.unpin(ino);
+        self.lock.lock();
+        defer self.lock.unlock();
+        const g = self.findLocked(ino) orelse return;
+        const n = g.kernel;
+        g.kernel = 0;
+        self.dropLocked(g, n);
     }
 
     /// READ: the slice `[off, off + dest.len)` of the frozen bytes copied
@@ -291,9 +348,13 @@ pub const Registry = struct {
 const testing = std.testing;
 
 fn owned(gpa: Allocator, text: []const u8) !Owned {
+    return ownedRendered(gpa, text, 0);
+}
+
+fn ownedRendered(gpa: Allocator, text: []const u8, render_ns: u64) !Owned {
     const buf = try gpa.alloc(u8, text.len + 8);
     @memcpy(buf[0..text.len], text);
-    return .{ .buf = buf, .len = text.len };
+    return .{ .buf = buf, .len = text.len, .render_ns = render_ns };
 }
 
 test "the ino scheme: the range starts at 2^64 − 2^32 and is disjoint from the real ino space and the two canonical inos; the class rides the low 2 bits and survives any registry state" {
@@ -327,8 +388,8 @@ test "the ino scheme: the range starts at 2^64 − 2^32 and is disjoint from the
 test "two lookups mint two distinct frozen generations; reads slice the snapshot; the size is exact; the kernel ref + the fh pin + the ring ref each hold the payload" {
     var r = Registry.init(testing.allocator);
     defer r.deinit();
-    const a = try r.mint(.stats, try owned(testing.allocator, "{\"a\":1}\n"));
-    const b = try r.mint(.stats, try owned(testing.allocator, "{\"a\":22}\n"));
+    const a = try r.mint(.stats, try owned(testing.allocator, "{\"a\":1}\n"), 0);
+    const b = try r.mint(.stats, try owned(testing.allocator, "{\"a\":22}\n"), 0);
     try testing.expect(a != b);
     try testing.expectEqual(@as(?u64, 8), r.size(a));
     try testing.expectEqual(@as(?u64, 9), r.size(b));
@@ -355,14 +416,14 @@ test "the FIFO ring evicts in mint order at the cap; a retired generation is EST
     var first: u64 = 0;
     var i: usize = 0;
     while (i < REGISTRY_CAP) : (i += 1) {
-        const ino = try r.mint(.config, try owned(testing.allocator, "x"));
+        const ino = try r.mint(.config, try owned(testing.allocator, "x"), 0);
         if (i == 0) first = ino;
         r.forget(ino); // the kernel forgot every one: the ring alone holds them
     }
     try testing.expectEqual(REGISTRY_CAP, r.liveCount());
     try testing.expectEqual(@as(?u64, 1), r.size(first));
     // The 257th mint evicts the first (mint order), which frees it (no other ref).
-    const n = try r.mint(.config, try owned(testing.allocator, "yy"));
+    const n = try r.mint(.config, try owned(testing.allocator, "yy"), 0);
     try testing.expectEqual(REGISTRY_CAP, r.liveCount());
     try testing.expect(r.size(first) == null);
     try testing.expect(!r.pin(first));
@@ -372,11 +433,11 @@ test "the FIFO ring evicts in mint order at the cap; a retired generation is EST
     try testing.expectEqual(evicted0, stats.stats_generations_evicted.load()); // forgotten ⇒ not an eviction of a live kernel ref
     r.forget(n);
     // A generation the kernel still references AND has open survives the ring.
-    const held = try r.mint(.config, try owned(testing.allocator, "held"));
+    const held = try r.mint(.config, try owned(testing.allocator, "held"), 0);
     try testing.expect(r.pin(held));
     i = 0;
     while (i < REGISTRY_CAP) : (i += 1) {
-        const ino = try r.mint(.config, try owned(testing.allocator, "z"));
+        const ino = try r.mint(.config, try owned(testing.allocator, "z"), 0);
         r.forget(ino);
     }
     try testing.expectEqual(evicted0 + 1, stats.stats_generations_evicted.load());
@@ -389,4 +450,47 @@ test "the FIFO ring evicts in mint order at the cap; a retired generation is EST
     try testing.expectEqual(REGISTRY_CAP, r.liveCount());
     // A wrong-class ino over a live seq is stale too.
     try testing.expect(r.size(inoOf(seqOf(n), .trace)) == null);
+}
+
+test "the share window (decision 0003 §CC.2): a lookup inside one render-time of the class's newest generation is answered with it — the same ino, one more kernel reference — a lookup at or past the window is not, another class never is, a zero-cost render shares nothing; the evicting FORGET returns every kernel reference (the mint's and the shares') at once and the ring's keeps the payload" {
+    var r = Registry.init(testing.allocator);
+    defer r.deinit();
+    const shares0 = stats.stats_generation_shares.load();
+    // Rendered in 1 ms at t = 1 ms: shared until t = 2 ms (exclusive).
+    const g = try r.mint(.stats, try ownedRendered(testing.allocator, "{\"n\":1}\n", 1_000_000), 1_000_000);
+    const s1 = r.share(.stats, 1_000_001) orelse return error.TestExpectedShare;
+    try testing.expectEqual(g, s1.ino);
+    try testing.expectEqual(@as(u64, 8), s1.len);
+    const s2 = r.share(.stats, 1_999_999) orelse return error.TestExpectedShare;
+    try testing.expectEqual(g, s2.ino);
+    try testing.expect(r.share(.stats, 2_000_000) == null);
+    try testing.expect(r.share(.stats, 5_000_000) == null);
+    try testing.expect(r.share(.config, 1_000_001) == null);
+    try testing.expectEqual(shares0 + 2, stats.stats_generation_shares.load());
+    // The kernel holds 3 (the mint + two shares): the evicting FORGET
+    // returns them all at once and leaves the ring's; a second FORGET of
+    // a generation the kernel no longer holds changes nothing.
+    r.forget(g);
+    try testing.expectEqual(@as(?u64, 8), r.size(g));
+    r.forget(g);
+    try testing.expectEqual(@as(?u64, 8), r.size(g));
+    try testing.expectEqual(@as(usize, 1), r.liveCount());
+    // A newer mint of the class is the one shared from then on.
+    const g2 = try r.mint(.stats, try ownedRendered(testing.allocator, "{\"n\":22}\n", 1_000_000), 3_000_000);
+    try testing.expectEqual(g2, (r.share(.stats, 3_500_000) orelse return error.TestExpectedShare).ino);
+    r.forget(g2);
+    // A zero-duration render (the fakes') never shares, even at its own instant.
+    const z = try r.mint(.trace, try owned(testing.allocator, "z"), 7_000_000);
+    try testing.expect(r.share(.trace, 7_000_000) == null);
+    r.forget(z);
+    // A forgotten generation the ring then evicts is gone for good, and
+    // its class shares nothing until the next mint.
+    const o = try r.mint(.config, try ownedRendered(testing.allocator, "o", 10), 9_000_000);
+    try testing.expectEqual(@as(usize, 4), r.liveCount());
+    r.forget(o);
+    try testing.expectEqual(@as(?u64, 1), r.size(o));
+    var i: usize = 0;
+    while (i < REGISTRY_CAP) : (i += 1) r.forget(try r.mint(.trace, try owned(testing.allocator, "t"), 0));
+    try testing.expect(r.size(o) == null);
+    try testing.expect(r.share(.config, 9_000_001) == null);
 }

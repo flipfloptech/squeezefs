@@ -8882,6 +8882,64 @@ test "smoke: --daemon --supervise --log-file: the invoking process returns 0 onl
     try testing.expect(!@import("status.zig").writerGuardHeld(testing.io, rig.img));
 }
 
+/// The `.stats` herd row's bound on ONE read, and twice its bound on a
+/// drain worker's pass (`transport_pass_stalest_ms`): the lane-hold bound
+/// of the sighting (a drain worker held a second) — well under the
+/// supervisor's 5 s probe, far over a render (1–4 ms) plus a loaded
+/// lane's turn.
+const stats_herd_read_bound_ms: u64 = 2000;
+
+test "smoke: 32 CONCURRENT READERS OF .stats UNDER A CREATE STORM NEVER WEDGE THE MOUNT (decision 0003 §CC; rung-10-stats-wedge.md) — a `--daemon --supervise` set, 8 creators making files beside 32 `cat .stats` loops for 8 s: every read completes within 2 s (on bc569d4 a read took 5–27 s under the kernel's lookup livelock and the supervisor SIGABRTed the daemon), lookups inside one render-time share a generation, the control inode's probe misses nothing, the op watchdog is silent, every document parses" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    try rig.spawnSupervised(&.{});
+    _ = try rig.awaitReady(0);
+    const mark = try rig.logLen();
+    // Eight creators and 32 readers in the background for 8 s, the
+    // readers' per-read walls and the lane-hold gauge each read saw in the
+    // work dir; the script's last line is `reads p50 max hold` over them.
+    const out = try rig.onMountTimed(
+        \\mkdir -p herd
+        \\for c in 0 1 2 3 4 5 6 7; do ( i=0; while [ ! -e "$1/stop" ] && [ $i -lt 4000 ]; do : > "herd/f$c-$i"; i=$((i+1)); done ) & done
+        \\r=0; while [ $r -lt 32 ]; do
+        \\  ( while [ ! -e "$1/stop" ]; do t0=$(date +%s%N); h=$(cat .stats | grep -o '"transport_pass_stalest_ms":[0-9]*' | cut -d: -f2); echo "$(( ($(date +%s%N) - t0) / 1000000 )) ${h:-999999}" >> "$1/herd-$r"; done ) &
+        \\  r=$((r+1))
+        \\done
+        \\sleep 8; : > "$1/stop"; wait
+        \\cat "$1"/herd-* | sort -n | awk '{ a[NR] = $1; if ($2 > h) h = $2 } END { print NR, a[int(NR / 2)], a[NR], h + 0 }'
+    , 120);
+    defer gpa.free(out);
+    var it = std.mem.tokenizeAny(u8, std.mem.trim(u8, out, " \n"), " ");
+    const reads = try std.fmt.parseInt(u64, it.next() orelse return error.NoReads, 10);
+    const p50 = try std.fmt.parseInt(u64, it.next() orelse return error.NoReads, 10);
+    const max = try std.fmt.parseInt(u64, it.next() orelse return error.NoReads, 10);
+    // The longest in-flight drain-worker pass any document saw: the lane
+    // hold (a document without the gauge, or an unreadable one, reads as
+    // a hold past every bound).
+    const held = try std.fmt.parseInt(u64, it.next() orelse return error.NoReads, 10);
+    const st = try rig.stats();
+    defer gpa.free(st);
+    const shares = numberAfter(st, "\"stats_generation_shares\":") orelse 0;
+    const builds = numberAfter(st, "\"stats_builds\":") orelse 0;
+    const overdue = numberAfter(st, "\"fuse_op_watchdog_overdue\":") orelse 0;
+    const text = try rig.readLog();
+    defer gpa.free(text);
+    const misses = std.mem.count(u8, text[mark..], "missed probe") + std.mem.count(u8, text[mark..], "unresponsive for");
+    std.debug.print("\nsmoke[stats herd]: {d} reads in 8 s, p50 {d} ms, max {d} ms, longest worker pass seen {d} ms; {d} renders, {d} shared lookups; probe misses {d}; watchdog overdue {d}\n", .{ reads, p50, max, held, builds, shares, misses, overdue });
+    try testing.expect(reads >= 64);
+    try testing.expect(max < stats_herd_read_bound_ms);
+    try testing.expect(held < stats_herd_read_bound_ms / 2);
+    try testing.expect(shares > 0);
+    try testing.expectEqual(@as(u64, 0), misses);
+    try testing.expectEqual(@as(u64, 0), overdue);
+    gpa.free(try rig.shOk(rig.mp, "rm -rf herd && echo cleaned"));
+    try rig.umount();
+}
+
 /// generic/604's file count, each file 8 KiB: past `inline_max`, so every
 /// one is STAGED (never fsync'd) and the dismount pass is a real promotion
 /// pass — the one the hold parks.

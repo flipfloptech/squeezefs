@@ -479,6 +479,16 @@ pub const ShedFn = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, t
 /// the clock the pools stamp their frees with). Never touches a live
 /// entry; never lossy. Invoked from the sampler thread with no lock held.
 pub const TrimFn = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, min_idle_ticks: u64) void };
+/// A periodic sampler the budget's thread runs after each of its ticks
+/// (`MemBudget.addSampler`): the daemon's other syscall-heavy observability
+/// walks — the CPU census over `/proc/self/task`, the fabric controllers
+/// off `/sys/class/nvme` — so no request worker ever runs them (decision
+/// 0003 §CC.1). Synchronous; its own tables; nothing shared with a render
+/// but what it publishes atomically.
+pub const Sampler = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque) void };
+/// Samplers the budget runs: the `.stats` renderer's is the one today;
+/// the slack is a slot per future family.
+pub const max_samplers = 4;
 
 /// Where a component's logical bytes come from: a plain ledger read
 /// directly, or a computed level. Callable from the sampler thread without
@@ -518,6 +528,12 @@ pub const Component = struct {
     trim: ?TrimFn = null,
     sheds: std.atomic.Value(u64) = .init(0),
     trims: std.atomic.Value(u64) = .init(0),
+    /// The gauge as the sampler's last tick read it: what the `.stats`
+    /// document reports (`sampled`). A `.func` source may be a syscall
+    /// walk (`mincore` over a 51 GiB slab, a `/proc` census), and the
+    /// render ran every one of them on a FUSE drain worker's thread per
+    /// `.stats` read (decision 0003 §CC.1); the tick is the one caller.
+    last: std.atomic.Value(u64) = .init(0),
 
     pub fn init(name: []const u8, floor: u64, weight: u64, source: Source, shed: ?ShedFn) Component {
         return .{ .name = name, .source = source, .floor = floor, .weight = weight, .shed = shed };
@@ -537,8 +553,14 @@ pub const Component = struct {
         return c;
     }
 
+    /// The gauge read NOW — the sampler's tick (and a test's).
     pub fn current(self: *const Component) u64 {
         return self.source.current();
+    }
+
+    /// The gauge as of the last tick (0 before the first).
+    pub fn sampled(self: *const Component) u64 {
+        return self.last.load(.monotonic);
     }
 
     /// Shed calls received.
@@ -616,6 +638,8 @@ pub const MemBudget = struct {
     sampler_started: std.atomic.Value(bool) = .init(false),
     sampler_stop: std.Io.Event = .unset,
     sampler_thread: ?std.Thread = null,
+    samplers: [max_samplers]Sampler = undefined,
+    sampler_count: std.atomic.Value(usize) = .init(0),
 
     // ---- registry ----
 
@@ -632,6 +656,22 @@ pub const MemBudget = struct {
         // slot: wait for every earlier ticket, then release ours. The
         // release pairs with the acquire load in `registry`/`components`.
         while (self.count.cmpxchgWeak(idx, idx + 1, .release, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    /// Add a sampler (mount-time, before `spawnSampler`; the thread reads
+    /// the list without a lock). Returns false when the slots are spent.
+    pub fn addSampler(self: *MemBudget, s: Sampler) bool {
+        const n = self.sampler_count.load(.acquire);
+        if (n >= max_samplers) return false;
+        self.samplers[n] = s;
+        // Release pairs with the acquire in `runSamplers`.
+        self.sampler_count.store(n + 1, .release);
+        return true;
+    }
+
+    /// Every sampler once, in registration order (the tick's thread).
+    pub fn runSamplers(self: *MemBudget) void {
+        for (self.samplers[0..self.sampler_count.load(.acquire)]) |s| s.call(s.ctx);
     }
 
     fn registry(self: *MemBudget) []Component {
@@ -743,6 +783,7 @@ pub const MemBudget = struct {
         var pressure_gauges: u64 = 0;
         for (reg) |*c| {
             const cur = c.current();
+            c.last.store(cur, .monotonic);
             gauge_sum +|= cur;
             if (!c.kernel_reclaimable) pressure_gauges +|= cur;
         }
@@ -946,6 +987,7 @@ pub const MemBudget = struct {
         const sample = if (owned) readCgroupUnreclaimable(host.io) else null;
         const in = tickInputs(self.resolveBudgetShared(host, share), readRssBytes(host.io, host.facts.page_size), cageUnreclaimable(census, sample), share);
         self.tickInner(in.budget, in.rss, in.unreclaimable);
+        self.runSamplers();
     }
 
     /// Log the arm's edges (never per tick): a cage that turned foreign or
@@ -1043,7 +1085,7 @@ pub const MemBudget = struct {
             var trims: u64 = 0;
             for (comps[i..]) |*s| if (std.mem.eql(u8, s.name, c.name)) {
                 instances += 1;
-                current += s.current();
+                current += s.sampled();
                 floor += s.floor;
                 weight += s.weight;
                 sheds += s.shedCount();
@@ -1747,6 +1789,45 @@ test "stats JSON carries every spec key with live values" {
     try testing.expectEqual(@as(i64, 0), hot.get("trims").?.integer);
 }
 
+test "stats JSON reads the SAMPLED gauges (decision 0003 §CC.1): a component whose source is a function is read by the tick alone — three documents after one tick call it zero more times and report the tick's reading; a tick with the gauge moved reports the new one; a sampler added to the budget runs once per tick, after the gauges" {
+    var b: MemBudget = .{};
+    var src: CountingSource = .{ .value = 4096 };
+    b.register(Component.init("counting", 0, 0, .{ .func = .{ .ctx = &src, .call = CountingSource.current } }, null));
+    const Probe = struct {
+        runs: u32 = 0,
+        seen_sampled: u64 = 0,
+        budget: *MemBudget,
+        fn call(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.runs += 1;
+            self.seen_sampled = self.budget.components()[0].sampled();
+        }
+    };
+    var probe: Probe = .{ .budget = &b };
+    try testing.expect(b.addSampler(.{ .ctx = &probe, .call = Probe.call }));
+    try testing.expectEqual(@as(u64, 0), b.components()[0].sampled());
+    b.tickInner(1 << 30, 0, 0);
+    b.runSamplers();
+    try testing.expectEqual(@as(u64, 1), src.reads.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), probe.runs);
+    try testing.expectEqual(@as(u64, 4096), probe.seen_sampled);
+    var buf: [4096]u8 = undefined;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var w: std.Io.Writer = .fixed(&buf);
+        try b.writeStatsJson(&w);
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"counting\":{\"instances\":1,\"current\":4096,") != null);
+    }
+    try testing.expectEqual(@as(u64, 1), src.reads.load(.monotonic));
+    src.value = 8192;
+    b.tickInner(1 << 30, 0, 0);
+    try testing.expectEqual(@as(u64, 2), src.reads.load(.monotonic));
+    var w: std.Io.Writer = .fixed(&buf);
+    try b.writeStatsJson(&w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"current\":8192,") != null);
+    try testing.expectEqual(@as(u64, 2), src.reads.load(.monotonic));
+}
+
 test "stats JSON: components registered under ONE name (a table per data volume, a cache per member) render as ONE entry — the instances counted, current / floor / weight / sheds / trims summed — so the document parses strictly (a strict parser refused `block_alloc_table` twice on a two-volume mount)" {
     var b: MemBudget = .{};
     var shed_log: ShedLog = .{};
@@ -2140,11 +2221,12 @@ test "sampler thread: idempotent spawn, ticks on its period, stops" {
 /// A source that counts its reads (the seam's tick-at-stop contract).
 const CountingSource = struct {
     reads: std.atomic.Value(u64) = .init(0),
+    value: u64 = 0,
 
     fn current(ctx: *anyopaque) u64 {
         const self: *CountingSource = @ptrCast(@alignCast(ctx));
         _ = self.reads.fetchAdd(1, .monotonic);
-        return 0;
+        return self.value;
     }
 };
 

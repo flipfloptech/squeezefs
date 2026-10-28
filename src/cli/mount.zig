@@ -539,6 +539,7 @@ fn mountMain(ctx: *Ctx) u8 {
     // daemon owns (the session joins once it is up); the op-trace ring
     // armed from its row with the derived geometry.
     var vs: VirtualSource = .{
+        .sqz = ctx.sqz,
         .renderer = stats.Renderer.init(gpa, .{
             .build = .{ .train = ctx.p.build.train, .commit = ctx.p.build.commit, .profile = ctx.p.build.profile },
             .mount = .{ .uid = ctx.opts.uid, .gid = ctx.opts.gid, .pid = @intCast(linux.getpid()), .mountpoint = ctx.mountpoint, .sqmeta_uri = ctx.meta_uri, .sqdata_uri = ctx.data_uri, .read_only = ctx.opts.read_only, .writeback = ctx.opts.write_back, .direct_device_true = ctx.opts.direct_device_true, .interception = ctx.opts.interception },
@@ -871,7 +872,11 @@ fn mountMain(ctx: *Ctx) u8 {
     //    below stops it first for the same reason. The thread reads every
     //    source without a lock: a source freed under it kills the daemon
     //    in `samplerMain → current` (the kmbuf ENOMEM bring-up of the R5
-    //    crash row died there with the plane already closed).
+    //    crash row died there with the plane already closed). The `.stats`
+    //    renderer's census walks (/proc, /sys) ride the same thread
+    //    (decision 0003 §CC.1); the renderer (`vs`) outlives the sampler
+    //    for the same reason.
+    if (!mem_budget.authority.addSampler(vs.renderer.sampler())) return ctx.failed("the memory-budget sampler has no slot for the stats census", .{});
     _ = mem_budget.authority.spawnSampler(ctx.budget_host, mem_budget.sampler_period_ns) catch |e| return ctx.failed("cannot start the memory-budget sampler ({s})", .{@errorName(e)});
     var sampler_live = true;
     defer if (sampler_live) mem_budget.authority.stopSampler(ctx.p.io);
@@ -2127,35 +2132,49 @@ fn serve(ctx: *Ctx, session: *Session, vs: *VirtualSource) void {
 /// SIGUSR1: every `.stats` family through the ONE aggregator, one log
 /// line per family (`stats <name>: {…}`; the daemon line last).
 fn dumpStats(vs: *VirtualSource) void {
-    stats.logFamilies(&vs.renderer.sources, vs.renderer.gpa);
+    stats.logFamilies(&vs.renderer);
 }
 
 /// The `.stats`/`.config`/`.trace` renderer bound into the filesystem
 /// (`kv_fs.VirtualFace`): ONE `stats.Renderer` over the daemon's sources,
-/// the set config for `.config`, the op-trace drain for `.trace`.
+/// the set config for `.config`, the op-trace drain for `.trace`. A
+/// lookup's render runs on the BLOCKING POOL (decision 0003 §CC.1): the
+/// handler is a fiber on the drain worker's own driven lane, so a render
+/// there held the worker — the ring not pumped, its queue's requests
+/// waiting — for the render's length (27 ms idle, hundreds under load,
+/// serialized across every reader); on the pool the fiber parks and the
+/// worker pumps on. A refused job (the pool's queue full) renders inline.
 const VirtualSource = struct {
     renderer: stats.Renderer,
     cfg: *const set_config.Config,
+    sqz: *SqzIo,
 
     fn build(ctx: *anyopaque, class: handler.virtual_inodes.Class, gpa: Allocator) Allocator.Error!handler.virtual_inodes.Owned {
         const self: *VirtualSource = @ptrCast(@alignCast(ctx));
+        return self.sqz.runBlocking(buildInline, .{ self, class, gpa }) catch |e| switch (e) {
+            error.ConcurrencyUnavailable => buildInline(self, class, gpa),
+        };
+    }
+
+    fn buildInline(self: *VirtualSource, class: handler.virtual_inodes.Class, gpa: Allocator) Allocator.Error!handler.virtual_inodes.Owned {
         switch (class) {
             .stats => {
                 const p = try self.renderer.render();
-                return .{ .buf = p.buf, .len = p.len };
+                return .{ .buf = p.buf, .len = p.len, .render_ns = p.render_ns };
             },
             .config => {
                 const p = try self.renderer.renderConfig(writeSet, self);
-                return .{ .buf = p.buf, .len = p.len };
+                return .{ .buf = p.buf, .len = p.len, .render_ns = p.render_ns };
             },
             .trace => {
+                const t0 = clock.monotonicNs();
                 var out: Io.Writer.Allocating = .init(gpa);
                 errdefer out.deinit();
                 op_trace.writeTraceJson(gpa, &out.writer) catch return error.OutOfMemory;
                 const buf = out.writer.buffer;
                 const len = out.writer.end;
                 out.writer.buffer = &.{};
-                return .{ .buf = buf, .len = len };
+                return .{ .buf = buf, .len = len, .render_ns = clock.monotonicNs() -| t0 };
             },
         }
     }

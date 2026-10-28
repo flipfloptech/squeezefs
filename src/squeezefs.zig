@@ -203,6 +203,7 @@ pub const wire = @import("wire/wire.zig");
 
 // ---- observability surface: the .stats inode + CLI families (charter §10) ----
 pub const stats = @import("stats/stats.zig");
+pub const stats_sampled_model = @import("stats/sampled_model.zig");
 
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
 pub const mem_budget = @import("mem/budget.zig");

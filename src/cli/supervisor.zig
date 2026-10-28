@@ -11,11 +11,16 @@
 //!
 //! Two probes, one per state of the mount (`probeKind`):
 //! - ATTACHED (the mount's entry, by its id, is in the mount table at the
-//!   mountpoint): `stat(<mountpoint>/.stats)` — the charter's control
+//!   mountpoint): `stat(<mountpoint>/.config)` — the charter's control
 //!   inode, a LOOKUP-only entry with TTL 0, so every probe REACHES the
 //!   daemon as a request and proves the FUSE path answers (a root `stat`
 //!   under the 1 s attr TTL would measure the dentry cache;
-//!   `stats_cli.md` §7 Q19).
+//!   `stats_cli.md` §7 Q19). `.config` and not `.stats` (decision 0003
+//!   §CC.3): a lookup of either renders its document, and the probe is a
+//!   liveness question, not a reader — `.config` is the daemon's smallest
+//!   document (the set summary, no census), and a probe's render of
+//!   `.stats` inside a reader's share window would hand that reader the
+//!   probe's snapshot.
 //! - NOT ATTACHED (the daemon's own `umount2` landed and its teardown
 //!   runs; or `squeezefs umount --lazy` detached the mountpoint and the
 //!   daemon serves the holders left on the detached superblock until the
@@ -83,6 +88,9 @@ const staging = @import("../data/staging.zig");
 /// outlives its daemon while it holds custody, childless —
 /// `umount.daemonByProcess`).
 pub const thread_comm = "sqz-supervise";
+
+/// The control inode's name under the mountpoint (module doc).
+pub const CONTROL_INODE_NAME = ".config";
 
 pub const PROBE_INTERVAL_NS: u64 = 5 * std.time.ns_per_s;
 pub const HEARTBEAT_STALE_NS: u64 = 2 * PROBE_INTERVAL_NS;
@@ -664,10 +672,10 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         }
     };
 
-    /// `stat(<mountpoint>/.stats)` within `timeout_ns`; false on a timeout
+    /// `stat(<mountpoint>/.config)` within `timeout_ns`; false on a timeout
     /// or an error.
     pub fn probe(gpa: std.mem.Allocator, mountpoint: [:0]const u8, timeout_ns: u64) bool {
-        const path = std.fmt.allocPrintSentinel(gpa, "{s}/.stats", .{mountpoint}, 0) catch return false;
+        const path = std.fmt.allocPrintSentinel(gpa, "{s}/" ++ CONTROL_INODE_NAME, .{mountpoint}, 0) catch return false;
         const p = gpa.create(Probe) catch {
             gpa.free(path);
             return false;

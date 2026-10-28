@@ -89,3 +89,26 @@ parks committers now; `--meta-journal-mb`, a bounded flush pass (§BY.5 (a)) and
 file's first write ≤ `inline_max` are the owner's levers. The checkpoint thread's own per-node page mappings
 (`fastMemset` 6.8 % of the profile after) want a pooled, pre-faulted buffer set. `__vdso_clock_gettime` is 10.6 %
 of the profile (the turn spin).
+
+## The A-B-B-A (2026-10-28, quiet host on AC, the RAM-NVMe perf mount, 2 MDT + 2 OST, dist builds)
+
+`dev` `8b14376` against `6d00fc0`, legs A B B A, two mdtest shapes per leg (`-n 10000 -u -i 1`, plain and
+`-w 4096 -e 4096`), gate lock and every build slot held, tctl ≤ 55 °C, fsck clean after all 32 runs;
+k ops/s (leg 1 / leg 2). A first round that began on battery is discarded (its AC pair read the same shape).
+
+| shape, row | -np 32 dev | -np 32 fix | Δ | -np 64 dev | -np 64 fix | Δ |
+|---|---|---|---|---|---|---|
+| 4 KiB per file, **file creation** | 24 / 23 | **64 / 64** | **+173 %** | 23 / 22 | **56 / 54** | **+147 %** |
+| 4 KiB per file, file read | 833 / 758 | 868 / 819 | +6.1 % | 524 / 459 | 521 / 505 | +4.3 % |
+| 4 KiB per file, file removal | 324 / 323 | 329 / 323 | +0.7 % | 261 / 234 | 296 / 274 | +14.9 % |
+| 4 KiB per file, directory creation | 287 / 252 | 289 / 247 | −0.5 % | 260 / 256 | 244 / 266 | −1.0 % |
+| 4 KiB per file, directory removal | 282 / 279 | 284 / 291 | +2.4 % | 299 / 292 | 293 / 257 | −6.9 % |
+| plain, file creation | 245 / 250 | 254 / 254 | +2.6 % | 251 / 236 | 250 / 262 | +5.1 % |
+| plain, file removal | 315 / 313 | 326 / 318 | +2.4 % | 331 / 355 | 344 / 356 | +1.9 % |
+| plain, directory creation | 287 / 281 | 267 / 292 | −1.8 % | 267 / 241 | 286 / 274 | +10.2 % |
+| plain, directory removal | 274 / 277 | 287 / 276 | +2.0 % | 287 / 295 | 293 / 290 | +0.2 % |
+
+The stat rows (file and directory, 1–12 M/s, served mostly by the kernel's caches) swung −18 … +9 % in
+both directions across the four shapes, inside the spread of `dev`'s own legs (7,845 / 8,736), and are
+not listed. Landed (gate 158 green, 75/75). Sessions: `/build/perf/fw2-abba/` (and `fw-abba/`, the
+discarded round).

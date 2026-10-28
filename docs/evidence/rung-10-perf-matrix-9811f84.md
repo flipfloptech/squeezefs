@@ -69,7 +69,9 @@ the FUSE path at depth. Jobs: QD1 = 1; "×32" = min(qd × nj, 32) psync jobs.
    (÷ 7.5) against the plain mount — while file stat and removal stay near the plain mount. Something
    the interception mount does for directories (entry/attr invalidation, or a shim path hook) costs a
    round trip per op. Reproduce with the plain `mdtest` under `-o interception` with and without the
-   preload to split mount option from shim.
+   preload to split mount option from shim. **Found and fixed 2026-10-28** (decision 0003 §CB,
+   `rung-10-interception-dirs.md`): the mount option's 1 s TTLs re-ask every directory, and the
+   directory LOOKUP's stripe-verdict insert under the cache's exclusive lock convoyed the workers.
 3. **Short-lived fds under the shim**: file read (open, 4 KiB read, close) 245 k vs 889 k through FUSE;
    the daemon logged 386 sessions for 320 k opens, so sessions are reused and the cost is the per-open
    fd bind (the fd screen round trip). The shim is built for long-lived fds (fio); per-open binding

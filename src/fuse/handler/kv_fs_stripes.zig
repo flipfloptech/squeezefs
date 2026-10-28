@@ -16,10 +16,14 @@
 //! keyed by the slot's lease generation ("only the holder flips a
 //! directory it holds, so its own flip is the one invalidation; a stale
 //! lease stamp reads as no hint") — a foreign directory's verdict is
-//! re-read off its token every time (RAM while the token is cached). A
-//! stripe is known by its RECORD's flag (`record.INODE_FLAG_STRIPE`),
-//! wherever it is read. Generic over the filesystem (`kv_fs.KvFs`);
-//! portable.
+//! re-read off its token every time (RAM while the token is cached). The
+//! hint is remembered for a directory asked as a PARENT (every op under
+//! it asks again) and never for one asked as the object of a lookup, a
+//! stat or an rmdir (`PlainMiss`): those are one marker probe each, and
+//! an insert under the cache's exclusive lock per such op convoyed every
+//! worker's shared probe (decision 0003 §BX.1, §CB.1). A stripe is known
+//! by its RECORD's flag (`record.INODE_FLAG_STRIPE`), wherever it is
+//! read. Generic over the filesystem (`kv_fs.KvFs`); portable.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -255,14 +259,25 @@ pub fn Stripes(comptime Fs: type) type {
             return self.verdict(global, .remember);
         }
 
-        /// A miss's plain answer: remembered for a directory that lives on
-        /// (its children's ops ask again), or not for an rmdir's victim — a
-        /// write would take the cache EXCLUSIVE once per rmdir for an entry
-        /// nobody asks again, and every worker's shared probe queued behind
-        /// those inserts (mdtest -np 32: 600 µs per rmdir, 560 of it there).
+        /// A miss's plain answer: remembered for a directory asked as a
+        /// PARENT (its children's ops ask again), or not for an rmdir's
+        /// victim nor for a directory asked as the OBJECT of a lookup or a
+        /// stat (`foldMapOf`) — a write would take the cache EXCLUSIVE once
+        /// per such op for an entry its asker's next op never needs (the
+        /// first op UNDER the directory remembers it as a parent), and
+        /// every worker's shared probe queued behind those inserts
+        /// (decision 0003 §BX.1: 600 µs per rmdir, 560 of it there; §CB.1:
+        /// 0.5–1 ms per directory lookup once the kernel's 1 s TTL of a
+        /// peered mount re-asks every directory).
         const PlainMiss = enum { remember, forget };
 
         fn verdict(self: *Self, global: u64, plain_miss: PlainMiss) Error!Verdict {
+            return self.verdictRecord(global, null, plain_miss);
+        }
+
+        /// `verdict` with the directory's record already in hand (`known`:
+        /// a lookup's or a stat's read; the miss path reads it otherwise).
+        fn verdictRecord(self: *Self, global: u64, known: ?InodeValue, plain_miss: PlainMiss) Error!Verdict {
             const g = self.plane.localGen(global);
             {
                 try self.lockCacheShared();
@@ -282,7 +297,7 @@ pub fn Stripes(comptime Fs: type) type {
             }
             stats.dir_stripe_verdict_reads.inc();
             const local = try Fs.localOf(global);
-            const v = (try self.fs.readInodeOpt(local)) orelse return .plain;
+            const v = known orelse (try self.fs.readInodeOpt(local)) orelse return .plain;
             if (!economy.isDirMode(v.mode)) return .plain;
             if (stripe.isStripeRecord(v)) {
                 try self.lockCache();
@@ -339,6 +354,16 @@ pub fn Stripes(comptime Fs: type) type {
         /// `mapOf` for an rmdir's victim: a plain answer is not remembered.
         pub fn victimMapOf(self: *Self, global: u64) Error!?StripeMap {
             return switch (try self.verdict(global, .forget)) {
+                .striped => |m| m,
+                else => null,
+            };
+        }
+
+        /// `mapOf` for the directory a lookup found or a stat reads, its
+        /// record `v` in hand: a plain answer is not remembered (a striped
+        /// one installs its map as ever).
+        pub fn foldMapOf(self: *Self, global: u64, v: InodeValue) Error!?StripeMap {
+            return switch (try self.verdictRecord(global, v, .forget)) {
                 .striped => |m| m,
                 else => null,
             };
@@ -930,4 +955,83 @@ test "an rmdir reads its victim's verdict and never remembers it: with a reader 
     try testing.expectEqual(reads0 + 1, stats.dir_stripe_verdict_reads.load());
     // Gone: the lookup answers a negative entry.
     try testing.expectEqual(@as(u64, 0), (try fs.lookup(&c, .{ .parent = d, .name = "dir.0" })).nodeid);
+}
+
+test "a positive lookup or a stat of a plain directory reads its verdict and never remembers it: with a reader inside the verdict cache, lookup(D/dir.0) and getattr(dir.0) complete without joining the cache's queue and the drain worker's try-only probes are served, not refused; the hint cache holds no entry for a directory only ever looked up (on mdtest -np 32 under -o interception every directory's first lookup after the kernel's 1 s entry TTL inserted its plain verdict under the EXCLUSIVE lock — 32 workers' shared probes queued behind each insert: 0.5–1 ms per lookup, directory stat 9.5 M → 78 k/s, rename and rmdir ÷ 8)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var store = try kv_fs.MemStore.init(gpa);
+    defer store.deinit();
+    var nodata: kv_fs.NoData = .{};
+    var fs = try kv_fs.MemFs.mount(gpa, io, &store, &nodata, .{ .dlm_stripes = 64 });
+    defer fs.unmount();
+    var plane = try kv_fs.MemFs.XvPlane.init(gpa, io, &store, &fs.locks, 1, 0, 7, OneHome.resolver(), .{}, 16 << 10);
+    defer plane.deinit();
+    try testing.expectEqual(@as(u32, 0), try fs.bindXv(&plane));
+    const st = try fs.bindStripes(64, .{ .fixed = 2 });
+    defer fs.unbindStripes();
+    var tr = op_trace.OpTrace.begin(0, .other);
+    defer tr.finish();
+    var window: [4096]u8 = undefined;
+    var c: filesystem.Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 1, .io = io, .trace = &tr, .wd_slot = null, .window = &window };
+    const d = (try fs.mkdir(&c, .{ .parent = inos.ROOT_INO, .name = "rank", .mode = 0o755, .umask = 0 })).nodeid;
+    const child = (try fs.mkdir(&c, .{ .parent = d, .name = "dir.0", .mode = 0o755, .umask = 0 })).nodeid;
+    // The parent's verdict is remembered by its first create; the child
+    // was made, never asked.
+    const hints0 = st.plain.count();
+    const Asker = struct {
+        fs: *kv_fs.MemFs,
+        io: Io,
+        parent: u64,
+        ino: u64,
+        op: enum { lookup, getattr, probe_lookup, probe_getattr },
+        nodeid: Error!u64 = error.Unexpected,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            var t = op_trace.OpTrace.begin(2, .lookup);
+            defer t.finish();
+            var ctx: filesystem.Ctx = .{ .unique = 2, .uid = 0, .gid = 0, .pid = 1, .io = self.io, .trace = &t, .wd_slot = null, .window = &.{} };
+            self.nodeid = switch (self.op) {
+                .lookup => if (self.fs.lookup(&ctx, .{ .parent = self.parent, .name = "dir.0" })) |e| e.nodeid else |e| e,
+                .probe_lookup => if (self.fs.probe_lookup(&ctx, .{ .parent = self.parent, .name = "dir.0" })) |e| e.nodeid else |e| e,
+                .getattr => if (self.fs.getattr(&ctx, .{ .ino = self.ino, .fh = null })) |a| a.attr.ino else |e| e,
+                .probe_getattr => if (self.fs.probe_getattr(&ctx, .{ .ino = self.ino, .fh = null })) |a| a.attr.ino else |e| e,
+            };
+            self.done.store(true, .release);
+        }
+    };
+    inline for (.{ .lookup, .getattr, .probe_lookup, .probe_getattr }) |op| {
+        const reads0 = stats.dir_stripe_verdict_reads.load();
+        const refusals0 = stats.dir_stripe_verdict_try_refusals.load();
+        // A reader inside (another worker's probe): the asker shares it,
+        // or queues for the exclusive hold an insert needs.
+        st.lock.lockSharedUncancelable(io);
+        var a: Asker = .{ .fs = &fs, .io = io, .parent = d, .ino = child, .op = op };
+        const th = try std.Thread.spawn(.{}, Asker.run, .{&a});
+        var queued = false;
+        while (!a.done.load(.acquire)) {
+            if (st.lock.waiters(io) != 0) {
+                queued = true;
+                break;
+            }
+            try std.Thread.yield();
+        }
+        st.lock.unlockShared(io);
+        th.join();
+        try testing.expect(!queued);
+        try testing.expectEqual(child, try a.nodeid);
+        // The child's verdict was read (no stale answer), not remembered:
+        // the next asker reads it again, the hint cache did not grow, and
+        // the try-only probe was served without a refusal.
+        try testing.expectEqual(reads0 + 1, stats.dir_stripe_verdict_reads.load());
+        try testing.expectEqual(refusals0, stats.dir_stripe_verdict_try_refusals.load());
+        try testing.expectEqual(hints0, st.plain.count());
+    }
+    // The hint stays what it is for: the first op UNDER the child remembers
+    // the child as a parent (one read, one insert), and the next does not read.
+    _ = try fs.mkdir(&c, .{ .parent = child, .name = "leaf", .mode = 0o755, .umask = 0 });
+    try testing.expectEqual(hints0 + 1, st.plain.count());
+    const reads1 = stats.dir_stripe_verdict_reads.load();
+    try testing.expectEqual(child, (try fs.lookup(&c, .{ .parent = d, .name = "dir.0" })).nodeid);
+    try testing.expectEqual(reads1, stats.dir_stripe_verdict_reads.load());
 }

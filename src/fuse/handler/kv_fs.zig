@@ -2221,10 +2221,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         /// `stat D` of a striped directory is the FOLD over its stripes
         /// (`nlink = D.nlink + Σ (D_i.nlink − 2)`, times = max); any other
-        /// directory is its record.
+        /// directory is its record. The verdict is read off `v` and D's
+        /// own tree and a plain one is NOT remembered (decision 0003 §CB.1:
+        /// the hint cache is for parents; the first op under D fills it).
         fn foldIfStriped(self: *Self, global: u64, v: InodeValue) Error!InodeValue {
             const st = self.stripes orelse return v;
-            const map = (try st.mapOf(global)) orelse return v;
+            const map = (try st.foldMapOf(global, v)) orelse return v;
             // The fold reads every stripe, foreign ones included.
             if (node_cache.try_only) return error.WouldBlock;
             return st.fold(&map, v);

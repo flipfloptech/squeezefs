@@ -19077,3 +19077,391 @@ test "smoke: FILE HANDLES SURVIVE A CACHE DROP AND A REMOUNT (FUSE_EXPORT_SUPPOR
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     std.debug.print("\nsmoke: export handles — file, hard link, symlink, directory, nested directory: open after a cache drop, after renames, after a remount; unlinked and removed stale\n", .{});
 }
+
+// ---------------------------------------------------------------------------
+// FIEMAP under the interposer (charter §4 "FIEMAP", decision 0003 §CJ).
+// ---------------------------------------------------------------------------
+
+const fiemap = handler.fiemap;
+
+/// One `FS_IOC_FIEMAP` exactly as an application issues it (libc's
+/// `ioctl`, so a preloaded shim's hook sees it): `probe <path> <fm_flags>
+/// <count> [start [length]]` prints the return, errno, the header read back
+/// and every extent the array received; `probe -g <path>` is
+/// FS_IOC_GETFLAGS, a request the shim must pass through untouched.
+const fiemap_probe_src =
+    \\#define _GNU_SOURCE
+    \\#include <errno.h>
+    \\#include <fcntl.h>
+    \\#include <stdio.h>
+    \\#include <stdlib.h>
+    \\#include <string.h>
+    \\#include <sys/ioctl.h>
+    \\#include <linux/fs.h>
+    \\#include <linux/fiemap.h>
+    \\#include <unistd.h>
+    \\int main(int argc, char **argv) {
+    \\    if (argc >= 3 && strcmp(argv[1], "-g") == 0) {
+    \\        int fd = open(argv[2], O_RDONLY);
+    \\        if (fd < 0) { printf("open errno=%d\n", errno); return 2; }
+    \\        int flags = -1; errno = 0;
+    \\        int rc = ioctl(fd, FS_IOC_GETFLAGS, &flags);
+    \\        printf("getflags rc=%d errno=%d flags=%d\n", rc, rc < 0 ? errno : 0, flags);
+    \\        return 0;
+    \\    }
+    \\    if (argc < 4) return 3;
+    \\    unsigned count = (unsigned)strtoul(argv[3], 0, 0);
+    \\    int fd = open(argv[1], O_RDONLY);
+    \\    if (fd < 0) { printf("open errno=%d\n", errno); return 2; }
+    \\    struct fiemap *fm = calloc(1, sizeof(struct fiemap) + ((size_t)count + 1) * sizeof(struct fiemap_extent));
+    \\    fm->fm_start = argc > 4 ? strtoull(argv[4], 0, 0) : 0;
+    \\    fm->fm_length = argc > 5 ? strtoull(argv[5], 0, 0) : ~0ULL;
+    \\    fm->fm_flags = (unsigned)strtoul(argv[2], 0, 0);
+    \\    fm->fm_extent_count = count;
+    \\    errno = 0;
+    \\    int rc = ioctl(fd, FS_IOC_FIEMAP, fm);
+    \\    printf("rc=%d errno=%d fm_flags=%u mapped=%u\n", rc, rc < 0 ? errno : 0, fm->fm_flags, fm->fm_mapped_extents);
+    \\    unsigned n = fm->fm_mapped_extents < count ? fm->fm_mapped_extents : count;
+    \\    for (unsigned i = 0; i < n; i++) {
+    \\        struct fiemap_extent *e = &fm->fm_extents[i];
+    \\        printf("e %llu %llu %llu %u\n", (unsigned long long)e->fe_logical, (unsigned long long)e->fe_physical, (unsigned long long)e->fe_length, e->fe_flags);
+    \\    }
+    \\    return 0;
+    \\}
+;
+
+/// The probe's answer, parsed.
+const ProbeFiemap = struct {
+    rc: i64 = 0,
+    errno: u32 = 0,
+    flags_out: u32 = 0,
+    mapped: u32 = 0,
+    ext: [32]fiemap.Extent = undefined,
+    n: usize = 0,
+    text: [2048]u8 = undefined,
+    text_len: usize = 0,
+
+    fn extents(self: *const ProbeFiemap) []const fiemap.Extent {
+        return self.ext[0..self.n];
+    }
+
+    fn covered(self: *const ProbeFiemap) u64 {
+        var b: u64 = 0;
+        for (self.extents()) |e| b += e.fe_length;
+        return b;
+    }
+
+    fn print(self: *const ProbeFiemap, label: []const u8) void {
+        std.debug.print("smoke[fiemap]: {s}:\n{s}", .{ label, self.text[0..self.text_len] });
+    }
+
+    fn parse(out: []const u8) !ProbeFiemap {
+        var p: ProbeFiemap = .{};
+        p.text_len = @min(out.len, p.text.len);
+        @memcpy(p.text[0..p.text_len], out[0..p.text_len]);
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        const head = lines.next() orelse return error.ProbeOutput;
+        var f = std.mem.tokenizeScalar(u8, head, ' ');
+        inline for (.{ "rc=", "errno=", "fm_flags=", "mapped=" }, 0..) |key, i| {
+            const tok = f.next() orelse return error.ProbeOutput;
+            if (!std.mem.startsWith(u8, tok, key)) return error.ProbeOutput;
+            const v = tok[key.len..];
+            switch (i) {
+                0 => p.rc = try std.fmt.parseInt(i64, v, 10),
+                1 => p.errno = try std.fmt.parseInt(u32, v, 10),
+                2 => p.flags_out = try std.fmt.parseInt(u32, v, 10),
+                else => p.mapped = try std.fmt.parseInt(u32, v, 10),
+            }
+        }
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "e ")) continue;
+            if (p.n == p.ext.len) return error.ProbeOutput;
+            var t = std.mem.tokenizeScalar(u8, line[2..], ' ');
+            const logical = try std.fmt.parseInt(u64, t.next() orelse return error.ProbeOutput, 10);
+            const physical = try std.fmt.parseInt(u64, t.next() orelse return error.ProbeOutput, 10);
+            const length = try std.fmt.parseInt(u64, t.next() orelse return error.ProbeOutput, 10);
+            const flags = try std.fmt.parseInt(u32, t.next() orelse return error.ProbeOutput, 10);
+            p.ext[p.n] = .{ .fe_logical = logical, .fe_physical = physical, .fe_length = length, .fe_reserved64 = @splat(0), .fe_flags = flags, .fe_reserved = @splat(0) };
+            p.n += 1;
+        }
+        return p;
+    }
+};
+
+const FiemapRig = struct {
+    rig: *Rig,
+    probe: []u8,
+    preload_env: std.process.Environ.Map,
+
+    /// Run the probe; `preloaded` under the shim, else as the kernel answers.
+    fn run(self: *FiemapRig, preloaded: bool, args: []const []const u8) ![]u8 {
+        var argv: [8][]const u8 = undefined;
+        argv[0] = self.probe;
+        for (args, 0..) |a, i| argv[i + 1] = a;
+        const r = try std.process.run(self.rig.gpa, self.rig.io, .{ .argv = argv[0 .. args.len + 1], .cwd = .{ .path = self.rig.mp }, .environ_map = if (preloaded) &self.preload_env else &self.rig.env });
+        defer self.rig.gpa.free(r.stderr);
+        if (!r.term.success()) {
+            std.debug.print("\n--- fiemap probe {s} ({f}) ---\n{s}{s}\n", .{ args[0], r.term, r.stdout, r.stderr });
+            self.rig.gpa.free(r.stdout);
+            return error.ProbeFailed;
+        }
+        // The shim prints nothing on a served or a passthrough FIEMAP.
+        if (std.mem.indexOf(u8, r.stderr, "squeezefs-il") != null and std.mem.indexOf(u8, r.stderr, "active via") == null) std.debug.print("smoke[fiemap]: shim stderr: {s}\n", .{r.stderr});
+        return r.stdout;
+    }
+
+    fn map(self: *FiemapRig, path: []const u8, flags: u32, count: u32) !ProbeFiemap {
+        var fb: [16]u8 = undefined;
+        var cb: [16]u8 = undefined;
+        const out = try self.run(true, &.{ path, try std.fmt.bufPrint(&fb, "{d}", .{flags}), try std.fmt.bufPrint(&cb, "{d}", .{count}) });
+        defer self.rig.gpa.free(out);
+        return ProbeFiemap.parse(out);
+    }
+
+    fn mapRange(self: *FiemapRig, path: []const u8, count: u32, start: u64, len: u64) !ProbeFiemap {
+        var cb: [16]u8 = undefined;
+        var sb: [24]u8 = undefined;
+        var lb: [24]u8 = undefined;
+        const out = try self.run(true, &.{ path, "0", try std.fmt.bufPrint(&cb, "{d}", .{count}), try std.fmt.bufPrint(&sb, "{d}", .{start}), try std.fmt.bufPrint(&lb, "{d}", .{len}) });
+        defer self.rig.gpa.free(out);
+        return ProbeFiemap.parse(out);
+    }
+
+    /// The whole file's map, served (rc 0).
+    fn mapAll(self: *FiemapRig, path: []const u8, flags: u32) !ProbeFiemap {
+        const a = try self.map(path, flags, 32);
+        if (a.rc != 0) {
+            a.print(path);
+            return error.FiemapNotServed;
+        }
+        return a;
+    }
+};
+
+/// Ascending, disjoint, non-empty extents, only the last LAST, none SHARED;
+/// physical 0 ⇔ UNKNOWN.
+fn expectProbeShape(label: []const u8, a: *const ProbeFiemap) !void {
+    var prev_end: u64 = 0;
+    for (a.extents(), 0..) |e, i| {
+        const last = i + 1 == a.n;
+        const unknown = e.fe_flags & fiemap.FIEMAP_EXTENT_UNKNOWN != 0;
+        if (e.fe_logical < prev_end or e.fe_length == 0 or (e.fe_flags & fiemap.FIEMAP_EXTENT_LAST != 0) != last or e.fe_flags & fiemap.FIEMAP_EXTENT_SHARED != 0 or (e.fe_physical == 0) != unknown) {
+            a.print(label);
+            return error.FiemapShape;
+        }
+        prev_end = e.fe_logical + e.fe_length;
+    }
+}
+
+fn placed(e: fiemap.Extent) bool {
+    return e.fe_physical >> fiemap.PHYS_VOLUME_SHIFT != 0 and e.fe_physical % fiemap.GRAIN == 0 and e.fe_flags & fiemap.FIEMAP_EXTENT_UNKNOWN == 0;
+}
+
+test "shim smoke: FIEMAP UNDER THE INTERPOSER (charter §4 FIEMAP, decision 0003 §CJ) — a supervised `-o interception` mount with the write cache; a C program calls FS_IOC_FIEMAP through libc: without LD_PRELOAD the kernel's EOPNOTSUPP stands; under it the daemon's map answers — inline data one DATA_INLINE|NOT_ALIGNED|UNKNOWN extent at physical 0; a sparse file its two written stripe blocks with the hole a gap (encoded physical, aligned), fm_extent_count 0 counts 2, a batch of one stops without LAST, a range clips at the 4 KiB grain, FIEMAP_FLAG_XATTR is EBADR with fm_flags = XATTR; a 16 MiB file with one whole block punched and a punch inside another maps blocks 0, 2, 3 (the 4 MiB grain: the inner punch stays mapped); a packed small file after fsync one DATA_TAIL|NOT_ALIGNED slot; a write-cache resident DELALLOC|UNKNOWN at 0 until FIEMAP_FLAG_SYNC promotes it (placed, counted); a file of another filesystem and FS_IOC_GETFLAGS pass through byte for byte; filefrag -v and xfs_io fiemap read the map; umount, fsck clean" {
+    const io = testing.io;
+    if (testkit.venue.mount(io, &.{ "squeezefs", "libsqueezefs_il.so" })) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const MiB: u64 = 1 << 20;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    // A dev tree's identity is `-dirty` on both ends: the seam admits it.
+    try rig.env.put("SQUEEZEFS_TEST_IPC_ALLOW_DIRTY", "1");
+    try rig.formatSet(true);
+    try rig.spawnSupervised(&.{ "-o", "interception" });
+    var fr: FiemapRig = .{ .rig = rig, .probe = undefined, .preload_env = try rig.env.clone(gpa) };
+    defer fr.preload_env.deinit();
+    var so_buf: [linux.PATH_MAX]u8 = undefined;
+    try fr.preload_env.put("LD_PRELOAD", try std.fmt.bufPrint(&so_buf, "{s}/libsqueezefs_il.so", .{std.fs.path.dirname(rig.bin).?}));
+    {
+        var sb: [256]u8 = undefined;
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&sb, "{s}/fiemap_probe.c", .{rig.work}), .data = fiemap_probe_src });
+        const out = try rig.shOk(rig.work, "cc -O1 -o fiemap_probe fiemap_probe.c 2>/dev/null || ZIG_GLOBAL_CACHE_DIR=$PWD/zc ZIG_LOCAL_CACHE_DIR=$PWD/zc /usr/local/bin/zig cc -O1 -o fiemap_probe fiemap_probe.c");
+        gpa.free(out);
+        fr.probe = try std.fmt.allocPrint(gpa, "{s}/fiemap_probe", .{rig.work});
+    }
+    defer gpa.free(fr.probe);
+    var p: FlagPaths = .{ .mp = rig.mp };
+    {
+        const out = try rig.onMount("mkdir t && echo hello > t/inline && cd t && xfs_io -f -c 'pwrite -S 0xab 0 4m' -c 'pwrite -S 0xcd 12m 4m' -c fsync sparse >/dev/null && xfs_io -f -c 'pwrite -S 0x11 0 16m' -c fsync -c 'fpunch 4m 4m' -c 'fpunch 9m 1m' -c fsync punched >/dev/null && xfs_io -f -c 'pwrite -S 0x5a 0 20000' -c fsync packed >/dev/null && stat -c %s sparse punched packed");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("16777216\n16777216\n20000\n", out);
+    }
+    // Without the shim: the kernel's answer, unchanged.
+    {
+        const out = try fr.run(false, &.{ p.of("sparse"), "0", "8" });
+        defer gpa.free(out);
+        const a = try ProbeFiemap.parse(out);
+        if (a.rc != -1 or a.errno != @backingInt(linux.E.OPNOTSUPP)) {
+            a.print("sparse without the shim");
+            return error.KernelAnswerChanged;
+        }
+    }
+    // Inline: the record's bytes, no stable device address.
+    {
+        const a = try fr.mapAll(p.of("inline"), 0);
+        try expectProbeShape("inline", &a);
+        try testing.expectEqual(@as(usize, 1), a.n);
+        try testing.expectEqual(@as(u64, 6), a.ext[0].fe_length);
+        try testing.expectEqual(@as(u64, 0), a.ext[0].fe_physical);
+        try testing.expectEqual(fiemap.FIEMAP_EXTENT_DATA_INLINE | fiemap.FIEMAP_EXTENT_NOT_ALIGNED | fiemap.FIEMAP_EXTENT_UNKNOWN | fiemap.FIEMAP_EXTENT_LAST, a.ext[0].fe_flags);
+    }
+    // A sparse striped file: blocks 0 and 3 written, 1–2 a hole.
+    {
+        const a = try fr.mapAll(p.of("sparse"), 0);
+        try expectProbeShape("sparse", &a);
+        if (a.n != 2 or a.ext[0].fe_logical != 0 or a.ext[0].fe_length != 4 * MiB or a.ext[1].fe_logical != 12 * MiB or a.ext[1].fe_length != 4 * MiB or !placed(a.ext[0]) or !placed(a.ext[1]) or a.ext[0].fe_flags != 0) {
+            a.print("sparse");
+            return error.FiemapShape;
+        }
+        // The count alone; a batch of one stops without LAST; a range
+        // inside the second block clips at the grain.
+        const c = try fr.map(p.of("sparse"), 0, 0);
+        try testing.expectEqual(@as(i64, 0), c.rc);
+        try testing.expectEqual(@as(u32, 2), c.mapped);
+        try testing.expectEqual(@as(usize, 0), c.n);
+        const one = try fr.map(p.of("sparse"), 0, 1);
+        try testing.expectEqual(@as(u32, 1), one.mapped);
+        try testing.expectEqual(@as(u32, 0), one.ext[0].fe_flags & fiemap.FIEMAP_EXTENT_LAST);
+        const r = try fr.mapRange(p.of("sparse"), 8, 12 * MiB + 5000, 100);
+        try testing.expectEqual(@as(u32, 1), r.mapped);
+        try testing.expectEqual(12 * MiB + 4096, r.ext[0].fe_logical);
+        try testing.expectEqual(@as(u64, 4096), r.ext[0].fe_length);
+        try testing.expectEqual(a.ext[1].fe_physical + 4096, r.ext[0].fe_physical);
+        try testing.expectEqual(fiemap.FIEMAP_EXTENT_LAST, r.ext[0].fe_flags);
+        // XATTR: the kernel's EBADR, fm_flags = the offending bit.
+        const x = try fr.map(p.of("sparse"), fiemap.FIEMAP_FLAG_XATTR | fiemap.FIEMAP_FLAG_SYNC, 8);
+        try testing.expectEqual(@as(i64, -1), x.rc);
+        try testing.expectEqual(@as(u32, @backingInt(linux.E.BADR)), x.errno);
+        try testing.expectEqual(fiemap.FIEMAP_FLAG_XATTR, x.flags_out);
+        try testing.expectEqual(@as(u32, 0), x.mapped);
+    }
+    // The 4 MiB grain: a whole punched block is a hole, a punch inside a
+    // block leaves it mapped (its bytes are written zeros).
+    {
+        const a = try fr.mapAll(p.of("punched"), 0);
+        try expectProbeShape("punched", &a);
+        var ok = a.covered() == 12 * MiB and a.n >= 2 and a.ext[0].fe_logical == 0 and a.ext[0].fe_length == 4 * MiB;
+        for (a.extents()) |e| {
+            if (!placed(e)) ok = false;
+            if (e.fe_logical < 8 * MiB and e.fe_logical + e.fe_length > 4 * MiB) ok = false;
+        }
+        if (!ok or a.ext[a.n - 1].fe_logical + a.ext[a.n - 1].fe_length != 16 * MiB) {
+            a.print("punched");
+            return error.FiemapShape;
+        }
+    }
+    // A packed small file after its fsync: its slot of a shared stripe block.
+    {
+        const a = try fr.mapAll(p.of("packed"), 0);
+        try expectProbeShape("packed", &a);
+        if (a.n != 1 or a.ext[0].fe_length != 20_480 or a.ext[0].fe_flags != fiemap.FIEMAP_EXTENT_DATA_TAIL | fiemap.FIEMAP_EXTENT_NOT_ALIGNED | fiemap.FIEMAP_EXTENT_LAST or a.ext[0].fe_physical >> fiemap.PHYS_VOLUME_SHIFT == 0) {
+            a.print("packed");
+            return error.FiemapShape;
+        }
+    }
+    // A write-cache resident not promoted: DELALLOC|UNKNOWN at physical 0;
+    // FIEMAP_FLAG_SYNC promotes it first and it maps placed. A host-wide
+    // sync (FUSE_SYNCFS from any process) promotes every resident: a window
+    // it hit is retried on a fresh file, judged by the counter.
+    {
+        const syncs0 = blk: {
+            const st = try rig.stats();
+            defer gpa.free(st);
+            break :blk numberAfter(st, "\"fuse_fiemap_syncs\":") orelse 0;
+        };
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            var name_buf: [32]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "staged{d}", .{attempt});
+            const path = p.of(name);
+            const before = blk: {
+                const st = try rig.stats();
+                defer gpa.free(st);
+                break :blk numberAfter(st, "\"fuse_syncfs\":") orelse 0;
+            };
+            const fd = try openRaw(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true });
+            const buf: [4096]u8 = @splat(0x5b);
+            var off: usize = 0;
+            while (off < 100_000) : (off += buf.len) try expectErrno("pwrite(staged)", null, linux.pwrite(fd, &buf, @min(buf.len, 100_000 - off), @intCast(off)));
+            _ = linux.close(fd);
+            const a = try fr.mapAll(path, 0);
+            const after = blk: {
+                const st = try rig.stats();
+                defer gpa.free(st);
+                break :blk numberAfter(st, "\"fuse_syncfs\":") orelse 0;
+            };
+            if (after != before and attempt < 4) {
+                std.debug.print("smoke[fiemap]: a host-wide sync promoted {s} inside the window — again\n", .{name});
+                continue;
+            }
+            try expectProbeShape("staged", &a);
+            if (a.n != 1 or a.ext[0].fe_length != 102_400 or a.ext[0].fe_physical != 0 or a.ext[0].fe_flags != fiemap.FIEMAP_EXTENT_DELALLOC | fiemap.FIEMAP_EXTENT_UNKNOWN | fiemap.FIEMAP_EXTENT_LAST) {
+                a.print("staged, not promoted");
+                return error.FiemapShape;
+            }
+            const s = try fr.mapAll(path, fiemap.FIEMAP_FLAG_SYNC);
+            try expectProbeShape("staged after FIEMAP_FLAG_SYNC", &s);
+            try testing.expectEqual(fiemap.FIEMAP_FLAG_SYNC, s.flags_out);
+            if (s.n != 1 or s.ext[0].fe_length != 102_400 or s.ext[0].fe_flags & (fiemap.FIEMAP_EXTENT_DELALLOC | fiemap.FIEMAP_EXTENT_UNKNOWN) != 0 or s.ext[0].fe_flags & fiemap.FIEMAP_EXTENT_LAST == 0 or s.ext[0].fe_physical >> fiemap.PHYS_VOLUME_SHIFT == 0) {
+                s.print("staged after FIEMAP_FLAG_SYNC");
+                return error.FiemapShape;
+            }
+            break;
+        }
+        const st = try rig.stats();
+        defer gpa.free(st);
+        try testing.expect((numberAfter(st, "\"fuse_fiemap_syncs\":") orelse 0) > syncs0);
+    }
+    // Not ours, or not FIEMAP: the real call, byte for byte.
+    {
+        var lb: [256]u8 = undefined;
+        const local = try std.fmt.bufPrint(&lb, "{s}/fiemap_probe.c", .{rig.work});
+        const base = try fr.run(false, &.{ local, "1", "8" });
+        defer gpa.free(base);
+        const pre = try fr.run(true, &.{ local, "1", "8" });
+        defer gpa.free(pre);
+        try testing.expectEqualStrings(base, pre);
+        const gbase = try fr.run(false, &.{ "-g", p.of("sparse") });
+        defer gpa.free(gbase);
+        const gpre = try fr.run(true, &.{ "-g", p.of("sparse") });
+        defer gpa.free(gpre);
+        try testing.expectEqualStrings(gbase, gpre);
+    }
+    // The tools under the preload: filefrag reads FIEMAP and lists both
+    // extents (its "N extents found" counts PHYSICAL discontinuities: two
+    // blocks the allocator laid side by side are one) — without the shim
+    // its FIBMAP fallback finds none; xfs_io's fiemap prints the hole.
+    {
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "sh", "-c", "filefrag -v t/sparse | grep -cE '^ +[0-9]+:'; filefrag -v t/punched | grep -cE '^ +[0-9]+:'; xfs_io -c 'fiemap -v' t/sparse | grep -c hole; filefrag -v t/inline" }, .cwd = .{ .path = rig.mp }, .environ_map = &fr.preload_env });
+        defer rig.freeRun(r);
+        std.debug.print("smoke[fiemap]: tools under the preload:\n{s}{s}", .{ r.stdout, r.stderr });
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.startsWith(u8, r.stdout, "2\n3\n1\n"));
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "last,unknown_loc,not_aligned,inline,eof") != null);
+        const k = try rig.onMount("filefrag t/sparse");
+        defer gpa.free(k);
+        try testing.expectEqualStrings("t/sparse: 0 extents found\n", k);
+    }
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        try testing.expect((numberAfter(st, "\"ipc_fiemap_requests\":") orelse 0) >= 10);
+        try testing.expect((numberAfter(st, "\"fuse_fiemap_requests\":") orelse 0) >= 8);
+    }
+    // The map is the durable layout's: umount, fsck clean.
+    {
+        const out = try rig.onMount("rm -rf t && ls | wc -l");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("0\n", out);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", rig.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+            std.debug.print("\n--- fsck --offline --scrub after the FIEMAP row ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+            return error.FsckNotClean;
+        }
+    }
+}

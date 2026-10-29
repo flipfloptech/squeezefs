@@ -117,6 +117,7 @@ const sync = @import("../../sync/sync.zig");
 const economy = @import("../../meta/economy.zig");
 const virtual_inodes = @import("virtual_inodes.zig");
 const inode_flags = @import("inode_flags.zig");
+const fiemap = @import("fiemap.zig");
 const lease_epoch = @import("../../data/lease_epoch.zig");
 const inos = @import("../../meta/inos.zig");
 const jc = @import("../../meta/journal_core.zig");
@@ -388,6 +389,13 @@ pub var fuse_inode_flag_refusals: counters.ShardedCounter = .{};
 /// `fuse_inode_flag_sets`: FS_IOC_SETFLAGS/FSSETXATTR requests that changed
 /// the record (a no-op set counts nothing).
 pub var fuse_inode_flag_sets: counters.ShardedCounter = .{};
+/// `fuse_fiemap_requests`: FIEMAP batches served (a count alone included;
+/// the interposer's verb is the only caller — Linux answers FS_IOC_FIEMAP
+/// on a FUSE file in the VFS and never asks); `fuse_fiemap_syncs`: those
+/// that carried `FIEMAP_FLAG_SYNC` and ran the fsync data leg first
+/// (charter §4 "FIEMAP").
+pub var fuse_fiemap_requests: counters.ShardedCounter = .{};
+pub var fuse_fiemap_syncs: counters.ShardedCounter = .{};
 /// `fuse_reserved_xattr_refusals`: the allowlist's engagement — a set/get/
 /// remove of a name outside `user.*` (minus `user.squeezefs.`), `security.*`,
 /// `trusted.*` (a counter, not a tripwire: a probing tenant is not a
@@ -9631,6 +9639,174 @@ fn writeWith(h: *Harness, ino: u64, offset: u64, data: []const u8, o_flags: u32)
 
 const o_wronly: u32 = @bitCast(linux.O{ .ACCMODE = .WRONLY });
 const o_append_w: u32 = @bitCast(linux.O{ .ACCMODE = .WRONLY, .APPEND = true });
+
+/// FS_IOC_FIEMAP as the IPC host's verb hands it over: one `struct
+/// fiemap` in (`fiemap.prep` passed it), `out_size` = 32 + 56 × `count`.
+fn fiemapCall(h: anytype, ino: u64, start: u64, len: u64, flags: u32, count: u32) Loopback.Captured {
+    const f: fiemap.Fiemap = .{ .fm_start = start, .fm_length = len, .fm_flags = flags, .fm_mapped_extents = 0, .fm_extent_count = count, .fm_reserved = 0 };
+    return fiemapRaw(h, ino, std.mem.asBytes(&f), @intCast(@sizeOf(fiemap.Fiemap) + @as(usize, count) * @sizeOf(fiemap.Extent)));
+}
+
+fn fiemapRaw(h: anytype, ino: u64, in: []const u8, out_size: u32) Loopback.Captured {
+    return h.call(.{ .ioctl = .{ .in = .{ .fh = 0, .flags = 0, .cmd = fiemap.FS_IOC_FIEMAP, .arg = 0, .in_size = @intCast(in.len), .out_size = out_size }, .data = in } }, ino);
+}
+
+/// The reply's header and its extents (copied out of the capture).
+fn fiemapReply(c: Loopback.Captured, out: []fiemap.Extent) !struct { mapped: u32, n: usize } {
+    if (c.errno()) |e| {
+        std.debug.print("FS_IOC_FIEMAP: errno {t}\n", .{e});
+        return error.TestUnexpectedErrno;
+    }
+    const io_out = abi.decodeExact(abi.fuse_ioctl_out, c.outBytes()) orelse return error.TestBadReply;
+    try testing.expectEqual(@as(i32, 0), io_out.result);
+    try testing.expect(c.body.len >= @sizeOf(fiemap.Fiemap));
+    try testing.expectEqual(@as(usize, 0), (c.body.len - @sizeOf(fiemap.Fiemap)) % @sizeOf(fiemap.Extent));
+    const h = std.mem.bytesToValue(fiemap.Fiemap, c.body[0..@sizeOf(fiemap.Fiemap)]);
+    const n = (c.body.len - @sizeOf(fiemap.Fiemap)) / @sizeOf(fiemap.Extent);
+    for (0..n) |i| out[i] = std.mem.bytesToValue(fiemap.Extent, c.body[@sizeOf(fiemap.Fiemap) + i * @sizeOf(fiemap.Extent) ..][0..@sizeOf(fiemap.Extent)]);
+    return .{ .mapped = h.fm_mapped_extents, .n = n };
+}
+
+/// Publish `l` as `ino`'s layout (the displaced one's references move).
+fn fiemapPublish(h: anytype, ino: u64, l: Layout, proofs: []const layout.DmaProof) !void {
+    const prev = try h.fs.readLayout(ino);
+    defer h.fs.freeLayout(prev);
+    const t = try h.store.begin(@src());
+    {
+        errdefer h.store.abandon(t);
+        try layout.publishLayout(t, .{ .ino = ino, .name_key = h.store.nameKey(), .coll_seq = if (prev) |p| p.coll_seq else 0, .prev = if (prev) |p| p.layout else null, .layout = l, .proofs = proofs }, h.data.refsSeam(), .default);
+    }
+    try h.store.commit(t);
+}
+
+test "fiemap through the dispatcher (charter §4 FIEMAP): inline data is one DATA_INLINE|NOT_ALIGNED|UNKNOWN extent; a striped map's contiguous written blocks merge, a hole is a gap, a reservation is UNWRITTEN, LAST on the last; the count alone; a batch of one stops without LAST; a range clips at the grain; a packed tenant is its slot at its address, DATA_TAIL|NOT_ALIGNED; a staged file's durable copy is its extent; the custody lands first (SYNC runs the fsync leg instead); XATTR is EOPNOTSUPP (prep's EBADR is the caller's), a malformed size EINVAL" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const bs = layout.DEFAULT_CHUNK;
+    const all = std.math.maxInt(u64);
+    var ex: [8]fiemap.Extent = undefined;
+    const f = try h.create(1, "f", 0o644);
+    h.release(f);
+    const local = try H.Fs.localOf(f);
+    // Empty: no extent.
+    try testing.expectEqual(@as(u32, 0), (try fiemapReply(fiemapCall(&h, f, 0, all, 0, 8), &ex)).mapped);
+    // Inline: the record's bytes.
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, "hello fiemap", 0).errno());
+    {
+        const r = try fiemapReply(fiemapCall(&h, f, 0, all, 0, 8), &ex);
+        try testing.expectEqual(@as(u32, 1), r.mapped);
+        try testing.expectEqual(@as(u64, 12), ex[0].fe_length);
+        try testing.expectEqual(@as(u64, 0), ex[0].fe_physical);
+        try testing.expectEqual(fiemap.FIEMAP_EXTENT_DATA_INLINE | fiemap.FIEMAP_EXTENT_NOT_ALIGNED | fiemap.FIEMAP_EXTENT_UNKNOWN | fiemap.FIEMAP_EXTENT_LAST, ex[0].fe_flags);
+    }
+    // A striped map: blocks 0 and 1 written and contiguous on the device,
+    // block 2 a hole, block 3 reserved, block 5 written elsewhere.
+    const m0 = Mapping.wholeBlock(0xA, 0, 1);
+    const m1 = Mapping.wholeBlock(0xA, bs, 2);
+    const m3 = Mapping.unwrittenBlock(0xA, 8 * bs, 3);
+    const m5 = Mapping.wholeBlock(0xA, 20 * bs, 4);
+    const entries = [_]layout.MapEntryWire{
+        (layout.MapEntry{ .block = 0, .mapping = m0 }).encode(),
+        (layout.MapEntry{ .block = 1, .mapping = m1 }).encode(),
+        (layout.MapEntry{ .block = 3, .mapping = m3 }).encode(),
+        (layout.MapEntry{ .block = 5, .mapping = m5 }).encode(),
+    };
+    const proofs = [_]layout.DmaProof{
+        .{ .vol_tag = 0xA, .offset = 0, .len = 2 * bs, .completed_ns = 1 },
+        .{ .vol_tag = 0xA, .offset = 20 * bs, .len = bs, .completed_ns = 1 },
+    };
+    try fiemapPublish(&h, local, Layout.stripedInline(5 * bs + 100, &entries), &proofs);
+    const requests0 = fuse_fiemap_requests.load();
+    {
+        const r = try fiemapReply(fiemapCall(&h, f, 0, all, 0, 8), &ex);
+        try testing.expectEqual(@as(u32, 3), r.mapped);
+        try testing.expectEqual(@as(usize, 3), r.n);
+        try testing.expectEqual(@as(u64, 0), ex[0].fe_logical);
+        try testing.expectEqual(2 * bs, ex[0].fe_length);
+        try testing.expectEqual(fiemap.physOf(0, 0, 0).?, ex[0].fe_physical);
+        try testing.expectEqual(@as(u32, 0), ex[0].fe_flags);
+        try testing.expectEqual(3 * bs, ex[1].fe_logical);
+        try testing.expectEqual(fiemap.FIEMAP_EXTENT_UNWRITTEN, ex[1].fe_flags);
+        try testing.expectEqual(fiemap.physOf(0, 8 * bs, 0).?, ex[1].fe_physical);
+        try testing.expectEqual(5 * bs, ex[2].fe_logical);
+        try testing.expectEqual(fiemap.FIEMAP_EXTENT_LAST, ex[2].fe_flags);
+    }
+    try testing.expectEqual(requests0 + 1, fuse_fiemap_requests.load());
+    // The count alone: the header, no extent.
+    {
+        const c = fiemapCall(&h, f, 0, all, 0, 0);
+        const r = try fiemapReply(c, &ex);
+        try testing.expectEqual(@as(u32, 3), r.mapped);
+        try testing.expectEqual(@as(usize, 0), r.n);
+    }
+    // A batch of one: the first extent, not LAST (the caller asks again
+    // from its end and the next batch begins at the reservation).
+    {
+        var r = try fiemapReply(fiemapCall(&h, f, 0, all, 0, 1), &ex);
+        try testing.expectEqual(@as(usize, 1), r.n);
+        try testing.expectEqual(@as(u32, 0), ex[0].fe_flags & fiemap.FIEMAP_EXTENT_LAST);
+        const next = ex[0].fe_logical + ex[0].fe_length;
+        r = try fiemapReply(fiemapCall(&h, f, next, all - next, 0, 1), &ex);
+        try testing.expectEqual(3 * bs, ex[0].fe_logical);
+    }
+    // A range inside the reservation clips at the grain.
+    {
+        const r = try fiemapReply(fiemapCall(&h, f, 3 * bs + 5000, 100, 0, 8), &ex);
+        try testing.expectEqual(@as(usize, 1), r.n);
+        try testing.expectEqual(3 * bs + 4096, ex[0].fe_logical);
+        try testing.expectEqual(@as(u64, 4096), ex[0].fe_length);
+        try testing.expectEqual(fiemap.FIEMAP_EXTENT_UNWRITTEN | fiemap.FIEMAP_EXTENT_LAST, ex[0].fe_flags);
+    }
+    // The striped custody lands before the map is read; SYNC runs the
+    // fsync data leg instead (the armed custody gone with it).
+    {
+        h.data.custody_of = local;
+        const flushes0 = h.data.flushes;
+        _ = try fiemapReply(fiemapCall(&h, f, 0, all, 0, 8), &ex);
+        try testing.expectEqual(flushes0 + 1, h.data.flushes);
+        const syncs0 = fuse_fiemap_syncs.load();
+        _ = try fiemapReply(fiemapCall(&h, f, 0, all, fiemap.FIEMAP_FLAG_SYNC, 8), &ex);
+        try testing.expectEqual(syncs0 + 1, fuse_fiemap_syncs.load());
+        try testing.expectEqual(@as(?u64, null), h.data.custody_of);
+        try testing.expectEqual(flushes0 + 1, h.data.flushes);
+    }
+    // A second file: staged, the ring no longer holding it — its durable
+    // copy; then promoted to a packed tenant — its slot at offset + rel_off.
+    const g = try h.create(1, "g", 0o644);
+    h.release(g);
+    const glocal = try H.Fs.localOf(g);
+    const fid: layout.FileId = @splat(7);
+    const copy = Mapping.wholeBlock(0xA, 31 * bs, 9);
+    try fiemapPublish(&h, glocal, Layout.staged(bs - 1, fid, copy), &.{.{ .vol_tag = 0xA, .offset = 31 * bs, .len = bs, .completed_ns = 1 }});
+    {
+        const r = try fiemapReply(fiemapCall(&h, g, 0, all, 0, 8), &ex);
+        try testing.expectEqual(@as(usize, 1), r.n);
+        try testing.expectEqual(bs, ex[0].fe_length);
+        try testing.expectEqual(fiemap.physOf(0, 31 * bs, 0).?, ex[0].fe_physical);
+        try testing.expectEqual(fiemap.FIEMAP_EXTENT_LAST, ex[0].fe_flags);
+    }
+    const tenant = Mapping.tenant(0xA, 30 * bs, 0, 3 * 4096, 10_000);
+    try fiemapPublish(&h, glocal, Layout.packedTenant(10_000, fid, tenant), &.{.{ .vol_tag = 0xA, .offset = 30 * bs + 3 * 4096, .len = 12_288, .completed_ns = 1 }});
+    {
+        const r = try fiemapReply(fiemapCall(&h, g, 0, all, 0, 8), &ex);
+        try testing.expectEqual(@as(usize, 1), r.n);
+        try testing.expectEqual(@as(u64, 12_288), ex[0].fe_length);
+        try testing.expectEqual(fiemap.physOf(0, 30 * bs + 3 * 4096, 0).?, ex[0].fe_physical);
+        try testing.expectEqual(fiemap.FIEMAP_EXTENT_DATA_TAIL | fiemap.FIEMAP_EXTENT_NOT_ALIGNED | fiemap.FIEMAP_EXTENT_LAST, ex[0].fe_flags);
+    }
+    // Refusals: XATTR (prep refuses it EBADR before any batch), a size
+    // that is not 32 + 56 × count; a virtual inode stays ENOSYS.
+    try testing.expectEqual(@as(?linux.E, .OPNOTSUPP), fiemapCall(&h, f, 0, all, fiemap.FIEMAP_FLAG_XATTR, 8).errno());
+    {
+        const fm: fiemap.Fiemap = .{ .fm_start = 0, .fm_length = all, .fm_flags = 0, .fm_mapped_extents = 0, .fm_extent_count = 8, .fm_reserved = 0 };
+        try testing.expectEqual(@as(?linux.E, .INVAL), fiemapRaw(&h, f, std.mem.asBytes(&fm), 32 + 7 * 56).errno());
+    }
+    try testing.expectEqual(@as(?linux.E, .NOSYS), fiemapCall(&h, virtual_inodes.STATS_INODE, 0, all, 0, 8).errno());
+}
 
 test "inode flags: the four ioctls serve the record — GETFLAGS 4 B and FSGETXATTR 28 B exactly (a wrong out_size EINVAL), SETFLAGS/FSSETXATTR store IMMUTABLE/APPEND, move ctime and count a set; the word read back is a no-op; a bit the record cannot hold is EOPNOTSUPP; an unknown command and a virtual inode are ENOSYS (the kernel's ENOTTY); a directory serves them too" {
     var h: Harness = undefined;

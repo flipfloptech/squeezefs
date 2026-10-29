@@ -233,6 +233,10 @@ pub const RamLoader = struct {
     images: std.atomic.Value(u64) = .init(0),
     /// Test seam: every append fails `error.Io`.
     fail_appends: std.atomic.Value(bool) = .init(false),
+    /// Test seam: every image and append is acknowledged and discarded
+    /// (dm-flakey `drop_writes`, the cut xfstests stages under a live
+    /// mount); reads serve what the volume held.
+    drop_writes: std.atomic.Value(bool) = .init(false),
 
     pub fn init(gpa: Allocator, len: usize) Allocator.Error!RamLoader {
         const b = try gpa.alloc(u8, len);
@@ -252,6 +256,7 @@ pub const RamLoader = struct {
     fn writeImage(ctx: *anyopaque, addr: u64, bytes: []const u8) LoaderError!void {
         const self: *RamLoader = @ptrCast(@alignCast(ctx));
         _ = self.images.fetchAdd(1, .monotonic);
+        if (self.drop_writes.load(.monotonic)) return;
         self.write(addr, bytes);
     }
 
@@ -265,6 +270,7 @@ pub const RamLoader = struct {
         const self: *RamLoader = @ptrCast(@alignCast(ctx));
         if (self.fail_appends.load(.monotonic)) return error.Io;
         _ = self.appends.fetchAdd(1, .monotonic);
+        if (self.drop_writes.load(.monotonic)) return;
         self.write(addr + off, bytes);
     }
 

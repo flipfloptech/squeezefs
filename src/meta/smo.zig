@@ -3024,6 +3024,66 @@ test "CheckpointSeam: the checkpoint's CacheFlusher appends in place, hands a fu
     try testing.expectEqual(@as(u64, 0), report.merges);
 }
 
+test "AN SMO NEVER READS BACK WHAT THE DEVICE ACKNOWLEDGED (xfstests generic/311: `kv checkpoint tick failed … Corrupt` at the unmount under dm-flakey drop_writes; charter §5.3 successors build from a frozen snapshot) — a node whose log filled with appends that landed, then the cut (every write acknowledged and dropped from here): the checkpoint's flush step hands the full node to the SMO, which compacts it off RAM; the successor's log fills with appends the device drops and its SMO folds them off RAM; unique keys split the leaf and grow the root; a guest tree minted under the cut takes its root; every key reads as committed and the device holds exactly the bytes of the cut (red on 0778bb4: the compaction loaded its successor back off the device, read the extent's old bytes and answered failed/corrupt — the trace generic/311's daemons logged; with the cut before the appends the fold of the node's DEVICE log refused instead)" {
+    const gpa = testing.allocator;
+    var vol = try TestVolume.init(gpa, .{});
+    defer vol.deinit();
+    const t = try vol.createTree(.native);
+    var seam_ctx: CheckpointSeam = .{ .ctx = &vol.ctx, .trees = vol.table };
+    var flusher: checkpoint_cycle.CacheFlusher = .{ .cache = vol.cache, .smo = seam_ctx.seam() };
+    const sink = flusher.sink();
+    var buf: [64]u8 = undefined;
+    var cut: ?[]u8 = null;
+    defer if (cut) |c| gpa.free(c);
+    var round: u64 = 0;
+    for (0..2) |phase| {
+        const n = try vol.cache.get(t.rootPtr().addr);
+        defer n.release();
+        while (true) : (round += 1) {
+            for (0..80) |i| try t.insert(&ikey(i), tree.testValue(i * 11 + round, 40, &buf));
+            const d = n.lockRead(testing.io);
+            const full = d.projectedLogEnd(vol.layout, 0) > vol.layout.node_size;
+            n.unlockRead(testing.io);
+            if (full) break;
+            const r = sink.flush(sink.ctx, n, .{ .mode = .threshold });
+            try testing.expectEqual(checkpoint_cycle.FlushDisposition.appended, r.disposition);
+            try testing.expect(round < 10_000);
+        }
+        // Phase 0: the cut lands between the last append and the SMO.
+        if (phase == 0) {
+            cut = try gpa.dupe(u8, vol.ram.bytes);
+            vol.ram.drop_writes.store(true, .monotonic);
+        }
+        const c0 = stats.meta_kv_node_compactions.load();
+        const r = sink.flush(sink.ctx, n, .{ .mode = .checkpoint, .keep_exempt = true });
+        try testing.expectEqual(checkpoint_cycle.FlushDisposition.replaced, r.disposition);
+        try testing.expectEqual(c0 + 1, stats.meta_kv_node_compactions.load());
+        for (0..80) |i| try expectLookup(t, &ikey(i), tree.testValue(i * 11 + round, 40, &buf));
+    }
+    // Unique keys until the root leaf splits: two successors and a new root.
+    const g0 = stats.meta_kv_root_grows.load();
+    var k: u64 = 1000;
+    while (stats.meta_kv_root_grows.load() == g0) {
+        for (0..64) |_| {
+            try t.insert(&ikey(k), tree.testValue(k, 40, &buf));
+            k += 1;
+        }
+        _ = try vol.drain(t);
+        try testing.expect(k < 1_000_000);
+    }
+    try testing.expectEqual(@as(u8, 1), try t.rootLevel());
+    // A guest tree minted under the cut takes its root.
+    const guest = try vol.createTree(.{ .slot = key.guestForestSlot(9) });
+    const gk = key.inodeKey(key.guestLocalIno(9, 5));
+    try guest.insert(&gk, tree.testValue(5, 24, &buf));
+    try vol.flushDirty(guest);
+    try expectLookup(guest, &gk, tree.testValue(5, 24, &buf));
+    try vol.flushDirty(t);
+    for (0..80) |i| try expectLookup(t, &ikey(i), tree.testValue(i * 11 + round, 40, &buf));
+    for ([_]u64{ 1000, (1000 + k) / 2, k - 1 }) |p| try expectLookup(t, &ikey(p), tree.testValue(p, 40, &buf));
+    try testing.expect(std.mem.eql(u8, cut.?, vol.ram.bytes));
+}
+
 fn sweepThrough(seam_ctx: *CheckpointSeam) checkpoint_cycle.SweepReport {
     const s = seam_ctx.seam();
     return s.mergeUnderfull(s.ctx, clock.monotonicNs() + 10 * std.time.ns_per_s);

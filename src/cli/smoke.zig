@@ -16454,6 +16454,115 @@ test "smoke: A PUNCH, A ZERO RANGE AND A SAME-SIZE TRUNCATE SURVIVE A POWER CUT 
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+/// The SMO census of one `.stats` document: compactions + splits + root
+/// grows + merges.
+fn smoCensus(st: []const u8) u64 {
+    var n: u64 = 0;
+    for ([_][]const u8{ "\"meta_kv_node_compactions\":", "\"meta_kv_node_splits\":", "\"meta_kv_root_grows\":", "\"meta_kv_node_merges\":" }) |k| n += numberAfter(st, k) orelse 0;
+    return n;
+}
+
+test "smoke: A CHECKPOINT UNDER A DEVICE THAT DROPS ITS WRITES NEVER READS ITS OWN WRITES BACK (xfstests generic/311; charter §5.3 successors build from a frozen snapshot; decision 0003 §CL) — a supervised set over device-mapper slices, a directory of 400 files with 200-byte names synced; dm-flakey drops every write from here (the cut generic/311 stages under the live mount), 1,600 more such names created in the directory — its tree's leaves compact and split inside the cut, in the cadence's ticks — every create answered, then the unmount: no `kv checkpoint tick failed` line, no error line, no tripwire; the working table back, fsck --offline --scrub clean, the remount serves the 400 synced names and none of the cut's, clean unmount, fsck clean (red on 0778bb4: every SMO inside the cut loaded its successor back off the device, read the extent's old bytes and the tick failed `Corrupt`, retried and failed again until the unmount's)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    if (DmErrorSet.flakeyMissing(rig)) |why| return testkit.skipWhy(@src(), why);
+    var dm = try DmErrorSet.up(rig);
+    defer dm.deinit();
+    {
+        const r = try rig.squeezefs(&.{ "format", dm.meta_uri, dm.data_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    try rig.spawnSupervisedOf(dm.meta_uri, &.{});
+    _ = try rig.awaitReady(0);
+    const create =
+        \\mkdir -p d && cd d
+        \\p=$(printf 'n%.0s' $(seq 1 194))
+        \\ok=0 failed=0
+        \\for i in $(seq {d} {d}); do if : > "$p.$i" 2>/dev/null; then ok=$((ok + 1)); else failed=$((failed + 1)); fi; done
+        \\cd .. && sync -f . && echo "created $ok failed $failed listed $(ls d | wc -l)"
+    ;
+    var script: [512]u8 = undefined;
+    {
+        const out = try rig.onMountTimed(try std.fmt.bufPrint(&script, create, .{ 1, 400 }), 120);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("created 400 failed 0 listed 400\n", out);
+    }
+    // The cut: every write dropped from here, the unmount's included.
+    const st0 = try rig.stats();
+    const smo0 = smoCensus(st0);
+    const fails0 = numberAfter(st0, "\"meta_kv_checkpoint_tick_failures\":") orelse 0;
+    gpa.free(st0);
+    const mark = try rig.logLen();
+    try dm.dropWrites(true);
+    {
+        errdefer dm.dropWrites(false) catch {};
+        {
+            const out = try rig.onMountTimed(try std.fmt.bufPrint(&script, create, .{ 401, 2000 }), 120);
+            defer gpa.free(out);
+            std.debug.print("\nsmoke[cut-ticks]: inside the cut: {s}", .{out});
+            try testing.expectEqualStrings("created 1600 failed 0 listed 2000\n", out);
+        }
+        // The cadence's ticks run the directory's SMOs inside the cut.
+        var smo_n: u64 = 0;
+        var fails: u64 = 0;
+        const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+        while (true) {
+            const st = try rig.stats();
+            defer gpa.free(st);
+            smo_n = smoCensus(st) - smo0;
+            fails = (numberAfter(st, "\"meta_kv_checkpoint_tick_failures\":") orelse 0) - fails0;
+            if (smo_n >= 1 or fails >= 1 or clock.monotonicNs() >= deadline) break;
+            sleepMs(200);
+        }
+        std.debug.print("smoke[cut-ticks]: SMOs inside the cut {d}, tick failures {d}\n", .{ smo_n, fails });
+        try testing.expectEqual(@as(u64, 0), fails);
+        try testing.expect(smo_n >= 1);
+        try rig.umount();
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    }
+    try dm.dropWrites(false);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        const ticks = std.mem.count(u8, seg, "kv checkpoint tick failed");
+        const errors = std.mem.count(u8, seg, "error(");
+        if (errors != 0) std.debug.print("--- the cut's alert lines ---\n{s}\n", .{seg});
+        try testing.expectEqual(@as(usize, 0), ticks);
+        try testing.expectEqual(@as(usize, 0), errors);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, seg, "TRIPWIRE"));
+    }
+    try dm.fsckClean("the cut's unmount");
+    const mark2 = try rig.logLen();
+    try rig.spawnSupervisedOf(dm.meta_uri, &.{});
+    _ = try rig.awaitReady(mark2);
+    {
+        const out = try rig.onMountTimed("ls d | wc -l; ls d | grep -c '\\.400$'; ls d | grep -c '\\.401$' || true", 60);
+        defer gpa.free(out);
+        std.debug.print("smoke[cut-ticks]: after the remount (names, the last synced, the first of the cut): {s}", .{out});
+        try testing.expectEqualStrings("400\n1\n0\n", out);
+    }
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try expectMustStayZero(t);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, text[mark2..], "error("));
+    }
+    try dm.fsckClean("the remount's clean unmount");
+}
+
 test "smoke: A HARD LINK, A RENAME AND A DIRECTORY FSYNC IN FRESH GUEST SLOTS SURVIVE A POWER CUT ON A RE-FORMATTED DEVICE (fstests generic/056, 073, 342; charter §5.1 node seqs) — a set over device-mapper slices, 8 rounds, each over an earlier format's long logs (a dozen synced batches of xattr'd files) on the extents the round's first guest roots take, inside one checkpoint period (no cycle names the slots' first roots before the cut): generic/056 (`foo` written and fsync'd, `ln foo foo_link`, a 6000 B xattr on `foo` fsync'd — past the 4 KiB writeback delta, so the slot's root takes a bset before any cycle names it — `bar` touched and fsync'd), generic/342 (`a/foo` written and fsync'd, `mv a/foo a/bar`, a new `a/foo` written and fsync'd) and generic/073's directory fsync (`mv a/bar b/bar`, fsync `a`) — the root's children land in guest slot trees minted on recycled extents → dm-flakey drops every write (the power cut) → the working table → remount: every fsync'd byte and name as before the cut → clean unmount → fsck --offline --scrub clean (the guard of the remount's guest re-mints over recycled extents: on 182eead the harness's generic/056, 057 and 073 failed 5 of 12 runs with [C1] on a guest slot's inode and xattr — the remount re-minted a guest root on the extent its lost root held, under the lost root's seq, because an earlier format's higher stamp there hid the lost one from the residue floor, and the lost frames verified as the new root's own; the alignment that needs — the first re-minted extent's residue topped by a foreign stamp — is the unit row's to pin, this row's rounds re-mint every slot over an earlier format's logs and fsck clean)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

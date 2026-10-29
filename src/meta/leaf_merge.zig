@@ -1094,6 +1094,30 @@ test "stale_writer_revalidates_and_retries_after_a_merge: two underfull leaves m
     try testing.expect(vol.ctx.imagesWritten() >= 1);
 }
 
+test "A MERGE UNDER A DEVICE THAT DROPS ITS WRITES BUILDS OFF RAM (xfstests generic/311 under dm-flakey drop_writes; charter §5.3) — a two-level tree flushed, the cut (every later write acknowledged and dropped), 95 % of the keys deleted and their tombstones appended (dropped), the sweep merges the underfull leaves: every kept key serves, every deleted key stays deleted, the device holds exactly the bytes of the cut (red on 0778bb4: the merge folded both leaves' DEVICE logs, which lack the dropped tombstones — the log-view guard refused Corrupt — and loaded its successor back off the device)" {
+    const gpa = testing.allocator;
+    var vol = try TestVolume.init(gpa, .{});
+    defer vol.deinit();
+    const t = try vol.createTree(.native);
+    var buf: [128]u8 = undefined;
+    var n: u64 = 0;
+    while (try t.rootLevel() < 1) : (n += 1) {
+        try t.insert(&ikey(n), tree.testValue(n, 64, &buf));
+        if (n % 64 == 63) _ = try vol.drain(t);
+        try testing.expect(n < 100_000);
+    }
+    try vol.flushDirty(t);
+    const cut = try gpa.dupe(u8, vol.ram.bytes);
+    defer gpa.free(cut);
+    vol.ram.drop_writes.store(true, .monotonic);
+    for (0..n) |i| if (i % 20 != 0) try t.delete(&ikey(i));
+    try vol.flushDirty(t);
+    const fx = try mergeToFixpoint(&vol, t);
+    try testing.expect(fx.out.merges >= 1);
+    for (0..n) |i| try expectLookup(t, &ikey(i), if (i % 20 == 0) tree.testValue(i, 64, &buf) else null);
+    try testing.expect(std.mem.eql(u8, cut, vol.ram.bytes));
+}
+
 test "fold_equivalence_holds_across_a_merge_storm: three 90 %-delete rounds with reinserts; lookup and range equal a BTreeMap-shaped oracle; the K2 walk holds; leaves shrink" {
     const gpa = testing.allocator;
     const KEYS: u64 = 12_000;

@@ -684,6 +684,102 @@ test "linux: A LESSEE'S ROOT HAS TWO HOMES AND A READER FOLLOWS THE LIVE ONE (ch
     }
 }
 
+/// The block references of `vol_tag` the census of `be` reads (every slot
+/// tree it holds, `rangeRefs`).
+fn refsOf(gpa: std.mem.Allocator, be: *KvBackend, vol_tag: u64) !usize {
+    var kvs: std.ArrayList(tree.KeyValue) = .empty;
+    defer tree.deinitKeyValues(gpa, &kvs);
+    const vr = key.volumeRange(vol_tag);
+    try be.range(gpa, key.TREE_BLOCK_REFS, vr.lo.slice(), vr.hi.slice(), std.math.maxInt(usize), &kvs);
+    return kvs.items.len;
+}
+
+test "linux: THE MANAGER'S REMOUNT BESIDE A LIVE LESSEE HOLDS NONE OF ITS TREES (decision 0003 §CF.1; the writer's half of the reader's two-homes fix): A mints a slot tree holding a block reference and hands the slot to B — the live manager forgets the tree at the grant, its census holds none of B's references; B compacts the root, then deletes the reference; A's remount beside the live B holds the same (no tree of the slot, the reference B deleted counted nowhere — never the grant-time word's stale tree); B compacts on until its pool recycles the grant-time image and the remount still opens (it refused Corrupt: 'slot N's tree root … does not verify')" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "writer-defers-lessee", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    // No cycle by age: the devices move only with the test's cycles.
+    try s.env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "60000");
+    var cut_buf: [192]u8 = undefined;
+    const cut = try std.fmt.bufPrintSentinel(&cut_buf, "{s}.cut", .{s.paths[0]}, 0);
+    defer _ = std.os.linux.unlink(cut.ptr);
+    const ref_vol: u64 = 0x5EED;
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try wire_plane.WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    const slot = try managerRotorSlot(gpa, be0);
+    // A's tree of the slot: an inode and a block reference it owns.
+    try fillSlot(be0, slot, 1, &@as([200]u8, @splat('a')));
+    const ref_key = key.blockRefKey(ref_vol, 42, key.guestLocalIno(slot, try be0.allocateInoInSlot(slot)), 0);
+    {
+        const t = try be0.begin(@src());
+        try t.stagePut(key.TREE_BLOCK_REFS, &ref_key, "r");
+        try be0.commit(t);
+    }
+    try be0.checkpointNow();
+    try testing.expectEqual(@as(usize, 1), try refsOf(gpa, be0, ref_vol));
+    const b = try MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-writer-defers-lessee-b", .endpoint = plane.advertised } });
+    defer b.close();
+    const bj = b.volumes[0];
+    const me = bj.joined.?.appenderId();
+    try testing.expectEqual(acquire.Verbs.OfferResult.offered, try be0.slots.verbs.offerSlot(lt.MANAGER, slot, me, std.math.maxInt(u64)));
+    const sink = bj.slots.carriageSink();
+    sink.offered(sink.ctx, slot, lt.MANAGER);
+    try testing.expect(bj.slots.table.view(slot).leasedBy(me));
+    try bj.checkpointNow();
+    const grant_time = try tree0Root(gpa, be0, slot);
+    // The live manager's posture: the tree is the lessee's from the grant
+    // on — none here, none of its references in this census.
+    try testing.expect(be0.slotTree(slot) == null);
+    try testing.expectEqual(@as(usize, 0), try refsOf(gpa, be0, ref_vol));
+    try testing.expectEqual(@as(usize, 1), try refsOf(gpa, bj, ref_vol));
+    // B moves the root (the grant-time image retires into B's pool, its
+    // bytes intact), then deletes the reference in the moved tree.
+    try compactRootAndCover(bj, slot);
+    {
+        const t = try bj.begin(@src());
+        try t.stageDelete(key.TREE_BLOCK_REFS, &ref_key);
+        try bj.commit(t);
+    }
+    try bj.checkpointNow();
+    try testing.expectEqual(@as(usize, 0), try refsOf(gpa, bj, ref_vol));
+    try testing.expectEqual(grant_time, try tree0Root(gpa, be0, slot));
+    // 1. A's remount (its device cut beside the live B): what the live
+    //    manager holds — no tree of B's slot, B's deleted reference
+    //    nowhere in its census.
+    try backend.snapshotImage(s.paths[0], cut);
+    {
+        const copy = try KvBackend.open(gpa, s.io(), cut, .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .index = 1 });
+        defer copy.close();
+        const held = if (copy.slotTree(slot)) |t| t.rootPtr() else null;
+        const counted = try refsOf(gpa, copy, ref_vol);
+        std.debug.print("\nthe remount beside the live lessee: slot {d}'s tree here {?}, the grant-time root 0x{x} seq {d}; B's root 0x{x} seq {d}; references counted {d} (B holds 0, the live manager 0)\n", .{ slot, held, grant_time.addr, grant_time.seq, bj.slotTree(slot).?.rootPtr().addr, bj.slotTree(slot).?.rootPtr().seq, counted });
+        try testing.expect(held == null);
+        try testing.expectEqual(@as(usize, 0), counted);
+    }
+    // 2. B's pool recycles the grant-time image: tree 0's word now names
+    //    a node under another seq; the remount still opens.
+    var rounds: u32 = 0;
+    while (!bj.alloc.isAllocated(bj.cache.addrExtent(grant_time.addr)) and rounds < 8) : (rounds += 1) try compactRootAndCover(bj, slot);
+    try testing.expect(bj.alloc.isAllocated(bj.cache.addrExtent(grant_time.addr)));
+    try backend.snapshotImage(s.paths[0], cut);
+    {
+        const copy = KvBackend.open(gpa, s.io(), cut, .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .index = 1 }) catch |e| {
+            std.debug.print("the remount refused {s} after B recycled the grant-time image ({d} compaction round(s))\n", .{ @errorName(e), rounds });
+            return e;
+        };
+        defer copy.close();
+        try testing.expect(copy.slotTree(slot) == null);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // THE MOVE MATRIX (0003 §X.1, §X.2): the filesystem over both members — A's
 // and B's planes bound the way `mount` binds them, B's behind the product's

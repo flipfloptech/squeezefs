@@ -102,23 +102,51 @@ fstests_build() {
   echo "xfstests $(cd "$FSTESTS_DIR" && git log -1 --format='%H %cd')" > "$RESULTS/fstests-version.txt"
   # The unprivileged users xfstests' `_require_user` wants.
   local u; for u in fsgqa 123456-fsgqa fsgqa2; do id "$u" >/dev/null 2>&1 || useradd -m "$u"; done
-  # ONE fstests harness per venue: the helper symlinks below and the
-  # venue-wide env file are re-pointed here, under any `check` already
-  # running (2026-10-22: a second harness's mkfs re-pointed the first's
-  # scratch slices during its post-test fsck). Wait for it, bounded.
+}
+
+# A harness from a tree before the host lock takes none: under ours, any
+# `check` running is such a run's — wait for it too, bounded.
+fstests_wait_lockless() {
   local other waited=0
-  while other=$(pgrep -f 'check -R xunit' | grep -vx "$$" | head -1) && [ -n "$other" ]; do
-    [ "$waited" = 0 ] && suite_log "another fstests check (pid $other) is running on this venue; waiting for it (the helpers are venue-wide)"
-    [ "$waited" -lt "${FSTESTS_VENUE_WAIT_S:-900}" ] || suite_die "another fstests check (pid $other) still runs after ${waited}s: one fstests harness per venue"
+  while other=$(pgrep -f 'check -R xunit' | head -1) && [ -n "$other" ]; do
+    [ "$waited" = 0 ] && suite_log "an fstests check (pid $other) of a harness without the host lock runs here; waiting for it"
+    [ "$waited" -lt "${FSTESTS_VENUE_WAIT_S:-900}" ] || suite_die "the fstests check (pid $other) still runs after ${waited}s: one fstests run per host"
     sleep 5; waited=$((waited + 5))
   done
-  # The mount/umount/mkfs/fsck helpers util-linux dispatches to.
+}
+
+# The host state a run re-points (under `suite_host_lock fstests` only): the
+# mount/umount/mkfs/fsck helpers util-linux dispatches to and the venue-wide
+# env file. What stood before is saved and put back at the run's end.
+FSTESTS_HELPERS=(/sbin/mount.fuse.squeezefs /sbin/umount.fuse /sbin/umount.fuse.squeezefs /sbin/mkfs.fuse.squeezefs /sbin/fsck.fuse.squeezefs)
+FSTESTS_HOST_SAVED=""
+fstests_helpers_point() {
+  FSTESTS_HOST_SAVED="$RESULTS/host-saved"
+  mkdir -p "$FSTESTS_HOST_SAVED"
+  local h
+  for h in "${FSTESTS_HELPERS[@]}"; do
+    if [ -L "$h" ]; then readlink "$h" > "$FSTESTS_HOST_SAVED/$(basename "$h").link"; fi
+  done
+  if [ -f /run/squeezefs-suites.env ]; then cp /run/squeezefs-suites.env "$FSTESTS_HOST_SAVED/suites.env"; fi
   ln -sf "$SUITES_DIR/mount.squeezefs" /sbin/mount.fuse.squeezefs
   # umount(8) names its helper by the type's PREFIX: `umount.fuse -t fuse.squeezefs`.
   ln -sf "$SUITES_DIR/mount.squeezefs" /sbin/umount.fuse
   rm -f /sbin/umount.fuse.squeezefs
   ln -sf "$SUITES_DIR/mkfs.squeezefs" /sbin/mkfs.fuse.squeezefs
   ln -sf "$SUITES_DIR/fsck.squeezefs" /sbin/fsck.fuse.squeezefs
+  suite_log "helpers point at this tree ($SUITES_DIR) for the run"
+}
+
+fstests_helpers_restore() {
+  [ -n "$FSTESTS_HOST_SAVED" ] || return 0
+  local h saved
+  for h in "${FSTESTS_HELPERS[@]}"; do
+    saved="$FSTESTS_HOST_SAVED/$(basename "$h").link"
+    if [ -f "$saved" ]; then ln -sfn "$(cat "$saved")" "$h"; else rm -f "$h"; fi
+  done
+  if [ -f "$FSTESTS_HOST_SAVED/suites.env" ]; then cp "$FSTESTS_HOST_SAVED/suites.env" /run/squeezefs-suites.env; else rm -f /run/squeezefs-suites.env; fi
+  FSTESTS_HOST_SAVED=""
+  suite_log "helpers and the venue env file restored to what stood before the run"
 }
 
 # The two sets: TEST (long-lived across the run) and SCRATCH (every test
@@ -332,7 +360,9 @@ fstests_run() {
   # reconfigure": generic/294, 306, 452's `-o remount,ro`); the classic
   # mount(2) applies the flag and ignores the options, as the daemon's
   # contract says. Helpers run the same under either API.
-  (cd "$FSTESTS_DIR" && exec setsid env LIBMOUNT_FORCE_MOUNT2=always FSTESTS_RUN_OWNER=$$ PATH="$SETS/bin:$PATH" "${FSTESTS_CHECK_ENV[@]}" timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}") > "$RESULTS/check-run$n.out" 2>&1 &
+  # The host lock stays the harness's: check and the daemons its mounts
+  # spawn never inherit it.
+  (cd "$FSTESTS_DIR" && exec setsid env LIBMOUNT_FORCE_MOUNT2=always FSTESTS_RUN_OWNER=$$ PATH="$SETS/bin:$PATH" "${FSTESTS_CHECK_ENV[@]}" timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}") {SUITE_HOST_LOCK_FD}>&- > "$RESULTS/check-run$n.out" 2>&1 &
   CHECK_PGID=$!
   # FAIL EARLY (owner ruling 2026-10-17): the first failing test that is not
   # a ledger row ends the pass — that failure is the work; the hours of
@@ -449,14 +479,28 @@ CHECK_PGID=""
 fstests_cleanup() {
   if [ -n "$CHECK_PGID" ]; then kill -KILL -- "-$CHECK_PGID" 2>/dev/null || true; CHECK_PGID=""; fi
   fstests_sysctl_restore
-  [ -n "${SETS:-}" ] || return 0
-  fstests_unmount_all
-  fstests_detach_loops
+  if [ -n "${SETS:-}" ]; then
+    fstests_unmount_all
+    fstests_detach_loops
+  fi
+  fstests_helpers_restore
 }
 
 main() {
   SUITE_CLEANUP_HOOK=fstests_cleanup
   suite_prepare fstests
+  # The whole run under the host lock: config write → check → restore.
+  suite_host_lock fstests "${FSTESTS_VENUE_WAIT_S:-900}"
+  fstests_wait_lockless
+  fstests_helpers_point
+  if [ -n "${FSTESTS_TEST_HOLD_S:-}" ]; then
+    # Test seam (scripts/suites/test-host-lock.sh): hold the run's host state
+    # this long, recording what the helpers point at, then end as a run does.
+    suite_log "hold probe: from $(date +%s%N), mount helper → $(readlink /sbin/mount.fuse.squeezefs)"
+    sleep "$FSTESTS_TEST_HOLD_S"
+    suite_log "hold probe: until $(date +%s%N), mount helper → $(readlink /sbin/mount.fuse.squeezefs)"
+    exit 0
+  fi
   fstests_preload_setup
   fstests_build
   local verdict=0 n

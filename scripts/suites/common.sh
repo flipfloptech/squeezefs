@@ -217,6 +217,27 @@ suite_prepare() {
   trap 'exit 143' TERM INT HUP
 }
 
+# ---- one run per host: the suites whose state is the HOST's -----------------
+# fstests re-points host state for its whole run — the /sbin helpers
+# util-linux dispatches to, /run/squeezefs-suites.env, the shared clone's
+# local.config — so two harnesses that both passed a process-list check
+# re-pointed each other's (a void pass, decision 0003 §CS). The run holds
+# one flock from before its first host write to after its restore: the fd
+# lives until the harness exits, after its EXIT trap; a child that may
+# outlive a step closes it (`{SUITE_HOST_LOCK_FD}>&-`).
+SUITE_HOST_LOCK_FD=""
+suite_host_lock() {
+  local name=$1 wait_s=$2
+  local lock="/run/lock/squeezefs-suite-$name.lock" owner="/run/lock/squeezefs-suite-$name.owner"
+  exec {SUITE_HOST_LOCK_FD}>>"$lock"
+  if ! flock -n "$SUITE_HOST_LOCK_FD"; then
+    suite_log "waiting for suite run by $(cat "$owner" 2>/dev/null || echo "an unnamed holder") — one $name run per host (up to ${wait_s} s)"
+    flock -w "$wait_s" "$SUITE_HOST_LOCK_FD" || suite_die "the $name suite run by $(cat "$owner" 2>/dev/null) still holds the host after ${wait_s} s"
+  fi
+  echo "pid $$ (owner $REPO, results $RESULTS)" > "$owner"
+  suite_log "holding the host's $name lock ($lock)"
+}
+
 # ---- the set: format + mount with the release posture ----------------------
 
 declare -A SUITE_MNT SUITE_META SUITE_PID SUITE_SETDIR

@@ -737,7 +737,9 @@ the trees is in flight while their custody moves):
    by `SmoContext.freePending`), step 7's record is the grant minus the images of every tree this
    process maintains (a live foreign lessee's projection excluded) and minus the held, read in ONE
    SMO-lock window; 7b parks the held extents in the FIFO at ring 0's reservation head; a rollback keeps
-   them allocated; every return is filtered by the record and clears exactly its hits. The SMO lock is
+   them allocated; every return is filtered by the record and clears exactly its hits. A rollback
+   after a slot's step-7 `Unleased` landed keeps that slot's installed tree (0003 §CF.2: the re-run
+   absorbs the slot from tree 0 and installs nothing). The SMO lock is
    held from the first root install to the replay's last record, ring 0's seq floor is raised above
    the dead frontier BEFORE the install (not at 7b: a manager flip stamped below the dead window's
    interior record loses the LWW and routes to a retired image), and the tails/images walks run under

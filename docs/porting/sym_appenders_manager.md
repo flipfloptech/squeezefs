@@ -127,7 +127,11 @@ Decode is total: `len < 2` ⇒ Corrupt; version ≠ 3 ⇒ Corrupt; each variant'
 Semantics the records carry (`D:365-368`): an UNLEASED slot's root lives here; a LEASED slot's LIVE root
 rides the lessee's page, and tree 0's Leased words are the grant-time snapshot a page entry supersedes
 "once written (a newer root seq)" (`SS:60-61`); the page-budget OVERFLOW law rewrites a Leased record
-with the current root (`D:308`, `F:823-829` `note_published_with_cursor`).
+with the current root (`D:308`, `F:823-829` `note_published_with_cursor`). **Port law (0003 §CF.1):** a
+writer's open never opens a tree at a Leased/Releasing word naming ANOTHER appender — the live manager
+forgets the tree at the grant (`forgetTree`), so the remount holds none either; a dead lessee's tree is
+installed by the recovery from its page. Only a `-o ro` reader projects a foreign lessee's tree (at its
+page's root, `2093e40`).
 
 **v4 (port):** keep the port's `routing/slot_state.zig` module as THE codec and grow it behind the
 version — `extern struct` with `[N]u8` LE fields (the port's convention, no alignment padding needed):

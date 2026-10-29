@@ -479,12 +479,13 @@ test "linux: THE MANAGER'S KILL WITH A LIVE LESSEE (charter §5.5 'Extent grants
         while (e < r.start + r.len) : (e += 1) free_named += @intFromBool(!copy.alloc.isAllocated(e));
     }
     try testing.expectEqual(@as(usize, 0), free_named);
-    // The walk's extents: every tree but B's projection.
+    // The walk's extents: every tree the reopened manager holds — none of
+    // B's (decision 0003 §CF.1).
+    try testing.expect(copy.slotTree(slot_of_b) == null);
     var maintained: u64 = 0;
     var extents: std.ArrayList(u64) = .empty;
     defer extents.deinit(gpa);
     for (copy.trees.load()) |tr| {
-        if (tr == copy.slotTree(slot_of_b).?) continue;
         extents.clearRetainingCapacity();
         try copy.collectTreeExtents(tr, &extents);
         maintained += extents.items.len;
@@ -755,9 +756,11 @@ test "linux: THE MANAGER'S REMOUNT BESIDE A LIVE LESSEE HOLDS NONE OF ITS TREES 
     //    manager holds — no tree of B's slot, B's deleted reference
     //    nowhere in its census.
     try backend.snapshotImage(s.paths[0], cut);
+    const deferred0 = backend.stats.writer_foreign_trees_deferred.load();
     {
         const copy = try KvBackend.open(gpa, s.io(), cut, .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .index = 1 });
         defer copy.close();
+        try testing.expectEqual(deferred0 + 1, backend.stats.writer_foreign_trees_deferred.load());
         const held = if (copy.slotTree(slot)) |t| t.rootPtr() else null;
         const counted = try refsOf(gpa, copy, ref_vol);
         std.debug.print("\nthe remount beside the live lessee: slot {d}'s tree here {?}, the grant-time root 0x{x} seq {d}; B's root 0x{x} seq {d}; references counted {d} (B holds 0, the live manager 0)\n", .{ slot, held, grant_time.addr, grant_time.seq, bj.slotTree(slot).?.rootPtr().addr, bj.slotTree(slot).?.rootPtr().seq, counted });
@@ -776,6 +779,7 @@ test "linux: THE MANAGER'S REMOUNT BESIDE A LIVE LESSEE HOLDS NONE OF ITS TREES 
             return e;
         };
         defer copy.close();
+        try testing.expectEqual(deferred0 + 2, backend.stats.writer_foreign_trees_deferred.load());
         try testing.expect(copy.slotTree(slot) == null);
     }
 }

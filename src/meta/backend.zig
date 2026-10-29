@@ -204,6 +204,11 @@ pub const Stats = struct {
     /// page's root was already behind the lessee's live tree (the slot is
     /// read under a token from the lessee).
     reader_foreign_roots_skipped: counters.ShardedCounter = .{},
+    /// A writer's open left a minted slot another appender leases without
+    /// a tree here (decision 0003 §CF.1): the live manager's posture after
+    /// the grant — the lessee's tree is its own, a dead lessee's the
+    /// recovery's to install from its page.
+    writer_foreign_trees_deferred: counters.ShardedCounter = .{},
     /// Journal holes the lane could not cover because the SMO lock was held
     /// (`checkpointPast`): the holder's own cycle covers them.
     hole_covers_smo_held: counters.ShardedCounter = .{},
@@ -2306,10 +2311,9 @@ pub const KvBackend = struct {
         };
         // The pages folded with tree 0 (the two-homes law): a WRITER's open
         // folds appender 0's — the lessee's home of the slots it names, at
-        // least as new as tree 0's grant-time word; a foreign lessee's tree
-        // is its projection at the word, never walked, and its arm and the
-        // recovery install the live root. A READER folds EVERY live page: a
-        // lessee's SMOs move its root and its pool recycles the image the
+        // least as new as tree 0's grant-time word; a slot another appender
+        // leases opens no tree here (below). A READER folds EVERY live page:
+        // a lessee's SMOs move its root and its pool recycles the image the
         // word names, so the word alone is a home the lessee left — and no
         // record of THIS ledger renames it while the lease stands, so no
         // re-point could wait it out. A Live entry at tree 0's generation
@@ -2338,10 +2342,16 @@ pub const KvBackend = struct {
                 return error.Corrupt;
             },
         };
-        // Trees another appender leases (live, or dead until the recovery
-        // installs them): projections here, never walked (§U.1).
-        var projections: std.ArrayList(key.ForestSlot) = .empty;
-        defer projections.deinit(gpa);
+        // A WRITER holds no tree of a slot another appender leases — the
+        // posture the live manager takes at the grant (`forgetTree`): a
+        // live lessee's tree is its own (read under its tokens; its SMOs
+        // move the root and its pool recycles the image tree 0's grant-time
+        // word names, so a tree here would read records the lessee
+        // superseded, feed them to the refs census and the free executor's
+        // durable count, or refuse the mount on a recycled root), and a dead
+        // one's is the recovery's to install from its page.
+        var deferred = std.AutoHashMapUnmanaged(u16, void).empty;
+        defer deferred.deinit(gpa);
         for (roots.items) |r0| {
             var r = r0;
             var stale_since: ?u64 = null;
@@ -2353,10 +2363,15 @@ pub const KvBackend = struct {
                 // identity; a second KvTree over the same nodes would hold a
                 // root pointer no SMO of the native tree ever moves.
                 if (be.mounted.membership_stamp.native_slot == r.slot) break;
+                const foreign = if (r.lessee) |a| a != journal.FIXED_RING_APPENDER else false;
+                if (foreign and !reader) {
+                    try deferred.put(gpa, r.slot, {});
+                    if (r.root.addr != 0) stats.writer_foreign_trees_deferred.inc();
+                    break;
+                }
                 // A granted, never-minted slot owns no extent yet.
                 if (r.root.addr == 0) break;
                 const root: tree.RootPtr = .{ .addr = r.root.addr, .seq = r.root.seq };
-                const foreign = if (r.lessee) |a| a != journal.FIXED_RING_APPENDER else false;
                 var why: ?KvTree.Stale = null;
                 const t = KvTree.openAsReader(gpa, be.cache, .{ .slot = key.guestForestSlot(r.slot) }, root, &be.seq, &why) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -2403,7 +2418,6 @@ pub const KvBackend = struct {
                     },
                 };
                 errdefer t.destroy();
-                if (foreign) try projections.append(gpa, key.guestForestSlot(r.slot));
                 t.seedNodeCount(r.extents);
                 be.seq.raiseTo(root.seq);
                 try be.trees.add(t);
@@ -2412,7 +2426,7 @@ pub const KvBackend = struct {
             }
         }
         // Before the first claim (the mints below).
-        if (recovered) |a| try be.adoptReachableClaims(a, projections.items);
+        if (recovered) |a| try be.adoptReachableClaims(a);
         // Slots the window names without a tree.
         var mentioned = std.AutoHashMapUnmanaged(u16, void).empty;
         defer mentioned.deinit(gpa);
@@ -2429,6 +2443,9 @@ pub const KvBackend = struct {
         var it = mentioned.keyIterator();
         while (it.next()) |slot| {
             if (be.trees.find(.{ .slot = key.guestForestSlot(slot.*) }) != null) continue;
+            // Another appender's slot is never this mount's to mint: its
+            // tree is the lessee's (or the recovery's).
+            if (deferred.contains(slot.*)) continue;
             // A re-mint's records are the replayed window's: its floor is the window's start.
             (try be.mintGuestTree(slot.*)).setRootFloor(be.core.reusableUpto());
         }
@@ -2448,18 +2465,16 @@ pub const KvBackend = struct {
     /// without a leaf's (`rung-10-routing-loop.md`). Cost: one read per
     /// interior node of every tree, leaves never read (their parents name
     /// them) — the walk's extents and wall are `meta_kv_mount_reach_walk_*`.
-    /// `projections`: the forest slots another appender leases — skipped
-    /// (§U.1: a lessee's tree is its lessee's to judge; its extents sit in
-    /// that lessee's grant, whose bits the grant's entry journals, and the
-    /// handover's cycle lands a holder's claims before the grant's entry
-    /// moves its images).
-    fn adoptReachableClaims(be: *KvBackend, alloc: *alloc_ext.ExtentAllocator, projections: []const key.ForestSlot) OpenError!void {
+    /// No tree another appender leases is open here (`openGuestTrees`
+    /// defers it, §U.1: its extents sit in that lessee's grant, whose bits
+    /// the grant's entry journals, and the handover's cycle lands a
+    /// holder's claims before the grant's entry moves its images).
+    fn adoptReachableClaims(be: *KvBackend, alloc: *alloc_ext.ExtentAllocator) OpenError!void {
         const t0 = clock.monotonicNs();
         var extents: std.ArrayList(u64) = .empty;
         defer extents.deinit(be.gpa);
         var walked: u64 = 0;
         for (be.trees.load()) |t| {
-            if (t.forest_slot) |fs| if (std.mem.indexOfScalar(key.ForestSlot, projections, fs) != null) continue;
             extents.clearRetainingCapacity();
             be.collectTreeExtents(t, &extents) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,

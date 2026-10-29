@@ -63,7 +63,8 @@ pub const decode = cr.SlotStateWire.decode;
 /// leased but never minted has no root yet (`root.addr == 0`).
 /// `lessee`: the appender whose page the root was adopted from, else the
 /// one a `leased` / `releasing` record names (null when unleased) —
-/// another appender's tree is a projection to this mount.
+/// another appender's tree is a projection to a reader and no tree at all
+/// to a writer's open (decision 0003 §CF.1).
 pub const GuestRoot = struct { slot: u16, root: Root, cursor: u64, extents: u64, lessee: ?u32 };
 
 pub const FoldError = error{ Corrupt, Conflict, OutOfMemory };

@@ -154,7 +154,8 @@ squeezefs mount -o interception --daemon --log-file … --supervise sqmeta://…
 LD_PRELOAD=$PWD/zig-out/lib/libsqueezefs_il.so your-application /mnt/sqz/…
 ```
 
-The shim finds the mount by itself and pairs only with a daemon of the same build. `-o
+The shim finds the mount by itself and pairs only with a daemon of the same build. FIEMAP (`filefrag`,
+`xfs_io fiemap`) is answered for preloaded programs. `-o
 interception=direct` additionally lets a trusted client (one that may open the data devices) read
 striped files from the devices directly. The C SDK (`zig build sdk`, `include/squeezefs_sdk.h`) offers
 the same path to programs you can link.

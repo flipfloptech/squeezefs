@@ -192,6 +192,15 @@ the design table (`R:docs/design-preload-interception.md:151`) but not interpose
 
 ### 1.12 libaio: `io_setup`, `io_destroy`, `io_submit`, `io_getevents`, `io_pgetevents`, `io_cancel` — §6; plus libaio's queue face `io_queue_init`, `io_queue_release`, `io_queue_run`, `io_queue_wait` (§6.9; the port's addition — the reference's 59 did not include it).
 
+### 1.12a `ioctl` — `FS_IOC_FIEMAP` alone (the port's addition, decision 0003 §CJ)
+
+Linux answers FIEMAP for a FUSE file in the VFS (EOPNOTSUPP), so the shim is the only place it can be
+served: a request whose `u32` is `FS_IOC_FIEMAP` on a regular file of an interception mount rides the
+IPC verb `FiemapReq` (`src/ipc/fiemap_verb.zig`, the fd attached); every other request, and FIEMAP on
+any other fd, is the real call. glibc exports `ioctl` alone on x86_64/aarch64 (`__ioctl_time64` is a
+32-bit time64 symbol). Copies are `ioctl_fiemap`'s: `process_vm_readv/writev` on the process itself,
+the header written back on an error too.
+
 ### 1.13 NOT interposed (kernel FUSE serves them; the fallback IS the design)
 
 `fsync`, `fdatasync`, `fstat*`, `ftruncate`, `fallocate`, `posix_fadvise`, `munmap`, `fork`/

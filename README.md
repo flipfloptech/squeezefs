@@ -31,7 +31,8 @@ shared-disk model.
   optional lz4/zstd compression and AES-256-GCM or ChaCha20-Poly1305 encryption, set at format.
 - **A bypass for the fast lane.** An `LD_PRELOAD` interposer (`libsqueezefs_il.so`) and a C SDK
   (`libsqueezefs_sdk`, `include/squeezefs_sdk.h`) move data operations over a shared-memory ring to the
-  daemon, skipping the kernel FUSE round trip.
+  daemon, skipping the kernel FUSE round trip. FIEMAP (`filefrag`, `xfs_io fiemap`) is answered for
+  preloaded programs.
 
 ## Status
 

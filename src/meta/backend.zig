@@ -1608,6 +1608,20 @@ pub const KvBackend = struct {
         try be.openControlProjection();
     }
 
+    /// The wedge census's line for this volume (the watchdog's thread,
+    /// while FUSE ops are overdue): the conveyor's pass and committers, the
+    /// journal lane's stage B, the checkpoint side's step — the state that
+    /// names the wait a wedged volume sits in. Atomics and the registry's
+    /// spin-locked words only, so it renders whatever is parked.
+    pub fn writeCensus(be: *KvBackend, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("meta census: volume {s}: ", .{be.path});
+        try be.cv.writeCensus(w);
+        try w.writeAll("; ");
+        try be.lane.writeCensus(w);
+        try w.print("; SMO structural slot {s}; ", .{if (be.smo_journal.tail_busy.load(.monotonic)) "held" else "free"});
+        try be.cp.writeCensus(w);
+    }
+
     /// The R5 component over THIS backend's live node cache (`kv_node_cache`:
     /// floor 64 MiB, weight 1, shed = a checkpoint kick). Registered through
     /// the backend, never the cache: `be.cache` is replaced by a joiner's
@@ -3735,6 +3749,35 @@ test "the block-map-tree ratchet: a fresh format carries no bit; the first stamp
         try testing.expectEqual(gen + 1, be.sb_generation);
         be.close();
     }
+}
+
+test "the wedge census (the watchdog's per-volume line): it names the conveyor's leader and pass site, the committers queued / building / parked, the windows and tail members in flight, the ring's and the registry's watermarks, stage B, the SMO structural slot and the checkpoint step with its record — a quiet volume after a commit and a cycle holds nothing open" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "census", null);
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    _ = try commitCreate(be, "c0");
+    try be.checkpointNow();
+    // The pass leaves its leadership, then its site: wait for the site
+    // (the observable), bounded so a regression fails instead of hanging.
+    be.cv.quiesce();
+    const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (be.cv.pass_site.load(.monotonic) != .idle) {
+        if (clock.monotonicNs() > deadline) return error.TestPassNeverIdle;
+        std.Thread.yield() catch {};
+    }
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try be.writeCensus(&w);
+    const line = w.buffered();
+    for ([_][]const u8{ "meta census: volume ", "leader=false pass=idle ", "queued=0 building=0 parked=0 room_waiters=0", "windows=0 tail_members=0 resident_waiters=0", "open=0 ", "; stage-B ", "; SMO structural slot free; ", "checkpoint ", " seq=" }) |needle| {
+        if (std.mem.indexOf(u8, line, needle) == null) {
+            std.debug.print("census line: {s}\nmissing: {s}\n", .{ line, needle });
+            return error.TestCensusMissing;
+        }
+    }
+    try testing.expect(std.mem.indexOf(u8, line, "oldest open") == null);
 }
 
 test "the D4 faces on a device-backed volume: one xattr band rewritten across checkpoints leaves a leaf mostly dead → `defragNudgeCompactions(8)` compacts it (≥ 1, every value current); a tree grown to many leaves then emptied by deletes → `defragMergeLap` merges (≥ 1) and a second lap finds nothing; both under the SMO lock, the cadence task live" {

@@ -715,6 +715,13 @@ pub const JournalLane = struct {
     durable_floor: std.atomic.Value(u64) = .init(0),
     /// The stage-B fiber and the group that joins it at shutdown.
     fiber: ?*Fiber = null,
+    /// Stage B's state as its fiber last parked (`writeCensus`): the
+    /// phase, the windows pending, the group's prefix target, the runs on
+    /// the device — mirrored once per poll for the watchdog's census.
+    census_phase: std.atomic.Value(Phase) = .init(.idle),
+    census_pending: std.atomic.Value(u32) = .init(0),
+    census_prefix_target: std.atomic.Value(u64) = .init(0),
+    census_runs: std.atomic.Value(u32) = .init(0),
     group: Io.Group = .init,
     /// The wait route (`routeWaits`): the executor's futex face every
     /// off-lane ticket waiter parks through and the lane's deliver wakes
@@ -1000,6 +1007,18 @@ pub const JournalLane = struct {
     /// returns to allocation only once the record that freed it is).
     pub fn durableFloor(self: *const JournalLane) u64 {
         return self.durable_floor.load(.acquire);
+    }
+
+    /// The census's stage-B half (any thread): the phase its fiber last
+    /// parked in, the windows pending, the group's prefix target, the runs
+    /// still on the device.
+    pub fn writeCensus(self: *const JournalLane, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("stage-B {t} pending={d} prefix_target={d} runs={d}", .{
+            self.census_phase.load(.monotonic),
+            self.census_pending.load(.monotonic),
+            self.census_prefix_target.load(.monotonic),
+            self.census_runs.load(.monotonic),
+        });
     }
 
     /// Wake the stage-B fiber without a message: the contract of every
@@ -1429,6 +1448,10 @@ pub const JournalLane = struct {
             self.maybeStartCoalescedBarrier(now);
             if (w.disconnected and !w.owesWork()) return;
             now = clock.monotonicNs();
+            self.census_phase.store(w.phase, .monotonic);
+            self.census_pending.store(@intCast(w.pending.items.len), .monotonic);
+            self.census_prefix_target.store(w.prefix_target, .monotonic);
+            self.census_runs.store(@intCast(w.runs_in_flight), .monotonic);
             const tick = w.tickFor(now);
             if (tick) |t| self.lane.timers.arm(f, now + t);
             f.park();
@@ -1818,7 +1841,7 @@ const Run = struct {
     bounce: ?uring_fs.AlignedBuf,
 };
 
-const Phase = enum { idle, prefix, want_barrier, barrier, ack };
+const Phase = enum(u8) { idle, prefix, want_barrier, barrier, ack };
 const BarrierKind = enum { strict_group, coalesced };
 
 /// Stage B's state: slot table, the pending windows in journal order, the

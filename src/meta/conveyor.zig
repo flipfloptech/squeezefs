@@ -1801,6 +1801,20 @@ pub const Conveyor = struct {
     /// a drain notifies `room` only while the count is non-zero (one
     /// relaxed load per drain otherwise).
     room_waiters: std.atomic.Value(u32) = .init(0),
+    /// The wedge census's words (`writeCensus`): where the pass stands and
+    /// since when it waits there, and the committers inside `build` — read
+    /// from the watchdog's thread while the volume may be wedged
+    /// (monotonic: a census line, never a protocol input).
+    pass_site: std.atomic.Value(PassSite) = .init(.idle),
+    pass_site_ns: std.atomic.Value(u64) = .init(0),
+    /// Inside the ring admission's park, the call the pass is in (the
+    /// census tells a park that never iterates — the 30 s escalation line
+    /// absent — from one that waits on the ring).
+    admission_step: std.atomic.Value(AdmissionStep) = .init(.try_admit),
+    /// Sharded (every committer passes `build`): their difference is the
+    /// committers inside it — the door, the heap admission.
+    build_enters: counters.ShardedCounter = .{},
+    build_exits: counters.ShardedCounter = .{},
     room: sync.Notify = .init,
     /// §BX: answers parked for the resident prefix, each on its own frame
     /// (`ResidentWaiter`); every move of it (the registry's hook) and every
@@ -2059,6 +2073,8 @@ pub const Conveyor = struct {
     }
 
     fn build(self: *Conveyor, t: *tx.KvTx, done: *Done) Error!Queued {
+        self.build_enters.inc();
+        defer self.build_exits.inc();
         if (self.isClosing()) {
             t.deinit();
             return error.VolumeClosed;
@@ -2380,11 +2396,13 @@ pub const Conveyor = struct {
     /// un-issued in the lane's inbox until the window gate parked it (§BW).
     pub fn pass(self: *Conveyor) void {
         self.pass_thread.store(@intCast(std.Thread.getCurrentId()), .release);
+        defer self.atSite(.idle);
         while (true) {
             {
                 // The growth gate before the pass's first read of the ring
                 // (the caps at the drain, the geometry and the head at the
                 // hold): a growth swaps them only while no pass is inside.
+                self.pass_site.store(.running, .monotonic);
                 if (self.deps.growth_gate) |g| g.enter(g.ctx);
                 defer if (self.deps.growth_gate) |g| g.leave(g.ctx);
                 const batch = self.drain(self.passCaps(), self.batch_buf);
@@ -2399,8 +2417,65 @@ pub const Conveyor = struct {
             // without a turn, a stale non-zero one turn.
             if (self.stats.queued.load() != 0) if (self.deps.pass.yield) |y| {
                 self.stats.pass_yields.inc();
+                self.atSite(.yield);
                 y(self.deps.pass.ctx);
+                self.pass_site.store(.running, .monotonic);
             };
+        }
+    }
+
+    /// Where the pass stands (the wedge census): idle (no pass), running
+    /// between waits, or the wait it parks in — entered on the wait's slow
+    /// path only, so the hot path takes no clock.
+    pub const PassSite = enum(u8) { idle, running, hold, window_gate, tail_gate, recall, admission, yield };
+    pub const AdmissionStep = enum(u8) { try_admit, kick, wait };
+
+    fn atSite(self: *Conveyor, s: PassSite) void {
+        self.pass_site_ns.store(clock.monotonicNs(), .monotonic);
+        self.pass_site.store(s, .monotonic);
+    }
+
+    /// One census line's worth of this conveyor's state (the watchdog's
+    /// wedge census, any thread): the leader latch, the pass's site and its
+    /// age, the committers queued / building / parked, the windows and
+    /// tail members in flight, the parked answers, and the ring's and the
+    /// registry's watermarks — what names the wait a wedged volume sits in.
+    pub fn writeCensus(self: *Conveyor, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const reg = self.deps.reg;
+        const site = self.pass_site.load(.monotonic);
+        try w.print("leader={} pass={t}", .{ self.core.leader.load(.seq_cst), site });
+        if (site != .running) try w.print(" {d} ms", .{(clock.monotonicNs() -| self.pass_site_ns.load(.monotonic)) / std.time.ns_per_ms});
+        if (site == .admission) try w.print(" (step {t})", .{self.admission_step.load(.monotonic)});
+        // The queue's `Io.Mutex` (the drain's and every enqueue's; its wait
+        // has no tick): `unlocked` under a pass that never moves is a wake
+        // the futex lost.
+        try w.print(", queue mutex {t}", .{self.core.mutex.state.load(.monotonic)});
+        try w.print(", queued={d} building={d} parked={d} room_waiters={d}, windows={d} tail_members={d} resident_waiters={d}; ring head={d} reusable={d}, open={d} completed_upto={d} resident_upto={d}", .{
+            self.stats.queued.load(),
+            self.build_enters.load() -| self.build_exits.load(),
+            self.stats.commit_parked.load(),
+            self.room_waiters.load(.monotonic),
+            self.windowsInflight(),
+            self.tail_members.load(.monotonic),
+            self.resident_waiters.load(.monotonic),
+            self.deps.core.headPos(),
+            self.deps.core.reusableUpto(),
+            reg.openCount(),
+            reg.completedUpto(),
+            reg.residentUpto(),
+        });
+        // The oldest open reservation names who holds both prefixes: a
+        // window (its turns, claims and applies) or an entry no window
+        // holds (an SMO's, a control record's, a compensation's). Read under
+        // the tracker's lock: a tracked window is alive until it untracks.
+        const oldest = reg.minInflightStart();
+        if (oldest == std.math.maxInt(u64)) return;
+        self.inflight_lock.lock();
+        defer self.inflight_lock.unlock();
+        if (self.inflight.get(oldest)) |win| {
+            try w.print("; oldest open {d}: a window of {d} (claimed {d}, pending {d}, {t})", .{ oldest, win.members.len, win.claimed_prefix.load(.monotonic), win.pending.load(.monotonic), win.helpable.load(.monotonic) });
+        } else {
+            try w.print("; oldest open {d}: no window (an SMO, control or compensation entry)", .{oldest});
         }
     }
 
@@ -2453,6 +2528,8 @@ pub const Conveyor = struct {
             }
             self.stats.holds_pacing.inc();
             const t0 = clock.monotonicNs();
+            self.atSite(.hold);
+            defer self.pass_site.store(.running, .monotonic);
             switch (n.waitUntilUncancelable(io, t0 + bound)) {
                 .deadline => self.stats.hold_deadlines.inc(),
                 .notified => self.stats.hold_landings.inc(),
@@ -2491,6 +2568,8 @@ pub const Conveyor = struct {
         self.stats.holds.inc();
         const t0 = clock.monotonicNs();
         const deadline = t0 + bound;
+        self.atSite(.hold);
+        defer self.pass_site.store(.running, .monotonic);
         // ONE landing ends the hold (§AW): in the paced regime it is the
         // flight's emptying, as before; in the pipelined regime — the
         // appliers keep several windows in flight — it is the next window's
@@ -2547,6 +2626,8 @@ pub const Conveyor = struct {
         const cap = windowCap(self.deps.lane.window_cells);
         if (self.windowsInflight() < cap) return;
         self.stats.window_gate_parks.inc();
+        self.atSite(.window_gate);
+        defer self.pass_site.store(.running, .monotonic);
         const io = self.deps.io;
         while (true) {
             var n = self.landed.notified();
@@ -2591,6 +2672,8 @@ pub const Conveyor = struct {
         const cap = t.slots(t.ctx);
         if (self.tail_members.load(.acquire) + n <= cap) return;
         self.stats.tail_gate_parks.inc();
+        self.atSite(.tail_gate);
+        defer self.pass_site.store(.running, .monotonic);
         const io = self.deps.io;
         while (true) {
             var w = self.tail_freed.notified();
@@ -2759,6 +2842,8 @@ pub const Conveyor = struct {
         if (core.tryAdmit(len, .user)) |a| return a;
         // ONE stall per park entry, however many wakes and ticks it spans.
         self.stats.full_stalls.inc();
+        self.atSite(.admission);
+        defer self.pass_site.store(.running, .monotonic);
         var since = clock.monotonicNs();
         // The waiter node is kept across a TICK-ended wait (it stays
         // registered, unlinked), so the next `enable` answers whether a wake
@@ -2767,6 +2852,7 @@ pub const Conveyor = struct {
         var n = self.deps.checkpoint.space.notified();
         var ticked = false;
         while (true) {
+            self.admission_step.store(.try_admit, .monotonic);
             const woken = n.enable(io);
             if (core.tryAdmit(len, .user)) |a| {
                 n.cancel(io);
@@ -2781,7 +2867,9 @@ pub const Conveyor = struct {
                 err.* = if (self.deps.latch.isRetired()) error.Deferred else if (self.deps.latch.isFailed()) error.VolumeFailed else error.VolumeClosed;
                 return null;
             }
+            self.admission_step.store(.kick, .monotonic);
             self.deps.checkpoint.kickPark(self.deps.checkpoint.ctx);
+            self.admission_step.store(.wait, .monotonic);
             while (test_seams.hold_at_park.load(.acquire) != 0) {
                 test_seams.park_held.store(1, .release);
                 std.Thread.yield() catch std.atomic.spinLoopHint();
@@ -2918,6 +3006,8 @@ pub const Conveyor = struct {
             }
             token_union = u.finish();
             const t_recall = clock.monotonicNs();
+            self.atSite(.recall);
+            defer self.pass_site.store(.running, .monotonic);
             hook.recall(hook.ctx, token_union, .{ .notes = notes.items, .unnamed = unnamed }) catch {
                 self.failBatch(members.items, error.OutOfMemory);
                 return;

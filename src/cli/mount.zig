@@ -243,6 +243,26 @@ const Ctx = struct {
     }
 };
 
+/// The watchdog's census hook (`watchdog.CensusHook`): the transport's
+/// worker census, then the metadata set's per-member census.
+const WedgeCensus = struct {
+    session: *Session,
+    set: *meta_set.MetaSet,
+
+    fn hook(self: *WedgeCensus) watchdog.CensusHook {
+        return .{ .ctx = self, .call = &call };
+    }
+
+    fn call(ctx: *anyopaque) void {
+        const self: *WedgeCensus = @ptrCast(@alignCast(ctx));
+        Session.logWorkerCensus(self.session);
+        // The executor's lost-wake absorbers: a park the scheduler itself
+        // never woke shows here first.
+        log.err("exec census: exec_lane_tick_rescues={d} exec_driven_owner_queued_parks={d}", .{ exec.stats.lane_tick_rescues.load(), exec.stats.driven_owner_queued_parks.load() });
+        self.set.logCensus();
+    }
+};
+
 fn onSessionShutdown(ctx_ptr: *anyopaque) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
     // release pairs with the serve loop's acquire after the eventfd wake.
@@ -782,8 +802,10 @@ fn mountMain(ctx: *Ctx) u8 {
     // deadline would end this mount — the timeout the kernel applies (the
     // one asked for, seam included, when it applies none) less a check.
     plane.wp.setStallAnswerNs(fuse_geometry.stallAnswerNs(fuse_geometry.resolveRequestTimeoutS(fuse_geometry.requestTimeoutOverride(env), fuse_geometry.requestTimeoutS(lattice_t_owner_ms, lattice_park_max_ms)), session.requestTimeoutS()));
-    // The wedge census names the drain workers' state while the session stands.
-    registry.setCensusHook(session.censusHook());
+    // The wedge census names the drain workers' state while the session
+    // stands, then every metadata member's conveyor, stage B and checkpoint.
+    var census: WedgeCensus = .{ .session = session, .set = be };
+    registry.setCensusHook(census.hook());
     defer registry.setCensusHook(null);
     // The sideband never `inode_lock`s a directory this daemon owes a reply
     // on (decision 0003 §AB.2): it judges every `INVAL_ENTRY`'s parent

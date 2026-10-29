@@ -775,6 +775,22 @@ pub const MetaSet = struct {
         return s;
     }
 
+    /// The wedge census's metadata half: one line per member
+    /// (`KvBackend.writeCensus`), logged after the worker census. A reader
+    /// runs no conveyor, lane or checkpointer.
+    pub fn logCensus(self: *MetaSet) void {
+        if (self.posture == .reader) return;
+        for (self.volumes, 0..) |_, i| {
+            // Acquire: pairs with `publishSuccessors`' release store (a
+            // retired incarnation stays mapped until `close`).
+            const be = @atomicLoad(*KvBackend, &self.volumes[i], .acquire);
+            var buf: [1024]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            be.writeCensus(&w) catch {};
+            log.err("{s}", .{w.buffered()});
+        }
+    }
+
     pub fn isFailed(self: *const MetaSet) bool {
         for (self.volumes) |be| if (be.isFailed()) return true;
         return false;

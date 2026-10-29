@@ -1713,10 +1713,6 @@ pub const Session = struct {
         if (named == 0) log.err("worker census: no drain worker holds a fiber, owes a reply or stands inside a pass", .{});
     }
 
-    pub fn censusHook(self: *Session) watchdog.CensusHook {
-        return .{ .ctx = self, .call = &logWorkerCensus };
-    }
-
     /// The probes and the lattice decision (ONCE per mount): the mainline
     /// pool by the INIT offer's bit 43 (or the test seam), kmbuf by the
     /// opcode ladder on a scratch ring, zc by `CapEff` + the sparse table,

@@ -549,6 +549,33 @@ pub const Checkpointer = struct {
     /// deferral in a row leaves it to the cadence's flush pass (no spin).
     reserve_deferred_addr: ?u64 = null,
 
+    // ---- the wedge census ----
+    /// The step the checkpoint side stands in and since when (`writeCensus`;
+    /// monotonic: a census line read from any thread, never a protocol input).
+    stage: std.atomic.Value(Stage) = .init(.waiting),
+    stage_ns: std.atomic.Value(u64) = .init(0),
+
+    /// The wedge census's steps: the task's wait and its SMO-lock take, the
+    /// decision, the threshold drain, and the cycle's C-steps.
+    pub const Stage = enum(u8) { waiting, serial, decide, drain, collect, flush, publish_roots, pages, barrier, record, appender_pages, final_barrier, sweep };
+
+    fn enterStage(self: *Checkpointer, s: Stage) void {
+        self.stage.store(s, .monotonic);
+        self.stage_ns.store(clock.monotonicNs(), .monotonic);
+    }
+
+    /// The census's checkpoint half: the step and its age, the last
+    /// record's seq and tail.
+    pub fn writeCensus(self: *const Checkpointer, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const since = self.stage_ns.load(.monotonic);
+        try w.print("checkpoint {t} {d} ms, seq={d} tail={d}", .{
+            self.stage.load(.monotonic),
+            if (since == 0) 0 else (clock.monotonicNs() -| since) / std.time.ns_per_ms,
+            self.checkpointSeq(),
+            self.lastLedgerTail(),
+        });
+    }
+
     pub fn init(gpa: Allocator, cfg: Config, deps: Deps) Checkpointer {
         // The record needs ONE durable home: the ledger slot or the page.
         std.debug.assert(deps.ledger != null or deps.record.appenderPages != null);
@@ -845,6 +872,7 @@ pub const Checkpointer = struct {
 
         // ---- C2: the dirty set. Every leaf dirtied from here is the NEXT
         // cycle's, so the cadence measures its interval from this instant.
+        self.enterStage(.collect);
         var dirty: std.ArrayList(*CachedNode) = .empty;
         defer {
             for (dirty.items) |n| n.release();
@@ -859,6 +887,7 @@ pub const Checkpointer = struct {
         const t_collected = clock.monotonicNs();
 
         // ---- C4: the flush pass.
+        self.enterStage(.flush);
         var sample: ckpt.FlushPassSample = .{};
         var deferred_for_space: u64 = 0;
         var deferred_for_grant: u64 = 0;
@@ -892,6 +921,7 @@ pub const Checkpointer = struct {
         // movers; the task serializes them) and BEFORE the tail rule, so
         // the entries sit inside the window the record names and tree 0's
         // dirty leaf floor clamps the tail under them.
+        self.enterStage(.publish_roots);
         try self.deps.record.publishGuestRoots(self.deps.record.ctx);
         const t_flushed = clock.monotonicNs();
 
@@ -903,6 +933,7 @@ pub const Checkpointer = struct {
         // ---- C6: the dirty bitmap pages at this checkpoint's generation —
         // on the device before the record that names it.
         const ckpt_seq = self.checkpoint_seq.load(.acquire) + 1;
+        self.enterStage(.pages);
         try self.writeDirtyPages(ckpt_seq);
         if (self.deps.record.dataPages) |f| try f(self.deps.record.ctx, ckpt_seq);
         const t_pages = clock.monotonicNs();
@@ -910,6 +941,7 @@ pub const Checkpointer = struct {
         // ---- C7: barrier #1. A failure counts toward the lattice and aborts
         // the cycle before its record; the appended bytes stay on the device
         // and the next cycle's barrier covers them before ITS record.
+        self.enterStage(.barrier);
         try self.syncDevice();
         const landed_ns = clock.monotonicNs();
         self.noteCheckpointBarrier(landed_ns -| t_pages);
@@ -929,6 +961,7 @@ pub const Checkpointer = struct {
 
         // ---- C9: the record. Node-seq watermark captured AFTER the flush
         // loop (whose SMOs mint).
+        self.enterStage(.record);
         var roots: std.ArrayList(TreeRoot) = .empty;
         defer roots.deinit(gpa);
         self.deps.record.treeRoots(self.deps.record.ctx, gpa, &roots) catch |e| {
@@ -972,11 +1005,13 @@ pub const Checkpointer = struct {
         ckpt.stats.meta_kv_checkpoints.inc();
         // C11: the appender pages (the record is authoritative; a page that
         // fails to land is one cycle stale and the next cycle rewrites it).
+        self.enterStage(.appender_pages);
         if (self.deps.ledger != null) if (self.deps.record.appenderPages) |f| try f(self.deps.record.ctx, &record, cache_clean);
         const t_ledger = clock.monotonicNs();
 
         // ---- C12: make THIS record durable now and judge progress.
         if (barrier_now) {
+            self.enterStage(.final_barrier);
             try self.syncDevice();
             try self.wedgedTailAudit(.{
                 .pending_before = pending_before,
@@ -988,6 +1023,7 @@ pub const Checkpointer = struct {
             });
         }
         // ---- C13: the heap-full sweep, after the barrier.
+        self.enterStage(.sweep);
         if (self.posture.isFull() or self.merge_backlog) self.mergeSweepArm();
         const t_end = clock.monotonicNs();
         tape.tail_ns = t_tail - landed_ns;
@@ -1181,6 +1217,7 @@ pub const Checkpointer = struct {
     /// cycle and retries the item once; a `NoSpace` deferral latches the
     /// posture and leaves the node to the cadence's flush pass.
     pub fn drainMaintenance(self: *Checkpointer, budget_in: DrainBudget) CycleError!void {
+        self.enterStage(.drain);
         const src = self.deps.maintenance;
         var budget = budget_in;
         var sample: ckpt.FlushPassSample = .{};
@@ -1252,6 +1289,7 @@ pub const Checkpointer = struct {
     /// iterates to the fixpoint (`tail == head ∧ no dirty pages`: an empty
     /// replay window).
     pub fn tick(self: *Checkpointer, final_cycle: bool, drain_deadline_ns: ?u64, park_kick: bool, tick_ms: u64) CycleError!void {
+        self.enterStage(.decide);
         if (final_cycle) self.checkHeadStable();
         var decided_at = clock.monotonicNs();
         var decision: ?Decision = if (final_cycle) null else self.decide(decided_at, park_kick, false);
@@ -1420,9 +1458,11 @@ pub const CheckpointTask = struct {
         _ = thread_name.nameCurrentThread(&name, "sqz-ckpt");
         self.next_tick_ns = clock.monotonicNs() + self.period_ns;
         while (true) {
+            self.cp.enterStage(.waiting);
             var w = self.wake.notified();
             const woke = w.waitUntilUncancelable(self.io, self.next_tick_ns) == .notified;
             const more = blk: {
+                self.cp.enterStage(.serial);
                 if (self.serial) |m| m.lockUncancelable(self.io);
                 defer if (self.serial) |m| m.unlock(self.io);
                 break :blk self.runOnce(woke, clock.monotonicNs());

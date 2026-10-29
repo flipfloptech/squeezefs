@@ -603,7 +603,7 @@ pub fn syncfs(ctx: Ctx, gpa: Allocator, io: Io, prof: *SyncfsProf) Error!void {
     // write cache's law); any kept is a syncfs that cannot be acked — EIO
     // for a decline, ENOSPC when every kept one was the store's refusal.
     if (ctx.staged_segment) |seg| {
-        const kept = try staging.promoteAllAtSyncfs(gpa, seg, ctx.promotion);
+        const kept = try staging.promoteAllAtSyncfs(gpa, io, seg, ctx.promotion);
         stats.fsync_promote_refusals.add(kept.declined);
         stats.fsync_promote_enospc.add(kept.no_space);
         if (kept.declined != 0) return error.InputOutput;

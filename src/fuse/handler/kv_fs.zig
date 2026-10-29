@@ -305,6 +305,10 @@ pub var fuse_write_promotions_to_striped: counters.ShardedCounter = .{};
 /// own-block arm instead of answering ENOSPC — the ring is a cache, never
 /// the set's capacity (rung 9: the fsstress 20-writer burst).
 pub var fuse_write_staged_ring_full_own_block: counters.ShardedCounter = .{};
+/// `fuse_write_staged_ring_full_inline`: small writes (an inline file's,
+/// ending within `inline_max`) the ring refused that took the INLINE arm —
+/// the record holds them, as on a mount without a write cache.
+pub var fuse_write_staged_ring_full_inline: counters.ShardedCounter = .{};
 /// `fuse_write_staged_store_full_refusals`: staged-arm writes answered
 /// ENOSPC before staging because the STORE's free bytes no longer cover
 /// the write cache's residents plus the image (`DataPlane.writeCacheAdmits`
@@ -4119,14 +4123,30 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 fuse_write_foreign_striped.inc();
                 return self.writeStriped(c, local, a, rec, kind, end, &layout_lock);
             }
-            if (kind == .inline_ and end <= self.inline_max) return self.writeInline(c, local, a, rec, end, &layout_lock);
+            // A small write takes the WRITE CACHE where the mount holds one
+            // (decision 0003 §CD, the owner's ruling "small files should go
+            // through the write cache"): acked from RAM like every staged
+            // write, its payload never journaled — the promotion places it
+            // in a tenant's slot. A mount without one keeps the inline arm,
+            // and so does a RECORD-SIZED file (`layout.inlineRecordMax`):
+            // its promotion would land it in the record anyway, so the
+            // cache could only add a transaction and a ring record.
             // The staged arm rings the WHOLE file: its bound is the file's
             // reach — `max(size, end)` — never the write's end alone (a
             // file grown past the block by truncate rang a 5 MiB image no
             // promotion could place: fstests generic/030, fsstress). A
             // striped file never takes the arm: its reach is not read.
-            if (self.data.stagingOn() and kind != .striped and @max(end, (try self.readInode(local)).size) <= self.block_size) {
+            const fits_inline = kind == .inline_ and end <= self.inline_max;
+            const reach: ?u64 = if (self.data.stagingOn() and kind != .striped) @max(end, (try self.readInode(local)).size) else null;
+            if (fits_inline and (reach == null or reach.? <= layout.inlineRecordMax())) return self.writeInline(c, local, a, rec, end, &layout_lock);
+            if (reach != null and reach.? <= self.block_size) {
                 if (try self.writeStaged(c, local, a, rec, end, &layout_lock)) |w| return w;
+                // The ring refused a write that fits the record: the
+                // cache-less mount's arm for it, never a whole block.
+                if (fits_inline) {
+                    fuse_write_staged_ring_full_inline.inc();
+                    return self.writeInline(c, local, a, rec, end, &layout_lock);
+                }
                 // The ring cannot hold the image (no hole, the pool at its
                 // cap): the ring is a cache, never the set's capacity — the
                 // own-block arm takes the write (the resident image lands
@@ -6814,9 +6834,11 @@ const SettlingData = struct {
         return layout.zero_file_id;
     }
     /// The store's side of the staged admission: the double's store covers
-    /// every image unless the test says the store is full.
-    pub fn writeCacheAdmits(self: *SettlingData, _: staging.StagingKey, _: u64) bool {
-        return !self.store_full;
+    /// every image unless the test says the store is full — and, the
+    /// plane's claim rule (`staging.StoreClaim`), an image that fits
+    /// `inline_max` claims nothing of it.
+    pub fn writeCacheAdmits(self: *SettlingData, _: staging.StagingKey, image_len: u64) bool {
+        return !self.store_full or image_len <= self.base.inline_max;
     }
     pub fn stageImage(self: *SettlingData, k: staging.StagingKey, image: []const u8, slack: staging.Slack) Error!u64 {
         if (!self.staging) return error.NotSupported;
@@ -7658,6 +7680,91 @@ test "the staged arm when the STORE is full (the write cache's claim uncovered):
     try testing.expectEqual(@as(u32, 1), h.data.staged_images);
     try testing.expectEqual(@as(u64, 1 << 20), (try h.getattr(f)).size);
     h.release(f);
+}
+
+// Decision 0003 §CD (the owner's ruling "small files should go through the
+// write cache"): a fresh file's first write of ≤ `inline_max` was the INLINE
+// arm on every mount — one transaction carrying the payload, ≈ 10–13 KiB of
+// metadata-device writes per 4 KiB file (§CA.5) and the journal ring's full
+// stalls under 32–64 ranks.
+test "a small write on a mount WITH a write cache takes the cache, never the inline record: a fresh file's 4 KiB first write rings its image whole and ONE commit names the staged record (no payload journaled); a record-sized file (≤ layout.inlineRecordMax) commits to its record at once, one byte more rings; the ring refusing it, the write takes the INLINE arm — never a whole block; a store too full for the residents' claim still admits it (a payload that fits the record claims nothing of the store) (red: the inline arm)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    h.data.staging = true;
+    h.data.ring = try SettlingData.RamRing.init(64 << 20);
+    defer h.data.ring.?.deinit();
+    const inline0 = fuse_write_inline.load();
+    const staged0 = fuse_write_staged.load();
+    const fallback0 = fuse_write_staged_ring_full_inline.load();
+    const own0 = fuse_write_staged_ring_full_own_block.load();
+    var page: [4096]u8 = undefined;
+    for (&page, 0..) |*b, i| b.* = @truncate(i *% 7 +% 1);
+    const f = try h.create(1, "f", 0o644);
+    const local = try H.Fs.localOf(f);
+    const commits0 = h.store.commits;
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &page, 0).errno());
+    try testing.expectEqual(commits0 + 1, h.store.commits);
+    try testing.expectEqual(inline0, fuse_write_inline.load());
+    try testing.expectEqual(staged0 + 1, fuse_write_staged.load());
+    {
+        const rec = (try h.fs.readLayout(local)).?;
+        defer h.fs.freeLayout(rec);
+        try testing.expectEqual(layout.Kind.staged, rec.layout.kind);
+        try testing.expectEqual(@as(u64, 4096), rec.layout.size);
+        try testing.expectEqual(@as(usize, 0), rec.layout.data.len);
+        const lease = h.data.ring.?.seg.get(staging.StagingKey.init(rec.layout.file_id, local)).?;
+        defer lease.release();
+        try testing.expectEqualSlices(u8, &page, lease.bytes());
+    }
+    try testing.expectEqual(@as(u64, 4096), (try h.getattr(f)).size);
+    h.release(f);
+    // A RECORD-SIZED file (≤ `layout.inlineRecordMax`): the record is its
+    // promotion's home, so its write commits there at once — no ring
+    // record, no second transaction at the promotion; one byte past the
+    // bound rings.
+    const t = try h.create(1, "t", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.write(t, 0, page[0..@intCast(layout.inlineRecordMax())], 0).errno());
+    try testing.expectEqual(inline0 + 1, fuse_write_inline.load());
+    try testing.expectEqual(staged0 + 1, fuse_write_staged.load());
+    try testing.expectEqual(@as(usize, 1), h.data.ring.?.seg.live());
+    try testing.expectEqual(@as(?linux.E, null), h.write(t, layout.inlineRecordMax(), page[0..1], 0).errno());
+    try testing.expectEqual(staged0 + 2, fuse_write_staged.load());
+    try testing.expectEqual(@as(usize, 2), h.data.ring.?.seg.live());
+    h.release(t);
+    // The ring refuses: the record holds the small write, as on a mount
+    // without a write cache.
+    h.data.stage_refuse = true;
+    const g = try h.create(1, "g", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.write(g, 0, page[0..512], 0).errno());
+    try testing.expectEqual(fallback0 + 1, fuse_write_staged_ring_full_inline.load());
+    try testing.expectEqual(own0, fuse_write_staged_ring_full_own_block.load());
+    try testing.expectEqual(inline0 + 2, fuse_write_inline.load());
+    try testing.expectEqual(@as(u32, 0), h.data.own_blocks);
+    try testing.expectEqual(@as(usize, 0), h.data.writes.items.len);
+    {
+        const rec = (try h.fs.readLayout(try H.Fs.localOf(g))).?;
+        defer h.fs.freeLayout(rec);
+        try testing.expectEqual(layout.Kind.inline_, rec.layout.kind);
+        try testing.expectEqualSlices(u8, page[0..512], rec.layout.data);
+    }
+    h.release(g);
+    // The store cannot cover the residents' claim: a payload that fits the
+    // record claims none of it (its promotion's fallback is the record).
+    h.data.stage_refuse = false;
+    h.data.store_full = true;
+    const k = try h.create(1, "k", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.write(k, 0, &page, 0).errno());
+    try testing.expectEqual(staged0 + 3, fuse_write_staged.load());
+    {
+        const rec = (try h.fs.readLayout(try H.Fs.localOf(k))).?;
+        defer h.fs.freeLayout(rec);
+        try testing.expectEqual(layout.Kind.staged, rec.layout.kind);
+    }
+    h.release(k);
 }
 
 test "the staged append law (repro-port: fstests generic/069 `append_writer` — 4-byte O_APPEND writes re-staged a 1–2 MiB image each, ≈ 3 ms and 2–4 MiB moved per append on c36b531): M small appends to a staged file land IN PLACE in the record's slack — ring bytes moved ≤ 11 × bytes appended (§J.2), ONE commit per append carrying a Δ(size, mtime, ctime), the image byte-exact, a re-stage only when the slack is exhausted" {

@@ -90,6 +90,9 @@ pub const stats = struct {
     /// `staging_pressure_kicks`: high-water crossings that kicked the write
     /// cache's drain (`evictUntil` through the promote sink).
     pub var staging_pressure_kicks: counters.ShardedCounter = .{};
+    /// `promotion_pass_concurrent`: bulk passes (syncfs, dismount, the
+    /// drain) that ran more than one promotion at once (`runPass`).
+    pub var promotion_pass_concurrent: counters.ShardedCounter = .{};
     /// The write cache's sink: `write_cache_evict_promotions` — residents
     /// the LRU eviction promoted; `write_cache_inline_evictions_declined` —
     /// an insert at the bound met a victim and declined to promote it under
@@ -180,7 +183,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_ring_full_episodes", "staging_pressure_kicks", "write_cache_evict_promotions", "write_cache_inline_evictions_declined", "write_cache_budget_sheds", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "fsync_promote_superseded", "fsync_promote_corpses", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
+    inline for (.{ "current_staged_write_bytes", "staged_writes_in_flight", "staging_cell_state_bytes", "staging_tables_bytes", "staging_over_cap_refusals", "staging_ring_full_refusals", "staging_ring_full_episodes", "staging_pressure_kicks", "promotion_pass_concurrent", "write_cache_evict_promotions", "write_cache_inline_evictions_declined", "write_cache_budget_sheds", "staging_recovery_records", "staging_recovery_torn_records", "staging_generation_discards", "staging_foreign_scope_refusals", "staging_owner_live_refusals", "staged_payload_lost_reads", "dismount_promoted_files", "dismount_promoted_bytes", "dismount_promote_failures", "dismount_corpse_residents_destroyed", "dismount_unnamed_residents_destroyed", "fsync_promoted_files", "fsync_promote_superseded", "fsync_promote_corpses", "staging_dirty_free_bytes", "staging_sweep_runs", "staging_sweep_punched_bytes", "staging_inplace_overwrites", "staging_inplace_bytes", "staging_read_retries", "staging_appends", "staging_append_bytes", "staging_restages", "staging_restage_bytes" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, @field(stats, name).load() });
     }
@@ -1554,6 +1557,9 @@ pub const PromotionHooks = struct {
     /// for the mount after the first full-store refill, and every small
     /// file's sync point answered ENOSPC long after space returned.
     begin_batch: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// The bulk passes' promotions in flight (`runPass`): the plane's
+    /// derivation (`DataPlane.promotionPassWidth`); 1 = one at a time.
+    width: usize = 1,
 
     pub const none: PromotionHooks = .{};
 
@@ -1950,34 +1956,79 @@ pub const DismountTally = struct { promoted: u64 = 0, promoted_bytes: u64 = 0, k
 /// never-wrong), or destroyed as a corpse's or an unnamed record (a clean
 /// unmount leaves no custody for an inode that does not exist, and none
 /// the metadata does not name) — then the caller seals the open packs
-/// before "Dismount clean".
-pub fn promoteAllAtDismount(gpa: Allocator, seg: *Segment, hooks: PromotionHooks) Allocator.Error!DismountTally {
-    var tally: DismountTally = .{};
-    const judge = hooks.dismount orelse return tally;
+/// before "Dismount clean". `hooks.width` residents at once (`runPass`).
+pub fn promoteAllAtDismount(gpa: Allocator, io: Io, seg: *Segment, hooks: PromotionHooks) Allocator.Error!DismountTally {
+    const judge = hooks.dismount orelse return .{};
     const out = try seg.residentsAlloc(gpa);
     defer gpa.free(out);
     hooks.beginBatch();
-    for (out) |r| switch (judge(hooks.ctx, r.key)) {
-        .promoted => {
-            tally.promoted += 1;
-            tally.promoted_bytes += r.cost;
-            stats.dismount_promoted_files.inc();
-            stats.dismount_promoted_bytes.add(r.cost);
-        },
-        .kept => {
-            tally.kept += 1;
-            stats.dismount_promote_failures.inc();
-        },
-        .corpse => {
-            tally.corpses += 1;
-            stats.dismount_corpse_residents_destroyed.inc();
-        },
-        .unnamed => {
-            tally.unnamed += 1;
-            stats.dismount_unnamed_residents_destroyed.inc();
-        },
+    var pass: DismountPass = .{ .residents = out, .hooks = hooks, .judge = judge };
+    runPass(io, &pass, hooks.width);
+    return .{ .promoted = pass.promoted.load(.monotonic), .promoted_bytes = pass.promoted_bytes.load(.monotonic), .kept = pass.kept.load(.monotonic), .corpses = pass.corpses.load(.monotonic), .unnamed = pass.unnamed.load(.monotonic) };
+}
+
+const DismountPass = struct {
+    residents: []const Census,
+    hooks: PromotionHooks,
+    judge: *const fn (ctx: ?*anyopaque, key: StagingKey) DismountVerdict,
+    next: std.atomic.Value(usize) = .init(0),
+    promoted: std.atomic.Value(u64) = .init(0),
+    promoted_bytes: std.atomic.Value(u64) = .init(0),
+    kept: std.atomic.Value(u64) = .init(0),
+    corpses: std.atomic.Value(u64) = .init(0),
+    unnamed: std.atomic.Value(u64) = .init(0),
+
+    fn work(self: *DismountPass) void {
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.residents.len) return;
+            const r = self.residents[i];
+            switch (self.judge(self.hooks.ctx, r.key)) {
+                .promoted => {
+                    _ = self.promoted.fetchAdd(1, .monotonic);
+                    _ = self.promoted_bytes.fetchAdd(r.cost, .monotonic);
+                    stats.dismount_promoted_files.inc();
+                    stats.dismount_promoted_bytes.add(r.cost);
+                },
+                .kept => {
+                    _ = self.kept.fetchAdd(1, .monotonic);
+                    stats.dismount_promote_failures.inc();
+                },
+                .corpse => {
+                    _ = self.corpses.fetchAdd(1, .monotonic);
+                    stats.dismount_corpse_residents_destroyed.inc();
+                },
+                .unnamed => {
+                    _ = self.unnamed.fetchAdd(1, .monotonic);
+                    stats.dismount_unnamed_residents_destroyed.inc();
+                },
+            }
+        }
+    }
+};
+
+/// The bulk passes (syncfs, dismount) run `width` promotions at once, each
+/// worker taking the next resident off one shared cursor (decision 0003
+/// §CD). WHY: a promotion waits on the device twice — its tenant's DMA and
+/// its volume's flush before the layout publishes (DUR-1) — around one
+/// commit. One at a time, every small resident paid a flush of its own;
+/// in flight together, the volume's barrier coalescer answers them with
+/// one (`fsync.BarrierCoalescer`). The workers never cancel: a pass is a
+/// sync point or the unmount (charter §9).
+/// The cursor and the tallies are monotonic: the residents are written
+/// before the group spawns its workers and the tallies read after its
+/// await — the spawn and the join are the two fences; the cursor's one RMW
+/// hands each index out exactly once.
+fn runPass(io: Io, pass: anytype, width: usize) void {
+    const T = @TypeOf(pass.*);
+    const w = @max(1, @min(width, pass.residents.len));
+    if (w == 1) return pass.work();
+    stats.promotion_pass_concurrent.inc();
+    var group: Io.Group = .init;
+    for (0..w) |_| group.async(io, T.work, .{pass});
+    group.await(io) catch |e| switch (e) {
+        error.Canceled => unreachable, // a sync point and the unmount are never cancelled (charter §9)
     };
-    return tally;
 }
 
 /// What the fsync point's promotion found.
@@ -2033,21 +2084,40 @@ fn promoteOne(seg: *Segment, hooks: PromotionHooks, key: StagingKey) FsyncPromot
 /// What the syncfs point left resident.
 pub const SyncfsKept = struct { declined: u64 = 0, no_space: u64 = 0 };
 
-/// The syncfs point: `promoteAtFsync` for EVERY resident entry; answers
-/// how many stayed resident by class (the caller answers EIO for any
-/// declined, else ENOSPC for any the store could not take).
-pub fn promoteAllAtSyncfs(gpa: Allocator, seg: *Segment, hooks: PromotionHooks) Allocator.Error!SyncfsKept {
+/// The syncfs point: `promoteAtFsync` for EVERY resident entry, `hooks.
+/// width` at once (`runPass`); answers how many stayed resident by class
+/// (the caller answers EIO for any declined, else ENOSPC for any the store
+/// could not take).
+pub fn promoteAllAtSyncfs(gpa: Allocator, io: Io, seg: *Segment, hooks: PromotionHooks) Allocator.Error!SyncfsKept {
     const out = try seg.residentsAlloc(gpa);
     defer gpa.free(out);
-    var kept: SyncfsKept = .{};
     hooks.beginBatch();
-    for (out) |r| switch (if (seg.residentGeneration(r.key) == null) FsyncPromote.absent else promoteOne(seg, hooks, r.key)) {
-        .kept => kept.declined += 1,
-        .kept_no_space => kept.no_space += 1,
-        .promoted, .absent => {},
-    };
-    return kept;
+    var pass: SyncfsPass = .{ .residents = out, .seg = seg, .hooks = hooks };
+    runPass(io, &pass, hooks.width);
+    return .{ .declined = pass.declined.load(.monotonic), .no_space = pass.no_space.load(.monotonic) };
 }
+
+const SyncfsPass = struct {
+    residents: []const Census,
+    seg: *Segment,
+    hooks: PromotionHooks,
+    next: std.atomic.Value(usize) = .init(0),
+    declined: std.atomic.Value(u64) = .init(0),
+    no_space: std.atomic.Value(u64) = .init(0),
+
+    fn work(self: *SyncfsPass) void {
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.residents.len) return;
+            const key = self.residents[i].key;
+            switch (if (self.seg.residentGeneration(key) == null) FsyncPromote.absent else promoteOne(self.seg, self.hooks, key)) {
+                .kept => _ = self.declined.fetchAdd(1, .monotonic),
+                .kept_no_space => _ = self.no_space.fetchAdd(1, .monotonic),
+                .promoted, .absent => {},
+            }
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------
 // §3.7 The reader's view of an unpromoted entry.
@@ -3154,6 +3224,57 @@ const Kicks = struct {
     }
 };
 
+/// A thread-safe promote double for the bulk passes' width: every key's
+/// promotions counted per ino, the promotions in flight at once observed.
+const PassKicks = struct {
+    seg: *Segment,
+    per_ino: [64]std.atomic.Value(u32) = @splat(.init(0)),
+    in_flight: std.atomic.Value(u32) = .init(0),
+    max_in_flight: std.atomic.Value(u32) = .init(0),
+    width: usize,
+
+    fn hooks(self: *PassKicks) PromotionHooks {
+        return .{ .ctx = self, .promote = onPromote, .dismount = onDismount, .width = self.width };
+    }
+
+    fn onPromote(ctx: ?*anyopaque, k: StagingKey) LiveVerdict {
+        const self: *PassKicks = @ptrCast(@alignCast(ctx.?));
+        const now = self.in_flight.fetchAdd(1, .acq_rel) + 1;
+        _ = self.max_in_flight.fetchMax(now, .acq_rel);
+        _ = self.per_ino[@intCast(k.ino())].fetchAdd(1, .acq_rel);
+        _ = self.seg.remove(k, null);
+        _ = self.in_flight.fetchSub(1, .acq_rel);
+        return .promoted;
+    }
+
+    fn onDismount(ctx: ?*anyopaque, k: StagingKey) DismountVerdict {
+        return if (onPromote(ctx, k) == .promoted) .promoted else .kept;
+    }
+};
+
+test "the bulk passes run `hooks.width` promotions at once off one cursor (decision 0003 §CD): syncfs and the dismount pass each promote every resident EXACTLY once at width 8, the tallies whole, never more in flight than the width, the ring empty after; width 1 is the sequential pass" {
+    const gpa = testing.allocator;
+    for ([_]usize{ 1, 8 }) |width| {
+        var r = try ramSegment(gpa, 256 * 4096);
+        defer gpa.free(r.image);
+        defer r.seg.deinit();
+        var kicks: PassKicks = .{ .seg = &r.seg, .width = width };
+        const v: [100]u8 = @splat(7);
+        for (0..48) |i| try r.seg.put(tkey(@intCast(i), i), &v, i + 1, 0, 0);
+        const c0 = stats.promotion_pass_concurrent.load();
+        try testing.expectEqual(SyncfsKept{}, try promoteAllAtSyncfs(gpa, testing.io, &r.seg, kicks.hooks()));
+        for (kicks.per_ino[0..48]) |*n| try testing.expectEqual(@as(u32, 1), n.load(.acquire));
+        try testing.expectEqual(@as(usize, 0), r.seg.live());
+        for (0..48) |i| try r.seg.put(tkey(@intCast(i), i), &v, 100 + i, 0, 0);
+        const tally = try promoteAllAtDismount(gpa, testing.io, &r.seg, kicks.hooks());
+        try testing.expectEqual(DismountTally{ .promoted = 48, .promoted_bytes = 48 * 8192 }, tally);
+        for (kicks.per_ino[0..48]) |*n| try testing.expectEqual(@as(u32, 2), n.load(.acquire));
+        try testing.expectEqual(@as(usize, 0), r.seg.live());
+        try testing.expect(kicks.max_in_flight.load(.acquire) <= width);
+        try testing.expectEqual(c0 + @as(u64, if (width > 1) 2 else 0), stats.promotion_pass_concurrent.load());
+    }
+}
+
 test "THE RESIDENTS' CLAIM ON THE STORE (StoreClaim): inline claims nothing, a packable image its 4 KiB slot, one past the pack's max slot a whole block, packing off a block for anything above inline, no store nothing; the pool sums it — a stage charges it, a re-stage replaces it, an in-place append re-reads it off the grown image (across the pack bound: slot → block), an overwrite keeps it, a release credits it — and recovery seeds it off the footprint" {
     const gpa = testing.allocator;
     const rule: StoreClaim = .{ .inline_max = 4096, .max_slot = 512 << 10, .block = 1 << 20 };
@@ -3519,7 +3640,7 @@ test "the promotion points: the dismount pass judges every resident — promoted
     const x0 = stats.dismount_promote_failures.load();
     const c0 = stats.dismount_corpse_residents_destroyed.load();
     const n0 = stats.dismount_unnamed_residents_destroyed.load();
-    const tally = try promoteAllAtDismount(gpa, &r.seg, kicks.hooks());
+    const tally = try promoteAllAtDismount(gpa, testing.io, &r.seg, kicks.hooks());
     try testing.expectEqual(DismountTally{ .promoted = 2, .promoted_bytes = 2 * 8192, .kept = 1, .corpses = 1, .unnamed = 1 }, tally);
     try testing.expectEqual(@as(u32, 2), kicks.promoted);
     try testing.expectEqual(f0 + 2, stats.dismount_promoted_files.load());
@@ -3555,7 +3676,7 @@ test "the promotion points: the dismount pass judges every resident — promoted
     try testing.expectEqual(s0 + 1, stats.fsync_promote_superseded.load());
     try testing.expectEqual(p0 + 1, stats.fsync_promoted_files.load());
     try testing.expectEqual(@as(?u64, 6), r.seg.residentGeneration(tkey(5, 5)));
-    try testing.expectEqual(SyncfsKept{}, try promoteAllAtSyncfs(gpa, &r.seg, kicks.hooks()));
+    try testing.expectEqual(SyncfsKept{}, try promoteAllAtSyncfs(gpa, testing.io, &r.seg, kicks.hooks()));
     try testing.expect(r.seg.remove(tkey(5, 5), 6));
     // The store's refusal (`LiveVerdict.no_space`): `kept_no_space` at the
     // fsync point, counted apart by the syncfs point — the caller's ENOSPC.
@@ -3564,9 +3685,9 @@ test "the promotion points: the dismount pass judges every resident — promoted
     try testing.expectEqual(FsyncPromote.kept_no_space, promoteAtFsync(&r.seg, kicks.hooks(), tkey(7, 7)));
     try testing.expectEqual(@as(?u64, 7), r.seg.residentGeneration(tkey(7, 7)));
     kicks.no_space_next = true;
-    try testing.expectEqual(SyncfsKept{ .no_space = 1 }, try promoteAllAtSyncfs(gpa, &r.seg, kicks.hooks()));
+    try testing.expectEqual(SyncfsKept{ .no_space = 1 }, try promoteAllAtSyncfs(gpa, testing.io, &r.seg, kicks.hooks()));
     kicks.fail_next = true;
-    try testing.expectEqual(SyncfsKept{ .declined = 1 }, try promoteAllAtSyncfs(gpa, &r.seg, kicks.hooks()));
+    try testing.expectEqual(SyncfsKept{ .declined = 1 }, try promoteAllAtSyncfs(gpa, testing.io, &r.seg, kicks.hooks()));
     try testing.expect(r.seg.remove(tkey(7, 7), 7));
 }
 

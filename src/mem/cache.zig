@@ -861,11 +861,23 @@ pub fn Cache(comptime Entry: type, comptime Sink: type) type {
         /// Evict tails across the shards until the entry bytes ≤ `target`
         /// (each shard to its proportional share), through the sink.
         pub fn evictUntil(self: *Self, target: u64) Progress {
+            return self.evictShardsUntil(target, 0, 1);
+        }
+
+        /// `evictUntil` over the shards `first, first + stride, …` alone:
+        /// `stride` callers with distinct `first` cover every shard once,
+        /// so a sink that parks (the write cache's promotion: a DMA, a
+        /// flush) overlaps its waits across shards while each shard keeps
+        /// its exact LRU order and its share (one evictor per shard — two
+        /// on one shard would each count the other's in-flight victims).
+        pub fn evictShardsUntil(self: *Self, target: u64, first: usize, stride: usize) Progress {
+            assert(stride >= 1);
             var p: Progress = .{};
             if (!self.enabled()) return p;
             const per_shard = target / self.shards.len;
-            for (self.shards) |*s| {
-                const q = self.evictShardTo(s, per_shard, 0);
+            var i = first;
+            while (i < self.shards.len) : (i += stride) {
+                const q = self.evictShardTo(&self.shards[i], per_shard, 0);
                 p.released += q.released;
                 p.kept += q.kept;
             }
@@ -1190,6 +1202,24 @@ test "the core (promote sink): the sink runs OUTSIDE the lock with the entry sti
     comp.shed.?.call(comp.shed.?.ctx, 0);
     try testing.expectEqual(@as(u64, 0), c.currentBytes());
     try testing.expectEqual(@as(u64, 0), comp.current());
+}
+
+test "the core: evictShardsUntil drains the shards first, first + stride, … alone, each to its share — two strided callers together evict exactly what evictUntil does (the write cache's concurrent drain)" {
+    var sink: DropSink = .{};
+    defer sink.deinit();
+    const C = Cache(TestEntry, DropSink);
+    const c = try C.init(testing.allocator, &sink, 64, 4, .{ .max = 64 }, null);
+    defer c.deinit();
+    for (0..32) |i| try testing.expectEqual(InsertOutcome.inserted, c.insert(mk(@intCast(i), 0, 0, 1, @intCast(i)), .{}));
+    var before: [4]u64 = undefined;
+    for (c.shards, 0..) |*s, i| before[i] = s.bytes.load(.monotonic);
+    // Stride 2 from shard 0: shards 0 and 2 drain to their share of 8
+    // (2 each), shards 1 and 3 keep every entry.
+    _ = c.evictShardsUntil(8, 0, 2);
+    for (c.shards, 0..) |*s, i| try testing.expectEqual(if (i % 2 == 0) @min(before[i], 2) else before[i], s.bytes.load(.monotonic));
+    _ = c.evictShardsUntil(8, 1, 2);
+    for (c.shards, 0..) |*s, i| try testing.expectEqual(@min(before[i], 2), s.bytes.load(.monotonic));
+    try testing.expectEqual(c.currentBytes(), c.stats.bytes.load());
 }
 
 test "the core: setBound re-derives the shards' shares live — a larger bound admits more, a smaller one evicts down through the sink; a disabled instance stays off" {

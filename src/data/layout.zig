@@ -43,6 +43,7 @@ const knobs = @import("../core/knobs.zig");
 const log = @import("../core/log.zig");
 const key = @import("../meta/key.zig");
 const record = @import("../meta/record.zig");
+const journal = @import("../meta/journal.zig");
 const tx = @import("../meta/tx.zig");
 const sync_mutex = @import("../sync/mutex.zig");
 const lock_order = @import("../sync/lock_order.zig");
@@ -1326,6 +1327,19 @@ pub fn inlineMaxFromEnv(env: *const std.process.Environ.Map, facts: derive.Facts
     return resolveInlineMax(knobs.optIntKnob("SQUEEZEFS_INLINE_MAX_BYTES", u64, env), facts, node_size);
 }
 
+/// The promotion's inline bound (decision 0003 §CD): a resident whose inline
+/// record costs the metadata device no more than a packed tenant's records
+/// do — the tenant's layout body (file id + mapping) over the inline body's
+/// fixed length word, plus the tenant's `+ref` record frame — is promoted
+/// INLINE: it saves the tenant's data slot and its cold read's device trip
+/// at no metadata cost. Above it the metadata device carries the record and
+/// a data volume the payload. 102 B on this wire.
+pub fn inlineRecordMax() u64 {
+    const tenant_body = Layout.packedTenant(0, zero_file_id, .{}).bodyLen();
+    const inline_fixed = Layout.inlineData(0, &.{}).bodyLen();
+    return tenant_body - inline_fixed + journal.recordFrameLen(key.BLOCK_REF_KEY_LEN, record.BLOCK_REF_VALUE_LEN);
+}
+
 // ---------------------------------------------------------------------------
 // Lock levels 3.5 and 3.7: the per-ino block-map meta stripe and the plane's
 // per-ino layout lock (charter §2; `data/plane.zig` module doc declares 3.7).
@@ -2354,6 +2368,18 @@ test "delta policy: 64 links then a re-base (counted); 0 = full Puts only; the p
     var serial: PublishWindow = .{ .max = 0 };
     defer serial.deinit(gpa);
     try testing.expect(try serial.push(gpa, .{ .block = 1, .mapping = Mapping.wholeBlock(1, 0, 0) }));
+}
+
+test "the promotion's inline bound ties to the wire: a payload no larger than the packed tenant's metadata records — its layout body over the inline body's length word plus its +ref frame, (16 + 40) − 4 + (1 + 16 + 29 + 4) = 102 B — journals no more inline than as a tenant" {
+    try testing.expectEqual(@as(u64, (16 + MAPPING_WIRE_LEN) - 4 + (1 + journal.RECORD_HEADER_LEN + key.BLOCK_REF_KEY_LEN + record.BLOCK_REF_VALUE_LEN)), inlineRecordMax());
+    try testing.expectEqual(@as(u64, 102), inlineRecordMax());
+    const tenant = journal.recordFrameLen(key.XATTR_KEY_LEN, (XattrLayout{ .layout = Layout.packedTenant(0, zero_file_id, .{}) }).encodedLen()) + journal.recordFrameLen(key.BLOCK_REF_KEY_LEN, record.BLOCK_REF_VALUE_LEN);
+    var payload: [128]u8 = @splat(0);
+    const at = journal.recordFrameLen(key.XATTR_KEY_LEN, (XattrLayout{ .layout = Layout.inlineData(0, payload[0..@intCast(inlineRecordMax())]) }).encodedLen());
+    const past = journal.recordFrameLen(key.XATTR_KEY_LEN, (XattrLayout{ .layout = Layout.inlineData(0, payload[0..@intCast(inlineRecordMax() + 1)]) }).encodedLen());
+    try testing.expectEqual(tenant, at);
+    try testing.expect(past > tenant);
+    try testing.expect(inlineRecordMax() < INLINE_MAX_FLOOR);
 }
 
 test "inline bound tie: the default is one page at every node size; the bound is the KV value cap minus the 4 KiB headroom (60 KiB at 256 KiB, 12 KiB at 64 KiB); an override above the bound refuses the mount; the gauge publishes" {

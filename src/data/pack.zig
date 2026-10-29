@@ -168,12 +168,19 @@ pub const DispatchError = error{
     ImageExceedsChunk,
 };
 
-/// §4.4 `prepare_promotion`'s size dispatch: `logical ≤ inline_max` ⇒
-/// inline; else by the stored (transformed) image's slot.
+/// §4.4 `prepare_promotion`'s size dispatch (amended 2026-10-28, decision
+/// 0003 §CD — the metadata device carries records, not payloads): a payload
+/// no larger than the packed tenant's own records (`layout.inlineRecordMax`)
+/// ⇒ inline; else by the stored (transformed) image's slot — packed, or its
+/// own block above the line; a payload that fits `inline_max` the packer
+/// cannot take (packing off) ⇒ inline, never a whole block. (The plane's
+/// arm falls back inline too when the store has no block for the tenant.)
 pub fn dispatch(policy: Policy, logical_len: u64, stored_len: u64, inline_max: u64, chunk: u64) DispatchError!Dispatch {
-    if (logical_len <= inline_max) return .inline_;
+    if (logical_len <= @min(layout.inlineRecordMax(), inline_max)) return .inline_;
+    const packs = policy.enabled and packSlotLen(stored_len) <= policy.max_slot;
+    if (logical_len <= inline_max and !packs) return .inline_;
     if (stored_len > chunk) return error.ImageExceedsChunk;
-    if (policy.enabled and packSlotLen(stored_len) <= policy.max_slot) return .packed_;
+    if (packs) return .packed_;
     stats.pack_own_block_promotions.inc();
     return .own_block;
 }
@@ -1334,19 +1341,31 @@ test "the two-faced law: slot = ceil_4k (1 → 4096, 4096 → 4096, 4097 → 819
     try testing.expect(knobs.boolDefault("SQUEEZEFS_SMALL_FILE_PACKING"));
     try testing.expectEqual(@as(u64, 375), packedBlocks(96_000, 16 * derive.KiB, CHUNK));
     try testing.expectEqual(@as(u64, 79), packedBlocks(20_000, 16 * derive.KiB, CHUNK));
-    // The dispatch: inline by LOGICAL size; packed by the STORED slot; own
-    // block above the line (counted); an image above CHUNK is the FIND-RW4-A
-    // breach.
+    // The dispatch (decision 0003 §CD): inline by LOGICAL size up to the
+    // record-sized bound alone; packed by the STORED slot — a page-sized
+    // payload too; own block above the line (counted); an image above CHUNK
+    // is the FIND-RW4-A breach.
     const p = Policy.resolve(true, null, CHUNK);
     try testing.expectEqual(max, stats.pack_max_slot_bytes.load());
-    try testing.expectEqual(Dispatch.inline_, try dispatch(p, 4096, 4096, 4096, CHUNK));
+    const rec_max = layout.inlineRecordMax();
+    try testing.expectEqual(Dispatch.inline_, try dispatch(p, 0, 0, 4096, CHUNK));
+    try testing.expectEqual(Dispatch.inline_, try dispatch(p, rec_max, rec_max, 4096, CHUNK));
+    try testing.expectEqual(Dispatch.packed_, try dispatch(p, rec_max + 1, rec_max + 1, 4096, CHUNK));
+    try testing.expectEqual(Dispatch.packed_, try dispatch(p, 512, 512, 4096, CHUNK));
+    try testing.expectEqual(Dispatch.packed_, try dispatch(p, 4096, 4096, 4096, CHUNK));
+    try testing.expectEqual(Dispatch.packed_, try dispatch(p, 4096, 4096 + layout.GRAIN, 4096, CHUNK));
     try testing.expectEqual(Dispatch.packed_, try dispatch(p, 4097, 4097, 4096, CHUNK));
     try testing.expectEqual(Dispatch.packed_, try dispatch(p, 3 * derive.MiB, max, 4096, CHUNK));
     const own0 = stats.pack_own_block_promotions.load();
     try testing.expectEqual(Dispatch.own_block, try dispatch(p, 3 * derive.MiB, max + 1, 4096, CHUNK));
     try testing.expectEqual(own0 + 1, stats.pack_own_block_promotions.load());
     try testing.expectError(error.ImageExceedsChunk, dispatch(p, 5 * derive.MiB, CHUNK + 1, 4096, CHUNK));
+    // Packing off: a payload that fits inline goes inline rather than take
+    // a whole block (a page-sized file never owns 4 MiB); larger ones own a
+    // block.
     const off = Policy.resolve(false, null, CHUNK);
+    try testing.expectEqual(Dispatch.inline_, try dispatch(off, 4096, 4096, 4096, CHUNK));
+    try testing.expectEqual(Dispatch.inline_, try dispatch(off, 512, 512, 4096, CHUNK));
     try testing.expectEqual(Dispatch.own_block, try dispatch(off, 8192, 8192, 4096, CHUNK));
     try testing.expectEqual(@as(u64, (7 << 32) | 3), packScopeKey(7, 3));
     try testing.expectEqual(@as(u64, 0), packScopeKey(0, 0));

@@ -271,6 +271,10 @@ pub const stats = struct {
     /// A promotion whose picked volume had no block retried on another
     /// volume with supply in sight (`promoteLocked`'s one retry).
     pub var promotions_replaced: counters.ShardedCounter = .{};
+    /// `promotions_inline_fallbacks`: a payload that fits inline whose
+    /// tenant the store had no block for, promoted into its record instead
+    /// (decision 0003 §CD) — no ENOSPC owed, no full-store episode closed.
+    pub var promotions_inline_fallbacks: counters.ShardedCounter = .{};
     /// `promotions_restaged`: a promotion handed its key by a census found
     /// the record re-staged by a newer write before it held the locks, and
     /// promoted the CURRENT resident (`promoteUnder`).
@@ -356,7 +360,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "write_cache_off_unsupervised", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_commit_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "layout_map_punches", "layout_shifts", "layout_shift_refusals", "kvmap_sweep_spawn_refusals", "kvmap_foreign_resolve_failures", "foreign_resolve_faults", "foreign_resolve_eio_reads", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_replaced", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_commit_failures", "layout_map_merge_clipped_blocks", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "layout_map_punches", "layout_shifts", "layout_shift_refusals", "kvmap_sweep_spawn_refusals", "kvmap_foreign_resolve_failures", "foreign_resolve_faults", "foreign_resolve_eio_reads", "promotions_run", "promotions_stale", "promotions_failed", "promotions_enospc", "promotions_replaced", "promotions_inline_fallbacks", "promotions_restaged", "recall_promotions", "recall_promotion_failures", "own_block_dmas", "own_block_dma_bytes", "promotion_barriers", "staged_point_hits", "staged_point_misses", "promotion_barriers_coalesced", "promotion_barrier_write_through_skips", "held_stores", "held_store_bytes", "held_store_failures", "hold_gate_admits", "hold_gate_overlay_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d},\"release_free_unheld\":{d},\"layout_map_merge_displaced_overflow\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked"), counters.tripwireCount("release_free_unheld"), counters.tripwireCount("layout_map_merge_displaced_overflow") });
@@ -1238,7 +1242,7 @@ pub const DataPlane = struct {
         st.seg = staging.Segment.init(gpa, r.image(), r.backing()) catch return error.OutOfMemory;
         errdefer st.seg.deinit();
         const rep = st.seg.recover();
-        st.pool = staging.Pool.init(gpa, .{ .ctx = self, .promote = &promoteHook, .dismount = &dismountHook, .begin_batch = &beginBatchHook });
+        st.pool = staging.Pool.init(gpa, .{ .ctx = self, .promote = &promoteHook, .dismount = &dismountHook, .begin_batch = &beginBatchHook, .width = promotionPassWidth(opts.facts) });
         // The residents' claim on the store (`staging.StoreClaim`): the
         // primitive's dispatch — inline, a packed slot, a whole block — set
         // before the seed so the recovered residents claim too.
@@ -1347,13 +1351,40 @@ pub const DataPlane = struct {
     /// a burst of stages lands without meeting the bound — or to the
     /// budget's shed target when one is pending, whichever is lower — in
     /// LRU order; a kept victim ends the pass (the next kick retries).
+    /// The pass runs `promotion_width` evictors over disjoint stripes of
+    /// the cache's shards (`Cache.evictShardsUntil`): each shard drains in
+    /// its exact LRU order, and the promotions of different shards share
+    /// their volume's flush (`staging.runPass`'s reason).
     fn drainTask(self: *DataPlane) Io.Cancelable!void {
         const st = &(self.stage orelse return);
         defer st.drain_armed.store(false, .release);
         const bound = st.cache.stats.bound_bytes.load();
         const shed = st.shed_target.swap(std.math.maxInt(u64), .acq_rel);
         self.beginPromotionBatch();
-        _ = st.cache.evictUntil(@min(bound - bound / WRITE_CACHE_DRAIN_DIVISOR, shed));
+        const target = @min(bound - bound / WRITE_CACHE_DRAIN_DIVISOR, shed);
+        const w = @min(st.pool.hooks.width, st.cache.shards.len);
+        if (w <= 1) {
+            _ = st.cache.evictUntil(target);
+            return;
+        }
+        staging.stats.promotion_pass_concurrent.inc();
+        var group: Io.Group = .init;
+        for (0..w) |first| group.async(self.io, drainStripe, .{ st.cache, target, first, w });
+        try group.await(self.io);
+    }
+
+    fn drainStripe(cache: *staging.WriteCache, target: u64, first: usize, stride: usize) void {
+        _ = cache.evictShardsUntil(target, first, stride);
+    }
+
+    /// The bulk promotion passes' width (syncfs, dismount, the drain;
+    /// `staging.runPass`): one promotion in flight per CPU — a promotion's
+    /// CPU work (the transform, its commit's apply) runs between its two
+    /// device waits (the tenant's DMA, the volume's flush), so the CPUs
+    /// bound the overlap worth having, and the barrier coalescer answers
+    /// each round's tenants on a volume with one flush.
+    pub fn promotionPassWidth(facts: derive.Facts) usize {
+        return @max(1, @as(usize, facts.cpus));
     }
 
     /// The high water that kicks the drain and the low water it drains to:
@@ -1440,7 +1471,7 @@ pub const DataPlane = struct {
         self.tasks.wait(io) catch {};
         self.wp.quiesce(io);
         if (self.stage) |*st| {
-            if (staging.promoteAllAtDismount(self.gpa, &st.seg, st.pool.hooks)) |t| {
+            if (staging.promoteAllAtDismount(self.gpa, io, &st.seg, st.pool.hooks)) |t| {
                 if (t.kept != 0) {
                     log.err("dismount promotion: {d} staged file(s) ({d} B) promoted, {d} FAILED — the failed residents stay in the staging ring (readable here, zeros elsewhere) until the next mount of this host promotes them; {d} corpse record(s) and {d} unnamed record(s) destroyed", .{ t.promoted, t.promoted_bytes, t.kept, t.corpses, t.unnamed });
                 } else {
@@ -2564,7 +2595,7 @@ pub const DataPlane = struct {
             .no_space => if (self.store_full.refused(clock.monotonicNs())) {
                 log.warn("data store FULL: the promotion of ino {d} ({d} B resident) found no free block on any data volume ({d} B free in sight, {d} B resident in the write cache) — its sync point answers ENOSPC, the bytes stay resident and dirty, the next sync point retries; one line per episode (counted full_store_episodes, fsync_promote_enospc): the next is the close's", .{ ino, image.len, self.vols.reachableFreeBytes(self.block_size), st.pool.currentBytes() });
             },
-            .promoted => if (self.store_full.landed(clock.monotonicNs())) |c| {
+            .promoted => if (!out.store_refused) if (self.store_full.landed(clock.monotonicNs())) |c| {
                 log.info("data store: the full-store episode closed after {d} ms — {d} promotion(s) refused their block; a promotion landed ({d} B free in sight, {d} B resident in the write cache)", .{ (clock.monotonicNs() - c.since_ns) / std.time.ns_per_ms, c.refusals, self.vols.reachableFreeBytes(self.block_size), st.pool.currentBytes() });
             },
             .kept, .corpse, .unnamed => {},
@@ -2599,7 +2630,10 @@ pub const DataPlane = struct {
     /// found no free block on the volume (the own-block mint's
     /// `StorageFull`, the pack refill's) — the store's refusal, ENOSPC at
     /// the sync point, never a resource decline's EIO.
-    const Promoted = struct { ok: bool, displaced: ?Mapping = null, unnamed: bool = false, no_space: bool = false };
+    /// `store_refused`: promoted INLINE after the store refused the tenant's
+    /// block — a landing on the record, never one on the store (the
+    /// full-store episode stays open).
+    const Promoted = struct { ok: bool, displaced: ?Mapping = null, unnamed: bool = false, no_space: bool = false, store_refused: bool = false };
 
     fn promoteLocked(self: *DataPlane, io: Io, ino: u64, k: staging.StagingKey, generation: u64, image: []const u8) Promoted {
         const st = &self.stage.?;
@@ -2640,6 +2674,17 @@ pub const DataPlane = struct {
             stats.promotions_replaced.inc();
             out = self.promoteOnto(io, ino, k, generation, image, cur, cur_bytes.coll_seq, other);
         };
+        // A payload that fits inline has a home the data store's fill
+        // cannot refuse (decision 0003 §CD): the record. Its claim on the
+        // store is nothing (`staging.StoreClaim`), so the write admitted it
+        // past a full store, and its sync point owes no ENOSPC.
+        if (out.no_space and cur.size <= self.inline_max) {
+            stats.promotions_inline_fallbacks.inc();
+            out = .{ .ok = self.promoteInline(ino, cur, cur_bytes.coll_seq, image, k, generation), .store_refused = true };
+            if (out.ok and !self.restricted(ino)) self.noteShape(ino, cur.size, .inline_);
+            if (!out.ok) stats.promotions_failed.inc();
+            return out;
+        }
         if (out.no_space) stats.promotions_enospc.inc();
         return out;
     }
@@ -5106,6 +5151,11 @@ test "the hold gate's verdict by class (charter §6.2 items 1–2 on PATCH_MAX =
 // the two spaces alias — the mint's rotor gives file #2 nodeid 4 (slot 2,
 // local 2: key `(3 << 40) | 2`) and file #128 key 4 (slot 0, local 4: nodeid
 // 131074), so file #2's writes were classified on file #128's size.
+test "the bulk promotion passes' width ties to the CPUs: one promotion in flight per CPU, at least one" {
+    try testing.expectEqual(@as(usize, 32), DataPlane.promotionPassWidth(derive.Facts.synthetic(32, 64 * derive.GiB)));
+    try testing.expectEqual(@as(usize, 1), DataPlane.promotionPassWidth(derive.Facts.synthetic(1, 1 * derive.GiB)));
+}
+
 test "the shared probe keys by the plane's effective ino: a nodeid answers its own file's shape, never the file whose key merely equals that number" {
     var t = try ShapeTable.init(testing.allocator);
     defer t.deinit(testing.allocator);

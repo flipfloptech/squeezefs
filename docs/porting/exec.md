@@ -621,12 +621,13 @@ spawn land there). Explicit API (all return `Io.Future(R)` / `ConcurrentError`):
 `spawnOn(lane: *Lane, …)`, `spawnHome(cpu: ?u16, node: ?u16, …)` = `lane_of_cpu[cpu]` → node group
 round-robin → fuse rotation (`spawn_boxed_home` L6127–6150 exactly), `spawnMeta(…)`, `spawnLease(…)`,
 `spawnUncancelable(lane, …)` (committers: the fiber starts with `protection = .blocked`). Refusal: a
-lane at `fiber_capacity` returns `error.ConcurrencyUnavailable` — the transport's `fail_ent` answers
-`EAGAIN`-class (0002 row 10); counted `exec_spawn_refused` (per class). Dead lane: a lane thread that
+lane at `fiber_capacity` returns `error.ConcurrencyUnavailable` — the transport tries the worker's own lane
+and the rotation, and its `fail_ent` answers `EAGAIN`-class (0002 row 10) only when every lane refuses (§CP); counted `exec_spawn_refused` (per class). Dead lane: a lane thread that
 exits (ring dead after `failAll`-class verdicts) flips `alive=false`; `spawnHome`/`spawnMeta` walk to the
 next live lane counting `exec_dead_lane_redispatches` (must-stay-0) and logging `log.err` once per dead
 lane; ALL lanes of a class dead ⇒ `std.process.abort()` with a loud line (L6186–6196 posture).
-Capacity: `fiber_capacity(fuse lane) = q_depth × ceil(nqueues / fuse_lanes) + slack(16)` (RES-18: resident
+Capacity: `fiber_capacity(fuse lane) = q_depth × ceil(nqueues / fuse_lanes) + slack(16) + fanout(cpus)` (port: the
+fan-out share is `Lane.optional_cap` — `async`/`Group.async` past it run inline, decision 0003 §CP; RES-18: resident
 handler futures ≤ `queues × q_depth`, L5880–5890), `meta` lanes 256 (a handful of loops; a tie test
 counts the plane's spawn sites), journal 64, main 16; all preallocated at init (stacks mmap'd lazily on
 first use, so the virtual reserve is the only cost).

@@ -915,7 +915,11 @@ zero is the kernel certifying no `struct file` is open (it cannot evict an inode
 FUSE-2 synthesized the reply but `remove_open` never ran) — `open_count_stranded += 1`,
 `error!`, and the count is NOT zeroed ("an unlinked-open file's live data must never be
 destroyed on the strength of an accounting we already know is wrong — the generic/795
-lesson"); the entry is removed only if `lookups == 0 && count == 0`.
+lesson"); the entry is removed only if `lookups == 0 && count == 0`. PORT: the second way to
+lose one is a RELEASE answered without its handler — the kernel discards a RELEASE's
+answer and never re-sends it, so the transport never answers a dispatch EAGAIN while a
+lane has room (a full handler lane hands the handler to the worker's own lane, then the
+rotation; decision 0003 §CP).
 
 `forget` (`30322-30348`): virtual gen ino ⇒ retire its payload; `!return_lookups ⇒
 return` (a partial forget — `fuse_force_forget(1)` on a readdirplus entry the kernel

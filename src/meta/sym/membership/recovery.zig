@@ -1656,20 +1656,30 @@ test "every crash window: a recovery that fails right after each step's durable 
         if (step != .page_recovered and step != .recovered_record) try testing.expect(!f.screen.isRecovering(2));
         switch (step) {
             .mark_dead, .replay, .flush, .tails, .tree0 => {
-                // Rolled back: the table refuses a first touch, the stale
-                // tree restored, the fresh guest removed, the page Recovering.
+                // Rolled back: the table refuses a first touch, the page
+                // Recovering.
                 for ([_]u16{ 10, 11 }) |s| {
                     const v = f.rv.table.view(s);
                     try testing.expect(v.state == .leased and v.holder == 2 and v.dead);
                     try testing.expect((try f.rv.table.acquire(s, 5, false)) == .refused);
                 }
-                try testing.expectEqual(@as(u64, 0x8000), f.rv.trees.get(10).?.root.addr);
-                try testing.expect(f.rv.trees.get(11) == null);
                 try testing.expect(f.rv.handover_notifies >= 1);
                 if (step == .tree0) {
                     // Tree 0 already Unleased: the re-run ABSORBS both slots and
-                    // owes only the page and the record.
-                    try testing.expectEqual(cr.SlotVariant.unleased, f.rv.slotStateOf(10).?.variant);
+                    // owes only the page and the record — so each slot's tree
+                    // stays at the flushed root the record names (decision 0003
+                    // §CF.2: restored, the stale tree or no tree at all would be
+                    // what this manager maintains for an Unleased slot).
+                    for ([_]u16{ 10, 11 }) |s| {
+                        const st = f.rv.slotStateOf(s).?;
+                        try testing.expectEqual(cr.SlotVariant.unleased, st.variant);
+                        const t = f.rv.trees.get(s) orelse return error.TestRecordedTreeDropped;
+                        try testing.expectEqual(st.root.addr, t.root.addr);
+                    }
+                } else {
+                    // The stale tree restored, the fresh guest removed.
+                    try testing.expectEqual(@as(u64, 0x8000), f.rv.trees.get(10).?.root.addr);
+                    try testing.expect(f.rv.trees.get(11) == null);
                 }
             },
             else => {},

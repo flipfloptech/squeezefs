@@ -721,6 +721,57 @@ test "kv_fs over a FLIPPED directory (RAM store): the explicit flip through setx
     try testing.expectEqual(@as(u32, 0), (try fs.getattr(&c, .{ .ino = d, .fh = null })).attr.nlink);
 }
 
+test "a subdirectory the flip's migration moves takes its count with it: D's own record loses it, its stripe gains it — so a later cross-stripe rename of it (old stripe −1, new +1) leaves every directory at 2 + its subdirectories and the fold at 3, and its rmdir at 2 (red: the migration moved the name with `parent_update = .none` — D kept the +1, the stripe never got it, the rename took the stripe to 1 and the fold read 4)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var store = try kv_fs.MemStore.init(gpa);
+    defer store.deinit();
+    var nodata: kv_fs.NoData = .{};
+    var fs = try kv_fs.MemFs.mount(gpa, io, &store, &nodata, .{ .dlm_stripes = 64 });
+    defer fs.unmount();
+    var plane = try kv_fs.MemFs.XvPlane.init(gpa, io, &store, &fs.locks, 1, 0, 7, OneHome.resolver(), .{}, 16 << 10);
+    defer plane.deinit();
+    try testing.expectEqual(@as(u32, 0), try fs.bindXv(&plane));
+    _ = try fs.bindStripes(64, .{ .fixed = 2 });
+    defer fs.unbindStripes();
+    var tr = op_trace.OpTrace.begin(0, .other);
+    defer tr.finish();
+    var window: [4096]u8 = undefined;
+    var c: filesystem.Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 1, .io = io, .trace = &tr, .wd_slot = null, .window = &window };
+    const root = inos.ROOT_INO;
+    const d = (try fs.mkdir(&c, .{ .parent = root, .name = "hot", .mode = 0o755, .umask = 0 })).nodeid;
+    // A subdirectory BEFORE the flip: it lives in D's own tree, D counts it.
+    _ = try fs.mkdir(&c, .{ .parent = d, .name = "sub", .mode = 0o755, .umask = 0 });
+    try fs.setxattr(&c, .{ .ino = d, .name = stripe.COMMAND_XATTR, .value = "64", .flags = 0 });
+    const map = (try fs.stripes.?.mapOf(d)).?;
+    // A target name in ANOTHER stripe than "sub"'s.
+    var nb: [16]u8 = undefined;
+    const from = map.routeName("sub", store.nameKey()).stripe;
+    var to_name: []const u8 = "";
+    for (0..1000) |i| {
+        to_name = try std.fmt.bufPrint(&nb, "moved{d}", .{i});
+        if (map.routeName(to_name, store.nameKey()).stripe != from) break;
+    }
+    const to = map.routeName(to_name, store.nameKey()).stripe;
+    try testing.expect(to != from);
+    // The rename re-homes "sub" into its stripe first (the touch's
+    // migration), then moves it across stripes.
+    try fs.rename(&c, .{ .parent = d, .name = "sub", .newparent = d, .newname = to_name, .flags = 0 });
+    const nlinkOf = struct {
+        fn get(f: *kv_fs.MemFs, ino: u64) !u32 {
+            return (try f.readInodeOpt(try kv_fs.MemFs.localOf(ino))).?.nlink;
+        }
+    }.get;
+    std.debug.print("after the cross-stripe rename: D {d}, the old stripe {d}, the new stripe {d}, the fold {d}\n", .{ try nlinkOf(&fs, d), try nlinkOf(&fs, from), try nlinkOf(&fs, to), (try fs.getattr(&c, .{ .ino = d, .fh = null })).attr.nlink });
+    try testing.expectEqual(@as(u32, 2), try nlinkOf(&fs, d));
+    try testing.expectEqual(@as(u32, 2), try nlinkOf(&fs, from));
+    try testing.expectEqual(@as(u32, 3), try nlinkOf(&fs, to));
+    try testing.expectEqual(@as(u32, 3), (try fs.getattr(&c, .{ .ino = d, .fh = null })).attr.nlink);
+    try fs.rmdir(&c, .{ .parent = d, .name = to_name });
+    try testing.expectEqual(@as(u32, 2), try nlinkOf(&fs, to));
+    try testing.expectEqual(@as(u32, 2), (try fs.getattr(&c, .{ .ino = d, .fh = null })).attr.nlink);
+}
+
 test "a verdict install is all or nothing: an allocation failure caches no part of a migrating map, so the next verdict re-reads it and queues its migration for the cadence" {
     const gpa = testing.allocator;
     const io = testing.io;

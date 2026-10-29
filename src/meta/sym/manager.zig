@@ -2479,6 +2479,55 @@ test "grow ring: screens; a pending witness this incarnation's page does not nam
     try testing.expectEqual(2 * region.RING_FLOOR_BYTES, j2.ring_segments.totalBytes());
 }
 
+test "a re-join while the predecessor's page is RECOVERED settles the pending GrowRing word against the PREDECESSOR's page: the segment it names stays its ring's until the release returns it once, so no extent of the new incarnation's ring or grant is ever freed under it (run 19's live member re-joined under a remounted manager: extent_grant_conflicts ×19, every GrowRing refused)" {
+    const gpa = testing.allocator;
+    const tv = try TestVolume.init(gpa, 1 << 30, 65_536, 4000);
+    defer tv.deinit();
+    try tv.liveManagerPage();
+    var m = newManager(gpa, tv);
+    defer m.deinit();
+    const j = try m.joinAppender(.{ .identity = ident_a });
+    const seg = (try m.growRing(.{ .appender_id = 1, .want_bytes = region.RING_FLOOR_BYTES })).segment.?;
+    // Appender 1 adopts the segment, then is evicted: its recovery leaves
+    // the page Recovered, the ring (the segment in it) still its own.
+    var p = (try m.readPageOf(1)).?;
+    try p.segments.push(seg);
+    p.state = .recovered;
+    p.generation += 1;
+    var img: [page.PAGE_LEN]u8 = undefined;
+    try p.encode(&img);
+    @memcpy(tv.at(j.page_addr)[0..page.PAGE_LEN], &img);
+    // The re-join in place: the same mount, a fresh incarnation, the next pair.
+    const ident_a2: Identity = .{ .node_token = ident_a.node_token, .mount_slot = ident_a.mount_slot, .writer_id = 0x1003 };
+    const j2 = try m.joinAppender(.{ .identity = ident_a2 });
+    try testing.expectEqual(@as(u32, 2), j2.appender_id);
+    const hint = cr.AppenderHintWire.decode(tv.get(cr.appenderHintKey(.{ .node_token = ident_a.node_token, .mount_slot = ident_a.mount_slot }).slice()).?) catch unreachable;
+    try testing.expect(hint.pending == null);
+    // The release (`releaseRecovered`): the page Free, then its ring's
+    // extents back to the heap — the ones still allocated, as
+    // `volume_bind`'s ring release frees them.
+    var freed = page.Page.free(1, p.generation + 1, .{});
+    freed.identity = p.identity;
+    freed.term = p.term;
+    try freed.encode(&img);
+    @memcpy(tv.at(j.page_addr)[0..page.PAGE_LEN], &img);
+    const g = tv.g;
+    for (p.segments.slice()) |s| {
+        var e = (s.start - g.heap.start) / g.node_size;
+        while (e < (s.start + s.len - g.heap.start) / g.node_size) : (e += 1) tv.bits[@intCast(e)] = false;
+    }
+    // Every extent of the new incarnation's ring and grant is still its own.
+    for (j2.ring_segments.slice()) |s| {
+        var e = (s.start - g.heap.start) / g.node_size;
+        while (e < (s.start + s.len - g.heap.start) / g.node_size) : (e += 1) try testing.expect(tv.bits[@intCast(e)]);
+    }
+    for (j2.grantRuns()) |r| for (r.start..r.start + r.len) |e| try testing.expect(tv.bits[e]);
+    // Its growth carves outside every grant.
+    const conflicts0 = counters.tripwireCount("extent_grant_conflicts");
+    _ = try m.growRing(.{ .appender_id = 2, .want_bytes = region.RING_FLOOR_BYTES });
+    try testing.expectEqual(conflicts0, counters.tripwireCount("extent_grant_conflicts"));
+}
+
 test "publish roots: a word for a slot the appender does not lease, a cursor below the recorded floor, a root outside the grant, or a wrong generation is rejected before any effect; a legal word lands in tree 0; the same word again is already" {
     const gpa = testing.allocator;
     const tv = try TestVolume.init(gpa, 1 << 30, 65_536, 4000);

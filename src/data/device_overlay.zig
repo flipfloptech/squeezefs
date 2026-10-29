@@ -2826,7 +2826,7 @@ test "A SERVE OWNS THE RECORD IT READS: a serve of block 0 parked between its sn
     pattern(&a, 0xA1);
     var b: [wt.BS]u8 align(4096) = undefined;
     pattern(&b, 0xB2);
-    _ = try w.ov.store(io, .{ .ino = 96, .block = 0, .rel = 0, .vehicle = .{ .bytes = &a }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 96, .block = 0, .rel = 0, .vehicle = .{ .bytes = &a }, .file = TestWorld.striped(0) });
     const rec0 = w.ov.registry.get(.{ .ino = 96, .block = 0 }).?;
     const Reader = struct {
         fn run(io_: Io, ov: *Overlay, out: *[wt.BS]u8, res: *Overlay.ServeOutcome) void {
@@ -2845,7 +2845,7 @@ test "A SERVE OWNS THE RECORD IT READS: a serve of block 0 parked between its sn
     // store installs a fresh record.
     w.ov.drainBlock(io, &w.locks, 96, 0, false, w.cs());
     try testing.expect(w.ov.registry.get(.{ .ino = 96, .block = 0 }) == null);
-    const o1 = try w.ov.store(io, .{ .ino = 96, .block = 1, .rel = 0, .vehicle = .{ .bytes = &b }, .file = TestWorld.striped(2 * wt.BS), .overwrite = false });
+    const o1 = try w.ov.store(io, .{ .ino = 96, .block = 1, .rel = 0, .vehicle = .{ .bytes = &b }, .file = TestWorld.striped(2 * wt.BS) });
     try testing.expect(o1 == .stored);
     const rec1 = w.ov.registry.get(.{ .ino = 96, .block = 1 }).?;
     w.ov.serve_release.notifyWaiters(io);

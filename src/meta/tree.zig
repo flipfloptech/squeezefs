@@ -21,7 +21,7 @@
 //!   — SUPERSEDED is set before any mapping change, so it IS the "address
 //!   still bound to this object" check) → seq assigned INSIDE the window
 //!   (minted, reserved by the caller's stamper, or the replayed record's
-//!   own with the per-key LWW gate) → `applyLocked` → unlock → threshold
+//!   own with the exact replay gate) → `applyLocked` → unlock → threshold
 //!   enqueue. A failed revalidation is `.stale`, counted on
 //!   `meta_kv_commit_smo_retries`; the caller re-resolves and retries,
 //!   bounded by the same budget.
@@ -81,6 +81,13 @@ pub const stats = struct {
     /// (`CachedNode.maintenance_queued`): one request per leaf, however
     /// many commits land on it before the drain pops it.
     pub var meta_kv_maintenance_coalesced: counters.ShardedCounter = .{};
+    /// Replayed records the node already held at their own seq (a frame
+    /// written after the replayed ledger) — skipped.
+    pub var meta_kv_replay_held_skips: counters.ShardedCounter = .{};
+    /// Replayed records applied BELOW a newer record of their key: the
+    /// §AW.4 straggler a later window's frame outran, or a record a
+    /// compaction folded into a newer `Put` (shadowed there). Never a fault.
+    pub var meta_kv_replay_below_newest: counters.ShardedCounter = .{};
 };
 
 // ---------------------------------------------------------------------------
@@ -146,8 +153,8 @@ pub const SeqPlan = union(enum) {
     /// — the standalone shape every tree-level contract drives.
     mint,
     /// Mount replay: the record's ORIGINAL seq and its entry start, with
-    /// the per-key LWW gate (a seq at-or-below the node's newest for the
-    /// key is already folded in — skipped, identical by the fold theorem).
+    /// the exact gate (a record the node holds at its own seq is already
+    /// folded in — skipped; any other folds by seq among the node's).
     replay: Stamp,
     /// A live commit whose reservation the caller takes under the lock.
     reserve: Stamper,
@@ -869,19 +876,24 @@ pub const KvTree = struct {
         }
         const st: Stamp = switch (plan) {
             .replay => |s| blk: {
-                // Per-key LWW replay gate: an old-ledger mount reads node
-                // bsets that already materialized part of the window; a
-                // record whose seq is ≤ the node's newest for the key is
-                // already folded in — re-applying it would hold one record
-                // in both sources (the folds merge the two by seq, so the
-                // order would stand, the duplicate would not).
+                // The replay gate is EXACT: an old-ledger mount reads node
+                // bsets that already materialized part of the window, and
+                // a record the node holds at its own seq is skipped (one
+                // record in both sources would be a duplicate). A record
+                // below the node's newest for the key is NOT thereby held:
+                // two windows apply in either order (§AW.4), so a frame may
+                // carry W2's record and not W1's; applied, it folds by seq
+                // beneath W2's. A record a compaction folded away replays
+                // below the folded `Put` that carries a newer seq: shadowed.
                 const snap = leaf.snapshotLoad();
                 defer snap.release();
+                if (snap.value.holdsSeqOf(k, s.seq)) {
+                    leaf.unlockWrite(io);
+                    stats.meta_kv_replay_held_skips.inc();
+                    return .applied;
+                }
                 if (snap.value.newestSeqOf(k)) |newest| {
-                    if (newest >= s.seq) {
-                        leaf.unlockWrite(io);
-                        return .applied;
-                    }
+                    if (newest > s.seq) stats.meta_kv_replay_below_newest.inc();
                 }
                 break :blk s;
             },
@@ -1163,7 +1175,7 @@ pub const ReplayOutcome = struct {
     /// Phase-1 pointer records the mounted (shorter) structure could not
     /// route — dropped sound and silent.
     interior_dropped: u64 = 0,
-    /// Phase-2 content records applied (or LWW-skipped).
+    /// Phase-2 content records applied (or skipped as held at their seq).
     content: u64 = 0,
     /// Records of trees not in `trees` (allocator deltas, unmounted kinds).
     skipped: u64 = 0,
@@ -1918,7 +1930,7 @@ test "the routing law: slot-tree kinds route by the key's slot (the key must dec
     try testing.expect(route(&trees, key.TREE_INODES, 1, &key.inodeKey(1)) == null);
 }
 
-test "replay LWW gate: a replayed record at-or-below the node's newest seq for its key is skipped as applied; a newer one lands with its own seq" {
+test "replay gate: a replayed record the node holds at its own seq is skipped, one below the key's newest folds beneath it (shadowed under a Put), a newer one lands with its own seq" {
     const gpa = testing.allocator;
     var vol = try smo.TestVolume.init(gpa, .{});
     defer vol.deinit();
@@ -1926,11 +1938,18 @@ test "replay LWW gate: a replayed record at-or-below the node's newest seq for i
     var buf: [64]u8 = undefined;
     try t.insert(&ikey(5), testValue(5, 24, &buf));
     const newest = vol.seq.load();
-    // At or below: skipped (the old value stands).
+    // Held at its own seq: skipped (the node's record stands).
+    const held0 = stats.meta_kv_replay_held_skips.load();
     try t.applyReplayed(&ikey(5), newest, .put, testValue(55, 24, &buf), newest);
     try expectLookup(t, &ikey(5), testValue(5, 24, &buf));
+    try testing.expectEqual(held0 + 1, stats.meta_kv_replay_held_skips.load());
+    // Below the newest: applied beneath it, shadowed by the newer Put.
+    const below0 = stats.meta_kv_replay_below_newest.load();
     try t.applyReplayed(&ikey(5), newest - 1, .delete, &.{}, newest - 1);
     try expectLookup(t, &ikey(5), testValue(5, 24, &buf));
+    try testing.expectEqual(below0 + 1, stats.meta_kv_replay_below_newest.load());
+    try t.applyReplayed(&ikey(5), newest - 1, .delete, &.{}, newest - 1);
+    try testing.expectEqual(held0 + 2, stats.meta_kv_replay_held_skips.load());
     // Above: applied; the handle is floored above it.
     try t.applyReplayed(&ikey(5), newest + 100, .put, testValue(555, 24, &buf), newest + 100);
     try expectLookup(t, &ikey(5), testValue(555, 24, &buf));

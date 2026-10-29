@@ -566,7 +566,7 @@ pub fn bootstrapRecord(tree_roots: []const TreeRoot, next_ino: u64, node_seq_wat
 /// a raw per-record floor could land mid-entry and replay's chain walk —
 /// which parses AT the tail — would drop the entry's acked records plus
 /// collateral entries to the resync point). A lower tail only lengthens the
-/// replay window, absorbed idempotently by the per-key LWW replay gate.
+/// replay window, absorbed idempotently by replay's exact gate.
 pub fn checkpointTail(h: u64, inputs: []const u64) u64 {
     var tail = h;
     for (inputs) |f| tail = @min(tail, f);

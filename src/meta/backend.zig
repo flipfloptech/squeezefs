@@ -662,7 +662,7 @@ pub const KvBackend = struct {
         // `slot_state` record, so the control records are replayed FIRST,
         // then the guest trees open (or are minted for slots the window
         // names without a published root), then the window replays again
-        // through the complete routing — idempotent by the per-key LWW gate.
+        // through the complete routing — idempotent by replay's exact gate.
         for (be.mounted.tree_roots) |r| {
             const t = KvTree.openFromLedger(gpa, be.cache, &be.mounted, r.id, &be.seq) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,

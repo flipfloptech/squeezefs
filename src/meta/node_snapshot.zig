@@ -1555,9 +1555,40 @@ pub const NodeSnapshot = struct {
         };
     }
 
+    /// Whether this node holds a record of `k` stamped exactly `seq` in
+    /// either source — replay's gate. A record is folded in here iff its
+    /// own stamp is: two windows apply in either order (§AW.4), so a node
+    /// can hold a NEWER record of the key and not this one; a compaction
+    /// folds a key into one `Put` carrying its newest contributor's seq,
+    /// and a record it folded away replays below that `Put`, shadowed.
+    /// Binary searches: the overlay group is seq-ascending, the base group
+    /// seq-descending.
+    pub fn holdsSeqOf(self: *const NodeSnapshot, k: []const u8, seq: u64) bool {
+        const g = self.groups(k);
+        const run = &self.overlay.value;
+        var lo = g.og.lo;
+        var hi = g.og.hi;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const s = run.at(mid).seq();
+            if (s == seq) return true;
+            if (s < seq) lo = mid + 1 else hi = mid;
+        }
+        const entries = self.base.value.entries;
+        lo = g.bg.lo;
+        hi = g.bg.hi;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const s = entries[mid].seq;
+            if (s == seq) return true;
+            if (s > seq) lo = mid + 1 else hi = mid;
+        }
+        return false;
+    }
+
     /// The newest record seq this node holds for `k` across every source,
     /// or null when the key is unknown here. Order-independent (max per
-    /// group), so safe mid-replay — replay's per-key LWW gate reads it.
+    /// group).
     pub fn newestSeqOf(self: *const NodeSnapshot, k: []const u8) ?u64 {
         const g = self.groups(k);
         var newest: ?u64 = null;

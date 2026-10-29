@@ -569,6 +569,22 @@ pub const MetaSet = struct {
         t.rangeCounted(gpa, start, end, max, out, cost) catch |e| return KvBackend.readError(e);
     }
 
+    /// `slot`'s door token taken BEFORE a committer's staging reads
+    /// (decision 0003 §CQ: a holder answers for a slot only under its
+    /// door): admitted, the slot is this mount's and stays so until the
+    /// token's terminal outcome — the caller puts it in `KvTx.door`, so the
+    /// commit holds it, or releases it with an abandoned tx. Refused like a
+    /// commit's door: `SlotBusy` (the move class), `Deferred`.
+    pub fn enterDoor(self: *MetaSet, slot: u16, out: *tx.DoorTokens) Error!void {
+        self.volumeOfSlot(slot).slots.enterSlot(slot, out) catch |e| return switch (e) {
+            error.SlotBusy, error.SlotMoved => error.SlotBusy,
+            error.Deferred => error.Deferred,
+            error.Io => error.Io,
+            error.Corrupt => error.Corrupt,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
     /// Commit `t`: the one member every record lives on; a tx spanning
     /// two members is a committer defect (module doc) — refused, nothing
     /// written, the tripwire fired.

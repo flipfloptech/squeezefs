@@ -2,7 +2,8 @@
 //! acquisition and minting", "Handover", "Slot → holder resolution", the
 //! commit door and the structural door of "Extent grants", the page-budget
 //! overflow law; `docs/porting/sym_slot_leases.md`): the dense per-slot
-//! lease table with its model (`lease_table`, `slot_door_model`), the ONE
+//! lease table with its models (`lease_table`, `slot_door_model`, the
+//! reservation's latch-free read `stand_model`), the ONE
 //! commit door that rung 5's cutover gate folded into (`door`),
 //! acquisition and minting with parent affinity and the manager's five
 //! slot verbs (`acquire`), holder-decided handover — the dominance window,
@@ -98,6 +99,7 @@ test {
     _ = mint_window;
     _ = @import("slots/move_epoch_model.zig");
     _ = @import("slots/mint_window_model.zig");
+    _ = @import("slots/stand_model.zig");
 }
 
 test "the tree gauges fold a sorted census: p50/p99/max of inos and bytes; empty reads 0" {

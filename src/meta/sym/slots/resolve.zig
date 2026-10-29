@@ -122,14 +122,14 @@ pub const SlotHolderCache = struct {
     /// The holder of `slot` as this mount sees it: the table's word, or a
     /// learnt view at a higher `g`; null = unleased.
     pub fn holderOf(self: *SlotHolderCache, slot: u16) ?SlotHolder {
-        const v = self.table.view(slot);
-        var out: ?SlotHolder = if (v.state == .unleased or v.state == .migrating) null else .{ .appender_id = v.holder, .g = v.g };
         // A handover's released slot is its accepter's while the stand
         // holds (only the manager's table keeps stands): every touch goes
-        // where the accepter's first touch takes it.
-        if (v.state == .unleased) if (self.table.reservedFor(slot, clock.monotonicNs())) |to| {
-            out = .{ .appender_id = to, .g = v.g };
-        };
+        // where the accepter's first touch takes it. The word and the
+        // stand are read as one pair (0003 §CQ.3).
+        const rv = self.table.viewReserved(slot, clock.monotonicNs());
+        const v = rv.view;
+        var out: ?SlotHolder = if (v.state == .unleased or v.state == .migrating) null else .{ .appender_id = v.holder, .g = v.g };
+        if (rv.reserved) |to| out = .{ .appender_id = to, .g = v.g };
         if (self.learnt_n.load(.acquire) == 0) return out;
         self.lock.lock();
         defer self.lock.unlock();

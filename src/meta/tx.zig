@@ -184,6 +184,12 @@ pub const KvTx = struct {
     /// engine's delta copy into the target (the slot is CLOSED at the
     /// source, the target's tree unpublished) — takes no door tokens.
     door_bypass: bool = false,
+    /// Door tokens the committer took BEFORE its staging reads (a
+    /// cross-owner step's witness, a shipped record verb's base — decision
+    /// 0003 §CQ): they become the entry's, so the door's admission covers
+    /// the reads and the commit as one hold; released at the terminal
+    /// outcome (or here, if the tx never becomes an entry).
+    door: DoorTokens = .none,
     /// The ring class the entry admits in: every user op is `.user`; the
     /// rollback's compensation records and the structural plane's control
     /// entries ride the checkpoint class (they never park behind user
@@ -230,10 +236,11 @@ pub const KvTx = struct {
         return .{ .arena = std.heap.ArenaAllocator.init(child), .site = site, .backing = backing };
     }
 
-    /// Releases every staged byte and the guards (if the tx never became a
-    /// queue entry).
+    /// Releases every staged byte, the guards and any door tokens (if the
+    /// tx never became a queue entry).
     pub fn deinit(self: *KvTx) void {
         self.guards.release();
+        self.door.release();
         self.arena.deinit();
         if (self.backing) |b| b.release();
         self.* = undefined;
@@ -539,10 +546,12 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
     const names = tx.names;
     const site = tx.site;
     const door_bypass = tx.door_bypass;
+    var door = tx.door;
     const backing = tx.backing;
     tx.* = undefined;
     errdefer {
         guards.release();
+        door.release();
         arena.deinit();
         if (backing) |b| b.release();
     }
@@ -580,6 +589,7 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
         .names = names,
         .site = site,
         .guards = guards,
+        .door = door,
         .door_bypass = door_bypass,
         .backing = backing,
     };

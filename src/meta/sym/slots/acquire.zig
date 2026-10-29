@@ -958,12 +958,15 @@ pub const Verbs = struct {
         try self.requireLease();
         if (!screen.slot(slot).isOk()) return error.Rejected;
         stats.slot_resolve_rpcs.inc();
-        const v = self.table.view(slot);
+        // The word and the stand as one pair (0003 §CQ.3): mid-grant the
+        // accepter, never "unleased".
+        const rv = self.table.viewReserved(slot, clock.monotonicNs());
+        const v = rv.view;
         return switch (v.state) {
             // A handover's released slot answers its accepter while the
             // stand holds: the asker's touch goes where the accepter's
             // first touch takes the slot (the accepter itself applies).
-            .unleased => if (self.table.reservedFor(slot, clock.monotonicNs())) |to| .{ .holder = .{ .appender_id = to, .g = v.g, .dead = false } } else .{ .unleased = .{ .g = v.g } },
+            .unleased => if (rv.reserved) |to| .{ .holder = .{ .appender_id = to, .g = v.g, .dead = false } } else .{ .unleased = .{ .g = v.g } },
             .migrating => .{ .unleased = .{ .g = v.g } },
             .leased, .offered, .releasing => .{ .holder = .{ .appender_id = v.holder, .g = v.g, .dead = v.dead } },
         };

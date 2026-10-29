@@ -399,6 +399,9 @@ pub const Plane = struct {
     /// The door for one entry's records committed by region `me`: the
     /// distinct slots the slot-tree records name (control records have no
     /// door), the subtree credit for every dentry-bearing record's parent.
+    /// Tokens the committer already holds in `out` (taken before its
+    /// staging reads, `enterSlot`) cover their slots; only the others are
+    /// entered here, and the entry holds both.
     pub fn enterFor(self: *Plane, me: AppenderId, recs: []const tx.Rec, out: *tx.DoorTokens) conveyor.DoorError!void {
         var set: [door_mod.MAX_SLOTS]u16 = undefined;
         var n: usize = 0;
@@ -409,6 +412,7 @@ pub const Plane = struct {
             const slot = route_table.slotOfKey(r.key) catch return error.Corrupt;
             var dup = false;
             for (set[0..n]) |s| dup = dup or s == slot;
+            for (out.slots[0..out.len]) |s| dup = dup or s == slot;
             if (!dup) {
                 if (n == set.len) return error.Corrupt;
                 set[n] = slot;
@@ -424,9 +428,44 @@ pub const Plane = struct {
                 }
             }
         }
-        if (n == 0) return;
+        if (n == 0 and !out.isHeld()) return;
+        // Tokens of another door than this volume's: a committer defect.
+        if (out.isHeld() and out.ctx != @as(*anyopaque, self)) return error.Corrupt;
+        if (n != 0) {
+            if (out.len + n > out.slots.len) return error.Corrupt;
+            var tokens: door_mod.Tokens = .{};
+            self.door.enter(set[0..n], me, &tokens) catch |e| return switch (e) {
+                error.SlotBusy => error.SlotBusy,
+                error.SlotMoved => error.SlotMoved,
+                error.Deferred => error.Deferred,
+                error.Io => error.Io,
+                error.Corrupt => error.Corrupt,
+                error.OutOfMemory => error.OutOfMemory,
+            };
+            if (out.isHeld()) {
+                @memcpy(out.slots[out.len..][0..tokens.len], tokens.slots[0..tokens.len]);
+                out.len += tokens.len;
+            } else out.* = .{ .ctx = self, .release_fn = doorReleaseFn, .slots = tokens.slots, .len = tokens.len };
+        }
+        if (self.armed and self.memo != null) {
+            const now = clock.monotonicNs();
+            const m = self.memoView();
+            for (parents[0..np]) |p| _ = handover.creditAncestors(self.table, m, route_table.globalOfEffective(p), out.slots[0..out.len], now, self.t_idle_ns);
+        }
+    }
+
+    /// The door for `slot` BEFORE a committer's staging reads (decision
+    /// 0003 §CQ): admitted, this mount leases the slot and its tree is in
+    /// place (the install publishes the word last), and no release of the
+    /// slot completes its drain while the token is out — so what the reads
+    /// find is the holder's and stays so until the tx's terminal outcome
+    /// (the token rides `KvTx.door` into the entry). Refused like a commit:
+    /// `SlotBusy` (another appender's), `SlotMoved` (left the volume),
+    /// `Deferred` (the first touch).
+    pub fn enterSlot(self: *Plane, slot: u16, out: *tx.DoorTokens) conveyor.DoorError!void {
+        std.debug.assert(!out.isHeld());
         var tokens: door_mod.Tokens = .{};
-        self.door.enter(set[0..n], me, &tokens) catch |e| return switch (e) {
+        self.door.enter(&.{slot}, self.me, &tokens) catch |e| return switch (e) {
             error.SlotBusy => error.SlotBusy,
             error.SlotMoved => error.SlotMoved,
             error.Deferred => error.Deferred,
@@ -435,11 +474,6 @@ pub const Plane = struct {
             error.OutOfMemory => error.OutOfMemory,
         };
         out.* = .{ .ctx = self, .release_fn = doorReleaseFn, .slots = tokens.slots, .len = tokens.len };
-        if (self.armed and self.memo != null) {
-            const now = clock.monotonicNs();
-            const m = self.memoView();
-            for (parents[0..np]) |p| _ = handover.creditAncestors(self.table, m, route_table.globalOfEffective(p), set[0..n], now, self.t_idle_ns);
-        }
     }
 
     /// The subtree memo over the filesystem's parent map: global inos,
@@ -857,10 +891,10 @@ pub const Plane = struct {
     /// first touch's install opens the grant's root or mints the virgin).
     pub fn mayMintAtCommit(self: *Plane, slot: u16) bool {
         if (!self.armed) return true;
-        const v = self.table.view(slot);
-        if (v.leasedBy(self.me)) return true;
-        if (self.joined != null or v.state != .unleased) return false;
-        const to = self.table.reservedFor(slot, clock.monotonicNs()) orelse return true;
+        const rv = self.table.viewReserved(slot, clock.monotonicNs());
+        if (rv.view.leasedBy(self.me)) return true;
+        if (self.joined != null or rv.view.state != .unleased) return false;
+        const to = rv.reserved orelse return true;
         return to == self.me;
     }
 

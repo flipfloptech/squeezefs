@@ -6149,6 +6149,9 @@ pub const MemStore = struct {
         self.gpa.destroy(t);
     }
 
+    /// No door: every slot is this store's.
+    pub fn enterDoor(_: *MemStore, _: u16, _: *tx.DoorTokens) StoreError!void {}
+
     /// Apply, then drop the guards with the tx (the terminal outcome).
     pub fn commit(self: *MemStore, t: *tx.KvTx) StoreError!void {
         defer self.abandon(t);

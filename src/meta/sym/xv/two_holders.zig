@@ -83,6 +83,15 @@ pub const HolderStore = struct {
         return self.mem.begin(site);
     }
 
+    /// The door before a holder's reads: a slot this holder does not lease
+    /// refuses `SlotBusy`, as its commit would.
+    pub fn enterDoor(self: *HolderStore, slot: u16, _: *tx.DoorTokens) StoreError!void {
+        if (!self.leases(slot)) {
+            self.refusals += 1;
+            return error.SlotBusy;
+        }
+    }
+
     pub fn abandon(self: *HolderStore, t: *tx.KvTx) void {
         self.mem.abandon(t);
     }

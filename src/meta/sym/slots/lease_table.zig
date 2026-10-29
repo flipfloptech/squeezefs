@@ -393,11 +393,14 @@ pub const LeaseTable = struct {
         const v = self.view(slot);
         if (v.state != .unleased) return .{ .refused = .{ .holder = v.holder, .g = v.g, .state = v.state, .dead = v.dead } };
         const c = try self.coldOf(slot);
-        if (c.offer_expires_ns != 0) self.dropStand(c);
         try self.addHeld(holder, slot);
         const g = v.g +% 1;
         self.cells[slot].g.store(g, .release);
         self.storeWord(slot, .leased, holder, false, rotor);
+        // A kept stand ends AFTER the word names the grantee: a latch-free
+        // reader that finds the stand gone re-reads the word and sees the
+        // grant (`viewReserved`; `stand_model.zig`, `stand_before_word`).
+        if (c.offer_expires_ns != 0) self.dropStand(c);
         return .{ .granted = g };
     }
 
@@ -494,6 +497,31 @@ pub const LeaseTable = struct {
         }
         return if (c.offered_to != 0) c.offered_to else null;
     }
+
+    /// The word and, for an UNLEASED slot, the accepter it is reserved for,
+    /// as ONE pair a latch-free reader may act on (decision 0003 §CQ.3):
+    /// the word, then the stand, then — no stand found — the word again,
+    /// judged afresh if it moved. The release counts its stand before the
+    /// word reads unleased and the grant names its grantee before the
+    /// stand ends, so a reader never reads a handover's slot as free
+    /// between the two (`stand_model.zig`; one read of the word answered
+    /// "unleased, reserved for nobody" inside the accepter's grant — the
+    /// manager's resolver called the slot its own, and `ResolveSlot` told
+    /// the accepter so).
+    pub fn viewReserved(self: *LeaseTable, slot: u16, now_ns: u64) ReservedView {
+        var v = self.view(slot);
+        while (true) {
+            if (v.state != .unleased) return .{ .view = v };
+            if (self.reservedFor(slot, now_ns)) |to| return .{ .view = v, .reserved = to };
+            // Unchanged across the stand's read: the slot was free. Else a
+            // transition landed between the reads — judged afresh.
+            const again = self.view(slot);
+            if (again.state == v.state and again.holder == v.holder and again.g == v.g) return .{ .view = v };
+            v = again;
+        }
+    }
+
+    pub const ReservedView = struct { view: View, reserved: ?AppenderId = null };
 
     /// A recovered slot is held from writes until `until_ns` (monotonic):
     /// a member may still serve the dead holder's cached token until its
@@ -598,14 +626,18 @@ pub const LeaseTable = struct {
         if (g != v.g) return .refused;
         if (v.state == .unleased) return .already;
         if (v.holder != holder) return .refused;
+        const c = try self.coldOf(slot);
         self.dropHeld(holder, slot);
         self.lease_seq += 1;
-        const c = try self.coldOf(slot);
         c.words = words;
         c.last_written = self.lease_seq;
         c.handover_at_ns = now_ns;
+        // The kept stand is counted BEFORE the word reads unleased: a
+        // latch-free reader that sees `unleased` sees the count, so a slot
+        // reserved for its accepter never reads as free (`viewReserved`;
+        // `stand_model.zig`, `count_after_word`).
+        if (c.offered_to != 0 and c.offer_expires_ns != 0) _ = self.stands.fetchAdd(1, .seq_cst);
         self.storeWord(slot, .unleased, MANAGER, false, false);
-        if (c.offered_to != 0 and c.offer_expires_ns != 0) _ = self.stands.fetchAdd(1, .release);
         return .released;
     }
 

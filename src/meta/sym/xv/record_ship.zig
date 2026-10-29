@@ -525,11 +525,12 @@ pub fn RecordShipService(comptime Store: type) type {
             }
             const a = &self.plane.apply;
             const k = route_table.effectiveIno(global);
-            var v = (a.readInode(global) catch return error.Io) orelse return error.Io;
             // The explicit flip COMMAND shipped to the holder (`setfattr -n
             // user.squeezefs.stripes -v K` from a non-holder): the striping
-            // face runs it; the reply is the directory's folded record.
+            // face runs it (its own intents, each under its own doors); the
+            // reply is the directory's folded record.
             if (call == .setxattr and std.mem.eql(u8, call.setxattr.name, stripe.COMMAND_XATTR)) {
+                const before = (a.readInode(global) catch return error.Io) orelse return error.Io;
                 const face = self.plane.striping orelse return error.Rejected;
                 face.flip(face.ctx, global, stripe.clampExplicitK(call.setxattr.value, self.plane.stripe_k)) catch |e| return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
@@ -540,11 +541,27 @@ pub fn RecordShipService(comptime Store: type) type {
                     else => error.Io,
                 };
                 stats.record_served.inc();
-                return .{ .inode = (a.readInode(global) catch return error.Io) orelse v };
+                return .{ .inode = (a.readInode(global) catch return error.Io) orelse before };
             }
-            const t = a.store.begin(@src()) catch return error.OutOfMemory;
+            // The record is read AS ITS HOLDER's only under the slot's door
+            // token, held to the entry's terminal outcome (decision 0003
+            // §CQ): a moved slot's forgotten tree reads as no record (an
+            // EIO and the merits tripwire), and an answer that commits
+            // nothing (an atime no-op, an absent xattr) meets no door.
+            var door = a.enterDoor(route_table.slotOf(global)) catch |e| return switch (e) {
+                error.SlotBusy => error.SlotMoved,
+                error.Deferred => error.Deferred,
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Io,
+            };
+            const t = a.store.begin(@src()) catch {
+                door.release();
+                return error.OutOfMemory;
+            };
+            t.door = door;
             var owned = true;
             errdefer if (owned) a.store.abandon(t);
+            var v = (a.readInode(global) catch return error.Io) orelse return error.Io;
             const now: u64 = @bitCast(clock.realtimeCoarseNs());
             switch (call) {
                 .setattr => |s| if (s.atime_touch) {

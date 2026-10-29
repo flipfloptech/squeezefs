@@ -100,7 +100,7 @@ pub const Rider = union(enum) {
 
 pub fn assertStore(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "StoreError", "coreError", "begin", "abandon", "commit", "lookup", "range", "fsync", "nameKey" }) |name| {
+        for ([_][]const u8{ "StoreError", "coreError", "begin", "abandon", "commit", "enterDoor", "lookup", "range", "fsync", "nameKey" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not an xv Store: lacks `" ++ name ++ "`");
         }
     }
@@ -232,24 +232,51 @@ pub fn Applier(comptime Store: type) type {
 
         // ---- the apply ----
 
+        /// The door token of `slot`, taken before a read this store answers
+        /// AS THE SLOT'S HOLDER (decision 0003 §CQ): a refusal is the
+        /// retryable `SlotBusy` / `Deferred`.
+        pub fn enterDoor(self: *Self, slot: u16) Error!tx.DoorTokens {
+            var door: tx.DoorTokens = .none;
+            self.store.enterDoor(slot, &door) catch |e| return storeErr(e);
+            return door;
+        }
+
         /// Apply `step` under the caller's guards (`guards` travels into
         /// the entry; `.none` when the op's set is held elsewhere), with
         /// the rider beside it. `now` stamps the parent updates.
+        ///
+        /// The witness is judged under the step slot's DOOR TOKEN, taken
+        /// before it is read and held to the entry's terminal outcome
+        /// (decision 0003 §CQ): a lease check alone is a snapshot, and a
+        /// declined effect (`already_applied`, `foreign_skipped`) commits
+        /// nothing, so no door would ever refuse a verdict read off a tree
+        /// this mount no longer holds — a moved slot's forgotten tree reads
+        /// as "no parent" (a create's EEXIST) or "no name" (an unlink that
+        /// removed nothing). Refused at the door: `SlotBusy`, the
+        /// dispatcher's re-resolve.
         pub fn apply(self: *Self, step: Step, rider: Rider, guards: tx.GuardSet, now: u64) Error!Outcome {
-            const t = self.store.begin(@src()) catch return error.OutOfMemory;
+            var held = guards;
+            var door = self.enterDoor(route_table.slotOf(step.homeIno())) catch |e| {
+                held.release();
+                return e;
+            };
+            const t = self.store.begin(@src()) catch {
+                door.release();
+                held.release();
+                return error.OutOfMemory;
+            };
+            t.door = door;
+            t.holdGuards(held);
             var owned = true;
             errdefer if (owned) self.store.abandon(t);
             const out = try self.stageStep(t, step, now);
             try stageRider(t, rider);
+            owned = false;
             if (t.isEmpty()) {
-                // Nothing to commit: the witness declined and no rider.
-                owned = false;
-                var g = guards;
-                g.release();
+                // Nothing to commit: the witness declined (under the door)
+                // and no rider.
                 self.store.abandon(t);
             } else {
-                t.holdGuards(guards);
-                owned = false;
                 self.store.commit(t) catch |e| return storeErr(e);
             }
             switch (out.status) {

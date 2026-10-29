@@ -12184,6 +12184,40 @@ test "smoke: THE UNLINK STORM'S INODE LAW (the mdtest row: ONE of 640,033 unlink
     }
 }
 
+/// The `N/M extents free` of the mount line at or after `from` in `text`.
+fn mountedFreeExtents(text: []const u8, from: usize) ?u64 {
+    const i = std.mem.indexOfPos(u8, text, from, "mounted — ") orelse return null;
+    const line_end = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse text.len;
+    const trees = std.mem.indexOf(u8, text[i..line_end], " trees, ") orelse return null;
+    return numberAfter(text[i + trees ..][0 .. line_end - i - trees], " trees, ");
+}
+
+test "smoke: A CLEAN REMOUNT GIVES BACK ITS BITMAP PAGES (the full metadata volume's root cause: every mount of a symmetric set held one heap extent per data volume for its KVDA allocation-bitmap pages and its clean stop released the allocation lease — the record naming them — without freeing them, so the heap lost them for good: 152 → 150 → 148 … free extents per remount of an EMPTY set, a full set below its compaction floor in four remounts) — format (two data volumes), five mount → umount cycles: every mount line names the free extents the first one did; fsck --offline --scrub 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    var first: ?u64 = null;
+    var seen: [5]u64 = undefined;
+    for (&seen) |*free| {
+        // The log exists from the first spawn on.
+        const mark = rig.logLen() catch 0;
+        try rig.spawnMount(&.{});
+        _ = try rig.awaitReady(mark);
+        try rig.umount();
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        free.* = mountedFreeExtents(text, mark) orelse return error.NoMountLine;
+        if (first == null) first = free.*;
+    }
+    std.debug.print("\nsmoke[remount heap]: free extents at each mount {any}\n", .{seen});
+    for (seen) |free| try testing.expectEqual(first.?, free);
+    _ = try fsckClean(rig, "five clean remounts");
+}
+
 /// Kernel aio (the raw `io_setup`/`io_submit`/`io_getevents` syscalls — no
 /// shim, no libaio) against `path` on a mount: `n` PWRITEs of one 4 KiB
 /// page each in ONE `io_submit` (offsets `0, 4 KiB, …`: a fresh file's

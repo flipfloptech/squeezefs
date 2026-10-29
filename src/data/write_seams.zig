@@ -705,12 +705,12 @@ test "volumes: ordinal and tag lookups; candidates are the active allocators" {
     try testing.expectEqual(a, v.candidates(&out)[0]);
 }
 
-test "the data path's failure lines follow the set's one-line law through its seam: no seam (a bare fixture) logs every line; a healthy latch logs every line; once FAILED each data-path class logs its first line and the rest are counted, not logged" {
+test "the data path's failure lines follow the set's one-line law through its seam: no seam (a bare fixture) logs every line; a healthy latch logs every line (the in-place DMA class: its first — one per mount); once FAILED each data-path class logs its first line and the rest are counted, not logged" {
     var v: Volumes = .{};
     for (0..3) |_| try testing.expect(v.admitsLine(.fsync_leg));
     var latch: journal.FailureLatch = .{};
     v.lines = latch.lineSeam();
-    for (0..3) |_| try testing.expect(v.admitsLine(.inplace_dma));
+    try testing.expect(v.admitsLine(.inplace_dma));
     try testing.expect(latch.failStop());
     const quieted0 = journal.meta_failed_volume_lines_quieted.load();
     const n_ops = 40;

@@ -1189,7 +1189,8 @@ pub var replay_dropped_after_clean_unmount: counters.Tripwire = .init("journal_r
 /// Checkpoints past a journal hole that could not cover it (the lane's
 /// post-failure and post-isolation covers, the conveyor's abandon arm).
 pub var meta_kv_journal_hole_checkpoint_failures: counters.ShardedCounter = .{};
-/// Failure lines a FAILED volume kept out of the log (`FailureLatch.admitsLine`);
+/// Failure lines a FAILED volume kept out of the log (`FailureLatch.admitsLine`),
+/// and every repeat of a once-per-mount class (`LogClass.oncePerMount`);
 /// each failure is still counted by its class's own counter.
 pub var meta_failed_volume_lines_quieted: counters.ShardedCounter = .{};
 
@@ -1298,6 +1299,14 @@ pub const FailureLatch = struct {
         edge_seed_read,
         staged_payload_lost,
         block_map_commit,
+
+        /// Classes that log ONE line per mount whether or not the set
+        /// latched: a failing data device answers every in-place write
+        /// the same way, and before the set's latch (or racing it) each
+        /// failed DMA logged its line — ≈ 115 per writer ino.
+        pub fn oncePerMount(self: LogClass) bool {
+            return self == .inplace_dma;
+        }
     };
 
     /// The one-line law (`LineMarks.admits`) over this volume's latch.
@@ -1332,7 +1341,8 @@ pub const FailureLatch = struct {
             // (paired with the latch's AcqRel swap): a class that logged
             // while healthy finds its bit set once FAILED.
             const prior = self.logged.fetchOr(bit, .acq_rel);
-            if (!owner.isFailed() or prior & bit == 0) return true;
+            if (prior & bit == 0) return true;
+            if (!class.oncePerMount() and !owner.isFailed()) return true;
             meta_failed_volume_lines_quieted.inc();
             return false;
         }

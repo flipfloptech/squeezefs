@@ -145,8 +145,10 @@ pub const Outcome = conveyor.Outcome;
 pub const Error = conveyor.Error;
 
 /// Why a mount refused (loud, typed; each name maps onto the ONE errno
-/// table through `openCoreError`).
-pub const OpenError = error{
+/// table through `openCoreError`). A bring-up step's own class — a tree's,
+/// the journal's, the store's, the checkpoint cycle's — refuses the mount
+/// AS ITSELF (decision 0003 §CS).
+pub const OpenError = Error || checkpoint_cycle.CycleError || error{
     /// Layer A: another writer holds the flock; layer B2: a live (or, on a
     /// non-PR substrate, a stale) foreign writer claim.
     Busy,
@@ -181,6 +183,9 @@ pub fn openCoreError(e: OpenError) errors.Error {
         error.Corrupt, error.Io, error.LaneSpawnFailed, error.ThreadSpawnFailed => error.InputOutput,
         error.InvalidIdentity => error.InvalidArgument,
         error.OutOfMemory => error.OutOfMemory,
+        // A bring-up step's own class (the store's, the cycle's): the mount
+        // is broken — EIO, the line names the class.
+        else => error.InputOutput,
     };
 }
 
@@ -364,7 +369,9 @@ pub const FormatOptions = struct {
     control_records: []const record.RecordRef = &.{},
 };
 
-pub const FormatError = error{ DeviceRefused, Io, OutOfMemory, Corrupt, VolumeTooSmall, InvalidNodeSize, InvalidJournalOverride, CannotStat, NotADeviceOrFile, Unexpected };
+/// The image plan's own classes as themselves (`format.FormatError`;
+/// decision 0003 §CS), the device's and the registration's.
+pub const FormatError = format.FormatError || error{ DeviceRefused, Io, OutOfMemory, Corrupt, CannotStat, NotADeviceOrFile, Unexpected };
 
 /// `squeezefs format`: register the device (O_DIRECT from the first byte),
 /// plan the image, write the steps with their barriers in the plan's
@@ -389,12 +396,9 @@ pub fn formatVolume(gpa: Allocator, path: []const u8, opts: FormatOptions) Forma
         .member_count = opts.member_count,
         .stamp_override = opts.stamp_override,
         .control_records = opts.control_records,
-    }, &diag) catch |e| return switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.VolumeTooSmall => error.VolumeTooSmall,
-        error.InvalidNodeSize => error.InvalidNodeSize,
-        error.InvalidJournalOverride => error.InvalidJournalOverride,
-        else => error.Corrupt,
+    }, &diag) catch |e| {
+        log.err("format {s}: the image plan failed ({s})", .{ path, @errorName(e) });
+        return e;
     };
     defer plan.deinit();
     try dev.writeSteps(plan.steps);
@@ -672,11 +676,7 @@ pub const KvBackend = struct {
         // names without a published root), then the window replays again
         // through the complete routing — idempotent by replay's exact gate.
         for (be.mounted.tree_roots) |r| {
-            const t = KvTree.openFromLedger(gpa, be.cache, &be.mounted, r.id, &be.seq) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Io => return error.Io,
-                else => return error.Corrupt,
-            };
+            const t = try KvTree.openFromLedger(gpa, be.cache, &be.mounted, r.id, &be.seq);
             errdefer t.destroy();
             be.seq.raiseTo(r.node_seq);
             try trees.append(gpa, t);
@@ -688,11 +688,7 @@ pub const KvBackend = struct {
             for (be.trees.load()) |t| t.destroy();
             be.trees.deinit();
         }
-        _ = tree.replayEntries(gpa, be.trees.load(), recovery.entries) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Io => return error.Io,
-            else => return error.Corrupt,
-        };
+        _ = try tree.replayEntries(gpa, be.trees.load(), recovery.entries);
         be.openGuestTrees(recovery.entries, &be.alloc) catch |e| switch (e) {
             error.RootStale => return error.Corrupt,
             else => |x| return x,
@@ -701,11 +697,7 @@ pub const KvBackend = struct {
             be.guest_published.deinit(gpa);
             be.guest_cursor_floors.deinit(gpa);
         }
-        _ = tree.replayEntries(gpa, be.trees.load(), recovery.entries) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Io => return error.Io,
-            else => return error.Corrupt,
-        };
+        _ = try tree.replayEntries(gpa, be.trees.load(), recovery.entries);
         var content_records: u64 = 0;
         for (recovery.entries) |e| {
             var it = e.records();
@@ -881,7 +873,7 @@ pub const KvBackend = struct {
         precovered catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Io => return error.Io,
-            else => return be.bringUpRefused("the bring-up checkpoint of the replayed window", e),
+            else => |other| return be.bringUpRefused("the bring-up checkpoint of the replayed window", other),
         };
         try be.guard.?.commit();
         be.gate_ns = clock.monotonicNs() - t_gate;
@@ -891,7 +883,7 @@ pub const KvBackend = struct {
         covered catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Io => return error.Io,
-            else => return be.bringUpRefused("the bring-up checkpoint after the writer claim", e),
+            else => |other| return be.bringUpRefused("the bring-up checkpoint after the writer claim", other),
         };
         // The symmetric plane: the D0 winner IS the manager (charter §5.7)
         // — region 0 goes Live with `is_manager` under this identity, the
@@ -909,7 +901,7 @@ pub const KvBackend = struct {
             joined catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Io => return error.Io,
-                else => return be.bringUpRefused("the checkpoint that makes the manager's join durable", e),
+                else => |other| return be.bringUpRefused("the checkpoint that makes the manager's join durable", other),
             };
         }
         be.test_ckpt_error_logs = opts.test_ckpt_error_logs;
@@ -927,10 +919,11 @@ pub const KvBackend = struct {
     }
 
     /// The open's cycle refused for a reason no device line names: the
-    /// mount's refusal says "see the log", so the log says which cycle.
-    fn bringUpRefused(be: *const KvBackend, what: []const u8, e: anyerror) OpenError {
+    /// mount's refusal says "see the log", so the log says which cycle and
+    /// the refusal carries its class (decision 0003 §CS).
+    fn bringUpRefused(be: *const KvBackend, what: []const u8, e: checkpoint_cycle.CycleError) OpenError {
         log.err("meta volume {s}: {s} failed ({s}) — the volume is refused", .{ be.path, what, @errorName(e) });
-        return error.Corrupt;
+        return e;
     }
 
     const ClassifiedSuperblock = struct { sb: superblock.Superblock, next_generation: u64 };
@@ -1276,7 +1269,7 @@ pub const KvBackend = struct {
         first catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Io => return error.Io,
-            else => return error.Corrupt,
+            else => |other| return be.bringUpRefused("the first checkpoint cycle", other),
         };
         be.test_ckpt_error_logs = opts.test_ckpt_error_logs;
         be.ckpt_thread = std.Thread.spawn(.{}, ckptMain, .{be}) catch return error.ThreadSpawnFailed;
@@ -1565,11 +1558,7 @@ pub const KvBackend = struct {
     fn openControlProjection(be: *KvBackend) OpenError!void {
         for (be.mounted.tree_roots) |r| {
             if (r.id != .control) continue;
-            const t = KvTree.openFromLedger(be.gpa, be.cache, &be.mounted, r.id, &be.seq) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Io => return error.Io,
-                else => return error.Corrupt,
-            };
+            const t = try KvTree.openFromLedger(be.gpa, be.cache, &be.mounted, r.id, &be.seq);
             errdefer t.destroy();
             try be.trees.add(t);
             return;
@@ -1657,17 +1646,9 @@ pub const KvBackend = struct {
         defer cache.deinit();
         cache.setDurableTail(rec.journal_tail_seq);
         var seq = node_seq.NodeSeqHandle.shared(rec.node_seq_watermark);
-        const t = KvTree.openFromLedger(gpa, cache, rec, .control, &seq) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            else => error.Corrupt,
-        };
+        const t = try KvTree.openFromLedger(gpa, cache, rec, .control, &seq);
         defer t.destroy();
-        return t.lookup(gpa, k) catch |e| switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            else => error.Corrupt,
-        };
+        return t.lookup(gpa, k);
     }
 
     /// A one-record read needs the control tree's root and one leaf: the
@@ -1883,9 +1864,9 @@ pub const KvBackend = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.JournalReserveExhausted => {
                 log.err("meta volume {s}: the recovered journal head stands mid-sector and the ring admits not even its pad — refusing the mount (the checkpoint-cycle deferral of the pad lands with the covering loop)", .{be.path});
-                return error.Corrupt;
+                return error.JournalReserveExhausted;
             },
-            else => return error.Corrupt,
+            else => |other| return other,
         }) orelse return;
         defer plan.deinit();
         var landed = true;
@@ -2133,14 +2114,12 @@ pub const KvBackend = struct {
         be.cp.barrierLanded(ticket);
     }
 
-    fn mapSubmitError(e: journal_lane.Error) Error {
+    fn mapSubmitError(e: journal_lane.SubmitError) Error {
         return switch (e) {
             error.VolumeFailed => error.VolumeFailed,
             error.LaneStopped => error.VolumeClosed,
             error.LaneQueueFull => error.ConveyorFull,
-            error.OutOfMemory => error.OutOfMemory,
-            error.HoleCheckpointFailed => error.HoleCheckpointFailed,
-            else => error.Corrupt,
+            error.UnalignedDirectWrite => error.UnalignedDirectWrite,
         };
     }
 
@@ -2516,11 +2495,7 @@ pub const KvBackend = struct {
         var walked: u64 = 0;
         for (be.trees.load()) |t| {
             extents.clearRetainingCapacity();
-            be.collectTreeExtents(t, &extents) catch |e| return switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.Io => error.Io,
-                else => error.Corrupt,
-            };
+            try be.collectTreeExtents(t, &extents);
             walked += extents.items.len;
             var adopted: usize = 0;
             for (extents.items) |ext| adopted += @intFromBool(alloc.adoptLive(ext));
@@ -2657,7 +2632,7 @@ pub const KvBackend = struct {
                 log.err("meta volume {s}: no heap extent for slot {d}'s first tree (heap full)", .{ be.path, slot });
                 return error.Io;
             },
-            else => return error.Corrupt,
+            else => |other| return other,
         };
         errdefer t.destroy();
         // Its records are this commit's and later: none sits under the head.
@@ -2695,10 +2670,7 @@ pub const KvBackend = struct {
         const gate = try be.writeSlotStateEntry(slot, null);
         be.smo_lock.lockUncancelable(be.io);
         defer be.smo_lock.unlock(be.io);
-        for (extents.items) |ext| be.smo_ctx.freePending(ext, gate, true) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.Corrupt,
-        };
+        for (extents.items) |ext| try be.smo_ctx.freePendingForced(ext, gate);
         _ = be.guest_published.remove(slot);
     }
 
@@ -2713,30 +2685,19 @@ pub const KvBackend = struct {
         const Frame = struct { addr: u64, level: u8 };
         var stack: std.ArrayList(Frame) = .empty;
         defer stack.deinit(gpa);
-        const root_level = t.rootLevel() catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            else => error.Corrupt,
-        };
+        const root_level = try t.rootLevel();
         try stack.append(gpa, .{ .addr = t.rootPtr().addr, .level = root_level });
         while (stack.pop()) |f| {
             try out.append(gpa, be.cache.addrExtent(f.addr));
             if (f.level == 0) continue;
-            const n = t.getNode(f.addr) catch |e| return switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.Io => error.Io,
-                else => error.Corrupt,
-            };
+            const n = try t.getNode(f.addr);
             defer n.release();
             if (n.level != f.level) return error.Corrupt;
             const snap = n.snapshotLoad();
             defer snap.release();
             var pos = key.KeyBuf.fromSlice("");
             while (true) {
-                var live = (snap.value.nextLive(gpa, pos.slice(), null) catch |e| return switch (e) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    else => error.Corrupt,
-                }) orelse break;
+                var live = (try snap.value.nextLive(gpa, pos.slice(), null)) orelse break;
                 defer live.deinit();
                 const iv = key.InteriorValue.decode(live.value) catch return error.Corrupt;
                 try stack.append(gpa, .{ .addr = iv.childAddr(), .level = f.level - 1 });
@@ -2754,11 +2715,7 @@ pub const KvBackend = struct {
         defer stack.deinit(gpa);
         try stack.append(gpa, t.rootPtr().addr);
         while (stack.pop()) |addr| {
-            const n = t.getNode(addr) catch |e| return switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.Io => error.Io,
-                else => error.Corrupt,
-            };
+            const n = try t.getNode(addr);
             defer n.release();
             if (n.level == 0) {
                 n.lock.lockSharedUncancelable(be.io);
@@ -2771,10 +2728,7 @@ pub const KvBackend = struct {
             defer snap.release();
             var pos = key.KeyBuf.fromSlice("");
             while (true) {
-                var live = (snap.value.nextLive(gpa, pos.slice(), null) catch |e| return switch (e) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    else => error.Corrupt,
-                }) orelse break;
+                var live = (try snap.value.nextLive(gpa, pos.slice(), null)) orelse break;
                 defer live.deinit();
                 const iv = key.InteriorValue.decode(live.value) catch return error.Corrupt;
                 try stack.append(gpa, iv.childAddr());
@@ -2789,11 +2743,7 @@ pub const KvBackend = struct {
     /// homes, the overflow law — `slots/plane.zig` `publishBeforeTail`);
     /// the UNLEASED trees stay the manager's structural custody here.
     fn publishGuestRoots(be: *KvBackend) checkpoint_cycle.CycleError!void {
-        if (be.slots.armed) be.slots.publishBeforeTail() catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Corrupt => error.Corrupt,
-            else => error.Io,
-        };
+        if (be.slots.armed) try be.slots.publishBeforeTail();
         for (be.trees.load()) |t| {
             // A joiner's leased roots went over the wire above; an unleased
             // tree it still holds (a release between the table word and
@@ -2813,12 +2763,10 @@ pub const KvBackend = struct {
                     log.debug("meta volume {s}: slot {d}'s root publish deferred (the checkpoint class is full)", .{ be.path, slot });
                     continue;
                 },
-                else => return switch (e) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    error.VolumeFailed => error.VolumeFailed,
-                    error.Io, error.JournalWriteFailed => error.Io,
-                    else => error.Corrupt,
-                },
+                // The journal write's failure is the device's; every other
+                // class fails the cycle as itself (decision 0003 §CS).
+                error.JournalWriteFailed => return error.Io,
+                else => |other| return other,
             };
             try be.guest_published.put(be.gpa, slot, root);
         }
@@ -2885,7 +2833,7 @@ pub const KvBackend = struct {
         const value: []const u8 = if (state) |st| &slot_state.encode(st) else &.{};
         const kind: record.RecordKind = if (state != null) .put else .delete;
         var frames = [_]journal.RecordFrame{.{ .tag = key.tagFor(key.TREE_CONTROL, 0), .key = k, .kind = @fromBackingInt(@intCast(@backingInt(kind))), .seq = 0, .value = value }};
-        const len = journal.entryLenFor(&frames) catch return error.Corrupt;
+        const len = try journal.entryLenFor(&frames);
         if (test_seams.refuse_guest_publish) return error.ConveyorFull;
         const adm = be.core.tryAdmit(len, .checkpoint) orelse return error.ConveyorFull;
         var st: StampCtx = .{ .j = &be.smo_journal, .adm = adm };
@@ -2893,20 +2841,12 @@ pub const KvBackend = struct {
         while (attempt < node.RETRY_BUDGET) : (attempt += 1) {
             const leaf = control.resolveLeaf(k) catch |e| {
                 be.core.release(adm);
-                return switch (e) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    error.Io => error.Io,
-                    else => error.Corrupt,
-                };
+                return e;
             };
             defer leaf.release();
             const outcome = control.applyAtSeqClass(leaf, k, kind, value, .{ .reserve = .{ .ctx = &st, .stamp = StampCtx.stamp } }, true) catch |e| {
                 be.core.release(adm);
-                return switch (e) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    error.Io => error.Io,
-                    else => error.Corrupt,
-                };
+                return e;
             };
             switch (outcome) {
                 .applied => {
@@ -2920,7 +2860,7 @@ pub const KvBackend = struct {
         }
         be.core.release(adm);
         log.err("meta volume {s}: the slot_state entry for slot {d} exhausted its lock-revalidate budget (SMO protocol bug)", .{ be.path, slot });
-        return error.Corrupt;
+        return error.RetryBudgetExhausted;
     }
 
     /// Mint a local ino in routing slot `slot`: the native watermark on
@@ -3007,25 +2947,10 @@ pub const KvBackend = struct {
         return tree.routeContent(be.trees.load(), kind, k);
     }
 
-    /// A tree read's error onto the store's. `WouldBlock` is the try-only
-    /// contract (decision 0003 §AB.1: `node_cache.try_only` met a leaf the
-    /// cache does not hold, or an SMO window it will not wait out) and
-    /// must stay itself: the caller re-asks blocking or defers — a FORGET
-    /// whose corpse judgement read `Corrupt` instead judged the inode
-    /// live and lost its corpse until the next mount's sweep.
-    pub fn readError(e: tree.Error) Error {
-        return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            error.WouldBlock => error.WouldBlock,
-            else => error.Corrupt,
-        };
-    }
-
     /// Point lookup through the tree (latch-free); an owned copy.
     pub fn lookup(be: *KvBackend, gpa: Allocator, kind: u8, k: []const u8) Error!?[]u8 {
         const t = be.treeForKey(kind, k) orelse return error.Corrupt;
-        return t.lookup(gpa, k) catch |e| readError(e);
+        return t.lookup(gpa, k);
     }
 
     /// Range scan over `[start, end]` of one kind; both bounds route to the
@@ -3039,7 +2964,7 @@ pub const KvBackend = struct {
         if (kind == key.TREE_BLOCK_REFS) return be.rangeRefs(gpa, start, end, max, out);
         const t = be.treeForKey(kind, start) orelse return error.Corrupt;
         if (be.treeForKey(kind, end) != t) return error.Corrupt;
-        t.range(gpa, start, end, max, out) catch |e| return readError(e);
+        try t.range(gpa, start, end, max, out);
     }
 
     /// The refs range over every slot tree, PAGED soundly: each tree is
@@ -3054,7 +2979,7 @@ pub const KvBackend = struct {
         for (be.trees.load()) |t| {
             if (t.forest_slot == null) continue;
             const before = out.items.len;
-            t.range(gpa, start, end, max, out) catch |e| return readError(e);
+            try t.range(gpa, start, end, max, out);
             const got = out.items.len - before;
             if (got == max and max != std.math.maxInt(usize)) {
                 const last = out.items[out.items.len - 1].key;

@@ -107,7 +107,7 @@ const BackendSource = struct {
         return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => error.Corrupt,
+            else => |other| errors.narrow(table.SourceError, other, "smoke_linux.mapErr"),
         };
     }
 

@@ -33,6 +33,7 @@ const counters = @import("../../../core/counters.zig");
 const clock = @import("../../../core/clock.zig");
 const knobs = @import("../../../core/knobs.zig");
 const log = @import("../../../core/log.zig");
+const errors = @import("../../../core/errors.zig");
 const checkpoint = @import("../../checkpoint.zig");
 const backend = @import("../../backend.zig");
 const journal = @import("../../journal.zig");
@@ -231,7 +232,7 @@ pub const VolumeBinding = struct {
         return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io, error.JournalWriteFailed, error.VolumeFailed => error.Io,
-            else => error.Corrupt,
+            else => |other| errors.narrow(Error, other, "volume_bind.mapBackend"),
         };
     }
 
@@ -239,7 +240,7 @@ pub const VolumeBinding = struct {
         return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => error.Corrupt,
+            else => |other| errors.narrow(Error, other, "volume_bind.mapTree"),
         };
     }
 
@@ -824,7 +825,7 @@ pub const VolumeBinding = struct {
                     const leaf = resident orelse (t.getNode(f.addr) catch |e| return switch (e) {
                         error.OutOfMemory => error.OutOfMemory,
                         error.Io => error.Io,
-                        else => error.Corrupt,
+                        else => |other| errors.narrow(Error, other, "volume_bind.walkTree"),
                     });
                     defer leaf.release();
                     leaf.lock.lockSharedUncancelable(self.be.io);
@@ -837,7 +838,7 @@ pub const VolumeBinding = struct {
             const n = t.getNode(f.addr) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Io => error.Io,
-                else => error.Corrupt,
+                else => |other| errors.narrow(Error, other, "volume_bind.walkTree"),
             };
             defer n.release();
             const snap = n.snapshotLoad();
@@ -846,7 +847,7 @@ pub const VolumeBinding = struct {
             while (true) {
                 var live = (snap.value.nextLive(gpa, pos.slice(), null) catch |e| return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
-                    else => error.Corrupt,
+                    else => |other| errors.narrow(Error, other, "volume_bind.walkTree"),
                 }) orelse break;
                 defer live.deinit();
                 const iv = key.InteriorValue.decode(live.value) catch return error.Corrupt;

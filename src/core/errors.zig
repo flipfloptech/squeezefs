@@ -223,6 +223,38 @@ pub fn classOf(err: Error) Class {
     };
 }
 
+/// A decoder's verification failures: the only classes a layer reports as
+/// `Corrupt` (decision 0003 §CS).
+fn isVerificationFailure(comptime name: []const u8) bool {
+    for ([_][]const u8{ "Corrupt", "ChecksumMismatch", "CheckpointCoveredBsetAfterTear" }) |v| if (std.mem.eql(u8, v, name)) return true;
+    return false;
+}
+
+fn errorSetNames(comptime T: type) []const [:0]const u8 {
+    return @typeInfo(T).error_set.error_names orelse @compileError("an anyerror or inferred set has no names to carry: " ++ @typeName(T));
+}
+
+fn setNames(comptime T: type, comptime name: []const u8) bool {
+    for (errorSetNames(T)) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// `e` reported in a layer's closed vocabulary `Target` (decision 0003 §CS):
+/// itself when `Target` names it; a decoder's verification failure as
+/// `Corrupt`; any other class as `Io` — the vocabulary's "the layer below
+/// failed" — with a line that names it. Never a relabel to `Corrupt`.
+pub fn narrow(comptime Target: type, e: anytype, comptime what: []const u8) Target {
+    // Comptime name matching over sets of up to a few hundred names.
+    @setEvalBranchQuota(1_000_000);
+    inline for (comptime errorSetNames(@TypeOf(e))) |n| if (e == @field(anyerror, n)) {
+        if (comptime setNames(Target, n)) return @field(Target, n);
+        if (comptime isVerificationFailure(n)) return error.Corrupt;
+        log.warn(what ++ ": " ++ n ++ " — a class this layer does not name, reported as Io", .{});
+        return error.Io;
+    };
+    unreachable;
+}
+
 const Row = struct { e: linux.E, err: Error };
 
 /// THE errno table: the kernel errnos with a one-to-one error. Both
@@ -344,6 +376,16 @@ test "the move classes are exactly the wire's typed retryable answers (the syste
     for ([_]Error{ error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock, error.InputOutput, error.Busy, error.HolderUnresolved }) |e| try testing.expect(!isMoveClass(e));
     try testing.expectEqual(Class.terminal, classOf(error.HolderUnresolved));
     try testing.expectEqual(linux.E.IO, toErrno(error.HolderUnresolved));
+}
+
+test "narrow: a class the vocabulary names stays itself, a decoder's verification failure is Corrupt, any other class is Io — never Corrupt (decision 0003 §CS)" {
+    const Below = error{ OutOfMemory, Corrupt, ChecksumMismatch, Canceled, RetryBudgetExhausted };
+    const Layer = error{ Io, Corrupt, OutOfMemory };
+    try testing.expectEqual(error.OutOfMemory, narrow(Layer, @as(Below, error.OutOfMemory), "test"));
+    try testing.expectEqual(error.Corrupt, narrow(Layer, @as(Below, error.Corrupt), "test"));
+    try testing.expectEqual(error.Corrupt, narrow(Layer, @as(Below, error.ChecksumMismatch), "test"));
+    try testing.expectEqual(error.Io, narrow(Layer, @as(Below, error.Canceled), "test"));
+    try testing.expectEqual(error.Io, narrow(Layer, @as(Below, error.RetryBudgetExhausted), "test"));
 }
 
 test "an errno outside the table is Unexpected and replies EIO" {

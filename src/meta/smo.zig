@@ -522,17 +522,30 @@ pub const SmoContext = struct {
     /// unreachable on the serialized task (a second producer would be a
     /// protocol bug, surfaced typed). A recovery's hold takes a dead
     /// grant's extent first (`RetireHold`).
-    pub fn freePending(self: *SmoContext, extent: u64, gate_seq: u64, forced: bool) Error!void {
-        if (self.retire_hold) |h| if (h.take(extent)) return;
-        if (self.grant_holds) |g| if (!g.holds(g.ctx, extent)) {
-            stats.extent_grant_foreign_retirements.fire("a joiner's SMO retired an image its grant does not hold — kept allocated, never recycled into its pool");
-            return;
-        };
-        if (forced) return self.alloc.freePendingForced(extent, gate_seq);
+    pub fn freePending(self: *SmoContext, extent: u64, gate_seq: u64, forced: bool) error{ PendingFreeFull, OutOfMemory }!void {
+        if (forced) return self.freePendingForced(extent, gate_seq);
+        if (!self.retireOwned(extent)) return;
         self.alloc.freePending(extent, gate_seq) catch {
             self.last_refusal = .{ .pending_free_full = .{ .pending = self.alloc.pendingCount() } };
             return error.PendingFreeFull;
         };
+    }
+
+    /// `freePending`'s forced arm: the unbounded overflow never refuses.
+    pub fn freePendingForced(self: *SmoContext, extent: u64, gate_seq: u64) Allocator.Error!void {
+        if (!self.retireOwned(extent)) return;
+        return self.alloc.freePendingForced(extent, gate_seq);
+    }
+
+    /// Whether this context recycles `extent`: a recovery's hold takes a
+    /// dead grant's extent; a foreign image stays allocated.
+    fn retireOwned(self: *SmoContext, extent: u64) bool {
+        if (self.retire_hold) |h| if (h.take(extent)) return false;
+        if (self.grant_holds) |g| if (!g.holds(g.ctx, extent)) {
+            stats.extent_grant_foreign_retirements.fire("a joiner's SMO retired an image its grant does not hold — kept allocated, never recycled into its pool");
+            return false;
+        };
+        return true;
     }
 
     /// The §4.7 at-cap admission valve (producer-side headroom; sound for
@@ -1498,10 +1511,11 @@ pub const CheckpointSeam = struct {
             error.JournalReserveExhausted => .journal_reserve_exhausted,
             error.PendingFreeFull => .pending_free_full,
             error.NoSpace => if (self.ctx.grant_fed) .grant_exhausted else .no_space,
-            error.OutOfMemory => .{ .failed = .out_of_memory },
             // The device's classes: the cycle aborts and the tick retries.
-            error.Io, error.BarrierFailed => .{ .failed = .io },
-            else => .{ .failed = .corrupt },
+            error.BarrierFailed => .{ .failed = error.Io },
+            // Every other class as itself (decision 0003 §CS): a dropped
+            // write or a cancelled wait never reads as corruption.
+            else => |other| .{ .failed = other },
         };
         return .{ .replaced = .{ .images = self.ctx.images_written - before } };
     }

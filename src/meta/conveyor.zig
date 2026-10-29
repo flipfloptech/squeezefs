@@ -500,7 +500,10 @@ pub fn windowCap(window_cells: usize) usize {
 // Errors: the typed classes (survey §2.19) with ONE errno each.
 // ---------------------------------------------------------------------------
 
-pub const Error = error{
+/// A tree read's or apply's class and a journal encoder's reach the caller
+/// AS THEMSELVES (`tree.Error`, `journal.Error`; decision 0003 §CS): only a
+/// decoder's verification failure is `Corrupt`.
+pub const Error = tree.Error || journal.Error || error{
     /// The heap law refused the member's projected SMO (`ENOSPC`).
     NoSpace,
     /// A staged value above `min(64 KiB, node_size/4)` + envelope.
@@ -531,7 +534,7 @@ pub const Error = error{
     /// A try-only read (`node_cache.try_only`, decision 0003 §AB.1) met a
     /// node the cache does not hold: the caller asks again blocking.
     WouldBlock,
-    /// A routing/protocol inconsistency.
+    /// A routing/protocol inconsistency, or bytes a decoder refused.
     Corrupt,
     /// The lock-revalidate budget exhausted (an SMO protocol bug).
     RetryBudgetExhausted,
@@ -545,6 +548,9 @@ pub const Error = error{
     /// projected SMO: the manager dependency (EAGAIN; the cadence's refill
     /// owns the retry), never ENOSPC (charter §5.5 "Extent grants").
     GrantExhausted,
+    /// The lane refused a journal run off the device grain (its tripwire
+    /// fired): the daemon's bug, never the caller's.
+    UnalignedDirectWrite,
 };
 
 pub const ErrorClass = errors.Class;
@@ -569,6 +575,9 @@ pub fn coreError(e: Error) errors.Error {
         error.GrantExhausted => error.GrantExhausted,
         error.JournalWriteFailed, error.Io, error.Corrupt, error.RetryBudgetExhausted => error.InputOutput,
         error.WouldBlock => error.WouldBlock,
+        // The tree's own classes, carried as themselves (decision 0003 §CS):
+        // EIO, the reply `Corrupt` gave them.
+        error.ChecksumMismatch, error.CheckpointCoveredBsetAfterTear, error.NodeFull, error.FlightTableFull, error.Canceled, error.ReloadParent, error.RetiredExtent, error.InvalidKey, error.SpaceExhausted, error.InvalidRecord, error.MixedDeltaClasses, error.LayoutChainHeterogeneous, error.LayoutChainDivergent, error.LayoutBaseLegacyJson, error.LayoutBaseUndecodable, error.LayoutBaseIndirect, error.LayoutBaseKvmap, error.JournalReserveExhausted, error.RingOverrideInvalid, error.UnalignedDirectWrite => error.InputOutput,
     };
 }
 
@@ -586,18 +595,6 @@ fn mapBuildError(e: tx.BuildError) Error {
         error.EntryTooLarge => error.EntryTooLarge,
         error.ForestKeyRefused => error.ForestKeyRefused,
         error.OutOfMemory => error.OutOfMemory,
-    };
-}
-
-fn mapTreeError(e: tree.Error) Error {
-    return switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Io => error.Io,
-        error.RetryBudgetExhausted => error.RetryBudgetExhausted,
-        error.PartitionRefused => error.PartitionRefused,
-        error.ValueTooLarge => error.ValueTooLarge,
-        error.WouldBlock => error.WouldBlock,
-        else => error.Corrupt,
     };
 }
 
@@ -2765,7 +2762,7 @@ pub const Conveyor = struct {
                     }
                     if (phase == .apply) self.stats.resolve_descended.inc();
                     const t = self.treeFor(r.tree_id, r.key) orelse return error.Corrupt;
-                    break :blk t.resolveLeaf(r.key) catch |e| return mapTreeError(e);
+                    break :blk try t.resolveLeaf(r.key);
                 };
                 leaves[qi][ri] = leaf;
                 all[n] = leaf;
@@ -3386,10 +3383,7 @@ pub const Conveyor = struct {
         var ops: std.ArrayList(journal.WriteOp) = .empty;
         const encoded: Error!u64 = blk: {
             const frames = m.q.framesAlloc() catch break :blk error.OutOfMemory;
-            break :blk journal.partOps(p.arena.allocator(), self.deps.ring_layout, self.deps.geo, self.deps.appender_id, .{ .res = Reservation.unpadded(p.start, m.q.len), .records = frames }, &ops) catch |e| switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.Corrupt,
-            };
+            break :blk journal.partOps(p.arena.allocator(), self.deps.ring_layout, self.deps.geo, self.deps.appender_id, .{ .res = Reservation.unpadded(p.start, m.q.len), .records = frames }, &ops);
         };
         if (encoded) |hb| {
             p.header_bytes = hb;
@@ -3595,7 +3589,7 @@ pub const Conveyor = struct {
                 }
                 self.stats.resolve_descended.inc();
                 const t = self.treeFor(r.tree_id, r.key) orelse return error.Corrupt;
-                break :blk t.resolveLeaf(r.key) catch |e| return mapTreeError(e);
+                break :blk try t.resolveLeaf(r.key);
             };
             resolved += 1;
         }
@@ -3640,7 +3634,7 @@ pub const Conveyor = struct {
                 }
                 const fresh_err: ?Error = for (run) |i| {
                     const t = self.treeFor(recs[i].tree_id, recs[i].key) orelse break error.Corrupt;
-                    const fresh = t.resolveLeaf(recs[i].key) catch |e| break mapTreeError(e);
+                    const fresh = t.resolveLeaf(recs[i].key) catch |e| break e;
                     leaves[i].release();
                     leaves[i] = fresh;
                 } else null;

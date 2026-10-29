@@ -359,11 +359,7 @@ pub const Guard = struct {
     /// record takes no door token, so a member that hosts no slot still
     /// refreshes and deletes its own claim.
     fn readClaim(g: *Guard, gpa: Allocator) backend.OpenError!?[]u8 {
-        return g.be.lookup(gpa, key.TREE_CONTROL, cr.writerClaimKey().slice()) catch |e| switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            else => error.Corrupt,
-        };
+        return g.be.lookup(gpa, key.TREE_CONTROL, cr.writerClaimKey().slice());
     }
 
     fn stageClaimPut(_: *const Guard, t: *backend.KvTx, c: claim.Claim) Allocator.Error!void {
@@ -619,7 +615,9 @@ pub const Guard = struct {
 // The probe (`open_probe`): the claim off the device without the flock.
 // ---------------------------------------------------------------------------
 
-pub const ProbeError = error{ DeviceRefused, NotFormatted, Corrupt, Io, OutOfMemory };
+/// The probe's refusals, and a private tree's or replay's class as itself
+/// (decision 0003 §CS).
+pub const ProbeError = tree.Error || error{ DeviceRefused, NotFormatted };
 
 /// The raw `writer_claim` value as the RAM state after bootstrap replay
 /// would hold it: both superblock copies → the newest ledger record → the
@@ -662,27 +660,15 @@ pub fn probeClaim(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, p
         trees.deinit(gpa);
     }
     for (mounted.tree_roots) |r| {
-        const t = tree.KvTree.openFromLedger(gpa, cache, &mounted, r.id, &seq) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Io => return error.Io,
-            else => return error.Corrupt,
-        };
+        const t = try tree.KvTree.openFromLedger(gpa, cache, &mounted, r.id, &seq);
         errdefer t.destroy();
         seq.raiseTo(r.node_seq);
         try trees.append(gpa, t);
     }
-    _ = tree.replayEntries(gpa, trees.items, recovery.entries) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Io => return error.Io,
-        else => return error.Corrupt,
-    };
+    _ = try tree.replayEntries(gpa, trees.items, recovery.entries);
     const k = cr.writerClaimKey();
     const t = tree.routeContent(trees.items, key.TREE_CONTROL, k.slice()) orelse return error.Corrupt;
-    return t.lookup(gpa, k.slice()) catch |e| switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Io => error.Io,
-        else => error.Corrupt,
-    };
+    return t.lookup(gpa, k.slice());
 }
 
 /// A probe needs a handful of nodes (the roots, the tree-0 claim leaf);

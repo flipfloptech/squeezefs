@@ -1490,7 +1490,7 @@ fn mapReopen(e: backend.OpenError) OpenError {
     return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.Io => error.Io,
-        else => error.Corrupt,
+        else => |other| errors.narrow(OpenError, other, "joined.mapReopen"),
     };
 }
 

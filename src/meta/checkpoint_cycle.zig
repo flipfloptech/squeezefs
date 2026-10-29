@@ -84,10 +84,20 @@ const ns_per_ms: u64 = std.time.ns_per_ms;
 
 pub const IoError = error{Io};
 
+/// What a failed flush step carries: the freeze's, the append's and the
+/// structural seam's classes (`smo.Error` coerces into it), each AS ITSELF
+/// (decision 0003 §CS) — the cycle fails with it unchanged and the tick's
+/// line names it. Only a decoder's verification failure is `Corrupt`.
+pub const FlushError = tree.Error || node_cache.FreezeError || node_cache.AppendError || journal.Error || error{ NoSpace, JournalReserveExhausted, PendingFreeFull, BarrierFailed };
+
+/// What the guest root publish (C4b) carries beyond the flush step's: the
+/// store's commit refusals and the slot plane's deferrals, as themselves.
+pub const PublishError = error{ ForestKeyRefused, VolumeClosed, HoleCheckpointFailed, SlotBusy, Deferred, GrantExhausted, UnalignedDirectWrite, Busy, HandoverDeferred };
+
 /// The cycle's classes: the device (`Io`, latched per the lattice), a record
 /// that cannot encode or a protocol inconsistency (`Corrupt`), allocation,
-/// and the wedge terminal.
-pub const CycleError = error{ Io, Corrupt, OutOfMemory, VolumeFailed };
+/// the wedge terminal, and a flush step's or a publish's failure as itself.
+pub const CycleError = error{ Io, Corrupt, OutOfMemory, VolumeFailed } || FlushError || PublishError;
 
 // ---------------------------------------------------------------------------
 // The seams: device effects and the structural task, as typed function-
@@ -154,8 +164,6 @@ pub const RecordSource = struct {
     dataPages: ?*const fn (ctx: *anyopaque, generation: u64) IoError!void = null,
 };
 
-pub const FlushFailure = enum { none, io, corrupt, out_of_memory };
-
 /// One node's flush outcome.
 pub const FlushDisposition = enum {
     /// The floor was taken and there was nothing to write (threshold
@@ -187,7 +195,7 @@ pub const FlushDisposition = enum {
     /// stays and clamps the tail — a node that fills with no SMO behind it is
     /// the wedge class the audit judges.
     declined,
-    /// `failure` names the class; the cycle aborts.
+    /// `failure` carries the error; the cycle aborts with it.
     failed,
 };
 
@@ -195,11 +203,11 @@ pub const FlushResult = struct {
     disposition: FlushDisposition,
     /// Fresh images the structural seam wrote (the per-image unit's count).
     images: u64 = 0,
-    failure: FlushFailure = .none,
+    failure: ?FlushError = null,
 
     /// The error a `.failed` result fails the cycle with.
     pub fn cycleError(r: FlushResult) CycleError {
-        return failureError(r.failure);
+        return r.failure.?;
     }
 };
 
@@ -236,7 +244,7 @@ pub const SmoOutcome = union(enum) {
     grant_exhausted,
     /// No structural task is bound (`SmoSeam.none`).
     declined,
-    failed: FlushFailure,
+    failed: FlushError,
 };
 
 /// The threshold maintenance queue the task drains — the trees' lock-free
@@ -349,11 +357,11 @@ pub const CacheFlusher = struct {
     fn freezeFailure(e: node_cache.FreezeError) FlushResult {
         return switch (e) {
             error.FreezeRefusedSuperseded => .{ .disposition = .skipped },
-            error.OutOfMemory => .{ .disposition = .failed, .failure = .out_of_memory },
-            // The remaining protocol refusals and the encoder's classes leave
-            // the floor in place (taken only after the freeze) — the pass
-            // fails loud and retries next tick.
-            error.FreezeRefusedNotDirty, error.FreezeRefusedAlreadyFreezing, error.InjectedFreezeFailure, error.ValueTooLarge, error.Corrupt => .{ .disposition = .failed, .failure = .corrupt },
+            // The remaining protocol refusals, the seam's and the encoder's
+            // classes leave the floor in place (taken only after the
+            // freeze) — the pass fails loud with the class itself and
+            // retries next tick.
+            else => |other| .{ .disposition = .failed, .failure = other },
         };
     }
 
@@ -400,11 +408,7 @@ pub const CacheFlusher = struct {
         }
         const appended = self.cache.appendFrozen(n) catch |e| {
             if (taken) |f| n.restoreDirtyFloor(f);
-            return .{ .disposition = .failed, .failure = switch (e) {
-                error.OutOfMemory => .out_of_memory,
-                error.Io => .io,
-                else => .corrupt,
-            } };
+            return .{ .disposition = .failed, .failure = e };
         };
         if (appended) return .{ .disposition = .appended };
         const out = self.smo.maintain(self.smo.ctx, n, .{ .keep_exempt = opts.keep_exempt, .forced_retirement = opts.mode == .checkpoint });
@@ -422,15 +426,6 @@ pub const CacheFlusher = struct {
         };
     }
 };
-
-fn failureError(f: FlushFailure) CycleError {
-    return switch (f) {
-        .io => error.Io,
-        .corrupt => error.Corrupt,
-        .out_of_memory => error.OutOfMemory,
-        .none => unreachable,
-    };
-}
 
 // ---------------------------------------------------------------------------
 // The per-volume checkpointer.
@@ -916,7 +911,7 @@ pub const Checkpointer = struct {
                 },
                 // The checkpoint mode freezes whatever is open.
                 .idle => unreachable,
-                .failed => return failureError(r.failure),
+                .failed => return r.cycleError(),
             }
         }
         // ---- C4b: the roots the ledger does NOT name (guest slot trees,
@@ -1259,7 +1254,7 @@ pub const Checkpointer = struct {
                     src.requeue(src.ctx, n);
                 },
                 .deferred_space => _ = self.posture.enter(self.cfg.volume, "threshold maintenance: the SMO could not claim an extent", self.spaceSnapshot()),
-                .failed => return failureError(r.failure),
+                .failed => return r.cycleError(),
                 .discharged, .appended, .replaced, .skipped, .deferred_grant, .declined => self.reserve_deferred_addr = null,
                 .idle => unreachable,
             }

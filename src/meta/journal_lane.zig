@@ -192,6 +192,10 @@ pub const Error = errors.Error;
 pub const ErrorClass = errors.Class;
 pub const classOf = errors.classOf;
 
+/// A submission's refusals, answered on the submitting thread before
+/// anything is queued (everything after is the ticket's outcome).
+pub const SubmitError = error{ UnalignedDirectWrite, VolumeFailed, LaneStopped, LaneQueueFull };
+
 pub const SpawnError = error{ OutOfMemory, RingSetupFailed, ThreadSpawnFailed, DeviceOpenFailed } || uring_fs.RegisterError;
 
 /// A CQE's `res`: negative is `-errno`.
@@ -907,7 +911,7 @@ pub const JournalLane = struct {
     /// before anything is queued: a misaligned run (the posture law; the
     /// tripwire fires here), a FAILED volume, a stopped lane, a full queue.
     /// Everything after that is the ticket's outcome.
-    pub fn submitWriteBatch(self: *JournalLane, req: WriteRequest) Error!Ticket {
+    pub fn submitWriteBatch(self: *JournalLane, req: WriteRequest) SubmitError!Ticket {
         return self.submitWindow(req, null);
     }
 
@@ -915,11 +919,11 @@ pub const JournalLane = struct {
     /// lane thread (journal order, at the ack instant) rather than observed
     /// through a ticket; the cell returns to the pool right after the hook.
     /// A refusal answers here, synchronously, and the hook never runs.
-    pub fn submitWriteBatchDetached(self: *JournalLane, req: WriteRequest, done: DoneHook) Error!void {
+    pub fn submitWriteBatchDetached(self: *JournalLane, req: WriteRequest, done: DoneHook) SubmitError!void {
         _ = try self.submitWindow(req, done);
     }
 
-    fn submitWindow(self: *JournalLane, req: WriteRequest, done: ?DoneHook) Error!Ticket {
+    fn submitWindow(self: *JournalLane, req: WriteRequest, done: ?DoneHook) SubmitError!Ticket {
         try self.refuseMisaligned(req.ops);
         if (self.latch.isFailed()) return error.VolumeFailed;
         const idx = self.free_windows.tryPop() orelse {
@@ -944,7 +948,7 @@ pub const JournalLane = struct {
     /// prefix law is its own. Never grouped, never barriered here (an SMO
     /// barriers its images before any pointer record exists; the entry's
     /// own durability rides the next barrier on the device).
-    pub fn submitStructural(self: *JournalLane, ops: []const WriteOp) Error!Ticket {
+    pub fn submitStructural(self: *JournalLane, ops: []const WriteOp) SubmitError!Ticket {
         try self.refuseMisaligned(ops);
         if (self.latch.isFailed()) return error.VolumeFailed;
         const idx = self.acquireCell() orelse {
@@ -962,7 +966,7 @@ pub const JournalLane = struct {
     /// after the lane admitted it completed with every window admitted
     /// before it landed (§BB.4); the outcome is `waiter.wait()`'s. Refusals
     /// answer here: a FAILED volume, a stopped lane — never a full one.
-    pub fn requestBarrier(self: *JournalLane, waiter: *BarrierWaiter) Error!void {
+    pub fn requestBarrier(self: *JournalLane, waiter: *BarrierWaiter) SubmitError!void {
         return self.enlist(waiter, null);
     }
 
@@ -974,11 +978,11 @@ pub const JournalLane = struct {
     /// floor does (the join: an FSYNC covers every write completed before
     /// it was issued), else the next; at the admission itself when the
     /// last completed barrier's floor does.
-    pub fn requestBarrierCovering(self: *JournalLane, waiter: *BarrierWaiter, cover: u64) Error!void {
+    pub fn requestBarrierCovering(self: *JournalLane, waiter: *BarrierWaiter, cover: u64) SubmitError!void {
         return self.enlist(waiter, cover);
     }
 
-    fn enlist(self: *JournalLane, waiter: *BarrierWaiter, want: ?u64) Error!void {
+    fn enlist(self: *JournalLane, waiter: *BarrierWaiter, want: ?u64) SubmitError!void {
         if (self.latch.isFailed()) return error.VolumeFailed;
         waiter.* = .{ .lane = self, .want = want };
         // SeqCst RMW: pairs with `shutdown`'s SeqCst `closing` store +
@@ -1034,7 +1038,7 @@ pub const JournalLane = struct {
     /// on a direct path is REFUSED before any byte is queued — a caller bug
     /// (the aligned form belongs beside the shape). Pointers are bounced on
     /// the lane (`prepareDirectWrite` at SQE build).
-    fn refuseMisaligned(self: *JournalLane, ops: []const WriteOp) Error!void {
+    fn refuseMisaligned(self: *JournalLane, ops: []const WriteOp) SubmitError!void {
         const d = switch (self.mode) {
             .buffered => return,
             .direct => |d| d,
@@ -1074,7 +1078,7 @@ pub const JournalLane = struct {
     /// on a queued cell would wait on itself; a foreign caller pushes it and
     /// the fiber scans it at its next poll. Either way ONE wake: the
     /// delivery word and the coalescer absorb the rest.
-    fn publish(self: *JournalLane, idx: u32) Error!Ticket {
+    fn publish(self: *JournalLane, idx: u32) SubmitError!Ticket {
         // SeqCst RMW: pairs with `shutdown`'s SeqCst `closing` store +
         // `inflight_submitters` load so exactly one of us sees the other.
         _ = self.inflight_submitters.fetchAdd(1, .seq_cst);

@@ -28,6 +28,7 @@ const Allocator = std.mem.Allocator;
 const counters = @import("../../core/counters.zig");
 const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
+const errors = @import("../../core/errors.zig");
 const knobs = @import("../../core/knobs.zig");
 const derive = @import("../../core/derive.zig");
 const backend = @import("../backend.zig");
@@ -487,7 +488,7 @@ pub const AppenderSet = struct {
                 error.Rejected => error.Rejected,
                 error.OutOfMemory => error.OutOfMemory,
                 error.Io => error.Io,
-                else => error.Corrupt,
+                else => |other| errors.narrow(Error, other, "bind.leaveInProcess"),
             };
         };
         self.manager.forgetEndpoint(r.appenderId());
@@ -572,7 +573,7 @@ pub const AppenderSet = struct {
                 return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
                     error.Io => error.Io,
-                    else => error.Corrupt,
+                    else => |other| errors.narrow(Error, other, "bind.appendRecord"),
                 };
             };
             defer leaf.release();
@@ -581,7 +582,7 @@ pub const AppenderSet = struct {
                 return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
                     error.Io => error.Io,
-                    else => error.Corrupt,
+                    else => |other| errors.narrow(Error, other, "bind.appendRecord"),
                 };
             };
             switch (outcome) {
@@ -748,7 +749,7 @@ pub const AppenderSet = struct {
                     return switch (e) {
                         error.OutOfMemory => error.OutOfMemory,
                         error.Io => error.Io,
-                        else => error.Corrupt,
+                        else => |other| errors.narrow(manager.ControlError, other, "bind.controlEntryFn"),
                     };
                 };
                 defer leaf.release();
@@ -758,7 +759,7 @@ pub const AppenderSet = struct {
                     return switch (e) {
                         error.OutOfMemory => error.OutOfMemory,
                         error.Io => error.Io,
-                        else => error.Corrupt,
+                        else => |other| errors.narrow(manager.ControlError, other, "bind.controlEntryFn"),
                     };
                 };
                 if (outcome == .applied) break;
@@ -846,10 +847,7 @@ pub const AppenderSet = struct {
 
     fn cycleFn(ctx: *anyopaque) error{ Io, Corrupt }!u64 {
         const be = self_(ctx).be;
-        be.checkpointNow() catch |e| return switch (e) {
-            error.Io, error.OutOfMemory, error.VolumeFailed => error.Io,
-            error.Corrupt => error.Corrupt,
-        };
+        be.checkpointNow() catch |e| return errors.narrow(error{ Io, Corrupt }, e, "slot handover: the covering checkpoint");
         return be.cp.lastLedgerTail();
     }
 

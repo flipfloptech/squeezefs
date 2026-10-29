@@ -346,23 +346,11 @@ pub const MetaSet = struct {
             loser.stamp.releaseSlot(d.slot) catch return error.OutOfMemory;
             loser.stamp.removeCursor(d.slot);
             loser.stamp.setEpoch(@max(loser.stamp.set_epoch, d.winner_epoch));
-            loser.dropTree(d.slot) catch |e| return mapOpenFailure(e);
-            loser.checkpointNow() catch |e| return switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.VolumeFailed, error.Io => error.Io,
-                error.Corrupt => error.Corrupt,
-            };
+            try loser.dropTree(d.slot);
+            try loser.checkpointNow();
             rstats.routing_dual_claims_converged.inc();
             log.warn("metadata set: slot {d} was claimed by member {d} (epoch {d}) and member {d} (epoch {d}) — a flip torn after its claim write; the stale claim on member {d} is released and its copy dropped (routing_dual_claims_converged)", .{ d.slot, d.winner, d.winner_epoch, d.loser, d.loser_epoch, d.loser });
         }
-    }
-
-    fn mapOpenFailure(e: Error) OpenError {
-        return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.VolumeFailed, error.Io, error.JournalWriteFailed => error.Io,
-            else => error.Corrupt,
-        };
     }
 
     /// Close every member in canonical order (each a clean dismount).
@@ -479,13 +467,13 @@ pub const MetaSet = struct {
     pub fn lookupCounted(self: *MetaSet, gpa: Allocator, kind: u8, k: []const u8, cost: *tree.WalkCost) Error!?[]u8 {
         const t = (try self.treeOfKey(kind, k)) orelse return null;
         cost.sources += 1;
-        return t.lookupCounted(gpa, k, cost) catch |e| KvBackend.readError(e);
+        return t.lookupCounted(gpa, k, cost);
     }
 
     /// `lookup` over the borrowed value (`KvTree.lookupView`): no copy.
     pub fn lookupView(self: *MetaSet, gpa: Allocator, kind: u8, k: []const u8, comptime T: type, ctx: anytype, comptime visit: fn (@TypeOf(ctx), []const u8) T) Error!?T {
         const t = (try self.treeOfKey(kind, k)) orelse return null;
-        return t.lookupView(gpa, k, T, ctx, visit) catch |e| KvBackend.readError(e);
+        return t.lookupView(gpa, k, T, ctx, visit);
     }
 
     /// Range scan over `[start, end]` of one kind. Bounds of an ino-major
@@ -566,7 +554,7 @@ pub const MetaSet = struct {
     };
 
     fn rangeIn(t: *tree.KvTree, gpa: Allocator, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue), cost: *tree.WalkCost) Error!void {
-        t.rangeCounted(gpa, start, end, max, out, cost) catch |e| return KvBackend.readError(e);
+        try t.rangeCounted(gpa, start, end, max, out, cost);
     }
 
     /// `slot`'s door token taken BEFORE a committer's staging reads

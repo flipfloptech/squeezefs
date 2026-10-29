@@ -48,6 +48,8 @@ const Io = std.Io;
 
 const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
+const errors = @import("../../core/errors.zig");
+const checkpoint_cycle = @import("../checkpoint_cycle.zig");
 const key = @import("../key.zig");
 const tree = @import("../tree.zig");
 const tx = @import("../tx.zig");
@@ -203,16 +205,16 @@ fn mapBackend(e: backend.Error) Error {
         error.OutOfMemory => error.OutOfMemory,
         error.VolumeFailed => error.VolumeFailed,
         error.Io, error.JournalWriteFailed, error.HoleCheckpointFailed, error.ConveyorFull, error.VolumeClosed => error.Io,
-        else => error.Corrupt,
+        else => |other| errors.narrow(Error, other, "migrate.mapBackend"),
     };
 }
 
-fn mapCycle(e: anyerror) Error {
+fn mapCycle(e: checkpoint_cycle.CycleError) Error {
     return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.VolumeFailed => error.VolumeFailed,
         error.Io => error.Io,
-        else => error.Corrupt,
+        else => |other| errors.narrow(Error, other, "migrate.mapCycle"),
     };
 }
 
@@ -427,7 +429,7 @@ pub fn copySlotTree(gpa: Allocator, src: *KvBackend, dst: *KvBackend, slot: u16)
             st.range(gpa, cursor.slice(), &tree.KEY_SPACE_MAX, COPY_PAGE, &page) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Io => error.Io,
-                else => error.Corrupt,
+                else => |other| errors.narrow(Error, other, "migrate.copySlotTree"),
             };
             if (page.items.len == 0) break;
             for (page.items) |kv| sw.append(kv.key, kv.value) catch |e| return mapStream(e);
@@ -443,7 +445,7 @@ pub fn copySlotTree(gpa: Allocator, src: *KvBackend, dst: *KvBackend, slot: u16)
     const t = tree.KvTree.open(gpa, dst.cache, identity, .{ .addr = root.addr, .seq = root.seq }, &dst.seq) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.Io => error.Io,
-        else => error.Corrupt,
+        else => |other| errors.narrow(Error, other, "migrate.copySlotTree"),
     };
     errdefer t.destroy();
     dst.adoptTree(t) catch return error.OutOfMemory;
@@ -454,16 +456,12 @@ pub fn mapBackendError(e: backend.Error) Error {
     return mapBackend(e);
 }
 
-pub fn mapCycleError(e: anyerror) Error {
-    return mapCycle(e);
-}
-
 fn mapStream(e: builder.StreamError) Error {
     return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.NoSpace => error.Io,
         error.SinkFailed, error.SeqMintFailed => error.Io,
-        else => error.Corrupt,
+        else => |other| errors.narrow(Error, other, "migrate.mapStream"),
     };
 }
 
@@ -495,7 +493,7 @@ fn applyDelta(set: *MetaSet, src: *KvBackend, dst: *KvBackend, slot: u16, keys: 
                 return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
                     error.Io => error.Io,
-                    else => error.Corrupt,
+                    else => |other| errors.narrow(Error, other, "migrate.applyDelta"),
                 };
             }) else null;
             defer if (value) |v| gpa.free(v);

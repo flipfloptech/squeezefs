@@ -2137,7 +2137,7 @@ pub const SetRecordSource = struct {
         return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => error.Corrupt,
+            else => |other| errors.narrow(tokens.table.SourceError, other, "wire_plane.mapErr"),
         };
     }
 

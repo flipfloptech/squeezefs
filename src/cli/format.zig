@@ -426,7 +426,8 @@ fn formatErrorText(e: backend.FormatError) []const u8 {
         error.CannotStat, error.NotADeviceOrFile => "not a regular file or block device",
         error.Io => "device I/O failed",
         error.OutOfMemory => "out of memory",
-        error.Corrupt, error.Unexpected => "the image build failed (see the log)",
+        // The image plan's own classes (decision 0003 §CS): the log names it.
+        else => "the image build failed (see the log)",
     };
 }
 

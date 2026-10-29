@@ -22,6 +22,7 @@ const std = @import("std");
 const counters = @import("../../core/counters.zig");
 const checksum = @import("../../core/checksum.zig");
 const log = @import("../../core/log.zig");
+const errors = @import("../../core/errors.zig");
 const claim = @import("../guard/claim.zig");
 const node_seq = @import("../node_seq.zig");
 const page = @import("appender_page.zig");
@@ -170,7 +171,7 @@ pub fn join(gpa: Allocator, door: Door, in: JoinInputs) JoinError!JoinedRegion {
         .page_words = words,
     }) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
-        else => error.Corrupt,
+        else => |other| errors.narrow(JoinError, other, "join.join"),
     };
     errdefer core.deinit();
     var g = grant.RegionGrant.init(gpa);
@@ -190,7 +191,7 @@ pub fn leave(gpa: Allocator, door: Door, jr: *JoinedRegion) JoinError!manager.Le
         error.Rejected => error.Rejected,
         error.OutOfMemory => error.OutOfMemory,
         error.Io, error.NoSpace => error.Io,
-        else => error.Corrupt,
+        else => |other| errors.narrow(JoinError, other, "join.leave"),
     };
 }
 

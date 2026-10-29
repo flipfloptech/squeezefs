@@ -1472,6 +1472,8 @@ fn openReason(e: meta_set.OpenError) []const u8 {
         error.Io => "device I/O failed",
         error.OutOfMemory => "out of memory",
         error.LaneSpawnFailed, error.ThreadSpawnFailed => "cannot spawn the journal lane or the checkpoint thread",
+        // A bring-up step's own class, carried as itself (decision 0003 §CS).
+        else => "a bring-up step failed (see the log: the line names its class)",
     };
 }
 

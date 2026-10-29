@@ -30,6 +30,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const log = @import("../../core/log.zig");
+const errors = @import("../../core/errors.zig");
 const checkpoint = @import("../checkpoint.zig");
 const key = @import("../key.zig");
 const ledger = @import("../ledger.zig");
@@ -116,7 +117,7 @@ fn observeAll(gpa: Allocator, opts: Options, paths: []const []const u8, out: []M
         m.* = .{ .path = p, .owned = discovery.linux_dev.observe(gpa, opts.env, opts.pool, p) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => error.Corrupt,
+            else => |other| errors.narrow(Error, other, "offline.observeAll"),
         } };
     }
 }
@@ -136,23 +137,19 @@ fn openMember(gpa: Allocator, io: Io, opts: Options, path: []const u8, index: u1
         error.Busy => error.LiveMounted,
         error.OutOfMemory => error.OutOfMemory,
         error.Io, error.DeviceRefused, error.LaneSpawnFailed, error.ThreadSpawnFailed => error.Io,
-        else => error.Corrupt,
+        else => |other| errors.narrow(Error, other, "offline.openMember"),
     };
 }
 
 fn checkpointMember(be: *KvBackend) Error!void {
-    be.checkpointNow() catch |e| return switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Io, error.VolumeFailed => error.Io,
-        error.Corrupt => error.Corrupt,
-    };
+    be.checkpointNow() catch |e| return errors.narrow(Error, e, "offline verb: a member's checkpoint");
 }
 
 fn mapMigrate(e: migrate.Error) Error {
     return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.Io, error.VolumeFailed => error.Io,
-        else => error.Corrupt,
+        else => |other| errors.narrow(Error, other, "offline.mapMigrate"),
     };
 }
 

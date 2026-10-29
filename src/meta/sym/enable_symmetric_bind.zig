@@ -16,6 +16,7 @@ const Io = std.Io;
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const log = @import("../../core/log.zig");
+const errors = @import("../../core/errors.zig");
 const clock = @import("../../core/clock.zig");
 const uring_fs = @import("../../io/uring_fs.zig");
 const align_probe = @import("../../io/align_probe.zig");
@@ -149,8 +150,7 @@ pub fn enableSymmetric(gpa: Allocator, io: Io, path: []const u8, opts: Options, 
             error.OutOfMemory => error.OutOfMemory,
             error.DeviceRefused => error.DeviceRefused,
             error.NotFormatted => error.NotFormatted,
-            error.Corrupt => error.Corrupt,
-            error.Io => error.Io,
+            else => |other| errors.narrow(Error, other, "enable-symmetric: the writer-claim probe"),
         };
         defer if (raw) |r| gpa.free(r);
         const now = clock.realtimeCoarseNs();

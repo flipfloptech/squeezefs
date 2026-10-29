@@ -22,6 +22,7 @@ const counters = @import("../../../core/counters.zig");
 const clock = @import("../../../core/clock.zig");
 const derive = @import("../../../core/derive.zig");
 const log = @import("../../../core/log.zig");
+const errors = @import("../../../core/errors.zig");
 const knobs = @import("../../../core/knobs.zig");
 const sync = @import("../../../sync/sync.zig");
 const backend = @import("../../backend.zig");
@@ -203,7 +204,7 @@ pub const Plane = struct {
         control.range(gpa, states.start.slice(), states.end.slice(), std.math.maxInt(usize), &kvs) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => error.Corrupt,
+            else => |other| errors.narrow(InitError, other, "plane.primeFrames"),
         };
         var held: std.ArrayList(u16) = .empty;
         defer held.deinit(gpa);
@@ -233,7 +234,7 @@ pub const Plane = struct {
         control.range(gpa, tails.start.slice(), tails.end.slice(), std.math.maxInt(usize), &kvs) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => error.Corrupt,
+            else => |other| errors.narrow(InitError, other, "plane.primeFrames"),
         };
         var entries: std.ArrayList(cr.TailEntry) = .empty;
         defer entries.deinit(gpa);
@@ -667,7 +668,7 @@ pub const Plane = struct {
         return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => error.Corrupt,
+            else => |other| errors.narrow(acquire.Error, other, "plane.mapBe"),
         };
     }
 
@@ -696,7 +697,7 @@ pub const Plane = struct {
         self.be.range(gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), std.math.maxInt(usize), &raw) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => error.Corrupt,
+            else => |other| errors.narrow(ArmError, other, "plane.loadTree0Population"),
         };
         errdefer tree.deinitKeyValues(gpa, &raw);
         for (raw.items) |kv| try kvs.append(gpa, .{ .key = kv.key, .value = kv.value });
@@ -861,7 +862,7 @@ pub const Plane = struct {
         if (touch and words.root.addr == 0 and self.be.slotTree(slot) == null) _ = self.be.mintGuestTree(slot) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => error.Corrupt,
+            else => |other| errors.narrow(ArmError, other, "plane.installWireGrant"),
         };
         self.parkMidInstall();
         try self.table.load(slot, .{ .variant = .leased, .appender_id = self.me, .g = g, .root = words.root, .cursor = words.cursor, .slot_tree_extents = words.extents, .seq_floor = words.seq_floor });
@@ -912,7 +913,7 @@ pub const Plane = struct {
         be.collectTreeExtents(t, &images) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => error.Corrupt,
+            else => |other| errors.narrow(error{ OutOfMemory, Io, Corrupt }, other, "plane.joinedImagesMoved"),
         };
         j.transferImages(images.items, dir);
     }
@@ -976,7 +977,7 @@ pub const Plane = struct {
                 const opened = tree.KvTree.open(self.gpa, be.cache, .{ .slot = key.guestForestSlot(slot) }, .{ .addr = words.root.addr, .seq = words.root.seq }, &be.seq) catch |e| return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
                     error.Io => error.Io,
-                    else => error.Corrupt,
+                    else => |other| errors.narrow(acquire.Error, other, "plane.install"),
                 };
                 be.adoptTree(opened) catch return error.OutOfMemory;
                 opened.seedNodeCount(words.extents);
@@ -1060,7 +1061,7 @@ pub const Plane = struct {
                 const t = tree.KvTree.open(self.gpa, be.cache, .{ .slot = key.guestForestSlot(slot) }, .{ .addr = root.addr, .seq = root.seq }, &be.seq) catch |e| return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
                     error.Io => error.Io,
-                    else => error.Corrupt,
+                    else => |other| errors.narrow(acquire.Error, other, "plane.treeImagesFn"),
                 };
                 defer t.destroy();
                 be.collectTreeExtents(t, &images) catch |e| return mapBe(e);
@@ -1241,7 +1242,7 @@ pub const Plane = struct {
         if (self.be.slotTree(slot)) |t| self.be.collectLeafTails(t, &out) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
-            else => error.Corrupt,
+            else => |other| errors.narrow(handover.Error, other, "plane.tailsFn"),
         };
         return out.toOwnedSlice(gpa) catch return error.OutOfMemory;
     }

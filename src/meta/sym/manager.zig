@@ -38,6 +38,7 @@ const std = @import("std");
 const counters = @import("../../core/counters.zig");
 const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
+const errors = @import("../../core/errors.zig");
 const checkpoint = @import("../checkpoint.zig");
 const geometry = @import("../geometry.zig");
 const journal = @import("../journal.zig");
@@ -1583,7 +1584,7 @@ pub const Manager = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
             error.Rejected => error.Rejected,
-            else => error.Corrupt,
+            else => |other| errors.narrow(CustodyError, other, "manager.custodyError"),
         };
     }
 

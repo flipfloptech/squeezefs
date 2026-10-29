@@ -16327,6 +16327,121 @@ test "smoke: FALLOCATE — EVERY MODE'S LAW (charter §6.6; decision 0003 §BH) 
     _ = try fsckClean(rig, "the clean unmount after the fallocate matrix");
 }
 
+test "smoke: A FALLOCATE'D LAY-DOWN HOLDS ITS SIZE, AND A DELETE'S BLOCKS ARE SUPPLY THE MOMENT ITS CORPSES ARE GATHERED (decision 0003 §CR; the perf matrix's fio lay-down) — a two-volume set of 2 × 47 usable 4 MiB blocks: four files `falloc 0 64m` (64 blocks reserved, `df` charged at once) then written O_DIRECT in whole-block pieces (the device overlay's arm): no block is minted by the writes — every piece lands IN its reservation (overlay_reserved_landings, `df` unchanged) and every byte reads back; the four files `rm`'d and, once their FORGETs gathered the corpses (no destroy yet: four corpses wait for the reclaim tick), four more `falloc 0 64m` (64 blocks against 30 free) — every one succeeds, the allocation kicking the gather's destroy (block_free_upstream_kicks) — and their lay-down reads back whole; a reservation the store cannot cover still answers ENOSPC; no error line, no tripwire, fsck clean (red on dev: the writes minted a fresh block per reserved block; with them landing in place, the second `falloc` still answered ENOSPC for three files of four — the rm's 64 blocks gathered as corpses, none destroyed — and their writes ENOSPC)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSetSized(true, &.{}, fallocate_row_data_bytes);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const mark = try rig.logLen();
+    rig.gpa.free(try rig.shOk(rig.work,
+        \\for p in 51 52 53 54 61 62 63 64; do xfs_io -f -c "pwrite -b 4m -S 0x$p 0 64m" e$p >/dev/null; done
+        \\echo ok
+    ));
+    // 1. The reservation, then the lay-down: whole-block O_DIRECT pieces.
+    {
+        const out = try rig.onMountTimed(
+            \\for f in a b c d; do xfs_io -f -c "falloc 0 64m" $f; done
+            \\echo "reserved $(df -kP . | tail -1 | awk '{print $3}')"
+        , 120);
+        defer gpa.free(out);
+        std.debug.print("\nsmoke[reservation lay-down]: reserve:\n{s}", .{out});
+    }
+    const mints0 = blk: {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expectEqual(@as(?u64, 64), numberAfter(t, "\"fallocate_blocks_reserved\":"));
+        break :blk numberAfter(t, "\"alloc_fresh_mints\":") orelse return error.StatMissing;
+    };
+    {
+        const out = try rig.onMountTimed(
+            \\used0=$(df -kP . | tail -1 | awk '{print $3}')
+            \\p=51; for f in a b c d; do xfs_io -d -c "pwrite -b 4m -S 0x$p 0 64m" -c fsync $f >/dev/null & p=$((p+1)); done; wait
+            \\used1=$(df -kP . | tail -1 | awk '{print $3}')
+            \\echo "delta $(( (used1 - used0) / 1024 ))"
+            \\p=51; for f in a b c d; do cmp -s "$1/e$p" $f && echo "$f whole" || echo "$f differs"; p=$((p+1)); done
+        , 300);
+        defer gpa.free(out);
+        std.debug.print("smoke[reservation lay-down]: the lay-down:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "delta 0\n") != null);
+        try testing.expect(std.mem.endsWith(u8, out, "a whole\nb whole\nc whole\nd whole\n"));
+    }
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expectEqual(mints0, numberAfter(t, "\"alloc_fresh_mints\":") orelse return error.StatMissing);
+        try testing.expectEqual(@as(?u64, 64), numberAfter(t, "\"overlay_reserved_landings\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"overlay_epoch_feeds_fresh\":"));
+    }
+    // 2. The delete, then the next lay-down's reservation: the four corpses
+    //    gathered (their FORGETs processed), none destroyed yet.
+    const forgets0, const destroys0 = blk: {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        break :blk .{ numberAfter(t, "\"fuse_forget_evictions\":") orelse return error.StatMissing, numberAfter(t, "\"fuse_reclaim_destroys\":") orelse return error.StatMissing };
+    };
+    rig.gpa.free(try rig.onMountTimed("rm a b c d\n", 60));
+    var forgets = forgets0;
+    var destroys = destroys0;
+    var polls: u32 = 0;
+    while (forgets < forgets0 + 4 and polls < 600) : (polls += 1) {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        forgets = numberAfter(t, "\"fuse_forget_evictions\":") orelse return error.StatMissing;
+        destroys = numberAfter(t, "\"fuse_reclaim_destroys\":") orelse return error.StatMissing;
+        if (forgets < forgets0 + 4) try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    std.debug.print("smoke[reservation lay-down]: the rm's corpses: {d} forgets, {d} destroyed before the next reservation\n", .{ forgets - forgets0, destroys - destroys0 });
+    try testing.expect(forgets >= forgets0 + 4);
+    {
+        const out = try rig.onMountTimed(
+            \\for f in e f g h; do xfs_io -f -c "falloc 0 64m" $f 2>&1 | grep -q 'No space left' && echo "$f ENOSPC"; done
+            \\echo "reserved $(stat -c %s e f g h | tr '\n' ' ')"
+            \\p=61; for f in e f g h; do xfs_io -d -c "pwrite -b 4m -S 0x$p 0 64m" -c fsync $f >/dev/null & p=$((p+1)); done; wait
+            \\p=61; for f in e f g h; do cmp -s "$1/e$p" $f && echo "$f whole" || echo "$f differs"; p=$((p+1)); done
+        , 300);
+        defer gpa.free(out);
+        std.debug.print("smoke[reservation lay-down]: rm, then the next lay-down at once:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "ENOSPC") == null);
+        try testing.expect(std.mem.endsWith(u8, out, "e whole\nf whole\ng whole\nh whole\n"));
+    }
+    // 3. A reservation the store cannot cover (40 blocks against 30 free,
+    //    nothing gathered): ENOSPC, nothing charged.
+    {
+        const out = try rig.onMountTimed(
+            \\used0=$(df -kP . | tail -1 | awk '{print $3}')
+            \\xfs_io -f -c "falloc 0 160m" big 2>&1 | grep -c 'No space left'
+            \\used1=$(df -kP . | tail -1 | awk '{print $3}')
+            \\echo "delta $(( (used1 - used0) / 1024 ))"
+        , 120);
+        defer gpa.free(out);
+        std.debug.print("smoke[reservation lay-down]: past the store:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "1\ndelta 0\n") != null);
+    }
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expect((numberAfter(t, "\"block_free_upstream_kicks\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"invariant_tripwires\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"unwritten_mapping_served\":"));
+    }
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        const errors = std.mem.count(u8, seg, "error(");
+        if (errors != 0) std.debug.print("--- the daemon's alert lines ---\n{s}\n", .{seg});
+        try testing.expectEqual(@as(usize, 0), errors);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, seg, "TRIPWIRE"));
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the clean unmount after the reservation lay-down");
+}
+
 test "smoke: A PUNCH, A ZERO RANGE AND A SAME-SIZE TRUNCATE SURVIVE A POWER CUT (fstests generic/695, 092; charter §6.6) — a set over device-mapper slices of 4 MiB blocks: generic/092's `falloc -k 0 12m` + `pwrite 0 5m` + `truncate 5m` returns the reservation past EOF (`df` 12 → 8 MiB) and `falloc -k 5m 5m` + `truncate 7m` keeps it (12 MiB); generic/695's `truncate 12M` + `pwrite -S 0xab 2M 8M` + sync, then `fpunch 2M 2M` + `fpunch 8M 2M` + fsync (and the same with `fzero`) reads zeros at [2M, 4M) and [8M, 10M) around the 0xab of [4M, 8M) → dm-flakey drops every write (the power cut) → unmount → the working table → fsck --offline --scrub clean → remount: every file byte-exact as fsync'd → clean unmount; no error line, no tripwire (red on dev: `fpunch 8M 2M` and `fzero 8M 2M` — a range starting ON a block boundary and ending inside it — zeroed nothing, read 0xab before and after the cut; the same-size truncate kept the reservation, `df` 12)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

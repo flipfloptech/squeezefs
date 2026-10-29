@@ -69,11 +69,27 @@ directory): 3 clean passes of 4 (63 + 1 shim skip); the fourth ran beside the ri
 lost TWO MOUNTS OF ONE SET at its first check, before B joins (`a_staged >= 200 × 64 KiB`: an outside
 sync promoted A's residents). xfstests generic/001 013: passed, 0 alerts, fsck 0 findings.
 
-## Seen, not fixed
+## 4. The three left seen-not-fixed, fixed (§CF.4–§CF.6, 2026-10-29)
 
-- A recovery rolled back after step 7 skips 7b's coherence hold and custody quarantine for the slots it
-  recorded (the re-run has no plan for them) — as on dev.
-- The offline `status` refs census (`cli/status.zig readRefCensus`) still opens a foreign lessee's slot at
-  tree 0's word (appender 0's page only): a dead lessee that recycled its image reads stale or refuses.
-- TWO MOUNTS OF ONE SET asserts A's write cache still holds its residents while any host `sync(2)`
-  promotes them. `ac7986e` lost one run to `daemon … died without unmounting` (fixed since).
+- **§CF.4 a rolled-back recovery's guards.** A failure after step 7 rolls back before 7b; the re-run
+  absorbs the slot from tree 0 with no plan, so the coherence hold and the custody quarantine were never
+  installed. **Red** (`32f5beb`, the RAM fixture, an EARLY record, `fail_at = .tree0`, against the
+  un-rolled run): `TestCoherenceNotHeld`. **Fix** (`9d63925`): `Driver.Guards` off the death record,
+  `guardRecovered` applied by 7b and by the absorption (before the word turns `Unleased`).
+- **§CF.5 the offline census.** `status`/`df` folded appender 0's page only. **Red** (`db89fe1`): B moves
+  the root and replaces A's reference with two — the census counted 1 (the grant-time tree's); after the
+  recycle `root pointer stale … extent 0x160000` and the census refused. **Fix** (`b4c7cd0`): every
+  holder's `Live`/`Recovering` page folded (`readHolderPages`) — the census reads B's 2 at its page root
+  before and after the recycle; a holder moving inside the census (`status.test_seams.after_pages`) is
+  `1 slot(s) … not counted`, 0 references, no refusal.
+- **§CF.6 the member-scope row.** **Red** (`9a8c578`): an outside `sync -f` of both mounts at each instant
+  the row reads residents (what any host `sync(2)` does) fails `a_staged >= 200 × 64 KiB`. **Fix**
+  (`9d565482`): the seam `SQUEEZEFS_TEST_SYNCFS_KEEPS_STAGED` holds both members' residents across a
+  syncfs (residency IS the row's precondition); the row checks the sync reached A (`fuse_syncfs ≥ 1`).
+  20/20 beside `while :; do sync; sleep 0.05; done`, started and stopped (trap EXIT) in one venue command.
+
+Checks on the follow-up head: the three reds green; unit filters `meta`, `membership`, `handover_moves`,
+`fsck`, `scrub`, `sym_planes`, `block_refs`, `data.plane`, `data.fsync`, `cli.status`, `cli.df`;
+`zig build fmt rails`; the 64-test smoke set above 2 clean passes (63 + 1 shim skip; KVDA `referenced
+50, released 0`); the five rows that read the `status`/`df` census (the POSIX pass's status, the SET
+format, the data plane with and without the write cache, THE KILL MATRIX) all pass.

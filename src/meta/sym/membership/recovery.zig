@@ -282,9 +282,11 @@ pub const Volume = struct {
         /// the census returns none of them.
         keptExtents: *const fn (ctx: *anyopaque, gpa: Allocator, grant: []const GrantRun, out: *std.ArrayList(u64)) Error!void,
         returnExtents: *const fn (ctx: *anyopaque, extents: []const u64) Error!void,
-        /// A released region's ring segments back to the heap (RAM bits
-        /// + `free` deltas), AFTER its page went Free.
-        freeRing: *const fn (ctx: *anyopaque, segments: []const page.Extent) Error!void,
+        /// A released region's ring back to the heap (RAM bits + `free`
+        /// deltas), AFTER its page went Free; `released` is the page as it
+        /// stood, against which the identity's pending GrowRing word settles
+        /// first (`Manager.settleReleasedRing`).
+        freeRing: *const fn (ctx: *anyopaque, released: *const page.Page) Error!void,
         /// The census of the grant's remainder outside `kept` (sorted:
         /// `keptExtents`'s answer) — every
         /// extent read once, the node-seq handle floored above every stamp
@@ -452,7 +454,7 @@ pub const Driver = struct {
             // Only THEN the ring's extents return to the heap (no durable
             // page names them any more) — the leave's pages-barrier-
             // release order; a crash between leaves C13's orphan class.
-            self.vol.vt.freeRing(self.vol.ctx, p.segments.slice()) catch |e| log.warn("recovery: appender {d}'s ring could not return to the heap ({s}) — fsck C13 reclaims", .{ p.appender_id, @errorName(e) });
+            self.vol.vt.freeRing(self.vol.ctx, &p) catch |e| log.warn("recovery: appender {d}'s ring could not return to the heap ({s}) — fsck C13 reclaims", .{ p.appender_id, @errorName(e) });
             n += 1;
         }
         return n;
@@ -1480,9 +1482,9 @@ const RamVolume = struct {
             self.returned.append(self.gpa, e) catch return error.OutOfMemory;
         }
     }
-    fn freeRingFn(ctx: *anyopaque, segments: []const page.Extent) Error!void {
+    fn freeRingFn(ctx: *anyopaque, released: *const page.Page) Error!void {
         const self = self_(ctx);
-        for (segments) |s| self.rings_freed += s.len;
+        for (released.segments.slice()) |s| self.rings_freed += s.len;
     }
     fn orphanImagesFn(ctx: *anyopaque, gpa: Allocator, _: u32, grant: []const GrantRun, reached: []const u64, orphans: *std.ArrayList(u64), unwritten: *std.ArrayList(u64)) Error!void {
         const self = self_(ctx);

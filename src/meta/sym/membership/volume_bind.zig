@@ -992,14 +992,16 @@ pub const VolumeBinding = struct {
     }
 
     /// A released region's ring back to the heap (the leave's own order:
-    /// the page went Free first): the RAM bits released, one `free(retire
-    /// 0)` delta per extent in ONE control entry.
-    fn freeRingFn(ctx: *anyopaque, segments: []const page.Extent) Error!void {
+    /// the page went Free first): the identity's pending GrowRing word
+    /// settled against the released page, then the RAM bits released, one
+    /// `free(retire 0)` delta per extent in ONE control entry.
+    fn freeRingFn(ctx: *anyopaque, released: *const page.Page) Error!void {
         const self = self_(ctx);
         const be = self.be;
+        self.set().manager.settleReleasedRing(released.*) catch |e| return mapVerb(e);
         var recs: std.ArrayList(manager.ControlRecord) = .empty;
         defer recs.deinit(self.gpa);
-        for (segments) |s| {
+        for (released.segments.slice()) |s| {
             var e = (s.start - be.sb.heap.start) / be.sb.node_size;
             const end = e + s.len / be.sb.node_size;
             while (e < end) : (e += 1) {

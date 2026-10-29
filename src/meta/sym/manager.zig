@@ -1156,7 +1156,7 @@ pub const Manager = struct {
         const prior = pair.newest();
 
         // 5. Settle the predecessor incarnation's pending GrowRing word.
-        try self.settlePending(stable, hint, prior);
+        try self.settlePending(stable, hint);
 
         // 7. Carve + zero + the alloc deltas.
         var carve = try self.carveRing(ring_bytes, region.RING_FLOOR_BYTES);
@@ -1223,19 +1223,35 @@ pub const Manager = struct {
         return m;
     }
 
-    /// A GrowRing segment the predecessor incarnation carved: one its last
-    /// page names went with the ring; one no page names is returned.
-    fn settlePending(self: *Manager, stable: cr.StableIdentity, hint: cr.AppenderHint, prior: ?page.Page) VerbError!void {
+    /// The pending GrowRing word, judged against the page of the appender
+    /// that CARVED it (`pending.appender_id`): a segment that page names went
+    /// with its ring and returns when the ring does (the leave, the release
+    /// of a Recovered page — `settleReleasedRing`); one it never named (the
+    /// lost reply) is returned here. Never against another pair: a re-join
+    /// in place takes the next pair while its predecessor's page stays
+    /// Recovered, the segment still in its ring (run 19: freed under it,
+    /// carved into the successor's ring, freed again at the release).
+    fn settlePending(self: *Manager, stable: cr.StableIdentity, hint: cr.AppenderHint) VerbError!void {
+        const p = hint.pending orelse return;
+        try self.settleAgainst(stable, hint, try self.readPageOf(p.appender_id));
+    }
+
+    /// The pending word settled against `owner` (the carving appender's page
+    /// as it stands): its incarnation gone — no page, Free, or a later term
+    /// on the pair — its ring's release settled it (or a crash between left
+    /// it to fsck C13), so the word clears alone.
+    fn settleAgainst(self: *Manager, stable: cr.StableIdentity, hint: cr.AppenderHint, owner: ?page.Page) VerbError!void {
         const p = hint.pending orelse return;
         const g = self.vol.geo();
-        var named = false;
-        if (prior) |pp| for (pp.segments.slice()) |s| if (s.start == p.start and s.len == p.len) {
-            named = true;
-        };
         var cleared = hint;
         cleared.pending = null;
         const hv = cleared.encode();
-        if (named) {
+        const carver = if (owner) |o| o.state != .free and o.term == p.term else false;
+        var named = false;
+        if (carver) for (owner.?.segments.slice()) |s| if (s.start == p.start and s.len == p.len) {
+            named = true;
+        };
+        if (!carver or named) {
             try self.control(&.{.{ .put = .{ .key = cr.appenderHintKey(stable).slice(), .value = &hv } }});
             return;
         }
@@ -1252,6 +1268,21 @@ pub const Manager = struct {
         e = first;
         while (e < end) : (e += 1) self.vol.vt.releaseUnpublished(self.vol.ctx, e);
         stats.appender_pending_segments_returned.inc();
+    }
+
+    /// A Recovered page's release (`recovery.releaseRecovered`, the page
+    /// written Free, its ring about to return): the identity's pending word
+    /// settles against the page as it was — a segment it names returns with
+    /// the ring, one it never named returns here.
+    pub fn settleReleasedRing(self: *Manager, released: page.Page) VerbError!void {
+        self.requireLease() catch return error.Refused;
+        self.verbs_lock.lockUncancelable(self.io);
+        defer self.verbs_lock.unlock(self.io);
+        const stable: cr.StableIdentity = .{ .node_token = released.identity.node_token, .mount_slot = released.identity.mount_slot };
+        const hint = try self.readHint(stable);
+        const p = hint.pending orelse return;
+        if (p.appender_id != released.appender_id or p.term != released.term) return;
+        try self.settleAgainst(stable, hint, released);
     }
 
     // ---- LeaveAppender (§3.2) ----
@@ -1288,7 +1319,7 @@ pub const Manager = struct {
         // The pending GrowRing word settles with the page.
         const stable: cr.StableIdentity = .{ .node_token = p.identity.node_token, .mount_slot = p.identity.mount_slot };
         const hint = try self.readHint(stable);
-        try self.settlePending(stable, hint, p);
+        try self.settlePending(stable, hint);
         // The page Free into BOTH directory slots keeping id, term and the
         // head hint (the seq-space watermark the next carve continues from).
         const ring = p.segments;
@@ -1582,7 +1613,7 @@ pub const Manager = struct {
                 stats.manager_verb_replays.inc();
                 return .{ .segment = .{ .start = pend.start, .len = pend.len } };
             }
-            try self.settlePending(stable, hint, p);
+            try self.settlePending(stable, hint);
         }
         if (p.segments.len >= page.RING_SEGMENTS_MAX) return .{ .segment = null };
         // 4. The room.
@@ -2526,6 +2557,54 @@ test "a re-join while the predecessor's page is RECOVERED settles the pending Gr
     const conflicts0 = counters.tripwireCount("extent_grant_conflicts");
     _ = try m.growRing(.{ .appender_id = 2, .want_bytes = region.RING_FLOOR_BYTES });
     try testing.expectEqual(conflicts0, counters.tripwireCount("extent_grant_conflicts"));
+}
+
+test "a Recovered page's release settles its identity's pending GrowRing word: a segment the page names returns with its ring (the word clears, nothing freed here), one it never named (the lost reply) returns here; a word of another incarnation is left alone" {
+    const gpa = testing.allocator;
+    const tv = try TestVolume.init(gpa, 1 << 30, 65_536, 4000);
+    defer tv.deinit();
+    try tv.liveManagerPage();
+    var m = newManager(gpa, tv);
+    defer m.deinit();
+    const Bits = struct {
+        fn allHeld(t: *TestVolume, seg: page.Extent, want: bool) !void {
+            var e = (seg.start - t.g.heap.start) / t.g.node_size;
+            while (e < (seg.start + seg.len - t.g.heap.start) / t.g.node_size) : (e += 1) try testing.expectEqual(want, t.bits[@intCast(e)]);
+        }
+    };
+    var img: [page.PAGE_LEN]u8 = undefined;
+    // Named: the page adopted the segment.
+    const ja = try m.joinAppender(.{ .identity = ident_a });
+    const seg_a = (try m.growRing(.{ .appender_id = ja.appender_id, .want_bytes = region.RING_FLOOR_BYTES })).segment.?;
+    var pa = (try m.readPageOf(ja.appender_id)).?;
+    try pa.segments.push(seg_a);
+    pa.state = .recovered;
+    pa.generation += 1;
+    try pa.encode(&img);
+    @memcpy(tv.at(ja.page_addr)[0..page.PAGE_LEN], &img);
+    // Another incarnation's word (a later term): untouched.
+    var stale = pa;
+    stale.term += 1;
+    try m.settleReleasedRing(stale);
+    const key_a = cr.appenderHintKey(.{ .node_token = ident_a.node_token, .mount_slot = ident_a.mount_slot });
+    try testing.expect((cr.AppenderHintWire.decode(tv.get(key_a.slice()).?) catch unreachable).pending != null);
+    try m.settleReleasedRing(pa);
+    try testing.expect((cr.AppenderHintWire.decode(tv.get(key_a.slice()).?) catch unreachable).pending == null);
+    try Bits.allHeld(tv, seg_a, true);
+    // The lost reply: carved, never named.
+    const jb = try m.joinAppender(.{ .identity = ident_b });
+    const seg_b = (try m.growRing(.{ .appender_id = jb.appender_id, .want_bytes = region.RING_FLOOR_BYTES })).segment.?;
+    var pb = (try m.readPageOf(jb.appender_id)).?;
+    pb.state = .recovered;
+    pb.generation += 1;
+    try pb.encode(&img);
+    @memcpy(tv.at(jb.page_addr)[0..page.PAGE_LEN], &img);
+    const returned0 = stats.appender_pending_segments_returned.load();
+    try m.settleReleasedRing(pb);
+    const key_b = cr.appenderHintKey(.{ .node_token = ident_b.node_token, .mount_slot = ident_b.mount_slot });
+    try testing.expect((cr.AppenderHintWire.decode(tv.get(key_b.slice()).?) catch unreachable).pending == null);
+    try Bits.allHeld(tv, seg_b, false);
+    try testing.expectEqual(returned0 + 1, stats.appender_pending_segments_returned.load());
 }
 
 test "publish roots: a word for a slot the appender does not lease, a cursor below the recorded floor, a root outside the grant, or a wrong generation is rejected before any effect; a legal word lands in tree 0; the same word again is already" {

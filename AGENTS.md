@@ -20,33 +20,36 @@ take the better design and add a row to the ledger in decision 0002 before diver
 
 ## Venue
 
-Linux only (charter §1.2). Every Linux venue is reached through `scripts/venue`, runs on
-the **sqz kernel series** (`scripts/kernel/patches-7.2/`, 0001–0033 on linux 7.2.y, plus
-`scripts/kernel/config-fragment`; `uname -r` carries `sqz`) with Zig 0.17.0 and the repo
-at the same absolute path, and runs commands as root:
+Linux ≥ 7.3 only (charter §1.2, §3; owner ruling 2026-10-29). Every Linux venue is reached
+through `scripts/venue`, runs **Linux ≥ 7.3 with FUSE-over-io_uring buffer pools**
+(`CONFIG_FUSE_IO_URING=y`, `fuse.enable_uring`; the venue kernel is mainline +
+`scripts/kernel/patches-mainline/` + `scripts/kernel/config-fragment`, `uname -r` ending
+`mainline-sqz`) with Zig 0.17.0 and the repo at the same absolute path, and runs commands as
+root:
 - `local` (`SQZ_VENUE=local`; the default when the controller is Linux): THIS host —
   commands run through `sudo` in this tree, no sync, no VM. Set it up once with
   `scripts/dev/provision-local-venue` (checks the distro — Debian/Ubuntu with apt, or Arch
-  and its derivatives such as Omarchy with pacman —, zig on root's PATH, the sqz kernel
+  and its derivatives such as Omarchy with pacman —, zig on root's PATH, a ≥ 7.3 kernel
   and `fuse.enable_uring`, the nvmet/brd/null_blk modules, the packages, the build root,
   passwordless sudo; prints each fix; `--apply` does the packages, modules, the boot
   parameter in GRUB or Limine, IOR/mdtest and directories — never a kernel install or a
   reboot; with ≥ 64 GiB of RAM, `/build/tmp` and the tree's `.zig-cache/tmp` live in RAM:
-  ext4 on a zram device via zram-generator, so every test image stays off the disk). The kernel: `scripts/kernel/build-host-kernel --local` — on Debian/Ubuntu
-  linux 7.2.8 + the series as .debs (`7.2.8-sqz`); on Arch/Omarchy Omarchy's CURRENT
-  `linux-omarchy` PKGBUILD (its base, all its patches, its config; `linux-omarchy-bore` until 2026-10-19) + the series, built
-  with makepkg, installed with pacman (`7.2.x-N-omarchy-sqz`; owner ruling 2026-10-16).
-  After an Omarchy bump run `--prepare-only` first: it applies everything at `--fuzz=0` in
-  minutes and a conflict means refreshing the patch in `scripts/kernel/patches-7.2/`.
-  Reboot into it yourself. `--mainline` (Arch only) builds a SECOND entry, `linux-mainline-sqz`
-  (mainline 7.3 + `scripts/kernel/patches-mainline/`, the series re-expressed on mainline: no
-  kmbuf/zero-copy there, upstream took another UAPI — the daemon runs UserEnts on it), placed
-  below the default in Limine; `docs/evidence/rung-10-kernel-mainline.md` has the tables. Build slots: one per 4 threads and per 8 GiB
+  ext4 on a zram device via zram-generator, so every test image stays off the disk). The kernel:
+  `scripts/kernel/build-host-kernel --local` (Arch/Omarchy) — `linux-mainline-sqz`: mainline
+  7.3 + `scripts/kernel/patches-mainline/` with Omarchy's CURRENT config as the seed and its
+  PKGBUILD's build/package functions, built with makepkg, installed with pacman, FIRST in
+  Limine's boot order (`7.3.0-1.N-mainline-sqz`; `docs/evidence/rung-10-kernel-mainline.md` has
+  the tables). `--prepare-only` applies every patch at `--fuzz=0` and checks the config in
+  minutes. A Debian/Ubuntu host runs a distro or kernel.org ≥ 7.3 kernel. Reboot into it
+  yourself. The 7.2 series and its build paths were deleted 2026-10-29
+  (`docs/evidence/rung-10-drop-7.2.md`). Build slots: one per 4 threads and per 8 GiB
   (`SQZ_VENUE_SLOTS` overrides; every controller of one build root must agree).
 - `vm` (the default on the Mac): the macOS `container` `sqz-zig` — aarch64, Ubuntu 24.04,
-  this repo mounted rw at the same path.
+  this repo mounted rw at the same path. Its kernel was the 7.2-sqz container build; it needs
+  a ≥ 7.3 arm64 kernel (no recipe exists yet) before it is a venue again.
 - `kamrui` (`SQZ_VENUE=kamrui`): the x86_64 box `kamrui-dev` over ssh — 12 threads,
-  61 GiB, local NVMe; the repo rsynced to the same path before every command.
+  61 GiB, local NVMe; the repo rsynced to the same path before every command. It ran the
+  7.2-sqz .debs; it needs a ≥ 7.3 kernel before it is a venue again.
 
 One venue covers one architecture: a local x86_64 workstation needs a second venue for
 aarch64 (the Mac's `vm`, or an arm64 box over ssh), and the gate train runs on every venue

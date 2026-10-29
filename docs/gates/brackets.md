@@ -64,7 +64,7 @@ record, and a hand-typed number is not a result.
 
 | item | requirement |
 |---|---|
-| client | 32 cores (the reference class), one NUMA domain or the recorded topology; the sqz kernel series (`7.2.6-sqz` or later) with `fuse.enable_uring=Y`, kmbuf + zero-copy + payload retention probed Present (the daemon logs `buffer mode zero_copy (kmbuf …, retention present)`) |
+| client | 32 cores (the reference class), one NUMA domain or the recorded topology; Linux ≥ 7.3 with `fuse.enable_uring=Y` (the venue's `mainline-sqz` kernel, decision 0003 §CT), buffer pools and zero-copy armed (the daemon's INIT line logs `bufpool present, zero-copy true`) |
 | targets | 5 memory-backed nvme-tcp targets (kernel nvmet; `nvmeof share --ip … --port …`, memory-backed namespaces), connected with `nvmeof connect`; 4 data + 1 meta, or the recorded split |
 | quiet | nothing else runs: no gates, no other agents, no `pkill` sweeps; `loadavg` at the start ≤ 0.5 and recorded |
 | build | `zig build -Dprofile=dist dist`; `squeezefs --version` says `dist`; the shim from the same build (`lib/libsqueezefs_il.so`) — the daemon refuses to pair across builds |

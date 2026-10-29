@@ -50,11 +50,12 @@ removes/s, 284 k mkdir/s, 283 k rmdir/s. The measurement notes behind every numb
 
 ## Requirements
 
-- **Linux ≥ 6.14** with FUSE-over-io_uring (`CONFIG_FUSE_IO_URING`; the daemon switches
-  `fuse.enable_uring` on itself). Linux 7.3 is the development platform and runs the filesystem
-  unpatched. `scripts/kernel/patches-mainline/` carries a few optional kernel patches — two fixes,
-  `syncfs(2)` forwarded to the daemon, `FUSE_TIME_LIMITS`, host-scoped NVMe-oF subsystems for two
-  fenced identities on one host — and `scripts/kernel/build-host-kernel` builds a kernel with them.
+- **Linux ≥ 7.3** with FUSE-over-io_uring buffer pools (`CONFIG_FUSE_IO_URING`; the daemon
+  switches `fuse.enable_uring` on itself). A kernel without them refuses the mount, naming what is
+  missing. Linux 7.3 runs the filesystem unpatched. `scripts/kernel/patches-mainline/` carries a
+  few optional kernel patches — two fixes, `syncfs(2)` forwarded to the daemon,
+  `FUSE_TIME_LIMITS`, host-scoped NVMe-oF subsystems for two fenced identities on one host — and
+  `scripts/kernel/build-host-kernel` builds a kernel with them.
   Every kernel feature is probed at runtime; a missing one is reported by name, never worked around
   silently.
 - **Root.** The daemon mounts with FUSE-over-io_uring and opens devices `O_DIRECT`.

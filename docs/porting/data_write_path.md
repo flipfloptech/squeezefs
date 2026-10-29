@@ -459,6 +459,8 @@ path that cannot run the precedence check DEMOTES.
 
 ### 3.6 ACK-early (`:19269-19341`, continuations `:19501-19741`)
 
+> **Historical (2026-10-29, decision 0003 §CT):** ACK-early rode the 7.2 series' payload retention (`commit_retain`); it was removed with the 7.2 rungs, and every overlay store is handler-awaited before its reply.
+
 `ack_early_enabled()` ∧ `z.ack_early_sound() ∧ z.commit_retain()` ⇒ detached
 `finish_ack_early_store` (page-cache folios: 0-copy, needs kernel 0029) and
 `Ok(true)` immediately; `!sound ∧ ack_early_odirect()` ⇒ SNAPSHOT (`materialize`)

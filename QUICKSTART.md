@@ -1,7 +1,7 @@
 # SqueezeFS quickstart
 
-Everything below runs as root on Linux ≥ 6.14 (Linux 7.3 is the development platform) with
-FUSE-over-io_uring in the kernel. Build the binary once:
+Everything below runs as root on Linux ≥ 7.3 with FUSE-over-io_uring buffer pools in the
+kernel (`CONFIG_FUSE_IO_URING`). Build the binary once:
 
 ```sh
 zig build -Dprofile=dist dist          # → zig-out/bin/squeezefs

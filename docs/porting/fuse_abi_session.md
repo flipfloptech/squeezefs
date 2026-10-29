@@ -178,6 +178,8 @@ log line; still answer `-ENOSYS` (the kernel latches `fc->no_<op>` on ENOSYS for
 - Killpriv bits pinned together: abi.rs:1211–1217.
 
 ### 1.9 FUSE-over-io_uring ABI (fuse_over_uring.rs:108–169; kmbuf.rs:170–205)
+
+> **Partly historical (2026-10-29, decision 0003 §CT):** the kmbuf, buffer-ring and retention rows below (`FUSE_URING_BUF_RING` through the retention probe) are the deleted 7.2-sqz UAPI; the Linux ≥ 7.3 command request and pool constants are `fuse_mainline_pools.md` §1.
 | item | value / layout | cite |
 |---|---|---|
 | `FUSE_URING_IN_OUT_HEADER_SZ` / `FUSE_URING_OP_IN_OUT_SZ` | 128 / 128 | fuse_over_uring.rs:111–112 |

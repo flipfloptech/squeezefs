@@ -1,5 +1,7 @@
 # PORTING SPEC — the FUSE-over-io_uring transport (rung 3: ring setup, slot state machine, lease + commit gate, drain groups, worker pass, teardown)
 
+> **Partly historical (2026-10-29, decision 0003 §CT):** the probe ladder (§1.1), the userspace payload arena (§1.4), the legacy REGISTER bytes (§1.5) and the multi-queue drain groups (§3: a group is one queue now) describe pre-7.3 transports that were deleted; the buffer-pool shapes that replace them are `fuse_mainline_pools.md` §1–§2.
+
 Reference tree: `/Users/joberdorf/Source/squeezefs/crates/fuse3/src/raw/connection/` unless a path says
 otherwise. Short names used in cites:
 

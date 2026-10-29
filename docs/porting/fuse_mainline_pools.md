@@ -1,38 +1,34 @@
 # Porting spec — mainline FUSE-over-io_uring buffer pools and per-file zero-copy (Linux ≥ 7.3)
 
-Scope: the kernel half of the transport's PRIMARY buffer rung, `MainlinePool` (charter §4
-amended 2026-10-21, decision 0003 §BE). This spec SUPERSEDES `fuse_kmbuf_zc.md` for the
-contract the daemon ships; that document stays as the spec of the TRANSITIONAL rungs
-(`BufRing`, `ZeroCopy`) until their owner-ruled deletion. Every claim below cites mainline
+Scope: the kernel half of THE transport — the buffer pool is the only transport since the
+owner's ruling of 2026-10-29 (Linux ≥ 7.3 only; charter §4, decision 0003 §BE and §CT). This
+spec SUPERSEDES `fuse_kmbuf_zc.md`, whose kmbuf, retention and lattice sections are historical
+(the 7.2-sqz rungs were deleted with the 7.2 series). Every claim below cites mainline
 `v7.3` (`/build/kernel/linux-mainline-v7.3`, `c03c1a14507d`): `fs/fuse/dev_uring.c`
 (`u:`), `fs/fuse/dev_uring_i.h`, `include/uapi/linux/fuse.h` (`h:`), `fs/fuse/file.c`,
 `Documentation/filesystems/fuse/uapi/fuse-uapi-io-uring.rst`, and the merge commits
 `b45aaabc628b` (pools), `96caf2496e15` (registered pools), `43f8343858eb` (zero-copy),
 `767094250c6c` (docs). The daemon's mirror: `src/fuse/abi.zig`, `transport/probes.zig`,
-`transport/worker.zig` (`Pool`, `setupMainlinePool`, `prep*Mainline`, `tryHoldPooled`),
-`transport/session.zig` (`resolveMode`, `openPosture`), `handler/lifecycle.zig`.
+`transport/worker.zig` (`Pool`, `setupPool`, `prepAddQueue`, `prepAddBufpool`,
+`tryHoldPooled`), `transport/session.zig` (`resolveProbes`, `openPosture`),
+`handler/lifecycle.zig`.
 
 ---
 
-## 0. The three strata, the one degrade point
+## 0. The one stratum, the one gate
 
-- **Mainline** (7.3+): the INIT offer carries `FUSE_HAS_IO_URING_BUFPOOL` (bit 43) beside
-  `FUSE_OVER_IO_URING` whenever `fuse.enable_uring` reads Y when the kernel SENDS the INIT
-  (`inode.c:1483`). The daemon writes Y BEFORE `mount(2)`, so the bit is reliable on every
-  mount including the first after boot (`session.mount` step 0).
-- **Legacy** (7.2-sqz): the kmbuf opcode ladder reads present (`fuse_kmbuf_zc.md` §2.1).
-- **Stock** (6.14–7.2): neither.
-
-The lattice (`probes.resolveBufferMode`): bit 43 ⇒ `mainline_pool` whatever the ladder says
-(the two UAPIs cannot coexist in one `dev_uring.c`); else kmbuf present ⇒ `zero_copy` /
-`buf_ring`; else `user_ents`. The explicit pin `SQUEEZEFS_FUSE_BUFFER_MODE=pool` is refused
-loud without the offer. **The opcode collision**: the series' `RELEASE_PAYLOAD` = 3 and
-`FEATURES` = 4 are mainline's `ADD_QUEUE` and `ADD_BUFPOOL`; the retention and FEATURES
-probes run only on a legacy rung (`probes.legacyProbesApply`), so no mainline kernel sees
-opcode 3 with the legacy meaning (it would create queue 0 without zero-copy:
-`u:fuse_uring_add_queue`) and no legacy kernel sees it with the mainline one (the seam
-`SQUEEZEFS_TEST_MAINLINE_POOLS` proves the latter fails loud: `-ENOTCONN` from
-`RELEASE_PAYLOAD`'s "no queue" arm, the typed `MainlinePoolRefused`).
+The INIT offer carries `FUSE_HAS_IO_URING_BUFPOOL` (bit 43) beside `FUSE_OVER_IO_URING`
+whenever `fuse.enable_uring` reads Y when the kernel SENDS the INIT (`inode.c:1483`). The
+daemon writes Y BEFORE `mount(2)`, so the bit is reliable on every mount including the first
+after boot (`session.mount` step 0). The bit IS the gate (`probes.bufpoolVerdict`): absent ⇒
+the mount fails with the typed `BufpoolAbsent` and a refusal naming the bit, "Linux >= 7.3",
+the running release and the two kernel switches (`CONFIG_FUSE_IO_URING=y`,
+`fuse.enable_uring=Y`) — before any ring exists. There is no fallback transport: the
+pre-7.3 strata (the 7.2-sqz kmbuf ladder, the stock userspace-ent arena) were removed
+2026-10-29 (decision 0003 §CT); the seam `SQUEEZEFS_TEST_FUSE_BUFPOOL_ABSENT` reads the
+offer absent so a row can judge the refusal on a 7.3 kernel. Zero-copy is the second verdict
+(`probes.zcVerdict`: `CAP_SYS_ADMIN` ∧ a sparse fixed-buffer table); without it the queues
+are created copying (`ADD_QUEUE` without the flag), never refused.
 
 ---
 
@@ -50,17 +46,13 @@ opcode 3 with the legacy meaning (it would create queue 0 without zero-copy:
 | `FUSE_KERNEL_MINOR_VERSION` | 46 | `h:286` |
 
 `struct fuse_uring_ent_in_out` (32 B, `h:1279-1295`): `flags u64 @0` ‖ `commit_id u64 @8` ‖
-`payload_sz u32 @16` ‖ **`offset u32 @20`** (the series' padding) ‖ `reserved u64 @24`.
-The daemon's `abi.fuse_uring_ent_in_out` names the word `offset` on both strata (zero on the
-series).
+`payload_sz u32 @16` ‖ **`offset u32 @20`** (padding before uapi 7.46) ‖ `reserved u64 @24`.
+The daemon's `abi.fuse_uring_ent_in_out` names the word `offset`.
 
-`struct fuse_uring_cmd_req` (40 B, `h:1340-1368`; `abi.fuse_uring_cmd_req_mainline`):
+`struct fuse_uring_cmd_req` (40 B, `h:1340-1368`; `abi.fuse_uring_cmd_req`):
 `flags u64 @0` ‖ `commit_id u64 @8` ‖ `qid u16 @16` ‖ `padding[6] @18` ‖ union @24 {
 `bufpool { uaddr u64 @24; len u32 @32; reserved u32 @36 }` | `ent_zero_copy_buf_index u16
-@24` }. The series' 24-byte struct puts `init_flags`/`queue_depth` at 18/20 — inside
-mainline's padding, which the kernel never reads — and leaves the union zero, so a legacy
-REGISTER is well-formed on mainline (`abi.zig`'s comptime asserts pin both facts); the
-converse is never sent.
+@24` } (`abi.zig`'s comptime asserts pin the offsets).
 
 ---
 
@@ -100,8 +92,7 @@ payload_sz` per queue, page-aligned, THP-hinted, pinned once by the registration
 queue's first ring (`ring_base == 0`) issues ADD_QUEUE + ADD_BUFPOOL and sets
 `Shared.pool_added[qid]`; later rings find it set (the session starts the rings in order).
 Table layout per ring: **index 0 = the pool** (`Pool.POOL_INDEX`), **`1 + ent`** = the
-entry's zc slot (`worker.zcSlotOf`; the legacy rung keeps `ent` with the headers at
-`depth`). `depth` buffers per queue = one per entry across the queue's rings, so the kernel
+entry's zc slot (`worker.zcSlotOf`). `depth` buffers per queue = one per entry across the queue's rings, so the kernel
 never parks a fetch for want of a buffer (`u:1319-1323`: a fetch with no free buffer leaves
 the cmd parked until one frees).
 
@@ -133,7 +124,7 @@ are `folio_get`'d into a carrier and registered as a bvec at `ent->zero_copy_ind
 release callback puts them when the slot is gone and every in-flight fixed op dropped its
 node — the series' 0020 law), `FUSE_URING_ENT_ZERO_COPY` set in the header, the folio copy
 skipped at delivery and at commit (`cs->skip_folio_copy`). The daemon reads the direction
-off the flag + opcode (`zc.mainlineDirOf`): no opcode mirror, no readdir latch (readdir is
+off the flag + opcode (`zc.dirOf`): no opcode mirror, no readdir latch (readdir is
 never zero-copied here). Slot addressing as before: `imu->ubuf = 0`, so `sqe.addr` is the
 byte offset into the slot, `buf_index` = `1 + ent`. Unregistered at `fuse_uring_req_end`
 (the COMMIT), `zero_copy_unregister` through the commit's cmd.
@@ -158,8 +149,8 @@ A zc WRITE's reply (`fuse_write_out`, 16 B) goes through the pool buffer the ker
 selected for it (out_numargs = 1 is copyable payload). A zero-length paged READ reply is
 header-only — never a zero-length `READ_FIXED` (the series' law stands).
 
-**The held write** (charter §6.2 item 1): a zc WRITE (SOURCE slot) is held or extracted as
-on the legacy rung (`deliverPagedWrite`); a COPIED WRITE (no flag) is held in its POOL
+**The held write** (charter §6.2 item 1): a zc WRITE (SOURCE slot) is held or extracted
+(`deliverPagedWrite`); a COPIED WRITE (no flag) is held in its POOL
 buffer when `zc.holdShape` and the filesystem's gate admit it (`tryHoldPooled`,
 `PayloadLease.acquireHeldPooled`: the bytes in hand AND the slot coordinates), the direct
 store `WRITE_FIXED(device ← pool)` on `POOL_INDEX` by user address (`prepPoolStore`). The
@@ -172,32 +163,26 @@ every pool-sourcing DMA is handler-awaited strictly before the reply exists — 
 
 ## 5. Teardown
 
-No retention on this rung (the series' RETAIN/RELEASE are kmbuf-only); every slot is
-unregistered at its COMMIT; `fuse_uring_destruct` frees the pools (`u:262-300`). The
-daemon's drain is the UserEnts one (synthesize the owed, unmount, join); the pool is unmapped
-after every group (its registrations went with the rings).
+No retention: every slot is unregistered at its COMMIT; `fuse_uring_destruct` frees the
+pools (`u:262-300`). The daemon's drain synthesizes the owed replies, unmounts and joins; the
+pool is unmapped after every group (its registrations went with the rings).
 
 ---
 
 ## 6. Tests (the contract, red first)
 
-`abi` "mainline uring ABI pins"; `probes` "the mainline stratum" (the lattice, the gates,
-the gauges); `geometry` "rings per queue" (mainline derives 3 with no FEATURES); `zc` "the
-mainline direction is the kernel's word"; `worker` "mainline SQE bytes" + "the mainline
-pool"; `slot` "a held lease …" (the pooled hold); `lifecycle` "mainline zero-copy per open
-file"; `session` "the open posture table", "e2e lattice: the mainline stratum" (the seam:
-fail-loud on a legacy kernel, mounts on 7.3) and "e2e mainline pools" (live, skips without
-bit 43).
+`abi` "uring ABI pins (uapi 7.46)"; `probes` "the buffer-pool gate"; `geometry` "rings per
+queue" (the derived 3); `zc` "the slot direction is the kernel's word"; `worker` "the uring
+command SQE bytes" + "the pool"; `slot` "a held lease …" (the pooled hold); `lifecycle`
+"mainline zero-copy per open file"; `session` "the open posture table", "e2e: the
+buffer-pool gate" (the seam: the typed refusal, no mount), "e2e buffer pools (Linux ≥ 7.3)"
+and "e2e buffer pools without zero-copy (the CAP_SYS_ADMIN seam)"; the smoke's late-refusal
+row (the same seam through `squeezefs mount`: exit 1, the refusal on stderr).
 
-**Rows on both strata.** A row judging the stock stratum hides BOTH carriers
-(`SQUEEZEFS_TEST_KMBUF_ABSENT` reads the kmbuf ladder and the bufpool offer absent: on a
-mainline kernel the ladder is absent already and the offer alone would keep the pool). A row
-judging zero-message opens (§AF/§AJ) pins `SQUEEZEFS_FUSE_ZC_OPEN=0` beside
-`SQUEEZEFS_FUSE_NO_OPEN=1` (`session.zig`'s `no_open_pin`, `smoke.zig`'s `pinNoOpen`): on a
-mainline zero-copy session the default lever serves opens whatever the mount read, and the
-lever is inert on the legacy rungs. A row judging a zero-copy session asks
-`Session.zeroCopyArmed()` (either stratum), never `mode == .zero_copy`; the smoke reads the
-daemon's INIT line (`bufpool present`, `zero-copy true`) beside its own kmbuf probe. The
-served-open control arm has its own cross-daemon O_TRUNC row ("O_TRUNC UNDER SERVED OPENS
-TRUNCATES"): on mainline it is the default posture, so every OPEN-carried path a no-open
-mount never sends must hold there too.
+**Row postures.** A row judging zero-message opens (§AF/§AJ) pins `SQUEEZEFS_FUSE_ZC_OPEN=0`
+beside `SQUEEZEFS_FUSE_NO_OPEN=1` (`session.zig`'s `no_open_pin`, `smoke.zig`'s `pinNoOpen`):
+on a zero-copy session the default lever serves opens whatever the mount read. A row judging
+a zero-copy session asks `Session.zeroCopyArmed()`; the smoke reads the daemon's INIT line
+(`bufpool present`, `zero-copy true`). The served-open control arm has its own cross-daemon
+O_TRUNC row ("O_TRUNC UNDER SERVED OPENS TRUNCATES"): it is the default posture, so every
+OPEN-carried path a no-open mount never sends must hold there too.

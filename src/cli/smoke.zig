@@ -10377,6 +10377,50 @@ fn plantHeldCopy(io: Io, dir: []const u8, id: journal_tail.Identity, path_buf: *
     return path;
 }
 
+/// A dead mount's held write cache of the set `set_uuid` in the rig's held
+/// dir (`staging.Ring.Ram.HeldPath`): grain 0 the marker (mount slot 0, a
+/// local member), one resident's grain past it — what the format's sweep
+/// reads. Returns its path.
+fn plantHeldRing(io: Io, work: []const u8, set_uuid: [16]u8, path_buf: *[journal_tail.PATH_CAP]u8) ![:0]const u8 {
+    const m: staging.Marker = .{ .set_uuid = set_uuid, .set_epoch = 1, .node_token = 0x5EED, .mount_slot = 0 };
+    var nb: [64]u8 = undefined;
+    const name = staging.Ring.Ram.claimName(&nb, m.identity(), m.mount_slot, m.member);
+    var dir_buf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "{s}/held", .{work});
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fmt.bufPrintSentinel(path_buf, "{s}/{s}" ++ staging.Ring.Ram.HELD_SUFFIX, .{ dir, name }, 0);
+    var image: [2 * 4096]u8 = @splat(0);
+    @memcpy(image[0..staging.MARKER_LEN], &m.encode());
+    @memset(image[4096..], 0x5A);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &image });
+    return path;
+}
+
+test "smoke: FORMAT REMOVES THE HELD WRITE CACHE OF THE SET IT OVERWRITES (decision 0003 §CV) — a formatted set; a dead mount's held write cache planted in the held dir (its marker naming the set) beside another set's; `squeezefs format --force` over the set ⇒ the overwritten set's copy is gone and the format says so, the other set's copy stays (red on 6415dc1: the copy stayed — no mount presents the old set's identity again, so it would sit in /run until the host rebooted)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    const old = try volumeIdentity(io, rig.img);
+    var own_buf: [journal_tail.PATH_CAP]u8 = undefined;
+    const own = try plantHeldRing(io, rig.work, old.set_uuid, &own_buf);
+    var other_buf: [journal_tail.PATH_CAP]u8 = undefined;
+    const other = try plantHeldRing(io, rig.work, "another-set!!!!!".*, &other_buf);
+    const r = try rig.squeezefs(&.{ "format", "--force", rig.meta_uri, rig.data_uri });
+    defer rig.freeRun(r);
+    if (!r.term.success()) std.debug.print("\nformat --force: {s}\n", .{r.stderr});
+    try testing.expect(r.term.success());
+    const own_left = if (Io.Dir.cwd().access(io, own, .{})) true else |_| false;
+    const other_left = if (Io.Dir.cwd().access(io, other, .{})) true else |_| false;
+    const said = std.mem.indexOf(u8, r.stderr, "removed the held write cache") != null;
+    std.debug.print("\nsmoke[format sweep]: the overwritten set's held write cache {s}, another set's {s}; the format said so: {}\n", .{ if (own_left) "LEFT" else "removed", if (other_left) "kept" else "REMOVED", said });
+    try testing.expect(!own_left);
+    try testing.expect(other_left);
+    try testing.expect(said);
+}
+
 test "smoke: FORMAT REMOVES THE HELD JOURNAL TAIL OF THE VOLUME IT OVERWRITES (decision 0003 §BR.10 (b)) — a formatted set; a held copy of its metadata volume's tail planted in the held dir (named by the volume's uuid, its header naming the volume and its set) beside another volume's copy; `squeezefs format --force` over the set ⇒ the overwritten volume's copy is gone and the format says so, the other volume's copy stays, the new volume names a new uuid (red before: the copy stayed — its uuid never recurs, so it leaked in /run until the host rebooted)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

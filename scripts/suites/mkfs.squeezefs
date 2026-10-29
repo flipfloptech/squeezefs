@@ -13,6 +13,9 @@
 # $SCRATCH_DEV` before every scratch test. Installed as
 # /sbin/mkfs.fuse.squeezefs.
 set -euo pipefail
+# The filesystem side is never interposed: a run under FSTESTS_PRELOAD
+# preloads the tests' tools, not the helpers or the daemons they start.
+unset LD_PRELOAD
 ENV_FILE=${SQZ_SUITES_ENV:-/run/squeezefs-suites.env}
 [ -f "$ENV_FILE" ] && source "$ENV_FILE"
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/setpaths.sh"

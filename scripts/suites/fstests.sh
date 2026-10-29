@@ -24,6 +24,7 @@
 #   SUITE_RUNS=1 FSTESTS_GROUPS="-g quick" scripts/venue scripts/suites/fstests.sh
 #   FSTESTS_TESTS="generic/001 generic/003" …                   # a subset (triage)
 #   FSTESTS_AFTER=generic/683 …                                   # resume discovery after a failure (never the release verdict)
+#   FSTESTS_PRELOAD=1 …                                          # every test process under libsqueezefs_il.so (below)
 set -euo pipefail
 # xfstests' sets and results live on the DISK: its fill/fallocate/reflink
 # tests (generic/299, 302, 303, …) write tens of GiB, and the venue's
@@ -46,6 +47,27 @@ FSTESTS_TIMEOUT_S=${FSTESTS_TIMEOUT_S:-14400}
 # Tests excluded in THIS venue only (`check -X`), each with its reason;
 # never a filesystem semantic (those are the ledger's).
 FSTESTS_VENUE_EXCLUDE="$SUITES_DIR/fstests-venue-exclude.txt"
+# FSTESTS_PRELOAD=<path to libsqueezefs_il.so> (`1`: the one this build
+# installed beside $SQZ_BIN): `check` and so every test process — xfs_io,
+# filefrag, the tests' own tools — run under the interposer (charter §7;
+# FIEMAP is served only there, decision 0003 §CJ), and both sets mount
+# `-o interception`. The mount, mkfs and fsck helpers and the daemons they
+# start never carry it (each helper unsets LD_PRELOAD). The shim pairs with
+# its own build alone: a `-dirty` build's identity is admitted on both
+# ends through SQUEEZEFS_TEST_IPC_ALLOW_DIRTY.
+FSTESTS_PRELOAD=${FSTESTS_PRELOAD:-}
+FSTESTS_CHECK_ENV=()
+fstests_preload_setup() {
+  [ -n "$FSTESTS_PRELOAD" ] || return 0
+  local so=$FSTESTS_PRELOAD
+  [ "$so" = 1 ] && so="$(dirname "$(dirname "$SQZ_BIN")")/lib/libsqueezefs_il.so"
+  so=$(readlink -f "$so")
+  [ -f "$so" ] || suite_die "FSTESTS_PRELOAD: no shim at $so (scripts/venue zig build installs it beside the binary)"
+  case ",$SUITE_MOUNT_OPTS," in *,interception,*|*,interception=*) ;; *) SUITE_MOUNT_OPTS="$SUITE_MOUNT_OPTS,interception" ;; esac
+  FSTESTS_CHECK_ENV=(LD_PRELOAD="$so")
+  if "$SQZ_BIN" --version | grep -q -- '-dirty'; then FSTESTS_CHECK_ENV+=(SQUEEZEFS_TEST_IPC_ALLOW_DIRTY=1); fi
+  suite_log "preload: every test process under $so (${FSTESTS_CHECK_ENV[*]:1}); mounts -o $SUITE_MOUNT_OPTS"
+}
 
 # xfstests master defines `struct delegation` (the file-delegation tests'
 # fcntl argument) only `#ifndef F_GETDELEG`; glibc 2.43+ defines the
@@ -309,7 +331,7 @@ fstests_run() {
   # reconfigure": generic/294, 306, 452's `-o remount,ro`); the classic
   # mount(2) applies the flag and ignores the options, as the daemon's
   # contract says. Helpers run the same under either API.
-  (cd "$FSTESTS_DIR" && exec setsid env LIBMOUNT_FORCE_MOUNT2=always FSTESTS_RUN_OWNER=$$ PATH="$SETS/bin:$PATH" timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}") > "$RESULTS/check-run$n.out" 2>&1 &
+  (cd "$FSTESTS_DIR" && exec setsid env LIBMOUNT_FORCE_MOUNT2=always FSTESTS_RUN_OWNER=$$ PATH="$SETS/bin:$PATH" "${FSTESTS_CHECK_ENV[@]}" timeout -s KILL "$FSTESTS_TIMEOUT_S" ./check -R xunit "${exclude[@]}" "${what[@]}") > "$RESULTS/check-run$n.out" 2>&1 &
   CHECK_PGID=$!
   # FAIL EARLY (owner ruling 2026-10-17): the first failing test that is not
   # a ledger row ends the pass — that failure is the work; the hours of
@@ -434,6 +456,7 @@ fstests_cleanup() {
 main() {
   SUITE_CLEANUP_HOOK=fstests_cleanup
   suite_prepare fstests
+  fstests_preload_setup
   fstests_build
   local verdict=0 n
   for n in $(seq 1 "$SUITE_RUNS"); do

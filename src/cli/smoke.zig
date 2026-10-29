@@ -142,9 +142,6 @@ const Rig = struct {
     /// (`spawnSupervised`): a grandchild its supervisor reaps; its log
     /// offset at the spawn, where the supervisor's verdict is read from.
     supervised: ?usize = null,
-    /// Every supervisor this rig started: one that outlives its row
-    /// holding a killed daemon's custody is killed at `deinit`.
-    supervisors: Supervisors = .{},
     /// The set's write cache (`formatSet`'s word; a set formatted by hand
     /// keeps the product's default, on): its mounts take the posture the
     /// cache needs (`mountAsSet`).
@@ -200,6 +197,11 @@ const Rig = struct {
             if (knobs.present(proc_env.get(k))) |v| try self.env.put(k, v);
         }
         _ = linux.mkdir(self.work.ptr, 0o755);
+        // A dead daemon's held custody (a failed replay's journal tail, a
+        // write cache no successor took) dies with the work dir, never in
+        // the host's /run (decision 0003 §CV); a row may name its own.
+        var held_buf: [96]u8 = undefined;
+        try self.env.put("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", try std.fmt.bufPrint(&held_buf, "/build/tmp/smoke-{d}/held", .{pid}));
         // The data dir's per-run folder (equals `work` unless the seam moved it).
         const data_work = try std.fmt.allocPrintSentinel(gpa, "{s}/smoke-{d}", .{ data_dir, pid }, 0);
         defer gpa.free(data_work);
@@ -250,7 +252,7 @@ const Rig = struct {
             _ = c.wait(self.io) catch {};
         }
         if (self.supervised != null and alive(self.child_pid)) _ = linux.kill(self.child_pid, .KILL);
-        self.supervisors.killAll();
+        killSupervisorsOf(self.io, self.mp);
         self.printDaemonAlerts();
         // Never leave a mount behind.
         _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
@@ -532,7 +534,6 @@ const Rig = struct {
         if (self.log_file == null) self.log_file = try openLogAppend(self.log_path);
         const mark = try self.logLen();
         self.child_pid = try mountSupervised(self, self.log_path, &.{}, extra, meta_uri, self.mp, &self.env, mark);
-        self.supervisors.note(self.child_pid);
         self.supervised = mark;
         self.killed = false;
         try writePidFile(self.io, self.work, "daemon", self.child_pid);
@@ -685,27 +686,32 @@ fn openLogAppend(path: [:0]const u8) !Io.File {
     return .{ .handle = @intCast(rc), .flags = .{ .nonblocking = false } };
 }
 
-/// The supervisors a rig started (the daemons' parents, noted at the
-/// spawn), killed when the rig goes: a supervisor holding a killed daemon's
-/// ring or held tail waits for a successor that never comes.
-const Supervisors = struct {
-    pids: [32]linux.pid_t = undefined,
-    n: usize = 0,
-
-    fn note(self: *Supervisors, daemon_pid: linux.pid_t) void {
-        const sup = ppidOf(daemon_pid) orelse return;
-        if (self.n == self.pids.len) return;
-        self.pids[self.n] = sup;
-        self.n += 1;
-    }
-
-    fn killAll(self: *Supervisors) void {
-        for (self.pids[0..self.n]) |p| if (alive(p)) {
-            _ = linux.kill(p, .KILL);
+/// Every `sqz-supervise` whose argv names `mp` (its mount's), killed when
+/// the rig or the peer goes: a supervisor holding a killed daemon's custody
+/// waits out its successor grace (decision 0003 §CV) or a held tail's
+/// device, and a row that ends early owes the host nothing of its own. Read
+/// off `/proc`, so a row that mounted through `rig.squeezefs` is covered
+/// too — the 2026-10-29 orphan was such a row's supervisor, never noted,
+/// holding its ring for six hours.
+fn killSupervisorsOf(io: Io, mp: []const u8) void {
+    var dir = Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |ent| {
+        const pid = std.fmt.parseInt(linux.pid_t, ent.name, 10) catch continue;
+        var pb: [64]u8 = undefined;
+        var comm_buf: [32]u8 = undefined;
+        const comm = Io.Dir.cwd().readFile(io, std.fmt.bufPrint(&pb, "/proc/{d}/comm", .{pid}) catch continue, &comm_buf) catch continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, comm, "\n"), cli_supervisor.thread_comm)) continue;
+        var argv_buf: [4096]u8 = undefined;
+        const argv = Io.Dir.cwd().readFile(io, std.fmt.bufPrint(&pb, "/proc/{d}/cmdline", .{pid}) catch continue, &argv_buf) catch continue;
+        var args = std.mem.splitScalar(u8, argv, 0);
+        while (args.next()) |a| if (std.mem.eql(u8, a, mp)) {
+            _ = linux.kill(pid, .KILL);
+            break;
         };
-        self.n = 0;
     }
-};
+}
 
 /// `mount --daemon --supervise --log-file <log> extra… <meta> <mp>` behind
 /// `prefix` (a peer's `unshare`): returns after ready; the daemon's pid off
@@ -1856,6 +1862,7 @@ const Peer = struct {
             _ = c.wait(self.rig.io) catch {};
         }
         if (self.supervised != null and alive(self.pid)) _ = linux.kill(self.pid, .KILL);
+        killSupervisorsOf(self.rig.io, self.mp);
         self.printAlerts();
         _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
         if (self.log_file) |f| f.close(self.rig.io);
@@ -1899,7 +1906,6 @@ const Peer = struct {
             }
         }
         self.pid = try mountSupervised(rig, self.log_path, prefix[0..n], extra, rig.meta_uri, self.mp, self.env orelse &rig.env, mark);
-        rig.supervisors.note(self.pid);
         self.supervised = mark;
         self.killed = false;
         var tag_buf: [32]u8 = undefined;
@@ -10607,6 +10613,224 @@ const UniformBlocks = struct {
         return 0;
     }
 };
+
+/// THE ORPHANED SUPERVISOR's ways (charter §4, §6.1 "Staged"; decision
+/// 0003 §CV). On 2026-10-29 a `--daemon --supervise` supervisor held a
+/// write cache's memfd for six hours after its daemon was killed, its mount
+/// detached and its set's directory deleted: the hold had no deadline.
+const OrphanPath = enum {
+    /// kill -9, then `umount -l` (`Rig.kill`: every harness's teardown).
+    detach,
+    /// kill -9, then `fusermount3 -uz`.
+    fusermount,
+    /// kill -9, the dead mount left attached (ENOTCONN) until the next
+    /// mount's own unmount of it.
+    attached,
+    /// The daemon wedged (SIGSTOP): the supervisor's own ladder kills it and
+    /// aborts the connection; the mount left attached.
+    escalation,
+    /// The connection aborted through fusectl under a live daemon: its
+    /// teardown drains the ring itself.
+    abort,
+    /// The mount started where SIGCHLD is ignored (the kernel would reap
+    /// the daemon itself); kill -9, `umount -l`.
+    sigchld,
+    /// kill -9, `umount -l`, the set's images deleted (the harness sweep).
+    deleted,
+    /// The same with a journal tail held: acked creates never landed (the
+    /// landing-hold seam) and the metadata image deleted before the kill —
+    /// the death replay fails and holds.
+    deleted_held_tail,
+
+    fn setGone(self: OrphanPath) bool {
+        return self == .deleted or self == .deleted_held_tail;
+    }
+
+    /// The dead connection's mount stands until the next mount unmounts it.
+    fn leftAttached(self: OrphanPath) bool {
+        return self == .attached or self == .escalation or self == .abort;
+    }
+};
+
+const orphan_files: usize = 8;
+const orphan_file_bytes: usize = 256 << 10;
+
+/// A daemon's ring in a memfd held by a process whose argv names `mp` (the
+/// mount's daemon and supervisor; another row's are another mountpoint's).
+fn writeCacheMemfdsOf(rig: *Rig, mp: []const u8) !usize {
+    var script: [640]u8 = undefined;
+    const out = try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "n=0; for p in /proc/[0-9]*; do tr '\\0' '\\n' < $p/cmdline 2>/dev/null | grep -qxF -- '{s}' || continue; for f in $p/fd/*; do case $(readlink $f 2>/dev/null) in '/memfd:{s}'*) n=$((n + 1)) ;; esac; done; done; echo $n", .{ mp, "sqz-write-cache" }));
+    defer rig.gpa.free(out);
+    return std.fmt.parseInt(usize, std.mem.trim(u8, out, " \n"), 10);
+}
+
+/// Held copies (`suffix`) in the rig's held dir.
+fn heldCopies(rig: *Rig, suffix: []const u8) !usize {
+    var script: [256]u8 = undefined;
+    const out = try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "ls held 2>/dev/null | grep -c -- '\\{s}$' || true", .{suffix}));
+    defer rig.gpa.free(out);
+    return std.fmt.parseInt(usize, std.mem.trim(u8, out, " \n"), 10);
+}
+
+/// One way of the row: the set formatted with the write cache, a supervised
+/// mount holding `orphan_files` staged files (closed, never synced; the
+/// directory fsync'd, their staged layouts durable), the daemon ended by
+/// `path`. The law: the supervisor EXITS — its hold of the ring bounded by
+/// the successor grace — with no write-cache memfd left to this mount's
+/// processes, and its custody either in the held copy the next supervised
+/// mount adopts (every file byte-exact, nothing lost, the copy gone after)
+/// or, the set deleted, discarded loud with every held copy.
+fn orphanSupervisorRow(path: OrphanPath) !void {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    // The successor grace: six probes of a quarter second.
+    try rig.env.put("SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS", "250");
+    if (path == .deleted_held_tail) {
+        try rig.env.put("SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING", "1");
+        try rig.env.put("SQUEEZEFS_META_WINDOW_HOLD", "none");
+    }
+    var script: [512]u8 = undefined;
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "i=0; while [ $i -lt {d} ]; do head -c {d} /dev/urandom > src$i; i=$((i + 1)); done; echo ok", .{ orphan_files, orphan_file_bytes })));
+    if (path == .sigchld) {
+        if (rig.log_file == null) rig.log_file = try openLogAppend(rig.log_path);
+        const mark = try rig.logLen();
+        const ignore_chld = "import os, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); os.execv(sys.argv[1], sys.argv[1:])";
+        rig.child_pid = try mountSupervised(rig, rig.log_path, &.{ "python3", "-c", ignore_chld }, &.{}, rig.meta_uri, rig.mp, &rig.env, mark);
+        rig.supervised = mark;
+        rig.killed = false;
+    } else try rig.spawnSupervised(&.{});
+    const daemon = rig.child_pid;
+    const sup = ppidOf(daemon) orelse return error.NoSupervisor;
+    // A wedged daemon the row's own ladder never reached goes with the row.
+    defer if (alive(daemon)) {
+        _ = linux.kill(daemon, .KILL);
+    };
+    // Under the landing hold no barrier lands: the files are staged unsynced
+    // and their creates acked in the journal tail alone.
+    const fsync_dir = if (path == .deleted_held_tail) "" else " && python3 -c 'import os; fd = os.open(\".\", os.O_RDONLY); os.fsync(fd)'";
+    gpa.free(try rig.onMount(try std.fmt.bufPrint(&script, "i=0; while [ $i -lt {d} ]; do cp \"$1/src$i\" f$i; i=$((i + 1)); done{s} && echo ok", .{ orphan_files, fsync_dir })));
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(st, "\"data_staging_on\":"));
+    }
+    const mark = try rig.logLen();
+    // The set deleted under its live daemon: the supervisor knows it from
+    // the death on, whatever the host's pace.
+    if (path.setGone()) rig.freeRunOk(try rig.sh(rig.work, "rm -f vol.img d0.img d1.img"));
+    switch (path) {
+        .detach, .sigchld, .deleted, .deleted_held_tail => try rig.kill(),
+        .fusermount => {
+            rig.killed = true;
+            _ = linux.kill(daemon, .KILL);
+            try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+            gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "fusermount3 -uz {s} 2>/dev/null || fusermount -uz {s}; echo ok", .{ rig.mp, rig.mp })));
+        },
+        .attached => {
+            rig.killed = true;
+            _ = linux.kill(daemon, .KILL);
+            try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+        },
+        .escalation => {
+            // The supervisor's ladder (30 s unanswered, SIGABRT → SIGKILL)
+            // names the death itself: the rig no longer waits for an exit.
+            rig.killed = true;
+            rig.supervised = null;
+            _ = linux.kill(daemon, .STOP);
+            var nb: [64]u8 = undefined;
+            _ = try rig.awaitLog(try std.fmt.bufPrint(&nb, "daemon {d} is dead (wait status 0x", .{daemon}), mark, 2 * exit_wait_ns);
+        },
+        .abort => {
+            rig.killed = true;
+            gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "echo 1 > /sys/fs/fuse/connections/$(mountpoint -d {s} | cut -d: -f2)/abort && echo ok", .{rig.mp})));
+            _ = try rig.waitChild();
+        },
+    }
+    // The law: the supervisor exits and lets the ring's memory go.
+    {
+        const deadline = clock.monotonicNs() + exit_wait_ns;
+        while (alive(sup) and clock.monotonicNs() < deadline) sleepMs(20);
+        const memfds = try writeCacheMemfdsOf(rig, rig.mp);
+        const t = try rig.readLog();
+        defer gpa.free(t);
+        std.debug.print("\nsmoke[orphan, {t}]: the supervisor {s}; write-cache memfds held by this mount's processes: {d}; held copies: {d} ring, {d} tail\n", .{ path, if (alive(sup)) "OUTLIVED ITS MOUNT" else "exited", memfds, try heldCopies(rig, ".wcache"), try heldCopies(rig, ".jtail") });
+        if (alive(sup)) {
+            std.debug.print("--- the log since the kill ---\n{s}\n", .{t[@min(mark, t.len)..]});
+            return error.SupervisorOutlivedItsMount;
+        }
+        try testing.expectEqual(@as(usize, 0), memfds);
+    }
+    if (path.setGone()) {
+        // Nothing to hand anyone: discarded loud, every held copy with it.
+        const t = try rig.readLog();
+        defer gpa.free(t);
+        try testing.expect(std.mem.indexOf(u8, t[mark..], "every metadata volume of this set was deleted") != null);
+        try testing.expectEqual(@as(usize, 0), try heldCopies(rig, ".wcache"));
+        try testing.expectEqual(@as(usize, 0), try heldCopies(rig, ".jtail"));
+        return;
+    }
+    // A teardown that drained the ring leaves no copy; a death leaves one.
+    try testing.expectEqual(@as(usize, if (path == .abort) 0 else 1), try heldCopies(rig, ".wcache"));
+    if (path.leftAttached()) try rig.umountAfterKill();
+    // The next supervised mount: every acked file, the copy adopted and gone.
+    const mark2 = try rig.logLen();
+    try rig.spawnSupervised(&.{});
+    const exact = blk: {
+        const out = try rig.onMount(try std.fmt.bufPrint(&script, "n=0; i=0; while [ $i -lt {d} ]; do if cmp -s \"$1/src$i\" f$i; then n=$((n + 1)); fi; i=$((i + 1)); done; echo $n", .{orphan_files}));
+        defer gpa.free(out);
+        break :blk std.fmt.parseInt(usize, std.mem.trim(u8, out, " \n"), 10) catch 0;
+    };
+    const lost = try stagedLostReads(rig);
+    {
+        const t = try rig.readLog();
+        defer gpa.free(t);
+        const adopted = std.mem.indexOf(u8, t[mark2..], "adopted from the held copy") != null;
+        std.debug.print("smoke[orphan, {t}]: the next mount {s}; {d} of {d} files byte-exact, staged_payload_lost_reads {d}\n", .{ path, if (adopted) "adopted the held copy" else "found no held copy", exact, orphan_files, lost });
+        try testing.expectEqual(path != .abort, adopted);
+    }
+    try testing.expectEqual(orphan_files, exact);
+    try testing.expectEqual(@as(u64, 0), lost);
+    try testing.expectEqual(@as(usize, 0), try heldCopies(rig, ".wcache"));
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, @tagName(path));
+}
+
+test "smoke: THE ORPHANED SUPERVISOR (a) — kill -9 the daemon, `umount -l` the mount (every harness's teardown): the supervisor holds the write cache on its claim for the successor grace, moves it to its held copy and EXITS, no write-cache memfd left to the mount's processes; the next supervised mount adopts the copy — every staged file byte-exact, nothing lost, the copy gone; fsck clean (red on origin/dev dea12cf: the supervisor held the memfd forever, decision 0003 §CV)" {
+    try orphanSupervisorRow(.detach);
+}
+
+test "smoke: THE ORPHANED SUPERVISOR (b) — kill -9 the daemon, `fusermount3 -uz` the mount: the supervisor exits after the successor grace, the ring in its held copy, the next mount adopts it, every file byte-exact (red on dea12cf: held forever)" {
+    try orphanSupervisorRow(.fusermount);
+}
+
+test "smoke: THE ORPHANED SUPERVISOR (c) — kill -9 the daemon, the dead mount left ATTACHED (ENOTCONN, nothing restarts the daemon): the supervisor exits after the successor grace all the same, the ring in its held copy; the dead mount unmounted, the next mount adopts the copy, every file byte-exact (red on dea12cf: held forever)" {
+    try orphanSupervisorRow(.attached);
+}
+
+test "smoke: THE ORPHANED SUPERVISOR (d) — the daemon wedged (SIGSTOP): the supervisor's own ladder (30 s, SIGABRT → SIGKILL, the fusectl abort) ends it, then the successor grace: the supervisor exits, the ring in its held copy; the next mount adopts it, every file byte-exact (red on dea12cf: held forever — 0003 §CK.6 (c))" {
+    try orphanSupervisorRow(.escalation);
+}
+
+test "smoke: THE ORPHANED SUPERVISOR (e) — the connection aborted through fusectl under a LIVE daemon: the daemon's teardown drains the write cache itself, exits 1, and the supervisor exits holding nothing — no held copy; the next mount reads every file byte-exact from the data volumes (green on dea12cf too: the abort is no orphan path)" {
+    try orphanSupervisorRow(.abort);
+}
+
+test "smoke: THE ORPHANED SUPERVISOR (f) — the mount started where SIGCHLD is ignored (the kernel reaps the daemon itself), kill -9, `umount -l`: the supervisor still reaps its daemon and names its wait status (it restores SIGCHLD's default before the fork), replays, exits after the grace; the next mount adopts the copy, every file byte-exact (red on dea12cf: the supervisor spun in its reap loop forever — no death replay, the writer guard and the ring held)" {
+    try orphanSupervisorRow(.sigchld);
+}
+
+test "smoke: THE ORPHANED SUPERVISOR (g) — kill -9 the daemon, `umount -l`, the set's image files deleted (the harness's sweep — the 2026-10-29 orphan): no mount can ever open the set again, so the supervisor discards the ring loud and exits — no memfd, no held copy left (red on dea12cf: the deleted set's write cache held for hours)" {
+    try orphanSupervisorRow(.deleted);
+}
+
+test "smoke: THE ORPHANED SUPERVISOR (h) — acked creates held in the journal tail (the landing-hold seam), the metadata image deleted, kill -9, `umount -l`: the death replay fails and holds the tail's copy; the set is deleted, so the supervisor removes the copy, discards the ring and exits (red on dea12cf: the held tail retried forever against a device that cannot come back)" {
+    try orphanSupervisorRow(.deleted_held_tail);
+}
 
 test "smoke: A FREED BLOCK IS NOT REUSED BEFORE THE RECORD THAT FREED IT IS DURABLE (charter §6.2 block reclaim, §5.2 the ack point; decision 0003 §BT) — a --single-writer set (the flat allocator: a mint takes the free list first) over device-mapper slices, cache-less: three one-block files of 0xa1, 0xa2, 0xa3 written O_DIRECT, fsync'd and synced, eight empty files beside them; the metadata slice slowed 12 s (dm-delay on writes and flushes: every journal window and barrier issued from here is in flight, as one inside the ≤ 50 ms flush span is); `fpunch 0 4m` of the second (answered once its window landed — its barrier still in flight), then `truncate 0` of the first and `rm` of the third (each answered at its RAM apply), then eight O_DIRECT one-block writes of 0xbb; the power cut inside the delay (dm-flakey drop_writes, kill -9 of the foreground daemon: no supervisor, no tail replay), the slices back: the three freed blocks still hold 0xa1, 0xa2, 0xa3 on the device — none was written, nor discarded, before its record was durable; fsck --offline --scrub clean; after the remount the truncate and the unlink were never durable and the two files read their OWN bytes, the landed punch reads its hole (red on 2d44c33: the frees ran right after the answer, the writers' mints took the freed blocks off the free list — the truncated file read 4 MiB of 0xbb, the unlinked one zeros: its block discarded by the debt drainer; fsck found nothing)" {
     const io = testing.io;

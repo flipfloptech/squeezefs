@@ -843,6 +843,13 @@ pub const Overlay = struct {
     announce_hold: Atomic(bool) = .init(false),
     announce_release: sync_notify.Notify = .init,
     announce_held: Atomic(u32) = .init(0),
+    /// Test seam (in-process): a `serve` parks right after its snapshot
+    /// and before its first device read, until `serve_release` fires;
+    /// `serve_held` is the park observable. The window a recycle of the
+    /// borrowed record must not cross.
+    serve_hold: Atomic(bool) = .init(false),
+    serve_release: sync_notify.Notify = .init,
+    serve_held: Atomic(u32) = .init(0),
 
     pub fn init(gpa: Allocator, cfg: Config, deps: Deps, capacity: usize) Allocator.Error!Overlay {
         return .{ .gpa = gpa, .cfg = cfg, .deps = deps, .registry = try Registry.init(gpa, capacity) };
@@ -1082,6 +1089,15 @@ pub const Overlay = struct {
             if (self.ov.announce_hold.load(.acquire)) self.ov.holdAnnounce(self.io);
         }
     };
+
+    /// The `serve_hold` seam's park (test builds arm it).
+    fn holdServe(self: *Overlay, io: Io) void {
+        var n = self.serve_release.notified();
+        _ = n.enable(io);
+        _ = self.serve_held.fetchAdd(1, .release);
+        n.waitUncancelable(io);
+        _ = self.serve_held.fetchSub(1, .release);
+    }
 
     /// The `announce_hold` seam's park (test builds arm it).
     fn holdAnnounce(self: *Overlay, io: Io) void {
@@ -1660,6 +1676,7 @@ pub const Overlay = struct {
             if (st.isTerminal()) return .settle;
             const snap = rec.core.readBegin();
             self.awaitPages(io, rec, first_page, pages);
+            if (self.serve_hold.load(.acquire)) self.holdServe(io);
             if (rec.core.stateNow().isTerminal()) return .settle;
             // Covered runs from dest; gaps collected between them.
             var runs_buf: [CoverageUnion.max_runs]cov.Run = undefined;
@@ -2727,6 +2744,52 @@ test "THE COMPLETION'S LAST TOUCH: a store's completion parked between its hold 
     try testing.expectEqual(q0 + 1, stats.overlay_teardown_quiesce_waits.load());
     try testing.expectEqual(@as(u64, 1), rec1.inflight_change.epoch);
     w.ov.drainBlock(io, &w.locks, 95, 1, false, w.cs());
+    try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
+}
+
+// rung-10-overlay-lifetime.md "Open": `serve` borrowed a record across its
+// device reads holding nothing; the registry's free list is LIFO, so a
+// settle of the block and the next install handed the slot to another
+// block's record mid-read, and the revalidation (terminal, generation
+// equality) read the newcomer's words.
+test "A SERVE OWNS THE RECORD IT READS: a serve of block 0 parked between its snapshot and its device reads while the block is drained (published, its record torn down) and a store of block 1 installs a fresh record — the slot block 0's record held is not handed to block 1 while the serve holds it, and the serve answers settle, never block 1's bytes (red: block 1's record took the slot mid-read and the serve answered served with block 1's bytes for block 0)" {
+    const io = testing.io;
+    const w = try TestWorld.init(testing.allocator, .{});
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(96, .striped, 0);
+    var a: [wt.BS]u8 align(4096) = undefined;
+    pattern(&a, 0xA1);
+    var b: [wt.BS]u8 align(4096) = undefined;
+    pattern(&b, 0xB2);
+    _ = try w.ov.store(io, .{ .ino = 96, .block = 0, .rel = 0, .vehicle = .{ .bytes = &a }, .file = TestWorld.striped(0), .overwrite = false });
+    const rec0 = w.ov.registry.get(.{ .ino = 96, .block = 0 }).?;
+    const Reader = struct {
+        fn run(io_: Io, ov: *Overlay, out: *[wt.BS]u8, res: *Overlay.ServeOutcome) void {
+            res.* = ov.serve(io_, 96, 0, 0, out);
+        }
+    };
+    w.ov.serve_hold.store(true, .release);
+    defer w.ov.serve_release.notifyWaiters(io);
+    var out: [wt.BS]u8 = undefined;
+    var res: Overlay.ServeOutcome = .none;
+    const th = try std.Thread.spawn(.{}, Reader.run, .{ io, &w.ov, &out, &res });
+    while (w.ov.serve_held.load(.acquire) == 0) try std.Thread.yield();
+    w.ov.serve_hold.store(false, .release);
+    // The block settles (published, the record torn down) and block 1's
+    // store installs a fresh record.
+    w.ov.drainBlock(io, &w.locks, 96, 0, false, w.cs());
+    try testing.expect(w.ov.registry.get(.{ .ino = 96, .block = 0 }) == null);
+    const o1 = try w.ov.store(io, .{ .ino = 96, .block = 1, .rel = 0, .vehicle = .{ .bytes = &b }, .file = TestWorld.striped(2 * wt.BS), .overwrite = false });
+    try testing.expect(o1 == .stored);
+    const rec1 = w.ov.registry.get(.{ .ino = 96, .block = 1 }).?;
+    w.ov.serve_release.notifyWaiters(io);
+    th.join();
+    // The law: the serve never answers block 1's bytes for block 0, and
+    // the slot it held is not block 1's.
+    if (res == .served) std.debug.print("the serve of block 0 answered served with {s}\n", .{if (std.mem.eql(u8, &out, &b)) "block 1's bytes" else if (std.mem.eql(u8, &out, &a)) "its own bytes" else "other bytes"});
+    try testing.expectEqual(Overlay.ServeOutcome.settle, res);
+    try testing.expect(rec1 != rec0);
+    w.ov.drainBlock(io, &w.locks, 96, 1, false, w.cs());
     try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
 }
 

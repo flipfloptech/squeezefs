@@ -377,6 +377,10 @@ pub var fuse_reclaim_blocks_freed: counters.ShardedCounter = .{};
 /// `fuse_reclaim_queue_overflow`: a forget found the gather full and drove
 /// its corpse inline.
 pub var fuse_reclaim_queue_overflow: counters.ShardedCounter = .{};
+/// `fuse_reclaim_space_deferrals`: corpse destroys a full metadata heap
+/// refused (`NoSpaceLeft`), each kept gathered for the cadence's next tick
+/// (the mount's sweep defers the same way) — the space class, never lost.
+pub var fuse_reclaim_space_deferrals: counters.ShardedCounter = .{};
 /// `fuse_forget_judgements_deferred`: a forget whose try-only inode read
 /// would have parked the drain worker (`WouldBlock`: the leaf not
 /// resident, an SMO window) or refused; the ino joined the gather for the
@@ -748,6 +752,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// deadline): a gather that fills a batch notifies it — the destroy
         /// is never the forgetting thread's (`gatherCorpse`).
         reclaim_wake: sync.Notify = .init,
+        /// A corpse destroy the heap refused stays gathered (a full metadata
+        /// heap; `drainGather`): set at the first such deferral (the one
+        /// warning), cleared by the tick whose drain defers nothing (the
+        /// one info line). While set the full-batch wake leaves the
+        /// deferred corpses to the tick: each retry may run the admission's
+        /// return-room cycles.
+        space_deferred: std.atomic.Value(bool) = .init(false),
         next_fh: std.atomic.Value(u64) = .init(1),
         /// From the INIT reply.
         minor: u32 = abi.FUSE_KERNEL_MINOR_VERSION,
@@ -2369,7 +2380,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 defer self.reclaim_lock.unlock();
                 self.reclaim.append(self.gpa, ino) catch {
                     fuse_reclaim_queue_overflow.inc();
-                    self.destroyCorpses(c, &.{ino}) catch |e| log.err("kv_fs: inline corpse destroy of ino {d} failed: {t}", .{ ino, e });
+                    self.destroyCorpses(c, &.{ino}, null) catch |e| log.err("kv_fs: inline corpse destroy of ino {d} failed: {t}", .{ ino, e });
                     return;
                 };
                 full = self.reclaim.items.len >= RECLAIM_BATCH;
@@ -2377,32 +2388,78 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (full) self.reclaim_wake.notifyOne(self.io);
         }
 
-        /// Destroy every gathered corpse, `RECLAIM_BATCH` per entry.
+        /// Destroy every gathered corpse, `RECLAIM_BATCH` per entry (the
+        /// tick's drain: it retries what a full heap deferred).
         pub fn reclaimDrain(self: *Self, c: *Ctx) Error!void {
-            return self.drainGather(c, 1);
+            return self.drainGather(c, 1, true);
         }
 
         /// Destroy FULL batches only (the cadence's wake, `gatherCorpse`):
         /// the tail under `RECLAIM_BATCH` waits for the tick, so a wake that
         /// lands mid-storm never spends an entry on a few corpses (the
-        /// `unlink ≤ 1.05 entries/op` economy).
+        /// `unlink ≤ 1.05 entries/op` economy). While a full heap defers
+        /// destroys the wake leaves them to the tick (`space_deferred`).
         pub fn reclaimDrainFull(self: *Self, c: *Ctx) Error!void {
-            return self.drainGather(c, RECLAIM_BATCH);
+            if (self.space_deferred.load(.acquire)) return;
+            return self.drainGather(c, RECLAIM_BATCH, false);
         }
 
-        fn drainGather(self: *Self, c: *Ctx, min_batch: usize) Error!void {
+        /// A corpse the heap refused goes back to the gather and the drain
+        /// stops there: the next tick retries it (charter §5.3 "Space": a
+        /// full heap is a posture, never terminal — deletes return room).
+        fn drainGather(self: *Self, c: *Ctx, min_batch: usize, tick: bool) Error!void {
             while (true) {
                 var batch: [RECLAIM_BATCH]u64 = undefined;
                 var n: usize = 0;
                 {
                     self.reclaim_lock.lock();
                     defer self.reclaim_lock.unlock();
-                    if (self.reclaim.items.len < min_batch) return;
+                    if (self.reclaim.items.len < min_batch) break;
                     while (n < RECLAIM_BATCH and self.reclaim.items.len > 0) : (n += 1) batch[n] = self.reclaim.pop().?;
                 }
-                if (n == 0) return;
-                try self.destroyCorpses(c, batch[0..n]);
+                if (n == 0) break;
+                var deferred: Deferred = .{};
+                try self.destroyCorpses(c, batch[0..n], &deferred);
+                if (deferred.n != 0) {
+                    self.regather(deferred.slice());
+                    self.noteSpaceDeferral(deferred.n);
+                    return;
+                }
             }
+            if (tick and self.space_deferred.swap(false, .acq_rel)) log.info("kv_fs: the deferred corpse destroys landed — the metadata heap took every one", .{});
+        }
+
+        /// The corpses a destroy pass left for a later one: the heap refused
+        /// their entries (`NoSpaceLeft`, a full metadata heap).
+        const Deferred = struct {
+            inos: [RECLAIM_BATCH]u64 = undefined,
+            n: usize = 0,
+
+            fn push(self: *Deferred, ino: u64) void {
+                self.inos[self.n] = ino;
+                self.n += 1;
+            }
+
+            fn slice(self: *const Deferred) []const u64 {
+                return self.inos[0..self.n];
+            }
+        };
+
+        /// Deferred corpses back into the gather. A gather that cannot grow
+        /// leaves them to the next mount's sweep (their records stay).
+        fn regather(self: *Self, inos_: []const u64) void {
+            self.reclaim_lock.lock();
+            defer self.reclaim_lock.unlock();
+            self.reclaim.appendSlice(self.gpa, inos_) catch {
+                fuse_reclaim_queue_overflow.inc();
+                log.warn("kv_fs: {d} deferred corpse(s) could not rejoin the gather (out of memory) — the next mount's sweep destroys them", .{inos_.len});
+            };
+        }
+
+        /// One warning per episode; every deferral counted.
+        fn noteSpaceDeferral(self: *Self, n: usize) void {
+            fuse_reclaim_space_deferrals.add(n);
+            if (!self.space_deferred.swap(true, .acq_rel)) log.warn("kv_fs: {d} corpse destroy(s) deferred — the metadata heap is full (the ENOSPC posture): they stay gathered and the reclaim cadence retries them every tick as deletes return room", .{n});
         }
 
         /// THE CORPSE SWEEP AT MOUNT: an inode record at `nlink == 0` after
@@ -2413,7 +2470,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// every such corpse with its `−ref` riders, `RECLAIM_BATCH` per
         /// entry, before the mount serves. Returns the corpses destroyed.
         /// (fsck C9 is the census at scale; this is the mount's belt.)
-        pub fn sweepCorpsesAtMount(self: *Self) Error!u64 {
+        pub const Swept = struct { destroyed: u64 = 0, deferred: u64 = 0 };
+
+        pub fn sweepCorpsesAtMount(self: *Self) Error!Swept {
             const gpa = self.gpa;
             var trace = op_trace.OpTrace.begin(0, .other);
             defer trace.finish();
@@ -2425,7 +2484,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const end = key.inodeKey(std.math.maxInt(u64));
             var batch: [RECLAIM_BATCH]u64 = undefined;
             var n: usize = 0;
-            var destroyed: u64 = 0;
+            var swept: Swept = .{};
             while (true) {
                 var kvs: std.ArrayList(tree.KeyValue) = .empty;
                 defer tree.deinitKeyValues(gpa, &kvs);
@@ -2441,8 +2500,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     batch[n] = std.mem.readInt(u64, kv.key[0..8], .big);
                     n += 1;
                     if (n == RECLAIM_BATCH) {
-                        try self.destroyCorpses(&ctx, batch[0..n]);
-                        destroyed += n;
+                        try self.sweepBatch(&ctx, batch[0..n], &swept);
                         n = 0;
                     }
                 }
@@ -2451,13 +2509,26 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 if (last_ino == std.math.maxInt(u64)) break;
                 cursor = key.KeyBuf.fromSlice(&key.inodeKey(last_ino + 1));
             }
-            if (n > 0) {
-                try self.destroyCorpses(&ctx, batch[0..n]);
-                destroyed += n;
-            }
-            fuse_corpse_sweep_destroyed.add(destroyed);
-            if (destroyed != 0) log.info("corpse sweep at mount: {d} corpse(s) left by the previous daemon destroyed, their references released", .{destroyed});
-            return destroyed;
+            if (n > 0) try self.sweepBatch(&ctx, batch[0..n], &swept);
+            fuse_corpse_sweep_destroyed.add(swept.destroyed);
+            if (swept.destroyed != 0) log.info("corpse sweep at mount: {d} corpse(s) left by the previous daemon destroyed, their references released", .{swept.destroyed});
+            if (swept.deferred != 0) log.warn("corpse sweep at mount: {d} corpse(s) deferred to the reclaim cadence — the metadata heap is full (the ENOSPC posture); the mount serves and the cadence destroys them as deletes return room", .{swept.deferred});
+            return swept;
+        }
+
+        /// One sweep batch: destroyed, or — once the heap refused a corpse —
+        /// gathered for the cadence untried (a retry may run the
+        /// admission's return-room cycles; the mount does not wait on them).
+        fn sweepBatch(self: *Self, c: *Ctx, batch: []const u64, swept: *Swept) Error!void {
+            var deferred: Deferred = .{};
+            if (swept.deferred == 0) try self.destroyCorpses(c, batch, &deferred) else for (batch) |ino| deferred.push(ino);
+            swept.destroyed += batch.len - deferred.n;
+            if (deferred.n == 0) return;
+            self.regather(deferred.slice());
+            swept.deferred += deferred.n;
+            fuse_reclaim_space_deferrals.add(deferred.n);
+            // The sweep's warning is the episode's one line.
+            self.space_deferred.store(true, .release);
         }
 
         /// One corpse's destroy plan: its xattr keys, its layout's named
@@ -2467,6 +2538,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             kvs: std.ArrayList(tree.KeyValue) = .empty,
             after: AfterCommit = .{},
             bytes: u64 = 0,
+            /// Its destroy landed: (5) frees its bindings.
+            committed: bool = false,
         };
 
         /// The destroy rider (charter §5.6): every corpse's inode + xattr
@@ -2488,7 +2561,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// refusals). The striped mutexes are not reentrant and two batches
         /// may share a stripe: the locks are taken in ONE order (ascending
         /// stripe, each once) — the multi-lock holder's order rule.
-        fn destroyCorpses(self: *Self, c: *Ctx, corpses: []const u64) Error!void {
+        ///
+        /// A full metadata heap (`NoSpaceLeft`): with `deferred`, an entry
+        /// refused whole is retried corpse by corpse (one corpse needs only
+        /// its own leaves' compactions — a batch of scattered corpses is
+        /// ONE member needing one per leaf, never admitted at the floor);
+        /// the first corpse refused alone and every one after it land in
+        /// `deferred`, their records untouched. Without it the refusal is
+        /// the caller's error. Every destroy that landed is freed either way.
+        fn destroyCorpses(self: *Self, c: *Ctx, corpses: []const u64, deferred: ?*Deferred) Error!void {
             const gpa = self.gpa;
             assert(corpses.len <= RECLAIM_BATCH);
             // (1) The nlink re-check (a forget of a live inode never reached
@@ -2533,6 +2614,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             defer payloads.deinit(gpa);
             var sweeps: std.ArrayList(struct { ino: u64, removed: u64 }) = .empty;
             defer sweeps.deinit(gpa);
+            // The heap refused a corpse: every later one is deferred untried.
+            var refused = false;
             for (live[0..n_live]) |ino| {
                 const v = (try self.readInodeOpt(ino)) orelse continue;
                 var p: Corpse = .{ .ino = ino };
@@ -2553,9 +2636,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                             // A tree-mapped corpse: its own tx marks it
                             // (head {size 0, sweep 0}); the sweep's terminal
                             // chunk destroys the inode and its xattrs.
-                            try self.markKvmapCorpse(c, ino, l);
-                            try sweeps.append(gpa, .{ .ino = ino, .removed = (v.size + self.block_size - 1) / self.block_size });
                             tree_mapped = true;
+                            if (refused) {
+                                deferred.?.push(ino);
+                                break;
+                            }
+                            self.markKvmapCorpse(c, ino, l) catch |e| {
+                                if (e != error.NoSpaceLeft or deferred == null) return e;
+                                refused = true;
+                                deferred.?.push(ino);
+                                break;
+                            };
+                            try sweeps.append(gpa, .{ .ino = ino, .removed = (v.size + self.block_size - 1) / self.block_size });
                             break;
                         }
                         if (l.kind == .staged) p.after.staged = .{ .key = stagingKeyOf(ino, l), .generation = null };
@@ -2575,26 +2667,33 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // (4) The commits, under the locks: every plan's bindings held
             // in flight from before its commit until after (5)'s frees.
             for (plans.items) |*p| self.holdAfter(&p.after);
+            var failed: ?Error = null;
             if (plans.items.len != 0) {
                 const ranges = try inos.packDestroyEntries(gpa, payloads.items);
                 defer gpa.free(ranges);
-                for (ranges) |rg| {
+                runs: for (ranges) |rg| {
                     // Every corpse's part is complete on its own member: a
                     // range is cut where the member changes (one entry per run).
                     var start = rg.start;
                     while (start < rg.end) {
                         var end = start + 1;
                         while (end < rg.end and !self.spansHomes(&.{ globalOf(plans.items[start].ino), globalOf(plans.items[end].ino) })) end += 1;
-                        try self.destroyRun(c, plans.items[start..end]);
+                        const run = plans.items[start..end];
                         start = end;
+                        self.destroyRunOrDefer(c, run, deferred, &refused) catch |e| {
+                            failed = e;
+                            break :runs;
+                        };
                     }
                 }
             }
             // (5) The locks drop; the frees, the ring releases and the
-            // sweep drains run after them (RES-1; the sweep takes (3.7)).
+            // sweep drains run after them (RES-1; the sweep takes (3.7)) —
+            // for every destroy that landed, whatever came after it.
             for (guards[0..n_guards]) |g| g.release(self.io);
             n_guards = 0;
             for (plans.items) |*p| {
+                if (!p.committed) continue;
                 self.afterCommit(&p.after);
                 fuse_reclaim_blocks_freed.add(@intCast(p.after.n));
             }
@@ -2602,6 +2701,25 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 var after: AfterCommit = .{};
                 after.kvmap_sweep = .{ .ino = sw.ino, .removed = sw.removed };
                 self.afterCommit(&after);
+            }
+            if (failed) |e| return e;
+        }
+
+        /// `destroyRun` with the full heap's answer (`destroyCorpses`' doc):
+        /// a run refused whole is retried corpse by corpse until one is
+        /// refused alone; it and the rest are deferred.
+        fn destroyRunOrDefer(self: *Self, c: *Ctx, run: []Corpse, deferred: ?*Deferred, refused: *bool) Error!void {
+            const d = deferred orelse return self.destroyRun(c, run);
+            if (!refused.*) {
+                if (self.destroyRun(c, run)) |_| return else |e| if (e != error.NoSpaceLeft) return e;
+                if (run.len == 1) refused.* = true;
+            }
+            for (0..run.len) |i| {
+                if (!refused.*) {
+                    if (self.destroyRun(c, run[i .. i + 1])) |_| continue else |e| if (e != error.NoSpaceLeft) return e;
+                    refused.* = true;
+                }
+                d.push(run[i].ino);
             }
         }
 
@@ -2628,8 +2746,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // reaches it, so its apply may take one leaf at a time (§BW).
             t.kernel_origin = true;
             t.leafwise = true;
+            // A background reclaim: it yields a full heap's room to a user
+            // commit waiting for it (`heap_law.SpaceRetryHold.users`).
+            t.reclaim = true;
             t_owned = false;
             try self.commit(c, t);
+            for (run) |*p| p.committed = true;
             fuse_reclaim_destroys.add(destroyed);
             self.destroys.noteCommitted(destroyed);
             fuse_reclaim_drains.inc();
@@ -10579,14 +10701,14 @@ test "the corpse sweep at mount: an unlinked file whose FORGET died with the dae
     var next = try MemFs.mount(testing.allocator, testing.io, &h.store, &h.data, .{ .dlm_stripes = 16 });
     defer next.unmount();
     const swept0 = fuse_corpse_sweep_destroyed.load();
-    try testing.expectEqual(@as(u64, 1), try next.sweepCorpsesAtMount());
+    try testing.expectEqual(MemFs.Swept{ .destroyed = 1 }, try next.sweepCorpsesAtMount());
     try testing.expectEqual(swept0 + 1, fuse_corpse_sweep_destroyed.load());
     try testing.expectEqual(inodes0 + 1, h.store.countKind(key.TREE_INODES));
     try testing.expectEqual(xattrs0 + 1, h.store.countKind(key.TREE_XATTRS));
     try testing.expect((try next.readInodeOpt(try MemFs.localOf(f))) == null);
     try testing.expectEqual(@as(u32, 1), (try next.readInode(try MemFs.localOf(live))).nlink);
     // Idempotent: a second sweep finds nothing.
-    try testing.expectEqual(@as(u64, 0), try next.sweepCorpsesAtMount());
+    try testing.expectEqual(MemFs.Swept{ .destroyed = 0 }, try next.sweepCorpsesAtMount());
 }
 
 /// `n` unlinked, released files (each an inode + its layout record: two
@@ -10615,7 +10737,10 @@ test "a FULL metadata heap never fails the corpse sweep at mount: the destroys i
     h.store.space_room = 0;
     var next = try MemFs.mount(testing.allocator, testing.io, &h.store, &h.data, .{ .dlm_stripes = 16 });
     defer next.unmount();
-    _ = try next.sweepCorpsesAtMount();
+    const deferrals0 = fuse_reclaim_space_deferrals.load();
+    try testing.expectEqual(MemFs.Swept{ .deferred = 3 }, try next.sweepCorpsesAtMount());
+    try testing.expectEqual(deferrals0 + 3, fuse_reclaim_space_deferrals.load());
+    try testing.expect(next.space_deferred.load(.acquire));
     try testing.expectEqual(inodes0 + 3, h.store.countKind(key.TREE_INODES));
     try testing.expectEqual(@as(usize, 3), next.reclaim.items.len);
     // Deletes returned room: the cadence's tick destroys every one.
@@ -10626,6 +10751,7 @@ test "a FULL metadata heap never fails the corpse sweep at mount: the destroys i
     try next.reclaimDrain(&c);
     try testing.expectEqual(inodes0, h.store.countKind(key.TREE_INODES));
     try testing.expectEqual(@as(usize, 0), next.reclaim.items.len);
+    try testing.expect(!next.space_deferred.load(.acquire));
 }
 
 test "a corpse batch the full heap refuses whole is destroyed corpse by corpse; a corpse still refused stays gathered for the next tick — never dropped, never an error to the cadence" {
@@ -10652,6 +10778,7 @@ test "a corpse batch the full heap refuses whole is destroyed corpse by corpse; 
     try h.fs.reclaimDrain(&c);
     try testing.expectEqual(inodes0 + 2, h.store.countKind(key.TREE_INODES));
     try testing.expectEqual(@as(usize, 2), h.fs.reclaim.items.len);
+    try testing.expect(h.fs.space_deferred.load(.acquire));
     // Room again: the next tick destroys them.
     h.store.space_room = null;
     try h.fs.reclaimDrain(&c);
@@ -10681,7 +10808,7 @@ test "the corpse sweep pages through a slot tree that interleaves inode, dentry 
     const inodes0 = h.store.countKind(key.TREE_INODES);
     var next = try MemFs.mount(testing.allocator, testing.io, &h.store, &h.data, .{ .dlm_stripes = 16 });
     defer next.unmount();
-    try testing.expectEqual(@as(u64, 3), try next.sweepCorpsesAtMount());
+    try testing.expectEqual(MemFs.Swept{ .destroyed = 3 }, try next.sweepCorpsesAtMount());
     try testing.expectEqual(inodes0 - 3, h.store.countKind(key.TREE_INODES));
     for (files, 0..) |ino, i| {
         const present = (try next.readInodeOpt(try MemFs.localOf(ino))) != null;

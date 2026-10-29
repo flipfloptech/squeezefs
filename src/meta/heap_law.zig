@@ -559,6 +559,13 @@ pub fn continueSpaceRetryCycles(cycles_run: u32, pending_free: u64) bool {
 /// recovery churned).
 pub const SpaceRetryHold = struct {
     retries: std.atomic.Value(u32) = .init(0),
+    /// The retries a USER commit holds (`beginUser`): while one waits, a
+    /// reclaim commit (`tx.KvTx.reclaim`, a corpse's destroy) is refused
+    /// at admission — the room the return-room cycles give back is the
+    /// user's first. Without it a full heap's background destroys took
+    /// that room between a user delete's cycles and its re-admission, and
+    /// the operator's `rm` answered ENOSPC.
+    users: std.atomic.Value(u32) = .init(0),
 
     /// `.acq_rel` pairs with `inflight`'s acquire load: a sweep that reads
     /// the count after a begin sees it.
@@ -571,9 +578,27 @@ pub const SpaceRetryHold = struct {
         assert(prev > 0);
     }
 
+    /// `begin` for a user commit's retry.
+    pub fn beginUser(self: *SpaceRetryHold) void {
+        self.begin();
+        _ = self.users.fetchAdd(1, .acq_rel);
+    }
+
+    pub fn endUser(self: *SpaceRetryHold) void {
+        const prev = self.users.fetchSub(1, .acq_rel);
+        assert(prev > 0);
+        self.end();
+    }
+
     /// The opportunistic merges' yield predicate.
     pub fn inflight(self: *const SpaceRetryHold) bool {
         return self.retries.load(.acquire) > 0;
+    }
+
+    /// The reclaim commits' yield predicate. `.acquire` pairs with
+    /// `beginUser`'s `.acq_rel` increment.
+    pub fn userWaiting(self: *const SpaceRetryHold) bool {
+        return self.users.load(.acquire) > 0;
     }
 
     /// One opportunistic merge stood down for a space retry.

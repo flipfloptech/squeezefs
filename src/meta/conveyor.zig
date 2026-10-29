@@ -813,6 +813,9 @@ pub const Stats = struct {
     /// the leaves they took (`leaves ÷ applies` = a destroy's spread).
     leafwise_applies: counters.ShardedCounter = .{},
     leafwise_leaves: counters.ShardedCounter = .{},
+    /// `meta_conveyor_reclaim_space_yields`: reclaim commits refused at
+    /// admission while a user commit waited out its space retry.
+    reclaim_space_yields: counters.ShardedCounter = .{},
     /// `meta_conveyor_heap_admit_fast` / `_locked`: heap admissions by
     /// the lock-free fast path (§BD) against the locked law.
     heap_admit_fast: counters.ShardedCounter = .{},
@@ -930,7 +933,7 @@ pub const Stats = struct {
             self.hold_bound_ns.load(),
             self.holds_pacing.load(),
         });
-        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_tail_gate_parks\":{d},\"meta_conveyor_resident_waits\":{d},\"meta_conveyor_resident_landings\":{d},\"meta_conveyor_pad_landings\":{d},\"meta_conveyor_resident_helps\":{d},\"meta_conveyor_resident_smo_waits\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.tail_gate_parks.load(), self.resident_waits.load(), self.resident_landings.load(), self.pad_landings.load(), self.resident_helps.load(), self.resident_smo_waits.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load() });
+        try w.print(",\"meta_conveyor_resolve_seeded\":{d},\"meta_conveyor_resolve_descended\":{d},\"meta_conveyor_acks_at_apply\":{d},\"meta_conveyor_acks_at_landing\":{d},\"meta_conveyor_acked_write_failures\":{d},\"meta_conveyor_tail_slot_misses\":{d},\"meta_conveyor_self_handoffs\":{d},\"meta_conveyor_self_applies\":{d},\"meta_conveyor_leafwise_applies\":{d},\"meta_conveyor_leafwise_leaves\":{d},\"meta_conveyor_pass_yields\":{d},\"meta_conveyor_tail_gate_parks\":{d},\"meta_conveyor_resident_waits\":{d},\"meta_conveyor_resident_landings\":{d},\"meta_conveyor_pad_landings\":{d},\"meta_conveyor_resident_helps\":{d},\"meta_conveyor_resident_smo_waits\":{d},\"meta_conveyor_turn_spin_hits\":{d},\"meta_conveyor_turn_spin_falls\":{d},\"meta_conveyor_heap_admit_fast\":{d},\"meta_conveyor_heap_admit_locked\":{d},\"meta_conveyor_reclaim_space_yields\":{d}", .{ self.resolve_seeded.load(), self.resolve_descended.load(), self.acks_at_apply.load(), self.acks_at_landing.load(), self.acked_write_failures.load(), self.tail_slot_misses.load(), self.self_handoffs.load(), self.self_applies.load(), self.leafwise_applies.load(), self.leafwise_leaves.load(), self.pass_yields.load(), self.tail_gate_parks.load(), self.resident_waits.load(), self.resident_landings.load(), self.pad_landings.load(), self.resident_helps.load(), self.resident_smo_waits.load(), self.turn_spin_hits.load(), self.turn_spin_falls.load(), self.heap_admit_fast.load(), self.heap_admit_locked.load(), self.reclaim_space_yields.load() });
         try w.print(",\"meta_conveyor_undo_keys\":{d}", .{self.undo_keys.load()});
         try w.print(",\"meta_conveyor_pass_claims_on\":{d},\"meta_conveyor_pass_claims_switches\":{d},\"meta_conveyor_turn_late_permille\":{d},\"meta_conveyor_pass_claimed_members\":{d}", .{ self.pass_claims_on.load(), self.pass_claims_switches.load(), self.turn_late_permille.load(), self.pass_claimed_members.load() });
         try w.print(",\"meta_conveyor_window_gate_parks\":{d},\"meta_conveyor_room_parks\":{d},\"meta_commit_ack_spin_hits\":{d},\"meta_commit_ack_spin_falls\":{d},\"meta_commit_ack_spin_skips\":{d},\"meta_commit_ack_spin_busy\":{d},\"meta_commit_ack_spin_bound_ns\":{d},\"meta_commit_ack_spin_wake_ns\":{d},\"meta_commit_ack_spin_ack_ns\":{d}}}", .{
@@ -2124,9 +2127,17 @@ pub const Conveyor = struct {
         var cycled_for_space = false;
         var space_retry_started: u64 = 0;
         var hold_active = false;
-        defer if (hold_active) self.deps.checkpoint.space_retry.end();
+        const hold = self.deps.checkpoint.space_retry;
+        defer if (hold_active) endHold(hold, q.reclaim);
         var attempt: u32 = 0;
         while (attempt < COMMIT_RETRY_BUDGET) {
+            // A reclaim yields the heap to a user commit waiting out its
+            // space retry (`heap_law.SpaceRetryHold.users`): refused at
+            // once, before it promises anything.
+            if (q.reclaim and hold.userWaiting()) {
+                self.stats.reclaim_space_yields.inc();
+                return if (self.deps.grant_fed) error.GrantExhausted else error.NoSpace;
+            }
             var r = try self.resolve(arena, &one, .admission);
             const dirties = arena.alloc(*NodeDirty, r.lock_set.len) catch {
                 r.releaseRefs();
@@ -2149,7 +2160,7 @@ pub const Conveyor = struct {
             };
             self.unlockAll(r.lock_set);
             if (hold_active) {
-                self.deps.checkpoint.space_retry.end();
+                endHold(hold, q.reclaim);
                 hold_active = false;
             }
             if (refused.items.len == 0) {
@@ -2173,7 +2184,7 @@ pub const Conveyor = struct {
             switch (decision) {
                 .retry_after_cycles => {
                     cycled_for_space = true;
-                    self.deps.checkpoint.space_retry.begin();
+                    if (q.reclaim) hold.begin() else hold.beginUser();
                     hold_active = true;
                     var runs: u32 = 0;
                     while (true) {
@@ -2198,6 +2209,10 @@ pub const Conveyor = struct {
         }
         log.err("meta volume {s}: commit retry budget exhausted (revalidation never passed — SMO protocol bug)", .{self.deps.volume});
         return error.RetryBudgetExhausted;
+    }
+
+    fn endHold(hold: *heap_law.SpaceRetryHold, reclaim: bool) void {
+        if (reclaim) hold.end() else hold.endUser();
     }
 
     fn enqueueOne(self: *Conveyor, entry: *Queued, len: u64) Error!void {

@@ -211,6 +211,11 @@ pub const KvTx = struct {
     /// an atomic one, so a self-applying member takes its leaves ONE AT A
     /// TIME (decision 0003 §BW). Crash atomicity is the entry's, unchanged.
     leafwise: bool = false,
+    /// A background reclaim (a forgotten corpse's destroy): its heap
+    /// admission yields to a user commit waiting out its space retry
+    /// (`heap_law.SpaceRetryHold.userWaiting`) — refused `NoSpace` at
+    /// once, the reclaim retries at its next tick.
+    reclaim: bool = false,
     names: NameNotes = .{},
 
     /// `site` is the committer's `@src()`.
@@ -466,6 +471,7 @@ pub const QueuedTx = struct {
     kernel_origin: bool = false,
     kernel_told: bool = false,
     leafwise: bool = false,
+    reclaim: bool = false,
     names: NameNotes = .{},
     site: Site,
     /// Never read, only owned: the hold IS the same-key exclusion. Released
@@ -564,6 +570,7 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
     const kernel_origin = tx.kernel_origin;
     const kernel_told = tx.kernel_told;
     const leafwise = tx.leafwise;
+    const reclaim = tx.reclaim;
     const names = tx.names;
     const site = tx.site;
     const door_bypass = tx.door_bypass;
@@ -604,6 +611,7 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
         .kernel_origin = kernel_origin,
         .kernel_told = kernel_told,
         .leafwise = leafwise,
+        .reclaim = reclaim,
         .names = names,
         .site = site,
         .guards = guards,

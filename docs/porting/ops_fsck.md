@@ -602,8 +602,13 @@ the key is the identity, `L4373-4425`).
 Findings: `C10NlinkTooHigh{ino}` (the LEAK direction — never reclaimable), `C10NlinkTooLow{ino}`,
 `C10ZeroNlinkNamed{ino}` (the DATA-LOSS direction — `destroy_inodes`' live-`nlink` skip no longer
 protects an inode a live path resolves; **the operator stops and reads on these two**),
-`C10DanglingDentry{vol, key_hex, child_ino}` (`L635-653`). Directories are never a count finding
-(`nlink = 2 + subdirs`, synthesized `.`/`..`, `L247-251`).
+`C10DanglingDentry{vol, key_hex, child_ino}` (`L635-653`). Directories are never a NAME-count finding
+(`nlink = 2 + subdirs`, synthesized `.`/`..`, `L247-251`). **The port adds the directory arm**
+(decision 0003 §CI.3, 0002 row 564): a live directory's stored nlink against `2 + subdirectories`
+(its dentries of `DT_DIR`, stripe markers excluded — each stripe is a directory counting its own),
+counted per parent's GLOBAL ino by the dentry pass before the child shard filter; finding
+`c10_dir_nlink{ino, nlink, subdirs}`, the same `(nlink, ctime)` witness under the directory's 4a
+across a fresh pass, repair `set-dir-nlink-to-counted-subdirs`.
 Zero-FP — NOT by the era floor (a prior-era inode can be hardlinked a microsecond ago, `L227-229`):
 (1) **the record witness** `(nlink, ctime)` read under the ino's exclusive 4a BEFORE the fresh pass
 and compared AFTER — every same-volume op that changes a name count mutates the record in the SAME

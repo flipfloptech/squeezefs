@@ -209,6 +209,9 @@ pub const JobCtl = struct {
     /// Operator pause intent (durable through `rec.pause_intent`).
     pause_intent: Atomic(bool) = .init(false),
     cancel_intent: Atomic(bool) = .init(false),
+    /// `SQUEEZEFS_TEST_JOB_TASK_HOLD`'s release: a `job throttle` to 100 sets it
+    /// (release; `testHold`'s acquire re-check pairs with it).
+    test_hold_released: Atomic(bool) = .init(false),
     ctl: throttle.Control = .{},
     /// Woken on every terminal transition (durable-then-visible).
     terminal: sync.Notify = .init,
@@ -262,6 +265,8 @@ pub const Fabric = struct {
     default_throttle_pct: u8,
     /// `SQUEEZEFS_TEST_JOB_PARK_DELAY_MS`: the park window's hold (0 = none).
     park_delay_ns: u64 = 0,
+    /// `SQUEEZEFS_TEST_JOB_TASK_HOLD`: the job type `taskDone` holds (null = none).
+    test_hold: ?JobType = null,
     /// The coordinator predicate (volume 0's manager): a non-coordinator
     /// SERVES shards but refuses `submit`.
     is_coordinator: Atomic(bool) = .init(true),
@@ -285,13 +290,14 @@ pub const Fabric = struct {
         pid: u32,
         default_throttle_pct: u8 = 100,
         park_delay_ns: u64 = 0,
+        test_hold: ?JobType = null,
         held: bool = false,
         random: *const fn () u64,
     };
 
     pub fn init(gpa: Allocator, store: Store, opts: Options) Fabric {
         std.debug.assert(opts.default_throttle_pct >= 1 and opts.default_throttle_pct <= 100);
-        return .{ .gpa = gpa, .store = store, .identity = opts.identity, .pid = opts.pid, .default_throttle_pct = opts.default_throttle_pct, .park_delay_ns = opts.park_delay_ns, .held = .init(opts.held), .random = opts.random };
+        return .{ .gpa = gpa, .store = store, .identity = opts.identity, .pid = opts.pid, .default_throttle_pct = opts.default_throttle_pct, .park_delay_ns = opts.park_delay_ns, .test_hold = opts.test_hold, .held = .init(opts.held), .random = opts.random };
     }
 
     pub fn deinit(self: *Fabric) void {
@@ -599,6 +605,9 @@ pub const Fabric = struct {
         const j = self.find(job_id) orelse return error.UnknownJob;
         if (j.rec.isTerminal()) return error.Terminal;
         j.rec.throttle_pct = pct;
+        // Unthrottled (`throttle.dutySleepNs`'s none) releases the test hold;
+        // stored before `setPct`'s wake, which the hold parks on.
+        if (pct == 0 or pct >= 100) j.test_hold_released.store(true, .release);
         j.ctl.setPct(io, pct);
         self.persistLocked(j) catch |e| return storeErr(e);
     }
@@ -674,19 +683,44 @@ pub const Fabric = struct {
     /// Called by a body after each task: the task count, the checkpoint
     /// cadence (256 tasks or 5 s), the throttle park, the control flags.
     pub fn taskDone(self: *Fabric, io: Io, j: *JobCtl, elapsed_ns: u64) Step {
-        {
+        const held: ?JobRecord = blk: {
             self.lock.lockUncancelable(io);
             defer self.lock.unlock(io);
             j.rec.tasks_done += 1;
             stats.job_tasks_done.inc();
             const now = clock.monotonicNs();
             if (j.rec.tasks_done - j.last_ckpt_tasks >= CHECKPOINT_TASKS or now - j.last_ckpt_ns >= CHECKPOINT_NS) self.persistLocked(j) catch {};
-        }
+            break :blk if (self.test_hold == j.rec.job_type) j.rec else null;
+        };
         if (j.shouldStop()) return .stop;
+        if (held) |rec| if (testHold(io, j, rec) == .stop) return .stop;
         return switch (throttle.dutyPark(io, &j.ctl, elapsed_ns)) {
             .served => if (j.shouldStop()) .stop else .@"continue",
             .interrupted => .stop,
         };
+    }
+
+    /// `SQUEEZEFS_TEST_JOB_TASK_HOLD`: park on the control word's wake until a
+    /// pause, a cancel or the fabric's stop (`interrupt` raises `ctl.stop`)
+    /// ends the step, or an unthrottling `setThrottle` releases the job for
+    /// good. Registered BEFORE the re-check, so neither lands unseen.
+    fn testHold(io: Io, j: *JobCtl, rec: JobRecord) Step {
+        if (j.test_hold_released.load(.acquire)) return .@"continue";
+        log.info("job fabric: SQUEEZEFS_TEST_JOB_TASK_HOLD — {f} ({s}) held after task {d} until a pause, a cancel or `job throttle … 100`", .{ rec, rec.job_type.name(), rec.tasks_done });
+        while (true) {
+            var n = j.ctl.wake.notified();
+            _ = n.enable(io);
+            if (j.ctl.stopped() or j.shouldStop()) {
+                n.cancel(io);
+                return .stop;
+            }
+            // acquire pairs with `setThrottle`'s release store.
+            if (j.test_hold_released.load(.acquire)) {
+                n.cancel(io);
+                return .@"continue";
+            }
+            n.waitUncancelable(io);
+        }
     }
 
     /// Publish `tasks_total` after a re-plan (`done + remaining`).
@@ -926,10 +960,10 @@ const Rig = struct {
     fabric: Fabric,
     noop: NoopBody = .{},
 
-    fn init(gpa: Allocator, opts: struct { held: bool = false, park_delay_ns: u64 = 0 }) !*Rig {
+    fn init(gpa: Allocator, opts: struct { held: bool = false, park_delay_ns: u64 = 0, test_hold: ?JobType = null }) !*Rig {
         const r = try gpa.create(Rig);
         r.* = .{ .store = RamStore.init(gpa), .fabric = undefined };
-        r.fabric = Fabric.init(gpa, r.store.store(), .{ .identity = .{ .node_token = 7, .mount_slot = 1 }, .pid = 99, .held = opts.held, .park_delay_ns = opts.park_delay_ns, .random = &testRandom });
+        r.fabric = Fabric.init(gpa, r.store.store(), .{ .identity = .{ .node_token = 7, .mount_slot = 1 }, .pid = 99, .held = opts.held, .park_delay_ns = opts.park_delay_ns, .test_hold = opts.test_hold, .random = &testRandom });
         r.fabric.registerBody(.noop, r.noop.body());
         return r;
     }
@@ -1088,6 +1122,69 @@ test "cancel inside the park window stays terminal; a parked job is re-claimable
     try r.fabric.cancel(io, id);
     try testing.expectEqual(JobState.cancelled, r.fabric.runClaimed(io, again));
     try testing.expectEqual(JobState.cancelled, r.store.record(id).?.state);
+}
+
+/// Until the worker parks in `testHold` with `done` tasks counted: the hold
+/// is the only waiter on the control word's wake of an unthrottled noop.
+fn awaitTestHold(r: *Rig, io: Io, id: u64, done: u64) void {
+    const j = r.fabric.find(id).?;
+    while (j.ctl.wake.waiters(io) != 1 or r.fabric.snapshot(io, id).?.tasks_done != done) {
+        var n = r.noop.wake.notified();
+        _ = n.waitUntilUncancelable(io, clock.monotonicNs() + std.time.ns_per_ms);
+    }
+}
+
+fn awaitLiveState(r: *Rig, io: Io, id: u64, want: JobState) void {
+    while (r.fabric.snapshot(io, id).?.state != want) {
+        var n = r.noop.wake.notified();
+        _ = n.waitUntilUncancelable(io, clock.monotonicNs() + std.time.ns_per_ms);
+    }
+}
+
+test "SQUEEZEFS_TEST_JOB_TASK_HOLD: a job of the held type parks after its first task (Running, 1 done) until a control lands — a retune below 100 keeps it held, a pause parks it and the hold stands again after the resume, an unthrottle releases it to complete; a held job cancels; the fabric's stop frees a held worker; an unthrottle before the hold and another type never hold" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const forever = std.math.maxInt(u64) / 2;
+    const r = try Rig.init(gpa, .{ .test_hold = .noop });
+    defer r.deinit(gpa);
+    const th = try std.Thread.spawn(.{}, Rig.worker, .{ r, io });
+    const id = try r.fabric.submit(io, .{ .job_type = .noop, .arg0 = 5 });
+    awaitTestHold(r, io, id, 1);
+    try testing.expectEqual(JobState.running, r.fabric.snapshot(io, id).?.state);
+    try r.fabric.setThrottle(io, id, 25);
+    try testing.expect(!r.fabric.find(id).?.test_hold_released.load(.acquire));
+    try r.fabric.pause(io, id);
+    awaitLiveState(r, io, id, .paused);
+    try testing.expectEqual(@as(u64, 1), r.fabric.snapshot(io, id).?.tasks_done);
+    try r.fabric.resumeJob(io, id);
+    awaitTestHold(r, io, id, 2);
+    try r.fabric.setThrottle(io, id, 100);
+    try testing.expectEqual(@as(?JobState, .completed), r.fabric.waitTerminal(io, id, forever));
+    try testing.expectEqual(@as(u64, 5), r.store.record(id).?.tasks_done);
+
+    const id2 = try r.fabric.submit(io, .{ .job_type = .noop, .arg0 = 5 });
+    awaitTestHold(r, io, id2, 1);
+    try r.fabric.cancel(io, id2);
+    try testing.expectEqual(@as(?JobState, .cancelled), r.fabric.waitTerminal(io, id2, forever));
+    try testing.expectEqual(@as(u64, 1), r.store.record(id2).?.tasks_done);
+
+    const id3 = try r.fabric.submit(io, .{ .job_type = .noop, .arg0 = 5 });
+    awaitTestHold(r, io, id3, 1);
+    r.fabric.stop(io);
+    th.join();
+    try testing.expectEqual(JobState.running, r.fabric.snapshot(io, id3).?.state);
+    try testing.expectEqual(@as(u64, 1), r.fabric.snapshot(io, id3).?.tasks_done);
+
+    // Single-threaded: a hold here would never return.
+    const r2 = try Rig.init(gpa, .{ .test_hold = .noop });
+    defer r2.deinit(gpa);
+    const early = try r2.fabric.submit(io, .{ .job_type = .noop, .arg0 = 3 });
+    try r2.fabric.setThrottle(io, early, 100);
+    try testing.expectEqual(JobState.completed, r2.fabric.runClaimed(io, r2.fabric.claimNext(io, false).?));
+    const r3 = try Rig.init(gpa, .{ .test_hold = .fsck });
+    defer r3.deinit(gpa);
+    _ = try r3.fabric.submit(io, .{ .job_type = .noop, .arg0 = 3 });
+    try testing.expectEqual(JobState.completed, r3.fabric.runClaimed(io, r3.fabric.claimNext(io, false).?));
 }
 
 test "crash resume reconstructs from durable records: a fresh fabric over the same store adopts Running/Queued as Queued, Paused stays paused, terminal and corrupt records are skipped (counted, logged)" {

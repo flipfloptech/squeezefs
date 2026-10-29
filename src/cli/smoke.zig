@@ -17391,6 +17391,8 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks) → fill (packed, striped
     defer gpa.free(v0);
     const v1 = (try volumeIdOfPath(rig, rig.d1)) orelse return error.NoVolumeId;
     defer gpa.free(v1);
+    // The drains' live acts (3, 5) meet a job held after a task.
+    try rig.env.put("SQUEEZEFS_TEST_JOB_TASK_HOLD", "evacuate_volume");
     var mark = try rig.logLen();
     try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark);
@@ -17443,9 +17445,10 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks) → fill (packed, striped
     }
 
     // 3. remove-data d0, throttled to 25 % live: pause (observable),
-    //    resume, throttle back to 100; the drain retires d0; undrain after
-    //    retire refuses.
+    //    resume, throttle back to 100 (which releases the hold); the drain
+    //    retires d0; undrain after retire refuses.
     var drain_id_buf: [jobs_records.JOB_ID_TEXT_LEN]u8 = undefined;
+    mark = try rig.logLen();
     {
         const r = try rig.squeezefs(&.{ "volume", "remove-data", rig.mp, v0 });
         defer rig.freeRun(r);
@@ -17456,6 +17459,7 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks) → fill (packed, striped
         @memcpy(&drain_id_buf, id);
     }
     const drain_id: []const u8 = &drain_id_buf;
+    try awaitJobHeld(rig, drain_id, mark);
     {
         const t = try rig.squeezefs(&.{ "job", "throttle", rig.mp, drain_id, "25" });
         defer rig.freeRun(t);
@@ -17465,17 +17469,17 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks) → fill (packed, striped
         try testing.expect(r.term.success());
     }
     try awaitJobState(rig, drain_id, "paused", 30 * std.time.ns_per_s);
+    mark = try rig.logLen();
     {
         const r = try rig.squeezefs(&.{ "job", "resume", rig.mp, drain_id });
         defer rig.freeRun(r);
         try testing.expect(r.term.success());
+    }
+    try awaitJobHeld(rig, drain_id, mark);
+    {
         const t = try rig.squeezefs(&.{ "job", "throttle", rig.mp, drain_id, "100" });
         defer rig.freeRun(t);
-        // The resumed drain may retire its last blocks before the throttle
-        // lands (a 25 % throttle over a tail of a few blocks on a quiet
-        // venue): a terminal job refuses control by design — that verdict
-        // is the lane's, not a failure of the row.
-        if (!t.term.success()) try testing.expect(std.mem.indexOf(u8, t.stderr, "the job is terminal") != null);
+        try testing.expect(t.term.success());
     }
     try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, drain_id, 900 * std.time.ns_per_s));
     {
@@ -17551,6 +17555,7 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks) → fill (packed, striped
     // 5. remove-data d1 at 25 %, kill -9 mid-drain → remount: the adopted
     //    job regenerates its plan and completes; d1 retires.
     var drain2_buf: [jobs_records.JOB_ID_TEXT_LEN]u8 = undefined;
+    mark = try rig.logLen();
     {
         const r = try rig.squeezefs(&.{ "volume", "remove-data", rig.mp, v1 });
         defer rig.freeRun(r);
@@ -17564,27 +17569,14 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks) → fill (packed, striped
         defer rig.freeRun(t);
         try testing.expect(t.term.success());
     }
-    {
-        // Mid-drain: at least one task done, the job still running.
-        const deadline = clock.monotonicNs() + 120 * std.time.ns_per_s;
-        var mid = false;
-        while (clock.monotonicNs() < deadline) {
-            const r = try rig.squeezefs(&.{ "job", "status", rig.mp, drain2 });
-            defer rig.freeRun(r);
-            if (std.mem.indexOf(u8, r.stdout, " running, ")) |_| {
-                if (std.mem.indexOf(u8, r.stdout, ", 0/")) |_| {} else {
-                    mid = true;
-                    break;
-                }
-            }
-            sleepMs(100);
-        }
-        try testing.expect(mid);
-    }
+    // Mid-drain: held after a task, the job still running.
+    try awaitJobHeld(rig, drain2, mark);
     rig.killed = true;
     _ = linux.kill(rig.child_pid, .KILL);
     try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
     try rig.umountAfterKill();
+    // The adopted drain runs free (at its durable 25 %).
+    try rig.env.put("SQUEEZEFS_TEST_JOB_TASK_HOLD", "off");
     mark = try rig.logLen();
     try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark);
@@ -17760,18 +17752,18 @@ fn heapSettledStats(rig: *Rig) ![]u8 {
     }
 }
 
-/// A bounded poll until the job reads `running` with ≥ 1 task done (the
-/// kill row's "mid-job").
-fn awaitJobMidRun(rig: *Rig, job_id: []const u8, bound_ns: u64) !void {
-    const deadline = clock.monotonicNs() + bound_ns;
-    while (clock.monotonicNs() < deadline) {
-        const r = try rig.squeezefs(&.{ "job", "status", rig.mp, job_id });
-        defer rig.freeRun(r);
-        if (std.mem.indexOf(u8, r.stdout, " running, ") != null and std.mem.indexOf(u8, r.stdout, ", 0/") == null) return;
-        if (std.mem.indexOf(u8, r.stdout, " completed") != null) return error.JobCompletedEarly;
-        sleepMs(50);
+/// The job parked by `SQUEEZEFS_TEST_JOB_TASK_HOLD` (its hold line logged since
+/// `mark`), read back Running with ≥ 1 task done: it stays mid-run until the
+/// row's control lands, whatever the host's pace (decision 0003 §CO.26).
+fn awaitJobHeld(rig: *Rig, job_id: []const u8, mark: usize) !void {
+    var needle_buf: [64]u8 = undefined;
+    _ = try rig.awaitLog(try std.fmt.bufPrint(&needle_buf, "SQUEEZEFS_TEST_JOB_TASK_HOLD — {s} ", .{job_id}), mark, 120 * std.time.ns_per_s);
+    const r = try rig.squeezefs(&.{ "job", "status", rig.mp, job_id });
+    defer rig.freeRun(r);
+    if (std.mem.indexOf(u8, r.stdout, " running, ") == null or std.mem.indexOf(u8, r.stdout, ", 0/") != null) {
+        std.debug.print("\n--- held, yet: {s} ---\n", .{r.stdout});
+        return error.JobNotHeldMidRun;
     }
-    return error.JobNeverMidRun;
 }
 
 test "smoke: DEFRAG --fold AND --meta ON A LIVE MOUNT — format (64 KiB meta nodes, 1 MiB blocks) → three fsync'd striped files held OPEN with 12 sector-aligned 512 B writes parked as W2 extents (parked_extent_bytes ≥ 12 pages) → `defrag --fold <mp>` folds every one in place (12 page DMAs for 6 KiB of user bytes ≤ the §J 8× bound, parked_extent_bytes 0, every byte exact after the close) → a forest of 8,000 files cut to 800 and rewritten 4× → `defrag --meta --throttle 1` runs under the duty cycle: `job cancel` mid-run → cancelled; a second at throttle 1: `job pause` → paused → `resume` → running → kill -9 mid-job → remount adopts it and it completes by plan regeneration → compactions + merges ≥ 1, nodes walked after ≤ before, `fsck --online` 0 findings" {
@@ -17786,6 +17778,8 @@ test "smoke: DEFRAG --fold AND --meta ON A LIVE MOUNT — format (64 KiB meta no
     // The parked W2 extents are the fold's input: the write-back timer
     // (decision 0003 §AJ) is held ten minutes away so only the job lands them.
     try rig.env.put("SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS", "600000");
+    // The meta jobs' mid-run acts (2a, 2b) meet a job held after a task.
+    try rig.env.put("SQUEEZEFS_TEST_JOB_TASK_HOLD", "defrag_meta");
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
 
@@ -17887,37 +17881,42 @@ test "smoke: DEFRAG --fold AND --meta ON A LIVE MOUNT — format (64 KiB meta no
     };
     // 2a. Cancel mid-run at throttle 1 (every chunk parks 99× its work).
     {
+        const held_from = try rig.logLen();
         const r = try rig.squeezefs(&.{ "defrag", "--meta", "--throttle", "1", rig.mp });
         defer rig.freeRun(r);
         try testing.expect(r.term.success());
         const id = jobIdIn(r.stdout) orelse return error.NoMetaJob;
-        try awaitJobState(rig, id, "running", 30 * std.time.ns_per_s);
+        try awaitJobHeld(rig, id, held_from);
         const c = try rig.squeezefs(&.{ "job", "cancel", rig.mp, id });
         defer rig.freeRun(c);
         try testing.expect(c.term.success());
         try testing.expectEqualStrings("cancelled", try awaitJobTerminal(rig, id, 120 * std.time.ns_per_s));
     }
     // 2b. Pause → resume → kill -9 mid-job → remount adopts → completes.
-    var mark: usize = 0;
+    var mark = try rig.logLen();
     {
         const r = try rig.squeezefs(&.{ "defrag", "--meta", "--throttle", "1", rig.mp });
         defer rig.freeRun(r);
         try testing.expect(r.term.success());
         const id = jobIdIn(r.stdout) orelse return error.NoMetaJob;
-        try awaitJobState(rig, id, "running", 30 * std.time.ns_per_s);
+        try awaitJobHeld(rig, id, mark);
         {
             const p = try rig.squeezefs(&.{ "job", "pause", rig.mp, id });
             defer rig.freeRun(p);
             try testing.expect(p.term.success());
         }
         try awaitJobState(rig, id, "paused", 60 * std.time.ns_per_s);
+        mark = try rig.logLen();
         {
             const p = try rig.squeezefs(&.{ "job", "resume", rig.mp, id });
             defer rig.freeRun(p);
             try testing.expect(p.term.success());
         }
-        try awaitJobMidRun(rig, id, 120 * std.time.ns_per_s);
+        try awaitJobHeld(rig, id, mark);
         try rig.kill();
+        // The adopted job and the converging one run free: no act left
+        // to land mid-run.
+        try rig.env.put("SQUEEZEFS_TEST_JOB_TASK_HOLD", "off");
         mark = try rig.logLen();
         try rig.spawnMount(&.{});
         _ = try rig.awaitReady(mark);
@@ -19271,6 +19270,8 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A) �
         try testing.expect(std.mem.indexOf(u8, r.stderr, "key id differs") != null);
     }
     try rig.env.put("SQUEEZEFS_ENCRYPT_KEY_FILE", key_b);
+    // The B → C sweep's kill (4) meets a job held after a task.
+    try rig.env.put("SQUEEZEFS_TEST_JOB_TASK_HOLD", "rekey");
     mark = try rig.logLen();
     try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark);
@@ -19283,6 +19284,7 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A) �
     //    from the key dir, the window is open, the job adopted; it
     //    converges and flips the primary to C.
     var job_c_buf: [jobs_records.JOB_ID_TEXT_LEN]u8 = undefined;
+    mark = try rig.logLen();
     {
         const r = try rig.squeezefs(&.{ "defrag", "--rekey", "--encrypt-key", key_c, "--throttle", "10", rig.mp });
         defer rig.freeRun(r);
@@ -19292,27 +19294,14 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A) �
         @memcpy(&key_c_id, keyIdIn(r.stdout) orelse return error.NoKeyId);
         ids_installed = 2;
     }
-    {
-        // Mid-sweep: at least one block rewritten, the job still running.
-        const deadline = clock.monotonicNs() + 120 * std.time.ns_per_s;
-        var mid = false;
-        while (clock.monotonicNs() < deadline) {
-            const r = try rig.squeezefs(&.{ "job", "status", rig.mp, &job_c_buf });
-            defer rig.freeRun(r);
-            if (std.mem.indexOf(u8, r.stdout, " running, ")) |_| {
-                if (std.mem.indexOf(u8, r.stdout, ", 0/")) |_| {} else {
-                    mid = true;
-                    break;
-                }
-            }
-            sleepMs(50);
-        }
-        try testing.expect(mid);
-    }
+    // Mid-sweep: held after a block rewritten, the job still running.
+    try awaitJobHeld(rig, &job_c_buf, mark);
     rig.killed = true;
     _ = linux.kill(rig.child_pid, .KILL);
     try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
     try rig.umountAfterKill();
+    // The adopted sweep runs free.
+    try rig.env.put("SQUEEZEFS_TEST_JOB_TASK_HOLD", "off");
     mark = try rig.logLen();
     try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(mark);

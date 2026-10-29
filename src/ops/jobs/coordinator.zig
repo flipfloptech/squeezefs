@@ -121,6 +121,7 @@ pub const Options = struct {
     verify_permille: u16,
     fleet_jobs: bool,
     park_delay_ns: u64,
+    test_hold: ?records.JobType,
     hold_submission: bool,
     pre_publish_hold: bool,
 
@@ -131,6 +132,7 @@ pub const Options = struct {
             .verify_permille = knobs.intKnob("SQUEEZEFS_JOB_WIRE_VERIFY_PERMILLE", u16, env),
             .fleet_jobs = knobs.boolKnob("SQUEEZEFS_FLEET_JOBS", env),
             .park_delay_ns = @as(u64, knobs.intKnob("SQUEEZEFS_TEST_JOB_PARK_DELAY_MS", u32, env)) * std.time.ns_per_ms,
+            .test_hold = std.meta.stringToEnum(records.JobType, knobs.enumKnob("SQUEEZEFS_TEST_JOB_TASK_HOLD", env)),
             .hold_submission = knobs.boolKnob("SQUEEZEFS_TEST_JOB_HOLD_SUBMISSION", env),
             .pre_publish_hold = knobs.boolKnob("SQUEEZEFS_TEST_MOVER_PRE_PUBLISH_HOLD", env),
         };
@@ -1434,7 +1436,7 @@ pub const Node = struct {
             .fleet_caller = in.fleet_caller,
             .bitmaps = in.bitmaps,
         };
-        n.fabric = Fabric.init(gpa, n.store.store(), .{ .identity = in.identity, .pid = in.pid, .default_throttle_pct = opts.cpu_limit, .park_delay_ns = opts.park_delay_ns, .held = in.held, .random = in.random });
+        n.fabric = Fabric.init(gpa, n.store.store(), .{ .identity = in.identity, .pid = in.pid, .default_throttle_pct = opts.cpu_limit, .park_delay_ns = opts.park_delay_ns, .test_hold = opts.test_hold, .held = in.held, .random = in.random });
         n.table = lease_mod.ShardTable.init(seams.LEASE_TTL_MS, n.sink.sink(), null);
         n.coord = wire_mod.Coordinator.init(gpa, io, &n.fabric, &n.table, .{ .verify = n.verify.vr(), .channel = wire_tls.posture().channel(), .configured_permille = opts.verify_permille, .wero = if (in.wero) |w| w.wero() else null });
         n.sink.coord = &n.coord;
@@ -1641,14 +1643,22 @@ test "Options.fromEnv: the derived worker count, the defaults, the seams; the co
     try testing.expectEqual(@as(u16, 1000), o.verify_permille);
     try testing.expect(o.fleet_jobs and !o.hold_submission and !o.pre_publish_hold);
     try testing.expectEqual(@as(u64, 0), o.park_delay_ns);
+    try testing.expectEqual(@as(?records.JobType, null), o.test_hold);
     try testing.expectEqual(@as(u64, 4 * 64 * (4 << 20)), o.copyWindowBytes(4 << 20));
     try env.put("SQUEEZEFS_JOB_WORKERS", "3");
     try env.put("SQUEEZEFS_JOB_CPU_LIMIT", "25");
     try env.put("SQUEEZEFS_TEST_JOB_PARK_DELAY_MS", "250");
+    try env.put("SQUEEZEFS_TEST_JOB_TASK_HOLD", "defrag_meta");
     const o2 = Options.fromEnv(&env, derive.Facts.synthetic(16, 64 << 30));
     try testing.expectEqual(@as(u32, 3), o2.workers);
     try testing.expectEqual(@as(u8, 25), o2.cpu_limit);
     try testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), o2.park_delay_ns);
+    try testing.expectEqual(@as(?records.JobType, .defrag_meta), o2.test_hold);
+    // The hold's row names exactly `off` and every job type.
+    const allowed = comptime knobs.row("SQUEEZEFS_TEST_JOB_TASK_HOLD").kind.enumeration.allowed;
+    const types = @typeInfo(records.JobType).@"enum".field_names;
+    try testing.expectEqualStrings("off", allowed[0]);
+    inline for (types, allowed[1..]) |t, a| try testing.expectEqualStrings(t, a);
 }
 
 test "the quarantine sink returns an expired lease's cohort to the free list at the drain proof: two pre-allocated unpublished destinations (minted, never published — flagged alone) and a free-listed one (taken out, OWED) leave the quarantine and read free; nothing stays allocated, in limbo or flagged — fsck's leaked arm has nothing to find (0003 §Y.2)" {

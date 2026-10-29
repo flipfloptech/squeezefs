@@ -722,16 +722,20 @@ fn barrierLeg(ctx: Ctx, ord: u32, out: *LegResult) void {
 }
 
 /// ≥ 2 legs under the lever ⇒ joined: every leg runs to completion, the
-/// first error wins; else sequential. A leg is never cancelled.
+/// first error wins; else sequential. A leg is never cancelled: a caller
+/// cancelled meanwhile (the times drain's fiber at an orderly unmount)
+/// observes it at its next cancelation point, after the join.
 fn runBarrierLegs(ctx: Ctx, io: Io, plan: []const u32) Error!void {
     if (plan.len == 0) return;
     var results: [256]LegResult = undefined;
     for (results[0..plan.len]) |*r| r.* = .{};
     if (plan.len >= 2 and ctx.levers.parallel_legs) {
+        const prev = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prev);
         var group: Io.Group = .init;
         for (plan, 0..) |ord, i| group.async(io, barrierLeg, .{ ctx, ord, &results[i] });
         group.await(io) catch |e| switch (e) {
-            error.Canceled => unreachable, // the fsync is never cancelled (charter §9)
+            error.Canceled => unreachable, // protection is blocked above
         };
         stats.fsync_parallel_joins.inc();
     } else {

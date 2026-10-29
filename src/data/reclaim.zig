@@ -1451,9 +1451,12 @@ pub const Reclaimer = struct {
 
     /// Group by device, sort by offset, `n_lanes` consecutive slices per
     /// device, one `io.concurrent` lane each, await every lane (the worker
-    /// never outruns its submissions).
+    /// never outruns its submissions). A lane is never cancelled mid-batch:
+    /// a cancel of the worker is observed after the join.
     fn dispatchLanes(self: *Reclaimer, io: Io, batch: []Entry) void {
         std.mem.sort(Entry, batch, {}, entryLess);
+        const prev = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prev);
         var group: Io.Group = .init;
         var spawned_any = false;
         var i: usize = 0;
@@ -1477,7 +1480,7 @@ pub const Reclaimer = struct {
             i = j;
         }
         if (spawned_any) group.await(io) catch |err| switch (err) {
-            error.Canceled => unreachable,
+            error.Canceled => unreachable, // protection is blocked above
         };
     }
 

@@ -485,6 +485,9 @@ pub const Options = struct {
     /// `SQUEEZEFS_TEST_WRITE_POSTLUDE_HOLD`: a striped write parks inside
     /// its postlude's `I{ino}` section until `write_hold_release` fires.
     write_postlude_hold: bool = false,
+    /// `SQUEEZEFS_TEST_SYNCFS_KEEPS_CUSTODY`: FUSE_SYNCFS lands no write
+    /// custody (its times drain and meta barrier still run).
+    syncfs_keeps_custody: bool = false,
     /// `SQUEEZEFS_TEST_FOREIGN_CLAIM_HOLD`: the mount's first foreign-slot
     /// write parks between its publish and its claim until a writer opens
     /// this FIFO (null = no hold).
@@ -691,6 +694,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         times_park: bool,
         /// `Options.write_postlude_hold` (`holdPostlude`).
         write_hold: bool = false,
+        /// `Options.syncfs_keeps_custody` (`syncfs`).
+        syncfs_keeps_custody: bool = false,
         /// Test seam: a striped write parks AFTER its bytes landed and
         /// BEFORE its postlude's `I{ino}` guard until `write_hold_release`
         /// fires (the window a size-setting commit crosses whole).
@@ -822,6 +827,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .pending = try economy.PendingTimes.init(gpa),
                 .times_park = opts.times_park,
                 .write_hold = opts.write_postlude_hold,
+                .syncfs_keeps_custody = opts.syncfs_keeps_custody,
                 .foreign_claim_hold = opts.foreign_claim_hold,
                 .promote_kill_after_commit = opts.promote_kill_after_commit,
                 .locks = undefined,
@@ -5301,7 +5307,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             defer prof.finish(&fuse_syncfs_phase_ns);
             _ = try self.drainPendingTimes(c);
             prof.mark(.times_drain);
-            if (self.data.hasVolumes()) {
+            if (self.data.hasVolumes() and !self.syncfs_keeps_custody) {
                 c.stage(.write_admitted);
                 try self.data.syncfs(self.io, &prof);
                 c.stage(.write_done);

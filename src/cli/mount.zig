@@ -540,6 +540,7 @@ fn mountMain(ctx: *Ctx) u8 {
         .gid = ctx.opts.gid,
         .times_park = flush_interval_ms != 0,
         .write_postlude_hold = knobs.boolKnob("SQUEEZEFS_TEST_WRITE_POSTLUDE_HOLD", env),
+        .syncfs_keeps_custody = knobs.boolKnob("SQUEEZEFS_TEST_SYNCFS_KEEPS_CUSTODY", env),
         .foreign_claim_hold = claimHoldPath(env),
         .promote_kill_after_commit = knobs.boolKnob("SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT", env),
     }) catch return ctx.failed("out of memory mounting the filesystem", .{});

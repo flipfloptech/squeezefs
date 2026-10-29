@@ -6740,6 +6740,24 @@ fn abortFuseConnectionOf(io: Io, mp: []const u8) void {
     std.debug.print("smoke: aborted the FUSE connection of {s} (minor {d}) so the row ends instead of hanging the shard\n", .{ mp, minor });
 }
 
+/// A host-wide sync(2) from any tenant of a shared venue reaches a FUSE
+/// mount as FUSE_SYNCFS: a row that pins `b`'s write custody for the
+/// fail-stop (B armed `SQUEEZEFS_TEST_SYNCFS_KEEPS_CUSTODY`) keeps it parked
+/// through one (red without the seam: 2 of 30 loaded DEAD MANAGER runs
+/// re-joined in place where the row pins the fail-stop — B's fuse_syncfs 3
+/// for the row's own 1, custody gone, no intent open at the judge).
+fn expectCustodyKeptThroughSync(b: *Peer) !void {
+    const gpa = testing.allocator;
+    const before = try b.stats();
+    defer gpa.free(before);
+    const sy = try b.onMount("sync -f .");
+    gpa.free(sy);
+    const after = try b.stats();
+    defer gpa.free(after);
+    try testing.expect(numberAfter(after, "\"fuse_syncfs\":").? > numberAfter(before, "\"fuse_syncfs\":").?);
+    try testing.expectEqual(numberAfter(before, "\"syncfs_custody_inos\":"), numberAfter(after, "\"syncfs_custody_inos\":"));
+}
+
 test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED HOT DIRECTORY (the flakes ledger's second shape, 2026-10-22) — A (the manager) holds `hot` striped over K = 64; B JOINED storms creates into it → kill -9 A ⇒ B PARKS at T_self → remount A (term 2) → B's reclaim lands in the grace window → B's member beat is HELD (SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD: no renewal, no reclaim beat, every other thread serving the storm) past T_owner ⇒ B's COMMITTERS park the gate at T_self on the member's own clock (its second park, with the beat still held: no commit past T_self), A evicts the silent B at T_owner (`tick — 1 evicted`) and recovers its region → released: the beat's reclaim meets the closed grace ⇒ UnknownLease ⇒ B holds acked bytes no layout names (64 KiB written through an fd a process holds open under the close write-back posture: write-side custody) ⇒ no re-join in place (decision 0003 §BS) ⇒ B POISONED (every volume FAILED, the move epoch closed) → the fail-stop: the storm's parked create and a fresh one answer EIO at once (never held), the storm child ends when told, `umount B` completes with the crash shape (no release, no page write; exit 1), A serves `hot` on (ls = find), no tripwire on A → fsck --offline --scrub 0 findings (red: a create held at the move gate for T_park_max per op, the storm child unkillable, the shard hung in wait4; B committed through the hold and its stop released 61 recovered slots: A's lookup wedged past the 51 s request timeout)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
@@ -6763,6 +6781,8 @@ test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED H
     var close_env = try rig.env.clone(gpa);
     defer close_env.deinit();
     try close_env.put("SQUEEZEFS_WRITEBACK_POSTURE", "close");
+    // ... and a sync(2) any tenant of the venue issues does not land it.
+    try close_env.put("SQUEEZEFS_TEST_SYNCFS_KEEPS_CUSTODY", "1");
     b.env = &close_env;
     b.node = kill_peer_node;
     try b.spawn(&.{});
@@ -6798,21 +6818,7 @@ test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED H
             break;
         }
     }
-    // A host-wide sync(2) from any tenant of a shared venue reaches B as
-    // FUSE_SYNCFS (2 of 30 loaded DEAD MANAGER runs re-joined in place
-    // where this row pins the fail-stop: B's fuse_syncfs 3 for the row's
-    // own 1, custody gone, no intent open at the judge). The custody this
-    // row pins stays parked through it.
-    {
-        const before = try b.stats();
-        defer gpa.free(before);
-        const sy = try b.onMount("sync -f .");
-        gpa.free(sy);
-        const after = try b.stats();
-        defer gpa.free(after);
-        try testing.expect(numberAfter(after, "\"fuse_syncfs\":").? > numberAfter(before, "\"fuse_syncfs\":").?);
-        try testing.expectEqual(numberAfter(before, "\"syncfs_custody_inos\":"), numberAfter(after, "\"syncfs_custody_inos\":"));
-    }
+    try expectCustodyKeptThroughSync(b);
     {
         const mk = try rig.onMount("mkdir hot");
         gpa.free(mk);
@@ -7223,6 +7229,7 @@ test "smoke: A LIVE MEMBER EVICTED WITH UN-LANDED STATE FAIL-STOPS (the re-join'
     var close_env = try rig.env.clone(gpa);
     defer close_env.deinit();
     try close_env.put("SQUEEZEFS_WRITEBACK_POSTURE", "close");
+    try close_env.put("SQUEEZEFS_TEST_SYNCFS_KEEPS_CUSTODY", "1");
     b.env = &close_env;
     b.node = kill_peer_node;
     try b.spawn(&.{});
@@ -7254,6 +7261,7 @@ test "smoke: A LIVE MEMBER EVICTED WITH UN-LANDED STATE FAIL-STOPS (the re-join'
             break;
         }
     }
+    try expectCustodyKeptThroughSync(b);
     var released = false;
     defer if (!released) releaseHold(fifo);
     const mark = try rig.logLen();

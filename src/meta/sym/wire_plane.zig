@@ -1637,16 +1637,24 @@ pub const WirePlane = struct {
         return .{ .node_token = self.identity.node_token, .mount_slot = self.identity.mount_slot, .writer_id = self.identity.writer_id };
     }
 
+    /// The clean stop's lease releases, then the bitmap pages the released
+    /// records named: nobody's once the release is durable (a lease
+    /// released with its pages still allocated lost them for good — one
+    /// heap extent per data volume per clean mount).
     fn releaseAllocLeases(self: *WirePlane, hp: *plane_arm.HolderPlane) void {
         const m = self.mgr orelse return;
         const control = m.ledger_store.store().control;
+        var pages: std.ArrayList(sym_records.BitmapRef) = .empty;
+        defer pages.deinit(self.gpa);
         for (0..hp.armed()) |i| {
             const h = hp.held(i);
             switch (alloc_lease.release(control, self.gpa, h.vol_tag, self.writerIdentity(), h.term)) {
-                .released, .already => {},
+                .released => pages.appendSlice(self.gpa, h.refs) catch log.warn("data planes: out of memory listing the released bitmap pages of vol {x} — they stay allocated until fsck", .{h.vol_tag}),
+                .already => {},
                 .deferred, .io_error => log.warn("data planes: the allocation lease of vol {x} (term {d}) could not be released at the stop — the successor acquires it through the death ledger", .{ h.vol_tag, h.term }),
             }
         }
+        if (pages.items.len != 0) if (self.kvda) |k| k.releaseOwnPages(pages.items);
     }
 
     fn dataVolumeBlocksFn(ctx: ?*anyopaque, vol_tag: u64) ?u64 {

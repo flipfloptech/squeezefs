@@ -204,6 +204,20 @@ pub const KvdaHome = struct {
         self.controlEntryCycling(recs.items) catch log.warn("data planes: the predecessor's {d} bitmap page extent(s) could not be journaled free — the next checkpoint's bitmap page carries the release", .{recs.items.len});
     }
 
+    /// This holder's own page extents after its clean stop released the
+    /// leases that named them: the releases made durable first (a crash
+    /// before that keeps the records naming the pages — the successor
+    /// folds them and frees them as a predecessor's), then the kind-4
+    /// frees as `freeExtents` journals a predecessor's.
+    pub fn releaseOwnPages(self: *KvdaHome, refs: []const records.BitmapRef) void {
+        const vol = self.aset.volume();
+        _ = vol.vt.cycleCheckpoint(vol.ctx) catch {
+            log.warn("data planes: the released allocation lease(s) could not be made durable — {d} bitmap page run(s) stay allocated until fsck", .{refs.len});
+            return;
+        };
+        freeExtents(self, refs);
+    }
+
     fn generation(ctx: *anyopaque) u64 {
         return self_(ctx).be.cp.checkpointSeq() + 1;
     }

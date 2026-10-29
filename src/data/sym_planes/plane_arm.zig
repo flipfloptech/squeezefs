@@ -554,11 +554,14 @@ pub const HolderPlane = struct {
         return self.n_vols.load(.acquire);
     }
 
-    /// The per-volume words (`vol_tag`, lease term) for the release.
-    pub const Held = struct { vol_tag: u64, term: u64 };
+    /// The per-volume words (`vol_tag`, lease term) for the release, and
+    /// the page refs this holder published: its own pages, freed once the
+    /// release that stops naming them is durable.
+    pub const Held = struct { vol_tag: u64, term: u64, refs: []const records.BitmapRef };
 
     pub fn held(self: *const HolderPlane, ordinal: usize) Held {
-        return .{ .vol_tag = self.vols[ordinal].vol_tag, .term = self.vols[ordinal].term };
+        const v = &self.vols[ordinal];
+        return .{ .vol_tag = v.vol_tag, .term = v.term, .refs = v.refs.items };
     }
 
     fn volOf(self: *HolderPlane, vol_tag: u64) ?*Vol {

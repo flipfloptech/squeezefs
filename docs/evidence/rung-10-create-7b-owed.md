@@ -17,7 +17,7 @@ move gate holding each foreign op `T_park_max`, the fenced leave wrote, a stale 
 
 **Verified:** the three DEAD MANAGER rows 30× beside 24 `yes` and four agents' builds (load 40–75):
 **0 hangs**, 28 green. Runs 19 and 21 (the F4 row) re-joined in place where the row expects the
-fail-stop: B's close-posture custody had cleared before the eviction (§CG.5 (a), a flakes row). Not a
+fail-stop: B's close-posture custody had cleared before the eviction (§CG.5 (a); the row's precondition is unpinned under load — a test defect, fixed on a follow-up branch with a seam, never a flakes row). Not a
 syncfs (85 `sync -f` of B over three runs: custody held); not reproduced beside 16 `yes` — `9435fe3`
 15/15 and `7693bab` 15/15 poisoned.
 

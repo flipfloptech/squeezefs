@@ -354,6 +354,10 @@ const EchoFsImpl = struct {
     /// Cleared at INIT when the session serves opens for zero-copy
     /// (`InitCaps.zc_open`) — the lifecycle's flip, mirrored.
     no_open: bool = false,
+    /// OPEN answers without `FOPEN_DIRECT_IO`: reads go through the page
+    /// cache, so a `/park` read holds its folio LOCKED across the parked
+    /// request (the kernel's readahead unlocks it at the reply).
+    cached_opens: bool = false,
     flush_custody: bool = false,
     /// The write-back timer's close (decision 0003 §AJ): every FLUSH is
     /// answered ENOSYS (the kernel latches `no_flush`), counted here.
@@ -732,10 +736,12 @@ const EchoFsImpl = struct {
                     return h.fail(.NOSYS);
                 }
                 if (self.attrOf(ino) == null) return h.fail(.NOENT);
-                // DIRECT_IO: every read and write reaches the daemon. A
+                // DIRECT_IO (unless `cached_opens`): every read and write
+                // reaches the daemon. A
                 // mainline zero-copy session's opens carry the per-file grant.
                 const zc_flag: u32 = if (self.caps != null and self.caps.?.zc_open) abi.FOPEN_IO_URING_ZERO_COPY else 0;
-                h.reply(codec.replyOpen(&out, u, ino, abi.FOPEN_DIRECT_IO | zc_flag));
+                const direct: u32 = if (self.cached_opens) 0 else abi.FOPEN_DIRECT_IO;
+                h.reply(codec.replyOpen(&out, u, ino, direct | zc_flag));
             },
             .opendir => h.reply(codec.replyOpen(&out, u, ino, 0)),
             .release => {

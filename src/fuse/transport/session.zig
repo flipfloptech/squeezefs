@@ -3734,6 +3734,129 @@ test "e2e: the sideband never inode_locks a directory this daemon owes a reply o
     try testing.expectEqual(ep0, notify_epochs_sent.load());
 }
 
+test "e2e: a notify the kernel sleeps on never stalls the sideband (decision 0003 §CK; the shim's fsstress wedge) — with root's i_rwsem held by a LOOKUP parked in its handler, an INVAL_ENTRY on root sleeps in the kernel until that lookup is answered; behind it an AWAITED attrs-only INVAL_INODE returns and a reserved one is written within the round, the entry stays unwritten while the lookup is held, and lands once it is answered" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 70, &.{});
+    defer rig.deinit();
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    var pb: [256]u8 = undefined;
+    _ = try statSize(rig.child(&pb, "hello"));
+    // The kernel holds root's i_rwsem SHARED across the parked handler
+    // (`lookup_slow`); `fuse_reverse_inval_entry` takes it exclusively.
+    const Lookup = struct {
+        fn run(path: [*:0]const u8, result: *anyerror!u64) void {
+            result.* = statSize(path);
+        }
+    };
+    var lb: [256]u8 = undefined;
+    var looked: anyerror!u64 = 0;
+    const lookup = try std.Thread.spawn(.{}, Lookup.run, .{ rig.child(&lb, EchoFs.park_lookup_name).ptr, &looked });
+    var lookup_joined = false;
+    defer if (!lookup_joined) {
+        rig.fs.releaseParked();
+        lookup.join();
+    };
+    const parked_by = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (rig.fs.parked_lookups.load(.monotonic) == 0 and clock.monotonicNs() < parked_by) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 1), rig.fs.parked_lookups.load(.monotonic));
+    const settled0 = notifySettled();
+    // The kernel-view notifier's INVAL_ENTRY. No in-flight registry is
+    // bound, so the deferral cannot see the lookup — the product's window:
+    // the kernel takes the lock before the daemon receives the request.
+    s.notifyInvalEntryOwed(EchoFs.ino_root, "hello");
+    // Behind it, in publish order: the awaited size announcement a ring
+    // write owes before its ack, then a reserved fire-and-forget attrs.
+    const Awaited = struct {
+        fn run(sess: *Session, done: *std.atomic.Value(bool)) void {
+            sess.notifyAttrsAwaited(EchoFs.ino_hello);
+            done.store(true, .release);
+        }
+    };
+    var awaited_done: std.atomic.Value(bool) = .init(false);
+    const awaited = try std.Thread.spawn(.{}, Awaited.run, .{ s, &awaited_done });
+    var awaited_joined = false;
+    defer if (!awaited_joined) {
+        rig.fs.releaseParked();
+        awaited.join();
+    };
+    const round_by = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!awaited_done.load(.acquire) and clock.monotonicNs() < round_by) std.Thread.yield() catch {};
+    try testing.expect(awaited_done.load(.acquire));
+    awaited.join();
+    awaited_joined = true;
+    s.notifyAttrs(EchoFs.ino_hello);
+    awaitNotifySettled(settled0 + 2);
+    try testing.expectEqual(settled0 + 2, notifySettled());
+    // The entry is still in the kernel, waiting on the lookup's lock.
+    try testing.expectEqual(settled0 + 2, notifySettled());
+    // Answered (negative): the kernel drops the lock, the entry lands.
+    rig.fs.releaseParked();
+    lookup.join();
+    lookup_joined = true;
+    try testing.expectError(error.StatFailed, looked);
+    awaitNotifySettled(settled0 + 3);
+    try testing.expectEqual(settled0 + 3, notifySettled());
+}
+
+test "e2e: a page-invalidating notify never stalls the sideband (decision 0003 §CK) — with `/park`'s folio held LOCKED by a buffered read parked in its handler, a whole INVAL_INODE of `/park` sleeps in the kernel's `invalidate_inode_pages2_range` until that read is answered; behind it an AWAITED attrs-only INVAL_INODE returns and a reserved one is written within the round, and the whole one lands once the read is answered" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const rig = try Rig.init(testing.allocator, 71, &.{});
+    defer rig.deinit();
+    rig.fs.cached_opens = true;
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    var pb: [256]u8 = undefined;
+    _ = try statSize(rig.child(&pb, "hello"));
+    const Reader = struct {
+        fn run(path: [*:0]const u8, result: *anyerror!usize) void {
+            var buf: [64]u8 = undefined;
+            result.* = readWhole(path, &buf);
+        }
+    };
+    var rb: [256]u8 = undefined;
+    var read_result: anyerror!usize = 0;
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{ rig.child(&rb, "park").ptr, &read_result });
+    var reader_joined = false;
+    defer if (!reader_joined) {
+        rig.fs.releaseParked();
+        reader.join();
+    };
+    const parked_by = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (rig.fs.parked_readers.load(.monotonic) == 0 and clock.monotonicNs() < parked_by) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 1), rig.fs.parked_readers.load(.monotonic));
+    const settled0 = notifySettled();
+    // The limiter's leading WHOLE: every page of `/park`.
+    try s.notifyInvalInode(EchoFs.ino_park, 0, 0);
+    const Awaited = struct {
+        fn run(sess: *Session, done: *std.atomic.Value(bool)) void {
+            sess.notifyAttrsAwaited(EchoFs.ino_hello);
+            done.store(true, .release);
+        }
+    };
+    var awaited_done: std.atomic.Value(bool) = .init(false);
+    const awaited = try std.Thread.spawn(.{}, Awaited.run, .{ s, &awaited_done });
+    var awaited_joined = false;
+    defer if (!awaited_joined) {
+        rig.fs.releaseParked();
+        awaited.join();
+    };
+    const round_by = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!awaited_done.load(.acquire) and clock.monotonicNs() < round_by) std.Thread.yield() catch {};
+    try testing.expect(awaited_done.load(.acquire));
+    awaited.join();
+    awaited_joined = true;
+    s.notifyAttrs(EchoFs.ino_hello);
+    awaitNotifySettled(settled0 + 2);
+    try testing.expectEqual(settled0 + 2, notifySettled());
+    // The whole one is still in the kernel, waiting on the read's folio.
+    try testing.expectEqual(settled0 + 2, notifySettled());
+    rig.fs.releaseParked();
+    reader.join();
+    reader_joined = true;
+    try testing.expectEqual(@as(usize, EchoFs.hello_text.len), try read_result);
+    awaitNotifySettled(settled0 + 3);
+    try testing.expectEqual(settled0 + 3, notifySettled());
+}
+
 test "e2e: A COHERENCE NOTIFY NEVER UNMOUNTS (xfstests generic/410; decision 0003 §BL) — a file bind-mounted onto /hello stands through an INVAL_ENTRY of `hello` (EXPIRED: its next walk revalidates by LOOKUP, the same node, the bind still reads), through one deferred behind its parent's in-flight request, and through an owed INC_EPOCH (withheld +1 while the bind stands, nothing written); with the bind gone the epoch is written (sent +1) and the next walk looks the name up anew (red on dev: the INVAL_ENTRY's `d_invalidate`, and the epoch at the next walk, detached the bind — the walk read EchoFs's own `hello`)" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 21, &.{});

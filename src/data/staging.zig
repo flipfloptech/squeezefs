@@ -1772,17 +1772,18 @@ pub const Pool = struct {
 // ---------------------------------------------------------------------------
 
 /// One resident as the cache core sees it: the ring key, its ino (the
-/// shard), the bytes it charges (its reserved stride) and the generation
-/// the record carries (the sink's gate: a superseded entry owes nothing).
-/// No epoch: a resident's bytes are the truth whatever landed on the inode
-/// since (the staging key's generation gate is the identity law), so the
-/// instance binds no `EpochSource`.
+/// shard) and the bytes it charges (its reserved stride). One entry per
+/// key: a re-stage's insert invalidates the old one, an in-place append or
+/// overwrite keeps it (the record's footprint is the same) — so the sink
+/// judges the key's PRESENCE in the ring, never a generation the entry
+/// would have to follow. No epoch: a resident's bytes are the truth
+/// whatever landed on the inode since (the staging key's generation gate
+/// is the identity law), so the instance binds no `EpochSource`.
 pub const Resident = struct {
     key: StagingKey,
     ino: u64,
     epoch: u64 = 0,
     bytes: u32,
-    generation: u64,
 
     pub const Key = StagingKey;
 };
@@ -1817,8 +1818,10 @@ pub const PromoteSink = struct {
             stats.write_cache_inline_evictions_declined.inc();
             return .kept;
         }
-        const g = self.pool.generationOf(e.key.file_id) orelse return .released;
-        if (g != e.generation) return .released;
+        // Gone from the ring (promoted elsewhere, released): owes nothing.
+        // A record still there is this entry's, whatever generation an
+        // in-place write stamped on it since the insert.
+        if (self.pool.generationOf(e.key.file_id) == null) return .released;
         const promote = self.hooks.promote orelse return .kept;
         if (promote(self.hooks.ctx, e.key) == .promoted) {
             stats.write_cache_evict_promotions.inc();
@@ -1868,7 +1871,7 @@ pub fn stageWrite(pool: *Pool, seg: *Segment, cache: ?*WriteCache, key: StagingK
         if (prior_row != null) _ = c.invalidateKey(key);
         PromoteSink.inline_insert = true;
         defer PromoteSink.inline_insert = false;
-        switch (c.insert(.{ .key = key, .ino = key.ino(), .bytes = @intCast(padded), .generation = generation }, .{})) {
+        switch (c.insert(.{ .key = key, .ino = key.ino(), .bytes = @intCast(padded) }, .{})) {
             .inserted => {},
             .exists, .refused => {
                 stats.staging_over_cap_refusals.inc();

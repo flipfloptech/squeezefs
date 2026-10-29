@@ -1262,7 +1262,7 @@ pub const DataPlane = struct {
         {
             const residents = st.seg.residentsAlloc(gpa) catch return error.OutOfMemory;
             defer gpa.free(residents);
-            for (residents) |c| _ = st.cache.insert(.{ .key = c.key, .ino = c.key.ino(), .bytes = @intCast(c.cost), .generation = c.generation }, .{});
+            for (residents) |c| _ = st.cache.insert(.{ .key = c.key, .ino = c.key.ino(), .bytes = @intCast(c.cost) }, .{});
         }
         // The floor: the ring's few whole blocks a Red shed leaves resident
         // (the budget's floor law, §2.4) — under the gate's shared cage

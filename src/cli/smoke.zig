@@ -8265,12 +8265,12 @@ test "smoke: ATIME — RELATIME, STRICTATIME, NOATIME ARE THE KERNEL MOUNT'S (fs
     // The kernel's flag remount reaches the daemon through the mount table
     // (its watcher's line names the new law) — before the phase judges it.
     try Phase.run(rig, atime_sh_nodiratime, "nodiratime ok rw,nodiratime,relatime\n");
-    mark = try rig.awaitLog("atime: relatime,nodiratime (the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
+    mark = try rig.awaitLog("atime: relatime,nodiratime (the kernel mount's flags)", mark, ready_wait_ns);
     try Phase.run(rig, atime_sh_strict_noatime_ro, "strict/noatime/ro ok\n");
-    mark = try rig.awaitLog("atime: strictatime (the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
-    mark = try rig.awaitLog("atime: noatime (the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
-    mark = try rig.awaitLog("atime: strictatime,ro (the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
-    mark = try rig.awaitLog("atime: relatime (the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
+    mark = try rig.awaitLog("atime: strictatime (the kernel mount's flags)", mark, ready_wait_ns);
+    mark = try rig.awaitLog("atime: noatime (the kernel mount's flags)", mark, ready_wait_ns);
+    mark = try rig.awaitLog("atime: strictatime,ro (the kernel mount's flags)", mark, ready_wait_ns);
+    mark = try rig.awaitLog("atime: relatime (the kernel mount's flags)", mark, ready_wait_ns);
     {
         const ta = try rig.stats();
         defer gpa.free(ta);
@@ -8294,7 +8294,7 @@ test "smoke: ATIME — RELATIME, STRICTATIME, NOATIME ARE THE KERNEL MOUNT'S (fs
     mark = try rig.logLen();
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(mark);
-    _ = try rig.awaitLog("atime: noatime (SQUEEZEFS_ATIME over the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
+    _ = try rig.awaitLog("atime: noatime (SQUEEZEFS_ATIME over the kernel mount's flags)", mark, ready_wait_ns);
     try Phase.run(rig, atime_sh_knob_noatime, "knob noatime ok\n");
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
@@ -8303,7 +8303,7 @@ test "smoke: ATIME — RELATIME, STRICTATIME, NOATIME ARE THE KERNEL MOUNT'S (fs
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(mark);
     try Phase.run(rig, atime_sh_knob_strict, "knob strictatime ok\n");
-    _ = try rig.awaitLog("atime: strictatime,nodiratime (SQUEEZEFS_ATIME over the kernel mount's flags)", mark, 5 * std.time.ns_per_s);
+    _ = try rig.awaitLog("atime: strictatime,nodiratime (SQUEEZEFS_ATIME over the kernel mount's flags)", mark, ready_wait_ns);
     _ = rig.env.swapRemove("SQUEEZEFS_ATIME");
     {
         const ta = try rig.stats();

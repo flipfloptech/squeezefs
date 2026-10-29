@@ -1153,6 +1153,7 @@ test {
     _ = session;
     _ = service;
     _ = direct;
+    _ = direct_lease;
     _ = e2e_linux;
     _ = fiemap_verb;
 }

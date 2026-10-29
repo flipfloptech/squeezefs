@@ -3522,6 +3522,15 @@ test "smoke: A MEMBER JOINS A SET WHOSE MANAGER WAS KILLED — format → A moun
 const scope_a_files: usize = 200;
 const scope_b_files: usize = 8;
 
+/// An outside syncfs of the member-scope row's mounts — what a host-wide
+/// `sync(2)` from any process (the gate's other rows, the suites) does to
+/// them at any instant: run at each instant the row reads a member's
+/// residents.
+fn outsideSync(rig: *Rig, b: ?*Peer) !void {
+    rig.gpa.free(try rig.onMount("sync -f ."));
+    if (b) |p| rig.gpa.free(try p.onMount("sync -f ."));
+}
+
 /// The last line a bring-up logged for its staging ring under a root whose
 /// path contains `member_root_tail` (`<cache>/member-<slot>`): its
 /// `recovered N record(s)` count.
@@ -3559,6 +3568,7 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
         defer gpa.free(out);
         try testing.expectEqual(scope_a_files, try std.fmt.parseInt(usize, std.mem.trimEnd(u8, out, "\n"), 10));
     }
+    try outsideSync(rig, null);
     // A's ring holds them (the pool's charged footprint; a 64 KiB image is
     // one record each).
     const a_staged = blk: {
@@ -3572,6 +3582,7 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
     defer b.deinit();
     try b.spawnAsSet(&.{});
     _ = try b.awaitReady();
+    try outsideSync(rig, b);
     {
         const text = try b.readLog();
         defer gpa.free(text);
@@ -3596,6 +3607,7 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
         defer gpa.free(out);
         try testing.expectEqual(scope_b_files, try std.fmt.parseInt(usize, std.mem.trimEnd(u8, out, "\n"), 10));
     }
+    try outsideSync(rig, b);
     // B's dismount promotes ITS residents; A's ring is untouched.
     const mark_b = try b.logLen();
     try b.umount();
@@ -3617,6 +3629,7 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
         try testing.expectEqualStrings("ok\n", out);
     }
     // A's dismount promotes ITS residents — all of them.
+    try outsideSync(rig, null);
     const mark_a = try rig.logLen();
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());

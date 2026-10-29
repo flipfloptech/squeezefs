@@ -972,6 +972,11 @@ const Step = enum {
     granted,
     /// The move done: B's door open on the slot.
     reopened,
+    /// B's request served at A straddles the move (decision 0003 §CQ): it
+    /// passes A's lease check while A's transfer is parked past its page,
+    /// parks there (`ServeHold`) while the transfer, B's grant and B's
+    /// install complete, and only then reads — A no longer holds the slot.
+    straddled,
 };
 
 const Kind = enum { create, chmod, unlink, rename, setattr };
@@ -1055,6 +1060,16 @@ fn awaitInWindow(n: u32, done: *std.atomic.Value(u32), marks: Marks) bool {
     return false;
 }
 
+/// A seam's `reached`, bounded like `awaitInWindow`.
+fn awaitEvent(ev: *const std.Io.Event) bool {
+    const until = clock.monotonicNs() + REACH_BOUND_NS;
+    while (clock.monotonicNs() < until) {
+        if (ev.isSet()) return true;
+        std.Thread.yield() catch {};
+    }
+    return false;
+}
+
 fn moveOne(comptime step: Step, comptime kind: Kind) !void {
     const gpa = testing.allocator;
     const s = try meta_set.TestSet.create(gpa, "move-matrix-" ++ @tagName(step) ++ "-" ++ @tagName(kind), 1);
@@ -1086,9 +1101,13 @@ fn moveOne(comptime step: Step, comptime kind: Kind) !void {
             break;
         }
     } else return error.NoRotorDirectory;
+    // The files gathered into the directory's slot (charter §5.5 `gather`):
+    // every object the five ops touch moves with it.
+    try a.fs.setxattr(&c, .{ .ino = dir, .name = acquire.GATHER_XATTR, .value = "1", .flags = 0 });
     var files: [4]u64 = undefined;
     for (&files, [_][]const u8{ "f.chmod", "f.unlink", "f.rename", "f.times" }) |*f, name| {
         f.* = (try a.fs.create(&c, .{ .parent = dir, .name = name, .mode = 0o644, .flags = 0, .umask = 0, .open_flags = 0 })).entry.nodeid;
+        try testing.expectEqual(slot, route_table.slotOf(f.*));
     }
     try be0.checkpointNow();
     // B joins with its filesystem behind the product's move gate.
@@ -1144,6 +1163,25 @@ fn moveOne(comptime step: Step, comptime kind: Kind) !void {
             Accept.run(bj.slots, slot);
             op.run();
         },
+        .straddled => {
+            var hold: xv.ops.ServeHold = .{};
+            hold.armed.store(true, .release);
+            a.bound.plane.seams.serve_hold = &hold;
+            defer a.bound.plane.seams.serve_hold = null;
+            be0.slots.seam.hold = .park_after_page;
+            const accept = try std.Thread.spawn(.{}, Accept.run, .{ bj.slots, slot });
+            be0.slots.seam.reached.waitUncancelable(io);
+            const t = try std.Thread.spawn(.{}, Op.run, .{&op});
+            // B's request at A, past A's lease check (A's own releasing
+            // slot reads as A's).
+            reached = awaitEvent(&hold.reached);
+            be0.slots.seam.hold = .off;
+            be0.slots.seam.release.set(io);
+            // The transfer, B's grant and B's install land before A reads.
+            accept.join();
+            hold.release.set(io);
+            t.join();
+        },
     }
     try testing.expect(reached);
     if (op.err) |e| {
@@ -1194,6 +1232,10 @@ test "linux: THE MOVE MATRIX — grant landed, B's install mid-way (0003 §X.1, 
 
 test "linux: THE MOVE MATRIX — door re-opened (0003 §X.1): B's five ops into the directory it now holds land locally, each one successful call's result, and A reads them through B" {
     try moveMatrix(.reopened);
+}
+
+test "linux: THE MOVE MATRIX — a served request straddles the move (0003 §CQ; gate 173's `drained: create answered PathAlreadyExists`, the drained unlink that left its name): B's five ops reach A past A's lease check, A's transfer, B's grant and B's install land, and only then A reads — the holder answers under its door or redirects, so each op answers one successful call's result (red: A read its forgotten tree — the create's parent `dying` → EEXIST, the unlink and the rename's source `already applied` with the names still there, the chmod's record absent → EIO)" {
+    try moveMatrix(.straddled);
 }
 
 // ---------------------------------------------------------------------------

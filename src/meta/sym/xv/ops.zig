@@ -249,6 +249,10 @@ pub const Seams = struct {
     crash_after_step: u32 = std.math.maxInt(u32),
     /// The holder answers the next served step `SlotMoved` once.
     serve_slot_moved_once: bool = false,
+    /// The move contracts' pin, set on the plane in process (never from
+    /// the env): the next served step or record verb parks past its lease
+    /// check, before it reads anything (`ServeHold.park`).
+    serve_hold: ?*ServeHold = null,
 
     pub fn fromEnv(env: *const std.process.Environ.Map) Seams {
         return .{
@@ -256,6 +260,20 @@ pub const Seams = struct {
             .crash_after_step = knobs.optIntKnob("SQUEEZEFS_TEST_XV_CRASH_AFTER_STEP", u32, env) orelse std.math.maxInt(u32),
             .serve_slot_moved_once = knobs.boolKnob("SQUEEZEFS_TEST_XV_SERVE_SLOT_MOVED_ONCE", env),
         };
+    }
+};
+
+/// `Seams.serve_hold`: armed once, the served request that meets it
+/// signals `reached` and waits for `release`.
+pub const ServeHold = struct {
+    armed: std.atomic.Value(bool) = .init(false),
+    reached: Io.Event = .unset,
+    release: Io.Event = .unset,
+
+    pub fn park(self: *ServeHold, io: Io) void {
+        if (!self.armed.swap(false, .acq_rel)) return;
+        self.reached.set(io);
+        self.release.waitUncancelable(io);
     }
 };
 
@@ -1292,6 +1310,7 @@ pub fn Plane(comptime Store: type) type {
             const slot = route_table.slotOf(step.homeIno());
             if (self.resolver.homeOf(self.resolver.ctx, slot) != .local) return error.SlotMoved;
             if (self.serve_moved_armed.swap(false, .acq_rel)) return error.SlotMoved;
+            if (self.seams.serve_hold) |h| h.park(self.io);
             if (step == .insert_dentry) {
                 const child = step.insert_dentry.child;
                 const admissible = switch (self.homeOfIno(child)) {

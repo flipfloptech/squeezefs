@@ -499,6 +499,7 @@ pub fn RecordShipService(comptime Store: type) type {
         /// ordering law a reader relies on).
         pub fn apply(self: *Self, global: u64, call: Call) ShipError!Reply {
             if (!self.plane.isLocal(global)) return error.SlotMoved;
+            if (self.plane.seams.serve_hold) |h| h.park(self.plane.io);
             // A size change runs the holder's own size path first (its
             // commit carries the size); the verb's other fields ride the
             // entry below. A WRITE's size claim is no size change: it rides

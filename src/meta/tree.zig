@@ -2001,6 +2001,36 @@ test "replay keeps a straggler Δ the node never saw (§AW.4 across a crash): W1
     try expectLookup(re.treeOf(.native), &k, &want.encode());
 }
 
+test "a compaction between two windows' applies keeps the straggler's place (§AW.4 across a compaction): W1 reserved before W2, W2's Δ applied, the leaf compacted while W1's range is open, W1's Δ applied after — the live read and the crash replay fold W1's fields under W2's (folding W2's Δ into the compacted Put at its seq shadowed W1's Δ: size and mtime lost in RAM)" {
+    const gpa = testing.allocator;
+    var vol = try smo.TestVolume.init(gpa, .{ .journaled = true });
+    defer vol.deinit();
+    const t = try vol.createTree(.native);
+    const k = ikey(9);
+    const base: rec.InodeValue = .{ .mode = 0o100644, .nlink = 1, .size = 10, .atime = 10, .mtime = 10, .ctime = 10 };
+    try vol.commit(t, &k, .put, &base.encode());
+    const led = try vol.checkpoint();
+    const d1 = (rec.InodeDelta{ .mask = rec.DELTA_SIZE | rec.DELTA_TIMES, .fields = .{ .size = 4096, .mtime = 1001, .ctime = 1001 } }).encode();
+    const d2 = (rec.InodeDelta{ .mask = rec.DELTA_ATIME, .fields = .{ .atime = 2002 } }).encode();
+    const w1 = try vol.reserveCommit(t, &k, .delta, d1.slice());
+    const w2 = try vol.reserveCommit(t, &k, .delta, d2.slice());
+    try vol.applyReserved(t, &w2);
+    {
+        const leaf = try t.resolveLeaf(&k);
+        defer leaf.release();
+        var out: smo.MaintenanceOutcome = .{};
+        try testing.expect(try smo.compactForDefrag(t, &vol.ctx, leaf, &out));
+    }
+    try vol.applyReserved(t, &w1);
+    const want: rec.InodeValue = .{ .mode = 0o100644, .nlink = 1, .size = 4096, .atime = 2002, .mtime = 1001, .ctime = 1001 };
+    try expectLookup(t, &k, &want.encode());
+    // The compacted image is on the device; the replay from the ledger
+    // before both windows folds the same.
+    var re = try vol.crashReplay(led);
+    defer re.deinit();
+    try expectLookup(re.treeOf(.native), &k, &want.encode());
+}
+
 test "a journal frame's kind maps 1:1 onto the record kind (put, delta, delete)" {
     try testing.expectEqual(RecordKind.put, kindOf(.put));
     try testing.expectEqual(RecordKind.delta, kindOf(.delta));

@@ -200,6 +200,10 @@ pub const Stats = struct {
     guard_exiting_holder_waits: counters.ShardedCounter = .{},
     mounts: counters.ShardedCounter = .{},
     clean_unmounts: counters.ShardedCounter = .{},
+    /// Dismounts whose final checkpoint or barrier failed, or whose
+    /// volume ended FAILED: the durability point was not reached and the
+    /// next mount replays the window (`closeJudged`).
+    unclean_unmounts: counters.ShardedCounter = .{},
     /// A reader's open left a live foreign lessee's slot un-projected: its
     /// page's root was already behind the lessee's live tree (the slot is
     /// read under a token from the lessee).
@@ -3385,7 +3389,16 @@ pub const KvBackend = struct {
 
     /// The clean dismount (module doc). Idempotent; frees the backend.
     pub fn close(be: *KvBackend) void {
+        _ = be.closeJudged();
+    }
+
+    /// `close`, answering whether the dismount was clean: its final
+    /// checkpoint and barrier landed on a healthy volume (a reader, a
+    /// retired incarnation and a second close answer true — they owe no
+    /// durability point).
+    pub fn closeJudged(be: *KvBackend) bool {
         const gpa = be.gpa;
+        var clean = true;
         if (be.posture == .reader) {
             // A reader wrote nothing: the projection goes.
             for (be.trees.load()) |t| t.destroy();
@@ -3399,7 +3412,7 @@ pub const KvBackend = struct {
             _ = linux.close(be.guard_fd);
             gpa.free(be.path);
             gpa.destroy(be);
-            return;
+            return true;
         }
         if (!be.closed and be.lane.latch.isRetired()) {
             be.closed = true;
@@ -3461,12 +3474,34 @@ pub const KvBackend = struct {
             // The lane last: its trailing barrier leaves every acked entry
             // durable.
             be.lane.shutdown();
-            be.dev.barrier() catch {};
+            var barrier_failed: ?anyerror = null;
+            be.dev.barrier() catch |e| {
+                barrier_failed = e;
+            };
             // The reservation released after the final barrier; the flock
             // fd closed last of all (below).
             if (be.guard) |g| g.releasePr();
-            stats.clean_unmounts.inc();
-            log.info("meta volume {s}: clean unmount (checkpoint seq {d}, tail {d}, head {d}, {s})", .{ be.path, be.cp.checkpointSeq(), be.cp.lastLedgerTail(), be.core.headPos(), @tagName(be.lane.latch.verdict()) });
+            const final_failed = be.task.finalTickFailed();
+            const verdict = be.lane.latch.verdict();
+            clean = verdict == .healthy and !final_failed and barrier_failed == null;
+            if (clean or verdict != .healthy) {
+                // A FAILED volume's own line already said so (the latch's
+                // one loud line); its dismount ran the procedure.
+                stats.clean_unmounts.inc();
+                log.info("meta volume {s}: clean unmount (checkpoint seq {d}, tail {d}, head {d}, {s})", .{ be.path, be.cp.checkpointSeq(), be.cp.lastLedgerTail(), be.core.headPos(), @tagName(verdict) });
+            } else {
+                stats.unclean_unmounts.inc();
+                log.err("meta volume {s}: UNCLEAN unmount — the final checkpoint {s}, the final barrier {s} (checkpoint seq {d}, tail {d}, head {d}, {s}): the dismount's durability point was not reached; the next open replays the journal from tail {d}", .{
+                    be.path,
+                    if (final_failed) "FAILED" else "landed",
+                    if (barrier_failed) |e| @errorName(e) else "landed",
+                    be.cp.checkpointSeq(),
+                    be.cp.lastLedgerTail(),
+                    be.core.headPos(),
+                    @tagName(verdict),
+                    be.cp.lastLedgerTail(),
+                });
+            }
         }
         if (be.guard) |g| {
             g.deinit();
@@ -3499,6 +3534,7 @@ pub const KvBackend = struct {
         _ = linux.close(be.guard_fd);
         gpa.free(be.path);
         gpa.destroy(be);
+        return clean;
     }
 };
 
@@ -3914,8 +3950,13 @@ test "a dismount whose final checkpoint fails is no clean unmount (rung-10-dm-er
         device_loader.test_seams.fail_ledger_writes.store(1 << 20, .release);
         defer device_loader.test_seams.fail_ledger_writes.store(0, .release);
         const clean0 = stats.clean_unmounts.load();
-        be.close();
+        const unclean0 = stats.unclean_unmounts.load();
+        // The close's own line: UNCLEAN, naming the failed checkpoint.
+        log.testing.expectErrorLogs(1);
+        try testing.expect(!be.closeJudged());
+        try log.testing.expectAllFired();
         try testing.expectEqual(clean0, stats.clean_unmounts.load());
+        try testing.expectEqual(unclean0 + 1, stats.unclean_unmounts.load());
     }
     {
         const be = try v.open();

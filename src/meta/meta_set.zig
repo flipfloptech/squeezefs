@@ -367,10 +367,17 @@ pub const MetaSet = struct {
 
     /// Close every member in canonical order (each a clean dismount).
     pub fn close(self: *MetaSet) void {
+        _ = self.closeJudged();
+    }
+
+    /// `close`, answering whether every member's dismount was clean
+    /// (`KvBackend.closeJudged`).
+    pub fn closeJudged(self: *MetaSet) bool {
         const gpa = self.gpa;
+        var clean = true;
         if (!self.closed) {
             self.closed = true;
-            for (self.volumes) |be| be.close();
+            for (self.volumes) |be| clean = be.closeJudged() and clean;
             for (self.retired.items) |be| be.close();
         }
         self.retired.deinit(gpa);
@@ -387,6 +394,7 @@ pub const MetaSet = struct {
         gpa.free(self.volumes);
         if (self.pool_owned) self.pool.deinit();
         gpa.destroy(self);
+        return clean;
     }
 
     pub fn volumeCount(self: *const MetaSet) usize {

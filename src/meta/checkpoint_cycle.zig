@@ -1305,6 +1305,9 @@ pub const CheckpointTask = struct {
     ring_park_kick: std.atomic.Value(bool) = .init(false),
     stop_requested: std.atomic.Value(bool) = .init(false),
     stopped: std.atomic.Value(bool) = .init(false),
+    /// The shutdown tick failed: the dismount's checkpoint never landed
+    /// (the close judges the unmount by it). Set before `stopped`.
+    final_tick_failed: std.atomic.Value(bool) = .init(false),
     period_ns: u64,
     next_tick_ns: u64,
     /// The volume's structural (SMO) context lock when other callers share
@@ -1348,6 +1351,11 @@ pub const CheckpointTask = struct {
         return self.stopped.load(.acquire);
     }
 
+    /// Read after the task's thread joined (or `isStopped`).
+    pub fn finalTickFailed(self: *const CheckpointTask) bool {
+        return self.final_tick_failed.load(.acquire);
+    }
+
     /// The node cache's budget-shed hook (`installCheckpointKick`).
     pub fn hook(self: *CheckpointTask) node_cache.Hook {
         return .{ .ctx = self, .call = shedHook };
@@ -1380,6 +1388,8 @@ pub const CheckpointTask = struct {
         if (cadence or shutting_down) {
             self.cp.tick(shutting_down, drain_deadline, park_kick, self.period_ns / ns_per_ms) catch |e| {
                 ckpt.stats.meta_kv_checkpoint_tick_failures.inc();
+                // Release pairs with `finalTickFailed`'s acquire.
+                if (shutting_down) self.final_tick_failed.store(true, .release);
                 // A FAILED volume's cadence stopped at the latch (above): only
                 // the shutdown tick still runs, and nothing retries it.
                 const next = if (self.cp.isFailed()) "the volume is FAILED: no tick retries it until remount" else "retrying next tick — barrier failures additionally escalate through the fail-stop lattice";

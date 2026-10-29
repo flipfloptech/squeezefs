@@ -9803,6 +9803,7 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
     var held_buf: [linux.PATH_MAX]u8 = undefined;
     try rig.env.put("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", try std.fmt.bufPrint(&held_buf, "{s}/held-tails", .{rig.work}));
     var latched_cycles: usize = 0;
+    var unclean_cycles: usize = 0;
     var lines_once = true;
     var cycle: usize = 0;
     while (cycle < dm_error_cycles) : (cycle += 1) {
@@ -9899,15 +9900,19 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
             }
         }
         // The daemon's own exit, never a signal: 1 when a member latched
-        // FAILED (named in its log), 0 when the cycle's failures were reads
-        // and checkpoint writes alone (those retry; they never latch).
+        // FAILED (named in its log) or its dismount never reached its
+        // durability point (the UNCLEAN unmount line: the final checkpoint
+        // or barrier failed — reads and checkpoint writes retry and never
+        // latch), 0 after a clean unmount.
         const exit_i = try rig.awaitLog("exited (wait status 0x", mark, exit_wait_ns);
         {
             const t = try rig.readLog();
             defer gpa.free(t);
             const latched = std.mem.indexOf(u8, t[mark..exit_i], "latched FAILED during this mount (EIO until remount) — exiting 1") != null;
-            if (!std.mem.startsWith(u8, t[exit_i..], if (latched) "100); done" else "0); done")) {
-                std.debug.print("\n--- cycle {d}: the daemon's exit was not its own (latched FAILED: {}) ---\n{s}\n", .{ cycle, latched, t[mark..] });
+            const unclean = std.mem.indexOf(u8, t[mark..exit_i], "UNCLEAN unmount") != null;
+            if (unclean and !latched) unclean_cycles += 1;
+            if (!std.mem.startsWith(u8, t[exit_i..], if (latched or unclean) "100); done" else "0); done")) {
+                std.debug.print("\n--- cycle {d}: the daemon's exit was not its own (latched FAILED: {}, unclean: {}) ---\n{s}\n", .{ cycle, latched, unclean, t[mark..] });
                 return error.FailedDaemonNotOwnExit;
             }
             if (latched) latched_cycles += 1;
@@ -9945,7 +9950,7 @@ test "smoke: A FAILED VOLUME'S DAEMON SERVES EIO UNTIL ITS UNMOUNT AND NEVER DIE
     {
         const out = try rig.onMount("n=$(find ./w* -type f | wc -l); test \"$n\" -gt 0; for f in w*/f*; do if test -e \"$f\"; then getfattr -d -m - \"$f\" >/dev/null; fi; done; echo \"$n files\"");
         defer gpa.free(out);
-        std.debug.print("\nsmoke[dm-error]: {d} error-table cycles ({d} latched FAILED), each unmounted in order by the daemon's own exit; the working table's mount serves the tree: {s}", .{ dm_error_cycles, latched_cycles, out });
+        std.debug.print("\nsmoke[dm-error]: {d} error-table cycles ({d} latched FAILED, {d} unclean without a latch), each unmounted in order by the daemon's own exit; the working table's mount serves the tree: {s}", .{ dm_error_cycles, latched_cycles, unclean_cycles, out });
     }
     try umountDaemon(rig, pid);
     {

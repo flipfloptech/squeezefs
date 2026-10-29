@@ -1101,13 +1101,19 @@ fn mountMain(ctx: *Ctx) u8 {
     plane_open = false;
     plane.close();
     be_open = false;
-    be.close();
+    const dismount_clean = be.closeJudged();
     // The watchdog last: its tick is the heartbeat the supervisor judged
     // the whole teardown by.
     wd.requestStop();
     wd_fut.cancel(io);
     if (failed) {
         log.err("a member of {s} latched FAILED during this mount (EIO until remount) — exiting 1", .{ctx.meta_uri});
+        return cli.exit_failed;
+    }
+    // A dismount that never reached its durability point (the member's
+    // UNCLEAN unmount line says which step failed) is no orderly exit.
+    if (!dismount_clean) {
+        log.err("the dismount of {s} did not land its final checkpoint — exiting 1 (the next mount replays its journal)", .{ctx.meta_uri});
         return cli.exit_failed;
     }
     if (ctx.connection_aborted) {

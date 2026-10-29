@@ -709,7 +709,12 @@ the HOLDER (`XV_STEPS_*`, `xv_cross_owner_steps_served`); the dominance window f
 is a striping domain (:2050–2072 — "a ship into a STRIPED directory or one of its stripes … feeds no
 window"). Z/: the served step enters `KvFs` BELOW the level-1 op guard as its own verb, takes the
 commit door like any local op (charter §5.5 "applied by ONE applier under the holder's door"), and
-its tx carries `served_step = true`.
+its tx carries `served_step = true`. Z/ (decision 0003 §CQ): every step's witness — the insert's
+name and dying parent, the remove's name, a count's CAS — is read under the step slot's DOOR TOKEN,
+taken BEFORE the read and held to the entry's terminal outcome (`applier.apply`, `KvTx.door`), and a
+shipped record verb's base the same (§3.3); the reference's one re-check of the lease after the
+dying-parent read covered the insert alone, and a declined verdict (`AlreadyApplied`,
+`ForeignSkipped`) commits nothing, so no door ever judged it.
 
 ### 2.7 The live-refusal compensation
 

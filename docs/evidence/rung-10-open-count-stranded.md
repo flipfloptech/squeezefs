@@ -58,6 +58,10 @@ Every row within ± 5 % of `dev` (file creation −1.4 / +1.2 / +0.9 / −0.3 %,
 +0.6 / +4.5 %, file read +6.6 / +4.2 / +3.8 / −1.8 %) but ONE: plain directory creation at -np 32,
 −10.0 % (`dev` 278 / 251 / 289 / 293, the fix 251 / 247 / 254 / 248), while the same row reads +2.0 % at
 -np 64 and −1.1 % in the 4 KiB shape at -np 32. Landed as a correctness fix (gate 176 green, 75/75): the
-regression it closes answers EAGAIN to applications; the mkdir row is OWED — measured with counters
-(`exec_fanout_inline`, `transport_dispatch_fallbacks` per phase) and recovered on a follow-up branch.
+regression it closes answers EAGAIN to applications; the mkdir row was re-judged: per-phase counters show the mkdir path never reaches the cap
+(`exec_fanout_inline`, `transport_dispatch_fallbacks`, `transport_dispatch_refused` 0 in all seven phases;
+`Io.async`/`Io.Group.async` are called only by `fsync.runBarrierLegs`, `staging.runPass` and `plane.drainTask`),
+and two more rounds (`occ-abba3/`, `occ-abba4/`) give, over 8 legs per arm, directory creation 274.4 → 266.3 k
+(−3.0 %, ranges 251–293 / 247–294 overlapping), directory removal +0.1 %, file creation −1.3 %, file read
++1.6 %, file removal +0.9 % — noise; nothing owed.
 Sessions: `/build/perf/occ-abba/`, `occ-abba2/`.

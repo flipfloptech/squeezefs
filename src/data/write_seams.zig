@@ -724,6 +724,21 @@ test "the data path's failure lines follow the set's one-line law through its se
     try testing.expectEqual(quieted0 + 3 * n_ops - 2, journal.meta_failed_volume_lines_quieted.load());
 }
 
+test "the in-place DMA class logs ONE line per mount, latched or not (a failing data device answers every in-place write the same way: the drains logged ≈ 115 lines per writer ino before and around the set's latch — rung-10-fence-classification.md, generic/753's row: two after the latch in one cycle): 40 failures on a healthy set log 1 line, the rest counted; the latch adds none" {
+    var v: Volumes = .{};
+    var latch: journal.FailureLatch = .{};
+    v.lines = latch.lineSeam();
+    const quieted0 = journal.meta_failed_volume_lines_quieted.load();
+    var lines: usize = 0;
+    for (0..40) |_| {
+        if (v.admitsLine(.inplace_dma)) lines += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), lines);
+    try testing.expectEqual(quieted0 + 39, journal.meta_failed_volume_lines_quieted.load());
+    try testing.expect(latch.failStop());
+    for (0..10) |_| try testing.expect(!v.admitsLine(.inplace_dma));
+}
+
 test "the fence's class: a probe reading FAILED counts the fence and leaves the must-stay-0 alone; a healthy probe (or none) fires the must-stay-0 and counts nothing" {
     const S = struct {
         var failed: counters.ShardedCounter = .{};

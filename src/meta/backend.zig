@@ -3059,6 +3059,25 @@ pub const KvBackend = struct {
         return be.cv.barrier();
     }
 
+    /// The set's durability request on this member (decision 0003 §CH):
+    /// `waiter` — the caller's, on its frame until `awaitDurable` returns —
+    /// is answered once `cover` is on stable media (a barrier whose floor
+    /// reaches it: the one in flight when it does). Not on a reader.
+    pub fn requestDurable(be: *KvBackend, waiter: *journal_lane.BarrierWaiter, cover: u64) Error!void {
+        std.debug.assert(be.posture != .reader);
+        be.lane.requestBarrierCovering(waiter, cover) catch |e| return mapSubmitError(e);
+    }
+
+    pub fn awaitDurable(waiter: *journal_lane.BarrierWaiter) Error!void {
+        waiter.wait().result catch |e| return mapVerdict(e);
+    }
+
+    /// Every journal position below it is on stable media (the last
+    /// completed barrier's floor). Not on a reader.
+    pub fn durableFloor(be: *const KvBackend) u64 {
+        return be.lane.durableFloor();
+    }
+
     /// One full cycle with an immediate barrier.
     pub fn checkpointNow(be: *KvBackend) checkpoint_cycle.CycleError!void {
         std.debug.assert(be.posture != .reader);

@@ -111,6 +111,7 @@ const heap_law = @import("heap_law.zig");
 const smo = @import("smo.zig");
 const key = @import("key.zig");
 const record = @import("record.zig");
+const fsync_marks = @import("fsync_marks.zig");
 
 const assert = std.debug.assert;
 
@@ -1049,6 +1050,10 @@ pub const Done = struct {
     acked_ns: std.atomic.Value(u64) = .init(0),
     /// `ch` carried the turn: the terminal outcome goes to `landing`.
     turned: bool = false,
+    /// The padded end of the window the member was reserved in (the pass
+    /// writes it before any send; 0 = never reserved): what an fsync of
+    /// the inodes it names must see covered (`fsync_marks`).
+    end_pos: u64 = 0,
 
     pub const init: Done = .{};
 
@@ -1188,6 +1193,9 @@ pub const Queued = struct {
     /// A `commitGroup` member: its committer parks on its siblings in
     /// turn, so it never applies itself (§BC).
     grouped: bool = false,
+    /// It holds a directory's dentry `Put`: its window is the dentry
+    /// chain's (`fsync_marks.Marks.stampChain`).
+    chain: bool = false,
     /// The terminal outcome's teardown: the seeds' references, then the tx.
     fn deinit(self: *Queued) void {
         for (self.seeds) |n| n.release();
@@ -1733,6 +1741,10 @@ pub const Conveyor = struct {
     /// The end of the furthest window reserved (§BB.4 under §BC: what an
     /// fsync must see landed, read by the lane through `Hooks.cover_upto`).
     reserved_hwm: std.atomic.Value(u64) = .init(0),
+    /// Per inode stripe, the last window an acked entry naming it was
+    /// reserved in (decision 0003 §CH): what an fsync of one inode needs
+    /// durable on this member.
+    marks: fsync_marks.Marks,
     inflight: std.AutoHashMapUnmanaged(u64, *Window) = .empty,
     inflight_cap: usize,
     /// Windows untracked since the map's last compaction (`untrack`).
@@ -1836,7 +1848,9 @@ pub const Conveyor = struct {
         errdefer window_arenas.deinit(gpa);
         var part_arenas = try ArenaPool.init(gpa, inflight_cap * @max(deps.caps.max_txs, 1));
         errdefer part_arenas.deinit(gpa);
-        self.* = .{ .deps = deps, .slots = slots, .core = undefined, .batch_buf = batch_buf, .inflight_cap = inflight_cap, .window_arenas = window_arenas, .part_arenas = part_arenas };
+        var marks = try fsync_marks.Marks.init(gpa, fsync_marks.Marks.WIDTH);
+        errdefer marks.deinit(gpa);
+        self.* = .{ .deps = deps, .slots = slots, .core = undefined, .batch_buf = batch_buf, .inflight_cap = inflight_cap, .window_arenas = window_arenas, .part_arenas = part_arenas, .marks = marks };
         errdefer self.inflight.deinit(gpa);
         try self.inflight.ensureTotalCapacity(gpa, @intCast(inflight_cap));
         self.core = Core.init(deps.io, slots, &self.stats.queued);
@@ -1852,6 +1866,7 @@ pub const Conveyor = struct {
         assert(self.inflight.count() == 0);
         self.deps.reg.resident_hook = null;
         self.inflight.deinit(gpa);
+        self.marks.deinit(gpa);
         self.part_arenas.deinit(gpa);
         self.window_arenas.deinit(gpa);
         gpa.free(self.batch_buf);
@@ -1940,14 +1955,25 @@ pub const Conveyor = struct {
             return;
         }
         var done: Done = .init;
+        // What an fsync of the inodes it names will ask of this member,
+        // read before the build consumes the records.
+        const deps = fsync_marks.Deps.of(t);
         var entry = try self.build(t, &done);
+        entry.chain = deps.chain;
         const len = entry.q.len;
         self.enqueueOne(&entry, len) catch |e| {
             entry.deinit();
             return e;
         };
         self.leadIfElected();
-        return self.park(&done);
+        try self.park(&done);
+        self.marks.stamp(&deps, done.end_pos);
+    }
+
+    /// What an fsync of key inode `ino` needs covered on this member
+    /// (decision 0003 §CH).
+    pub fn fsyncNeed(self: *Conveyor, ino: u64) fsync_marks.Marks.Need {
+        return self.marks.need(ino);
     }
 
     /// Group commit: every member built first, the set enqueued under ONE
@@ -1962,6 +1988,7 @@ pub const Conveyor = struct {
             dones: []Done,
             entries: []Core.Entry,
             tx_of: []usize,
+            deps: []fsync_marks.Deps,
 
             fn alloc(a: Allocator, n: usize) Allocator.Error!@This() {
                 const dones = try a.alloc(Done, n);
@@ -1969,13 +1996,16 @@ pub const Conveyor = struct {
                 const entries = try a.alloc(Core.Entry, n);
                 errdefer a.free(entries);
                 const tx_of = try a.alloc(usize, n);
-                return .{ .dones = dones, .entries = entries, .tx_of = tx_of };
+                errdefer a.free(tx_of);
+                const deps = try a.alloc(fsync_marks.Deps, n);
+                return .{ .dones = dones, .entries = entries, .tx_of = tx_of, .deps = deps };
             }
 
             fn free(s: @This(), a: Allocator) void {
                 a.free(s.dones);
                 a.free(s.entries);
                 a.free(s.tx_of);
+                a.free(s.deps);
             }
         };
         const scratch = Scratch.alloc(gpa, txs.len) catch {
@@ -1997,11 +2027,13 @@ pub const Conveyor = struct {
                 continue;
             }
             d.* = .init;
+            scratch.deps[i] = fsync_marks.Deps.of(t);
             var entry = self.build(t, d) catch |e| {
                 r.* = e;
                 continue;
             };
             entry.grouped = true;
+            entry.chain = scratch.deps[i].chain;
             scratch.entries[n] = .{ .item = entry, .len = entry.q.len };
             scratch.tx_of[n] = i;
             n += 1;
@@ -2017,7 +2049,10 @@ pub const Conveyor = struct {
         self.stats.group_commits.inc();
         self.stats.group_txs.add(n);
         self.leadIfElected();
-        for (scratch.tx_of[0..n]) |i| results[i] = self.park(&scratch.dones[i]);
+        for (scratch.tx_of[0..n]) |i| {
+            results[i] = self.park(&scratch.dones[i]);
+            if (results[i]) |_| self.marks.stamp(&scratch.deps[i], scratch.dones[i].end_pos) else |_| {}
+        }
     }
 
     fn build(self: *Conveyor, t: *tx.KvTx, done: *Done) Error!Queued {
@@ -2936,10 +2971,18 @@ pub const Conveyor = struct {
         // (§BB.4 under §BC); monotonic: positions only grow.
         _ = self.reserved_hwm.fetchMax(reg.res.paddedEnd(), .release);
         var stamp_cursor = reg.seq_base;
+        var chain = false;
         for (window_members) |*m| {
             _ = m.q.stampSeqs(stamp_cursor);
             stamp_cursor += m.q.len;
+            // Before any send to the member: its turn's or its outcome's
+            // release carries it (`Done.end_pos`).
+            m.done.end_pos = reg.res.paddedEnd();
+            chain = chain or m.chain;
         }
+        // Before any member is answered: an fsync ordered after a mkdir's
+        // answer reads the chain covering it.
+        if (chain) self.marks.stampChain(reg.res.paddedEnd());
         w.members = window_members;
         w.failed = failed;
         w.res = reg.res;

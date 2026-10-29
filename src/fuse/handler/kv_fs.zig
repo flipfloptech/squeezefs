@@ -346,6 +346,11 @@ pub var fuse_fallocate_setid_strips: counters.ShardedCounter = .{};
 /// `fuse_write_sync_fsyncs`: WRITEs whose open flags carried O_DSYNC/O_SYNC
 /// and ran the fsync ladder before their ack (the sync law, `write`).
 pub var fuse_write_sync_fsyncs: counters.ShardedCounter = .{};
+/// `fuse_fsyncs` / `fuse_fsync_ns`: FSYNC requests (fsync and fdatasync,
+/// and the sync law's own) and each one's wall, exact-sum — the data legs,
+/// the stamps' journaling and the metadata members' barriers.
+pub var fuse_fsyncs: counters.ShardedCounter = .{};
+pub var fuse_fsync_ns: counters.ShardedLatencyHistogram = .{};
 /// `fuse_killpriv_clears`: KILLPRIV_V2 strips folded into a commit.
 pub var fuse_killpriv_clears: counters.ShardedCounter = .{};
 /// `fuse_killpriv_negotiated`: 0/1 from the INIT reply.
@@ -5118,9 +5123,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         /// fsync (charter §6.4): the ino's parked stamp journaled (§L.6),
-        /// the data legs through the plane, then the trailing coalesced
-        /// meta barrier (every acked entry durable).
+        /// the data legs through the plane, then the metadata members
+        /// holding an un-durable entry the ino depends on barriered
+        /// (decision 0003 §CH: its records, its names, the directories'
+        /// names above it — `MetaSet.fsyncIno`).
         pub fn fsync(self: *Self, c: *Ctx, a: filesystem.FsyncArgs) Error!void {
+            fuse_fsyncs.inc();
+            const t0 = clock.monotonicNs();
+            defer fuse_fsync_ns.record(clock.monotonicNs() -| t0);
             const local = try localOf(a.ino);
             // The claim this fsync covers: every byte under it was accepted
             // before the data leg below began, so the leg lands it whole.
@@ -5136,13 +5146,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 // its bytes landed behind the data barrier — at least the
                 // claim found at entry, whatever custody a concurrent write
                 // opened since — then the meta barrier that covers it.
-                if (try self.drainTimesOf(c, local, found) != 0) self.store.fsync() catch |e| return storeErr(e);
+                if (try self.drainTimesOf(c, local, found) != 0) self.store.fsyncIno(local) catch |e| return storeErr(e);
                 return;
             }
             _ = try self.drainTimesOf(c, local, 0);
             c.stage(.meta_backend_start);
             defer c.stage(.meta_backend_done);
-            self.store.fsync() catch |e| return storeErr(e);
+            self.store.fsyncIno(local) catch |e| return storeErr(e);
         }
 
         /// fsyncdir: the syncfs-class durability point — every parked
@@ -6077,6 +6087,11 @@ pub const MemStore = struct {
     }
 
     pub fn fsync(self: *MemStore) StoreError!void {
+        self.fsyncs += 1;
+    }
+
+    /// One store, one journal: an inode's fsync is the store's.
+    pub fn fsyncIno(self: *MemStore, _: u64) StoreError!void {
         self.fsyncs += 1;
     }
 

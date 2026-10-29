@@ -63,6 +63,7 @@ pub const meta = struct {
     pub const routing = @import("meta/routing.zig");
     pub const meta_set = if (builtin.os.tag == .linux) @import("meta/meta_set.zig") else struct {};
     pub const conveyor = @import("meta/conveyor.zig");
+    pub const fsync_marks = @import("meta/fsync_marks.zig");
     pub const device_loader = if (builtin.os.tag == .linux) @import("meta/device_loader.zig") else struct {};
     pub const backend = if (builtin.os.tag == .linux) @import("meta/backend.zig") else struct {};
     pub const tree = @import("meta/tree.zig");
@@ -322,6 +323,7 @@ test {
     _ = cli;
     if (builtin.os.tag == .linux) _ = uring128;
     _ = meta.conveyor;
+    _ = meta.fsync_marks;
     if (builtin.os.tag == .linux) _ = meta.device_loader;
     if (builtin.os.tag == .linux) _ = meta.backend;
     _ = meta.tree;

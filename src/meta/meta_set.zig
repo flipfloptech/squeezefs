@@ -33,6 +33,8 @@ const counters = @import("../core/counters.zig");
 const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
 const derive = @import("../core/derive.zig");
+const clock = @import("../core/clock.zig");
+const knobs = @import("../core/knobs.zig");
 const uring_fs = @import("../io/uring_fs.zig");
 const key = @import("key.zig");
 const tree = @import("tree.zig");
@@ -45,6 +47,8 @@ const inos = @import("inos.zig");
 const conveyor = @import("conveyor.zig");
 const checkpoint_cycle = @import("checkpoint_cycle.zig");
 const backend = @import("backend.zig");
+const journal_lane = @import("journal_lane.zig");
+const fsync_marks = @import("fsync_marks.zig");
 const guard = @import("guard.zig");
 const routing = @import("routing.zig");
 const routing_slots = @import("sym.zig").slots;
@@ -105,6 +109,25 @@ pub const VolumeMints = struct {
     dirs: counters.ShardedCounter = .{},
 };
 
+/// `SQUEEZEFS_META_FSYNC_SCOPE` (decision 0003 §CH): `ino` — an fsync of
+/// one inode asks the members its un-durable entries lie on, in parallel;
+/// `set` — every member, one after another (the control arm).
+pub const FsyncScope = enum { ino, set };
+
+/// A member's share of the set's durability points (`.stats` `fsync`
+/// under each member; `fsync_marks.stats` the set's sums).
+pub const MemberFsync = struct {
+    requests: counters.ShardedCounter = .{},
+    requests_own: counters.ShardedCounter = .{},
+    requests_chain: counters.ShardedCounter = .{},
+    requests_none: counters.ShardedCounter = .{},
+    skips: counters.ShardedCounter = .{},
+};
+
+/// Members asked at once by one durability point: their waiters live on
+/// the caller's frame (a set wider than this asks in rounds).
+const FSYNC_PARALLEL = 8;
+
 pub const MetaSet = struct {
     gpa: Allocator,
     io: Io,
@@ -120,6 +143,9 @@ pub const MetaSet = struct {
     /// under each member — a phase's share of the namespace per member).
     mints: []VolumeMints,
     mint_rr: std.atomic.Value(u64) = .init(0),
+    /// Per volume: the durability requests (`MemberFsync`).
+    fsync_counts: []MemberFsync,
+    fsync_scope: FsyncScope = .ino,
     /// The set's directory spread depth `D` (`routing/dir_place.zig`;
     /// `set_config.dir_spread_depth`, read by the mount after the record
     /// and stored here before the FUSE session arms; 0 until then and on
@@ -275,6 +301,9 @@ pub const MetaSet = struct {
         const mints = try gpa.alloc(VolumeMints, paths.len);
         errdefer gpa.free(mints);
         @memset(mints, .{});
+        const fsync_counts = try gpa.alloc(MemberFsync, paths.len);
+        errdefer gpa.free(fsync_counts);
+        @memset(fsync_counts, .{});
         const initial = disc.table();
         for (rotors, 0..) |*r, v| {
             var buf: [router.MINT_SPREAD]u16 = undefined;
@@ -290,6 +319,8 @@ pub const MetaSet = struct {
             .route = try route_table.Published.init(gpa, initial),
             .rotors = rotors,
             .mints = mints,
+            .fsync_counts = fsync_counts,
+            .fsync_scope = std.meta.stringToEnum(FsyncScope, knobs.enumKnob("SQUEEZEFS_META_FSYNC_SCOPE", opts.env)).?,
             .set_uuid = disc.set_uuid,
             .hash_seed = disc.hash_seed,
             .name_key = .init(disc.hash_seed),
@@ -352,6 +383,7 @@ pub const MetaSet = struct {
         self.route.deinit();
         gpa.free(self.rotors);
         gpa.free(self.mints);
+        gpa.free(self.fsync_counts);
         gpa.free(self.volumes);
         if (self.pool_owned) self.pool.deinit();
         gpa.destroy(self);
@@ -567,9 +599,100 @@ pub const MetaSet = struct {
         return self.volumes[hv].commit(t);
     }
 
-    /// `fsync`: every member's trailing barrier.
+    /// Every acked entry of every member on stable media at the return
+    /// (fsyncdir, syncfs, the cross-owner intents' barriers, the freed-
+    /// block hold's drain): each member asked at once for everything it
+    /// reserved, a member whose durable floor is already there asked
+    /// nothing (decision 0003 §CH).
     pub fn fsync(self: *MetaSet) Error!void {
-        for (self.volumes) |be| try be.fsync();
+        if (self.posture == .reader) return;
+        fsync_marks.stats.meta_fsync_set_calls.inc();
+        const t0 = clock.monotonicNs();
+        defer fsync_marks.stats.meta_fsync_set_ns.record(clock.monotonicNs() -| t0);
+        if (self.fsync_scope == .set) return self.fsyncEveryMember(null);
+        return self.barrierMembers(null);
+    }
+
+    /// fsync / fdatasync of key inode `ino` (charter §5.2, §6.4; decision
+    /// 0003 §CH): on stable media at the return is every acked entry its
+    /// durability depends on — its records, the dentries naming it and the
+    /// dentry chain above it (`fsync_marks`) — with every entry below them
+    /// on the same members; a member holding none of them is asked
+    /// nothing. The members asked are asked at once.
+    pub fn fsyncIno(self: *MetaSet, ino: u64) Error!void {
+        if (self.posture == .reader) return;
+        fsync_marks.stats.meta_fsync_ino_calls.inc();
+        const t0 = clock.monotonicNs();
+        defer fsync_marks.stats.meta_fsync_ino_ns.record(clock.monotonicNs() -| t0);
+        if (self.fsync_scope == .set) return self.fsyncEveryMember(ino);
+        return self.barrierMembers(ino);
+    }
+
+    /// The control arm (`SQUEEZEFS_META_FSYNC_SCOPE=set`): every member's
+    /// trailing barrier, one after another — each request counted by what
+    /// the member held of `ino`'s.
+    fn fsyncEveryMember(self: *MetaSet, ino: ?u64) Error!void {
+        for (self.volumes, self.fsync_counts) |be, *c| {
+            if (ino) |i| classify(c, be.cv.fsyncNeed(i), be.durableFloor());
+            c.requests.inc();
+            fsync_marks.stats.meta_fsync_member_requests.inc();
+            try be.fsync();
+        }
+    }
+
+    fn classify(c: *MemberFsync, need: fsync_marks.Marks.Need, floor: u64) void {
+        if (need.own > floor) {
+            c.requests_own.inc();
+            fsync_marks.stats.meta_fsync_requests_own.inc();
+        } else if (need.all > floor) {
+            c.requests_chain.inc();
+            fsync_marks.stats.meta_fsync_requests_chain.inc();
+        } else {
+            c.requests_none.inc();
+            fsync_marks.stats.meta_fsync_requests_none.inc();
+        }
+    }
+
+    /// Ask each member for what it owes (`ino`'s need, or with `ino` null
+    /// everything it reserved) at once, then wait for every one asked. A
+    /// FAILED member fails every durability point first (ext4's journal
+    /// abort: no fsync of the set is acked over a member that latched).
+    fn barrierMembers(self: *MetaSet, ino: ?u64) Error!void {
+        for (self.volumes) |be| if (be.isFailed()) return error.VolumeFailed;
+        var waiters: [FSYNC_PARALLEL]journal_lane.BarrierWaiter = undefined;
+        var first_err: ?Error = null;
+        var base: usize = 0;
+        while (base < self.volumes.len) : (base += FSYNC_PARALLEL) {
+            const end = @min(base + FSYNC_PARALLEL, self.volumes.len);
+            var asked: [FSYNC_PARALLEL]bool = @splat(false);
+            for (self.volumes[base..end], self.fsync_counts[base..end], 0..) |be, *c, k| {
+                const floor = be.durableFloor();
+                const cover = if (ino) |i| blk: {
+                    const need = be.cv.fsyncNeed(i);
+                    if (need.all > floor) classify(c, need, floor);
+                    break :blk need.all;
+                } else be.cv.reservedHwm();
+                if (cover <= floor) {
+                    c.skips.inc();
+                    fsync_marks.stats.meta_fsync_member_skips.inc();
+                    continue;
+                }
+                be.requestDurable(&waiters[k], cover) catch |e| {
+                    first_err = e;
+                    break;
+                };
+                asked[k] = true;
+                c.requests.inc();
+                fsync_marks.stats.meta_fsync_member_requests.inc();
+            }
+            // Every node asked is answered before the frame goes.
+            for (asked[0 .. end - base], waiters[0 .. end - base]) |a, *w| {
+                if (a) KvBackend.awaitDurable(w) catch |e| if (first_err == null) {
+                    first_err = e;
+                };
+            }
+            if (first_err) |e| return e;
+        }
     }
 
     /// The freed-block hold's seal (charter §6.2): per member, the
@@ -998,6 +1121,11 @@ pub const MetaSet = struct {
             // covering barrier.
             const census = be.residentNodeCensus();
             try w.print(",\"heap_total_extents\":{d},\"heap_free_extents\":{d},\"heap_pending_free\":{d},\"resident_leaves\":{d},\"resident_interior\":{d},\"mint_files\":{d},\"mint_dirs\":{d}", .{ be.alloc.totalExtents(), be.alloc.freeExtents(), be.alloc.pendingCount(), census.leaves, census.interior, self.mints[i].files.load(), self.mints[i].dirs.load() });
+            // The member's durability points (decision 0003 §CH): its lane's
+            // barriers, what the set asked of it, what its lane joined.
+            const lane = be.laneSnapshot();
+            const fc = &self.fsync_counts[i];
+            try w.print(",\"fsync\":{{\"lane_barriers\":{d},\"requests\":{d},\"requests_own\":{d},\"requests_chain\":{d},\"requests_none\":{d},\"skips\":{d},\"joins\":{d},\"durable_at_admit\":{d},\"durable_floor\":{d}}}", .{ lane.barriers_coalesced + lane.barriers_strict, fc.requests.load(), fc.requests_own.load(), fc.requests_chain.load(), fc.requests_none.load(), fc.skips.load(), lane.fsync_joins, lane.fsync_durable_at_admit, be.durableFloor() });
             try w.writeAll(",\"checkpointer\":");
             try counters.writeFieldsJson(&be.cp, w);
             if (be.guard) |g| {
@@ -1399,6 +1527,90 @@ test "a child of a directory this mount leases outside the native slot mints on 
         }
     }
     try testing.expectEqual(minted0, xv.intent.stats.xv_cross_owner_intents_minted.load());
+}
+
+fn laneBarriers(set: *MetaSet) [2]u64 {
+    var out: [2]u64 = undefined;
+    for (&out, set.volumes[0..2]) |*o, be| {
+        const snap = be.laneSnapshot();
+        o.* = snap.barriers_coalesced + snap.barriers_strict;
+    }
+    return out;
+}
+
+/// One more entry naming `global` (its inode record re-put as it stands).
+fn touchInode(set: *MetaSet, global: u64) !void {
+    const k = key.inodeKey(set.effectiveIno(global));
+    const v = (try set.lookup(testing.allocator, key.TREE_INODES, &k)) orelse return error.Absent;
+    defer testing.allocator.free(v);
+    const t = try set.begin(@src());
+    t.stagePut(key.TREE_INODES, &k, v) catch |e| {
+        set.abandon(t);
+        return e;
+    };
+    try set.commit(t);
+}
+
+test "an fsync of one inode barriers only the members holding its un-durable entries (decision 0003 §CH; RED under the control arm `set`: member 1 barriered for a file whose every entry is on member 0): the file's entry → member 0 alone; again with nothing new → no member; a directory made on member 1 (the dentry chain's) → member 1 alone; the every-member point asks each member holding anything, at once" {
+    const gpa = testing.allocator;
+    const s = try TestSet.create(gpa, "fsync-scope", 2);
+    defer s.destroy();
+    // Only the requests barrier (the cadence's own barrier parked).
+    try s.env.put("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "600000");
+    for ([_][]const u8{ "set", "ino" }) |arm| {
+        try s.env.put("SQUEEZEFS_META_FSYNC_SCOPE", arm);
+        const shipped = std.mem.eql(u8, arm, "ino");
+        const set = try s.open();
+        defer set.close();
+        var nb: [16]u8 = undefined;
+        // A directory on each member (the root's children spread).
+        var home: [2]?u64 = .{ null, null };
+        var i: usize = 0;
+        while (home[0] == null or home[1] == null) : (i += 1) {
+            const d = try createChild(set, inos.ROOT_INO, try std.fmt.bufPrint(&nb, "{s}{d}", .{ arm, i }), economy.S.IFDIR | 0o755);
+            const v = set.volumeIndexOfSlot(route_table.slotOf(d));
+            if (home[v] == null) home[v] = d;
+        }
+        const f = try createFile(set, home[0].?, "f");
+        try testing.expectEqual(@as(route_table.VolumeIndex, 0), set.volumeIndexOfSlot(route_table.slotOf(f)));
+        const ino = set.effectiveIno(f);
+        try set.fsync();
+        // 1. The file's own entry, on member 0.
+        try touchInode(set, f);
+        var b0 = laneBarriers(set);
+        try set.fsyncIno(ino);
+        var b1 = laneBarriers(set);
+        std.debug.print("\nfsync scope {s}: the file's entry: member barriers +{d} +{d}\n", .{ arm, b1[0] - b0[0], b1[1] - b0[1] });
+        try testing.expectEqual(@as(u64, 1), b1[0] - b0[0]);
+        try testing.expectEqual(@as(u64, if (shipped) 0 else 1), b1[1] - b0[1]);
+        // 2. Nothing new: nothing owed.
+        b0 = b1;
+        try set.fsyncIno(ino);
+        b1 = laneBarriers(set);
+        try testing.expectEqual(@as(u64, if (shipped) 0 else 1), b1[0] - b0[0]);
+        try testing.expectEqual(@as(u64, if (shipped) 0 else 1), b1[1] - b0[1]);
+        // 3. A directory made on member 1: a dentry chain any file's name
+        //    may hang from — the file's fsync asks member 1 for it.
+        const sub = try createChild(set, home[1].?, "sub", economy.S.IFDIR | 0o755);
+        try testing.expectEqual(@as(route_table.VolumeIndex, 1), set.volumeIndexOfSlot(route_table.slotOf(sub)));
+        b0 = b1;
+        try set.fsyncIno(ino);
+        b1 = laneBarriers(set);
+        try testing.expectEqual(@as(u64, if (shipped) 0 else 1), b1[0] - b0[0]);
+        try testing.expectEqual(@as(u64, 1), b1[1] - b0[1]);
+        // 4. The every-member point: an entry on each member, one barrier
+        //    each; with nothing new, none.
+        try touchInode(set, home[0].?);
+        try touchInode(set, home[1].?);
+        b0 = b1;
+        try set.fsync();
+        b1 = laneBarriers(set);
+        try testing.expectEqual([2]u64{ b0[0] + 1, b0[1] + 1 }, b1);
+        b0 = b1;
+        try set.fsync();
+        b1 = laneBarriers(set);
+        if (shipped) try testing.expectEqual(b0, b1) else try testing.expectEqual([2]u64{ b0[0] + 1, b0[1] + 1 }, b1);
+    }
 }
 
 fn depthOf(set: *MetaSet, global: u64) !u8 {

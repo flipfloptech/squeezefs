@@ -68,6 +68,7 @@ const heap_law = @import("../meta/heap_law.zig");
 const node = @import("../meta/node.zig");
 const node_snapshot = @import("../meta/node_snapshot.zig");
 const node_state_core = @import("../meta/node_state_core.zig");
+const fsync_marks = @import("../meta/fsync_marks.zig");
 const guard = @import("../meta/guard.zig");
 const sym = @import("../meta/sym.zig");
 const sym_planes = @import("../data/sym_planes.zig");
@@ -321,6 +322,7 @@ pub const sources = [_]Source{
     .{ .path = "src/meta/node.zig", .family = "meta" },
     .{ .path = "src/meta/node_snapshot.zig", .family = "meta" },
     .{ .path = "src/meta/node_state_core.zig", .family = "meta" },
+    .{ .path = "src/meta/fsync_marks.zig", .family = "meta" },
     .{ .path = "src/meta/conveyor.zig", .family = "meta" },
     .{ .path = "src/meta/guard.zig", .family = "meta" },
     .{ .path = "src/meta/routing/stats.zig", .family = "meta" },
@@ -637,7 +639,7 @@ fn writeMeta(src: *Sources, w: *Writer) Error!void {
         .{ "ledger", ledger },                     .{ "record", record.stats },        .{ "key", key.stats },
         .{ "tx", tx.stats },                       .{ "economy", economy.stats },      .{ "inos", inos.stats },
         .{ "dlm", dlm },                           .{ "heap_law", heap_law.stats },    .{ "node", node },
-        .{ "node_snapshot", node_snapshot.stats }, .{ "node_state", node_state_core },
+        .{ "node_snapshot", node_snapshot.stats }, .{ "node_state", node_state_core }, .{ "fsync", fsync_marks.stats },
     }) |m| {
         try w.print(",\"{s}\":", .{m[0]});
         try counters.writeNamespaceJson(m[1], w);

@@ -9273,6 +9273,8 @@ const DmErrorSet = struct {
     meta_uri: []u8,
     data_uri: []u8,
     up_count: u8 = 0,
+    /// Metadata members: `-meta` (and `-meta1`) at the slice's head.
+    metas: u8 = 1,
 
     const meta_sectors: u64 = (512 << 20) / 512;
     const data_sectors: u64 = (128 << 20) / 512;
@@ -9289,15 +9291,23 @@ const DmErrorSet = struct {
     }
 
     fn up(rig: *Rig) !DmErrorSet {
+        return upWith(rig, 1);
+    }
+
+    /// `metas` metadata members (1 or 2) on the one device, so a table
+    /// swap of the device cuts the power of every member at once.
+    fn upWith(rig: *Rig, metas: u8) !DmErrorSet {
+        std.debug.assert(metas == 1 or metas == 2);
         const gpa = rig.gpa;
         const pid = linux.getpid();
         const name = try std.fmt.allocPrint(gpa, "sqz-smoke-{d}-err", .{pid});
         errdefer gpa.free(name);
-        const meta_uri = try std.fmt.allocPrint(gpa, "sqmeta:///dev/mapper/{s}-meta", .{name});
+        const meta_uri = if (metas == 1) try std.fmt.allocPrint(gpa, "sqmeta:///dev/mapper/{s}-meta", .{name}) else try std.fmt.allocPrint(gpa, "sqmeta:///dev/mapper/{s}-meta,/dev/mapper/{s}-meta1", .{ name, name });
         errdefer gpa.free(meta_uri);
         const data_uri = try std.fmt.allocPrint(gpa, "sqdata:///dev/mapper/{s}-d0,/dev/mapper/{s}-d1", .{ name, name });
         errdefer gpa.free(data_uri);
-        var self: DmErrorSet = .{ .rig = rig, .name = name, .meta_uri = meta_uri, .data_uri = data_uri, .sectors = meta_sectors + 2 * data_sectors };
+        const metas_len = metas * meta_sectors;
+        var self: DmErrorSet = .{ .rig = rig, .name = name, .meta_uri = meta_uri, .data_uri = data_uri, .sectors = metas_len + 2 * data_sectors, .metas = metas };
         errdefer self.down();
         var script: [1024]u8 = undefined;
         const out = try rig.shOk(rig.work, try std.fmt.bufPrint(&script,
@@ -9312,9 +9322,13 @@ const DmErrorSet = struct {
             \\dmsetup create {s}-meta --table "0 {d} linear /dev/mapper/{s} 0"
             \\dmsetup create {s}-d0 --table "0 {d} linear /dev/mapper/{s} {d}"
             \\dmsetup create {s}-d1 --table "0 {d} linear /dev/mapper/{s} {d}"
-            \\dmsetup mknodes >/dev/null 2>&1 || true
             \\echo up
-        , .{ name, self.sectors, self.loop, name, meta_sectors, name, name, data_sectors, name, meta_sectors, name, data_sectors, name, meta_sectors + data_sectors })));
+        , .{ name, self.sectors, self.loop, name, meta_sectors, name, name, data_sectors, name, metas_len, name, data_sectors, name, metas_len + data_sectors })));
+        if (metas == 2) gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script,
+            \\dmsetup create {s}-meta1 --table "0 {d} linear /dev/mapper/{s} {d}"
+            \\echo up
+        , .{ name, meta_sectors, name, meta_sectors })));
+        gpa.free(try rig.shOk(rig.work, "dmsetup mknodes >/dev/null 2>&1 || true; echo up"));
         self.up_count = 2;
         return self;
     }
@@ -9386,9 +9400,13 @@ const DmErrorSet = struct {
     /// swaps the linear slice back (dm-delay's suspend issues what it
     /// holds to the device underneath).
     fn delayMeta(self: *DmErrorSet, ms: u32) !void {
-        var script: [768]u8 = undefined;
-        const table = if (ms == 0) try std.fmt.bufPrint(script[512..], "0 {d} linear /dev/mapper/{s} 0", .{ meta_sectors, self.name }) else try std.fmt.bufPrint(script[512..], "0 {d} delay /dev/mapper/{s} 0 0 /dev/mapper/{s} 0 {d}", .{ meta_sectors, self.name, self.name, ms });
-        self.rig.gpa.free(try self.rig.shOk(self.rig.work, try std.fmt.bufPrint(script[0..512], "dmsetup suspend --nolockfs {s}-meta && dmsetup load {s}-meta --table \"{s}\" && dmsetup resume {s}-meta && echo ok", .{ self.name, self.name, table, self.name })));
+        for (0..self.metas) |m| {
+            var script: [768]u8 = undefined;
+            const off = m * meta_sectors;
+            const suffix: []const u8 = if (m == 0) "meta" else "meta1";
+            const table = if (ms == 0) try std.fmt.bufPrint(script[512..], "0 {d} linear /dev/mapper/{s} {d}", .{ meta_sectors, self.name, off }) else try std.fmt.bufPrint(script[512..], "0 {d} delay /dev/mapper/{s} {d} 0 /dev/mapper/{s} {d} {d}", .{ meta_sectors, self.name, off, self.name, off, ms });
+            self.rig.gpa.free(try self.rig.shOk(self.rig.work, try std.fmt.bufPrint(script[0..512], "dmsetup suspend --nolockfs {s}-{s} && dmsetup load {s}-{s} --table \"{s}\" && dmsetup resume {s}-{s} && echo ok", .{ self.name, suffix, self.name, suffix, table, self.name, suffix })));
+        }
     }
 
     fn down(self: *DmErrorSet) void {
@@ -9398,7 +9416,7 @@ const DmErrorSet = struct {
             // A row that failed mid-cycle leaves its daemon (and supervisor)
             // holding the slices: killed and detached first (`[/]` keeps the
             // pattern from matching this shell's own command line).
-            const cmd = std.fmt.bufPrint(&script, "pkill -KILL -f '[/]dev/mapper/{s}-meta' >/dev/null 2>&1 || true; umount -l {s} >/dev/null 2>&1 || true; dmsetup resume {s} >/dev/null 2>&1 || true; for s in -d1 -d0 -meta ''; do dmsetup remove --retry {s}$s >/dev/null 2>&1 || true; done; losetup -d {s} >/dev/null 2>&1 || true; rm -f dmerr.img", .{ self.name, self.rig.mp, self.name, self.name, self.loop }) catch "";
+            const cmd = std.fmt.bufPrint(&script, "pkill -KILL -f '[/]dev/mapper/{s}-meta' >/dev/null 2>&1 || true; umount -l {s} >/dev/null 2>&1 || true; dmsetup resume {s} >/dev/null 2>&1 || true; for s in -d1 -d0 -meta1 -meta ''; do dmsetup remove --retry {s}$s >/dev/null 2>&1 || true; done; losetup -d {s} >/dev/null 2>&1 || true; rm -f dmerr.img", .{ self.name, self.rig.mp, self.name, self.name, self.loop }) catch "";
             if (self.rig.sh(self.rig.work, cmd)) |r| self.rig.freeRun(r) else |_| {}
         }
         self.up_count = 0;
@@ -16120,6 +16138,142 @@ test "smoke: A HARD LINK, A RENAME AND A DIRECTORY FSYNC IN FRESH GUEST SLOTS SU
         try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
         try dm.fsckClean("the guest-slot power cut's remount");
     }
+}
+
+/// `od -tx1` of a 4 KiB run of one byte, `sort -u`'d with the spaces gone.
+fn sixteen(comptime byte_hex: []const u8) []const u8 {
+    comptime var out: []const u8 = "";
+    inline for (0..16) |_| out = out ++ byte_hex;
+    return out;
+}
+
+/// The second occurrence of `key` (member 1's word of a two-member set's
+/// `volumes` array).
+fn secondNumberAfter(text: []const u8, key: []const u8) ?u64 {
+    const i = std.mem.indexOf(u8, text, key) orelse return null;
+    return numberAfter(text[i + key.len ..], key);
+}
+
+test "smoke: AN fsync BARRIERS ONLY THE MEMBERS ITS FILE DEPENDS ON, AND EVERY fsync'd FILE SURVIVES A POWER CUT (decision 0003 §CH) — a TWO-member set over device-mapper slices of one device (one table swap cuts both members), every metadata write and flush late (dm-delay): `a` beside `/` on member 0 and `b` on member 1 (§BZ), a file written and fsync'd in each; four files in `/` (the round-robin: those on member 1 have their dentry on member 0 — a cross-owner create); `a/p/g` written and fsync'd, `a/p` renamed, `g` fsync'd again; a hard link to `a/f` and `a/f` fsync'd (generic/056); `b/c/h` in a new directory on member 1 → no member was asked for what it did not hold (`meta_fsync_requests_none` 0), fewer requests than the every-member law's two per fsync → then, with every metadata write and flush 400 ms late, a file written and fsync'd on each member and `a/p2` renamed with `g` fsync'd (its dentry chain), and the power cut AT ONCE (dm-flakey drops every write — what the delay still holds included) → remount: every fsync'd name, link count and byte as before the cut → clean unmount → fsck --offline --scrub clean (red with the per-inode fsync asking no member: `a/last` and `b/last` absent after the cut; with the chain word unstamped: `a/p3/g` absent)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    if (DmErrorSet.flakeyMissing(rig)) |why| return testkit.skipWhy(@src(), why);
+    if (DmErrorSet.delayMissing(rig)) |why| return testkit.skipWhy(@src(), why);
+    var dm = try DmErrorSet.upWith(rig, 2);
+    defer dm.deinit();
+    {
+        const r = try rig.squeezefs(&.{ "format", dm.meta_uri, dm.data_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    try rig.spawnSupervisedOf(dm.meta_uri, &.{});
+    _ = try rig.awaitReady(0);
+    const mark = try rig.logLen();
+    const shapes =
+        \\mkdir a b
+        \\xfs_io -f -c "pwrite -S 0xa1 0 8k" -c fsync a/f >/dev/null
+        \\xfs_io -f -c "pwrite -S 0xb1 0 8k" -c fsync b/f >/dev/null
+        \\for i in 0 1 2 3; do xfs_io -f -c "pwrite -S 0xc$i 0 4k" -c fsync r$i >/dev/null; done
+        \\mkdir a/p && xfs_io -f -c "pwrite -S 0xd1 0 4k" -c fsync a/p/g >/dev/null
+        \\mv a/p a/p2 && xfs_io -c fsync a/p2/g
+        \\ln a/f a/f_link && xfs_io -c fsync a/f
+        \\mkdir b/c && xfs_io -f -c "pwrite -S 0xe1 0 4k" -c fsync b/c/h >/dev/null
+        \\echo done
+    ;
+    const shapes_after =
+        \\for f in a/f a/f_link b/f r0 r1 r2 r3 b/c/h; do echo "$f $(od -An -tx1 -v $f | sort -u | tr -s ' \n' ' ') links $(stat -c %h $f)"; done
+    ;
+    // The last ops before the cut: their entries wait in the delay when
+    // their fsync returns unless the fsync waited for their barrier.
+    const last =
+        \\xfs_io -f -c "pwrite -S 0xf0 0 4k" -c fsync a/last >/dev/null
+        \\xfs_io -f -c "pwrite -S 0xf1 0 4k" -c fsync b/last >/dev/null
+        \\mv a/p2 a/p3 && xfs_io -c fsync a/p3/g
+        \\echo done
+    ;
+    const last_after =
+        \\echo "tree: $(find . | LC_ALL=C sort | tr '\n' ' ')"
+        \\for f in a/last b/last a/p3/g; do echo "$f $(od -An -tx1 -v $f 2>&1 | sort -u | tr -d ' \n')"; done
+    ;
+    const last_want = "tree: . ./a ./a/f ./a/f_link ./a/last ./a/p3 ./a/p3/g ./b ./b/c ./b/c/h ./b/f ./b/last ./r0 ./r1 ./r2 ./r3 \n" ++
+        "a/last " ++ comptime sixteen("f0") ++ "\nb/last " ++ sixteen("f1") ++ "\na/p3/g " ++ sixteen("d1") ++ "\n";
+    try dm.delayMeta(40);
+    {
+        errdefer dm.delayMeta(0) catch {};
+        const out = try rig.onMountTimed(shapes, 300);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("done\n", out);
+    }
+    const want = try rig.onMountTimed(shapes_after, 60);
+    defer gpa.free(want);
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        const calls = numberAfter(t, "\"meta_fsync_ino_calls\":") orelse 0;
+        const requests = numberAfter(t, "\"meta_fsync_member_requests\":") orelse 0;
+        std.debug.print("\nsmoke[fsync-scope-cut]: ino fsyncs {d}, member requests {d}, own {?d}, chain {?d}, none {?d}, skips {?d}, joins {?d}, cross-owner ops {?d}, member 1 files {?d}\n", .{
+            calls,                                           requests,
+            numberAfter(t, "\"meta_fsync_requests_own\":"),  numberAfter(t, "\"meta_fsync_requests_chain\":"),
+            numberAfter(t, "\"meta_fsync_requests_none\":"), numberAfter(t, "\"meta_fsync_member_skips\":"),
+            numberAfter(t, "\"journal_lane_fsync_joins\":"), numberAfter(t, "\"xv_completed\":"),
+            secondNumberAfter(t, "\"mint_files\":"),
+        });
+        try testing.expect(calls >= 10);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"meta_fsync_requests_none\":"));
+        try testing.expect(requests < 2 * calls);
+        // A root file on member 1 (its dentry on member 0) and `b`.
+        try testing.expect((numberAfter(t, "\"xv_completed\":") orelse 0) >= 2);
+        try testing.expect((secondNumberAfter(t, "\"mint_files\":") orelse 0) >= 3);
+        try expectMustStayZero(t);
+    }
+    try dm.delayMeta(400);
+    {
+        errdefer dm.delayMeta(0) catch {};
+        const out = try rig.onMountTimed(last, 300);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("done\n", out);
+    }
+    // The power cut at once: every write dropped from here — the entries
+    // the delay still holds and the unmount's alike; the delay drained
+    // into the cut before the working table is back.
+    try dm.dropWrites(true);
+    {
+        errdefer dm.dropWrites(false) catch {};
+        errdefer dm.delayMeta(0) catch {};
+        try rig.umount();
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+        try dm.delayMeta(0);
+    }
+    try dm.dropWrites(false);
+    const mark2 = try rig.logLen();
+    try rig.spawnSupervisedOf(dm.meta_uri, &.{});
+    _ = try rig.awaitReady(mark2);
+    {
+        const out = try rig.onMountTimed(shapes_after, 60);
+        defer gpa.free(out);
+        try testing.expectEqualStrings(want, out);
+        const out2 = try rig.onMountTimed(last_after, 60);
+        defer gpa.free(out2);
+        std.debug.print("smoke[fsync-scope-cut]: after the cut:\n{s}{s}", .{ out, out2 });
+        try testing.expectEqualStrings(last_want, out2);
+    }
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        const errors = std.mem.count(u8, seg, "error(");
+        if (errors != 0) std.debug.print("--- the daemon's alert lines ---\n{s}\n", .{seg});
+        try testing.expectEqual(@as(usize, 0), errors);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, seg, "TRIPWIRE"));
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    try dm.fsckClean("the two-member power cut's remount");
 }
 
 test "smoke: FALLOCATE STRIPS THE SETID BITS (fstests generic/683; decision 0003 §BK: the kernel strips nothing around FUSE_FALLOCATE — the daemon owns `should_remove_suid` + the group rule) — mounted allow_other: over root's 192 KiB files `fallocate -o 64k -l 64k` by a non-owner outside the group without CAP_FSETID (setpriv) ⇒ 6666→666, 6676→676, 6766→766, 6777→777, 2676→676, 2777→777, 2666→666 (a non-member's sgid goes without group-exec); by root every mode kept; `.stats` fuse_fallocate_setid_strips = 7; B JOINS and the non-owner's `truncate -s 0` through B's mount over A's 6666 and 6676 files (the SHIPPED setattr's kill bit — FATTR_KILL_SUIDGID's law: suid always, sgid iff group-exec; handoff 2026-10-21 create 7b) lands 2666 and 676 at the holder, record_killpriv_strips = 2 on A, both views agree; no alert line" {

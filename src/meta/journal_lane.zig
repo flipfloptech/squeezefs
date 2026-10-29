@@ -256,6 +256,11 @@ pub const Stats = struct {
     /// the request cells (64 on a floor ring) is the storm that answered
     /// EAGAIN before §BO.1.
     fsync_waiters_hwm: counters.Gauge = .{},
+    /// Covering fsyncs (decision 0003 §CH) answered by the barrier already
+    /// in flight at their admission — its floor covered them — and those
+    /// whose cover was durable when the lane admitted them (no barrier).
+    fsync_joins: counters.ShardedCounter = .{},
+    fsync_durable_at_admit: counters.ShardedCounter = .{},
     queue_full: counters.ShardedCounter = .{},
     volumes_failed: counters.ShardedCounter = .{},
     /// Rings that died under a lane (`io_uring_enter` / the CQE read
@@ -272,7 +277,7 @@ pub var stats: Stats = .{};
 
 /// `{"journal_lanes_spawned":n,…}`
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"journal_lanes_spawned\":{d},\"journal_lanes_live\":{d},\"journal_ring_lane_writes\":{d},\"journal_lane_structural_writes\":{d},\"journal_lane_write_bytes\":{d},\"journal_lane_write_failures\":{d},\"journal_lane_rollbacks\":{d},\"journal_lane_barriers_strict\":{d},\"journal_lane_barriers_coalesced\":{d},\"journal_lane_barrier_failures\":{d},\"journal_lane_wake_writes\":{d},\"journal_lane_wake_elided\":{d},\"journal_lane_parks\":{d},\"journal_lane_park_tick_rescues\":{d},\"journal_lane_park_backstop_ticks\":{d},\"journal_lane_prefix_waits\":{d},\"journal_lane_wait_fiber_parks\":{d},\"journal_lane_wait_raw_parks\":{d},\"journal_lane_fsync_waiters_hwm\":{d},\"journal_lane_queue_full\":{d},\"journal_lane_volumes_failed\":{d},\"journal_lane_rings_dead\":{d},\"journal_lane_cqe_orphan\":{d},\"journal_lane_ack_out_of_order\":{d}}}", .{
+    try w.print("{{\"journal_lanes_spawned\":{d},\"journal_lanes_live\":{d},\"journal_ring_lane_writes\":{d},\"journal_lane_structural_writes\":{d},\"journal_lane_write_bytes\":{d},\"journal_lane_write_failures\":{d},\"journal_lane_rollbacks\":{d},\"journal_lane_barriers_strict\":{d},\"journal_lane_barriers_coalesced\":{d},\"journal_lane_barrier_failures\":{d},\"journal_lane_wake_writes\":{d},\"journal_lane_wake_elided\":{d},\"journal_lane_parks\":{d},\"journal_lane_park_tick_rescues\":{d},\"journal_lane_park_backstop_ticks\":{d},\"journal_lane_prefix_waits\":{d},\"journal_lane_wait_fiber_parks\":{d},\"journal_lane_wait_raw_parks\":{d},\"journal_lane_fsync_waiters_hwm\":{d},\"journal_lane_fsync_joins\":{d},\"journal_lane_fsync_durable_at_admit\":{d},\"journal_lane_queue_full\":{d},\"journal_lane_volumes_failed\":{d},\"journal_lane_rings_dead\":{d},\"journal_lane_cqe_orphan\":{d},\"journal_lane_ack_out_of_order\":{d}}}", .{
         stats.lanes_spawned.load(),
         stats.lanes_live.load(),
         stats.lane_writes.load(),
@@ -292,6 +297,8 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.wait_fiber_parks.load(),
         stats.wait_raw_parks.load(),
         stats.fsync_waiters_hwm.load(),
+        stats.fsync_joins.load(),
+        stats.fsync_durable_at_admit.load(),
         stats.queue_full.load(),
         stats.volumes_failed.load(),
         stats.rings_dead.load(),
@@ -319,6 +326,10 @@ pub const LaneSnapshot = struct {
     acks: u64,
     /// `io_uring_enter` calls the lane's ring paid (`exec.Lane.enters`).
     enters: u64,
+    /// Covering fsyncs (`requestBarrierCovering`) a barrier already in
+    /// flight answered, and those already durable at their admission.
+    fsync_joins: u64,
+    fsync_durable_at_admit: u64,
 };
 
 const LaneStats = struct {
@@ -335,6 +346,8 @@ const LaneStats = struct {
     barrier_failures: std.atomic.Value(u64) = .init(0),
     prefix_waits: std.atomic.Value(u64) = .init(0),
     acks: std.atomic.Value(u64) = .init(0),
+    fsync_joins: std.atomic.Value(u64) = .init(0),
+    fsync_durable_at_admit: std.atomic.Value(u64) = .init(0),
 
     fn bump(v: *std.atomic.Value(u64)) void {
         _ = v.fetchAdd(1, .monotonic);
@@ -356,6 +369,8 @@ const LaneStats = struct {
             .prefix_waits = self.prefix_waits.load(.monotonic),
             .acks = self.acks.load(.monotonic),
             .enters = enters,
+            .fsync_joins = self.fsync_joins.load(.monotonic),
+            .fsync_durable_at_admit = self.fsync_durable_at_admit.load(.monotonic),
         };
     }
 };
@@ -392,6 +407,11 @@ pub const TestSeams = struct {
     /// (the fiber issues them at a later poll): the device-is-slow shape —
     /// a completion owed past the backstop with nothing lost.
     delay_issue: std.atomic.Value(u32) = .init(0),
+    /// 1 ⇒ a barrier's CQE is recorded but the fiber does not fold it
+    /// (`barrierDone`) until the seam clears and the lane is kicked: the
+    /// barrier stays IN FLIGHT while the fiber admits requests (the join's
+    /// window, decision 0003 §CH).
+    hold_barrier_fold: std.atomic.Value(u32) = .init(0),
 };
 
 pub var test_seams: TestSeams = .{};
@@ -582,6 +602,12 @@ pub const BarrierWaiter = struct {
     /// it ends by — the barrier that answers it must have started with
     /// every pending window below this landed.
     cover_upto: u64 = 0,
+    /// The caller's own cover (`requestBarrierCovering`, decision 0003
+    /// §CH): the position it needs durable — its inode's last entry —
+    /// instead of every window admitted so far. Such a request is answered
+    /// at once when the lane's durable floor is there, and JOINS the
+    /// barrier in flight when that barrier's floor is.
+    want: ?u64 = null,
     /// A waiter that is a fiber on THIS lane (set by `wait` before it
     /// parks, read by the lane's answer — one thread).
     waiter: ?*Fiber = null,
@@ -930,8 +956,24 @@ pub const JournalLane = struct {
     /// before it landed (§BB.4); the outcome is `waiter.wait()`'s. Refusals
     /// answer here: a FAILED volume, a stopped lane — never a full one.
     pub fn requestBarrier(self: *JournalLane, waiter: *BarrierWaiter) Error!void {
+        return self.enlist(waiter, null);
+    }
+
+    /// `requestBarrier` for a caller that knows the position it needs
+    /// durable (decision 0003 §CH: an fsync of one inode needs its
+    /// inode's last entry, not every window the lane holds): answered once
+    /// a barrier whose floor — the landed prefix when it STARTED — reaches
+    /// `cover` completed: the barrier in flight at the admission when its
+    /// floor does (the join: an FSYNC covers every write completed before
+    /// it was issued), else the next; at the admission itself when the
+    /// last completed barrier's floor does.
+    pub fn requestBarrierCovering(self: *JournalLane, waiter: *BarrierWaiter, cover: u64) Error!void {
+        return self.enlist(waiter, cover);
+    }
+
+    fn enlist(self: *JournalLane, waiter: *BarrierWaiter, want: ?u64) Error!void {
         if (self.latch.isFailed()) return error.VolumeFailed;
-        waiter.* = .{ .lane = self };
+        waiter.* = .{ .lane = self, .want = want };
         // SeqCst RMW: pairs with `shutdown`'s SeqCst `closing` store +
         // `inflight_submitters` load (`publish`'s Dekker): a push the
         // closer did not see precedes its seal.
@@ -1365,7 +1407,7 @@ pub const JournalLane = struct {
             if (sealed) w.disconnected = true;
             if (test_seams.kill_ring.swap(0, .acq_rel) != 0) self.failAll(error.RingFailed);
             var now = clock.monotonicNs();
-            if (w.barrier_landed) self.barrierDone(w.barrier_outcome, now);
+            if (w.barrier_landed and test_seams.hold_barrier_fold.load(.acquire) == 0) self.barrierDone(w.barrier_outcome, now);
             self.advanceDurability();
             if (judge_tick) {
                 judge_tick = false;
@@ -1614,16 +1656,42 @@ pub const JournalLane = struct {
         const w = &self.w;
         const need = w.barriers_started + 1;
         const cover = self.coverNow();
+        var pulled = false;
         while (true) {
             const next = it.next;
-            it.need_barrier = need;
-            it.cover_upto = cover;
+            if (it.want) |want| {
+                // §CH: its own cover. Lane thread: the floor's one writer.
+                if (want <= self.durable_floor.load(.monotonic)) {
+                    stats.fsync_durable_at_admit.inc();
+                    LaneStats.bump(&self.stats.fsync_durable_at_admit);
+                    self.answerBarrier(it, if (self.latch.isFailed()) error.VolumeFailed else {}, clock.monotonicNs());
+                    it = next orelse break;
+                    continue;
+                }
+                it.cover_upto = want;
+                // The barrier in flight started with every reservation
+                // below its floor landed: it covers the request iff its
+                // floor reaches the want (`barrierDone` answers it there).
+                if (w.barrier_in_flight != null and w.barrier_floor >= want) {
+                    it.need_barrier = w.barriers_started;
+                    stats.fsync_joins.inc();
+                    LaneStats.bump(&self.stats.fsync_joins);
+                } else {
+                    it.need_barrier = need;
+                    pulled = true;
+                }
+            } else {
+                it.need_barrier = need;
+                it.cover_upto = cover;
+                pulled = true;
+            }
             it.next = w.fsync_waiters;
             w.fsync_waiters = it;
             w.fsync_count += 1;
             it = next orelse break;
         }
         stats.fsync_waiters_hwm.raise(w.fsync_count);
+        if (!pulled) return;
         w.needs_flush = true;
         w.flush_due_ns = 0;
     }
@@ -2307,6 +2375,66 @@ test "§BB.4: a barrier an fsync pulls while a window admitted before it is stil
     var rec = try h.replay(0);
     defer rec.deinit();
     try testing.expectEqual(@as(usize, 1), rec.entries.len);
+}
+
+test "§CH: a covering fsync JOINS the barrier in flight when that barrier's floor covers its want — answered by it, no barrier of its own — waits for the next when its want landed after that barrier started, and is answered at its admission once the durable floor covers it" {
+    const h = try Harness.init(testing.allocator, "fsync-join");
+    defer h.deinit();
+    try h.spawnLane(.{}, "600000", 0);
+    const lane = h.lane.?;
+    const a = try h.append(1, 400, 0xA1);
+    try a.ticket.wait().result;
+    // B1, pulled by a plain fsync, held in flight once its CQE is in.
+    test_seams.hold_barrier_fold.store(1, .release);
+    defer test_seams.hold_barrier_fold.store(0, .release);
+    var t0: BarrierWaiter = .{};
+    try lane.requestBarrier(&t0);
+    spinUntil(struct {
+        l: *JournalLane,
+        fn ready(s: @This()) bool {
+            return s.l.snapshot().barriers_coalesced == 1;
+        }
+    }{ .l = lane });
+    // A's entry landed before B1 started: its fsync rides B1.
+    var join: BarrierWaiter = .{};
+    try lane.requestBarrierCovering(&join, a.res.paddedEnd());
+    // Admitted at the fiber's next scan (the request's own wake).
+    _ = spinUntilBy(struct {
+        l: *JournalLane,
+        fn ready(s: @This()) bool {
+            return s.l.snapshot().fsync_joins == 1;
+        }
+    }{ .l = lane }, clock.monotonicNs() + 5 * std.time.ns_per_s);
+    try testing.expectEqual(@as(u64, 1), lane.snapshot().fsync_joins);
+    // W2 reserved after B1 started and not landed (the device holds it):
+    // its fsync cannot ride B1.
+    test_seams.delay_issue.store(1, .release);
+    defer test_seams.delay_issue.store(0, .release);
+    const w2 = try h.append(2, 400, 0xA2);
+    var next: BarrierWaiter = .{};
+    try lane.requestBarrierCovering(&next, w2.res.paddedEnd());
+    // B1 completes: t0 and the joined request are answered by it; the
+    // other waits for a barrier after W2's landing.
+    test_seams.hold_barrier_fold.store(0, .release);
+    lane.kick();
+    try t0.wait().result;
+    try join.wait().result;
+    try testing.expectEqual(@as(?Outcome, null), next.poll());
+    try testing.expectEqual(@as(u64, 1), lane.snapshot().barriers_coalesced);
+    test_seams.delay_issue.store(0, .release);
+    lane.kick();
+    try w2.ticket.wait().result;
+    try next.wait().result;
+    try testing.expectEqual(@as(u64, 2), lane.snapshot().barriers_coalesced);
+    try testing.expectEqual(@as(u64, 1), lane.snapshot().fsync_joins);
+    // A's want is below the durable floor now: answered at the admission,
+    // no barrier.
+    var durable: BarrierWaiter = .{};
+    try lane.requestBarrierCovering(&durable, a.res.paddedEnd());
+    try durable.wait().result;
+    try testing.expectEqual(@as(u64, 2), lane.snapshot().barriers_coalesced);
+    try testing.expectEqual(@as(u64, 1), lane.snapshot().fsync_durable_at_admit);
+    try testing.expect(lane.durableFloor() >= w2.res.paddedEnd());
 }
 
 // The window gate's report (0003 §BN): a barrier past the request half of

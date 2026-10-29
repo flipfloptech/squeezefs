@@ -2141,9 +2141,11 @@ pub const DataPlane = struct {
         };
     }
 
-    fn metaSync(ctx: ?*anyopaque, _: Io, _: u64) anyerror!void {
+    /// The meta leg of one inode's fsync: the members its un-durable
+    /// entries lie on (decision 0003 §CH).
+    fn metaSync(ctx: ?*anyopaque, _: Io, ino: u64) anyerror!void {
         const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
-        try self.backend.fsync();
+        try self.backend.fsyncIno(ino);
     }
 
     /// `df` (charter §5.5 "a holder's `df` used count is its bitmap

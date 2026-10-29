@@ -285,6 +285,8 @@ pub const OpenOptions = struct {
     /// Error logs the LANE thread is expected to emit in a test (the log
     /// seam is thread-local; `journal_lane.Options.test_error_logs`).
     test_error_logs: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    /// Error logs the CHECKPOINT thread is expected to emit in a test.
+    test_ckpt_error_logs: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     /// The D0 gate's mode, host identity and seams (`guard/gate.zig`).
     guard: guard.gate.Options = .{},
     /// A held writer lock is the JOIN DOOR's signal, not a refusal: the
@@ -463,6 +465,8 @@ pub const KvBackend = struct {
     /// is the ONE notifier (every barrier that moves `reusable_upto`).
     space_notify: sync.Notify = .init,
     ckpt_thread: ?std.Thread = null,
+    /// `Options.test_ckpt_error_logs`, armed on the checkpoint thread.
+    test_ckpt_error_logs: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     cv: *conveyor.Conveyor,
     /// The conveyor's pass: a committer fiber on the journal lane, woken by
     /// the election winner, joined through its group at `close`.
@@ -904,6 +908,7 @@ pub const KvBackend = struct {
                 else => return be.bringUpRefused("the checkpoint that makes the manager's join durable", e),
             };
         }
+        be.test_ckpt_error_logs = opts.test_ckpt_error_logs;
         be.ckpt_thread = std.Thread.spawn(.{}, ckptMain, .{be}) catch return error.ThreadSpawnFailed;
         try be.guard.?.startHeartbeat();
         be.replay.replay_ns = clock.monotonicNs() - t0;
@@ -913,6 +918,7 @@ pub const KvBackend = struct {
     }
 
     fn ckptMain(be: *KvBackend) void {
+        if (builtin.is_test) log.testing.expectErrorLogs(be.test_ckpt_error_logs);
         be.task.runUntilStopped();
     }
 
@@ -1268,6 +1274,7 @@ pub const KvBackend = struct {
             error.Io => return error.Io,
             else => return error.Corrupt,
         };
+        be.test_ckpt_error_logs = opts.test_ckpt_error_logs;
         be.ckpt_thread = std.Thread.spawn(.{}, ckptMain, .{be}) catch return error.ThreadSpawnFailed;
         be.replay.replay_ns = clock.monotonicNs() - t0;
         stats.mounts.inc();
@@ -3517,6 +3524,8 @@ const TestVol = struct {
     path_len: usize = 0,
     /// Error logs the lane thread will emit (the FAILED latch's one line).
     lane_error_logs: usize = 0,
+    /// Error logs the checkpoint thread will emit.
+    ckpt_error_logs: usize = 0,
 
     fn path(self: *const TestVol) []const u8 {
         return self.path_buf[0..self.path_len];
@@ -3579,7 +3588,7 @@ const TestVol = struct {
     }
 
     fn open(self: *TestVol) !*KvBackend {
-        return KvBackend.open(self.gpa, self.io(), self.path(), .{ .env = &self.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .test_error_logs = self.lane_error_logs });
+        return KvBackend.open(self.gpa, self.io(), self.path(), .{ .env = &self.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .test_error_logs = self.lane_error_logs, .test_ckpt_error_logs = self.ckpt_error_logs });
     }
 };
 
@@ -3885,6 +3894,35 @@ test "an access stamp alone (a Δatime: the atime posture's drain, charter §4 '
     }
     try testing.expect(ino_witness.genOf(ino) != gen1);
     try testing.expect(lease_epoch.load(ino) != lease1);
+}
+
+test "a dismount whose final checkpoint fails is no clean unmount (rung-10-dm-error-unmount.md, seen (a): `clean unmount (… healthy)` and exit 0 after the final checkpoint and barrier failed under the error table): every ledger write refused (a checkpoint write — it latches nothing), the close counts no clean unmount; the next open replays the acked window and every create is there" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "unclean", null);
+    defer v.destroy();
+    var acked: [4]u64 = undefined;
+    {
+        // The checkpoint thread's two lines: the device's ledger slot and
+        // the final tick's.
+        v.ckpt_error_logs = 2;
+        defer v.ckpt_error_logs = 0;
+        const be = try v.open();
+        for (&acked, 0..) |*ino, i| {
+            var nb: [16]u8 = undefined;
+            ino.* = try commitCreate(be, try std.fmt.bufPrint(&nb, "u-{d}", .{i}));
+        }
+        device_loader.test_seams.fail_ledger_writes.store(1 << 20, .release);
+        defer device_loader.test_seams.fail_ledger_writes.store(0, .release);
+        const clean0 = stats.clean_unmounts.load();
+        be.close();
+        try testing.expectEqual(clean0, stats.clean_unmounts.load());
+    }
+    {
+        const be = try v.open();
+        defer be.close();
+        try testing.expect(be.replayStats().entries > 0);
+        for (acked) |ino| try testing.expect(try present(be, ino));
+    }
 }
 
 test "the single-writer guard: a second open of a held volume refuses Busy loud; a closed volume opens again" {

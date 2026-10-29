@@ -134,6 +134,9 @@ pub var stats: Stats = .{};
 /// file.
 pub const TestSeams = struct {
     fail_barriers: std.atomic.Value(u32) = .init(0),
+    /// The next N ledger slot writes fail synthetically (EIO) — a
+    /// checkpoint write, the class that latches nothing (dm-error's).
+    fail_ledger_writes: std.atomic.Value(u32) = .init(0),
     /// `@backingInt` of a `linux.E`; 0 = EIO.
     fail_errno: std.atomic.Value(u32) = .init(0),
 };
@@ -303,6 +306,10 @@ pub const DeviceLoader = struct {
     fn writeSlotFn(ctx: *anyopaque, slot: u64, image: *const [ledger.ROOT_LEDGER_SLOT_LEN]u8) checkpoint_cycle.IoError!void {
         const self: *DeviceLoader = @ptrCast(@alignCast(ctx));
         const off = ledger.slotOffset(self.ledger_base, slot);
+        if (test_seams.fail_ledger_writes.load(.acquire) != 0) {
+            _ = test_seams.fail_ledger_writes.fetchSub(1, .acq_rel);
+            return self.ioFailed(.ledger_slot, off, image.len, error.InputOutput);
+        }
         self.pool.writeAt(self.path, off, image) catch |e| return self.ioFailed(.ledger_slot, off, image.len, e);
         stats.ledger_slots.inc();
     }

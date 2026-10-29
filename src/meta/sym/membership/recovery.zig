@@ -458,6 +458,20 @@ pub const Driver = struct {
         return n;
     }
 
+    /// A recovered slot's guards: no first touch before `coherence_until`
+    /// (0003 §U.2) and, for an EARLY record, the custody quarantine (RAM;
+    /// its durable record rides step 7's entry).
+    const Guards = struct { coherence_until: u64, quarantine_until: ?u64 };
+
+    fn guardRecovered(self: *Driver, slot: u16, g: Guards) Error!void {
+        try self.vol.vt.holdCoherence(self.vol.ctx, slot, g.coherence_until);
+        if (g.quarantine_until) |u| {
+            self.vol.vt.quarantineCustody(self.vol.ctx, slot, u);
+            stats.slot_custody_quarantines_installed.inc();
+            custody.stats.slot_custody_quarantined.add(1);
+        }
+    }
+
     fn phase(p: Phase, since_ns: u64) void {
         stats.appender_recovery_phase_ns[@backingInt(p)].record(clock.monotonicNs() -| since_ns);
     }
@@ -474,6 +488,12 @@ pub const Driver = struct {
             return .skipped;
         }
         const standing = (try self.mount.ledger.readDeath(death.identity)) orelse return .skipped;
+        // The recovered slots' guards, off the record alone: the same on a
+        // re-run as on the run that recorded the slot.
+        const guards: Guards = .{
+            .coherence_until = standing.ts_realtime_ns +| self.mount.coherence_hold_ms * std.time.ns_per_ms,
+            .quarantine_until = if (standing.early) custody.custodyQuarantineUntilNs(standing.ts_realtime_ns, self.mount.skew_max_ms * std.time.ns_per_ms) else null,
+        };
         if (self.mount.census) |o| if (o.memberIsLive(shard.writerMemberId(death_ledger.wireOf(death.identity)), 0)) {
             self.mount.ledger.retireForJoin(death.identity) catch return error.Io;
             return .skipped;
@@ -514,7 +534,9 @@ pub const Driver = struct {
         // past its tree-0 step finds slots the rollback left `Leased{dead}`
         // in RAM that tree 0 already holds `Unleased` (absorbed above) —
         // the RAM word is reconciled here, never left refusing first
-        // touches until the next mount's arm.
+        // touches until the next mount's arm. Such a slot gets the guards
+        // 7b would have given it (decision 0003 §CF.4), held before the word
+        // turns `Unleased` so no first touch lands between the two.
         const table = self.vol.vt.table(self.vol.ctx);
         {
             var held_ram: std.ArrayList(u16) = .empty;
@@ -525,7 +547,9 @@ pub const Driver = struct {
                 for (leased.items) |l| still = still or l == slot;
                 if (still) continue;
                 const st = (try self.vol.vt.slotState(self.vol.ctx, slot)) orelse continue;
-                if (st.variant == .unleased) try table.load(slot, st);
+                if (st.variant != .unleased) continue;
+                try self.guardRecovered(slot, guards);
+                try table.load(slot, st);
             }
         }
         phase(.read, t_read);
@@ -640,8 +664,6 @@ pub const Driver = struct {
         defer kept.deinit(gpa);
         try self.vol.vt.keptExtents(self.vol.ctx, gpa, grant, &kept);
         std.mem.sort(u64, kept.items, {}, std.sort.asc(u64));
-        const quarantine_until: ?u64 = if (standing.early) custody.custodyQuarantineUntilNs(standing.ts_realtime_ns, self.mount.skew_max_ms * std.time.ns_per_ms) else null;
-        const coherence_until = standing.ts_realtime_ns +| self.mount.coherence_hold_ms * std.time.ns_per_ms;
         var tails_buf: [TAILS_INLINE_MAX * cr.TailEntryWire.LEN + cr.SlotTailsHead.LEN]u8 = undefined;
         for (plans.items, 0..) |*pl, i| {
             const flushed = try self.vol.vt.flushedRoot(self.vol.ctx, pl.slot);
@@ -666,7 +688,7 @@ pub const Driver = struct {
             try recs.append(gpa, .{ .put = .{ .key = cr.slotTailsKey(pl.slot).slice(), .value = tv } });
             if (spilled) |sp| for (sp.extents) |e| try recs.append(gpa, .{ .alloc = e });
             var qv: [cr.CustodyQuarantineWire.LEN]u8 = undefined;
-            if (quarantine_until) |u| {
+            if (guards.quarantine_until) |u| {
                 qv = cr.CustodyQuarantineWire.init(u).encode();
                 try recs.append(gpa, .{ .put = .{ .key = cr.custodyQuarantineKey(pl.slot).slice(), .value = &qv } });
             }
@@ -692,12 +714,7 @@ pub const Driver = struct {
                     return error.Corrupt;
                 },
             }
-            try self.vol.vt.holdCoherence(self.vol.ctx, pl.slot, coherence_until);
-            if (quarantine_until) |u| {
-                self.vol.vt.quarantineCustody(self.vol.ctx, pl.slot, u);
-                stats.slot_custody_quarantines_installed.inc();
-                custody.stats.slot_custody_quarantined.add(1);
-            }
+            try self.guardRecovered(pl.slot, guards);
         }
         rollback.disarm();
         self.vol.vt.endRetirementHold(self.vol.ctx, true);

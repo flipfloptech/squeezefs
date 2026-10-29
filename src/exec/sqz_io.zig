@@ -1821,6 +1821,56 @@ test "every fuse lane dead aborts loud (a forked child dies with SIGABRT)" {
     try testing.expectEqual(linux.SIG.ABRT, linux.W.TERMSIG(st));
 }
 
+// rung-10-open-count-stranded: a syncfs handler's bulk promotion pass
+// fanned out one `Io.Group.async` member per CPU on its own lane, and the
+// members took the fibers the lane holds for the handlers its slots
+// deliver — the transport answered the next RELEASE EAGAIN (lost).
+test "optional fan-out from a fiber on a FUSE lane (Io.Group.async past every bound) never takes the fibers the lane holds for its handlers: with the fan-out parked, the lane still admits its slot share and its helpers' slack" {
+    const sqz = try SqzIo.init(testing.allocator, .{ .budget_bytes = derive.GiB, .fuse = .{ .nqueues = 1, .q_depth = 4 }, .meta_lanes = 1, .blocking_cap = 4 });
+    defer sqz.deinit();
+    const io = sqz.io();
+    if (sqz.fuseLanes().len == 0) return testkit.skip(@src(), .no_device, "the test executor built no FUSE lanes on this host");
+    const lane = sqz.fuseLanes()[0];
+    const S = struct {
+        gate: Io.Event = .unset,
+        handler_fiber: std.atomic.Value(?*Fiber) = .init(null),
+        inline_parked: std.atomic.Value(bool) = .init(false),
+        fn member(s: *@This(), io_: Io) void {
+            // A member past the bound runs inline, on the handler's fiber.
+            if (lane_mod.currentFiber() == s.handler_fiber.load(.acquire)) s.inline_parked.store(true, .release);
+            s.gate.wait(io_) catch {};
+        }
+        fn handler(s: *@This(), io_: Io, n: usize) void {
+            s.handler_fiber.store(lane_mod.currentFiber(), .release);
+            var g: Io.Group = .init;
+            for (0..n) |_| g.async(io_, member, .{ s, io_ });
+            g.await(io_) catch {};
+        }
+        fn hold(s: *@This(), io_: Io) void {
+            s.gate.wait(io_) catch {};
+        }
+        fn parked(s: *@This()) bool {
+            return s.inline_parked.load(.acquire);
+        }
+    };
+    var s: S = .{};
+    var handlers: Io.Group = .init;
+    defer {
+        s.gate.set(io);
+        handlers.await(io) catch {};
+    }
+    try sqz.spawnGroupOn(lane, &handlers, S.handler, .{ &s, io, 2 * @as(usize, lane.fiber_capacity) });
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!S.parked(&s)) {
+        try testing.expect(clock.monotonicNs() < deadline);
+        std.Thread.yield() catch {};
+    }
+    // The slot share (q_depth × ceil(1 queue / lanes) = 4) less the handler
+    // above, then the lane's own helpers' slack: all admitted.
+    const share: usize = 4;
+    for (0..share - 1 + spawn_slack) |_| try sqz.spawnGroupOn(lane, &handlers, S.hold, .{ &s, io });
+}
+
 test "stats JSON names every lane of the instance" {
     const sqz = try SqzIo.testInstance();
     defer sqz.deinit();

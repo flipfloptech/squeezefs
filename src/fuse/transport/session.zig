@@ -3276,6 +3276,65 @@ test "e2e: a namespace request's handler runs on the thread that delivered it �
     }
 }
 
+// rung-10-open-count-stranded: the kernel discards a RELEASE's answer and
+// never re-sends it, so a dispatch refused by a full handler lane and
+// answered EAGAIN lost the release — the daemon's open count stranded and
+// `open_count_stranded` fired at the inode's last FORGET (fsstress -p 32:
+// 452 RELEASEs answered -EAGAIN in one run, the bulk promotion passes'
+// helpers holding the lanes' fibers).
+test "e2e: A RELEASE NEVER MEETS A FULL LANE — the closing CPU's handler lane held at its fiber capacity, a close's RELEASE still reaches the filesystem and nothing is answered EAGAIN" {
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    const H = struct {
+        fn park(gate: *Io.Event, io: Io) void {
+            gate.wait(io) catch {};
+        }
+        /// Pinned to `cpu`: its close queues the RELEASE on that CPU's
+        /// queue, whose handler lane is the one homed on `cpu`.
+        fn readHello(r: *Rig, cpu: u16, result: *anyerror!void) void {
+            var set: linux.cpu_set_t = @splat(0);
+            set[cpu / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(cpu % @bitSizeOf(usize));
+            linux.sched_setaffinity(0, &set) catch |e| {
+                result.* = e;
+                return;
+            };
+            var pb: [256]u8 = undefined;
+            var buf: [64]u8 = undefined;
+            result.* = if (readWhole(r.child(&pb, "hello"), &buf)) |_| {} else |e| e;
+        }
+        const Served = struct {
+            fs: *EchoFs,
+            want: u64,
+            fn pred(d: *const @This()) bool {
+                return d.fs.file_releases.load(.monotonic) >= d.want;
+            }
+        };
+    };
+    const rig = try Rig.init(testing.allocator, 68, &.{});
+    defer rig.deinit();
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    if (rig.io_exec.fuseLanes().len == 0) return testkit.skip(@src(), .no_device, "the rig's executor built no FUSE handler lanes on this host");
+    if (s.plan.nqueues != derive.facts().possible_cpus) return testkit.skip(@src(), .no_device, "the plan's queues are not one per CPU here: a RELEASE's handler lane is the node's rotation, not its CPU's");
+    const lane = rig.io_exec.fuseLanes()[0];
+    const io = rig.io_exec.io();
+    var gate: Io.Event = .unset;
+    var holders: Io.Group = .init;
+    defer {
+        gate.set(io);
+        holders.await(io) catch {};
+    }
+    while (true) rig.io_exec.spawnGroupOn(lane, &holders, H.park, .{ &gate, io }) catch break;
+    const releases0 = rig.fs.file_releases.load(.monotonic);
+    const refused0 = worker.dispatch_refused.load();
+    var result: anyerror!void = {};
+    const t = try std.Thread.spawn(.{}, H.readHello, .{ rig, lane.home_cpu.?, &result });
+    t.join();
+    try result;
+    // close(2) sends RELEASE in the background: a hang guard, not a pace.
+    const served = waitUntil(&H.Served{ .fs = rig.fs, .want = releases0 + 1 }, H.Served.pred, 5 * std.time.ns_per_s);
+    try testing.expectEqual(refused0, worker.dispatch_refused.load());
+    try testing.expect(served);
+}
+
 test "e2e: EchoFs mounts over the ring — INIT negotiated FUSE_OVER_IO_URING, enable_uring reads Y, every queue armed, stat/open/read from a helper thread arrive over the RING (the sideband saw no request), replies byte-exact, the geometry the kernel accepted equals the plan" {
     if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 1, &.{});

@@ -521,6 +521,7 @@ fn mountMain(ctx: *Ctx) u8 {
     };
     coherence.init() catch return ctx.failed("out of memory (the kernel view's queue)", .{});
     defer coherence.deinit();
+    handler.kv_fs.fuse_ttl_law_peered.set(@intFromBool(coherence.law.peered.load(.acquire)));
     for (be.volumes) |vol| if (vol.sym) |s| {
         s.manager.peer_gate = &coherence.gate;
     };
@@ -990,7 +991,9 @@ fn mountMain(ctx: *Ctx) u8 {
     // The session's posture, not the knob's: a mainline zero-copy session
     // serves opens (decision 0003 §BE) and has nothing to latch.
     if (session.noOpen()) latchNoOpen(ctx.mountpoint);
-    log.info("ready: {s} mounted at {s} (pid {d}; {d} queue(s) × depth {d}; budget {d} MiB; TTLs attr {d} ms entry {d} ms dir_entry {d} ms negative {d} ms)", .{ ctx.meta_uri, ctx.mountpoint, linux.getpid(), session.plan.nqueues, session.plan.depth, ctx.budget_bytes >> 20, ctx.opts.ttls.attr_ns / std.time.ns_per_ms, ctx.opts.ttls.entry_ns / std.time.ns_per_ms, ctx.opts.ttls.dir_entry_ns / std.time.ns_per_ms, ctx.opts.ttls.negative_ns / std.time.ns_per_ms });
+    // The classes the law serves now, and its posture (decision 0003 §AB.2).
+    const ttls_now = coherence.law.current();
+    log.info("ready: {s} mounted at {s} (pid {d}; {d} queue(s) × depth {d}; budget {d} MiB; TTLs attr {d} ms entry {d} ms dir_entry {d} ms negative {d} ms, {s})", .{ ctx.meta_uri, ctx.mountpoint, linux.getpid(), session.plan.nqueues, session.plan.depth, ctx.budget_bytes >> 20, ttls_now.attr_ns / std.time.ns_per_ms, ttls_now.entry_ns / std.time.ns_per_ms, ttls_now.dir_entry_ns / std.time.ns_per_ms, ttls_now.negative_ns / std.time.ns_per_ms, if (coherence.law.peered.load(.acquire)) "peered" else "isolated" });
     if (ctx.reporter) |*r| {
         r.ready();
         r.close();
@@ -1921,6 +1924,7 @@ const KernelCoherence = struct {
     fn enterPeered(ctx: *anyopaque) void {
         const self: *KernelCoherence = @ptrCast(@alignCast(ctx));
         if (!self.law.enterPeered()) return;
+        handler.kv_fs.fuse_ttl_law_peered.set(1);
         log.info("mount: a member joined — the kernel's TTLs take the peered classes (decision 0003 §AB.2); its whole view is invalidated", .{});
         if (self.thread == null) return;
         const f0 = self.flushes.load(.acquire);

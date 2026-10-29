@@ -268,6 +268,10 @@ pub var fuse_write_times_drain_failed_ticks: counters.ShardedCounter = .{};
 /// ctime, never an entry per read). The rest of the reads cost one byte
 /// load and three compares over the record already in hand.
 pub var fuse_atime_touches: counters.ShardedCounter = .{};
+/// The mount's TTL law (decision 0003 §AB.2, §CE): 1 = PEERED (the
+/// charter's classes: a reader, a joiner, a manager a member joined), 0 =
+/// ISOLATED (`T_owner`). One-way; its flip is logged with its cause.
+pub var fuse_ttl_law_peered: counters.Gauge = .{};
 /// `fuse_atime_touches_shipped`: access stamps of FOREIGN-slot inodes the
 /// times drain shipped to their holder (`SETATTR_ATIME_TOUCH`, one per
 /// ino per tick at most; charter §5.5's record-level ship).

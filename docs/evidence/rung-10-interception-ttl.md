@@ -62,6 +62,16 @@ kernel-feature skips), `shim.` 79/82, `sdk.` 60/60; smoke `INTERCEPTION` 42/42, 
 `-o interception` mounts (12 daemons, host armed): Passed all 4, fsck 0, 0 alerts (the "did NOT pass"
 is the subset's stale-ledger check; the harness has no preload hook).
 
+## Gate 163's red (decision 0003 §CE.10)
+
+Gate 163 failed the row at "49 LOOKUP/GETATTR" with the law ISOLATED: the row's names were unpinned, and a
+host-wide `drop_caches` (the export-handles row, shard 5 of the same gate) or reclaim evicted them in the
+window (fuse evicts an inode with its last dentry). By hand: one drop in the window = 49 asks, law isolated,
+56 inodes evicted; pinned = 0; pinned on `7693bab` = 49 (the red stands). The gate's shard 2/16 beside a
+drop every 5 s reproduced it on its first run (58 evicted). The row now pins every counted name with an
+`O_PATH` fd, asserts the new `fuse_ttl_law_peered` gauge 0, prints the evictions; the ready line prints the
+law's current classes and posture. 20 × green beside the full smoke's 16 shards and a drop every 5 s.
+
 ## Seen, not changed
 
 §CE.9: a bind racing a kernel truncate of the same inode (its regrow announced by the leading fire,

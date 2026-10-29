@@ -1205,7 +1205,13 @@ test "smoke: THE INTERCEPTION TTL (decision 0003 §CE) — an -o interception mo
     var nb: [64]u8 = undefined;
 
     // 1. A tree through the kernel, each name stat'd once (the kernel's
-    //    cache warm); then the charter's 1 s class lapses.
+    //    cache warm) and PINNED — an O_PATH fd on it until the last count —
+    //    then the charter's 1 s class lapses. The kernel never evicts a
+    //    dentry in use: unpinned, a host-wide `drop_caches` (the
+    //    export-handles row in another shard) or reclaim turns every count
+    //    into the re-fetch of an evicted inode, the TTL's or not; pinned, a
+    //    dentry still revalidates past its entry TTL — a peered mount
+    //    re-asks each one.
     const N = 24;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir((try rig.filePath(&pb, "t")).ptr, 0o755)));
     for (0..N) |i| {
@@ -1214,6 +1220,20 @@ test "smoke: THE INTERCEPTION TTL (decision 0003 §CE) — an -o interception mo
         _ = try statOf(rig, try std.fmt.bufPrint(&nb, "t/d{d}", .{i}));
         _ = try statOf(rig, try std.fmt.bufPrint(&nb, "t/f{d}", .{i}));
     }
+    var pins: [2 * N + 1]linux.fd_t = undefined;
+    var n_pins: usize = 0;
+    defer for (pins[0..n_pins]) |p| {
+        _ = linux.close(p);
+    };
+    pins[n_pins] = try rig.openOnMount("t", .{ .PATH = true, .CLOEXEC = true });
+    n_pins += 1;
+    for (0..N) |i| {
+        pins[n_pins] = try rig.openOnMount(try std.fmt.bufPrint(&nb, "t/d{d}", .{i}), .{ .PATH = true, .CLOEXEC = true });
+        n_pins += 1;
+        pins[n_pins] = try rig.openOnMount(try std.fmt.bufPrint(&nb, "t/f{d}", .{i}), .{ .PATH = true, .CLOEXEC = true });
+        n_pins += 1;
+    }
+    const evict0 = try rig.stat("fuse_forget_evictions");
     sleepMs(1200);
     // 2. Directory and file stats past the 1 s class: the kernel's cache
     //    answers (a peered mount re-asks every name: ≥ 2N LOOKUPs). A
@@ -1227,7 +1247,10 @@ test "smoke: THE INTERCEPTION TTL (decision 0003 §CE) — an -o interception mo
         _ = try statOf(rig, try std.fmt.bufPrint(&nb, "t/f{d}", .{i}));
     }
     const stat_asks = (try attrAsks(rig)) - asks1 - one_read;
-    std.debug.print("smoke[interception-ttl]: {d} stats past 1 s asked the daemon {d} LOOKUP/GETATTR (a .stats read costs {d})\n", .{ 2 * N, stat_asks, one_read });
+    const evicted = (try rig.stat("fuse_forget_evictions")) - evict0;
+    const peered = try rig.stat("fuse_ttl_law_peered");
+    std.debug.print("smoke[interception-ttl]: {d} stats past 1 s asked the daemon {d} LOOKUP/GETATTR (a .stats read costs {d}; TTL law {s}; {d} inode(s) the kernel evicted meanwhile)\n", .{ 2 * N, stat_asks, one_read, if (peered == 0) "isolated" else "PEERED", evicted });
+    try testing.expectEqual(@as(u64, 0), peered);
     try testing.expect(stat_asks <= 2);
     //    Removal of half of them: no revalidation either.
     const asks2 = try attrAsks(rig);
@@ -1278,6 +1301,9 @@ test "smoke: THE INTERCEPTION TTL (decision 0003 §CE) — an -o interception mo
     const bind_asks = (try attrAsks(rig)) - asks3 - one_read;
     std.debug.print("smoke[interception-ttl]: two binds and unbinds with no ring I/O cost {d} LOOKUP/GETATTR\n", .{bind_asks});
     try testing.expectEqual(@as(u64, 0), bind_asks);
+    // The counts are done: the pins go (an fd on the mount keeps it busy).
+    for (pins[0..n_pins]) |p| _ = linux.close(p);
+    n_pins = 0;
 
     // 4. Coherence under T_owner. A kernel reader on another fd holds the
     //    file's attrs and pages; the ring writer's GROW is announced before

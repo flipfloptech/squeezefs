@@ -130,6 +130,7 @@ const sym_xv = @import("../../meta/sym/xv.zig");
 const kv_fs_stripes = @import("kv_fs_stripes.zig");
 const layout = @import("../../data/layout.zig");
 const staging = @import("../../data/staging.zig");
+const kvmap = @import("../../data/kvmap.zig");
 const block_refs = @import("../../data/block_refs.zig");
 const pack = @import("../../data/pack.zig");
 const write_admit = @import("../../data/write_admit.zig");
@@ -5541,13 +5542,16 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         /// FS_IOC_GETFLAGS/SETFLAGS and FS_IOC_FSGETXATTR/FSSETXATTR
-        /// (`inode_flags.zig`: the request shape, the flag set, the law).
-        /// Any other command is ENOSYS, which the kernel answers as ENOTTY.
+        /// (`inode_flags.zig`: the request shape, the flag set, the law);
+        /// FS_IOC_FIEMAP (`fiemap.zig`, `fiemapIoctl`: the IPC host's verb
+        /// for the interposer — the kernel never forwards it). Any other
+        /// command is ENOSYS, which the kernel answers as ENOTTY.
         /// A SET is one record Put (the flags, a new ctime) under the
         /// inode's exclusive guard; a foreign-slot inode's is ONE shipped
         /// setattr verb carrying the attribute bits (charter §5.5).
         pub fn ioctl(self: *Self, c: *Ctx, a: filesystem.IoctlArgs) Error!filesystem.Ioctl {
             if (virtual_inodes.isVirtualIno(a.ino)) return error.NotImplemented;
+            if (a.cmd == fiemap.FS_IOC_FIEMAP) return self.fiemapIoctl(c, a);
             const cmd = inode_flags.command(a.cmd) orelse return error.NotImplemented;
             const ok: filesystem.Ioctl = .{ .out = .{ .result = 0, .flags = 0, .in_iovs = 0, .out_iovs = 0 }, .data_len = 0 };
             const local = try localOf(a.ino);
@@ -5595,6 +5599,108 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 error.NotSupported => error.NotSupported,
                 error.InvalidArgument => error.InvalidArgument,
             };
+        }
+
+        /// FS_IOC_FIEMAP (charter §4 "FIEMAP"; `fiemap.zig` is the law):
+        /// one batch of the layout the daemon holds after the file's
+        /// striped write custody landed — `FIEMAP_FLAG_SYNC` runs the fsync
+        /// data leg first (the write-cache residents promoted, so a synced
+        /// map shows no DELALLOC). A foreign-slot inode's layout is the
+        /// holder's, read through the token divert as a read reads it
+        /// (`readLayout`). The request passed `fiemap.prep` at its caller.
+        fn fiemapIoctl(self: *Self, c: *Ctx, a: filesystem.IoctlArgs) Error!filesystem.Ioctl {
+            const r = fiemap.decodeRequest(a.in, a.out_size) catch |e| return switch (e) {
+                error.InvalidArgument => error.InvalidArgument,
+                error.NotSupported => error.NotSupported,
+            };
+            const out = c.window[filesystem.IOCTL_DATA_OFFSET..];
+            if (out.len < @sizeOf(fiemap.Fiemap)) return error.InvalidArgument;
+            const local = try localOf(a.ino);
+            fuse_fiemap_requests.inc();
+            if (self.data.hasVolumes()) {
+                if (r.sync()) {
+                    const rec = try self.readLayout(local);
+                    defer self.freeLayout(rec);
+                    const staged_key: ?staging.StagingKey = if (rec) |lr| (if (lr.layout.kind == .staged) stagingKeyOf(local, lr.layout) else null) else null;
+                    try self.data.fsync(self.io, local, staged_key);
+                    fuse_fiemap_syncs.inc();
+                } else if (self.data.hasWriteCustody(local)) self.data.flushCustody(self.io, local);
+            }
+            const rec = try self.readLayout(local);
+            defer self.freeLayout(rec);
+            const cap = fiemap.batchCap(r, out.len);
+            var em = fiemap.Emitter.init(fiemap.Range.of(r.start, r.length), fiemap.extentsOf(out, cap), r.extent_count == 0);
+            if (rec) |lr| try self.fiemapFeed(local, a.ino, lr.layout, &em);
+            const n = em.finish();
+            return .{ .out = .{ .result = 0, .flags = 0, .in_iovs = 0, .out_iovs = 0 }, .data_len = fiemap.encodeReply(r, n, if (r.extent_count == 0) 0 else n, out) };
+        }
+
+        /// The file's runs, ascending, into the emitter (`fiemap.zig`'s
+        /// law per layout kind).
+        fn fiemapFeed(self: *Self, local: u64, global: u64, l: Layout, em: *fiemap.Emitter) Error!void {
+            const encoded = !self.data.isPassthrough();
+            switch (l.kind) {
+                .inline_ => if (fiemap.inlineRun(@min(l.data.len, l.size))) |r| {
+                    _ = em.push(r);
+                },
+                .staged => {
+                    if (self.data.stagedLease(stagingKeyOf(local, l))) |lease| {
+                        lease.release();
+                        if (fiemap.delallocRun(l.size)) |r| _ = em.push(r);
+                        return;
+                    }
+                    if (l.durableCopy()) |m| {
+                        _ = em.push(fiemap.mappingRun(0, m, self.block_size, self.data.volumeOrdinal(m.vol_tag), encoded));
+                        return;
+                    }
+                    // Another member's write cache holds the bytes (a
+                    // foreign read recalls them; FIEMAP reports them unplaced).
+                    if (self.foreignSlot(global)) if (fiemap.delallocRun(l.size)) |r| {
+                        _ = em.push(r);
+                    };
+                },
+                .packed_ => if (l.durableCopy()) |m| {
+                    _ = em.push(fiemap.mappingRun(0, m, self.block_size, self.data.volumeOrdinal(m.vol_tag), encoded));
+                },
+                .striped => {
+                    if (l.kvmapHead()) |head| return self.fiemapKvmap(local, head, em, encoded);
+                    const from = em.range.firstBlock(self.block_size);
+                    for (0..l.entries.len) |i| {
+                        const e = l.entry(self.geo.chunk, i);
+                        if (e.block < from) continue;
+                        if (em.push(fiemap.mappingRun(@as(u64, e.block) * self.block_size, e.mapping, self.block_size, self.data.volumeOrdinal(e.mapping.vol_tag), encoded)) == .done) return;
+                    }
+                },
+            }
+        }
+
+        /// A tree-mapped file's runs: the block-map tree paged through the
+        /// plane from the range's first block; a RUN record is one run of
+        /// consecutive device blocks (one per block on a transformed set).
+        fn fiemapKvmap(self: *Self, local: u64, head: Layout.KvmapHead, em: *fiemap.Emitter, encoded: bool) Error!void {
+            const Feed = struct {
+                fs: *Self,
+                em: *fiemap.Emitter,
+                encoded: bool,
+
+                fn visit(f: *@This(), r: kvmap.Rec, ceiling: u64) bool {
+                    const bs = f.fs.block_size;
+                    if (r.special) |m| return f.em.push(fiemap.mappingRun(@as(u64, r.index) * bs, m, bs, f.fs.data.volumeOrdinal(m.vol_tag), f.encoded)) == .more;
+                    const end = @min(r.end(), ceiling);
+                    var b: u64 = r.index;
+                    if (f.encoded) {
+                        while (b < end) : (b += 1) {
+                            if (f.em.push(fiemap.mappingRun(b * bs, r.bindingAt(@intCast(b), f.fs.geo.chunk), bs, f.fs.data.volumeOrdinal(r.vol_tag), true)) == .done) return false;
+                        }
+                        return true;
+                    }
+                    return f.em.push(fiemap.blocksRun(b * bs, (end - b) * bs, f.fs.data.volumeOrdinal(r.vol_tag), r.offset)) == .more;
+                }
+            };
+            var feed: Feed = .{ .fs = self, .em = em, .encoded = encoded };
+            const from = em.range.firstBlock(self.block_size);
+            if (from >= key.BLOCK_INDEX_MAP_BLOB) return;
+            try self.data.walkKvmap(local, head, @intCast(from), &feed, Feed.visit);
         }
     };
 }
@@ -5713,6 +5819,14 @@ pub const NoData = struct {
     pub fn releaseStaged(_: *NoData, _: staging.StagingKey, _: ?u64) void {}
     pub fn stagedLease(_: *NoData, _: staging.StagingKey) ?staging.Segment.Lease {
         return null;
+    }
+    /// No volume, no device address (FIEMAP's physical half).
+    pub fn volumeOrdinal(_: *NoData, _: u64) ?u16 {
+        return null;
+    }
+    /// A volume-less set maps no file through the block-map tree.
+    pub fn walkKvmap(_: *NoData, _: u64, _: Layout.KvmapHead, _: u32, ctx: anytype, comptime _: fn (@TypeOf(ctx), kvmap.Rec, u64) bool) Error!void {
+        return error.InputOutput;
     }
     pub fn readMappingImage(_: *NoData, _: Mapping, _: []u8) Error![]const u8 {
         return error.NotSupported;
@@ -6903,6 +7017,14 @@ const SettlingData = struct {
     pub fn stagedLease(self: *SettlingData, k: staging.StagingKey) ?staging.Segment.Lease {
         const r = self.ring orelse return null;
         return r.seg.get(k);
+    }
+    /// The settling double binds every block on one volume, ordinal 0.
+    pub fn volumeOrdinal(_: *SettlingData, _: u64) ?u16 {
+        return 0;
+    }
+    /// The settling double publishes inline maps alone.
+    pub fn walkKvmap(_: *SettlingData, _: u64, _: Layout.KvmapHead, _: u32, ctx: anytype, comptime _: fn (@TypeOf(ctx), kvmap.Rec, u64) bool) Error!void {
+        return error.InputOutput;
     }
     pub fn readMappingImage(_: *SettlingData, _: Mapping, _: []u8) Error![]const u8 {
         return error.NotSupported;

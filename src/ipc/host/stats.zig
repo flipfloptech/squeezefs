@@ -227,6 +227,12 @@ pub const stats = struct {
     pub var ipc_direct_write_notes: counters.ShardedCounter = .{};
     pub var ipc_direct_writes_recalled: counters.ShardedCounter = .{};
 
+    // ---- the interposer's FIEMAP verb (`fiemap_verb.zig`) ----
+    /// Requests answered (served or refused), and the refused ones (prep's
+    /// EINVAL/EFBIG/EBADR, a screen refusal, a handler error).
+    pub var ipc_fiemap_requests: counters.ShardedCounter = .{};
+    pub var ipc_fiemap_refusals: counters.ShardedCounter = .{};
+
     // ---- coherence (KD-11's residual windows; decision 0003 §CE) ----
     pub var ipc_inval_notifies: counters.ShardedCounter = .{};
     pub var ipc_inval_attrs_only: counters.ShardedCounter = .{};

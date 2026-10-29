@@ -18,6 +18,8 @@ const fd_table = @import("fd_table.zig");
 const classify = @import("classify.zig");
 const client = @import("../ipc/client.zig");
 const layout = @import("../ipc/layout.zig");
+const wire = @import("../ipc/wire.zig");
+const fiemap_verb = @import("../ipc/fiemap_verb.zig");
 
 pub const State = classify.State;
 pub const Session = client.Session;
@@ -544,4 +546,88 @@ pub fn mmapPre(st: *State, fd: sys.fd_t, flags: c_int) void {
 /// runs NO atfork handlers): the fork flush.
 pub fn spawnPre(st: *State) void {
     st.table.forkFlushAll({}, flushOne);
+}
+
+// ---------------------------------------------------------------------------
+// FIEMAP (charter §4 "FIEMAP", decision 0003 §CJ): `ioctl_fiemap`'s copy law
+// over the IPC verb — Linux answers FS_IOC_FIEMAP on a FUSE file in the VFS
+// (EOPNOTSUPP), so the interposer is the only place it can be served.
+// ---------------------------------------------------------------------------
+
+const fiemap = fiemap_verb.fiemap;
+pub const FS_IOC_FIEMAP: u32 = fiemap.FS_IOC_FIEMAP;
+
+/// `ioctl(fd, FS_IOC_FIEMAP, arg)`: a regular file of an interception mount
+/// is served by the daemon's map; anything else — another filesystem, an
+/// unarmed mount, `O_PATH`, a directory, a dead session — is the real call.
+/// The copies are the kernel's: the 32 B header in (EFAULT on an unmapped
+/// address, never a fault in the app), the extents out batch by batch from
+/// `arg + 32` (a batch the daemon filled without LAST continues from its
+/// last extent's end, SYNC asked once), and the header back with
+/// `fm_mapped_extents` and `fm_flags` — on an error too, as `ioctl_fiemap`
+/// copies it back after `->fiemap` failed (EBADR: the refused flags).
+pub fn fiemapIoctl(st: *State, p: classify.Probes, fd: sys.fd_t, arg: usize) Verdict(c_int) {
+    const fl = p.getfl(fd) orelse return .real;
+    if (fl & sys.O.PATH != 0) return .real;
+    const stat = p.fstat(fd) orelse return .real;
+    if (stat.kind != .regular) return .real;
+    const s = classify.sessionFor(st, p, fd, stat) orelse return .real;
+    var h: fiemap.Fiemap = undefined;
+    switch (sys.copyFromUser(std.mem.asBytes(&h), arg)) {
+        .SUCCESS => {},
+        .FAULT => return fiemapFail(.FAULT),
+        // `process_vm_readv` refused (a seccomp filter): the real call.
+        else => return .real,
+    }
+    const buf = sys.mapAnon(wire.CTL_MSG_MAX) orelse return .real;
+    defer sys.unmapAnon(buf, wire.CTL_MSG_MAX);
+    const want = h.fm_extent_count;
+    const end = h.fm_start +| h.fm_length;
+    var start = h.fm_start;
+    var flags = h.fm_flags;
+    var mapped: u32 = 0;
+    var first = true;
+    while (true) {
+        const batch: u32 = if (want == 0) 0 else @min(want - mapped, fiemap_verb.REPLY_MAX_EXTENTS);
+        const req: fiemap_verb.FiemapReq = .{ .fm_flags = flags, .fm_start = start, .fm_length = if (first) h.fm_length else end - start, .fm_extent_count = batch };
+        const rep = fiemap_verb.ask(s, fd, req, buf[0..wire.CTL_MSG_MAX]) catch {
+            classify.note(.poisoned, s);
+            // Nothing of the caller's memory moved yet: the kernel's answer.
+            if (mapped == 0) return .real;
+            return fiemapFinish(arg, h, h.fm_flags, mapped, .IO);
+        };
+        if (rep.errno != 0) return fiemapFinish(arg, h, rep.fm_flags, mapped, @fromBackingInt(@as(u16, @intCast(rep.errno))));
+        if (want == 0) return fiemapFinish(arg, h, h.fm_flags, rep.fm_mapped_extents, null);
+        const n: u32 = @intCast(rep.extents.len);
+        const bytes = std.mem.sliceAsBytes(rep.extents);
+        const moved = sys.copyToUserPartial(arg + @sizeOf(fiemap.Fiemap) + @as(usize, mapped) * @sizeOf(fiemap.Extent), bytes);
+        mapped += @intCast(moved.n / @sizeOf(fiemap.Extent));
+        if (moved.n != bytes.len) return fiemapFinish(arg, h, h.fm_flags, mapped, .FAULT);
+        if (n == 0 or mapped == want) break;
+        const last = rep.extents[n - 1];
+        if (last.fe_flags & fiemap.FIEMAP_EXTENT_LAST != 0) break;
+        const next = last.fe_logical +| last.fe_length;
+        // A batch that does not advance or reaches the end is the last.
+        if (next <= start or next >= end) break;
+        start = next;
+        flags &= ~fiemap.FIEMAP_FLAG_SYNC;
+        first = false;
+    }
+    return fiemapFinish(arg, h, h.fm_flags, mapped, null);
+}
+
+fn fiemapFail(e: linux.E) Verdict(c_int) {
+    sys.setErrno(e);
+    return .{ .done = -1 };
+}
+
+/// The header back (`fm_flags`, `fm_mapped_extents`; every other field as
+/// the caller wrote it), then the answer.
+fn fiemapFinish(arg: usize, h: fiemap.Fiemap, fm_flags: u32, mapped: u32, err: ?linux.E) Verdict(c_int) {
+    var back = h;
+    back.fm_flags = fm_flags;
+    back.fm_mapped_extents = mapped;
+    if (sys.copyToUser(arg, std.mem.asBytes(&back)) != .SUCCESS) return fiemapFail(.FAULT);
+    if (err) |e| return fiemapFail(e);
+    return .{ .done = 0 };
 }

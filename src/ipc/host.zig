@@ -59,6 +59,8 @@ const shm = @import("shm.zig");
 const doorbell = @import("doorbell.zig");
 const ipc = @import("ipc.zig");
 const ring_inodes = @import("ring_inodes.zig");
+const fiemap_verb = @import("fiemap_verb.zig");
+const errors = @import("../core/errors.zig");
 
 pub const stats = @import("host/stats.zig");
 pub const severed_pool = @import("host/severed_pool.zig");
@@ -890,8 +892,79 @@ pub const IpcHost = struct {
                 }
                 s.touch(clock.monotonicNs());
             },
+            .fiemap_req => {
+                const req = fiemap_verb.decodeReq(frame) catch return self.malformed(s);
+                const f = r.fd orelse return self.malformed(s);
+                self.fiemapReq(s, req, f);
+                s.touch(clock.monotonicNs());
+            },
             else => self.malformed(s),
         }
+    }
+
+    /// The interposer's FIEMAP (`fiemap_verb.zig`, charter §4 "FIEMAP"):
+    /// the screen and `prep` here; the handler — which may land a write
+    /// custody and wait on the device — on a FUSE-class lane homed on the
+    /// session's node (the data class's place for IOCTL), replying on a
+    /// DUP of the ctl socket: the teardown closes `s.ctl` before it joins
+    /// the handoff group, and a dup's send after that shutdown fails
+    /// rather than reaching a recycled descriptor. Every lane refusing
+    /// serves it here, on the poller (never EAGAIN).
+    fn fiemapReq(self: *IpcHost, s: *Session, req: fiemap_verb.FiemapReq, f: linux.fd_t) void {
+        const ino = fiemap_verb.screen(rl.fdFacts(f), self.d.mount_dev) orelse return self.fiemapRefuse(s.ctl, .OPNOTSUPP, req.fm_flags);
+        const r = switch (fiemap_verb.fiemap.prep(fiemap_verb.header(req))) {
+            .ok => |r| r,
+            .refused => |x| return self.fiemapRefuse(s.ctl, x.errno, x.flags),
+        };
+        const dup_rc = linux.fcntl(s.ctl, linux.F.DUPFD_CLOEXEC, 0);
+        if (linux.errno(dup_rc) != .SUCCESS) return self.fiemapRefuse(s.ctl, .NOMEM, req.fm_flags);
+        const reply_fd: linux.fd_t = @intCast(dup_rc);
+        var attempt: u8 = 0;
+        while (attempt < FIEMAP_LANE_ATTEMPTS) : (attempt += 1) {
+            const lane = self.d.sqz.homeLane(null, if (attempt == 0) s.node else null);
+            self.d.sqz.spawnGroupOn(lane, &s.group, fiemapServe, .{ self, s, r, ino, reply_fd }) catch continue;
+            return;
+        }
+        self.fiemapServe(s, r, ino, reply_fd);
+    }
+
+    /// Lanes tried before the poller serves a FIEMAP itself.
+    const FIEMAP_LANE_ATTEMPTS: u8 = 3;
+
+    fn fiemapRefuse(_: *IpcHost, sock: linux.fd_t, errno: linux.E, fm_flags: u32) void {
+        hs.ipc_fiemap_requests.inc();
+        hs.ipc_fiemap_refusals.inc();
+        const reply = fiemap_verb.refusal(errno, fm_flags);
+        rl.sendCtl(sock, std.mem.asBytes(&reply), null) catch {};
+    }
+
+    /// One batch through the handler (`kv_fs.fiemapIoctl`): the window is
+    /// `fuse_ioctl_out` room ‖ `struct fiemap` ‖ the batch's extents; the
+    /// reply header is laid over the struct's tail so the extents go out
+    /// where the handler wrote them.
+    fn fiemapServe(self: *IpcHost, s: *Session, r: fiemap_verb.fiemap.Request, ino: u64, reply_fd: linux.fd_t) void {
+        defer _ = linux.close(reply_fd);
+        const Fm = fiemap_verb.Fiemap;
+        const Ext = fiemap_verb.Extent;
+        const Hdr = fiemap_verb.FiemapReplyHeader;
+        const cap = @min(r.extent_count, fiemap_verb.REPLY_MAX_EXTENTS);
+        const out_size: u32 = @intCast(@sizeOf(Fm) + @as(usize, cap) * @sizeOf(Ext));
+        const window = self.gpa.alloc(u8, filesystem.IOCTL_DATA_OFFSET + out_size) catch return self.fiemapRefuse(reply_fd, .NOMEM, r.flags);
+        defer self.gpa.free(window);
+        const in: Fm = .{ .fm_start = r.start, .fm_length = r.length, .fm_flags = r.flags, .fm_mapped_extents = 0, .fm_extent_count = cap, .fm_reserved = 0 };
+        var trace = op_trace.OpTrace.begin(0, .other);
+        defer trace.finish();
+        var ctx: filesystem.Ctx = .{ .unique = 0, .uid = s.peer.uid, .gid = s.peer.gid, .pid = @intCast(s.peer.pid), .io = self.d.io, .trace = &trace, .wd_slot = null, .window = window, .kernel_told = true };
+        const got = self.d.fs.vtable.ioctl(self.d.fs.impl, &ctx, .{ .ino = ino, .fh = 0, .flags = 0, .cmd = fiemap_verb.fiemap.FS_IOC_FIEMAP, .arg = 0, .in = std.mem.asBytes(&in), .out_size = out_size }) catch |e| return self.fiemapRefuse(reply_fd, errors.toErrno(e), r.flags);
+        const data = window[filesystem.IOCTL_DATA_OFFSET..][0..got.data_len];
+        if (data.len < @sizeOf(Fm) or (data.len - @sizeOf(Fm)) % @sizeOf(Ext) != 0) return self.fiemapRefuse(reply_fd, .IO, r.flags);
+        const out_hdr = std.mem.bytesToValue(Fm, data[0..@sizeOf(Fm)]);
+        const n: u32 = @intCast((data.len - @sizeOf(Fm)) / @sizeOf(Ext));
+        const h: Hdr = .{ .errno = 0, .fm_flags = r.flags, .fm_mapped_extents = out_hdr.fm_mapped_extents, .n_extents = n };
+        const frame = data[@sizeOf(Fm) - @sizeOf(Hdr) ..];
+        @memcpy(frame[0..@sizeOf(Hdr)], std.mem.asBytes(&h));
+        hs.ipc_fiemap_requests.inc();
+        rl.sendCtl(reply_fd, frame, null) catch {};
     }
 
     fn malformed(self: *IpcHost, s: *Session) void {
@@ -1081,6 +1154,7 @@ test {
     _ = service;
     _ = direct;
     _ = e2e_linux;
+    _ = fiemap_verb;
 }
 
 const testing = std.testing;

@@ -81,6 +81,8 @@ pub const table = [_]Symbol{
     // libaio's queue face (composed from the rows above, never resolved)
             .{ .name = "io_queue_init", .version = aio.Versions.io_queue_init },
     .{ .name = "io_queue_release", .version = aio.Versions.io_queue_release }, .{ .name = "io_queue_run", .version = aio.Versions.io_queue_run },   .{ .name = "io_queue_wait", .version = aio.Versions.io_queue_wait },
+    // ioctl: FS_IOC_FIEMAP alone (decision 0003 §CJ)
+    .{ .name = "ioctl" },
     // the linked-mode API
     .{ .name = "squeezefs_il_bind", .api = true },
 };
@@ -90,8 +92,11 @@ pub const table = [_]Symbol{
 /// which libaio binds to its OWN `io_setup`/`io_getevents` internally —
 /// fio's libaio engine created its context through it uncounted) + the
 /// direct write arm's `fsync`/`fdatasync` (decision 0003 §AY: the postlude
-/// note acked and the devices flushed before the kernel's FSYNC).
-pub const INTERPOSED: usize = 67;
+/// note acked and the devices flushed before the kernel's FSYNC) + `ioctl`
+/// for `FS_IOC_FIEMAP` (decision 0003 §CJ; glibc on x86_64 and aarch64
+/// exports `ioctl` alone — `__ioctl_time64` exists only on 32-bit
+/// time64 targets).
+pub const INTERPOSED: usize = 68;
 
 comptime {
     var n: usize = 0;
@@ -614,6 +619,43 @@ pub const wrappers = struct {
         return fcntlBody("fcntl64", fd, cmd, if (fcntlHasArg(cmd)) arg_reg else 0);
     }
 
+    // ---- ioctl: FS_IOC_FIEMAP alone (decision 0003 §CJ); every other
+    //      request — and FIEMAP on any fd not ours — is the real call ----
+
+    fn ioctlBody(fd: c_int, req: c_ulong, arg: usize) c_int {
+        const r = real("ioctl");
+        // The kernel reads the request as `unsigned int`
+        // (`SYSCALL_DEFINE3(ioctl, …, unsigned int cmd, …)`).
+        if (@as(u32, @truncate(req)) == ops.FS_IOC_FIEMAP) served: {
+            if (!lifecycle.enter()) {
+                classify.note(.reentrant, null);
+                break :served;
+            }
+            defer lifecycle.leave();
+            const st = lifecycle.state() orelse break :served;
+            switch (ops.fiemapIoctl(st, classify.Probes.real, fd, arg)) {
+                .done => |v| return v,
+                .real => {},
+            }
+        }
+        if (r) |f| return f(fd, req, arg);
+        return @intCast(sys.libcResult(linux.ioctl(fd, @truncate(req), arg)));
+    }
+
+    pub const ioctl = if (va_ok) ioctlVa else ioctlFixed;
+
+    /// Every ioctl request's third argument is one word (the kernel's
+    /// `unsigned long arg`); glibc's own wrapper reads it unconditionally.
+    fn ioctlVa(fd: c_int, req: c_ulong, ...) callconv(.c) c_int {
+        var ap = @cVaStart();
+        defer @cVaEnd(&ap);
+        const arg = @cVaArg(&ap, usize);
+        return ioctlBody(fd, req, arg);
+    }
+    fn ioctlFixed(fd: c_int, req: c_ulong, arg_reg: usize) callconv(.c) c_int {
+        return ioctlBody(fd, req, arg_reg);
+    }
+
     // ---- mmap ----
 
     const MAP_FAILED: ?*anyopaque = @ptrFromInt(std.math.maxInt(usize));
@@ -862,7 +904,7 @@ comptime {
 
 const testing = std.testing;
 
-test "the table: 65 interpositions + the API, unique names, every row has a wrapper named exactly as the symbol; libaio rows carry their default versions, the queue face included" {
+test "the table: 68 interpositions + the API, unique names, every row has a wrapper named exactly as the symbol; libaio rows carry their default versions, the queue face included" {
     @setEvalBranchQuota(20_000);
     var n_api: usize = 0;
     inline for (table, 0..) |e, i| {
@@ -935,3 +977,36 @@ test "linked mode in the test binary: the real symbols resolve through RTLD_NEXT
     // The plain file never engaged the ladder's control plane: no session.
     if (lifecycle.stateIfReady()) |st| try testing.expectEqual(@as(u32, 0), st.readySessions());
 }
+
+test "ioctl in linked mode: a request other than FS_IOC_FIEMAP and FS_IOC_FIEMAP on a file of another filesystem are the real call byte for byte (the same return, errno and header the raw syscall answers)" {
+    var pbuf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "/tmp/sqz-il-ioctl-{d}", .{linux.getpid()}, 0);
+    defer _ = linux.unlinkat(linux.AT.FDCWD, path, 0);
+    const fd = wrappers.openFixed(path, @bitCast(sys.O.RDWR | sys.O.CREAT | sys.O.CLOEXEC), 0o600);
+    try testing.expect(fd >= 0);
+    defer _ = wrappers.close(fd);
+    try testing.expectEqual(@as(isize, 4), wrappers.pwrite64(fd, @constCast("data".ptr), 4, 0));
+    try testing.expect(realResolved("ioctl"));
+    // FIONREAD on a regular file: the bytes past f_pos.
+    var n_wrapped: c_int = -1;
+    var n_raw: c_int = -1;
+    try testing.expectEqual(@as(c_int, 0), wrappers.ioctlFixed(fd, linux.T.FIONREAD, @intFromPtr(&n_wrapped)));
+    try testing.expectEqual(@as(usize, 0), linux.ioctl(fd, linux.T.FIONREAD, @intFromPtr(&n_raw)));
+    try testing.expectEqual(n_raw, n_wrapped);
+    // FIEMAP on the local filesystem: whatever the kernel says, the same.
+    const Arg = extern struct { h: ops_fiemap.Fiemap, e: [4]ops_fiemap.Extent };
+    var a: Arg = std.mem.zeroes(Arg);
+    var b: Arg = std.mem.zeroes(Arg);
+    a.h = .{ .fm_start = 0, .fm_length = std.math.maxInt(u64), .fm_flags = ops_fiemap.FIEMAP_FLAG_SYNC, .fm_mapped_extents = 0, .fm_extent_count = 4, .fm_reserved = 0 };
+    b.h = a.h;
+    const rc_wrapped = wrappers.ioctlFixed(fd, ops.FS_IOC_FIEMAP, @intFromPtr(&a));
+    const errno_wrapped = if (rc_wrapped < 0) sys.getErrno() else .SUCCESS;
+    const rc_raw = linux.ioctl(fd, ops.FS_IOC_FIEMAP, @intFromPtr(&b));
+    try testing.expectEqual(linux.errno(rc_raw), errno_wrapped);
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&b), std.mem.asBytes(&a));
+    // A bad fd: the kernel's EBADF for both arms.
+    try testing.expectEqual(@as(c_int, -1), wrappers.ioctlFixed(-1, ops.FS_IOC_FIEMAP, @intFromPtr(&a)));
+    try testing.expectEqual(linux.E.BADF, sys.getErrno());
+}
+
+const ops_fiemap = @import("../fuse/handler/fiemap.zig");

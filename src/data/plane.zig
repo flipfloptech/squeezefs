@@ -4869,6 +4869,44 @@ pub const DataPlane = struct {
         return self.wp.foldParked(io, ino);
     }
 
+    /// FIEMAP's walk of one tree-mapped file (`fuse/handler/fiemap.zig`):
+    /// the record covering `from`, then every record above it, ascending,
+    /// paged `kvmap_chunk` records at a time, below the live sweep cursor
+    /// (`ceiling`, handed to `visit`: the indices at/above it are the
+    /// sweep's shadowed residue, holes to every reader). `visit` returning
+    /// false ends the walk.
+    pub fn walkKvmap(self: *DataPlane, ino: u64, head: layout.Layout.KvmapHead, from: u32, ctx: anytype, comptime visit: fn (@TypeOf(ctx), kvmap.Rec, u64) bool) Error!void {
+        const ceiling: u64 = head.sweep orelse key.BLOCK_INDEX_MAP_BLOB;
+        var recs: std.ArrayList(kvmap.Rec) = .empty;
+        defer recs.deinit(self.gpa);
+        var next: u64 = from;
+        var first = true;
+        while (next < ceiling) {
+            recs.clearRetainingCapacity();
+            const got = if (first) kvmap.rangeCovering(self.mapStore(), self.gpa, ino, @intCast(next), self.kvmap_chunk, self.chunk, &recs) else kvmap.rangeFrom(self.mapStore(), self.gpa, ino, @intCast(next), self.kvmap_chunk, self.chunk, &recs);
+            got catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InputOutput,
+            };
+            first = false;
+            if (recs.items.len == 0) return;
+            for (recs.items) |r| {
+                if (r.index >= ceiling) return;
+                if (!visit(ctx, r, ceiling)) return;
+            }
+            const last = recs.items[recs.items.len - 1];
+            if (last.end() <= next) return;
+            next = last.end();
+        }
+    }
+
+    /// The ordinal this mount bound `vol_tag` at (FIEMAP's `fe_physical`
+    /// volume half); null when no mounted volume carries the tag.
+    pub fn volumeOrdinal(self: *DataPlane, vol_tag: u64) ?u16 {
+        const v = self.vols.byTag(vol_tag) orelse return null;
+        return @intCast(v.ordinal);
+    }
+
     /// Every binding of every live file (the census walk the movers plan
     /// from): the inline map's and the packed tenant's off the record, a
     /// block-map-tree head's off its tree below the live sweep cursor (the

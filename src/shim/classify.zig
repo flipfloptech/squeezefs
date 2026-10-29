@@ -622,6 +622,26 @@ pub fn classifyAndBind(st: *State, p: Probes, fd: sys.fd_t, epoch: u64) Verdict 
     return .bound;
 }
 
+/// The session the FIEMAP verb rides for an fd on `stat.dev` (the verb
+/// carries the fd itself, so no binding is needed): a READY, unpoisoned
+/// session of the mount on any shard, else the ladder's establish for this
+/// fd's shard. Null = kernel-served (the negative cache, a foreign or
+/// unarmed mount, an ineligible credential with no session yet, an
+/// establish in flight on another thread).
+pub fn sessionFor(st: *State, p: Probes, fd: sys.fd_t, stat: sys.Stat) ?*Session {
+    const now = clock.monotonicNs();
+    if (st.dev_cache.verdict(stat.dev, now) != null) return null;
+    for (&st.registry) |*slot| {
+        if (slot.state.load(.acquire) == RegistrySlot.READY and slot.dev == stat.dev and !slot.session.poisoned()) return &slot.session;
+    }
+    const shard: u32 = @as(u32, @intCast(fd)) % @max(st.sessions_per_mount, 1);
+    // A READY slot here is poisoned (the walk above passed it); a CLAIMING
+    // one is another thread's establish: the real call either way.
+    if (st.find(stat.dev, shard) != null) return null;
+    const index = establishFor(st, p, fd, stat, shard, now) orelse return null;
+    return st.sessionAt(index);
+}
+
 // ---------------------------------------------------------------------------
 // Tests: the ladder with injected answers; the registry; the once set.
 // ---------------------------------------------------------------------------

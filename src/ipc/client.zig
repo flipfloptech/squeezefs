@@ -43,6 +43,7 @@ pub const direct_client = @import("direct_client.zig");
 pub const direct_client_core = @import("write_lease_core.zig");
 pub const futex = @import("../sync/futex.zig");
 const derive = @import("../core/derive.zig");
+const fiemap_verb = @import("fiemap_verb.zig");
 
 pub const Kind = wire.ClientKind;
 pub const Durability = wire.Durability;
@@ -1045,6 +1046,12 @@ pub const StubHost = struct {
     next_binding: u64 = 1,
     /// The last BIND's rights (the per-op EBADF arm reads them).
     rights: Rights = .{ .read = true, .write = true },
+    /// The FIEMAP verb's synthetic map: extent `i` is `[i × 8 KiB, +4 KiB)`
+    /// at physical `1 << 48 | i × 4 KiB`, LAST on the last; requests asked
+    /// and the flags of each (a SYNC rides the first batch alone).
+    fiemap_extents: u32 = 0,
+    fiemap_asks: Atomic(u32) = .init(0),
+    fiemap_sync_asks: Atomic(u32) = .init(0),
 
     pub fn init(self: *Self, policy: rendezvous.Policy, mount_dev: ?u64) !void {
         self.* = .{ .policy = policy, .nonces = rendezvous.NonceState.init(&rl.fillNonce, clock.monotonicNs()), .mount_dev = mount_dev };
@@ -1225,8 +1232,39 @@ pub const StubHost = struct {
                 }
             },
             .unbind => _ = self.unbinds.fetchAdd(1, .monotonic),
+            .fiemap_req => {
+                _ = fd orelse return;
+                const req = fiemap_verb.decodeReq(frame) catch return;
+                self.answerFiemap(req);
+            },
             else => {},
         }
+    }
+
+    fn answerFiemap(self: *Self, req: fiemap_verb.FiemapReq) void {
+        const fm = fiemap_verb.fiemap;
+        _ = self.fiemap_asks.fetchAdd(1, .monotonic);
+        if (req.fm_flags & fm.FIEMAP_FLAG_SYNC != 0) _ = self.fiemap_sync_asks.fetchAdd(1, .monotonic);
+        const r = switch (fm.prep(fiemap_verb.header(req))) {
+            .ok => |r| r,
+            .refused => |x| {
+                const ref = fiemap_verb.refusal(x.errno, x.flags);
+                rl.sendCtl(self.ctl, std.mem.asBytes(&ref), null) catch {};
+                return;
+            },
+        };
+        const first: u32 = if (r.start < 4096) 0 else @intCast(@min((r.start - 4096) / 8192 + 1, self.fiemap_extents));
+        const left = self.fiemap_extents - first;
+        const n = @min(left, r.extent_count, fiemap_verb.REPLY_MAX_EXTENTS);
+        var out: [wire.CTL_MSG_MAX]u8 = undefined;
+        const h: fiemap_verb.FiemapReplyHeader = .{ .errno = 0, .fm_flags = r.flags, .fm_mapped_extents = if (r.extent_count == 0) left else n, .n_extents = n };
+        @memcpy(out[0..@sizeOf(fiemap_verb.FiemapReplyHeader)], std.mem.asBytes(&h));
+        for (0..n) |k| {
+            const i: u64 = first + k;
+            const e: fiemap_verb.Extent = .{ .fe_logical = i * 8192, .fe_physical = (1 << 48) | (i * 4096), .fe_length = 4096, .fe_reserved64 = @splat(0), .fe_flags = if (i + 1 == self.fiemap_extents) fm.FIEMAP_EXTENT_LAST else 0, .fe_reserved = @splat(0) };
+            @memcpy(out[@sizeOf(fiemap_verb.FiemapReplyHeader) + k * @sizeOf(fiemap_verb.Extent) ..][0..@sizeOf(fiemap_verb.Extent)], std.mem.asBytes(&e));
+        }
+        rl.sendCtl(self.ctl, out[0 .. @sizeOf(fiemap_verb.FiemapReplyHeader) + @as(usize, n) * @sizeOf(fiemap_verb.Extent)], null) catch {};
     }
 };
 

@@ -600,3 +600,94 @@ test "e2e: fio's shape — a context from libaio's io_queue_init rides the ring 
     // Nothing of the passthrough reached the ring.
     try testing.expectEqual(@as(u64, 4), rig.served());
 }
+
+/// A `struct fiemap` followed by room for `cap` extents, as an app lays
+/// out the FS_IOC_FIEMAP argument.
+fn FiemapArg(comptime cap: usize) type {
+    return extern struct {
+        h: ops_fiemap.Fiemap,
+        e: [cap]ops_fiemap.Extent,
+    };
+}
+
+const ops_fiemap = @import("../fuse/handler/fiemap.zig");
+
+fn expectFiemapDone(v: ops.Verdict(c_int), want: c_int) !void {
+    switch (v) {
+        .done => |n| try testing.expectEqual(want, n),
+        .real => return error.TestExpectedServed,
+    }
+}
+
+test "e2e: FS_IOC_FIEMAP through the verb follows ioctl_fiemap's copy law — 3,000 extents arrive in three batches (1,169 + 1,169 + 662; SYNC asked once) with LAST on the last; fm_extent_count 0 counts them and writes no extent; a short array stops without LAST; XATTR is EBADR with fm_flags = XATTR read back; a NULL or unmapped argument is EFAULT and an array running into an unmapped page keeps the extents written before it; O_PATH and a directory are the real call" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const fd = try rig.openBound(sys.O.RDWR);
+    defer sys.close(fd);
+    rig.host.fiemap_extents = 3000;
+    const fm = ops_fiemap;
+    const Big = FiemapArg(3000);
+    const big = try testing.allocator.create(Big);
+    defer testing.allocator.destroy(big);
+    big.h = .{ .fm_start = 0, .fm_length = std.math.maxInt(u64), .fm_flags = fm.FIEMAP_FLAG_SYNC, .fm_mapped_extents = 0, .fm_extent_count = 3000, .fm_reserved = 0 };
+    try expectFiemapDone(ops.fiemapIoctl(rig.st, Mount.probes, fd, @intFromPtr(big)), 0);
+    try testing.expectEqual(@as(u32, 3000), big.h.fm_mapped_extents);
+    try testing.expectEqual(fm.FIEMAP_FLAG_SYNC, big.h.fm_flags);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), big.h.fm_length);
+    for (big.e, 0..) |e, i| {
+        try testing.expectEqual(@as(u64, i * 8192), e.fe_logical);
+        try testing.expectEqual(@as(u64, 4096), e.fe_length);
+        try testing.expectEqual(if (i == 2999) fm.FIEMAP_EXTENT_LAST else 0, e.fe_flags);
+    }
+    try testing.expectEqual(@as(u32, 3), rig.host.fiemap_asks.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), rig.host.fiemap_sync_asks.load(.monotonic));
+    // The count alone: no extent written.
+    var c: FiemapArg(1) = undefined;
+    c.h = .{ .fm_start = 0, .fm_length = std.math.maxInt(u64), .fm_flags = 0, .fm_mapped_extents = 99, .fm_extent_count = 0, .fm_reserved = 0 };
+    c.e[0].fe_length = 0xDEAD;
+    try expectFiemapDone(ops.fiemapIoctl(rig.st, Mount.probes, fd, @intFromPtr(&c)), 0);
+    try testing.expectEqual(@as(u32, 3000), c.h.fm_mapped_extents);
+    try testing.expectEqual(@as(u64, 0xDEAD), c.e[0].fe_length);
+    // A short array: ten extents, the tenth not LAST.
+    var ten: FiemapArg(10) = undefined;
+    ten.h = .{ .fm_start = 8192 * 5, .fm_length = std.math.maxInt(u64), .fm_flags = 0, .fm_mapped_extents = 0, .fm_extent_count = 10, .fm_reserved = 0 };
+    try expectFiemapDone(ops.fiemapIoctl(rig.st, Mount.probes, fd, @intFromPtr(&ten)), 0);
+    try testing.expectEqual(@as(u32, 10), ten.h.fm_mapped_extents);
+    try testing.expectEqual(@as(u64, 8192 * 5), ten.e[0].fe_logical);
+    try testing.expectEqual(@as(u32, 0), ten.e[9].fe_flags & fm.FIEMAP_EXTENT_LAST);
+    // XATTR: EBADR, fm_flags = the refused bit, nothing mapped.
+    ten.h = .{ .fm_start = 0, .fm_length = 1 << 20, .fm_flags = fm.FIEMAP_FLAG_XATTR | fm.FIEMAP_FLAG_SYNC, .fm_mapped_extents = 7, .fm_extent_count = 10, .fm_reserved = 0 };
+    try expectFiemapDone(ops.fiemapIoctl(rig.st, Mount.probes, fd, @intFromPtr(&ten)), -1);
+    try testing.expectEqual(linux.E.BADR, sys.getErrno());
+    try testing.expectEqual(fm.FIEMAP_FLAG_XATTR, ten.h.fm_flags);
+    try testing.expectEqual(@as(u32, 0), ten.h.fm_mapped_extents);
+    // A zero length: EINVAL, the header read back unchanged but the count.
+    ten.h = .{ .fm_start = 0, .fm_length = 0, .fm_flags = 0, .fm_mapped_extents = 7, .fm_extent_count = 10, .fm_reserved = 0 };
+    try expectFiemapDone(ops.fiemapIoctl(rig.st, Mount.probes, fd, @intFromPtr(&ten)), -1);
+    try testing.expectEqual(linux.E.INVAL, sys.getErrno());
+    try testing.expectEqual(@as(u32, 0), ten.h.fm_mapped_extents);
+    // EFAULT: NULL, an unmapped page, an array running into one.
+    try expectFiemapDone(ops.fiemapIoctl(rig.st, Mount.probes, fd, 0), -1);
+    try testing.expectEqual(linux.E.FAULT, sys.getErrno());
+    const pages = sys.mapAnon(8192).?;
+    sys.unmapAnon(@alignCast(pages + 4096), 4096);
+    defer sys.unmapAnon(pages, 4096);
+    try expectFiemapDone(ops.fiemapIoctl(rig.st, Mount.probes, fd, @intFromPtr(pages) + 4096), -1);
+    try testing.expectEqual(linux.E.FAULT, sys.getErrno());
+    // Room for (4096 − 32 − 64) / 56 = 71 whole extents before the hole.
+    const at = @intFromPtr(pages) + 64;
+    const h: fm.Fiemap = .{ .fm_start = 0, .fm_length = std.math.maxInt(u64), .fm_flags = 0, .fm_mapped_extents = 0, .fm_extent_count = 100, .fm_reserved = 0 };
+    @memcpy(pages[64..][0..@sizeOf(fm.Fiemap)], std.mem.asBytes(&h));
+    try expectFiemapDone(ops.fiemapIoctl(rig.st, Mount.probes, fd, at), -1);
+    try testing.expectEqual(linux.E.FAULT, sys.getErrno());
+    const back = std.mem.bytesToValue(fm.Fiemap, pages[64..][0..@sizeOf(fm.Fiemap)]);
+    try testing.expectEqual(@as(u32, (4096 - 64 - 32) / 56), back.fm_mapped_extents);
+    // Not ours to serve: O_PATH, a directory.
+    const opath = try rig.open(sys.O.PATH);
+    defer sys.close(opath);
+    try testing.expect(ops.fiemapIoctl(rig.st, Mount.probes, opath, @intFromPtr(&ten)) == .real);
+    const dir: sys.fd_t = @intCast(linux.openat(linux.AT.FDCWD, "/tmp", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0));
+    defer sys.close(dir);
+    try testing.expect(ops.fiemapIoctl(rig.st, Mount.probes, dir, @intFromPtr(&ten)) == .real);
+}

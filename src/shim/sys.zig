@@ -225,6 +225,48 @@ pub fn mapAnon(len: usize) ?[*]align(4096) u8 {
     return @ptrFromInt(rc);
 }
 
+pub fn unmapAnon(p: [*]align(4096) u8, len: usize) void {
+    _ = linux.munmap(p, len);
+}
+
+/// The kernel's `copy_from_user` restated in userspace: `len` bytes at the
+/// caller's address `src` into `dst` through `process_vm_readv` on this
+/// process, so an unmapped address answers EFAULT where a plain load would
+/// fault the app. `.SUCCESS` only when every byte moved.
+pub fn copyFromUser(dst: []u8, src: usize) E {
+    if (src == 0) return .FAULT;
+    const local = [_]std.posix.iovec{.{ .base = dst.ptr, .len = dst.len }};
+    const remote = [_]std.posix.iovec_const{.{ .base = @ptrFromInt(src), .len = dst.len }};
+    const rc = linux.process_vm_readv(linux.getpid(), &local, &remote, 0);
+    return userCopyResult(rc, dst.len);
+}
+
+/// `copy_to_user`, the same way (`process_vm_writev`).
+pub fn copyToUser(dst: usize, src: []const u8) E {
+    const moved = copyToUserPartial(dst, src);
+    if (moved.e != .SUCCESS) return moved.e;
+    return if (moved.n == src.len) .SUCCESS else .FAULT;
+}
+
+/// `copyToUser` that reports how far it got: the bytes moved before an
+/// unmapped page (the kernel's per-extent `copy_to_user` leaves the
+/// extents before a fault written and counted).
+pub fn copyToUserPartial(dst: usize, src: []const u8) struct { e: E, n: usize } {
+    if (dst == 0) return .{ .e = .FAULT, .n = 0 };
+    if (src.len == 0) return .{ .e = .SUCCESS, .n = 0 };
+    const local = [_]std.posix.iovec_const{.{ .base = src.ptr, .len = src.len }};
+    const remote = [_]std.posix.iovec_const{.{ .base = @ptrFromInt(dst), .len = src.len }};
+    const rc = linux.process_vm_writev(linux.getpid(), &local, &remote, 0);
+    const e = linux.errno(rc);
+    return if (e != .SUCCESS) .{ .e = e, .n = 0 } else .{ .e = .SUCCESS, .n = rc };
+}
+
+fn userCopyResult(rc: usize, want: usize) E {
+    const e = linux.errno(rc);
+    if (e != .SUCCESS) return e;
+    return if (rc == want) .SUCCESS else .FAULT;
+}
+
 /// One line to stderr, raw (AS-safe; the panic handler's and the refusal
 /// lines' only output path).
 pub fn writeStderr(bytes: []const u8) void {
@@ -292,6 +334,29 @@ test "fstatfs on /tmp answers a type that is not FUSE; fstat and getfl read a re
     try testing.expect(cpuCount() >= 1);
     try testing.expect(fstat(-1) == null);
     try testing.expect(getfl(-1) == null);
+}
+
+test "copyFromUser/copyToUser move bytes through this process's own memory and answer EFAULT for NULL, an unmapped page, or a range running into one — never a fault in the caller" {
+    var src: [64]u8 = undefined;
+    for (&src, 0..) |*b, i| b.* = @intCast(i);
+    var dst: [64]u8 = @splat(0);
+    try testing.expectEqual(E.SUCCESS, copyFromUser(&dst, @intFromPtr(&src)));
+    try testing.expectEqualSlices(u8, &src, &dst);
+    @memset(&dst, 0xEE);
+    try testing.expectEqual(E.SUCCESS, copyToUser(@intFromPtr(&src), &dst));
+    try testing.expectEqualSlices(u8, &dst, &src);
+    try testing.expectEqual(E.FAULT, copyFromUser(&dst, 0));
+    try testing.expectEqual(E.FAULT, copyToUser(0, &dst));
+    // Two pages, the second unmapped: a range across the edge is EFAULT.
+    const pages = mapAnon(8192).?;
+    unmapAnon(@alignCast(pages + 4096), 4096);
+    defer unmapAnon(pages, 4096);
+    try testing.expectEqual(E.SUCCESS, copyToUser(@intFromPtr(pages) + 4096 - 32, dst[0..32]));
+    try testing.expectEqual(E.FAULT, copyToUser(@intFromPtr(pages) + 4096 - 32, &dst));
+    try testing.expectEqual(E.FAULT, copyFromUser(&dst, @intFromPtr(pages) + 4096));
+    const part = copyToUserPartial(@intFromPtr(pages) + 4096 - 32, &dst);
+    try testing.expectEqual(E.SUCCESS, part.e);
+    try testing.expectEqual(@as(usize, 32), part.n);
 }
 
 test "libcResult sets errno and answers −1 for a failed raw call; aioResult answers the negative errno" {

@@ -212,6 +212,9 @@ pub const Tag = enum(u32) {
     // The direct WRITE arm (decision 0003 §AY).
     write_note = 17,
     write_note_ok = 18,
+    // The interposer's FIEMAP (`fiemap_verb.zig`, decision 0003 §CJ).
+    fiemap_req = 19,
+    fiemap_reply = 20,
     _,
 };
 
@@ -220,7 +223,7 @@ pub fn tagOf(raw: []const u8) DecodeError!Tag {
     if (raw.len < 4) return error.Truncated;
     const v = std.mem.readInt(u32, raw[0..4], .little);
     return switch (v) {
-        1...18 => @fromBackingInt(@intCast(v)),
+        1...20 => @fromBackingInt(@intCast(v)),
         else => error.BadTag,
     };
 }
@@ -747,7 +750,7 @@ test "ctl round-trip of every fixed variant through the ONE decoder; the tag dis
     try testing.expectError(error.BadTag, decodeFixed(Bind, frameBytes(&unbind)[0..8]));
     try testing.expectError(error.Truncated, decodeFixed(Hello, frameBytes(&hello)[0..111]));
     try testing.expectError(error.Truncated, decodeFixed(Bind, frameBytes(&unbind)));
-    try testing.expectError(error.BadTag, tagOf(&[_]u8{ 19, 0, 0, 0 }));
+    try testing.expectError(error.BadTag, tagOf(&[_]u8{ 21, 0, 0, 0 }));
     try testing.expectError(error.Truncated, tagOf(&[_]u8{ 1, 0 }));
     // A bad class word; an unterminated commit; a rights pad bit.
     const badref: Refuse = .{ .class = 42 };

@@ -567,6 +567,11 @@ fuse_over_uring.rs:7165–7182). Optional/never: access (default_permissions), b
   a peer mount's size/mtime/ctime (abi.rs:507–514). W1 ring-write invalidation uses
   `invalid_inode_detached`; generic/451 DIO coherence uses a synchronous ranged INVAL_INODE awaited before
   the WRITE reply (fuse_client.rs:8820–8829).
+- The port's issue law (decision 0003 §CK): io_uring writes `/dev/fuse` INLINE on the submitter (the device
+  polls EPOLLOUT; fuse ignores IOCB_NOWAIT), so a frame the kernel may sleep on — INVAL_ENTRY (the parent's
+  `i_rwsem`), a page-invalidating INVAL_INODE (a folio a WRITE or READ holds locked), PRUNE — goes
+  `IOSQE_ASYNC` (`SbCell.sleeps`); attrs-only INVAL_INODE, INC_EPOCH and replies stay inline. Otherwise the
+  sideband sleeps behind a request whose lane awaits it (the shim's fsstress wedge).
 
 ---
 

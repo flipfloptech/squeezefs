@@ -42,8 +42,10 @@ The 30 tests that `_notrun` "xfs_io fiemap failed" on the venue's kernel, the fi
 | FAIL — the allocation unit (proposed by-design rows below) | 009 092 094 177 225 255 316 483 677 695 796 797 |
 | FAIL — not FIEMAP | 013 (below) |
 
-**Proposed by-design rows** (OWNER CALL, decision 0003 §CJ.9; `fstests-exceptions.md`'s format but NOT
-in the ledger: the release run is unpreloaded, where these tests `_notrun` and a row would be stale):
+**By-design rows for a preloaded run** (owner ruling 2026-10-29, decision 0003 §CJ.9: the allocation
+unit is the 4 MiB stripe block by the KISS ruling; `fstests-exceptions.md`'s format but NOT in the ledger:
+the release run is unpreloaded, where these tests `_notrun` and a row would be stale; a preloaded run
+judges any of them failing on another cause as a defect):
 
 | test-id | reason-class | evidence |
 |---|---|---|
@@ -64,7 +66,9 @@ The alternative that turns most of these into honest `_notrun`s is xfstests' own
 mechanism: `_require_congruent_file_oplen` reads `stat -f -c %S` (statfs `f_frsize`, 4096 today); a
 mount reporting the stripe block there would `_notrun` 009 092 255 316 483 677 695 796 797 (and size
 177's punches in 4 MiB units) — a posture change for every `statvfs` consumer (`df` counts in
-`f_frsize` units), the owner's call. fiemap-tester (094, 225) reads FIGETBSZ and fails either way.
+`f_frsize` units). **Not taken** (owner ruling 2026-10-29): `f_frsize` stays 4096 — it would misstate
+small files, which allocate 4 KiB packed slots or live inline, and change what `df` and every `statvfs`
+caller see. fiemap-tester (094, 225) reads FIGETBSZ and fails either way.
 
 **generic/225's first run** found the one flag defect: a packed tenant carried DATA_TAIL|NOT_ALIGNED
 on a 4 KiB-aligned slot ("FIEMAP_EXTENT_NOT_ALIGNED is set but offset and length is blocksize

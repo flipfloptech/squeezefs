@@ -42,7 +42,7 @@
 //!   applier, which runs: A3 resolve every record's leaf latch-free → A4
 //!   lock the UNION ascending by address, deduped → A5 revalidate every
 //!   member (any member moved ⇒ drop ALL, re-resolve ALL; the seqs are the
-//!   window's) → A7 pre-images, first touch per `(tree, key)` → A9 apply
+//!   window's) → A7 undo keys, first touch per `(tree, key)` → A9 apply
 //!   in queue order (a member whose apply fails is rolled OUT in-window and
 //!   its range is left an unwritten hole) → A10 the writeback threshold →
 //!   unlock → A11 the threshold kick → A12 SUBMIT the survivors as ordinary
@@ -796,7 +796,7 @@ pub const Stats = struct {
     /// tail's table full — the entry stays and the error is answered at
     /// the landing (§BX).
     pad_landings: counters.ShardedCounter = .{},
-    /// `meta_conveyor_undo_keys`: pre-images the apply captured (A7) — one
+    /// `meta_conveyor_undo_keys`: undo keys the apply captured (A7) — one
     /// per distinct key of a member a failed write may still roll back;
     /// none for a member answered ahead of its landing (§BB.5).
     undo_keys: counters.ShardedCounter = .{},
@@ -1296,7 +1296,7 @@ const ResidentWaiter = struct {
 /// the encode and the submit, then in the lane's hands until `finish`
 /// (the reference's `ConveyorWindow`). Heap-allocated: the lane and the
 /// hooks address it by pointer; its arena owns the members' copies and the
-/// undo pre-images — the pass writes it before the handoff, the applier
+/// undo keys — the pass writes it before the handoff, the applier
 /// after, never both.
 pub const Window = struct {
     conveyor: *Conveyor,
@@ -1375,7 +1375,7 @@ pub const Window = struct {
 
     /// One self-applying member's share of the window (§BC): its own
     /// arena (the members apply concurrently), its sub-range and seq, its
-    /// ops (the window's image is their concatenation), its pre-images,
+    /// ops (the window's image is their concatenation), its undo keys,
     /// its tail slot, and whether it answered itself at the apply.
     pub const Part = struct {
         arena: std.heap.ArenaAllocator,
@@ -3194,7 +3194,7 @@ pub const Conveyor = struct {
 
     /// §BC: ONE member's apply on its own committer's thread — A3 resolve
     /// (seeded) → A4 lock ITS leaves (ascending) → A5 revalidate → A7 its
-    /// pre-images (none when it answers at its apply) → A9 apply → A10 the threshold → unlock → A12 its own
+    /// undo keys (none when it answers at its apply) → A9 apply → A10 the threshold → unlock → A12 its own
     /// ops (a PAD over its range if it rolled out) → the tail → the ack
     /// (this mount's kernel's own op, §BB.1) → the window's submit when it
     /// is the last member. A served verb, a control record or a tool waits
@@ -3230,7 +3230,7 @@ pub const Conveyor = struct {
                 // §BB.5: a member whose success is answered here (the
                 // `early` rule below, its inputs all fixed before the
                 // apply) leaves its window answered, and an answered
-                // window never rolls back — its pre-images would never be
+                // window never rolls back — its undo keys would never be
                 // read. A failed apply removes its records in-window.
                 const answered_at_apply = kernel_origin and self.deps.ack_at_apply and p.tail_slot != null and !w.pad_unclaimed;
                 self.applyUnion(a, members, p, failed, !answered_at_apply);
@@ -3444,7 +3444,7 @@ pub const Conveyor = struct {
                 tree.stats.meta_kv_commit_smo_retries.inc();
                 continue;
             }
-            if (capture_undo) p.undo = self.captureUndo(a, members, &r) catch |e| {
+            if (capture_undo) p.undo = self.captureUndo(a, members) catch |e| {
                 self.unlockAll(r.lock_set);
                 r.releaseRefs();
                 failed[0] = e;
@@ -3472,7 +3472,7 @@ pub const Conveyor = struct {
     /// destroy — no name reaches its objects, no kernel holds them, so no
     /// reader can tell this apply from an atomic one): ONE leaf at a time,
     /// ascending — lock it, revalidate it against the records resolved to
-    /// it (a moved leaf re-resolves those alone), their pre-images, apply,
+    /// it (a moved leaf re-resolves those alone), their undo keys, apply,
     /// the threshold, unlock — then the next. THE LAW: it never waits for a
     /// leaf while holding one, so a committer on any of its leaves waits
     /// behind it for at most that leaf's share of its records, never for
@@ -3559,7 +3559,7 @@ pub const Conveyor = struct {
                 continue;
             }
             const applied: ?Error = blk: {
-                self.captureUndoRun(a, &undo, recs, run, leaf) catch |e| break :blk e;
+                self.captureUndoRun(a, &undo, recs, run) catch |e| break :blk e;
                 group.clearRetainingCapacity();
                 for (run) |i| {
                     const r = recs[i];
@@ -3589,27 +3589,15 @@ pub const Conveyor = struct {
     }
 
     /// A7 for one leaf's run of a leafwise member, under that leaf's lock:
-    /// one pre-image per distinct `(tree, key)` across the member, first
+    /// one undo key per distinct `(tree, key)` across the member, first
     /// touch wins (`captureUndo`'s law).
-    fn captureUndoRun(self: *Conveyor, a: Allocator, undo: *std.ArrayList(tx.UndoKey), recs: []const tx.Rec, run: []const u32, leaf: *CachedNode) Error!void {
-        const snap = leaf.snapshotLoad();
-        defer snap.release();
+    fn captureUndoRun(self: *Conveyor, a: Allocator, undo: *std.ArrayList(tx.UndoKey), recs: []const tx.Rec, run: []const u32) Error!void {
         recs: for (run) |i| {
             const rec = recs[i];
             for (undo.items) |u| {
                 if (u.tree_id == rec.tree_id and std.mem.eql(u8, u.key, rec.key)) continue :recs;
             }
-            var l = snap.value.lookup(self.deps.gpa, rec.key) catch |e| return switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.Corrupt,
-            };
-            defer l.deinit();
-            const pre: tx.PreImage = switch (l) {
-                .live => |lv| .{ .live = try a.dupe(u8, lv.value) },
-                .tombstone => .tombstone,
-                .absent => .absent,
-            };
-            try undo.append(a, .{ .tree_id = rec.tree_id, .key = try a.dupe(u8, rec.key), .pre = pre });
+            try undo.append(a, .{ .tree_id = rec.tree_id, .key = try a.dupe(u8, rec.key) });
             self.stats.undo_keys.inc();
         }
     }
@@ -3697,7 +3685,7 @@ pub const Conveyor = struct {
 
     /// Stage A's second half on the APPLIER's thread (§AW): A3 resolve →
     /// A4 lock the union → A5 revalidate (re-resolve on a moved leaf; the
-    /// seqs are the window's already) → A7 pre-images → A9 apply in queue
+    /// seqs are the window's already) → A7 undo keys → A9 apply in queue
     /// order → A10 the threshold → unlock → A11 the kick → A12 encode →
     /// A13 submit. Every exit completes the reservation: a refusal before
     /// any apply abandons the window (nothing to roll back); a member
@@ -3751,8 +3739,8 @@ pub const Conveyor = struct {
                 tree.stats.meta_kv_commit_smo_retries.inc();
                 continue;
             }
-            // A7: pre-images, first touch per (tree, key).
-            window.undo = self.captureUndo(wa, members, &r) catch |e| {
+            // A7: the undo keys, first touch per (tree, key).
+            window.undo = self.captureUndo(wa, members) catch |e| {
                 self.unlockAll(r.lock_set);
                 r.releaseRefs();
                 self.abandonWindow(window, e);
@@ -4082,32 +4070,20 @@ pub const Conveyor = struct {
         if (self.deps.smo_journal.device) |d| d.completed(d.ctx);
     }
 
-    /// A7: one pre-image per distinct `(tree, key)` across the batch, first
-    /// touch wins (same-key members are Δtime merge records by the co-queue
-    /// invariant; their shared pre-image is the pre-batch fold).
-    fn captureUndo(self: *Conveyor, wa: Allocator, members: []const Queued, r: *const Resolved) Error![]tx.UndoKey {
+    /// A7: one undo key per distinct `(tree, key)` across the batch, first
+    /// touch wins (the rollback undoes the whole span of a key at once).
+    /// Keys only: what undoes them is read at the rollback
+    /// (`NodeSnapshot.spanUndo`), never captured on the apply's path.
+    fn captureUndo(self: *Conveyor, wa: Allocator, members: []const Queued) Error![]tx.UndoKey {
         var undo: std.ArrayList(tx.UndoKey) = .empty;
-        for (members, 0..) |m, qi| {
-            recs: for (m.q.recs, 0..) |rec, ri| {
+        for (members) |m| {
+            recs: for (m.q.recs) |rec| {
                 for (undo.items) |u| {
                     if (u.tree_id == rec.tree_id and std.mem.eql(u8, u.key, rec.key)) continue :recs;
                 }
-                const leaf = r.leaves[qi][ri];
-                const snap = leaf.snapshotLoad();
-                defer snap.release();
-                var l = snap.value.lookup(self.deps.gpa, rec.key) catch |e| return switch (e) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    else => error.Corrupt,
-                };
-                defer l.deinit();
-                const pre: tx.PreImage = switch (l) {
-                    .live => |lv| .{ .live = try wa.dupe(u8, lv.value) },
-                    .tombstone => .tombstone,
-                    .absent => .absent,
-                };
                 // The key copied: the member's own goes with its ack, which
                 // may precede the rollback's need of it (§BB.5).
-                try undo.append(wa, .{ .tree_id = rec.tree_id, .key = try wa.dupe(u8, rec.key), .pre = pre });
+                try undo.append(wa, .{ .tree_id = rec.tree_id, .key = try wa.dupe(u8, rec.key) });
             }
         }
         self.stats.undo_keys.add(undo.items.len);
@@ -4516,7 +4492,9 @@ pub const Conveyor = struct {
 
     // ---- the seq-conditional rollback (§5.2 "Failure") ----
 
-    const Comp = struct { tree_id: u8, key: []const u8, kind: record.RecordKind, value: []const u8 };
+    /// A compensating record and the key's newest seq when it was computed
+    /// (`commitCompensation` re-checks it under its own locks).
+    const Comp = struct { tree_id: u8, key: []const u8, kind: record.RecordKind, value: []const u8, newest: ?u64 };
 
     /// RAM ≠ replay: a roll-out, rollback or compensation exited before it
     /// could make RAM agree with what the ring will replay. Loud, counted
@@ -4553,14 +4531,27 @@ pub const Conveyor = struct {
     }
 
     /// Phase 1 under re-acquired ascending locks: remove every record of the
-    /// window's STAMPED span for each undo key; probe the key's newest seq —
-    /// still inside the span ⇒ a record escaped the open overlay (a freeze
-    /// raced the failed write) ⇒ a compensating record. A NEWER committed
-    /// record on the key (a Δtime merge) stands: LWW-correct. Phase 2
-    /// commits the compensations through the checkpoint-class direct writer.
+    /// window's STAMPED span for each undo key; a record of the span the
+    /// key still holds escaped the open overlay (a freeze raced the failed
+    /// write) ⇒ the record that undoes it over everything else the key
+    /// holds (`NodeSnapshot.spanUndo`: a Δ of the span's own fields, so a
+    /// newer record of another mask stands). Phase 2 commits the
+    /// compensations through the checkpoint-class direct writer; a record
+    /// of their keys applied between the two lock windows sends the
+    /// rollback round again.
     pub fn rollbackFailedTx(self: *Conveyor, span: SeqSpan, undo: []const tx.UndoKey) void {
-        const gpa = self.deps.gpa;
         self.stats.rollbacks.inc();
+        var round: u32 = 0;
+        while (round < COMMIT_RETRY_BUDGET) : (round += 1) {
+            if (!self.rollbackRound(span, undo)) return;
+        }
+        self.divergedFromReplay(&self.stats.divergence_compensation, "a newer record of a compensated key landed between the rollback's two lock windows on every round (the retry budget); escaped records stand uncompensated");
+    }
+
+    /// One round of `rollbackFailedTx`: true when the compensation went
+    /// stale and the round must run again.
+    fn rollbackRound(self: *Conveyor, span: SeqSpan, undo: []const tx.UndoKey) bool {
+        const gpa = self.deps.gpa;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -4569,15 +4560,27 @@ pub const Conveyor = struct {
         var attempt: u32 = 0;
         while (attempt < COMMIT_RETRY_BUDGET) : (attempt += 1) {
             comps.clearRetainingCapacity();
-            const leaves = arena.alloc(*CachedNode, undo.len) catch return self.divergedFromReplay(site, "out of memory before the rollback's leaf resolution; the window's records stay applied");
+            const leaves = arena.alloc(*CachedNode, undo.len) catch {
+                self.divergedFromReplay(site, "out of memory before the rollback's leaf resolution; the window's records stay applied");
+                return false;
+            };
             var n: usize = 0;
             defer for (leaves[0..n]) |l| l.release();
             for (undo) |u| {
-                const t = self.treeFor(u.tree_id, u.key) orelse return self.divergedFromReplay(site, "a dirty key names a tree that is not mounted; the window's records stay applied");
-                leaves[n] = t.resolveLeaf(u.key) catch return self.divergedFromReplay(site, "leaf resolution failed for a dirty key; the window's records stay applied");
+                const t = self.treeFor(u.tree_id, u.key) orelse {
+                    self.divergedFromReplay(site, "a dirty key names a tree that is not mounted; the window's records stay applied");
+                    return false;
+                };
+                leaves[n] = t.resolveLeaf(u.key) catch {
+                    self.divergedFromReplay(site, "leaf resolution failed for a dirty key; the window's records stay applied");
+                    return false;
+                };
                 n += 1;
             }
-            const lock_set = arena.dupe(*CachedNode, leaves) catch return self.divergedFromReplay(site, "out of memory building the rollback's lock set; the window's records stay applied");
+            const lock_set = arena.dupe(*CachedNode, leaves) catch {
+                self.divergedFromReplay(site, "out of memory building the rollback's lock set; the window's records stay applied");
+                return false;
+            };
             core_sort.stable(*CachedNode, lock_set, {}, addrLess);
             var out: usize = 0;
             for (lock_set) |l| {
@@ -4586,7 +4589,10 @@ pub const Conveyor = struct {
                 out += 1;
             }
             const set = lock_set[0..out];
-            const dirties = arena.alloc(*NodeDirty, set.len) catch return self.divergedFromReplay(site, "out of memory taking the rollback's locks; the window's records stay applied");
+            const dirties = arena.alloc(*NodeDirty, set.len) catch {
+                self.divergedFromReplay(site, "out of memory taking the rollback's locks; the window's records stay applied");
+                return false;
+            };
             self.lockAll(set, dirties, .apply);
             var is_stale = false;
             for (undo, leaves) |u, leaf| {
@@ -4607,41 +4613,57 @@ pub const Conveyor = struct {
                 };
                 const snap = leaf.snapshotLoad();
                 defer snap.release();
-                if (tx.UndoKey.escaped(span, snap.value.newestSeqOf(u.key))) {
-                    const c = u.compensation();
-                    comps.append(arena, .{ .tree_id = u.tree_id, .key = u.key, .kind = c.kind, .value = c.value }) catch {
-                        diverged = true;
-                    };
-                }
+                const c = snap.value.spanUndo(arena, u.key, span.lo, span.hi) catch {
+                    diverged = true;
+                    continue;
+                } orelse continue;
+                comps.append(arena, .{ .tree_id = u.tree_id, .key = u.key, .kind = c.kind, .value = c.value, .newest = snap.value.newestSeqOf(u.key) }) catch {
+                    diverged = true;
+                };
             }
             self.unlockAll(set);
-            if (diverged) return self.divergedFromReplay(site, "out of memory removing a window's records or recording an escaped record's compensation");
+            if (diverged) {
+                self.divergedFromReplay(site, "out of memory (or an undecodable record) removing a window's records or computing an escaped record's compensation");
+                return false;
+            }
             break;
         } else {
-            return self.divergedFromReplay(site, "the rollback's lock-revalidate retry budget is exhausted (SMO protocol bug); the window's records stay applied");
+            self.divergedFromReplay(site, "the rollback's lock-revalidate retry budget is exhausted (SMO protocol bug); the window's records stay applied");
+            return false;
         }
-        if (comps.items.len == 0) return;
-        self.commitCompensation(span, comps.items);
+        if (comps.items.len == 0) return false;
+        return self.commitCompensation(comps.items) == .stale;
     }
 
     /// Phase 2 (rare): the compensating records as ONE checkpoint-class
     /// entry through the direct writer — admitted from the reserve (never
-    /// parks behind user admissions), leaves locked ascending, skip-if-newer
-    /// re-checked under the locks, reserved inside, applied, written after
-    /// release. An escaped record left uncompensated is RAM ≠ replay: every
-    /// exit short of the written entry is a divergence (terminal); only the
-    /// entry write itself is the ring's crash-equivalent hole class.
-    fn commitCompensation(self: *Conveyor, span: SeqSpan, comps: []const Comp) void {
+    /// parks behind user admissions), leaves locked ascending, each key's
+    /// newest seq re-checked under the locks (a record applied since makes
+    /// the compensation `stale`: computed again), reserved inside, applied,
+    /// written after release. An escaped record left uncompensated is RAM ≠
+    /// replay: every exit short of the written entry is a divergence
+    /// (terminal); only the entry write itself is the ring's
+    /// crash-equivalent hole class.
+    fn commitCompensation(self: *Conveyor, comps: []const Comp) enum { done, stale } {
         const gpa = self.deps.gpa;
         const j = self.deps.smo_journal;
         const site = &self.stats.divergence_compensation;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const frames = arena.alloc(journal.RecordFrame, comps.len) catch return self.divergedFromReplay(site, "out of memory building the compensation frames; escaped records stand uncompensated");
+        const frames = arena.alloc(journal.RecordFrame, comps.len) catch {
+            self.divergedFromReplay(site, "out of memory building the compensation frames; escaped records stand uncompensated");
+            return .done;
+        };
         for (comps, frames) |c, *f| f.* = .{ .tag = journal.tagFor(c.tree_id, 0), .key = c.key, .kind = @fromBackingInt(@intCast(@backingInt(c.kind))), .seq = 0, .value = c.value };
-        const len = journal.entryLenFor(frames) catch return self.divergedFromReplay(site, "the compensation entry does not encode; escaped records stand uncompensated");
-        const adm = self.deps.core.tryAdmit(len, .checkpoint) orelse return self.divergedFromReplay(site, "the checkpoint reserve could not admit the compensation entry; escaped records stand uncompensated");
+        const len = journal.entryLenFor(frames) catch {
+            self.divergedFromReplay(site, "the compensation entry does not encode; escaped records stand uncompensated");
+            return .done;
+        };
+        const adm = self.deps.core.tryAdmit(len, .checkpoint) orelse {
+            self.divergedFromReplay(site, "the checkpoint reserve could not admit the compensation entry; escaped records stand uncompensated");
+            return .done;
+        };
         var attempt: u32 = 0;
         while (attempt < COMMIT_RETRY_BUDGET) : (attempt += 1) {
             const leaves = arena.alloc(*CachedNode, comps.len) catch break;
@@ -4672,37 +4694,29 @@ pub const Conveyor = struct {
                 self.unlockAll(set);
                 continue;
             }
-            // Skip-if-newer under the locks: a key whose newest record is
-            // past the failed span was committed since — it stands.
-            const live = arena.alloc(bool, comps.len) catch {
-                self.unlockAll(set);
-                break;
-            };
-            var any = false;
-            for (comps, leaves, live) |c, leaf, *lv| {
+            // A record of a compensated key applied since the first lock
+            // window: the compensation was computed against older records.
+            for (comps, leaves) |c, leaf| {
                 const snap = leaf.snapshotLoad();
                 defer snap.release();
-                const newest = snap.value.newestSeqOf(c.key);
-                lv.* = newest == null or newest.? < span.hi;
-                any = any or lv.*;
-            }
-            if (!any) {
-                self.unlockAll(set);
-                self.deps.core.release(adm);
-                return;
+                if (!std.meta.eql(snap.value.newestSeqOf(c.key), c.newest)) {
+                    self.unlockAll(set);
+                    self.deps.core.release(adm);
+                    return .stale;
+                }
             }
             const reg = j.reserve(adm) catch {
                 // The core transferred the claim before the registry's append
                 // failed: the range is the ring's now, un-registered.
                 self.unlockAll(set);
-                return self.divergedFromReplay(site, "the compensation's reservation could not be registered (out of memory); escaped records stand uncompensated");
+                self.divergedFromReplay(site, "the compensation's reservation could not be registered (out of memory); escaped records stand uncompensated");
+                return .done;
             };
             for (frames, 0..) |*f, i| f.seq = reg.seq_base + i;
             // The frame IS written below, so a record that cannot be applied
             // to RAM is a divergence in the other direction.
             var diverged = false;
-            for (comps, leaves, live, frames) |c, leaf, lv, f| {
-                if (!lv) continue;
+            for (comps, leaves, frames) |c, leaf, f| {
                 const gi = for (set, 0..) |l, i| {
                     if (l.addr == leaf.addr) break i;
                 } else unreachable;
@@ -4728,10 +4742,11 @@ pub const Conveyor = struct {
                 error.Corrupt => self.compensationWriteFailed(),
                 else => self.divergedFromReplay(site, "the compensation entry could not be built; the escaped record stands for replay while RAM holds its compensation"),
             };
-            return;
+            return .done;
         }
         self.deps.core.release(adm);
         self.divergedFromReplay(site, "the compensation could not resolve or lock its leaves (out of memory or the lock-revalidate budget); escaped records stand uncompensated");
+        return .done;
     }
 };
 

@@ -716,6 +716,16 @@ pub const InodeDelta = struct {
         return .{ .mask = mask, .fields = fields };
     }
 
+    /// The Δ that takes `from` to `to` over the fields of `mask`: the masked
+    /// fields where they differ, `to`'s values (mask 0 when none differs).
+    pub fn between(from: InodeValue, to: InodeValue, mask: u16) InodeDelta {
+        var d: InodeDelta = .{ .mask = 0, .fields = to };
+        inline for (field_table) |f| {
+            if (mask & f.bit != 0 and @field(from, f.name) != @field(to, f.name)) d.mask |= f.bit;
+        }
+        return d;
+    }
+
     /// Field OVERWRITE of the masked fields — idempotent, so replaying a
     /// delta over an already-folded base is a no-op.
     pub fn apply(self: InodeDelta, base: *InodeValue) void {

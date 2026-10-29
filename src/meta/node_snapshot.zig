@@ -701,6 +701,9 @@ pub fn runGroup(run: *const Run, k: []const u8) Range {
     return .{ .lo = lo, .hi = run.groupEnd(lo, k) };
 }
 
+/// `NodeSnapshot.spanUndo`'s answer: the record that undoes a span.
+pub const SpanUndo = struct { kind: RecordKind, value: []const u8 };
+
 /// The outcome of folding one key in a snapshot. `live.value` borrows the
 /// snapshot (a head serve, a memo hit, a plain `Put`) unless `held` carries
 /// the reference a cold delta fold materialized.
@@ -1586,6 +1589,68 @@ pub const NodeSnapshot = struct {
         return false;
     }
 
+    /// What undoes, over everything else this node holds of `k`, the
+    /// records stamped in `[lo, hi)` it still holds (a failed window's that
+    /// a freeze took into the base): null when it holds none of them or
+    /// they change nothing. An inode-Δ span undoes field by field — the Δ
+    /// back to the fold WITHOUT the span over the span's masked fields that
+    /// differ — so a newer record of another mask stands; any other span
+    /// re-puts that fold (or deletes, when it folds to nothing). `gpa` owns
+    /// the answer's value.
+    pub fn spanUndo(self: *const NodeSnapshot, gpa: Allocator, k: []const u8, lo: u64, hi: u64) FoldError!?SpanUndo {
+        const Split = struct {
+            all: std.ArrayList(RecordRef) = .empty,
+            rest: std.ArrayList(RecordRef) = .empty,
+            gpa: Allocator,
+            lo: u64,
+            hi: u64,
+            held: bool = false,
+            /// Every held record an inode Δ; their masks' union.
+            deltas_only: bool = true,
+            mask: u16 = 0,
+            oom: bool = false,
+            fn visit(sp: *@This(), r: RecordRef) bool {
+                sp.all.append(sp.gpa, r) catch {
+                    sp.oom = true;
+                    return false;
+                };
+                if (r.seq < sp.lo or r.seq >= sp.hi) {
+                    sp.rest.append(sp.gpa, r) catch {
+                        sp.oom = true;
+                        return false;
+                    };
+                    return true;
+                }
+                sp.held = true;
+                if (r.kind == .delta and !rec.isLayoutDelta(r.value)) {
+                    if (rec.InodeDelta.decode(r.value)) |d| sp.mask |= d.mask else |_| sp.deltas_only = false;
+                } else sp.deltas_only = false;
+                return true;
+            }
+        };
+        var sp: Split = .{ .gpa = gpa, .lo = lo, .hi = hi };
+        defer sp.all.deinit(gpa);
+        defer sp.rest.deinit(gpa);
+        self.walkNewestFirst(self.groups(k), &sp, Split.visit);
+        if (sp.oom) return error.OutOfMemory;
+        if (!sp.held) return null;
+        var cur = try rec.foldNewestFirst(gpa, sp.all.items);
+        defer cur.deinit(gpa);
+        var without = try rec.foldNewestFirst(gpa, sp.rest.items);
+        defer without.deinit(gpa);
+        const cv = cur.liveValue();
+        const wv = without.liveValue() orelse return if (cv == null) null else .{ .kind = .delete, .value = &.{} };
+        if (cv) |c| {
+            if (std.mem.eql(u8, c, wv)) return null;
+            if (sp.deltas_only) {
+                const d = rec.InodeDelta.between(try rec.InodeValue.decode(c), try rec.InodeValue.decode(wv), sp.mask);
+                if (d.mask == 0) return null;
+                return .{ .kind = .delta, .value = try gpa.dupe(u8, d.encode().slice()) };
+            }
+        }
+        return .{ .kind = .put, .value = try gpa.dupe(u8, wv) };
+    }
+
     /// The newest record seq this node holds for `k` across every source,
     /// or null when the key is unknown here. Order-independent (max per
     /// group).
@@ -2317,6 +2382,43 @@ fn expectSearchExact(idx: *const RecordIndex, k: []const u8) !void {
     };
     try testing.expectEqual(want.lo, idx.firstAtOrAfter(k));
     try testing.expectEqual(want, idx.groupBounds(k));
+}
+
+test "spanUndo: what undoes a failed span's held records over everything else the key holds — an inode-Δ span is a Δ of its own differing fields (a newer Δ of another mask stands), a Delete span re-puts the fold without it, a span a newer Put shadows or a span the node does not hold needs nothing" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const k1 = key.inodeKey(1);
+    var base_recs = [_]Record{ try put(gpa, 1, 1), try put(gpa, 2, 1), try put(gpa, 3, 1) };
+    defer rec.deinitRecords(gpa, &base_recs);
+    var later = [_]Record{
+        // ino 1: the failed span [10, 12) holds a Δ{size}; a newer Δatime at 20.
+        try Record.delta(gpa, &k1, 10, .{ .mask = rec.DELTA_SIZE, .fields = .{ .size = 4242 } }),
+        try Record.delta(gpa, &k1, 20, .{ .mask = rec.DELTA_ATIME, .fields = .{ .atime = 777 } }),
+        // ino 2: the span's Delete.
+        try del(gpa, 2, 11),
+        // ino 3: the span's Δ shadowed by a newer Put.
+        try dtimes(gpa, 3, 10, 5, 5),
+        try put(gpa, 3, 30),
+    };
+    defer rec.deinitRecords(gpa, &later);
+    const sources = try gpa.alloc(Bytes, 2);
+    sources[0] = try imageOf(gpa, &base_recs);
+    sources[1] = try imageOf(gpa, &later);
+    const snap = try snapshotOver(gpa, sources);
+    defer snap.release();
+    const s = &snap.value;
+    const undo1 = (try s.spanUndo(arena, &k1, 10, 12)).?;
+    try testing.expectEqual(RecordKind.delta, undo1.kind);
+    const d = try InodeDelta.decode(undo1.value);
+    try testing.expectEqual(rec.DELTA_SIZE, d.mask);
+    try testing.expectEqual(iv(1).size, d.fields.size);
+    const undo2 = (try s.spanUndo(arena, &key.inodeKey(2), 10, 12)).?;
+    try testing.expectEqual(RecordKind.put, undo2.kind);
+    try testing.expectEqualSlices(u8, &iv(1).encode(), undo2.value);
+    try testing.expectEqual(@as(?SpanUndo, null), try s.spanUndo(arena, &key.inodeKey(3), 10, 12));
+    try testing.expectEqual(@as(?SpanUndo, null), try s.spanUndo(arena, &k1, 12, 20));
 }
 
 test "snapshot lookup folds across sources; a delta chain is a memo miss then a memo hit with zero decodes; newestSeqOf; census" {

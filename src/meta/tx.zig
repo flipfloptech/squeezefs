@@ -379,50 +379,15 @@ pub fn dentryInsertKey(tx: *const KvTx, name_key: *const key.NameKey, parent: u6
 }
 
 // ---------------------------------------------------------------------------
-// UndoKey — a key's pre-image captured at RAM apply (§5.2 "Failure": the
-// seq-conditional rollback).
+// UndoKey — a key a tx staged, for the rollback of its window (§5.2
+// "Failure": what the key holds of the window's span is undone over
+// everything else it holds, `NodeSnapshot.spanUndo`).
 // ---------------------------------------------------------------------------
-
-/// What the key folded to in its leaf BEFORE this tx's records were applied
-/// (first touch wins across a batch, so the batch-range rollback restores
-/// the pre-batch state exactly).
-pub const PreImage = union(enum) {
-    /// A live value.
-    live: []const u8,
-    /// A tombstone shadows the key.
-    tombstone,
-    /// No records for the key.
-    absent,
-};
-
-pub const Compensation = struct { kind: RecordKind, value: []const u8 };
 
 pub const UndoKey = struct {
     tree_id: u8,
     /// The staged key.
     key: []const u8,
-    pre: PreImage,
-
-    /// The compensating record for a record of this tx that ESCAPED the open
-    /// overlay into a frozen or durable bset before the write failed (a
-    /// freeze raced the failed write): re-Put the pre-image, or Delete what
-    /// was tombstoned/absent — committed through the checkpoint-class
-    /// reserve so a crash after the escaped records reach a durable bset
-    /// still replays to the rolled-back state.
-    pub fn compensation(self: UndoKey) Compensation {
-        return switch (self.pre) {
-            .live => |v| .{ .kind = .put, .value = v },
-            .tombstone, .absent => .{ .kind = .delete, .value = &.{} },
-        };
-    }
-
-    /// The seq-conditional probe: a record of this tx escaped iff the key's
-    /// newest record seq (after the open-overlay removal) lies in the tx's
-    /// stamped span — a NEWER committed record stands.
-    pub fn escaped(span: SeqSpan, newest_seq: ?u64) bool {
-        const s = newest_seq orelse return false;
-        return span.contains(s);
-    }
 };
 
 // ---------------------------------------------------------------------------
@@ -745,9 +710,8 @@ test "staging keeps stage order, kinds and bytes; seqs are unassigned until the 
     try testing.expectEqual(@as(u64, 1003), q.recs[3].seq);
     try testing.expectEqual(@as(u64, 1000), span.lo);
     try testing.expectEqual(1000 + q.len, span.hi);
-    try testing.expect(UndoKey.escaped(span, 1002));
-    try testing.expect(!UndoKey.escaped(span, 1000 + q.len));
-    try testing.expect(!UndoKey.escaped(span, null));
+    try testing.expect(span.contains(1002));
+    try testing.expect(!span.contains(1000 + q.len));
 }
 
 test "entry length is the exact journal arithmetic; the queue entry's frames are byte-identical to journal.buildEntryWrite of the same records (batch-of-one shape)" {
@@ -960,18 +924,6 @@ test "dentry insert key: name too long refuses; a full chain of 256 is the count
     try tx.stageDelete(key.TREE_DENTRIES, &keys[200]);
     const ins = try dentryInsertKey(&tx, &seed, 1, "crowded", &live);
     try testing.expectEqual(@as(u8, 200), (try key.DentryKey.decode(&ins)).collSeq());
-}
-
-test "undo pre-images project to their compensating records: live ⇒ Put(pre), tombstone/absent ⇒ Delete" {
-    const u_live = UndoKey{ .tree_id = key.TREE_INODES, .key = &key.inodeKey(1), .pre = .{ .live = "before" } };
-    const c = u_live.compensation();
-    try testing.expectEqual(RecordKind.put, c.kind);
-    try testing.expectEqualStrings("before", c.value);
-    const u_tomb = UndoKey{ .tree_id = key.TREE_INODES, .key = &key.inodeKey(1), .pre = .tombstone };
-    try testing.expectEqual(RecordKind.delete, u_tomb.compensation().kind);
-    try testing.expectEqual(@as(usize, 0), u_tomb.compensation().value.len);
-    const u_abs = UndoKey{ .tree_id = key.TREE_INODES, .key = &key.inodeKey(1), .pre = .absent };
-    try testing.expectEqual(RecordKind.delete, u_abs.compensation().kind);
 }
 
 test "an empty tx builds an empty entry of exactly the header length (the degenerate group member)" {

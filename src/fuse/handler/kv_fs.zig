@@ -5900,7 +5900,7 @@ const testing = std.testing;
 /// upserts, Delete removes, a Delta overwrites its masked fields on an
 /// existing base and folds to nothing on an absent one).
 pub const MemStore = struct {
-    pub const StoreError = error{ OutOfMemory, Io, WouldBlock };
+    pub const StoreError = error{ OutOfMemory, Io, WouldBlock, NoSpaceLeft };
 
     gpa: Allocator,
     lock: jc.SpinLock = .{},
@@ -5935,6 +5935,11 @@ pub const MemStore = struct {
     /// A real member's fail-stop latch (`journal.FailureLatch`): set,
     /// `isFailed` says so and every commit refuses as the device would.
     failed: bool = false,
+    /// A full metadata heap (`heap_law.admitHeapLocked`): set, a commit
+    /// staging more Deletes than this refuses `NoSpaceLeft` whole, as a
+    /// member whose leaves need more compaction extents than the heap
+    /// holds above its floor is refused (null = room for every commit).
+    space_room: ?usize = null,
 
     const Row = struct { kind: u8, k: []u8, v: []u8 };
 
@@ -5959,6 +5964,7 @@ pub const MemStore = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.InputOutput,
             error.WouldBlock => error.WouldBlock,
+            error.NoSpaceLeft => error.NoSpaceLeft,
         };
     }
 
@@ -6019,6 +6025,11 @@ pub const MemStore = struct {
     pub fn commit(self: *MemStore, t: *tx.KvTx) StoreError!void {
         defer self.abandon(t);
         if (self.failed) return error.Io;
+        if (self.space_room) |room| {
+            var deletes: usize = 0;
+            for (t.staged.items) |s| deletes += @intFromBool(s.kind == .delete);
+            if (deletes > room) return error.NoSpaceLeft;
+        }
         self.lock.lock();
         defer self.lock.unlock();
         for (t.staged.items) |s| {
@@ -10576,6 +10587,76 @@ test "the corpse sweep at mount: an unlinked file whose FORGET died with the dae
     try testing.expectEqual(@as(u32, 1), (try next.readInode(try MemFs.localOf(live))).nlink);
     // Idempotent: a second sweep finds nothing.
     try testing.expectEqual(@as(u64, 0), try next.sweepCorpsesAtMount());
+}
+
+/// `n` unlinked, released files (each an inode + its layout record: two
+/// Deletes to destroy) into `out`; `forget` gathers each as the kernel's
+/// last FORGET would, else they stay corpses for a mount's sweep.
+fn makeCorpses(h: *Harness, prefix: []const u8, out: []u64, forget: bool) !void {
+    for (out, 0..) |*ino, i| {
+        var nb: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nb, "{s}{d}", .{ prefix, i });
+        ino.* = try h.create(1, name, 0o644);
+        _ = h.write(ino.*, 0, "payload", 0);
+        try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = name } }, 1).errno());
+        h.release(ino.*);
+        if (forget) h.forget(ino.*, 1);
+    }
+}
+
+test "a FULL metadata heap never fails the corpse sweep at mount: the destroys it refuses wait in the reclaim cadence's gather and land once deletes return room (rung-10-dm-error-unmount.md, seen (b): `the corpse sweep at mount failed (NoSpaceLeft)` refused the mount of a full volume)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const inodes0 = h.store.countKind(key.TREE_INODES);
+    var corpses: [3]u64 = undefined;
+    try makeCorpses(&h, "c", &corpses, false);
+    // The daemon dies here; the heap is full when the next mount sweeps.
+    h.store.space_room = 0;
+    var next = try MemFs.mount(testing.allocator, testing.io, &h.store, &h.data, .{ .dlm_stripes = 16 });
+    defer next.unmount();
+    _ = try next.sweepCorpsesAtMount();
+    try testing.expectEqual(inodes0 + 3, h.store.countKind(key.TREE_INODES));
+    try testing.expectEqual(@as(usize, 3), next.reclaim.items.len);
+    // Deletes returned room: the cadence's tick destroys every one.
+    h.store.space_room = null;
+    var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
+    defer tr.finish();
+    var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &.{} };
+    try next.reclaimDrain(&c);
+    try testing.expectEqual(inodes0, h.store.countKind(key.TREE_INODES));
+    try testing.expectEqual(@as(usize, 0), next.reclaim.items.len);
+}
+
+test "a corpse batch the full heap refuses whole is destroyed corpse by corpse; a corpse still refused stays gathered for the next tick — never dropped, never an error to the cadence" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const inodes0 = h.store.countKind(key.TREE_INODES);
+    var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
+    defer tr.finish();
+    var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &.{} };
+    var four: [4]u64 = undefined;
+    try makeCorpses(&h, "a", &four, true);
+    try testing.expectEqual(@as(usize, 4), h.fs.reclaim.items.len);
+    // Room for one corpse's Deletes, never two: the batch's one entry is
+    // refused whole, each corpse alone lands.
+    h.store.space_room = 3;
+    try h.fs.reclaimDrain(&c);
+    try testing.expectEqual(inodes0, h.store.countKind(key.TREE_INODES));
+    try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
+    // No room at all: refused, kept.
+    var two: [2]u64 = undefined;
+    try makeCorpses(&h, "b", &two, true);
+    h.store.space_room = 0;
+    try h.fs.reclaimDrain(&c);
+    try testing.expectEqual(inodes0 + 2, h.store.countKind(key.TREE_INODES));
+    try testing.expectEqual(@as(usize, 2), h.fs.reclaim.items.len);
+    // Room again: the next tick destroys them.
+    h.store.space_room = null;
+    try h.fs.reclaimDrain(&c);
+    try testing.expectEqual(inodes0, h.store.countKind(key.TREE_INODES));
+    try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
 }
 
 test "the corpse sweep pages through a slot tree that interleaves inode, dentry and xattr records (> SWEEP_PAGE of them): only the corpses go, every live file stays" {

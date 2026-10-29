@@ -153,6 +153,9 @@ const Rig = struct {
     /// The test sent `kill -9` to the current child (the kill rows): a
     /// SIGKILL death is then OURS; any other SIGKILL is a stray runner's.
     killed: bool = false,
+    /// The metadata volume's length at the next `formatSet` (a row that
+    /// fills the heap to ENOSPC wants it small).
+    meta_len: u64 = volume_len,
     env: std.process.Environ.Map,
 
     fn init(gpa: std.mem.Allocator, io: Io) !*Rig {
@@ -276,7 +279,7 @@ const Rig = struct {
     fn createMetaVolume(self: *Rig) !void {
         const f = try Io.Dir.cwd().createFile(self.io, self.img, .{ .truncate = true });
         defer f.close(self.io);
-        try f.setLength(self.io, volume_len);
+        try f.setLength(self.io, self.meta_len);
     }
 
     /// The SET: the meta volume, two sparse data volumes, the mount WITH
@@ -12216,6 +12219,120 @@ test "smoke: A CLEAN REMOUNT GIVES BACK ITS BITMAP PAGES (the full metadata volu
     std.debug.print("\nsmoke[remount heap]: free extents at each mount {any}\n", .{seen});
     for (seen) |free| try testing.expectEqual(first.?, free);
     _ = try fsckClean(rig, "five clean remounts");
+}
+
+/// One file of the full-heap row: created, then `full_heap_xattrs` user
+/// xattrs of `full_heap_xattr_len` bytes. Null = it fit; else the errno
+/// that refused it (the heap's answer must be ENOSPC).
+fn fullHeapFile(mp: []const u8, i: usize) !?linux.E {
+    var pb: [256]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pb, "{s}/x/f{d}", .{ mp, i }, 0);
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(rc) != .SUCCESS) return linux.errno(rc);
+    _ = linux.close(@intCast(rc));
+    const value: [full_heap_xattr_len]u8 = @splat('a');
+    for (0..full_heap_xattrs) |j| {
+        var nb: [16]u8 = undefined;
+        const name = try std.fmt.bufPrintSentinel(&nb, "user.k{d}", .{j}, 0);
+        const e = linux.errno(linux.setxattr(path.ptr, name.ptr, &value, value.len, 0));
+        if (e != .SUCCESS) return e;
+    }
+    return null;
+}
+
+const full_heap_meta_len: u64 = 48 << 20;
+const full_heap_xattrs: usize = 4;
+const full_heap_xattr_len: usize = 200;
+/// Every `full_heap_stride`-th file is unlinked: a destroy batch then
+/// spans as many full leaves as it holds corpses.
+const full_heap_stride: usize = 30;
+
+test "smoke: A FULL METADATA VOLUME MOUNTS AND RECOVERS BY DELETION (rung-10-dm-error-unmount.md, seen (b)) — a 48 MiB metadata volume filled by files with four 200 B xattrs until the heap refuses (ENOSPC, never EIO) → umount, mount → every 30th file unlinked (each destroy batch spans as many full leaves as it holds corpses: the full heap refuses it whole) → umount → the next mount SERVES, whatever corpses its sweep met (red by hand: `the corpse sweep at mount failed (NoSpaceLeft)`, exit 1) → `rm -rf` of the tree: every unlink answers and the live daemon destroys every corpse (red: every batch's destroy refused and DROPPED — `reclaim cadence: drain failed: NoSpaceLeft` per wake, nothing reclaimed) → 2,000 fresh files with their xattrs fit → umount → fsck --offline --scrub 0 findings and no corpse left for its mount sweep" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    rig.meta_len = full_heap_meta_len;
+    try rig.formatSet(false);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var xb: [256]u8 = undefined;
+    const x = try std.fmt.bufPrintSentinel(&xb, "{s}/x", .{rig.mp}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(x.ptr, 0o755)));
+    var files: usize = 0;
+    const refusal: linux.E = while (true) : (files += 1) {
+        if (try fullHeapFile(rig.mp, files)) |e| break e;
+    };
+    std.debug.print("\nsmoke[full heap]: {d} files fit, the next refused {t}\n", .{ files, refusal });
+    try testing.expectEqual(linux.E.NOSPC, refusal);
+    try testing.expect(files > 1000);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    var mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    var unlinked: usize = 0;
+    var k: usize = 0;
+    while (k < files) : (k += full_heap_stride) {
+        var pb: [256]u8 = undefined;
+        const path = try std.fmt.bufPrintSentinel(&pb, "{s}/x/f{d}", .{ rig.mp, k }, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(path.ptr)));
+        unlinked += 1;
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    // THE LAW: a full volume mounts.
+    mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        var it = std.mem.splitScalar(u8, text[mark..], '\n');
+        while (it.next()) |line| if (std.mem.indexOf(u8, line, "corpse sweep at mount:")) |i| std.debug.print("smoke[full heap]:   {s}\n", .{line[i..]});
+    }
+    // The operator's recovery: delete the tree; every unlink answers and
+    // the live daemon destroys every corpse, and the heap takes files.
+    {
+        const out = try rig.onMountTimed("rm -rf x; echo removed", 300);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "removed") != null);
+    }
+    const removed = files - unlinked;
+    const tail = try awaitAtLeast(rig, "\"fuse_reclaim_destroys\":", removed, 120 * std.time.ns_per_s);
+    defer gpa.free(tail);
+    std.debug.print("smoke[full heap]: {d} unlinked before the remount, {d} removed after it → reclaim destroys {d}, space deferrals {d}, reclaim yields {d}\n", .{ unlinked, removed, numberAfter(tail, "\"fuse_reclaim_destroys\":") orelse 0, numberAfter(tail, "\"fuse_reclaim_space_deferrals\":") orelse 0, numberAfter(tail, "\"meta_conveyor_reclaim_space_yields\":") orelse 0 });
+    try testing.expect((numberAfter(tail, "\"fuse_reclaim_destroys\":") orelse 0) >= removed);
+    // The emptied leaves merge and their extents return through the
+    // pending-free FIFO over the next cycles: the heap leaves its full
+    // posture (bounded poll).
+    const deadline = clock.monotonicNs() + 120 * std.time.ns_per_s;
+    while (true) {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        if ((numberAfter(t, "\"meta_kv_heap_full\":") orelse 1) == 0) {
+            std.debug.print("smoke[full heap]: the heap left its full posture: {d} free extent(s), {d} pending\n", .{ numberAfter(t, "\"heap_free_extents\":") orelse 0, numberAfter(t, "\"heap_pending_free\":") orelse 0 });
+            break;
+        }
+        if (clock.monotonicNs() >= deadline) return error.HeapStayedFull;
+        sleepMs(200);
+    }
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(x.ptr, 0o755)));
+    for (0..2000) |i| try testing.expectEqual(@as(?linux.E, null), try fullHeapFile(rig.mp, i));
+    try expectMustStayZero(tail);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", rig.meta_uri });
+    defer rig.freeRun(r);
+    if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+        std.debug.print("\n--- fsck --offline --scrub after the full heap's recovery ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+        return error.FsckNotClean;
+    }
+    if (std.mem.indexOf(u8, r.stderr, "corpse sweep at mount:")) |i| {
+        std.debug.print("\n--- the live daemon left a corpse: {s}\n", .{r.stderr[i..@min(r.stderr.len, i + 200)]});
+        return error.CorpseLeftToTheMountSweep;
+    }
 }
 
 /// Kernel aio (the raw `io_setup`/`io_submit`/`io_getevents` syscalls — no

@@ -79,3 +79,22 @@ dev vs the branch, or `SQUEEZEFS_META_FSYNC_SCOPE=set` vs `ino` in one binary; t
 ignores `datasync`) — skipping it would leave most overwrite fdatasyncs with no metadata barrier: the owner's
 call. (b) One FUSE fsync runs 1.2–1.4 per-inode meta rounds on fio (the epoch save's, then the times
 drain's, §AL.5's order).
+
+## The A-B-B-A (2026-10-29, quiet host on AC, the RAM-NVMe perf mount, 2 MDT + 2 OST, dist builds)
+
+`dev` `0b43903` against the rule (`7ad825e`), legs A B B A, each leg one fresh set: `abba-fsync.fio` (8 psync
+jobs, one per top-level directory `d0`–`d7` — §BZ spreads them over both members — 4 KiB random overwrites
+of a laid-down 256 MiB file, 60 s) with `--fsync=1`, then with `--fdatasync=1`, then `mpirun -np 32 mdtest
+-F -n 2000 -w 4096 -y -u -i 1`; gate lock and every build slot held, fsck clean after every leg:
+
+| row | dev (leg 1 / leg 2) | rule | Δ |
+|---|---|---|---|
+| fio fsync, IOPS | 100,458 / 101,662 | 156,697 / 155,224 | **+54.3 %** |
+| fio fsync, p99 µs | 46 / 46 | 43 / 43 | −7 % |
+| fio fdatasync, IOPS | 99,282 / 99,197 | 152,786 / 151,505 | **+53.3 %** |
+| fio fdatasync, p99 µs | 46 / 47 | 44 / 44 | −5 % |
+| mdtest `-y` file creation | 58,680 / 57,453 | 66,228 / 65,289 | +13.2 % |
+| mdtest `-y` file read | 838,410 / 945,865 | 893,942 / 965,015 | +4.2 % |
+| mdtest `-y` file removal | 305,190 / 294,448 | 315,319 / 310,150 | +4.3 % |
+
+Landed (gate 168 green, 75/75). Sessions: `/build/perf/fs-abba/`.

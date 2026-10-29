@@ -64,6 +64,7 @@ const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
 
 const counters = @import("../core/counters.zig");
+const u64_map = @import("../core/u64_map.zig");
 const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
 const jc = @import("../meta/journal_core.zig");
@@ -263,16 +264,21 @@ pub const CloseOutcome = union(enum) {
     orphan_discarded,
 };
 
+const EpochMap = u64_map.U64Map(*Epoch);
+
 pub const Epochs = struct {
     gpa: Allocator,
     block_size: u64,
     lock: jc.SpinLock = .{},
-    /// The OPEN epochs (accepting records), one per ino.
-    table: std.AutoHashMapUnmanaged(u64, *Epoch) = .empty,
+    /// The OPEN epochs (accepting records), one per ino. Both maps are
+    /// `U64Map`s: their inos come and go for the mount's life, and a
+    /// tombstone-keeping map would lengthen every `holds` miss with it
+    /// (decision 0003 §CU).
+    table: EpochMap = .empty,
     /// The epochs whose ONE save is in flight, one per ino: still visible
     /// to `bindsBlock`/`shadowOf` until the save landed or dropped (module
     /// doc). A second close of the ino parks on `close_settled`.
-    closing: std.AutoHashMapUnmanaged(u64, *Epoch) = .empty,
+    closing: EpochMap = .empty,
     close_settled: sync_notify.Notify = .init,
     /// The lever: `SQUEEZEFS_REWRITE_SHADOW` (off ⇒ every overwrite takes
     /// the per-block durable publish — `rewrite_shadow_fallbacks`).
@@ -283,13 +289,14 @@ pub const Epochs = struct {
     }
 
     pub fn deinit(self: *Epochs) void {
-        for ([_]*std.AutoHashMapUnmanaged(u64, *Epoch){ &self.table, &self.closing }) |t| {
-            var it = t.valueIterator();
-            while (it.next()) |e| {
-                stats.rewrite_shadow_parked_bytes.sub(e.*.parked_bytes);
+        for ([_]*EpochMap{ &self.table, &self.closing }) |t| {
+            var it = t.iterator();
+            while (it.next()) |kv| {
+                const e = kv.value_ptr.*;
+                stats.rewrite_shadow_parked_bytes.sub(e.parked_bytes);
                 stats.rewrite_shadow_open_epochs.sub(1);
-                e.*.deinit(self.gpa);
-                self.gpa.destroy(e.*);
+                e.deinit(self.gpa);
+                self.gpa.destroy(e);
             }
             t.deinit(self.gpa);
         }
@@ -313,9 +320,9 @@ pub const Epochs = struct {
                 want = n;
                 continue;
             }
-            for ([_]*std.AutoHashMapUnmanaged(u64, *Epoch){ &self.table, &self.closing }) |t| {
-                var it = t.keyIterator();
-                while (it.next()) |k| out.appendAssumeCapacity(k.*);
+            for ([_]*EpochMap{ &self.table, &self.closing }) |t| {
+                var it = t.iterator();
+                while (it.next()) |kv| out.appendAssumeCapacity(kv.key);
             }
             return;
         }
@@ -774,10 +781,10 @@ pub const Epochs = struct {
         {
             self.lock.lock();
             defer self.lock.unlock();
-            var it = self.table.keyIterator();
-            while (it.next()) |k| {
+            var it = self.table.iterator();
+            while (it.next()) |kv| {
                 if (n == inos.len) break;
-                inos[n] = k.*;
+                inos[n] = kv.key;
                 n += 1;
             }
         }
@@ -804,7 +811,7 @@ pub const Epochs = struct {
             while (it.next()) |kv| {
                 if (n == inos.len) break;
                 if (now_ns -| kv.value_ptr.*.last_record_ns >= EPOCH_IDLE_HORIZON_MS * std.time.ns_per_ms) {
-                    inos[n] = kv.key_ptr.*;
+                    inos[n] = kv.key;
                     n += 1;
                 }
             }

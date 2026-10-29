@@ -103,6 +103,7 @@ const op_guard = @import("op_guard.zig");
 const op_trace = @import("op_trace.zig");
 const errors = @import("../../core/errors.zig");
 const counters = @import("../../core/counters.zig");
+const u64_map = @import("../../core/u64_map.zig");
 const checksum = @import("../../core/checksum.zig");
 const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
@@ -191,6 +192,22 @@ pub const killSuidgidMode = economy.killSuidgidMode;
 // ---------------------------------------------------------------------------
 // Instruments.
 // ---------------------------------------------------------------------------
+
+/// The `..` memo's and the depth memo's census (`memoCensus`).
+pub const MemoCensus = struct { parents: u64_map.Census, depths: u64_map.Census };
+
+/// The `..` memo's level, published at each `.stats` lookup
+/// (`publishMemoGauges`): its entries, its table's slots and the Σ
+/// distance of its entries from their home slots — a hit reads
+/// `1 + displacement / entries` slots on the mean, a miss a function of
+/// `entries / slots` alone (the table holds no tombstones, decision 0003
+/// §CU). The depth memo's three beside it.
+pub var fuse_parent_memo_entries: counters.Gauge = .{};
+pub var fuse_parent_memo_slots: counters.Gauge = .{};
+pub var fuse_parent_memo_displacement: counters.Gauge = .{};
+pub var fuse_dir_depth_memo_entries: counters.Gauge = .{};
+pub var fuse_dir_depth_memo_slots: counters.Gauge = .{};
+pub var fuse_dir_depth_memo_displacement: counters.Gauge = .{};
 
 /// `fuse_parent_memo_drops`: a directory's `..` memo refused for memory —
 /// its `..` answers ENOENT, readdir's `..` names the directory itself and
@@ -733,16 +750,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// `afterTimerPass`).
         claims_landed: bool = false,
         locks: dlm.Manager,
-        /// The `..` memo (module doc).
+        /// The `..` memo (module doc). Both memos are `U64Map`s: a removal
+        /// leaves no tombstone, so a mount's churn of fresh directories
+        /// never lengthens a probe (decision 0003 §CU).
         parents_lock: jc.SpinLock = .{},
-        parents: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+        parents: u64_map.U64Map(u64) = .empty,
         /// A directory's depth byte (decision 0003 §BZ) and the count of
         /// directories this mount placed under it (the pick's ordinal,
         /// seeded from its `nlink − 2` at the first read after a mount),
         /// beside the parent memo: written at its mkdir and at a depth
         /// read, dropped with the parent memo; never written by a rename
         /// (the byte is the birth's).
-        depths: std.AutoHashMapUnmanaged(u64, DepthMemo) = .empty,
+        depths: u64_map.U64Map(DepthMemo) = .empty,
         /// The entry generation (charter §4 `FUSE_EXPORT_SUPPORT`): the
         /// kernel packs `(nodeid, i_generation)` into every file handle and
         /// a decode after the inode left its cache compares the generation
@@ -1130,6 +1149,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// FORGET).
         fn lookupVirtual(self: *Self, c: *Ctx, class: virtual_inodes.Class) Error!filesystem.Entry {
             const face = self.virtual orelse return error.FileNotFound;
+            if (class == .stats) self.publishMemoGauges();
             c.stage(.meta_backend_start);
             defer c.stage(.meta_backend_done);
             fuse_virtual_lookups.inc();
@@ -1765,6 +1785,29 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         const DepthMemo = struct { depth: u8, placed: u32 };
+
+        /// The two memos' full scans (O(capacity): the tests' and the
+        /// evidence rigs', never an op's).
+        fn memoCensus(self: *Self) MemoCensus {
+            self.parents_lock.lock();
+            defer self.parents_lock.unlock();
+            return .{ .parents = self.parents.census(), .depths = self.depths.census() };
+        }
+
+        /// The memos' gauges, published by the `.stats` lookup (the
+        /// render reads them exact; never an op's work).
+        fn publishMemoGauges(self: *Self) void {
+            self.parents_lock.lock();
+            const p = [3]u64{ self.parents.count(), self.parents.capacity(), self.parents.displacement };
+            const d = [3]u64{ self.depths.count(), self.depths.capacity(), self.depths.displacement };
+            self.parents_lock.unlock();
+            fuse_parent_memo_entries.set(p[0]);
+            fuse_parent_memo_slots.set(p[1]);
+            fuse_parent_memo_displacement.set(p[2]);
+            fuse_dir_depth_memo_entries.set(d[0]);
+            fuse_dir_depth_memo_slots.set(d[1]);
+            fuse_dir_depth_memo_displacement.set(d[2]);
+        }
 
         /// A fresh directory: its byte, no child placed yet.
         fn rememberDepth(self: *Self, dir: u64, depth: u8) void {
@@ -7397,6 +7440,54 @@ test "a mkdir on a set that cannot spread (one member, D = 0, one healthy member
     // rmdir drops the memo with the parent's.
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .rmdir = .{ .name = "d" } }, b).errno());
     try testing.expectEqual(@as(?u8, null), h.fs.memoDepth(legacy_child));
+}
+
+test "the `..` memo and the depth memo through a churn of fresh directories (decision 0003 §CU): 12 rounds of 20,000 remembered then forgotten — after every round's removals a miss reads ≤ 2 slots on the mean, at every peak ≤ 8.5 (the load bound), neither table grows past the peak's 32,768 slots, every lookup answers exactly, and the `.stats` gauges read the scan's level" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const n: u64 = 20_000;
+    const c0 = h.fs.memoCensus();
+    // Inos are never reused: every round's directories are fresh keys.
+    var next: u64 = 1 << 20;
+    for (0..12) |_| {
+        const base = next;
+        while (next < base + n) : (next += 1) {
+            h.fs.rememberParent(next, next - 1);
+            h.fs.rememberDepth(next, @truncate(next));
+        }
+        const peak = h.fs.memoCensus();
+        h.fs.publishMemoGauges();
+        try testing.expectEqual(peak.parents.entries, fuse_parent_memo_entries.load());
+        try testing.expectEqual(peak.parents.slots, fuse_parent_memo_slots.load());
+        try testing.expectEqual(peak.parents.displacement, fuse_parent_memo_displacement.load());
+        try testing.expectEqual(peak.depths.entries, fuse_dir_depth_memo_entries.load());
+        try testing.expectEqual(peak.depths.slots, fuse_dir_depth_memo_slots.load());
+        try testing.expectEqual(peak.depths.displacement, fuse_dir_depth_memo_displacement.load());
+        for ([_]u64_map.Census{ peak.parents, peak.depths }, [_]u64_map.Census{ c0.parents, c0.depths }) |c, z| {
+            try testing.expectEqual(z.entries + n, c.entries);
+            try testing.expect(c.slots <= 32_768);
+            try testing.expect(c.miss_probes * 2 <= c.slots * 17);
+        }
+        var k = base;
+        while (k < next) : (k += 97) {
+            try testing.expectEqual(@as(?u64, k - 1), h.fs.parentOf(k));
+            try testing.expectEqual(@as(?u8, @truncate(k)), h.fs.memoDepth(k));
+        }
+        k = base;
+        while (k < next) : (k += 1) h.fs.forgetParent(k);
+        const after = h.fs.memoCensus();
+        for ([_]u64_map.Census{ after.parents, after.depths }, [_]u64_map.Census{ c0.parents, c0.depths }) |c, z| {
+            try testing.expectEqual(z.entries, c.entries);
+            try testing.expect(c.slots <= 32_768);
+            try testing.expect(c.miss_probes <= 2 * c.slots);
+        }
+        k = base;
+        while (k < next) : (k += 97) {
+            try testing.expectEqual(@as(?u64, null), h.fs.parentOf(k));
+            try testing.expectEqual(@as(?u8, null), h.fs.memoDepth(k));
+        }
+    }
 }
 
 test "a FORGET whose corpse judgement would park the drain worker (the inode read refused try-only: a demand page, a load a fiber of its own lane leads) defers the judgement to the gather: the cadence re-judges nlink there, destroys the corpse and leaves the live inode" {

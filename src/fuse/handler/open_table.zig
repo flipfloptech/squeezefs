@@ -70,6 +70,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const counters = @import("../../core/counters.zig");
+const u64_map = @import("../../core/u64_map.zig");
 const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
 const jc = @import("../../meta/journal_core.zig");
@@ -224,10 +225,13 @@ pub const OpenTable = struct {
 
     const Stripe = struct {
         lock: jc.SpinLock = .{},
-        map: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
+        /// Both maps are `U64Map`s: every ino is fresh (never reused) and
+        /// leaves at its FORGET, so a tombstone-keeping map would lengthen
+        /// every miss over the mount's life (decision 0003 §CU).
+        map: u64_map.U64Map(Entry) = .empty,
         /// No-open: ino → its latest uncovered write. Independent of `map`:
         /// an evicted ino's custody is still owed its drain.
-        owed: std.AutoHashMapUnmanaged(u64, Owed) = .empty,
+        owed: u64_map.U64Map(Owed) = .empty,
         /// The timer posture's age order over `owed`: one live entry per
         /// owed ino (its `born_ns`), plus the stale ones a re-owe left.
         aged: AgeHeap = .empty,
@@ -260,10 +264,10 @@ pub const OpenTable = struct {
         var open: u64 = 0;
         var owed: u64 = 0;
         for (&self.stripes) |*s| {
-            var it = s.map.valueIterator();
+            var it = s.map.iterator();
             while (it.next()) |e| {
                 tracked += 1;
-                if (e.count > 0) open += 1;
+                if (e.value_ptr.count > 0) open += 1;
             }
             owed += s.owed.count();
             s.map.deinit(self.gpa);
@@ -295,7 +299,7 @@ pub const OpenTable = struct {
         const born_ns = if (gop.found_existing) gop.value_ptr.born_ns else now_ns;
         if (!gop.found_existing and self.posture == .timer) {
             s.aged.push(self.gpa, .{ .ino = ino, .born_ns = born_ns }) catch |e| {
-                s.owed.removeByPtr(gop.key_ptr);
+                _ = s.owed.remove(ino);
                 return e;
             };
         }
@@ -341,7 +345,7 @@ pub const OpenTable = struct {
         if (gop.found_existing and gop.value_ptr.born_ns <= born_ns) return;
         s.aged.push(self.gpa, .{ .ino = ino, .born_ns = born_ns }) catch |e| {
             // A new note rolls back; an existing one keeps its own entry.
-            if (!gop.found_existing) s.owed.removeByPtr(gop.key_ptr);
+            if (!gop.found_existing) _ = s.owed.remove(ino);
             return e;
         };
         if (gop.found_existing) {
@@ -428,7 +432,7 @@ pub const OpenTable = struct {
             while (n < out.len) {
                 const kv = it.next() orelse break;
                 if (!kv.value_ptr.deferred and now_ns -| kv.value_ptr.last_ns < idle_ns) continue;
-                out[n] = kv.key_ptr.*;
+                out[n] = kv.key;
                 n += 1;
             }
             // Removed after the walk: the iterator never sees a removal.
@@ -498,8 +502,8 @@ pub const OpenTable = struct {
                 s.lock.lock();
                 const n = s.map.count();
                 if (out.unusedCapacitySlice().len >= n) {
-                    var it = s.map.keyIterator();
-                    while (it.next()) |k| out.appendAssumeCapacity(k.*);
+                    var it = s.map.iterator();
+                    while (it.next()) |e| out.appendAssumeCapacity(e.key);
                     s.lock.unlock();
                     break;
                 }
@@ -625,9 +629,9 @@ pub const OpenTable = struct {
         for (&self.stripes) |*s| {
             s.lock.lock();
             defer s.lock.unlock();
-            var it = s.map.valueIterator();
+            var it = s.map.iterator();
             while (it.next()) |e| {
-                if (e.count > 0) n += 1;
+                if (e.value_ptr.count > 0) n += 1;
             }
         }
         return n;

@@ -31,9 +31,11 @@
 //!   continue each other logically and physically on one volume, with
 //!   equal flags, merge; a block past EOF is reported (allocation truth);
 //! - a packed tenant (and a staged file's tenant-shaped durable copy) is
-//!   `[0, ceil_4k(image))` at `offset + rel_off` with `DATA_TAIL |
-//!   NOT_ALIGNED`: its slot inside a stripe block other files share — the
-//!   kernel's tail-packing flags;
+//!   `[0, ceil_4k(image))` at `offset + rel_off`: its slot is its own 4 KiB
+//!   grains of a stripe block other files share, so at FIEMAP's block size
+//!   (FIGETBSZ) no block holds another file's byte — an ordinary aligned
+//!   extent, never DATA_TAIL (whose NOT_ALIGNED would be false: xfstests'
+//!   fiemap-tester refuses NOT_ALIGNED on an aligned extent);
 //! - inline data is `[0, len)` with `DATA_INLINE | NOT_ALIGNED`, physical
 //!   0 and UNKNOWN (the bytes are a metadata record's in a CoW tree node
 //!   that moves);
@@ -230,14 +232,12 @@ pub fn blocksRun(base: u64, len: u64, ordinal: ?u16, dev_off: u64) Run {
 }
 
 /// The run of a binding at logical `base`: a whole block covers `block`
-/// bytes, a tenant window its slot `ceil_4k(len)` at `offset + rel_off`
-/// (tail-packed: a stripe block other files share). A quarantined
-/// (DAMAGED) binding is no readable address: UNKNOWN at 0.
+/// bytes, a tenant window its slot `ceil_4k(len)` at `offset + rel_off`. A
+/// quarantined (DAMAGED) binding is no readable address: UNKNOWN at 0.
 pub fn mappingRun(base: u64, m: layout.Mapping, block: u64, ordinal: ?u16, encoded: bool) Run {
     const len = if (m.whole_block) block else layout.ceilGrain(m.len);
     const phys = if (m.damaged) null else physOf(ordinal, m.offset + m.rel_off, len);
     var flags: u32 = 0;
-    if (!m.whole_block) flags |= FIEMAP_EXTENT_DATA_TAIL | FIEMAP_EXTENT_NOT_ALIGNED;
     if (m.unwritten) flags |= FIEMAP_EXTENT_UNWRITTEN;
     if (phys == null) flags |= FIEMAP_EXTENT_UNKNOWN;
     if (encoded) flags |= FIEMAP_EXTENT_ENCODED;
@@ -505,7 +505,7 @@ test "fiemap: a full reply stops WITHOUT LAST and the next batch from the last e
     try testing.expectEqual(FIEMAP_EXTENT_LAST, exact[4].fe_flags);
 }
 
-test "fiemap: the non-striped shapes — inline [0, len) DATA_INLINE|NOT_ALIGNED|UNKNOWN at 0; a staged resident [0, ceil_4k(size)) DELALLOC|UNKNOWN at 0; a packed tenant [0, slot) at offset + rel_off, DATA_TAIL|NOT_ALIGNED (its stripe block is shared); a transformed block ENCODED and never merged; a DAMAGED binding UNKNOWN at 0" {
+test "fiemap: the non-striped shapes — inline [0, len) DATA_INLINE|NOT_ALIGNED|UNKNOWN at 0; a staged resident [0, ceil_4k(size)) DELALLOC|UNKNOWN at 0; a packed tenant [0, slot) at offset + rel_off, aligned, never DATA_TAIL (no 4 KiB block holds another file's byte); a transformed block ENCODED and never merged; a DAMAGED binding UNKNOWN at 0" {
     var buf: [4]Extent = undefined;
     var got = run(Range.of(0, std.math.maxInt(u64)), &.{inlineRun(1000).?}, &buf, false);
     try testing.expectEqual(@as(u32, 1), got.n);
@@ -523,11 +523,8 @@ test "fiemap: the non-striped shapes — inline [0, len) DATA_INLINE|NOT_ALIGNED
     got = run(Range.of(0, std.math.maxInt(u64)), &.{mappingRun(0, tenant, block4m, 0, false)}, &buf, false);
     try testing.expectEqual(@as(u64, 20_480), buf[0].fe_length);
     try testing.expectEqual(physOf(0, 8 * MiB + 12 * 4096, 0).?, buf[0].fe_physical);
-    try testing.expectEqual(FIEMAP_EXTENT_DATA_TAIL | FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_LAST, buf[0].fe_flags);
+    try testing.expectEqual(FIEMAP_EXTENT_LAST, buf[0].fe_flags);
     try testing.expect(buf[0].fe_physical % GRAIN == 0 and buf[0].fe_length % GRAIN == 0);
-    // A tenant never merges with a neighbouring whole block (its flags differ).
-    got = run(Range.of(0, std.math.maxInt(u64)), &.{ mappingRun(0, layout.Mapping.wholeBlock(0xA, 8 * MiB - block4m, 1), block4m, 0, false), mappingRun(block4m, layout.Mapping.tenant(0xA, 8 * MiB, 7, 0, 4096), block4m, 0, false) }, &buf, false);
-    try testing.expectEqual(@as(u32, 2), got.n);
 
     const t0 = layout.Mapping.wholeBlock(0xA, 0, 1);
     const t1 = layout.Mapping.wholeBlock(0xA, block4m + 4096, 2);

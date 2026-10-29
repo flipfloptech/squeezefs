@@ -9801,7 +9801,7 @@ fn fiemapPublish(h: anytype, ino: u64, l: Layout, proofs: []const layout.DmaProo
     try h.store.commit(t);
 }
 
-test "fiemap through the dispatcher (charter §4 FIEMAP): inline data is one DATA_INLINE|NOT_ALIGNED|UNKNOWN extent; a striped map's contiguous written blocks merge, a hole is a gap, a reservation is UNWRITTEN, LAST on the last; the count alone; a batch of one stops without LAST; a range clips at the grain; a packed tenant is its slot at its address, DATA_TAIL|NOT_ALIGNED; a staged file's durable copy is its extent; the custody lands first (SYNC runs the fsync leg instead); XATTR is EOPNOTSUPP (prep's EBADR is the caller's), a malformed size EINVAL" {
+test "fiemap through the dispatcher (charter §4 FIEMAP): inline data is one DATA_INLINE|NOT_ALIGNED|UNKNOWN extent; a striped map's contiguous written blocks merge, a hole is a gap, a reservation is UNWRITTEN, LAST on the last; the count alone; a batch of one stops without LAST; a range clips at the grain; a packed tenant is its slot at its address (aligned, never DATA_TAIL); a staged file's durable copy is its extent; the custody lands first (SYNC runs the fsync leg instead); XATTR is EOPNOTSUPP (prep's EBADR is the caller's), a malformed size EINVAL" {
     const H = HarnessOf(SettlingData);
     var h: H = undefined;
     try h.init();
@@ -9918,7 +9918,7 @@ test "fiemap through the dispatcher (charter §4 FIEMAP): inline data is one DAT
         try testing.expectEqual(@as(usize, 1), r.n);
         try testing.expectEqual(@as(u64, 12_288), ex[0].fe_length);
         try testing.expectEqual(fiemap.physOf(0, 30 * bs + 3 * 4096, 0).?, ex[0].fe_physical);
-        try testing.expectEqual(fiemap.FIEMAP_EXTENT_DATA_TAIL | fiemap.FIEMAP_EXTENT_NOT_ALIGNED | fiemap.FIEMAP_EXTENT_LAST, ex[0].fe_flags);
+        try testing.expectEqual(fiemap.FIEMAP_EXTENT_LAST, ex[0].fe_flags);
     }
     // Refusals: XATTR (prep refuses it EBADR before any batch), a size
     // that is not 32 + 56 × count; a virtual inode stays ENOSYS.

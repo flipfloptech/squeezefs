@@ -225,6 +225,8 @@ pub fn mapAnon(len: usize) ?[*]align(4096) u8 {
     return @ptrFromInt(rc);
 }
 
+/// `mapAnon`'s pages back through the raw syscall (libc's `munmap` is
+/// not interposed, but the shim's own I/O never reaches libc).
 pub fn unmapAnon(p: [*]align(4096) u8, len: usize) void {
     _ = linux.munmap(p, len);
 }

@@ -19257,7 +19257,7 @@ fn placed(e: fiemap.Extent) bool {
     return e.fe_physical >> fiemap.PHYS_VOLUME_SHIFT != 0 and e.fe_physical % fiemap.GRAIN == 0 and e.fe_flags & fiemap.FIEMAP_EXTENT_UNKNOWN == 0;
 }
 
-test "shim smoke: FIEMAP UNDER THE INTERPOSER (charter §4 FIEMAP, decision 0003 §CJ) — a supervised `-o interception` mount with the write cache; a C program calls FS_IOC_FIEMAP through libc: without LD_PRELOAD the kernel's EOPNOTSUPP stands; under it the daemon's map answers — inline data one DATA_INLINE|NOT_ALIGNED|UNKNOWN extent at physical 0; a sparse file its two written stripe blocks with the hole a gap (encoded physical, aligned), fm_extent_count 0 counts 2, a batch of one stops without LAST, a range clips at the 4 KiB grain, FIEMAP_FLAG_XATTR is EBADR with fm_flags = XATTR; a 16 MiB file with one whole block punched and a punch inside another maps blocks 0, 2, 3 (the 4 MiB grain: the inner punch stays mapped); a packed small file after fsync one DATA_TAIL|NOT_ALIGNED slot; a write-cache resident DELALLOC|UNKNOWN at 0 until FIEMAP_FLAG_SYNC promotes it (placed, counted); a file of another filesystem and FS_IOC_GETFLAGS pass through byte for byte; filefrag -v and xfs_io fiemap read the map; umount, fsck clean" {
+test "shim smoke: FIEMAP UNDER THE INTERPOSER (charter §4 FIEMAP, decision 0003 §CJ) — a supervised `-o interception` mount with the write cache; a C program calls FS_IOC_FIEMAP through libc: without LD_PRELOAD the kernel's EOPNOTSUPP stands; under it the daemon's map answers — inline data one DATA_INLINE|NOT_ALIGNED|UNKNOWN extent at physical 0; a sparse file its two written stripe blocks with the hole a gap (encoded physical, aligned), fm_extent_count 0 counts 2, a batch of one stops without LAST, a range clips at the 4 KiB grain, FIEMAP_FLAG_XATTR is EBADR with fm_flags = XATTR; a 16 MiB file with one whole block punched and a punch inside another maps blocks 0, 2, 3 (the 4 MiB grain: the inner punch stays mapped); a packed small file after fsync one aligned extent of its slot; a write-cache resident DELALLOC|UNKNOWN at 0 until FIEMAP_FLAG_SYNC promotes it (placed, counted); a file of another filesystem and FS_IOC_GETFLAGS pass through byte for byte; filefrag -v and xfs_io fiemap read the map; umount, fsck clean" {
     const io = testing.io;
     if (testkit.venue.mount(io, &.{ "squeezefs", "libsqueezefs_il.so" })) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -19350,11 +19350,12 @@ test "shim smoke: FIEMAP UNDER THE INTERPOSER (charter §4 FIEMAP, decision 0003
             return error.FiemapShape;
         }
     }
-    // A packed small file after its fsync: its slot of a shared stripe block.
+    // A packed small file after its fsync: its own 4 KiB grains of a shared
+    // stripe block, an aligned extent (never DATA_TAIL).
     {
         const a = try fr.mapAll(p.of("packed"), 0);
         try expectProbeShape("packed", &a);
-        if (a.n != 1 or a.ext[0].fe_length != 20_480 or a.ext[0].fe_flags != fiemap.FIEMAP_EXTENT_DATA_TAIL | fiemap.FIEMAP_EXTENT_NOT_ALIGNED | fiemap.FIEMAP_EXTENT_LAST or a.ext[0].fe_physical >> fiemap.PHYS_VOLUME_SHIFT == 0) {
+        if (a.n != 1 or a.ext[0].fe_length != 20_480 or a.ext[0].fe_flags != fiemap.FIEMAP_EXTENT_LAST or !placed(a.ext[0])) {
             a.print("packed");
             return error.FiemapShape;
         }

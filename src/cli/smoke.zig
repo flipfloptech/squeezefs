@@ -6798,6 +6798,21 @@ test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED H
             break;
         }
     }
+    // A host-wide sync(2) from any tenant of a shared venue reaches B as
+    // FUSE_SYNCFS (2 of 30 loaded DEAD MANAGER runs re-joined in place
+    // where this row pins the fail-stop: B's fuse_syncfs 3 for the row's
+    // own 1, custody gone, no intent open at the judge). The custody this
+    // row pins stays parked through it.
+    {
+        const before = try b.stats();
+        defer gpa.free(before);
+        const sy = try b.onMount("sync -f .");
+        gpa.free(sy);
+        const after = try b.stats();
+        defer gpa.free(after);
+        try testing.expect(numberAfter(after, "\"fuse_syncfs\":").? > numberAfter(before, "\"fuse_syncfs\":").?);
+        try testing.expectEqual(numberAfter(before, "\"syncfs_custody_inos\":"), numberAfter(after, "\"syncfs_custody_inos\":"));
+    }
     {
         const mk = try rig.onMount("mkdir hot");
         gpa.free(mk);

@@ -402,10 +402,10 @@ test "the recall over the ledger: quiescent at once with nothing in flight; a wr
     try testing.expect(write_lease_core.enterWrite(&d, 2));
     const drained0 = stats.ipc_write_lease_recalls_drained.load();
     const t = try std.Thread.spawn(.{}, Exiter.run, .{Exiter{ .w = &d, .delay_ns = 30 * std.time.ns_per_ms }});
-    const t0 = clock.monotonicNs();
-    try testing.expectEqual(WriteLeases.RecallOutcome.drained, WriteLeases.recallWords(testing.io, &d, std.time.ns_per_s));
+    // The outcome is the verdict (drained, never forced): the bound only
+    // has to outlast the exiter's start under any host load.
+    try testing.expectEqual(WriteLeases.RecallOutcome.drained, WriteLeases.recallWords(testing.io, &d, 60 * std.time.ns_per_s));
     t.join();
-    try testing.expect(clock.monotonicNs() - t0 < 500 * std.time.ns_per_ms);
     try testing.expectEqual(drained0 + 1, stats.ipc_write_lease_recalls_drained.load());
     try testing.expect(!write_lease_core.landedUnderForce(&d));
     // Wedged: never exits; forced at a short bound.

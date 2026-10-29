@@ -54,7 +54,6 @@ const knobs = @import("../core/knobs.zig");
 const mem_sizing = @import("../mem/sizing.zig");
 const json_scan = @import("../core/json_scan.zig");
 const mountinfo = @import("../core/mountinfo.zig");
-const tick_law = @import("../sync/tick.zig");
 const handler = @import("../fuse/handler.zig");
 const transport = @import("../fuse/transport.zig");
 const fuse_geometry = @import("../fuse/geometry.zig");
@@ -1238,7 +1237,7 @@ test "smoke: format → mount → the POSIX pass through the shell → umount �
 const routing_dirs: usize = 8;
 const routing_files_per_dir: usize = 250;
 
-fn routingTreeScript(gpa: std.mem.Allocator) ![]u8 {
+fn routingDirsScript(gpa: std.mem.Allocator) ![]u8 {
     var w: std.Io.Writer.Allocating = .init(gpa);
     errdefer w.deinit();
     // `r$d/s` (depth 2): a mkdir whose depth the rule needs — served off the
@@ -1246,7 +1245,16 @@ fn routingTreeScript(gpa: std.mem.Allocator) ![]u8 {
     // own `mkdir` process: a one-off caller with ONE decision (a caller
     // with two is an active stream and would open the shell's mint window,
     // decision 0003 §BV.4 — the row's spread premise is the lone shell).
-    try w.writer.print("for d in $(seq 0 {d}); do mkdir -p r$d; mkdir r$d/s; for i in $(seq 1 {d}); do echo \"$d-$i\" > r$d/f$i; done; done; find . -path ./.stats -prune -o -type f -print | wc -l", .{ routing_dirs - 1, routing_files_per_dir });
+    try w.writer.print("for d in $(seq 0 {d}); do mkdir -p r$d; mkdir r$d/s; done; echo dirs-made", .{routing_dirs - 1});
+    return w.toOwnedSlice();
+}
+
+/// The tree's files, after its directories (`routingDirsScript`); the
+/// file count.
+fn routingFilesScript(gpa: std.mem.Allocator) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    errdefer w.deinit();
+    try w.writer.print("for d in $(seq 0 {d}); do for i in $(seq 1 {d}); do echo \"$d-$i\" > r$d/f$i; done; done; find . -path ./.stats -prune -o -type f -print | wc -l", .{ routing_dirs - 1, routing_files_per_dir });
     return w.toOwnedSlice();
 }
 
@@ -1287,8 +1295,42 @@ test "smoke: a TWO-MEMBER metadata set through the binary — format sqmeta://a,
     // Mount the set, build the tree, read the gauges.
     try rig.spawnMountOf(rig.set_uri, &.{});
     _ = try rig.awaitReady(0);
+    // Directory placement (decision 0003 §BZ): the eight `r$d` are `/`'s
+    // children and the eight `r$d/s` depth-2 rotor decisions; every
+    // parent's depth and ordinal comes off the directory memo but `/`'s
+    // own, read ONCE per mount. The memo lives as long as the kernel holds
+    // the directory: its evicting FORGET drops it, and the next mkdir under
+    // it reads the record once more — so the law is judged against the
+    // phase's evictions (a host-wide `drop_caches` or reclaim between
+    // `mkdir r$d` and `mkdir r$d/s`, which no pin can close: the directory
+    // is unreferenced from its own mkdir's return), read through SIGUSR1
+    // (a `.stats` read would add an eviction of its own); with none, `/`
+    // alone was read.
+    const evicted0 = blk: {
+        const tail = try rig.statsTail();
+        defer gpa.free(tail);
+        break :blk numberAfter(tail, "\"fuse_forget_evictions\":") orelse return error.StatMissing;
+    };
     {
-        const script = try routingTreeScript(gpa);
+        const script = try routingDirsScript(gpa);
+        defer gpa.free(script);
+        const out = try rig.onMountTimed(script, 600);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("dirs-made\n", out);
+    }
+    {
+        const tail = try rig.statsTail();
+        defer gpa.free(tail);
+        const evicted = (numberAfter(tail, "\"fuse_forget_evictions\":") orelse return error.StatMissing) - evicted0;
+        const hits = numberAfter(tail, "\"fuse_dir_depth_memo_hits\":") orelse return error.StatMissing;
+        const reads = numberAfter(tail, "\"fuse_dir_depth_reads\":") orelse return error.StatMissing;
+        std.debug.print("\nsmoke: two-member set: {d} mkdirs — depth off the memo {d}, record reads {d}, inodes the kernel evicted meanwhile {d}\n", .{ 2 * routing_dirs, hits, reads, evicted });
+        try testing.expectEqual(@as(u64, 2 * routing_dirs), hits + reads);
+        try testing.expect(reads >= 1);
+        try testing.expect(reads <= 1 + evicted);
+    }
+    {
+        const script = try routingFilesScript(gpa);
         defer gpa.free(script);
         const out = try rig.onMountTimed(script, 600);
         defer gpa.free(out);
@@ -1303,13 +1345,8 @@ test "smoke: a TWO-MEMBER metadata set through the binary — format sqmeta://a,
         // (member 0: 63 guests + the native slot; member 1: 64 guests).
         try testing.expect((numberAfter(tail, "\"routing_guest_trees_minted\":") orelse 0) >= 2 * 63);
         try testing.expect((numberAfter(tail, "\"routing_mint_volume_picks\":") orelse 0) > 0);
-        // Directory placement (decision 0003 §BZ): the eight `r$d` are `/`'s
-        // children and the eight `r$d/s` depth-2 rotor decisions; every
-        // parent's depth and ordinal came off the directory memo but `/`'s
-        // own, read ONCE per mount — no other mkdir read a parent record.
+        // The sixteen placements were rotor decisions (the depth law above).
         try testing.expectEqual(@as(?u64, 2 * routing_dirs), numberAfter(tail, "\"routing_dir_place_rotor\":"));
-        try testing.expectEqual(@as(?u64, 2 * routing_dirs - 1), numberAfter(tail, "\"fuse_dir_depth_memo_hits\":"));
-        try testing.expectEqual(@as(?u64, 1), numberAfter(tail, "\"fuse_dir_depth_reads\":"));
         try testing.expectEqual(@as(?u64, 3), numberAfter(tail, "\"routing_dir_spread_depth\":"));
         // Each `r$d/s` sits beside its parent (a first child, the ordinal
         // pick) and the r's alternate: 4 of 16 placements remote, the
@@ -2181,6 +2218,18 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
         const first = try rig.onMount("cat b1/f7; ls b0 | wc -l");
         defer gpa.free(first);
         try testing.expectEqualStrings("b1-f7\n500\n", first);
+        // A's second read is A's kernel's cache hit only while that kernel
+        // holds the names: `b1/f7` (and so `b1`, its dentry's parent) is
+        // PINNED by an O_PATH fd from here to the count — unpinned, a
+        // host-wide `drop_caches` or reclaim between the reads evicts them
+        // and A's re-LOOKUPs take new grants on B (decision 0003 §CO). A
+        // pin that re-looked an evicted name up did so before `grants1`.
+        var pin_buf: [linux.PATH_MAX]u8 = undefined;
+        const pin = try openRaw(try std.fmt.bufPrintSentinel(&pin_buf, "{s}/b1/f7", .{rig.mp}, 0), .{ .PATH = true, .CLOEXEC = true });
+        var pinned = true;
+        defer if (pinned) {
+            _ = linux.close(pin);
+        };
         const tail_b1 = try b.stats();
         defer gpa.free(tail_b1);
         const grants1 = numberAfter(tail_b1, "\"dlm_token_grants\":") orelse 0;
@@ -2191,6 +2240,8 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
         const tail_b2 = try b.stats();
         defer gpa.free(tail_b2);
         try testing.expectEqual(grants1, numberAfter(tail_b2, "\"dlm_token_grants\":") orelse 0);
+        pinned = false;
+        _ = linux.close(pin);
         const w = try b.onMount("printf 'fresh\\n' > b1/f7");
         gpa.free(w);
         const third = try rig.onMount("cat b1/f7");
@@ -2479,9 +2530,10 @@ test "smoke: INVALIDATION COHERENCE ACROSS DAEMONS (decision 0003 §AB.2, §AG.2
         gpa.free(made);
         // A's own kernel is invalidated by its notifier thread, which the
         // served step's ack does not wait for (0003 §AB.2 (2)): the row
-        // waits for the observable within 2 s — a lost invalidation keeps
-        // the negative for the whole 60 s TTL.
-        const after = try rig.onMount("for i in $(seq 100); do test -e d/x && { echo yes; exit 0; }; sleep 0.02; done; echo no");
+        // waits for the observable for up to half the TTL — a lost
+        // invalidation keeps the negative for the whole 60 s, while the
+        // notifier's pace is the host's (decision 0003 §CO).
+        const after = try rig.onMount("for i in $(seq 1500); do test -e d/x && { echo yes; exit 0; }; sleep 0.02; done; echo no");
         defer gpa.free(after);
         try testing.expectEqualStrings("yes\n", after);
     }
@@ -3946,13 +3998,6 @@ fn expectMirrorOf(rig: *Rig, b: *Peer, files: []const u8, when: []const u8) !voi
     try expectMustStayZero(sa);
 }
 
-/// The bound on the daemon's exit once the kernel ends its connection, and
-/// on an orderly stop that finds the connection held by a bind: two lock
-/// plane ticks — the teardown's quantum twice (a drain, the dismount pass
-/// and the final checkpoint are sub-second on a quiet mount), 7× under
-/// the 30 s residency backstop the bind case used to wait out.
-const bind_exit_bound_ns: u64 = 2 * tick_law.tick_ns;
-
 /// `mount --bind src dst` (the kernel's, the daemon not involved).
 fn bindMount(src: [:0]const u8, dst: [:0]const u8) !void {
     _ = linux.mkdir(dst.ptr, 0o755);
@@ -3966,18 +4011,22 @@ fn mountedAt(gpa: std.mem.Allocator, io: Io, path: []const u8) !bool {
     return mountinfo.entryAt(mountinfo.read(io, buf), path) != null;
 }
 
-/// Poll the rig's daemon until it exits (its term) or the bound lapses
-/// (the wall is printed either way).
-fn awaitExitWithin(rig: *Rig, bound_ns: u64, what: []const u8) !std.process.Child.Term {
+/// The rig's daemon's exit (its term), awaited — the wall is printed, never
+/// judged (decision 0003 §CO) — and the stop's law judged by its mechanism:
+/// no transport group waited out the 30 s residency backstop since `mark`
+/// (the bind case's red: `residency backstop lapsed` ×N groups). The
+/// rig's exit ceiling is the anti-hang.
+fn awaitExit(rig: *Rig, mark: usize, what: []const u8) !std.process.Child.Term {
     const t0 = clock.monotonicNs();
-    while (alive(rig.child_pid) and clock.monotonicNs() - t0 < bound_ns) sleepMs(10);
-    const wall_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
-    std.debug.print("smoke[bind]: {s}: the daemon {s} after {d} ms (bound {d} ms)\n", .{ what, if (alive(rig.child_pid)) "is STILL ALIVE" else "exited", wall_ms, bound_ns / std.time.ns_per_ms });
-    try testing.expect(!alive(rig.child_pid));
-    return rig.waitChild();
+    const term = try rig.waitChild();
+    std.debug.print("smoke[bind]: {s}: the daemon exited after {d} ms\n", .{ what, (clock.monotonicNs() - t0) / std.time.ns_per_ms });
+    const text = try rig.readLog();
+    defer rig.gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text[mark..], "residency backstop lapsed") == null);
+    return term;
 }
 
-test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xfstests generic/409–411, 589 under the symmetric default) — mount, `mount --bind` it elsewhere, a file written through the mount reads through the bind; (a) the kernel's `umount` of the original: the daemon is not signalled, the bind KEEPS SERVING (`.stats`, the file sha-equal), `umount` of the bind drops the superblock's last reference and the daemon exits within two ticks, exit 0; (b) `squeezefs umount <bind>`: the kernel's plain detach naming daemon and mount, nothing signalled, the mount serves on; (c) `squeezefs umount <mount>` with the bind alive: the orderly stop ends its connection AT ONCE naming the bind (red: 30 s of `residency backstop lapsed` ×N groups), the bind answers ENOTCONN and detaches plainly; (d) generic/410's breakage — a tmpfs stacked INSIDE the tree (on the manager's dentry `sub`) stands through a member's join and through the member's changes of the shared root (fsstress's `fss<pid>` temp names, a directory renamed into and removed): the walk through `sub` reads the tmpfs each time, the join's whole-view epoch withheld (red on dev: that INC_EPOCH made `sub` invalid at the next walk and the kernel's `d_invalidate` detached the tmpfs — `sub/x` ENOENT); (e) a copy propagation made of the mount (its parent shared with a peer) goes WITH the orderly unmount — never another mount: no `other mount(s) of this superblock`, no abort, exit 0, nothing of ours left at the peer (red on dev: the verdict, read before the umount2, counted the copy and aborted under it); fsck --offline --scrub 0 findings after each" {
+test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xfstests generic/409–411, 589 under the symmetric default) — mount, `mount --bind` it elsewhere, a file written through the mount reads through the bind; (a) the kernel's `umount` of the original: the daemon is not signalled, the bind KEEPS SERVING (`.stats`, the file sha-equal), `umount` of the bind drops the superblock's last reference and the daemon exits, exit 0, no transport group waiting out the residency backstop; (b) `squeezefs umount <bind>`: the kernel's plain detach naming daemon and mount, nothing signalled, the mount serves on; (c) `squeezefs umount <mount>` with the bind alive: the orderly stop ends its connection AT ONCE naming the bind (red: 30 s of `residency backstop lapsed` ×N groups), the bind answers ENOTCONN and detaches plainly; (d) generic/410's breakage — a tmpfs stacked INSIDE the tree (on the manager's dentry `sub`) stands through a member's join and through the member's changes of the shared root (fsstress's `fss<pid>` temp names, a directory renamed into and removed): the walk through `sub` reads the tmpfs each time, the join's whole-view epoch withheld (red on dev: that INC_EPOCH made `sub` invalid at the next walk and the kernel's `d_invalidate` detached the tmpfs — `sub/x` ENOENT); (e) a copy propagation made of the mount (its parent shared with a peer) goes WITH the orderly unmount — never another mount: no `other mount(s) of this superblock`, no abort, exit 0, nothing of ours left at the peer (red on dev: the verdict, read before the umount2, counted the copy and aborted under it); fsck --offline --scrub 0 findings after each" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -4028,7 +4077,7 @@ test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xf
     }
     // The last reference: the kernel ends the connection, the daemon tears down.
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(bind.ptr, 0)));
-    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExitWithin(rig, bind_exit_bound_ns, "(a) the bind's umount dropped the last reference"));
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExit(rig, mark_a, "(a) the bind's umount dropped the last reference"));
     {
         const text = try rig.readLog();
         defer gpa.free(text);
@@ -4061,7 +4110,7 @@ test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xf
         try testing.expect(std.mem.indexOf(u8, text[mark_b..], "stop requested") == null);
     }
     try rig.umount();
-    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExitWithin(rig, bind_exit_bound_ns, "(b) the orderly stop after the bind's detach"));
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExit(rig, mark_b, "(b) the orderly stop after the bind's detach"));
     _ = try fsckClean(rig, "(b) the verb's plain detach of the bind");
     // ---- (c) the orderly stop with the bind alive: prompt and loud, never the backstop ----
     const mark_c = try rig.logLen();
@@ -4070,10 +4119,8 @@ test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xf
     try bindMount(rig.mp, bind);
     const t0 = clock.monotonicNs();
     try rig.umount();
-    const verb_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
-    std.debug.print("smoke[bind]: (c) `squeezefs umount` of the mount with the bind alive returned 0 after {d} ms\n", .{verb_ms});
-    try testing.expect(verb_ms <= bind_exit_bound_ns / std.time.ns_per_ms);
-    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExitWithin(rig, bind_exit_bound_ns, "(c) the orderly stop with the bind alive"));
+    std.debug.print("smoke[bind]: (c) `squeezefs umount` of the mount with the bind alive returned 0 after {d} ms\n", .{(clock.monotonicNs() - t0) / std.time.ns_per_ms});
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExit(rig, mark_c, "(c) the orderly stop with the bind alive"));
     {
         const text = try rig.readLog();
         defer gpa.free(text);
@@ -4138,7 +4185,7 @@ test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xf
         try b.expectCleanExit("(d) B's unmount");
     }
     try rig.umount();
-    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExitWithin(rig, bind_exit_bound_ns, "(d) the orderly stop after the member left"));
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExit(rig, mark_d, "(d) the orderly stop after the member left"));
     _ = try fsckClean(rig, "(d) a mount stacked inside the tree through a member's join and changes");
     // ---- (e) a copy propagation made goes WITH the orderly unmount ----
     // The mountpoint bound onto itself, its own peer group (private first:
@@ -4166,7 +4213,7 @@ test "smoke: A BIND OF THE MOUNT IS THE KERNEL'S, NEVER THE DAEMON'S TO STOP (xf
         try testing.expectEqualStrings("ok\n", out);
     }
     try rig.umount();
-    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExitWithin(rig, bind_exit_bound_ns, "(e) the orderly stop with a propagated copy"));
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try awaitExit(rig, mark_e, "(e) the orderly stop with a propagated copy"));
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, peer));
     {
         const text = try rig.readLog();
@@ -4319,15 +4366,13 @@ test "smoke: A DAEMON ENDS ONLY THE CONNECTION IT OWNS (decision 0003 §AN, §S)
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
 }
 
-/// The bound on one cross-owner rename with nothing moving (the law: a
-/// cross-owner op resolves within its round trips — a handover's at most —
-/// never the move gate's fail-stop deadline, 90 s at the default T_owner).
-const cross_owner_rename_bound_s: u32 = 2;
-
-/// The rename matrix's shell: `r SRC DST` is one `mv` under the bound, its
-/// wall time in ms on stdout (a timed-out rename fails the script).
+/// The rename matrix's shell: `r SRC DST` is one `mv`, its wall time in ms
+/// on stdout (printed, never judged — the op's law is the move gate's: an
+/// op whose slot move does not resolve within `T_park_max` is answered
+/// EIO and counted `slot_move_unresolved`, so a failed `mv` fails the
+/// script; decision 0003 §CO).
 const rename_matrix_prelude =
-    \\r() { t0=$(date +%s%N); timeout -s KILL 2 mv "$@" || { echo "rename $* did not resolve within 2 s (rc $?)" >&2; exit 1; }; echo "$(( ($(date +%s%N) - t0) / 1000000 ))"; }
+    \\r() { t0=$(date +%s%N); mv "$@" || { echo "rename $* failed (rc $?)" >&2; exit 1; }; echo "$(( ($(date +%s%N) - t0) / 1000000 ))"; }
     \\
 ;
 
@@ -4340,7 +4385,7 @@ fn expectIntentsAtRest(st: []const u8) !void {
     try testing.expectEqual(numberAfter(st, "\"xv_cross_owner_intents_minted\":") orelse 0, numberAfter(st, "\"xv_cross_owner_intents_retired\":") orelse 0);
 }
 
-/// Every line of `out` as a rename's ms, each within the bound; the max.
+/// Every line of `out` as a rename's ms; the max (printed).
 fn renameMatrixMaxMs(out: []const u8) !u64 {
     var max: u64 = 0;
     var n: usize = 0;
@@ -4348,7 +4393,6 @@ fn renameMatrixMaxMs(out: []const u8) !u64 {
     while (it.next()) |line| {
         if (line.len == 0) continue;
         const ms = try std.fmt.parseInt(u64, line, 10);
-        try testing.expect(ms <= cross_owner_rename_bound_s * std.time.ms_per_s);
         max = @max(max, ms);
         n += 1;
     }
@@ -4356,7 +4400,7 @@ fn renameMatrixMaxMs(out: []const u8) !u64 {
     return max;
 }
 
-test "smoke: A RENAME THROUGH A JOINED MOUNT INTO THE MANAGER'S DIRECTORY RESOLVES ITS SLOT MOVE (F8; generic/732 under the symmetric default) — A (the manager) `mkdir A B; touch A/f; mv A/f B/`; B JOINED reads B/f and moves it into A (every object the manager's: the intent's home is B's OWN rotor slot, never slot 0), A moves it back, B again; the mirror (B's directories and file, A moving it, B back); each member's file between the OTHER's directories both ways; a rename whose two parents are two holders' — every rename ≤ 2 s, never the move gate's deadline; every file whole through BOTH mounts, nlink exact, `df -i` equal on both; minted ≡ retired; umount B, A → fsck --offline --scrub 0 findings" {
+test "smoke: A RENAME THROUGH A JOINED MOUNT INTO THE MANAGER'S DIRECTORY RESOLVES ITS SLOT MOVE (F8; generic/732 under the symmetric default) — A (the manager) `mkdir A B; touch A/f; mv A/f B/`; B JOINED reads B/f and moves it into A (every object the manager's: the intent's home is B's OWN rotor slot, never slot 0), A moves it back, B again; the mirror (B's directories and file, A moving it, B back); each member's file between the OTHER's directories both ways; a rename whose two parents are two holders' — every rename resolves, never the move gate's deadline (its wall printed, never judged); every file whole through BOTH mounts, nlink exact, `df -i` equal on both; minted ≡ retired; umount B, A → fsck --offline --scrub 0 findings" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -4497,7 +4541,7 @@ test "smoke: A RENAME THROUGH A JOINED MOUNT INTO THE MANAGER'S DIRECTORY RESOLV
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     _ = try fsckClean(rig, "the joiner rename matrix");
-    std.debug.print("smoke: joiner rename matrix: 12 renames over two mounts (11 cross-owner), the slowest {d} ms (bound {d} s); the tree equal through both, df -i used {s}; fsck clean\n", .{ max_ms, cross_owner_rename_bound_s, std.mem.trimEnd(u8, df_a, "\n") });
+    std.debug.print("smoke: joiner rename matrix: 12 renames over two mounts (11 cross-owner), the slowest {d} ms; the tree equal through both, df -i used {s}; fsck clean\n", .{ max_ms, std.mem.trimEnd(u8, df_a, "\n") });
 }
 
 /// The wait channel of a daemon's thread by its comm (`/proc/<pid>/task/
@@ -4519,7 +4563,7 @@ fn threadWchan(io: Io, pid: linux.pid_t, comm: []const u8, out: []u8) !?[]const 
     return null;
 }
 
-test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY ON (decision 0003 §AB.2; generic/589 under joins) — A (the manager) + B JOINED; B lists the root (its token on the root with the dentries) and creates INTO the root: the create's step ships to A, A's pass recalls the root from B — B acks at once and queues the name's INVAL_ENTRY — and HOLDS after the acks (the seam), B's create in flight with its kernel holding the root's i_rwsem the whole hold: B's sideband thread is never in `fuse_reverse_inval_entry` (red on dev: it sat there until the create completed — in generic/589 39 s, then an uninterruptible exit), B's INVAL_ENTRY WAITED for the create's answer (deferred ≥ 1, decision 0003 §BL.2); released: the create completes ≤ 2 s, B's next walk of the root sees the file (the expired name's revalidation); B's ack came at once — the pass's recall closed on acks alone, every recall of A's acked (none retired at a lease's expiry or the deadline), while a grant B asked across the hold (its stat of the root) PARKED on the held pass and was served at the release (red: the row judged A's 'token_grant served in' line, which a grant parked behind its own hold writes — under load C3's 1511 ms); umount B, A → fsck 0 findings" {
+test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY ON (decision 0003 §AB.2; generic/589 under joins) — A (the manager) + B JOINED; B lists the root (its token on the root with the dentries) and creates INTO the root: the create's step ships to A, A's pass recalls the root from B — B acks at once and queues the name's INVAL_ENTRY — and HOLDS after the acks (the seam), B's create in flight with its kernel holding the root's i_rwsem the whole hold: B's sideband thread is never in `fuse_reverse_inval_entry` (red on dev: it sat there until the create completed — in generic/589 39 s, then an uninterruptible exit), B's INVAL_ENTRY WAITED for the create's answer (deferred ≥ 1, decision 0003 §BL.2); released: the create completes (its wall printed, never judged), B's next walk of the root sees the file (the expired name's revalidation); B's ack came at once — the pass's recall closed on acks alone, every recall of A's acked (none retired at a lease's expiry or the deadline), while a grant B asked across the hold (its stat of the root) PARKED on the held pass and was served at the release (red: the row judged A's 'token_grant served in' line, which a grant parked behind its own hold writes — under load C3's 1511 ms); umount B, A → fsck 0 findings" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -4625,7 +4669,6 @@ test "smoke: THE SIDEBAND NEVER inode_locks A DIRECTORY ITS DAEMON OWES A REPLY 
     const create_ms = (clock.monotonicNs() - t_release) / std.time.ns_per_ms;
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, touch_term);
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try stat_root.wait(io));
-    try testing.expect(create_ms <= cross_owner_rename_bound_s * std.time.ms_per_s);
     const touch_wall = try Io.Dir.cwd().readFileAlloc(io, touch_out_path, gpa, .limited(64));
     defer gpa.free(touch_wall);
     // The file through both mounts; B's next walk revalidates the expired
@@ -8904,14 +8947,20 @@ test "smoke: --daemon --supervise --log-file: the invoking process returns 0 onl
     try testing.expect(!@import("status.zig").writerGuardHeld(testing.io, rig.img));
 }
 
-/// The `.stats` herd row's bound on ONE read, and twice its bound on a
-/// drain worker's pass (`transport_pass_stalest_ms`): the lane-hold bound
-/// of the sighting (a drain worker held a second) — well under the
-/// supervisor's 5 s probe, far over a render (1–4 ms) plus a loaded
-/// lane's turn.
-const stats_herd_read_bound_ms: u64 = 2000;
+/// The `.stats` herd: readers, each reading at least `stats_herd_min_reads`
+/// whole documents, beside 8 creators for at least 8 s.
+const stats_herd_readers: u64 = 32;
+const stats_herd_min_reads: u64 = 8;
 
-test "smoke: 32 CONCURRENT READERS OF .stats UNDER A CREATE STORM NEVER WEDGE THE MOUNT (decision 0003 §CC; rung-10-stats-wedge.md) — a `--daemon --supervise` set, 8 creators making files beside 32 `cat .stats` loops for 8 s: every read completes within 2 s (on bc569d4 a read took 5–27 s under the kernel's lookup livelock and the supervisor SIGABRTed the daemon), lookups that arrive during a render share the next one (one render in flight per class), the control inode's probe misses nothing, no drain worker is held, the op watchdog is silent, every document parses" {
+/// The herd's renders per completed read stay under `readers / 4`: before
+/// §CC.2 every lookup was its own render and a read cost O(readers) of them
+/// (the kernel's revalidation retry — 23 a read at 32 readers on bc569d4);
+/// under one render in flight per class a read costs O(1) — the in-lookup
+/// owner's render and the waiters' revalidation (2–3 a read, idle and
+/// beside a gate's load).
+const stats_herd_renders_per_read_max: u64 = stats_herd_readers / 4;
+
+test "smoke: 32 CONCURRENT READERS OF .stats UNDER A CREATE STORM NEVER WEDGE THE MOUNT (decision 0003 §CC, §CO; rung-10-stats-wedge.md) — a `--daemon --supervise` set, 8 creators making files beside 32 readers of `.stats` for at least 8 s and at least 8 reads each: every reader completes its reads and every read is a whole document (on bc569d4 the supervisor SIGABRTed the daemon under the kernel's lookup livelock), the control inode's probe misses nothing, no drain worker is held for the probe's answer window, lookups share renders (fewer renders than shared lookups, renders per read under a quarter of the readers — every lookup was its own render before §CC.2), the op watchdog is silent; the read walls are printed, never judged (a fresh render per read takes what the host gives it)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -8921,45 +8970,71 @@ test "smoke: 32 CONCURRENT READERS OF .stats UNDER A CREATE STORM NEVER WEDGE TH
     try rig.spawnSupervised(&.{});
     _ = try rig.awaitReady(0);
     const mark = try rig.logLen();
-    // Eight creators and 32 readers in the background for 8 s, the
-    // readers' per-read walls and the lane-hold gauge each read saw in the
-    // work dir; the script's last line is `reads p50 max hold` over them.
-    const out = try rig.onMountTimed(
+    const st0 = try rig.stats();
+    const builds0 = numberAfter(st0, "\"stats_builds\":") orelse 0;
+    const shares0 = numberAfter(st0, "\"stats_generation_shares\":") orelse 0;
+    gpa.free(st0);
+    // Eight creators and 32 readers in the background: a reader runs until
+    // the 8 s stop AND its own minimum, one line per read in the work dir
+    // (`ok <wall µs> <lane hold ms>`, or `bad` for a failed read or a
+    // document that is not whole: no `{…}` frame or no lane-hold gauge),
+    // and keeps its last document for the strict parser below. bash for
+    // the reads: `$(< f)`, `[[ =~ ]]` and EPOCHREALTIME fork no tool, so a
+    // read is the FUSE path and a subshell. Output: `readers min ok bad
+    // hold` then `p50 max` (µs).
+    const script = std.fmt.comptimePrint(
         \\mkdir -p herd
         \\for c in 0 1 2 3 4 5 6 7; do ( i=0; while [ ! -e "$1/stop" ] && [ $i -lt 4000 ]; do : > "herd/f$c-$i"; i=$((i+1)); done ) & done
-        \\r=0; while [ $r -lt 32 ]; do
-        \\  ( while [ ! -e "$1/stop" ]; do t0=$(date +%s%N); h=$(cat .stats | grep -o '"transport_pass_stalest_ms":[0-9]*' | cut -d: -f2); echo "$(( ($(date +%s%N) - t0) / 1000000 )) ${h:-999999}" >> "$1/herd-$r"; done ) &
+        \\r=0; while [ $r -lt {d} ]; do
+        \\  bash -c 'n=0; while [ ! -e "$1/stop" ] || [ $n -lt {d} ]; do n=$((n+1)); t0=${{EPOCHREALTIME//[!0-9]/}}; if doc=$(< .stats) && [[ $doc == \{{*\}} && $doc =~ \"transport_pass_stalest_ms\":([0-9]+) ]]; then echo "ok $(( ${{EPOCHREALTIME//[!0-9]/}} - t0 )) ${{BASH_REMATCH[1]}}"; last=$doc; else echo bad; fi; done >> "$1/herd-$2"; printf "%s\n" "$last" > "$1/last-$2"' herd "$1" $r &
         \\  r=$((r+1))
         \\done
         \\sleep 8; : > "$1/stop"; wait
-        \\cat "$1"/herd-* | sort -n | awk '{ a[NR] = $1; if ($2 > h) h = $2 } END { print NR, a[int(NR / 2)], a[NR], h + 0 }'
-    , 120);
+        \\awk '{{ if (!(FILENAME in n)) f++; n[FILENAME]++ }} $1 == "ok" {{ ok++; if ($3 > h) h = $3 }} $1 != "ok" {{ bad++ }} END {{ m = -1; for (k in n) if (m < 0 || n[k] < m) m = n[k]; print f + 0, m, ok + 0, bad + 0, h + 0 }}' "$1"/herd-*
+        \\cat "$1"/herd-* | awk '$1 == "ok" {{ print $2 }}' | sort -n | awk '{{ a[NR] = $1 }} END {{ print a[int((NR + 1) / 2)] + 0, a[NR] + 0 }}'
+    , .{ stats_herd_readers, stats_herd_min_reads });
+    const out = try rig.onMountTimed(script, 120);
     defer gpa.free(out);
-    var it = std.mem.tokenizeAny(u8, std.mem.trim(u8, out, " \n"), " ");
-    const reads = try std.fmt.parseInt(u64, it.next() orelse return error.NoReads, 10);
-    const p50 = try std.fmt.parseInt(u64, it.next() orelse return error.NoReads, 10);
-    const max = try std.fmt.parseInt(u64, it.next() orelse return error.NoReads, 10);
-    // The longest in-flight drain-worker pass any document saw: the lane
-    // hold (a document without the gauge, or an unreadable one, reads as
-    // a hold past every bound).
-    const held = try std.fmt.parseInt(u64, it.next() orelse return error.NoReads, 10);
-    const st = try rig.stats();
-    defer gpa.free(st);
-    const shares = numberAfter(st, "\"stats_generation_shares\":") orelse 0;
-    const builds = numberAfter(st, "\"stats_builds\":") orelse 0;
-    const overdue = numberAfter(st, "\"fuse_op_watchdog_overdue\":") orelse 0;
+    var it = std.mem.tokenizeAny(u8, out, " \n");
+    var v: [7]u64 = undefined;
+    for (&v) |*x| x.* = try std.fmt.parseInt(u64, it.next() orelse return error.NoReads, 10);
+    const readers, const min_reads, const reads, const bad, const held, const p50_us, const max_us = v;
     const text = try rig.readLog();
     defer gpa.free(text);
     const misses = std.mem.count(u8, text[mark..], "missed probe") + std.mem.count(u8, text[mark..], "unresponsive for");
-    std.debug.print("\nsmoke[stats herd]: {d} reads in 8 s, p50 {d} ms, max {d} ms, longest worker pass seen {d} ms; {d} renders, {d} shared lookups; probe misses {d}; watchdog overdue {d}\n", .{ reads, p50, max, held, builds, shares, misses, overdue });
-    try testing.expect(reads >= 64);
-    try testing.expect(max < stats_herd_read_bound_ms);
-    try testing.expect(held < stats_herd_read_bound_ms / 2);
-    try testing.expect(shares > 0);
+    // A dead daemon has no document: the verdicts below name it.
+    const st_read = try rig.statsTry();
+    defer if (st_read) |t| gpa.free(t);
+    const st = st_read orelse "";
+    const builds = (numberAfter(st, "\"stats_builds\":") orelse 0) -| builds0;
+    const shares = (numberAfter(st, "\"stats_generation_shares\":") orelse 0) -| shares0;
+    const overdue = numberAfter(st, "\"fuse_op_watchdog_overdue\":") orelse 0;
+    std.debug.print("\nsmoke[stats herd]: {d} readers, {d} reads (fewest by one reader {d}), {d} failed; walls p50 {d} ms, max {d} ms (printed, not judged); longest worker pass seen {d} ms; {d} renders for {d} shared lookups ({d}.{d:0>2} renders a read); probe misses {d}; watchdog overdue {d}; daemon document {s}\n", .{ readers, reads + bad, min_reads, bad, p50_us / 1000, max_us / 1000, held, builds, shares, builds / @max(reads, 1), builds * 100 / @max(reads, 1) % 100, misses, overdue, if (st.len == 0) "UNREADABLE" else "read" });
+    // Progress: every reader completed its reads, each one a whole document.
+    try testing.expectEqual(stats_herd_readers, readers);
+    try testing.expect(min_reads >= stats_herd_min_reads);
+    try testing.expectEqual(@as(u64, 0), bad);
+    try testing.expect(st.len != 0);
+    // Each reader's last document, strictly parsed.
+    for (0..stats_herd_readers) |r| {
+        var pb: [linux.PATH_MAX]u8 = undefined;
+        const doc = try Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&pb, "{s}/last-{d}", .{ rig.work, r }), gpa, .limited(16 << 20));
+        defer gpa.free(doc);
+        try expectStrictStats(gpa, doc);
+    }
+    // Liveness: the supervisor's probe answered every tick, and no drain
+    // worker sat inside one pass for the window it gives an answer.
     try testing.expectEqual(@as(u64, 0), misses);
+    try testing.expect(held * std.time.ns_per_ms < (cli_supervisor.Policy{}).probe_timeout_ns);
+    // The collapse: lookups that arrived during a render shared the next.
+    try testing.expect(shares >= builds);
+    try testing.expect(builds <= reads * stats_herd_renders_per_read_max);
     try testing.expectEqual(@as(u64, 0), overdue);
     gpa.free(try rig.shOk(rig.mp, "rm -rf herd && echo cleaned"));
     try rig.umount();
+    const after = try rig.readLog();
+    defer gpa.free(after);
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, after[mark..], "missed probe") + std.mem.count(u8, after[mark..], "unresponsive for"));
 }
 
 /// generic/604's file count, each file 8 KiB: past `inline_max`, so every
@@ -9559,7 +9634,7 @@ fn timedFill(rig: *Rig, prefix: []const u8, files: u32) !TimedFill {
     return .{ .rc = rc, .at = at, .ms = ms, .err = r.stderr };
 }
 
-test "smoke: A WRITE HELD BEHIND A DEVICE THAT REFUSES EVERY DMA ANSWERS BEFORE THE KERNEL'S REQUEST DEADLINE AND THE MOUNT KEEPS SERVING (the daemon answers, never holds — xfstests generic/347) — a set whose two data volumes are thin volumes of a 64 MiB dm-thin pool in error_if_no_space (the allocator sees 2 GiB free), the write cache off, 8 parked buffers, the FUSE request timeout 30 s → a 1 MiB file written and synced → 64 files preallocated and 1 MiB written into each off the page grain (generic/347's shape: the accumulation arm parks each): the pool fills, every later DMA answers ENOSPC, the parked set fills, the next write meets the parked-buffer gate behind a stalled plane and answers ENOSPC before the 30 s request deadline (red on dev: held at the gate until the kernel aborted the connection at 30.7 s — ENOTCONN, the daemon fail-stopped) → a second writer during the stall answers within two ticks → `stat` and a read of the synced file succeed, the daemon alive → the pool grown: the parked set lands, `sync -f` succeeds → umount clean → `fsck --offline --scrub` 0 findings" {
+test "smoke: A WRITE HELD BEHIND A DEVICE THAT REFUSES EVERY DMA ANSWERS BEFORE THE KERNEL'S REQUEST DEADLINE AND THE MOUNT KEEPS SERVING (the daemon answers, never holds — xfstests generic/347) — a set whose two data volumes are thin volumes of a 64 MiB dm-thin pool in error_if_no_space (the allocator sees 2 GiB free), the write cache off, 8 parked buffers, the FUSE request timeout 30 s → a 1 MiB file written and synced → 64 files preallocated and 1 MiB written into each off the page grain (generic/347's shape: the accumulation arm parks each): the pool fills, every later DMA answers ENOSPC, the parked set fills, the next write meets the parked-buffer gate behind a stalled plane and answers ENOSPC before the 30 s request deadline (red on dev: held at the gate until the kernel aborted the connection at 30.7 s — ENOTCONN, the daemon fail-stopped) → a second writer during the stall answers at once, by the standing episode (no second wall of refused flushes) → `stat` and a read of the synced file succeed, the daemon alive → the pool grown: the parked set lands, `sync -f` succeeds → umount clean → `fsck --offline --scrub` 0 findings" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     if (DmErrorSet.venueMissing()) |why| return testkit.skipWhy(@src(), why);
@@ -9591,13 +9666,25 @@ test "smoke: A WRITE HELD BEHIND A DEVICE THAT REFUSES EVERY DMA ANSWERS BEFORE 
     try testing.expect(big.rc != 0);
     try testing.expect(std.mem.indexOf(u8, big.err, "No space left on device") != null);
     try testing.expect(big.ms < @as(u64, stalled_plane_request_timeout_s) * std.time.ms_per_s);
-    // A second writer meets the same stalled gate: answered at once.
+    // A second writer meets the same stalled gate: answered at once, by the
+    // standing episode — judged by the mechanism, never the wall (decision
+    // 0003 §CO): a writer held to the stall bound again would run a second
+    // wall of refused flushes (`parked_gate_wall_plane_stalls` +1).
+    const before_more = try rig.stats();
+    const stalls0 = numberAfter(before_more, "\"parked_gate_wall_plane_stalls\":") orelse 0;
+    const answers0 = numberAfter(before_more, "\"parked_gate_stall_answers\":") orelse 0;
+    gpa.free(before_more);
     const more = try timedFill(rig, "g", 4);
     defer gpa.free(more.err);
     std.debug.print("smoke[stalled plane]: a second writer during the stall: rc {d} at file {d} after {d} ms: {s}\n", .{ more.rc, more.at, more.ms, more.err });
     try rig.expectAlive("the second writer's answer");
     try testing.expect(more.rc != 0);
-    try testing.expect(more.ms < 2 * tick_law.tick_ns / std.time.ns_per_ms + 2 * std.time.ms_per_s);
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        try testing.expectEqual(stalls0, numberAfter(st, "\"parked_gate_wall_plane_stalls\":") orelse 0);
+        try testing.expect((numberAfter(st, "\"parked_gate_stall_answers\":") orelse 0) > answers0);
+    }
     {
         // Both answers were the gate's stall answer, after a counted stall.
         const st = try rig.stats();
@@ -10525,7 +10612,7 @@ fn expectSupervisorSilent(text: []const u8) !void {
     }
 }
 
-test "smoke: umount of a BUSY mount (another process's cwd inside it) — the verb REFUSES loud within a tick naming the holder's pid (EBUSY, exit 1), the daemon keeps serving (stat, a write), nothing detaches, the supervisor stays silent; a bare SIGTERM is refused the same way (counted in .stats); after the holder leaves the next umount is the clean one (`clean unmount`, `exited (wait status 0x0)`)" {
+test "smoke: umount of a BUSY mount (another process's cwd inside it) — the verb REFUSES loud naming the holder's pid (EBUSY, exit 1; its census alone, never the daemon's signalled refusal), the daemon keeps serving (stat, a write), nothing detaches, the supervisor stays silent; a bare SIGTERM is refused the same way (counted in .stats); after the holder leaves the next umount is the clean one (`clean unmount`, `exited (wait status 0x0)`)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -10560,16 +10647,20 @@ test "smoke: umount of a BUSY mount (another process's cwd inside it) — the ve
     }
     var pid_text: [16]u8 = undefined;
     const pid_s = try std.fmt.bufPrint(&pid_text, "{d}", .{holder.pid});
-    // 1. The verb refuses: EBUSY within one lock-plane tick, the holder
-    //    named, exit 1 — never 0, never 29 s, never a dead daemon.
+    // 1. The verb refuses: EBUSY, the holder named, exit 1 — never 0, never
+    //    a dead daemon, and never the daemon's own refusal after a signal
+    //    (the 29 s path: `transport_umount_busy_refusals` reads 1 after the
+    //    bare SIGTERM below, so the verb's census refused alone). The wall
+    //    is the host's census of every process's fds: printed, not judged
+    //    (decision 0003 §CO).
     {
         const t0 = clock.monotonicNs();
         const r = try rig.squeezefs(&.{ "umount", rig.mp });
         defer rig.freeRun(r);
         const took_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
-        if (r.term.success() or took_ms > 5000) std.debug.print("\n--- umount of the busy mount: rc {f} after {d} ms (expected exit 1 within a tick); stderr:\n{s}\n", .{ r.term, took_ms, r.stderr });
+        std.debug.print("\nsmoke[busy umount]: the verb answered rc {f} after {d} ms\n", .{ r.term, took_ms });
+        if (r.term.success()) std.debug.print("\n--- umount of the busy mount: rc {f} (expected exit 1); stderr:\n{s}\n", .{ r.term, r.stderr });
         try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
-        try testing.expect(took_ms <= 5000);
         if (std.mem.indexOf(u8, r.stderr, "busy") == null or std.mem.indexOf(u8, r.stderr, pid_s) == null) std.debug.print("\n--- the refusal did not name the holder {d}:\n{s}\n", .{ holder.pid, r.stderr });
         try testing.expect(std.mem.indexOf(u8, r.stderr, "busy") != null);
         try testing.expect(std.mem.indexOf(u8, r.stderr, pid_s) != null);
@@ -10611,7 +10702,6 @@ test "smoke: umount of a BUSY mount (another process's cwd inside it) — the ve
         const took_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
         if (!r.term.success()) std.debug.print("\n--- the clean umount failed ({f}) after {d} ms:\n{s}\n", .{ r.term, took_ms, r.stderr });
         try testing.expect(r.term.success());
-        try testing.expect(took_ms <= 20_000);
     }
     {
         const deadline = clock.monotonicNs() + exit_wait_ns;
@@ -10759,13 +10849,17 @@ test "smoke: `umount --lazy` of a BUSY mount — the verb returns at once naming
         // The daemon's log says which way its census went (the holder found
         // and the detach, or "unmounting": the orderly stop over a holder
         // the census missed, whose teardown ends the connection under it).
-        if (!r.term.success() or took_ms > 5000 or !named) {
+        // The wall is the host's census of every process's fds: printed,
+        // never judged (decision 0003 §CO); "at once" is the verb's return
+        // with the holder still inside (a verb that waited for the holder
+        // would never return: it leaves only at the stop file below).
+        std.debug.print("\nsmoke[lazy umount]: the verb answered rc {f} after {d} ms\n", .{ r.term, took_ms });
+        if (!r.term.success() or !named) {
             const since = try rig.readLog();
             defer gpa.free(since);
             std.debug.print("\n--- umount --lazy: rc {f} after {d} ms; stdout:\n{s}\nstderr:\n{s}\n--- the daemon's log since the signal ---\n{s}\n", .{ r.term, took_ms, r.stdout, r.stderr, since[@min(lazy_mark, since.len)..] });
         }
         try testing.expect(r.term.success());
-        try testing.expect(took_ms <= 5000);
         try testing.expect(named);
     }
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
@@ -12523,6 +12617,17 @@ test "smoke: THE READ VIEW — a 16 MiB striped file (no write cache), its custo
     const f = try std.fmt.bufPrintSentinel(&fb, "{s}/f", .{rig.mp}, 0);
     var pb: [linux.PATH_MAX]u8 = undefined;
     const pattern = try std.fmt.bufPrintSentinel(&pb, "{s}/pattern", .{rig.work}, 0);
+    // The view is the daemon's while the kernel holds the inode: its
+    // evicting FORGET empties the slot (`DataPlane.forgetShape`). Every
+    // read pass opens and closes the file, so the inode is PINNED by an
+    // O_PATH fd for the row — unpinned, a host-wide `drop_caches` or
+    // reclaim between two passes turns the next pass's first resolve into
+    // a miss (or a refill where a stale view is judged; decision 0003 §CO).
+    const pin = try openRaw(f, .{ .PATH = true, .CLOEXEC = true });
+    var pinned = true;
+    defer if (pinned) {
+        _ = linux.close(pin);
+    };
     // One read first: the view fills off the KV path for this file.
     try aioRandomReads(f, pattern, file_len, 1, 1, 1);
     const t0 = try rig.stats();
@@ -12582,6 +12687,8 @@ test "smoke: THE READ VIEW — a 16 MiB striped file (no write cache), its custo
     defer gpa.free(t3);
     try testing.expect(numberAfter(t3, "\"read_view_stale\":").? > numberAfter(t2, "\"read_view_stale\":").?);
     try expectMustStayZero(t3);
+    pinned = false;
+    _ = linux.close(pin);
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
@@ -14509,8 +14616,9 @@ fn oTruncRow(no_open: bool) !void {
         defer gpa.free(t);
         try testing.expectEqualStrings("0\n0\n", t);
         // A's kernel learns it from its own notifier (0003 §AB.2 (2)):
-        // bounded, a lost invalidation keeps the size for the 60 s TTL.
-        const a = try rig.onMount("for i in $(seq 100); do [ \"$(stat -c %s d/a)\" = 0 ] && break; sleep 0.02; done; stat -c %s d/a && cat d/a | wc -c");
+        // awaited for up to half the TTL (the notifier's pace is the
+        // host's); a lost invalidation keeps the size for the 60 s TTL.
+        const a = try rig.onMount("for i in $(seq 1500); do [ \"$(stat -c %s d/a)\" = 0 ] && break; sleep 0.02; done; stat -c %s d/a && cat d/a | wc -c");
         defer gpa.free(a);
         try testing.expectEqualStrings("0\n0\n", a);
     }
@@ -14519,10 +14627,10 @@ fn oTruncRow(no_open: bool) !void {
         const w = try b.onMount("echo from-b > d/b && cat d/b");
         defer gpa.free(w);
         try testing.expectEqualStrings("from-b\n", w);
-        const t = try rig.onMount("for i in $(seq 100); do [ -e d/b ] && break; sleep 0.02; done; cat d/b > /dev/null && : > d/b && stat -c %s d/b");
+        const t = try rig.onMount("for i in $(seq 1500); do [ -e d/b ] && break; sleep 0.02; done; cat d/b > /dev/null && : > d/b && stat -c %s d/b");
         defer gpa.free(t);
         try testing.expectEqualStrings("0\n", t);
-        const seen = try b.onMount("for i in $(seq 100); do [ \"$(stat -c %s d/b)\" = 0 ] && break; sleep 0.02; done; stat -c %s d/b && cat d/b | wc -c");
+        const seen = try b.onMount("for i in $(seq 1500); do [ \"$(stat -c %s d/b)\" = 0 ] && break; sleep 0.02; done; stat -c %s d/b && cat d/b | wc -c");
         defer gpa.free(seen);
         try testing.expectEqualStrings("0\n0\n", seen);
     }
@@ -14640,7 +14748,7 @@ test "smoke: A JOINED PEER READS THE HOLDER'S UNLANDED WRITES (charter §5.5 tok
         const w = try b.onMount("head -c 3000000 \"$1/image\" > d/c && stat -c %s d/c");
         defer gpa.free(w);
         try testing.expectEqualStrings("3000000\n", w);
-        const seen = try rig.onMount("for i in $(seq 100); do [ -e d/c ] && break; sleep 0.02; done; stat -c %s d/c && head -c 3000000 \"$1/image\" | cmp - d/c && echo same");
+        const seen = try rig.onMount("for i in $(seq 1500); do [ -e d/c ] && break; sleep 0.02; done; stat -c %s d/c && head -c 3000000 \"$1/image\" | cmp - d/c && echo same");
         defer gpa.free(seen);
         try testing.expectEqualStrings("3000000\nsame\n", seen);
     }
@@ -16482,8 +16590,8 @@ test "smoke: FALLOCATE STRIPS THE SETID BITS (fstests generic/683; decision 0003
         defer gpa.free(t);
         try testing.expectEqualStrings("6666\n6676\n2666 0\n676 0\n", t);
         // A's kernel learns it from the holder's own notifier (bounded by
-        // the attr TTL otherwise).
-        const a = try rig.onMount("for i in $(seq 200); do [ \"$(stat -c %a d/a)\" = 2666 ] && [ \"$(stat -c %a d/b)\" = 676 ] && break; sleep 0.02; done; stat -c '%a %s' d/a d/b");
+        // the attr TTL otherwise); awaited, the notifier's pace the host's.
+        const a = try rig.onMount("for i in $(seq 1500); do [ \"$(stat -c %a d/a)\" = 2666 ] && [ \"$(stat -c %a d/b)\" = 676 ] && break; sleep 0.02; done; stat -c '%a %s' d/a d/b");
         defer gpa.free(a);
         try testing.expectEqualStrings("2666 0\n676 0\n", a);
     }

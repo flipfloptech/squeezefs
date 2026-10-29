@@ -1276,12 +1276,12 @@ test "SQUEEZEFS_TEST_EXEC_DROP_WAKE: a dropped eventfd write is healed by the pa
     try testing.expectEqual(@as(u64, 1), l.tick_rescues.load(.monotonic));
     try testing.expectEqual(rescues_before + 1, stats.lane_tick_rescues.load());
     // The coalescer was disarmed by the rescue: the next wake is written and
-    // the second spawn lands within the tick.
+    // the second spawn lands by it — no second rescue (the tick counts the
+    // one that needed it, so the host's pace cannot move this verdict).
     p.done.store(0, .monotonic);
-    const t1 = clock.monotonicNs();
     _ = try spawnTest(l, &g, S.run, .{ .probe = &p, .lane = l });
     p.waitDone();
-    try testing.expect(clock.monotonicNs() - t1 < tick_ns / 2);
+    try testing.expectEqual(@as(u64, 1), l.tick_rescues.load(.monotonic));
     waitQuiescent(l);
 }
 

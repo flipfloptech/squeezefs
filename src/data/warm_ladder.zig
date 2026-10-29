@@ -41,7 +41,6 @@ const linux = std.os.linux;
 const Io = std.Io;
 
 const counters = @import("../core/counters.zig");
-const clock = @import("../core/clock.zig");
 const derive = @import("../core/derive.zig");
 const layout = @import("layout.zig");
 const rsc = @import("read_size_class.zig");
@@ -587,9 +586,7 @@ test "the warm ladder asks the write side TRY-ONLY: a `busy` custody station is 
     const ws0 = stats.fast_dispatch_demote_write_side.load();
     // Busy: the demote names the write side; the probe asked try-only.
     WS.mode = .busy;
-    const t0 = clock.monotonicNs();
     try testing.expectEqual(Verdict{ .demote = .write_side }, ladder.probe(7, 0, 4096, false, window));
-    try testing.expect(clock.monotonicNs() - t0 < 100 * std.time.ns_per_ms);
     try testing.expectEqual(@as(?bool, true), WS.try_only_seen);
     try testing.expectEqual(ws0 + 1, stats.fast_dispatch_demote_write_side.load());
     // Served: the station's bytes, the rest of the window zeros.
@@ -765,12 +762,11 @@ test "the warm ladder never blocks: a cold block demotes (miss), a held guard de
     try testing.expectEqual(Verdict{ .demote = .pre_screen }, ladder.probe(7, 0, 0, false, window));
     try testing.expectEqual(Verdict{ .demote = .pre_screen }, ladder.probe(7, 0, 4096, false, window[0..100]));
     probes += 2;
-    // A held exclusive guard: Demote at once (no wait).
+    // A held exclusive guard: Demote at once (no wait — this thread holds
+    // the guard, so a probe that waited for it would never return).
     const held = guards.acquire(testing.io, 7, .exclusive);
-    const t0 = clock.monotonicNs();
     try testing.expectEqual(Verdict{ .demote = .contended }, ladder.probe(7, 0, 4096, false, window));
     probes += 1;
-    try testing.expect(clock.monotonicNs() - t0 < 100 * std.time.ns_per_ms);
     held.release(testing.io);
     // The hold arm after the hot tier dropped the block: block 0's whole-
     // block read credited its full coverage (retired from the hold); block

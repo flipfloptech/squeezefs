@@ -864,7 +864,9 @@ test "smoke: THE INTERCEPTION HOST, death — kill -9 the daemon under a parked 
     const t0 = clock.monotonicNs();
     try testing.expect(s.pread(b.id, &buf, 0) == .fallthrough);
     const elapsed = clock.monotonicNs() - t0;
-    try testing.expect(elapsed < 5 * std.time.ns_per_s);
+    // The death poisoned it, never the op's deadline (the only other way
+    // this op ends): the bound is the session's own.
+    try testing.expect(elapsed < s.op_timeout_ns);
     try testing.expect(s.poisoned());
     _ = linux.umount2(rig.mp.ptr, linux.MNT.DETACH);
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));

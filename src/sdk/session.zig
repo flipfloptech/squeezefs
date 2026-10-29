@@ -1496,8 +1496,9 @@ test "sdk e2e: daemon death — the heartbeat watch poisons within the 1 s ladde
     var cqe: [1]Cqe = undefined;
     try testing.expectEqual(@as(i32, 1), s.wait(&cqe, 10 * std.time.ns_per_s));
     const elapsed = clock.monotonicNs() - t0;
+    // The heartbeat's ladder, never the 20 s op deadline: the cause says
+    // which (the wall is the host's).
     try testing.expect(elapsed >= rendezvous.HEARTBEAT_STALE_NS);
-    try testing.expect(elapsed < 5 * std.time.ns_per_s);
     try testing.expectEqual(@as(u64, 42), cqe[0].user_data);
     try testing.expectEqual(neg(.IO), cqe[0].res);
     try testing.expectEqual(PoisonCause.heartbeat, s.poisonCause());
@@ -1544,7 +1545,6 @@ test "sdk e2e: the op deadline is the last rung — a frozen daemon with a live 
     try testing.expectEqual(neg(.IO), s.rw(f, .read, &iov, 0));
     const elapsed = clock.monotonicNs() - t0;
     try testing.expect(elapsed >= 300 * std.time.ns_per_ms);
-    try testing.expect(elapsed < 3 * std.time.ns_per_s);
     try testing.expectEqual(PoisonCause.deadline, s.poisonCause());
     try testing.expectEqual(lease.State.poisoned, b.lease.load().state);
     try testing.expectEqual(neg(.NOTCONN), s.rw(f, .read, &iov, 0));

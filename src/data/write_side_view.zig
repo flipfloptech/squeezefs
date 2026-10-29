@@ -21,7 +21,6 @@ const Io = std.Io;
 const assert = std.debug.assert;
 
 const counters = @import("../core/counters.zig");
-const clock = @import("../core/clock.zig");
 const staging = @import("staging.zig");
 const cov = @import("write_coverage.zig");
 const seams = @import("write_seams.zig");
@@ -540,12 +539,11 @@ test "try-only (the uring worker's warm-ladder probe): a held block lock answers
     const e = w.table.checkout(1, 0, false, null).?;
     var q: [wt.BS / 4]u8 = @splat(0x44);
     _ = try w.table.recordWrite(e, wt.BS / 2, &q);
-    // The write side holds (3) for (1, 0): a blocking serve would park here.
+    // The write side holds (3) for (1, 0): a blocking serve would park here
+    // for good (this thread is the holder) — the answer is the proof.
     const held = w.locks.acquire(io, 1, 0, .write_checkout);
     const busy0 = stats.write_side_busy.load();
-    const t0 = clock.monotonicNs();
     try testing.expectEqual(Outcome.busy, v.serve(io, .{ .ino = 1, .block = 0, .rel = 0, .out = &out, .try_only = true }));
-    try testing.expect(clock.monotonicNs() - t0 < 100 * std.time.ns_per_ms);
     try testing.expectEqual(busy0 + 1, stats.write_side_busy.load());
     held.release(io);
     // Free again: the try-only probe serves exactly what the blocking serve does.

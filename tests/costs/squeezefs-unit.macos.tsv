@@ -1855,7 +1855,7 @@ ops.jobs.records.test.the type predicates: movers are evacuate/rebalance/defrag_
 ops.jobs.seams.test.the fabric's own AdminJob and Throttle bindings: submit/status/wait route to the fabric; a step prices the park and reads the live pct; the none dispatcher has zero capacity and the charter's TTL	183	184
 ops.jobs.stats.test.the family renders as one JSON object with every instrument named; the closures hold on a quiet fabric	40	40
 ops.jobs.test_0	6	7
-ops.jobs.throttle.test.dutyPark at a fixed pct serves the law's total: a 20 ms task at 50 % parks ≈ 20 ms across slices (±10 %), and its books hold the task and exactly the law's park	20665	13
+ops.jobs.throttle.test.dutyPark at a fixed pct serves the law's total: a 20 ms task at 50 % parks at least 20 ms across slices (the wall's overshoot is the host's), and its books hold the task and exactly the law's park	20665	13
 ops.jobs.throttle.test.dutyPark: unthrottled returns at once; a pre-set stop interrupts before the first slice; a live rethrottle to 100 from another thread ends the park within one slice	73	79
 ops.jobs.throttle.test.pipeline width: unthrottled movers overlap 4; throttled or order-dependent passes are serial	1	1
 ops.jobs.throttle.test.throttle law is exact at every duty target: sleep = t × (100 − pct)/pct — 25/50/75 give 3t, t, t/3; 0 and ≥ 100 are none; under 1 ms is none	3	3

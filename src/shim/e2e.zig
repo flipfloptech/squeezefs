@@ -403,7 +403,9 @@ test "e2e: the daemon dying mid-op — a frozen, severed host ⇒ the op falls t
     const t0 = clock.monotonicNs();
     try testing.expect(ops.positional(rig.st, .read, fd, &buf, buf.len, 0) == .real);
     const elapsed = clock.monotonicNs() - t0;
-    try testing.expect(elapsed < 5 * std.time.ns_per_s);
+    // The heartbeat poisoned it, never the 20 s op deadline set above (the
+    // only other way this op ends).
+    try testing.expect(elapsed < 20_000 * std.time.ns_per_ms);
     try testing.expectEqual(before + 1, classify.passthroughCount(.poisoned));
     try testing.expect(!rig.st.table.isBound(fd));
     try testing.expectEqual(@as(u64, 0), rig.host.unbinds.load(.monotonic));

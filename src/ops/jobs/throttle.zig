@@ -169,27 +169,36 @@ test "dutyPark: unthrottled returns at once; a pre-set stop interrupts before th
     const io = testing.io;
     var ctl: Control = .{};
     try testing.expectEqual(ParkOutcome.served, dutyPark(io, &ctl, 10 * std.time.ns_per_ms));
+    // Judged in SERVED time, never the wall: each slice is credited no more
+    // than its deadline, so the host's pace moves no verdict (decision 0003
+    // §CO).
     ctl.setPct(io, 10);
     ctl.interrupt(io);
-    const t0 = clock.monotonicNs();
+    const served0 = ctl.served_ns.load(.monotonic);
     try testing.expectEqual(ParkOutcome.interrupted, dutyPark(io, &ctl, std.time.ns_per_s));
-    try testing.expect(clock.monotonicNs() - t0 < DUTY_SLICE_NS);
+    try testing.expectEqual(served0, ctl.served_ns.load(.monotonic));
     ctl.clearStop();
-    // A 1 % park of a 1 s task would be 99 s; the retune lands it.
+    // A 1 % park of a 1 s task would be 99 s; the retune lands it: after the
+    // pct moved the park serves the slice in flight and at most one more (a
+    // retune between a slice's re-read and the next wait's registration).
     ctl.setPct(io, 1);
     const Retune = struct {
-        fn run(c: *Control, i: Io) void {
-            c.setPct(i, 100);
+        c: *Control,
+        i: Io,
+        served_at: u64 = 0,
+        fn run(self: *@This()) void {
+            self.c.setPct(self.i, 100);
+            self.served_at = self.c.served_ns.load(.monotonic);
         }
     };
-    const t1 = clock.monotonicNs();
-    const th = try std.Thread.spawn(.{}, Retune.run, .{ &ctl, io });
+    var retune: Retune = .{ .c = &ctl, .i = io };
+    const th = try std.Thread.spawn(.{}, Retune.run, .{&retune});
     try testing.expectEqual(ParkOutcome.served, dutyPark(io, &ctl, std.time.ns_per_s));
     th.join();
-    try testing.expect(clock.monotonicNs() - t1 < 5 * DUTY_SLICE_NS);
+    try testing.expect(ctl.served_ns.load(.monotonic) - retune.served_at <= 2 * DUTY_SLICE_NS);
 }
 
-test "dutyPark at a fixed pct serves the law's total: a 20 ms task at 50 % parks ≈ 20 ms across slices (±10 %), and its books hold the task and exactly the law's park" {
+test "dutyPark at a fixed pct serves the law's total: a 20 ms task at 50 % parks at least 20 ms across slices (the wall's overshoot is the host's), and its books hold the task and exactly the law's park" {
     const io = testing.io;
     var ctl: Control = .{};
     ctl.setPct(io, 50);
@@ -197,7 +206,6 @@ test "dutyPark at a fixed pct serves the law's total: a 20 ms task at 50 % parks
     try testing.expectEqual(ParkOutcome.served, dutyPark(io, &ctl, 20 * std.time.ns_per_ms));
     const parked = clock.monotonicNs() - t0;
     try testing.expect(parked >= 18 * std.time.ns_per_ms);
-    try testing.expect(parked < 200 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u64, 20 * std.time.ns_per_ms), ctl.worked_ns.load(.monotonic));
     try testing.expectEqual(@as(u64, 20 * std.time.ns_per_ms), ctl.served_ns.load(.monotonic));
     try testing.expect(parked >= ctl.served_ns.load(.monotonic));

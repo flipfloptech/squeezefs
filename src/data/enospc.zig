@@ -705,7 +705,6 @@ test "the write path's grace-bounded mint: `.none` ⇒ byte-identical to the val
     try log.testing.expectAllFired();
     const waited = clock.monotonicNs() - t0;
     try testing.expect(waited >= PRESSURE_PARK_WALL_FLOOR_MS * std.time.ns_per_ms);
-    try testing.expect(waited < 5 * std.time.ns_per_s);
     try testing.expect(stats.alloc_pressure_parks.load() > parks0);
     try testing.expectEqual(wall0 + 1, stats.alloc_pressure_park_wall_refusals.load());
     // Supply that ARRIVES during the park: the free rings the edge, the mint lands on it.

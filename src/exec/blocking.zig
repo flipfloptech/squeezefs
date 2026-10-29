@@ -368,7 +368,7 @@ test "run_blocking_returns_and_reuses_threads: two sequential jobs run on ONE th
     try testing.expectEqual(@as(u32, 1), p.pool.threads());
 }
 
-test "burst_submits_run_in_parallel_past_one_idle_worker: 4 × 100 ms finish in < 250 ms" {
+test "burst_submits_run_in_parallel_past_one_idle_worker: 4 jobs that each wait for all 4 to be running all finish" {
     const p = try testPool(8, idle_reap_ns);
     defer p.timer.deinit();
     defer p.pool.deinit();
@@ -379,16 +379,32 @@ test "burst_submits_run_in_parallel_past_one_idle_worker: 4 × 100 ms finish in 
     try p.pool.submit(&warm.job);
     warm.wait();
     while (p.pool.idleWorkers() == 0) try std.Thread.yield();
-    var jobs: [4]Counter = undefined;
-    const t0 = clock.monotonicNs();
+    // Concurrency is the law, judged by its observable: each job holds its
+    // thread until all four are running at once — a pool that ran the burst
+    // on fewer threads would never let the first one finish (never a wall
+    // bound on the jobs, whose threads the host schedules).
+    const Rendezvous = struct {
+        job: Job,
+        running: *std.atomic.Value(u32),
+        hits: *std.atomic.Value(u32),
+        fn run(j: *Job) void {
+            const r: *@This() = @fieldParentPtr("job", j);
+            _ = r.running.fetchAdd(1, .acq_rel);
+            while (r.running.load(.acquire) < 4) std.Thread.yield() catch {};
+            _ = r.hits.fetchAdd(1, .acq_rel);
+        }
+        fn wait(r: *@This()) void {
+            while (r.job.done.load(.acquire) == 0) futex.wait(&r.job.done, 0);
+        }
+    };
+    var running: std.atomic.Value(u32) = .init(0);
+    var jobs: [4]Rendezvous = undefined;
     for (&jobs) |*j| {
-        j.* = .{ .job = .{ .run = Counter.run, .fiber = null }, .hits = &hits, .tid = &tid, .sleep_ms = 100 };
+        j.* = .{ .job = .{ .run = Rendezvous.run, .fiber = null }, .running = &running, .hits = &hits };
         try p.pool.submit(&j.job);
     }
     for (&jobs) |*j| j.wait();
-    const elapsed = clock.monotonicNs() - t0;
     try testing.expectEqual(@as(u32, 5), hits.load(.acquire));
-    try testing.expect(elapsed < 250 * std.time.ns_per_ms);
     try testing.expect(p.pool.threads() >= 4);
 }
 
@@ -403,11 +419,9 @@ test "idle reap: workers exit after the reap period with an empty queue (through
     a.wait();
     try testing.expectEqual(@as(u32, 1), p.pool.threads());
     const reaped_before = stats.blocking_reaped.load();
-    const t0 = clock.monotonicNs();
-    while (p.pool.threads() != 0) {
-        try testing.expect(clock.monotonicNs() - t0 < 2 * std.time.ns_per_s);
-        try std.Thread.yield();
-    }
+    // The reap is awaited, never timed: a worker that never reaps is the
+    // hang watchdog's.
+    while (p.pool.threads() != 0) try std.Thread.yield();
     try testing.expectEqual(reaped_before + 1, stats.blocking_reaped.load());
     // The pool respawns on the next job.
     var b: Counter = .{ .job = .{ .run = Counter.run, .fiber = null }, .hits = &hits, .tid = &tid, .sleep_ms = 0 };

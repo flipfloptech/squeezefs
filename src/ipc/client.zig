@@ -1694,8 +1694,10 @@ test "e2e: heartbeat death detection — a daemon that stops stamping and severs
     const t0 = clock.monotonicNs();
     try testing.expect(s.pread(b.id, &buf, 0) == .fallthrough);
     const elapsed = clock.monotonicNs() - t0;
+    // The heartbeat's ladder poisoned it, never the op's deadline (the
+    // only other way this op ends): the bound is the session's own.
     try testing.expect(elapsed >= rendezvous.HEARTBEAT_STALE_NS);
-    try testing.expect(elapsed < 5 * std.time.ns_per_s);
+    try testing.expect(elapsed < s.op_timeout_ns);
     try testing.expect(s.poisoned());
     try testing.expectEqual(@as(u64, 1), s.il_abandoned_slots.load(.monotonic));
     try testing.expect(s.pread(b.id, &buf, 0) == .fallthrough);

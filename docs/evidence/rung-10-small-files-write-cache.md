@@ -77,3 +77,24 @@ inline arm lost ≤ 50 ms. A small resident is charged 12 KiB of ring. `writebac
 product caller. THE FULL DATA STORE row's fill bound fails under a host-wide `sync(2)` mid-fill (2 of 3 on
 the branch; green on the third and on `7693bab`). The first measuring rounds ran capped by the venue's
 cage and beside another agent's `sync(2)` loop (21:30–22:21): superseded by the pinned, interleaved round.
+
+## The A-B-B-A (2026-10-29, quiet host on AC, the RAM-NVMe perf mount, 2 MDT + 2 OST, dist builds)
+
+`dev` `0778bb4` against `e0c0596`, three rounds of legs A B B A, two mdtest shapes per leg
+(`-n 10000 -u -i 1`, plain and `-w 4096 -e 4096`), gate lock and every build slot held, tctl ≤ 70 °C,
+fsck clean after all 48 runs; k ops/s, the mean of all legs (`dev` 5–6, branch 6):
+
+| row | plain -np 32 | plain -np 64 | 4 KiB/file -np 32 | 4 KiB/file -np 64 |
+|---|---|---|---|---|
+| file creation | 253 → 253 (0 %) | 258 → 262 (+2 %) | 64 → **98 (+53 %)** | 56 → **94 (+68 %)** |
+| file read | 913 → 880 (−4 %) | 942 → 915 (−3 %) | 849 → 828 (−2 %) | 515 → **869 (+69 %)** |
+| file removal | 322 → 321 (0 %) | 346 → 343 (−1 %) | 324 → 314 (−3 %) | 283 → **370 (+31 %)** |
+| directory creation | 277 → 285 (+3 %) | 257 → 258 (0 %) | 293 → 278 (−5 %, one 250 k leg) | 255 → 263 (+3 %) |
+| directory removal | 288 → 289 (0 %) | 298 → 295 (−1 %) | 291 → 285 (−2 %) | 289 → 291 (+1 %) |
+
+The stat rows (kernel-cached, 1–13 M/s) swing ± 30 % between `dev`'s own legs and are not listed. One
+`dev` run (round 2, 4 KiB/file -np 32) WEDGED: every in-flight op parked past `meta_backend_start` /
+`write_locked`, the supervisor SIGABRTed the daemon — the inline arm's journal-full stall that never
+cleared; that shape no longer journals payloads on this branch, and the wedge itself is fixed on its own
+branch (`fix/journal-full-wedge`, decision 0003 §CM). Landed (gate 166 green, 75/75). Sessions:
+`/build/perf/sf-abba/`, `sf-abba2/`, `sf-abba3/`.

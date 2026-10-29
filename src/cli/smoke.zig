@@ -6967,6 +6967,127 @@ test "smoke: A LIVE MEMBER EVICTED AT T_OWNER UNDER THE DEAD MANAGER'S STRIPED H
     _ = try fsckClean(rig, "a live member evicted at T_owner");
 }
 
+test "smoke: A LIVE MEMBER EVICTED UNDER THE DEAD MANAGER'S STRIPED HOT DIRECTORY WITH NOTHING UN-LANDED RE-JOINS IN PLACE (decision 0003 §BS, §CG — the path the F4 row met under load) — A (the manager) holds `hot` striped over K = 64; B JOINED storms creates into it → kill -9 A ⇒ B parks → remount A (term 2) → B's reclaim → the storm stops and B's cross-owner intents settle (0 open) → B's beat HELD past T_owner ⇒ A evicts B and recovers its region (the page Recovered, its ring with it) → released: UnknownLease ⇒ nothing un-landed ⇒ B RE-JOINS IN PLACE (a new appender under the same mount) → a second storm on the successor while A releases the predecessor's Recovered page (its ring back to the heap): no GrowRing refused, invariant tripwires 0 on both → ls = find from A and B → umount B (exit 0), umount A (exit 0) → fsck --offline --scrub 0 findings (the path's GrowRing defect — run 19's successor had every GrowRing refused, A fired extent_grant_conflicts ×19 — is the manager's unit red: the smoke's successor seldom grows)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/beat.fifo", .{rig.work}, 0);
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD", fifo);
+    try rig.formatSetWith(false, &.{});
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const mk = try rig.onMount("mkdir hot");
+        gpa.free(mk);
+        var sbuf: [256]u8 = undefined;
+        const out = try rig.onMount(try setStripesScript(&sbuf, "hot", 64));
+        gpa.free(out);
+    }
+    var storm_b = try Storm.start(rig, b.mp, "b", "b");
+    var storm_done = false;
+    defer if (!storm_done) storm_b.deinit(rig);
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    {
+        const warm = try awaitAtLeast(b, "\"dir_stripe_routed_mutations\":", stripe_matrix_phase_floor, kill_row_wait_ns);
+        gpa.free(warm);
+    }
+    try rig.kill();
+    _ = try b.awaitLog("appender park: T_self reached with the home volume 0's manager unreachable — parked", 0, kill_row_wait_ns);
+    var mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const reclaimed = try awaitStats(b, &.{.{ .key = "\"appender_parked\":", .want = 0 }}, kill_row_wait_ns);
+        gpa.free(reclaimed);
+    }
+    _ = try b.awaitLog("admitted the reclaim", 0, kill_row_wait_ns);
+    // The storm stops and every cross-owner intent of B's lands: B holds
+    // nothing un-landed at the eviction.
+    const before_hold = try storm_b.finish(rig);
+    storm_b.err_file.close(io);
+    gpa.free(storm_b.stop);
+    gpa.free(storm_b.count);
+    storm_done = true;
+    {
+        const settled = try awaitExactly(b, "\"xv_cross_owner_intents_open\":", 0, kill_row_wait_ns);
+        defer gpa.free(settled);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(settled, "\"xv_cross_owner_intents_open\":"));
+    }
+    const grows_before = blk: {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        break :blk std.mem.count(u8, tb, "'s ring grew by one segment");
+    };
+    mark = try rig.logLen();
+    const b_mark = try b.logLen();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    _ = try b.awaitLog("the member's beat holds", b_mark, kill_row_wait_ns);
+    try awaitEvictionOf(rig, b, mark);
+    releaseHold(fifo);
+    released = true;
+    const v = try awaitEvictionVerdict(b, b_mark);
+    try testing.expectEqual(EvictionVerdict.rejoined, v.verdict);
+    // The successor storms under the remounted manager while A releases
+    // the predecessor's Recovered page (its ring returns to the heap).
+    const released0 = blk: {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        break :blk numberAfter(ta, "\"recovered_regions_released\":") orelse 0;
+    };
+    var storm_c = try Storm.start(rig, b.mp, "c", "c");
+    var storm_c_done = false;
+    defer if (!storm_c_done) storm_c.deinit(rig);
+    {
+        const rel = try awaitAtLeast(rig, "\"recovered_regions_released\":", released0 + 1, kill_row_wait_ns);
+        gpa.free(rel);
+        const more = try awaitAtLeast(b, "\"dir_stripe_routed_mutations\":", 2 * stripe_matrix_phase_floor, kill_row_wait_ns);
+        gpa.free(more);
+    }
+    const after_rejoin = try storm_c.finish(rig);
+    storm_c.err_file.close(io);
+    gpa.free(storm_c.stop);
+    gpa.free(storm_c.count);
+    storm_c_done = true;
+    {
+        const tb = try b.readLog();
+        defer gpa.free(tb);
+        try testing.expect(std.mem.indexOf(u8, tb[v.at..], "GrowRing failed") == null);
+        const grows = std.mem.count(u8, tb, "'s ring grew by one segment");
+        std.debug.print("\nsmoke: re-joined under the dead manager: {d} creates before the hold, {d} after the re-join; ring growths {d} before the eviction, {d} after\n", .{ before_hold, after_rejoin, grows_before, grows - grows_before });
+        const st = try b.stats();
+        defer gpa.free(st);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"invariant_tripwires\":"));
+    }
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"invariant_tripwires\":"));
+        const va = try hotView(rig, "a");
+        defer gpa.free(va);
+        try testing.expect(lsEqualsFind(va));
+        const vb = try hotView(b, "b");
+        defer gpa.free(vb);
+        try testing.expect(lsEqualsFind(vb));
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "a live member re-joined under the dead manager's striped directory");
+}
+
 /// A's eviction of the silent B at `T_owner` (`tick — N evicted`), read off
 /// A's log from `mark`; both daemons must live meanwhile.
 fn awaitEvictionOf(rig: *Rig, b: *Peer, mark: usize) !void {

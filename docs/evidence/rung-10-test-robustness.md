@@ -11,9 +11,9 @@ inside one pass for the probe's answer window, renders are shared, the watchdog 
 builtins; walls and renders per read are printed only (the ratio is load-paced: a descheduled reader
 revalidates against every render that ran while it slept — 2.0 idle, 5.0 at load 115). **20/20** beside the
 full smoke binary's 16 shards and 16 busy loops (load 88–156): slowest read 3,967 ms (14 runs past the old
-bound), lane hold ≤ 24 ms, 0 misses. **Red on `bc569d4`** (+ the row and the gauge): 171 of 256 reads failed
+bound), lane hold ≤ 24 ms, 0 misses (those 20 also judged renders ≤ shared lookups and < readers / 4 a read; the shipped `shares > 0` ran 5/5 more at load 111–140). **Red on `bc569d4`** (+ the row and the gauge): 171 of 256 reads failed
 when the supervisor SIGABRTed the daemon (1 probe miss), walls p50 9.8 s / max 35.7 s; the lane hold read
-58 ms — the reads and the probe tell the shapes apart.
+58 ms — the reads and the probe tell the shapes apart (the failing assertion is the shipped row's).
 
 **2. Counting the kernel's caches (§CE.10's class).** An evicting FORGET empties the daemon's read view
 and directory memo; `echo 2 > drop_caches` (the export-handles row) or reclaim evicts every unreferenced
@@ -36,7 +36,7 @@ move gate's `T_park_max` EIO), the stalled plane's second writer (no second wall
 (half the 60 s TTL), the atime and interception-death rows; units — `dutyPark` in served time, try-only
 probes whose lock this thread holds, the ring park and lease recall by their verdicts, the pool's burst by
 rendezvous, the lane's drop-wake by `tick_rescues`, the poison rows by cause or op deadline, the mint's
-lower bound only. `direct_lease`'s one test never compiled into the unit binary: referenced, passes.
+lower bound only. `direct_lease`'s one test never compiled into the unit binary: referenced, 20/20 beside the busy loops.
 Units **20/20** beside 16 busy loops; the ten smoke rows **20/20** beside the full smoke's shards and 16 busy loops (load 55–185). Kept as product laws: tick-, `T_owner`-, quantum-,
 recovery-, request-deadline-, `DIAL_TIMEOUT`- and exiting-holder-derived bounds.
 

@@ -300,14 +300,29 @@ pub fn planFlip(dir: u64, stripes: []const u64, names: *[K_MAX][MARKER_NAME_LEN]
 /// One name's migration: insert into the STRIPE first, remove from `D`
 /// second ("a kill between the two leaves the name in both places and the
 /// stripe wins"); a FILE loser (the stripe already names another child)
-/// goes with its count.
-pub fn planMigrateOne(dir: u64, stripe: u64, name: []const u8, child: u64, ft_bits: u32, loser_count: ?struct { ino: u64, nlink: u32 }, now: u64) Plan {
+/// goes with its count. A DIRECTORY takes its count from `D`'s own record
+/// to the stripe's (`dir_counts`, read under the plan's guards: both are
+/// parents, held exclusive): every directory stays at 2 + its
+/// subdirectories and the fold is unchanged; no times move (the names
+/// only change homes inside `D`).
+pub fn planMigrateOne(dir: u64, stripe: u64, name: []const u8, child: u64, ft_bits: u32, loser_count: ?LoserCount, dir_counts: ?MigrateCounts, now: u64) Plan {
     var p: Plan = .{ .op = .rename };
     p.push(.{ .insert_dentry = .{ .parent = stripe, .name = name, .child = child, .ft_bits = ft_bits, .parent_update = .none } });
     p.push(.{ .remove_dentry = .{ .parent = dir, .name = name, .expect_child = child, .parent_update = .none } });
     if (loser_count) |l| p.push(.{ .set_nlink = .{ .ino = l.ino, .pre = l.nlink, .post = l.nlink -| 1, .ctime = now } });
+    if (dir_counts) |k| {
+        p.push(.{ .set_nlink = .{ .ino = dir, .pre = k.dir_nlink, .post = k.dir_nlink -| 1, .ctime = null } });
+        p.push(.{ .set_nlink = .{ .ino = stripe, .pre = k.stripe_nlink, .post = k.stripe_nlink + 1, .ctime = null } });
+    }
     return p;
 }
+
+/// `D`'s own count and the stripe's, as the migration of a directory
+/// reads them under its guards.
+pub const MigrateCounts = struct { dir_nlink: u32, stripe_nlink: u32 };
+
+/// A FILE loser's count (the LWW loser goes with it).
+pub const LoserCount = struct { ino: u64, nlink: u32 };
 
 /// `rmdir D` as ONE intent: the parent's name, the commit marker FIRST
 /// ("a reader between steps sees no map"), `migrating` if set, every
@@ -1165,13 +1180,21 @@ pub fn Striping(comptime Store: type) type {
                     loser = .{ .ino = rec.child, .nlink = lv.nlink };
                 }
             }
-            const plan = if (loser) |l|
-                planMigrateOne(map.dir, stripe, rec.name, rec.child, @as(u32, rec.file_type) << 12, .{ .ino = l.ino, .nlink = l.nlink }, now)
-            else
-                planMigrateOne(map.dir, stripe, rec.name, rec.child, @as(u32, rec.file_type) << 12, null, now);
+            const ft_bits = @as(u32, rec.file_type) << 12; // the dentry byte is the mode's S_IFMT >> 12 (economy.ftByte)
+            const loser_count: ?LoserCount = if (loser) |l| .{ .ino = l.ino, .nlink = l.nlink } else null;
+            // The guards first (D and the stripe are parents: exclusive),
+            // then a directory's two counts under them.
+            const skeleton = planMigrateOne(map.dir, stripe, rec.name, rec.child, ft_bits, loser_count, null, now);
             const scope = self.plane.mintScope();
-            var held = try self.plane.acquirePlanGuards(&plan, scope, false);
+            var held = try self.plane.acquirePlanGuards(&skeleton, scope, false);
             defer held.release(self.plane.gpa);
+            var counts: ?MigrateCounts = null;
+            if (economy.isDirMode(ft_bits)) {
+                const dv = (self.plane.readWitness(map.dir) catch return error.Io) orelse return error.Io;
+                const sv = (self.plane.readWitness(stripe) catch return error.Io) orelse return error.Io;
+                counts = .{ .dir_nlink = dv.nlink, .stripe_nlink = sv.nlink };
+            }
+            const plan = planMigrateOne(map.dir, stripe, rec.name, rec.child, ft_bits, loser_count, counts, now);
             _ = try self.plane.execute(&plan, scope, now);
             stats.dir_stripe_migrated_names.inc();
         }
@@ -1402,7 +1425,7 @@ test "the plans: the flip is K + 2 inserts with the commit marker LAST under the
     try testing.expectEqual(steps.ParentUpdate.exclusive_times, fp.steps[4].insert_dentry.parent_update);
     try testing.expectEqual(steps.ParentUpdate.none, fp.steps[0].insert_dentry.parent_update);
     try testing.expectEqual(@as(u64, 100), fp.steps[3].insert_dentry.child);
-    const mp = planMigrateOne(9, 101, "n", 500, S.IFREG, .{ .ino = 501, .nlink = 1 }, 7);
+    const mp = planMigrateOne(9, 101, "n", 500, S.IFREG, .{ .ino = 501, .nlink = 1 }, null, 7);
     try testing.expectEqual(@as(usize, 3), mp.len);
     try testing.expectEqual(steps.Kind.insert_dentry, @as(steps.Kind, mp.steps[0]));
     try testing.expectEqual(@as(u64, 101), mp.steps[0].insert_dentry.parent);

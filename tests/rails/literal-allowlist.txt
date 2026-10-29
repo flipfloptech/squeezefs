@@ -481,8 +481,6 @@ src/meta/sym/xv/record_ship.zig:535 | 256 | afd1a5d2776c60d9 | OWED: derive it o
 src/meta/sym/xv/stripe.zig:155 | 10 | 4a6f66b04de5eacf | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/stripe.zig:156 | 10 | 5f55abd73ee91476 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/meta/sym/xv/stripe.zig:461 | 64 | 96992bee2c63fdc1 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/xv/stripe.zig:1128 | 12 | 214bbd2baa84ebc2 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/meta/sym/xv/stripe.zig:1130 | 12 | 8863488180dbbea4 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/tx.zig:283 | 64 | 2e339e5cb46ffd1a | OWED: derive it or document it on the line (charter §1.5)
 src/ops/defrag/metrics.zig:33 | 1000 | 6da7c134ac69d566 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/fsck/census.zig:364 | 64 | 0258bd2f3e095aee | OWED: derive it or document it on the line (charter §1.5)

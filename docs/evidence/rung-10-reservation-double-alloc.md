@@ -58,3 +58,14 @@ census lines (52; dev 36): the full-store regimes, on dev too. (c) `transport_le
 payload held ≥ 1 s) under the 512-deep lay-down at host load ~50, on dev too. (d) A block the write-back timer
 settles partial is flipped written, so its later pieces CoW (36 of 1,536 blocks at most, freed after their
 save). (e) `df` counts a gathered corpse's blocks used until its destroy (≤ one tick).
+
+## The A-B-B-A (2026-10-29, quiet host on AC, the RAM-NVMe perf mount, 2 MDT + 2 OST, dist builds)
+
+`dev` `6415dc1` against this branch (`72d1045`), two rounds of the fio matrix (one `baseline.sh ram-sqz`
+psync session per leg; 4 legs per arm), mean of the legs: 4k randread ×32 −2.5 %, ×32×4 −1.0 %; 4k
+randwrite QD1 −3.0 %, ×32 −0.6 %, ×32×4 −2.7 %; 64 KiB +2.0 / +3.8 %; 1 MiB seq read +0.3 / +0.2 %, write
++1.2 / +0.2 %; 4 MiB write −0.9 % (4k randread QD1 +8.7 % on one 89 k `dev` leg). mdtest (one round, both
+shapes, -np 32/64): within the legs' spread. Neutral on throughput; the lay-down's peak blocks halve.
+Landed after the rebase onto `1df4bdd` (drop-7.2 removed the overlay's early-ack counters; the conflict kept
+this branch's reservation counters) — gate 184 green, 75/75. Sessions: `/build/perf/mx/results.tsv`
+(`ram-sqz-rrc{A,B}*`, `ram-sqz-rrv2*`), `/build/perf/rc-md/`.

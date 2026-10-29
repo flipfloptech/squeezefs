@@ -39,6 +39,7 @@ pub const Verb = enum {
     destroy_unreferenced_inode,
     lower_nlink_to_counted_names,
     raise_nlink_to_counted_names,
+    set_dir_nlink_to_counted_subdirs,
     remove_dangling_dentry,
     return_orphan_image_extent,
     recover_dead_appender,
@@ -76,6 +77,9 @@ pub const Finding = union(enum) {
     /// The dentry RECORD is the identity (a collision chain holds several
     /// keys for one name): `(parent key ino, key suffix)` + the child named.
     c10_dangling: struct { parent: u64, suffix: u64, child: u64 },
+    /// A directory whose `nlink` is not `2 + subdirectories` (its names of
+    /// a directory, stripe markers excluded).
+    c10_dir_nlink: struct { ino: u64, nlink: u32, subdirs: u32 },
     c11_orphan_map_records: struct { ino: u64, records: u64 },
     c11_empty_kvmap_head: struct { ino: u64 },
     c11_run_foreign_shadow: struct { ino: u64, shadows: u64 },
@@ -102,7 +106,7 @@ pub const Finding = union(enum) {
             .c7_scrub => .c7,
             .c8_drift => .c8,
             .c9_unreferenced => .c9,
-            .c10_nlink_too_high, .c10_nlink_too_low, .c10_zero_nlink_named, .c10_dangling => .c10,
+            .c10_nlink_too_high, .c10_nlink_too_low, .c10_zero_nlink_named, .c10_dangling, .c10_dir_nlink => .c10,
             .c11_orphan_map_records, .c11_empty_kvmap_head, .c11_run_foreign_shadow => .c11,
             .c12_overlap, .c12_overrun => .c12,
             .c13_orphan_image => .c13,
@@ -141,6 +145,7 @@ pub const Finding = union(enum) {
             .c10_nlink_too_high => .lower_nlink_to_counted_names,
             .c10_nlink_too_low, .c10_zero_nlink_named => .raise_nlink_to_counted_names,
             .c10_dangling => .remove_dangling_dentry,
+            .c10_dir_nlink => .set_dir_nlink_to_counted_subdirs,
             .c11_orphan_map_records, .c11_empty_kvmap_head, .c11_run_foreign_shadow, .c12_overlap, .c12_overrun, .c14_slot_custody_conflict, .c14_grant_record_corrupt, .c16_shared_index_drift, .c17_stripe => .report_only,
             .c13_orphan_image => .return_orphan_image_extent,
             .c15_unrecovered_appender => .recover_dead_appender,
@@ -197,6 +202,7 @@ pub const Finding = union(enum) {
             .c10_nlink_too_low => |f| try w.print("ino {d} — nlink {d} BELOW {d} name(s) (the LOSS direction: stop and read)", .{ f.ino, f.nlink, f.names }),
             .c10_zero_nlink_named => |f| try w.print("ino {d} — nlink 0 while {d} path(s) resolve (the LOSS direction: stop and read)", .{ f.ino, f.names }),
             .c10_dangling => |f| try w.print("dentry parent {d} suffix {x} → child {d} — dangling: the child has no record", .{ f.parent, f.suffix, f.child }),
+            .c10_dir_nlink => |f| try w.print("directory ino {d} — nlink {d} vs 2 + {d} subdirector(ies) ({s})", .{ f.ino, f.nlink, f.subdirs, if (f.nlink > 2 + f.subdirs) "above: an empty directory never reads empty" else "below: a subdirectory's rmdir underflows the count" }),
             .c11_orphan_map_records => |f| try w.print("ino {d} — {d} block-map record(s) with no live kvmap head (report-only)", .{ f.ino, f.records }),
             .c11_empty_kvmap_head => |f| try w.print("ino {d} — a sweep-less kvmap head with a size and ZERO records (report-only)", .{f.ino}),
             .c11_run_foreign_shadow => |f| try w.print("ino {d} — {d} foreign-volume point(s) inside a covering run (report-only)", .{ f.ino, f.shadows }),
@@ -345,6 +351,8 @@ pub const Counters = struct {
     inode_plane_window_scoped: u64 = 0,
     inode_plane_foreign_dentry_scoped: u64 = 0,
     nlink_names_counted: u64 = 0,
+    /// Directories whose `nlink` C10's directory arm judged.
+    dir_nlinks_counted: u64 = 0,
     nlink_mismatch_high: u64 = 0,
     nlink_mismatch_low: u64 = 0,
     nlink_zero_named: u64 = 0,
@@ -462,6 +470,7 @@ pub const Counters = struct {
         s.fsck_inode_plane_window_scoped.add(self.inode_plane_window_scoped);
         s.fsck_inode_plane_foreign_dentry_scoped.add(self.inode_plane_foreign_dentry_scoped);
         s.fsck_nlink_names_counted.add(self.nlink_names_counted);
+        s.fsck_dir_nlinks_counted.add(self.dir_nlinks_counted);
         s.fsck_nlink_mismatch_high.add(self.nlink_mismatch_high);
         s.fsck_nlink_mismatch_low.add(self.nlink_mismatch_low);
         s.fsck_nlink_zero_named.add(self.nlink_zero_named);

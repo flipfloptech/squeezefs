@@ -125,6 +125,7 @@ pub const stats = struct {
     pub var fsck_inode_plane_foreign_dentry_scoped: counters.ShardedCounter = .{};
     // ---- the inode plane ----
     pub var fsck_nlink_names_counted: counters.ShardedCounter = .{};
+    pub var fsck_dir_nlinks_counted: counters.ShardedCounter = .{};
     pub var fsck_nlink_mismatch_high: counters.ShardedCounter = .{};
     pub var fsck_nlink_mismatch_low: counters.ShardedCounter = .{};
     pub var fsck_nlink_zero_named: counters.ShardedCounter = .{};

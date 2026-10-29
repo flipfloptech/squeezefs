@@ -53,7 +53,7 @@ const Row = finding.RepairRow;
 fn applyRank(f: Finding) u8 {
     return switch (f) {
         .c9_unreferenced => 0,
-        .c10_nlink_too_high, .c10_nlink_too_low, .c10_zero_nlink_named, .c10_dangling => 1,
+        .c10_nlink_too_high, .c10_nlink_too_low, .c10_zero_nlink_named, .c10_dangling, .c10_dir_nlink => 1,
         else => 2,
     };
 }
@@ -144,6 +144,7 @@ pub const Engine = struct {
             .c9_unreferenced => |x| self.c9Destroy(f, x.ino),
             .c10_nlink_too_high, .c10_nlink_too_low, .c10_zero_nlink_named => self.c10Adjust(f),
             .c10_dangling => |x| self.c10RemoveDangling(f, x.parent, x.suffix, x.child),
+            .c10_dir_nlink => |x| self.c10DirAdjust(f, x.ino),
             .c13_orphan_image => |x| self.c13Return(x.vol, x.appender, x.extent),
             .c15_unrecovered_appender => |x| self.c15Recover(x.vol, x.appender),
             else => unreachable, // report-only arms never reach apply
@@ -453,6 +454,37 @@ pub const Engine = struct {
         return .{ .applied = if (lowering) "nlink lowered to the counted names" else "nlink raised to the counted names" };
     }
 
+    /// `set-dir-nlink-to-counted-subdirs`: intent ⇒ refuse; incomplete
+    /// repair-time pass ⇒ refuse; under the directory's lease the record is
+    /// a live directory, `nlink ≠ 2 + subdirectories` still holds (equal ⇒
+    /// healed); quarantine the record; set it.
+    fn c10DirAdjust(self: *Engine, f: Finding, global: u64) Error!Outcome {
+        const host = self.pass.host;
+        const gpa = self.gpa;
+        if (host.intents) |i| if (i.isOpen(i.ctx, global)) return .{ .refused = "an open cross-volume intent names the directory" };
+        const d = (try self.freshDentries()) orelse return .{ .refused = "the repair-time dentry pass is incomplete" };
+        if (!d.subdirs_complete or !d.names_complete) return .{ .refused = "the repair-time subdirectory count is incomplete" };
+        const sl = census.ofGlobalIno(global) orelse return .{ .refused = "not a routable ino" };
+        const kino = census.keyInoOf(sl);
+        const g = host.lockIno(kino);
+        defer host.unlock(g);
+        var v = (try host.readInode(gpa, kino)) orelse return .{ .refused = "vanished" };
+        if (!economy.isDirMode(v.mode) or v.nlink == 0) return .{ .refused = "no longer a live directory" };
+        const want = 2 + d.subdirsOf(global);
+        if (v.nlink == want) return .{ .refused = "healed: nlink equals 2 + the subdirectories" };
+        try self.q.putRecord(.c10, "inode", &key.inodeKey(kino));
+        try self.q.putRecord(.c10, "inode-value", &v.encode());
+        if (self.hook(f)) return .{ .refused = "aborted after the quarantine (re-detected next run)" };
+        v.nlink = want;
+        const t = try host.store.begin(@src());
+        {
+            errdefer host.store.abandon(t);
+            try t.stagePut(key.TREE_INODES, &key.inodeKey(kino), &v.encode());
+        }
+        try host.store.commit(t);
+        return .{ .applied = "directory nlink set to 2 + the counted subdirectories" };
+    }
+
     /// `remove-dangling-dentry` under the PARENT's lease: the record
     /// present verbatim, decodes, still names this child, `DT_DIR`
     /// refuses, the child still absent; quarantine key + value; delete.
@@ -636,6 +668,7 @@ fn planDetail(f: Finding) []const u8 {
         .destroy_unreferenced_inode => "quarantine the inode + every xattr, release its references, destroy in ONE tx",
         .lower_nlink_to_counted_names => "quarantine the record, set nlink to the deduped names (a third pass must agree)",
         .raise_nlink_to_counted_names => "quarantine the record, raise nlink to the deduped names (the census re-walks after)",
+        .set_dir_nlink_to_counted_subdirs => "under the directory's lease: quarantine the record, set nlink to 2 + the subdirectories a fresh dentry pass counts",
         .remove_dangling_dentry => "under the parent's lease: quarantine the dentry, delete it",
         .return_orphan_image_extent => "one free(extent) record in the appender's ring; nothing quarantined (no route reaches the image)",
         .recover_dead_appender => "the §5.9 recovery on the volume's manager (online only)",

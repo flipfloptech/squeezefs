@@ -1131,6 +1131,17 @@ pub const Pass = struct {
                 if (names == 0) continue; // C9's object
                 if (e.value_ptr.* > names) try self.suspect(.{ .c10_nlink_too_high = .{ .ino = global, .nlink = e.value_ptr.*, .names = names } }) else if (e.value_ptr.* < names) try self.suspect(.{ .c10_nlink_too_low = .{ .ino = global, .nlink = e.value_ptr.*, .names = names } });
             }
+            // The directory arm: `nlink = 2 + subdirectories`.
+            if (self.cen.dir_nlink_complete and self.dentries.subdirs_complete) {
+                var dit = self.cen.dir_nlink.iterator();
+                while (dit.next()) |e| {
+                    const global = e.key_ptr.*;
+                    if (self.unjudgedGlobal(global)) continue;
+                    const subdirs = self.dentries.subdirsOf(global);
+                    self.counters.dir_nlinks_counted += 1;
+                    if (e.value_ptr.* != 2 + subdirs) try self.suspect(.{ .c10_dir_nlink = .{ .ino = global, .nlink = e.value_ptr.*, .subdirs = subdirs } });
+                }
+            }
             // Side B: multi-named inos side A did not judge (nlink == 1 files).
             var mit = self.dentries.multi.iterator();
             while (mit.next()) |e| {
@@ -1447,6 +1458,7 @@ pub const Pass = struct {
                 return d.namesOf(f.ino) == 0;
             },
             .c10_nlink_too_high, .c10_nlink_too_low, .c10_zero_nlink_named => return self.c10Count(s),
+            .c10_dir_nlink => |f| return self.c10DirCount(f.ino),
             .c10_dangling => |f| {
                 const g = host.lockIno(f.parent);
                 defer host.unlock(g);
@@ -1606,6 +1618,37 @@ pub const Pass = struct {
             .c10_zero_nlink_named => after.nlink == 0,
             else => unreachable,
         };
+    }
+
+    /// C10's directory ladder: the `(nlink, ctime)` witness under the
+    /// directory's exclusive 4a across the fresh pass (a mkdir, rmdir or
+    /// rename that moves a subdirectory count moves the record in the same
+    /// tx); the subdirectories re-counted by that pass.
+    fn c10DirCount(self: *Pass, global: u64) Error!bool {
+        const host = self.host;
+        const gpa = self.gpa;
+        if (host.intents) |i| if (i.isOpen(i.ctx, global)) {
+            self.counters.unreferenced_intent_exempted += 1;
+            return false;
+        };
+        const sl = census.ofGlobalIno(global) orelse return false;
+        const kino = census.keyInoOf(sl);
+        const g = host.lockIno(kino);
+        defer host.unlock(g);
+        const before = (try host.readInode(gpa, kino)) orelse return false;
+        if (!economy.isDirMode(before.mode) or before.nlink == 0) return false;
+        const d = (try self.freshDentries()) orelse return false;
+        if (!d.subdirs_complete or !d.names_complete) return false;
+        const after = (try host.readInode(gpa, kino)) orelse return false;
+        if (after.nlink != before.nlink or after.ctime != before.ctime) {
+            self.counters.nlink_transient_cleared += 1;
+            return false;
+        }
+        if (after.nlink == 2 + d.subdirsOf(global)) {
+            self.counters.nlink_transient_cleared += 1;
+            return false;
+        }
+        return true;
     }
 
     /// The deduped `(parent, name)` identities the fresh pass collected for

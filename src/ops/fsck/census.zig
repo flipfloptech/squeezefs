@@ -687,8 +687,12 @@ pub const Census = struct {
     /// Non-directory live inodes with `nlink != 1` (global ino → nlink).
     odd_nlink: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     odd_nlink_complete: bool = true,
-    /// Directories (global inos) — never a C10 count finding.
+    /// Directories (global inos) — never a C10 NAME-count finding.
     dirs: InoBitmap,
+    /// Live directories' `nlink` (global ino → nlink): C10's directory
+    /// arm, judged against `2 + subdirectories` (`DentryPass.subdirs`).
+    dir_nlink: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    dir_nlink_complete: bool = true,
     /// Per slot the maximum raw local an inode record carries (the
     /// referenced set's ceiling).
     max_raw: std.AutoHashMapUnmanaged(u16, u64) = .empty,
@@ -712,6 +716,7 @@ pub const Census = struct {
         self.corpses.deinit();
         self.dirs.deinit();
         self.odd_nlink.deinit(gpa);
+        self.dir_nlink.deinit(gpa);
         self.max_raw.deinit(gpa);
         for (self.owners.items) |o| gpa.free(o.bindings);
         self.owners.deinit(gpa);
@@ -816,6 +821,9 @@ pub fn run(gpa: Allocator, store: Store, opts: Options) Error!Census {
         _ = try c.live.mark(r.sl);
         if (r.dir) {
             _ = try c.dirs.mark(r.sl);
+            if (c.dir_nlink.count() < entry_budget) {
+                try c.dir_nlink.put(gpa, r.global, r.nlink);
+            } else c.dir_nlink_complete = false;
         } else if (r.nlink != 1) {
             if (c.odd_nlink.count() < entry_budget) {
                 try c.odd_nlink.put(gpa, r.global, r.nlink);
@@ -963,6 +971,13 @@ pub const DentryPass = struct {
     names: std.ArrayList(NameRec) = .empty,
     /// C17: per directory (GLOBAL ino → its markers + user names).
     dirs: std.AutoHashMapUnmanaged(u64, *DirNames) = .empty,
+    /// C10's directory arm: per parent (its GLOBAL ino) the names it holds
+    /// of a directory, stripe markers excluded (a striped directory's
+    /// stripes count their own subdirectories). Counted for EVERY parent
+    /// a judged slot holds, before the child shard filter: a directory's
+    /// count needs all of its names.
+    subdirs: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    subdirs_complete: bool = true,
     refs_indexed: u64 = 0,
     foreign_dentry_scoped: u64 = 0,
     window_scoped: u64 = 0,
@@ -981,6 +996,7 @@ pub const DentryPass = struct {
         self.unindexed.deinit(self.gpa);
         self.names.deinit(self.gpa);
         self.dirs.deinit(self.gpa);
+        self.subdirs.deinit(self.gpa);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -991,6 +1007,11 @@ pub const DentryPass = struct {
         if (self.multi.get(global)) |n| return n;
         const sl = ofGlobalIno(global) orelse return 0;
         return if (self.referenced.isSet(sl)) 1 else 0;
+    }
+
+    /// Directory names the pass saw under `dir` (its GLOBAL ino).
+    pub fn subdirsOf(self: *const DentryPass, dir: u64) u32 {
+        return self.subdirs.get(dir) orelse 0;
     }
 };
 
@@ -1056,6 +1077,12 @@ pub fn dentryPass(gpa: Allocator, store: Store, opts: DentryOptions) Error!Dentr
             } else {
                 try d.names.append(arena, .{ .cookie = key.encodeReaddirCookie(dk.hash54(), dk.collSeq()), .child = dv.child_ino, .file_type = dv.file_type, .name = name });
             }
+        }
+        if (dv.file_type == economy.ftByte(economy.S.IFDIR) and !stripe.isMarkerName(dv.name)) {
+            const pg = globalOfKeyIno(parent);
+            if (p.subdirs.count() < entry_budget or p.subdirs.contains(pg)) {
+                (try p.subdirs.getOrPutValue(gpa, pg, 0)).value_ptr.* += 1;
+            } else p.subdirs_complete = false;
         }
         if (opts.shard) |s| if (!s.owns(dv.child_ino)) continue;
         if (opts.scope.window_inos.contains(dv.child_ino)) {

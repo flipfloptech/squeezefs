@@ -193,7 +193,9 @@ cp "$STATE/format.log" "$RUN/" 2>/dev/null || true
 
 teardown() {
   rc=$?
-  cp "$MNT/.stats" "$RUN/stats-at-exit.json" 2>/dev/null || true
+  # cat, not cp: the virtual .stats reports no size, and cp's copy path
+  # trusts it (an empty record).
+  cat "$MNT/.stats" > "$RUN/stats-at-exit.json" 2>/dev/null || rm -f "$RUN/stats-at-exit.json"
   [ "$KEEP" = 1 ] && { echo "perf_mount: --keep — $MNT stays mounted; run record $RUN"; exit $rc; }
   cd /
   if mountpoint -q "$MNT"; then

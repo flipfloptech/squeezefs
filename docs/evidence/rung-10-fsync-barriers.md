@@ -46,6 +46,7 @@ lines, 0 tripwires on every run):
 | fio fdatasync | 2 / 4 | 1.89 / 3.43 | 2.05 / 4.49 | **0.23 / 0.22** | 89 % / 93 % | 327 → 157 µs / 1,781 → 112 µs |
 | create+write+fsync | 2 / 4 | 1.72 / 2.82 | 1.59 / 2.64 | **0.75 / 0.81** | 67 % / 89 % | 523 → 247 µs / 1,337 → 260 µs |
 | mdtest -y | 2 / 4 | 1.73 / 2.64 | 1.54 / 2.62 | **0.81 / 0.89** | 66 % / 87 % | 468 → 323 µs / 1,548 → 378 µs |
+| 300 threads at a gate: create + write + fsync, ×5 | 2 / 4 | — | 0.96 / 1.83 | **0.34 / 0.41** | 88 % / 95 % | 304 → 75 µs / 760 → 79 µs |
 | syncfs | 2 / 4 | 2.00 / 4.00 | 2.00 / 4.00 | 1.98 / 3.93 | — (every member holds writes) | syncfs meta leg 812 → 678 µs / 1,736 → 1,265 µs |
 
 Under the rule `requests_none` is 0 everywhere; the fio rows' data-path meta leg (`fsync_phase_ns.meta_barrier`)
@@ -54,7 +55,20 @@ fsyncs) asks the file's member. Joins: 228 of 26,128 requests on fio, 1,267 of 2
 `chain` requests and mark overflows 0 in every run (no workload names directories beside its fsyncs; the
 smoke row's renamed parent is the chain's one asker).
 
-**Checks.** See the report of the landing commit (unit filters, rails, fmt, smoke rows, xfstests).
+**Checks** (light tier, on the head rebased onto `d80407c`; the full venue gate the durability law asks
+before landing is owed). Unit filters `meta.` 1109 (3 skipped), `fuse.` 386, `data.` 619, `ipc.` 155, `ops.` 332, `cli.` 257 — 0 failed; `zig build
+rails`, `zig fmt --check` clean. Smoke, 61 tests green in one run: this row, the fsync/fdatasync/syncfs rows under
+the write-back timer, `sync -f`, 300 concurrent fsyncs + creates, 1,100 writes + fsyncs, the KILL ROWS (a)–(c),
+THE KILL MATRIX, both mid-tar kills, the promotion-commit kill, THE ORDERED LAW'S KILL ROW, both syncfs rows,
+the punch/zero and the guest-slot power cuts, the freed-block hold, the two-member set, RENAME_EXCHANGE.
+xfstests (generic/001 013 and the fsync-durability list 039–042 056 059 065 066 104 106 107 177 311 321 322 325 335
+336 341–343 348 376 455 456 479–483 498 502 509 510 512 526 527 534 535 547 552 690 695 703 736 737) on
+the suites' shipped one-member sets AND on two-member sets (`SUITE_META_MEMBERS=2`, new): of the 48, 39
+passed, 9 not run (FIEMAP ×3, `$LOGWRITES_DEV` ×2, shutdown ×2, fcollapse, O_TMPFILE), fsck 0 findings,
+both. The alerts are generic/311's (`kv checkpoint tick failed … Corrupt` on the shutdown tick of a
+mount-then-unmount, 3–4 per run, and four `replayed free … names a LIVE tree root` warnings): generic/311
+alone on dev `7693bab` logs the same `Corrupt` line three times, and db58179's `-g auto` run of 10-27 both
+classes — pre-existing, not chased.
 
 **The A-B-B-A row for the owner.** `~/tmp/fsync-barriers/abba-fsync.fio`: psync 4 KiB randwrite, `fsync=1`,
 8 jobs each in its own top-level directory `d0 … d7` (256 MiB files laid down first, 60 s time-based); arms

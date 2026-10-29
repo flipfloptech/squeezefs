@@ -1253,6 +1253,31 @@ test "syncfs is fsync's data ladder for EVERY ino holding custody: parked blocks
     try testing.expectEqual(flushes0 + 1, w.f.dev.flushes.items.len);
 }
 
+test "a barrier whose caller is CANCELLED ends cleanly — the times drain's fiber cancelled at the orderly unmount (generic/013's daemon panicked: `error.Canceled => unreachable` in runBarrierLegs): both joined legs run to completion, the barrier answers, the cancel stays pending for the caller's next cancelation point" {
+    const io = testing.io;
+    const w = try FsyncWorld.init(testing.allocator);
+    defer w.deinit(testing.allocator);
+    w.f.vols.rows[1].?.write_cache_volatile = true;
+    w.touched.stampOrdinal(4, 0);
+    w.touched.stampOrdinal(4, 1);
+    const Task = struct {
+        fn run(ctx: Ctx, io_: Io, inos: []const u64) Error!void {
+            // The teardown's cancel lands before the barrier: the request
+            // is pending when the legs are joined.
+            io_.sleep(.fromSeconds(600), .awake) catch io_.recancel();
+            return barrierInos(ctx, io_, inos);
+        }
+    };
+    const joins0 = stats.fsync_parallel_joins.load();
+    const flushes0 = w.f.dev.flushes.items.len;
+    const inos = [_]u64{4};
+    var fut = try io.concurrent(Task.run, .{ w.mkCtx(), io, &inos });
+    try fut.cancel(io);
+    try testing.expectEqual(joins0 + 1, stats.fsync_parallel_joins.load());
+    try testing.expectEqual(flushes0 + 2, w.f.dev.flushes.items.len);
+    try testing.expectEqual(@as(u64, 0), TouchedTable.bitsOf(w.touched.observe(4)));
+}
+
 test "in_place_dma_shapes_stamp_their_namespace and parallel legs pay the join: two touched volatile namespaces barrier as joined legs (both awaited); the overlay drain publishes before the barrier" {
     const io = testing.io;
     const w = try FsyncWorld.init(testing.allocator);

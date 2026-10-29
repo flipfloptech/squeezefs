@@ -409,7 +409,10 @@ Per GROUP = head window awaited + every successor whose write already landed:
 → per window in order: Ok ⇒ `journal_failures.store(0)`, record apply-hole end if the window had
 rolled-back members; Err ⇒ `rollback_failed_tx(SeqSpan::stamped(seq_base, res.len), undo, ring)`
 (re-acquire leaf locks ascending/deduped/revalidated, restore pre-image ONLY if the key's newest
-dirty record still bears this window's seq — skip-if-newer, LWW-correct for Δtime merge records;
+dirty record still bears this window's seq — skip-if-newer, LWW-correct for Δtime merge records — **diverged**
+(decision 0002 row 565, 0003 §CG.9): the port keeps the undo keys alone and undoes what the key still holds of
+the span over everything else it holds (`NodeSnapshot.spanUndo`: a Δ of the span's own fields, so a newer Δ of
+another mask stands);
 `COMMIT_RETRY_BUDGET` retries on stale leaves), `note_journal_failure()`, then
 `checkpoint_past_region(region, padded_end)` (zero ring bytes; failure ⇒ another
 `note_journal_failure`) → apply-holes in acked windows: checkpoint past the furthest BEFORE

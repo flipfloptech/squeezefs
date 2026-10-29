@@ -508,7 +508,10 @@ Order of effects at the manager, under `manager_verbs` (one verb at a time, `B:1
    next = none), barrier, re-write the previous last header with `next = extent`, barrier — a torn growth
    leaves a chain that ends where it did (`B:10380-10438`).
 5. **Settle a pending GrowRing word** of the identity's PREVIOUS incarnation against its LAST page in any
-   state (`B:10445-10466`; §3.3).
+   state (`B:10445-10466`; §3.3) — the page of `pending.appender_id`, never the pair this join reuses (a
+   re-join in place takes the next pair while the predecessor's page stays Recovered; the port's first cut
+   judged the reused pair's page and freed a segment the Recovered ring still named — decision 0003 §CG.7).
+   The release of a Recovered page settles the word too (`Manager.settleReleasedRing`).
 6. **Ring size**: `ring_want_bytes == 0` ⇒ `resolve_sym_ring_bytes_hinted(hint.ring_bytes)` =
    `max(derived(ewma 0) = floor, hint)` clamped `[512 KiB, ceiling]` page-aligned (`A:930-939`); explicit
    ⇒ clamped to `[floor, ceiling]` (`B:10467-10477`). Then the ask UNDER THE BUDGET:

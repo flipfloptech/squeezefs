@@ -194,6 +194,9 @@ pub const stats = struct {
     /// inside the record's notify, and waited for it to leave (THE
     /// COMPLETION'S LAST TOUCH, module doc).
     pub var overlay_teardown_quiesce_waits: counters.ShardedCounter = .{};
+    /// A record retired while a serve still read it: its slot left the free
+    /// list until that serve's release (`Registry.release`).
+    pub var overlay_retires_behind_readers: counters.ShardedCounter = .{};
     pub var writeback_orphan_discards_overlay: counters.ShardedCounter = .{};
     /// W5 drops taken while the volume was FAILED (or a device fenced): the
     /// fail-stop working, never a tripwire (owner ruling 2026-10-19).
@@ -516,6 +519,12 @@ pub const Record = struct {
     /// steady writer).
     opened_ns: u64 = 0,
     in_use: bool = false,
+    /// Serves reading the record (`Registry.acquire`), under the registry's
+    /// lock: a retire while one reads leaves the slot off the free list
+    /// (`retire_pending`) until the last of them releases it — no install
+    /// re-fills a slot a serve still reads.
+    readers: u32 = 0,
+    retire_pending: bool = false,
 };
 
 /// Fixed pool + an index under a spin lock (records are rare: one per block
@@ -537,6 +546,12 @@ pub const Registry = struct {
     pub fn init(gpa: Allocator, capacity: usize) Allocator.Error!Registry {
         const recs = try gpa.alloc(Record, capacity);
         errdefer gpa.free(recs);
+        // The words a free slot is judged by before any install fills it.
+        for (recs) |*r| {
+            r.in_use = false;
+            r.readers = 0;
+            r.retire_pending = false;
+        }
         var free = try std.ArrayList(u32).initCapacity(gpa, capacity);
         errdefer free.deinit(gpa);
         var i: u32 = @intCast(capacity);
@@ -561,6 +576,33 @@ pub const Registry = struct {
         self.lock.lock();
         defer self.lock.unlock();
         return self.index.get(k);
+    }
+
+    /// `get` with a reader's hold on the record (`Record.readers`): its
+    /// slot is not re-filled until `release`.
+    pub fn acquire(self: *Registry, k: Key) ?*Record {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const r = self.index.get(k) orelse return null;
+        r.readers += 1;
+        return r;
+    }
+
+    /// A reader's hold dropped; the last one of a retired record frees
+    /// its slot.
+    pub fn release(self: *Registry, r: *Record) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        assert(r.readers > 0);
+        r.readers -= 1;
+        if (r.readers == 0 and r.retire_pending) {
+            r.retire_pending = false;
+            self.free.appendAssumeCapacity(self.slotOf(r));
+        }
+    }
+
+    fn slotOf(self: *const Registry, r: *const Record) u32 {
+        return @intCast((@intFromPtr(r) - @intFromPtr(self.records.ptr)) / @sizeOf(Record));
     }
 
     /// Promise one free record to an install about to mint; false = every
@@ -591,6 +633,7 @@ pub const Registry = struct {
         if (self.index.contains(k)) return error.Exists;
         const idx = self.free.pop() orelse return error.Full;
         const r = &self.records[idx];
+        assert(r.readers == 0 and !r.retire_pending);
         r.* = fill.*;
         r.in_use = true;
         r.inflight_change = .init;
@@ -606,10 +649,15 @@ pub const Registry = struct {
         defer self.lock.unlock();
         _ = self.index.remove(r.key);
         r.in_use = false;
-        const idx: u32 = @intCast((@intFromPtr(r) - @intFromPtr(self.records.ptr)) / @sizeOf(Record));
-        self.free.appendAssumeCapacity(idx);
         _ = self.open_count.fetchSub(1, .monotonic);
         stats.overlay_open.sub(1);
+        if (r.readers != 0) {
+            // A serve still reads it: the last reader's release frees it.
+            r.retire_pending = true;
+            stats.overlay_retires_behind_readers.inc();
+            return;
+        }
+        self.free.appendAssumeCapacity(self.slotOf(r));
     }
 
     /// The syncfs census: every live record's ino appended to `out`
@@ -1666,7 +1714,10 @@ pub const Overlay = struct {
     /// by `SETTLE_RETRIES`.
     pub fn serve(self: *Overlay, io: Io, ino: u64, block: u32, rel: u32, out: []u8) ServeOutcome {
         if (!self.anyOpenFast()) return .none;
-        const rec = self.registry.get(.{ .ino = ino, .block = block }) orelse return .none;
+        // A reader's hold: the record's slot is never re-filled under the
+        // device reads (its own incarnation's words to the last one).
+        const rec = self.registry.acquire(.{ .ino = ino, .block = block }) orelse return .none;
+        defer self.registry.release(rec);
         const first_page: u32 = rel / OVERLAY_PAGE;
         const end: u32 = rel + @as(u32, @intCast(out.len));
         const pages: u32 = (end + OVERLAY_PAGE - 1) / OVERLAY_PAGE - first_page;
@@ -2768,6 +2819,7 @@ test "A SERVE OWNS THE RECORD IT READS: a serve of block 0 parked between its sn
             res.* = ov.serve(io_, 96, 0, 0, out);
         }
     };
+    const behind0 = stats.overlay_retires_behind_readers.load();
     w.ov.serve_hold.store(true, .release);
     defer w.ov.serve_release.notifyWaiters(io);
     var out: [wt.BS]u8 = undefined;
@@ -2785,10 +2837,13 @@ test "A SERVE OWNS THE RECORD IT READS: a serve of block 0 parked between its sn
     w.ov.serve_release.notifyWaiters(io);
     th.join();
     // The law: the serve never answers block 1's bytes for block 0, and
-    // the slot it held is not block 1's.
+    // the slot it held is not block 1's (its retire waited for the serve).
     if (res == .served) std.debug.print("the serve of block 0 answered served with {s}\n", .{if (std.mem.eql(u8, &out, &b)) "block 1's bytes" else if (std.mem.eql(u8, &out, &a)) "its own bytes" else "other bytes"});
     try testing.expectEqual(Overlay.ServeOutcome.settle, res);
     try testing.expect(rec1 != rec0);
+    try testing.expectEqual(behind0 + 1, stats.overlay_retires_behind_readers.load());
+    // The released slot is the free list's again.
+    try testing.expect(!rec0.retire_pending and rec0.readers == 0);
     w.ov.drainBlock(io, &w.locks, 96, 1, false, w.cs());
     try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
 }

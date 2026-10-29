@@ -784,6 +784,105 @@ test "linux: THE MANAGER'S REMOUNT BESIDE A LIVE LESSEE HOLDS NONE OF ITS TREES 
     }
 }
 
+const status = @import("../../cli/status.zig");
+const uring_fs = @import("../../io/uring_fs.zig");
+const set_config = @import("../../data/set_config.zig");
+const dir_place = @import("../routing/dir_place.zig");
+
+/// The offline `status` census of `path` for one data volume `vol_tag`, at
+/// the newest checkpoint (`status.readRefCensus`, as `status` and `df` run it).
+fn statusCensus(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8, vol_tag: u64) !status.VolCensus {
+    const pool = try uring_fs.Pool.init(gpa, uring_fs.Config.fixed(2, 1024));
+    defer pool.deinit();
+    var reason: [512]u8 = undefined;
+    const snap = try status.classify(gpa, env, pool, path, &reason);
+    const sb = snap.sb orelse return error.TestNotFormatted;
+    var rec = (try status.newestLedger(gpa, env, pool, path, sb)) orelse return error.TestNoLedger;
+    defer rec.deinit(gpa);
+    const vols = [_]set_config.DataVolume{.{ .vol_tag = vol_tag, .state = .active, .device_uuid = @splat(1), .added_ts = 0, .capacity_blocks = 1024, .volume_len = 1 << 30, .uri = "/dev/d0" }};
+    var conf = try set_config.birth(gpa, sb.set_uuid, .{ .compression = .lz4, .block_size = 1 << 20 }, null, &vols, dir_place.DEFAULT_DEPTH);
+    defer conf.deinit(gpa);
+    var out: std.ArrayList(status.VolCensus) = .empty;
+    defer out.deinit(gpa);
+    try status.readRefCensus(gpa, testing.io, env, pool, path, sb, &rec, &conf, &out);
+    return out.items[0];
+}
+
+/// A block reference of `vol_tag` owned by a fresh ino of `slot`,
+/// committed by its lessee `be`.
+fn commitRef(be: *KvBackend, slot: u16, vol_tag: u64, block_idx: u64) ![key.BLOCK_REF_KEY_LEN]u8 {
+    const k = key.blockRefKey(vol_tag, block_idx, key.guestLocalIno(slot, try be.allocateInoInSlot(slot)), 0);
+    const t = try be.begin(@src());
+    try t.stagePut(key.TREE_BLOCK_REFS, &k, "r");
+    try be.commit(t);
+    return k;
+}
+
+test "linux: THE OFFLINE `status` CENSUS READS A FOREIGN HOLDER'S SLOT AT ITS PAGE, NEVER AT THE GRANT-TIME WORD (decision 0003 §CF.5; §CF.1's rule for `status`/`df`): A mints a slot tree with one block reference and hands the slot to B; B moves the root, deletes that reference and adds two; the census of the device counts B's two (the root B's page names, as the recovery installs it) — never the grant-time tree's one; after B's pool recycles the grant-time image the census still reads B's two (it refused: the grant-time root does not verify)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "status-holder-page", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try s.env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "60000");
+    const ref_vol: u64 = 0x5EED;
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try wire_plane.WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    const slot = try managerRotorSlot(gpa, be0);
+    try fillSlot(be0, slot, 1, &@as([200]u8, @splat('a')));
+    const first = try commitRef(be0, slot, ref_vol, 42);
+    try be0.checkpointNow();
+    try testing.expectEqual(@as(u64, 1), (try statusCensus(gpa, &s.env, s.paths[0], ref_vol)).references);
+    const b = try MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-status-holder-page-b", .endpoint = plane.advertised } });
+    defer b.close();
+    const bj = b.volumes[0];
+    const me = bj.joined.?.appenderId();
+    try testing.expectEqual(acquire.Verbs.OfferResult.offered, try be0.slots.verbs.offerSlot(lt.MANAGER, slot, me, std.math.maxInt(u64)));
+    const sink = bj.slots.carriageSink();
+    sink.offered(sink.ctx, slot, lt.MANAGER);
+    try testing.expect(bj.slots.table.view(slot).leasedBy(me));
+    try bj.checkpointNow();
+    const grant_time = try tree0Root(gpa, be0, slot);
+    // B moves the root, then replaces A's reference with two of its own.
+    try compactRootAndCover(bj, slot);
+    {
+        const t = try bj.begin(@src());
+        try t.stageDelete(key.TREE_BLOCK_REFS, &first);
+        try bj.commit(t);
+    }
+    _ = try commitRef(bj, slot, ref_vol, 43);
+    _ = try commitRef(bj, slot, ref_vol, 44);
+    try bj.checkpointNow();
+    try be0.checkpointNow();
+    try testing.expectEqual(grant_time, try tree0Root(gpa, be0, slot));
+    try testing.expectEqual(@as(usize, 2), try refsOf(gpa, bj, ref_vol));
+    // 1. The census reads B's slot at the root B's page names.
+    {
+        const c = try statusCensus(gpa, &s.env, s.paths[0], ref_vol);
+        std.debug.print("\nstatus census beside B's moved slot {d}: {d} reference(s) over {d} block(s) (B holds 2; the grant-time root 0x{x} holds 1)\n", .{ slot, c.references, c.blocks, grant_time.addr });
+        try testing.expectEqual(@as(u64, 2), c.references);
+        try testing.expectEqual(@as(u64, 2), c.blocks);
+    }
+    // 2. The grant-time image recycled: the census still reads B's page root.
+    var rounds: u32 = 0;
+    while (!bj.alloc.isAllocated(bj.cache.addrExtent(grant_time.addr)) and rounds < 8) : (rounds += 1) try compactRootAndCover(bj, slot);
+    try testing.expect(bj.alloc.isAllocated(bj.cache.addrExtent(grant_time.addr)));
+    try be0.checkpointNow();
+    {
+        const c = statusCensus(gpa, &s.env, s.paths[0], ref_vol) catch |e| {
+            std.debug.print("the status census refused {s} after B recycled the grant-time image ({d} compaction round(s))\n", .{ @errorName(e), rounds });
+            return e;
+        };
+        try testing.expectEqual(@as(u64, 2), c.references);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // THE MOVE MATRIX (0003 §X.1, §X.2): the filesystem over both members — A's
 // and B's planes bound the way `mount` binds them, B's behind the product's

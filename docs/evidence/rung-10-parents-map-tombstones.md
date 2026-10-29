@@ -67,3 +67,24 @@ times, `kv_fs_stripes`' `plain`) stay flat in this profile (≤ 0.05 %); each wo
 churn. The reclaim cadence's tick drain (`drainGather` at batch 1) runs while corpses keep arriving — destroys lag a
 removal phase (316 k of 640 k at run 1's end) — so the tick's other passes wait out a sustained storm (a census the
 first rig published from the tick updated once in three minutes).
+
+## The A-B-B-A (2026-10-29, quiet host on AC, the RAM-NVMe perf mount, 2 MDT + 2 OST, dist builds)
+
+`dev` `6e9fbdf` against the fix (`7d0640a`), legs A B B A, each leg ONE fresh mount running `mpirun -np 32
+mdtest -n 10000 -u -i 1` eight times back to back (`-d …/md1` … `md8`); fsck clean after every leg; k ops/s,
+mean of two legs per arm:
+
+| run on the mount | 1 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|
+| file creation, dev → fix | 240 → 240 | 220 → 239 | 120 → 223 | 69 → 209 | 55 → 210 | **62 → 206 (×3.3)** |
+| directory creation, dev → fix | 271 → 282 | 236 → 250 | 200 → 240 | 95 → 215 | 68 → 212 | **61 → 208 (×3.4)** |
+| directory removal, dev → fix | 281 → 280 | 269 → 268 | 255 → 239 | 252 → 225 | 222 → 237 | 172 → 231 |
+| file removal, dev → fix | 311 → 310 | 308 → 310 | 291 → 291 | 272 → 269 | 266 → 270 | 253 → 262 |
+| file read, dev → fix | 949 → 903 | 889 → 908 | 843 → 859 | 819 → 713 | 782 → 800 | 750 → 802 |
+
+A fresh mount (run 1) reads the same; from run 5 a `dev` mount's creates collapse to a quarter while the
+fix holds. File read moves ± 13 % run to run in both directions (open/close of an empty file; no trend).
+Two earlier rounds of four runs per mount (`pm-abba/`, `pm-abba2/`) agree at runs 1–4; in the first, one
+fix leg's daemon was aborted by the supervisor in run 2's directory removal — the conveyor pass parked in
+`recall` (the §CM wedge, named by its census, now owned by `fix/pass-recall-wedge`), not this change.
+Landed (gate 185 green, 75/75). Sessions: `/build/perf/pm8/`, `pm-abba/`, `pm-abba2/`.

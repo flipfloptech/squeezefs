@@ -410,6 +410,41 @@ test "C10: nlink above the names is the leak direction and lowers; below raises;
     try ram.expectClasses(r3, &.{});
 }
 
+test "C10 directory nlink: a directory's count is 2 + its subdirectories — above or below is a finding offline and online, repaired to the counted subdirectories; a healthy tree of directories, files and hard links is clean (red: directories were never a count finding, ops_fsck.md §3.10 — an inflated directory the RENAME_EXCHANGE defect left, generic/025, was invisible)" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    const p = try populate(set);
+    const sub = try set.mkdir(p.dir, "sub");
+    _ = try set.mkdir(sub, "leaf");
+    _ = try set.mkdir(p.dir, "sub2");
+    try set.freezeEra();
+    for ([_]finding.Mode{ .offline, .online }) |mode| {
+        var r = try ram.run(set, mode, .{});
+        defer r.deinit(gpa);
+        try ram.expectClasses(r, &.{});
+    }
+    // `dir` holds two subdirectories (4 is right), `sub` one (3 is right).
+    try set.setNlink(p.dir, 7);
+    try set.setNlink(sub, 2);
+    try set.freezeEra();
+    for ([_]finding.Mode{ .offline, .online }) |mode| {
+        var r = try ram.run(set, mode, .{});
+        defer r.deinit(gpa);
+        try ram.expectClasses(r, &.{ .c10, .c10 });
+    }
+    var sink: RamSink = .{ .gpa = gpa };
+    defer sink.deinit();
+    var r2 = try ram.run(set, .offline, .{ .repair = repairOpts(&sink, true) });
+    defer r2.deinit(gpa);
+    try testing.expectEqual(@as(u64, 2), r2.repair.?.count(.applied));
+    try testing.expectEqual(@as(u32, 4), (try set.readInode(RamSet.local(p.dir))).?.nlink);
+    try testing.expectEqual(@as(u32, 3), (try set.readInode(RamSet.local(sub))).?.nlink);
+    var r3 = try ram.run(set, .offline, .{});
+    defer r3.deinit(gpa);
+    try ram.expectClasses(r3, &.{});
+}
+
 test "C2 leaked frees after the ledger check; C2 lost with good content repairs the allocator; C3 recounts; the untouched blocks stay" {
     const gpa = testing.allocator;
     const set = try RamSet.init(gpa);

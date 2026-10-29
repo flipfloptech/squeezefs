@@ -8952,15 +8952,7 @@ test "smoke: --daemon --supervise --log-file: the invoking process returns 0 onl
 const stats_herd_readers: u64 = 32;
 const stats_herd_min_reads: u64 = 8;
 
-/// The herd's renders per completed read stay under `readers / 4`: before
-/// §CC.2 every lookup was its own render and a read cost O(readers) of them
-/// (the kernel's revalidation retry — 23 a read at 32 readers on bc569d4);
-/// under one render in flight per class a read costs O(1) — the in-lookup
-/// owner's render and the waiters' revalidation (2–3 a read, idle and
-/// beside a gate's load).
-const stats_herd_renders_per_read_max: u64 = stats_herd_readers / 4;
-
-test "smoke: 32 CONCURRENT READERS OF .stats UNDER A CREATE STORM NEVER WEDGE THE MOUNT (decision 0003 §CC, §CO; rung-10-stats-wedge.md) — a `--daemon --supervise` set, 8 creators making files beside 32 readers of `.stats` for at least 8 s and at least 8 reads each: every reader completes its reads and every read is a whole document (on bc569d4 the supervisor SIGABRTed the daemon under the kernel's lookup livelock), the control inode's probe misses nothing, no drain worker is held for the probe's answer window, lookups share renders (fewer renders than shared lookups, renders per read under a quarter of the readers — every lookup was its own render before §CC.2), the op watchdog is silent; the read walls are printed, never judged (a fresh render per read takes what the host gives it)" {
+test "smoke: 32 CONCURRENT READERS OF .stats UNDER A CREATE STORM NEVER WEDGE THE MOUNT (decision 0003 §CC, §CO; rung-10-stats-wedge.md) — a `--daemon --supervise` set, 8 creators making files beside 32 readers of `.stats` for at least 8 s and at least 8 reads each: every reader completes its reads and every read is a whole document (on bc569d4 the supervisor SIGABRTed the daemon under the kernel's lookup livelock), the control inode's probe misses nothing, no drain worker is held for the probe's answer window, lookups share renders (every lookup was its own render before §CC.2), the op watchdog is silent; the read walls and the renders a read costs are printed, never judged (both are the host's pace)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -9026,9 +9018,13 @@ test "smoke: 32 CONCURRENT READERS OF .stats UNDER A CREATE STORM NEVER WEDGE TH
     // worker sat inside one pass for the window it gives an answer.
     try testing.expectEqual(@as(u64, 0), misses);
     try testing.expect(held * std.time.ns_per_ms < (cli_supervisor.Policy{}).probe_timeout_ns);
-    // The collapse: lookups that arrived during a render shared the next.
-    try testing.expect(shares >= builds);
-    try testing.expect(builds <= reads * stats_herd_renders_per_read_max);
+    // The collapse: lookups that arrived during a render shared the next
+    // (before §CC.2 every lookup minted its own: no share at all). How many
+    // share a render, and so the renders a read costs, is the host's pace —
+    // a descheduled reader revalidates against every render that ran while
+    // it slept (2.0 a read idle, 5.0 at load 115) — printed, never judged;
+    // the batch law itself is the registry's unit test (§CC.4).
+    try testing.expect(shares > 0);
     try testing.expectEqual(@as(u64, 0), overdue);
     gpa.free(try rig.shOk(rig.mp, "rm -rf herd && echo cleaned"));
     try rig.umount();

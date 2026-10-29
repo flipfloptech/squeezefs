@@ -9,9 +9,9 @@
 #       (the nvmet modules loaded and persisted, the nvme_core boot parameter in GRUB or
 #       Limine, IOR/mdtest into /opt/sqz-tools, root-MPI env, the build root's directories)
 #
-# Two package families: Debian/Ubuntu (apt, dpkg; the sqz kernel as .debs from
-# scripts/kernel/build-host-kernel) and Arch and its derivatives such as Omarchy (pacman;
-# the sqz kernel as the distro kernel's PKGBUILD plus the sqz series, built with makepkg).
+# Two package families: Debian/Ubuntu (apt, dpkg; a distro or kernel.org Linux >= 7.3) and
+# Arch and its derivatives such as Omarchy (pacman; scripts/kernel/build-host-kernel builds
+# mainline + scripts/kernel/patches-mainline with makepkg).
 #
 # Never done here: a kernel install, a reboot, a filesystem, LV or sudoers change — those
 # print as commands to run.
@@ -21,9 +21,10 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 ROOT=${SQZ_BUILD_ROOT:-/build}
 REF=${SQZ_REFERENCE:-$HOME/Source/squeezefs}
 ZIG_WANT=0.17.0
-# build-host-kernel's release string; a PKGBUILD-built kernel carries the sqz tag in its own
-# form (7.2.x-N-omarchy-sqz), so the kernel check looks for the tag, not this string.
-KVER=7.2.6-sqz
+# The oldest kernel the daemon mounts on: FUSE-over-io_uring buffer pools (uapi 7.46), the
+# transport's only mode since the owner's 2026-10-29 ruling; the daemon refuses an older one
+# by its INIT probe (FUSE_HAS_IO_URING_BUFPOOL), this check reads the release.
+KMIN_MAJOR=7 KMIN_MINOR=3
 apply=0
 case "${1:-}" in --apply) apply=1 ;; '') ;; *) echo "usage: provision-local-venue [--apply]" >&2; exit 2 ;; esac
 
@@ -68,21 +69,24 @@ v=$(sudo -n bash -lc 'zig version' 2>/dev/null)
 [ "$v" = "$ZIG_WANT" ] && ok "zig $v on root's login PATH (sudo bash -lc)" || miss "zig $ZIG_WANT on root's login PATH (have: ${v:-none})" "$zig_fix"
 
 echo "== kernel"
-# The sqz tag in uname -r is the series' contract (the reference's config-fragment).
 kr=$(uname -r)
-case $kr in
-  *sqz*) ok "kernel $kr (the sqz series)" ;;
-  *) if [ "$FAMILY" = arch ]; then
-    miss "the sqz kernel (running $kr): FUSE over io_uring, kmbuf, syncfs — patches 0001–0029" \
-      "scripts/kernel/build-host-kernel --local   # Omarchy's current linux-omarchy PKGBUILD + the series, makepkg, pacman -U; the Limine hooks make the UKI and entry (never reboots)" \
-      "(after an Omarchy bump: build-host-kernel --local --prepare-only first — every patch at --fuzz=0 in minutes)" "then REBOOT into it"
-  else
-    miss "the sqz kernel $KVER (running $kr): FUSE over io_uring, kmbuf, syncfs — patches 0001–0029" \
-      "scripts/kernel/build-host-kernel --local   # builds + installs the .debs (never reboots)" "then REBOOT into $KVER"
-  fi ;;
-esac
-if [ -e /sys/module/fuse/parameters/enable_uring ]; then ok "fuse.enable_uring=$(cat /sys/module/fuse/parameters/enable_uring) (the tests set it)"; else
-  miss "fuse.enable_uring (FUSE_IO_URING: a mount has no classical fallback, charter §1.2)" "the sqz kernel (above)"
+kmaj=${kr%%.*}; kmin=${kr#*.}; kmin=${kmin%%[!0-9]*}
+if [ "$kmaj" -gt "$KMIN_MAJOR" ] || { [ "$kmaj" = "$KMIN_MAJOR" ] && [ "${kmin:-0}" -ge "$KMIN_MINOR" ]; }; then
+  case $kr in
+    *sqz*) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR, the sqz mainline series)" ;;
+    *) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR)"
+       note "no sqz tag: scripts/kernel/patches-mainline is absent (FUSE_TIME_LIMITS, FUSE_SYNCFS before 7.4, host-scoped NVMe-oF subsystems)" ;;
+  esac
+elif [ "$FAMILY" = arch ]; then
+  miss "Linux >= $KMIN_MAJOR.$KMIN_MINOR (running $kr): FUSE-over-io_uring buffer pools — the daemon refuses an older kernel" \
+    "scripts/kernel/build-host-kernel --local   # mainline $KMIN_MAJOR.$KMIN_MINOR + scripts/kernel/patches-mainline, makepkg, pacman -U; the Limine hooks make the UKI and entry (never reboots)" \
+    "(after a base bump: build-host-kernel --local --prepare-only first — every patch at --fuzz=0 in minutes)" "then REBOOT into it"
+else
+  miss "Linux >= $KMIN_MAJOR.$KMIN_MINOR (running $kr): FUSE-over-io_uring buffer pools — the daemon refuses an older kernel" \
+    "install a distro or kernel.org $KMIN_MAJOR.$KMIN_MINOR+ kernel with CONFIG_FUSE_IO_URING=y (scripts/kernel/config-fragment lists the rest), then REBOOT into it"
+fi
+if [ -e /sys/module/fuse/parameters/enable_uring ]; then ok "fuse.enable_uring=$(cat /sys/module/fuse/parameters/enable_uring) (the daemon sets it)"; else
+  miss "fuse.enable_uring (CONFIG_FUSE_IO_URING: a mount has no classical fallback, charter §1.2)" "a Linux >= $KMIN_MAJOR.$KMIN_MINOR kernel built with CONFIG_FUSE_IO_URING=y (above)"
 fi
 v=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)
 [ "$v" = 0 ] && ok "io_uring enabled" || miss "io_uring (kernel.io_uring_disabled=$v)" "echo kernel.io_uring_disabled=0 | sudo tee /etc/sysctl.d/60-sqz-io-uring.conf && sudo sysctl --system"
@@ -91,7 +95,7 @@ for m in nvmet nvme_loop nvmet_tcp nvme_tcp nvme_fabrics tls brd null_blk; do
   [ -d "/sys/module/$m" ] || modprobe -n "$m" 2>/dev/null || lack="$lack $m"
 done
 [ -z "$lack" ] && ok "modules nvmet nvme_loop nvmet_tcp nvme_tcp nvme_fabrics tls brd null_blk available" \
-  || miss "modules:$lack (the nvmet, NVMe-oF, kTLS and RAM-namespace rows)" "a kernel config that has them: build-host-kernel loads every sqz module before localmodconfig"
+  || miss "modules:$lack (the nvmet, NVMe-oF, kTLS and RAM-namespace rows)" "a kernel config that has them (scripts/kernel/config-fragment lists them)"
 [ -f /etc/modules-load.d/sqz.conf ] && ok "nvmet modules persisted (/etc/modules-load.d/sqz.conf)" \
   || miss "the nvmet modules loaded at boot" "scripts/dev/provision-local-venue --apply"
 # Where provision-ssh-venue persists a kernel parameter: Debian's GRUB drop-ins, or
@@ -118,12 +122,11 @@ echo "== packages"
 pkgs=()
 if [ "$FAMILY" = deb ]; then
   lock=$REPO/scripts/suites/apt.$ID-$VERSION_ID.lock
-  pkg_from="suites lock, instruments, kernel build deps"
+  pkg_from="suites lock, instruments"
   if [ -f "$lock" ]; then mapfile -t pkgs < <(cut -d= -f1 "$lock"); else note "no suites lock for $ID-$VERSION_ID (scripts/suites/apt.*.lock): the first suite run pins one"; fi
-  # The instruments and the venue's own tools; then build-host-kernel's build dependencies
-  # (debhelper provides the debhelper-compat it installs).
+  # The instruments and the venue's own tools (build-essential builds IOR/mdtest).
   pkgs+=(fio nvme-cli fuse3 util-linux e2fsprogs rsync curl git python3 openssl openmpi-bin libopenmpi-dev
-    build-essential flex bison bc cpio dwarves libelf-dev libdw-dev libssl-dev zstd debhelper)
+    build-essential flex bison bc libssl-dev zstd)
   pkg_have() { dpkg -s "$1" >/dev/null 2>&1; }
   pkg_install="sudo apt-get install -y --no-install-recommends"
 else
@@ -145,8 +148,8 @@ if PATH=/opt/sqz-tools/bin:$PATH command -v ior >/dev/null && PATH=/opt/sqz-tool
 else
   miss "ior/mdtest at io500's pinned hash" "scripts/dev/provision-local-venue --apply (builds them into /opt/sqz-tools)"
 fi
-# (The kernel series lives in scripts/kernel/patches-7.2 since 2026-10-16; the reference is
-# porting evidence only.)
+# (The kernel series lives in scripts/kernel/patches-mainline; the reference is porting
+# evidence only.)
 git -C "$REF" rev-parse --is-inside-work-tree >/dev/null 2>&1 && ok "the Rust reference at $REF (read-only porting evidence)" \
   || miss "the Rust reference at $REF (read-only porting evidence; the vm venue mounts it)" "git clone git@github.com:flipfloptech/squeezefs.git $REF   # or set SQZ_REFERENCE"
 

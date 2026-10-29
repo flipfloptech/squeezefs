@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The Linux venue: run a command on this Linux host, inside the `sqz-zig` macOS
-# container, or on an ssh box — each on the sqz kernel series with Zig 0.17 and
-# this repo at the same absolute path.
+# container, or on an ssh box — each on Linux >= 7.3 (FUSE-over-io_uring buffer pools) with
+# Zig 0.17 and this repo at the same absolute path.
 #
 #   scripts/venue                 # interactive shell in the repo
 #   scripts/venue zig build gate  # run the gate in the container
@@ -15,7 +15,9 @@
 #   local         THIS host (the default when it is Linux): commands run as root via sudo
 #                 in this tree — no sync, no VM. `up` runs scripts/dev/provision-local-venue.
 #   vm            the `sqz-zig` container on this Mac (the default on macOS; aarch64,
-#                 8 vCPU / 16 GiB, the sqz kernel with patches 0001–0029)
+#                 8 vCPU / 16 GiB; its kernel must be Linux >= 7.3 — the 7.2-sqz recipe
+#                 scripts/kernel/build-venue-kernel was removed 2026-10-29 and no arm64 7.3
+#                 recipe exists yet)
 #   kamrui        the x86_64 box `kamrui-dev` over ssh (12 threads, 61 GiB, local NVMe;
 #                 Ubuntu 26.04): the repo is mirrored at the SAME absolute path by rsync
 #                 before every command (a delta is ~2 s), commands run as root via sudo,

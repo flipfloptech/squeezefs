@@ -283,24 +283,13 @@ suite_format() {
 suite_spawn_daemon() {
   local tag=$1 set_tag=$2 mnt=$3 log=$4; shift 4
   mkdir -p "$mnt"
-  # The kmbuf ring wants order-8 contiguous pages; a fragmented venue
-  # (other agents' daemons, a hot page cache) answers ENOMEM. Compact and
-  # retry — never a weaker buffer mode to pass (charter §1.6/§1.8).
   # `--supervise` IS the release posture (charter §4 "an external mount
   # supervisor"): a daemon that dies is named with its wait status in the
   # log (two silent deaths under venue OOM pressure left no trace without
   # it), and a daemon that stops answering is dumped (every task's kernel
   # stack) and aborted — a wedge becomes evidence, never a hung suite.
-  local attempt
-  for attempt in 1 2 3; do
-    "$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$SUITE_MOUNT_OPTS" "$@" "${SUITE_META[$set_tag]}" "$mnt" && break
-    if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' "$log"; then
-      suite_log "mount $tag: kmbuf ENOMEM (fragmented venue); compacting memory and retrying ($attempt/3)"
-      sync -f "${SUITE_SETDIR[$set_tag]}"; { echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; } 2>/dev/null || true; sleep 2
-      continue
-    fi
-    tail -40 "$log" >&2; suite_die "mount failed ($tag)"
-  done
+  "$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$SUITE_MOUNT_OPTS" "$@" "${SUITE_META[$set_tag]}" "$mnt" \
+    || { tail -40 "$log" >&2; suite_die "mount failed ($tag)"; }
   grep -q " $mnt fuse.squeezefs " /proc/mounts || suite_die "$mnt is not in /proc/mounts after a ready mount"
   SUITE_PID[$tag]=$(grep -o '"pid":[0-9]*' "$mnt/.stats" | head -1 | cut -d: -f2)
   suite_log "mounted $tag at $mnt (daemon pid ${SUITE_PID[$tag]}, -o $SUITE_MOUNT_OPTS $*)"

@@ -172,11 +172,6 @@ tag="/run/squeezefs-suites/mnt-$(printf '%s' "$dir" | md5sum | cut -c1-16)"
 echo "$SET_ID" > "$tag"
 mount_failed() { flock -u 9; if flock -x -n 9; then suite_slices_down; fi; rm -f "$tag"; }
 mount_tagged() { printf '%s\n%s\n' "$SET_ID" "$(awk -v t="$dir" '$5 == t { id = $1 } END { print id }' /proc/self/mountinfo)" > "$tag"; }
-# The zero-copy kmbuf ring needs order-8 contiguous pages per queue; a
-# fragmented venue (other agents' daemons, a hot page cache) answers
-# ENOMEM. Compact and retry, as `common.sh`'s `suite_mount` does — never a
-# weaker buffer mode to pass (charter §1.6/§1.8); a test's own mount
-# failing on the venue's memory is a venue casualty, never a semantic.
 attempt=0
 while :; do
   attempt=$((attempt + 1))
@@ -188,13 +183,6 @@ while :; do
   # `suite_mount` says why) — a death gets its wait status, a wedge its dump.
   out=$("$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$all" "$SLICE_META_URI" "$dir" 2>&1 9>&-) && { mount_tagged; exit 0; }
   rc=$?
-  if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' <<< "$out"; then
-    echo "$(date +%s) mount $dir: kmbuf ENOMEM (fragmented venue); compacting memory, retry $attempt/3" >> "$SET_DIR/mounts.log"
-    # /proc/sys is read-only in the container venue: best effort, the
-    # retry itself is the recovery.
-    sync -f "$SET_DIR"; { echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; } 2>/dev/null || true; sleep 2
-    continue
-  fi
   # A stale writer claim whose holder is DEAD: the previous daemon of this
   # set died without its clean unmount (the product never auto-takes a
   # claim on a volume without PR — operator attestation, charter D0). The

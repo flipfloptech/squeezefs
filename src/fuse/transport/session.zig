@@ -341,6 +341,12 @@ const SbCell = struct {
     /// An `INVAL_ENTRY` frame's parent (0 = another frame): judged against
     /// the in-flight registry at the write (`entryWaits`).
     entry_parent: u64 = 0,
+    /// The kernel may SLEEP handling this frame on a lock a request holds
+    /// until the daemon answers it: an `INVAL_ENTRY` on the parent's
+    /// `i_rwsem`, a page-invalidating `INVAL_INODE` on a folio lock (a
+    /// write-through WRITE or a READ holds it across its request), a
+    /// `PRUNE` in the eviction. Written through io-wq (`submitWrite`).
+    sleeps: bool = false,
 };
 
 /// One of the sideband's cell pools: its free list — a ring holding the
@@ -492,21 +498,22 @@ const Sideband = struct {
     /// and none is free.
     fn takeCell(self: *Sideband, wait: bool) ?u32 {
         while (true) {
-            if (self.pool.free.tryPop()) |i| {
-                self.cells[i].done.reset();
-                self.cells[i].entry_parent = 0;
-                return i;
-            }
+            if (self.pool.free.tryPop()) |i| return self.fresh(i);
             if (!wait) return null;
             const gen = self.pool.freed.load(.acquire);
-            if (self.pool.free.tryPop()) |i| {
-                self.cells[i].done.reset();
-                self.cells[i].entry_parent = 0;
-                return i;
-            }
+            if (self.pool.free.tryPop()) |i| return self.fresh(i);
             // The lock plane's ticked park: a lost recycle costs one tick.
             _ = futex.waitTimeout(&self.pool.freed, gen, tick_law.tick_ns);
         }
+    }
+
+    /// A cell just taken, reset to a pending inline frame of no parent.
+    fn fresh(self: *Sideband, idx: u32) u32 {
+        const c = &self.cells[idx];
+        c.done.reset();
+        c.entry_parent = 0;
+        c.sleeps = false;
+        return idx;
     }
 
     fn recycle(self: *Sideband, idx: u32) void {
@@ -519,18 +526,12 @@ const Sideband = struct {
     fn takeNbCell(self: *Sideband, wait: bool) ?u32 {
         var waited = false;
         while (true) {
-            if (self.nb_pool.free.tryPop()) |i| {
-                self.cells[i].done.reset();
-                return i;
-            }
+            if (self.nb_pool.free.tryPop()) |i| return self.fresh(i);
             if (!wait or self.disconnected or self.stop.load(.acquire)) return null;
             if (!waited) notify_nb_waits.inc();
             waited = true;
             const gen = self.nb_pool.freed.load(.acquire);
-            if (self.nb_pool.free.tryPop()) |i| {
-                self.cells[i].done.reset();
-                return i;
-            }
+            if (self.nb_pool.free.tryPop()) |i| return self.fresh(i);
             _ = futex.waitTimeout(&self.nb_pool.freed, gen, tick_law.tick_ns);
         }
     }
@@ -547,10 +548,10 @@ const Sideband = struct {
 
     /// `notifyNb` AWAITED: returns once the device write completed — the
     /// kernel has the attrs invalidated when its write returns, and a
-    /// reserved cell's write never waits in the kernel, so the wait is one
-    /// sideband round. What a ring write that grew a file owes before its
-    /// ack (`ipc/host/inval.zig`). False = the session ended or the write
-    /// failed (counted).
+    /// reserved cell's write never waits in the kernel (nor behind a frame
+    /// that does: `SbCell.sleeps`), so the wait is one sideband round. What
+    /// a ring write that grew a file owes before its ack (`ipc/host/
+    /// inval.zig`). False = the session ended or the write failed (counted).
     fn notifyNbAwaited(self: *Sideband, comptime build: anytype, args: anytype) bool {
         if (self.disconnected or self.stop.load(.acquire)) return false;
         const idx = self.takeNbCell(true) orelse return false;
@@ -584,6 +585,7 @@ const Sideband = struct {
         if (self.takeCell(false)) |idx| {
             if (self.fillNotify(idx, codec.notifyInvalEntry, .{ parent, name, self.session.entry_flags })) |_| {
                 self.cells[idx].entry_parent = parent;
+                self.cells[idx].sleeps = true;
                 self.publish(idx);
                 return;
             } else |_| {}
@@ -593,19 +595,18 @@ const Sideband = struct {
     }
 
     /// The loop's half of an `INVAL_ENTRY` (decision 0003 §AB.2, §BL.2): a
-    /// parent this daemon owes a reply on is NEVER `inode_lock`ed by this
-    /// thread — the kernel's `fuse_reverse_inval_entry` would park on the
-    /// `i_rwsem` the request holds (`lookup_open`, mkdir, unlink, rename
-    /// hold it exclusively; a lookup or readdir shared) for the op's whole
-    /// life, with every FORGET, classical reply and awaited notify behind it
-    /// and the daemon's own exit after them. The name WAITS (true) until
-    /// that request is answered, re-judged every `ENTRY_DEFER_RECHECK_NS`;
+    /// parent this daemon owes a reply on is never written — the kernel's
+    /// `fuse_reverse_inval_entry` would sleep on the `i_rwsem` the request
+    /// holds (`lookup_open`, mkdir, unlink, rename hold it exclusively; a
+    /// lookup or readdir shared) for the op's whole life, an io-wq worker
+    /// and a shared cell pinned under it. The name WAITS (true) until that
+    /// request is answered, re-judged every `ENTRY_DEFER_RECHECK_NS`;
     /// never an `INC_EPOCH` in its place — the epoch invalidates every
     /// dentry of the connection and the kernel's `d_invalidate` of a
     /// mountpoint detaches the mounts on it (xfstests generic/410). An op
-    /// that arrives between this check and the kernel's lock parks the
-    /// write for that op's duration alone — nothing of the op's depends on
-    /// this thread.
+    /// whose lock the kernel took before the daemon received it is
+    /// invisible here: the write sleeps on its io-wq worker for that op's
+    /// duration alone, never on this thread (`SbCell.sleeps`, §CK).
     fn entryWaits(self: *Sideband, idx: u32) bool {
         const c = &self.cells[idx];
         const parent = c.entry_parent;
@@ -713,7 +714,8 @@ const Sideband = struct {
     }
 
     /// A notify frame built into a free cell by `build`; fire-and-forget.
-    fn notify(self: *Sideband, comptime build: anytype, args: anytype) error{QueueFull}!void {
+    /// `sleeps`: the kernel may sleep on it (`SbCell.sleeps`).
+    fn notify(self: *Sideband, comptime build: anytype, args: anytype, sleeps: bool) error{QueueFull}!void {
         if (self.disconnected or self.stop.load(.acquire)) return error.QueueFull;
         const idx = self.takeCell(false) orelse {
             notify_dropped.inc();
@@ -727,6 +729,7 @@ const Sideband = struct {
         };
         c.head_len = frame.head.len;
         c.body = frame.body;
+        c.sleeps = sleeps;
         markFireAndForget(c);
         self.publish(idx);
     }
@@ -819,6 +822,14 @@ const Sideband = struct {
             sqe.prep_writev(self.sqeFd(), &c.iov, 0);
         }
         self.markFixed(sqe);
+        // `/dev/fuse` polls EPOLLOUT, so io_uring issues a write INLINE on
+        // this thread under IOCB_NOWAIT, which the fuse device ignores: a
+        // frame the kernel sleeps on would park the loop — every reserved
+        // cell, awaited notify and classical reply behind it — until the
+        // request holding the lock is answered, and that request may be on
+        // a lane waiting for one of them (decision 0003 §CK). io-wq parks
+        // a worker instead; the shared pool bounds how many.
+        if (c.sleeps) sqe.flags |= linux.IOSQE_ASYNC;
         sqe.user_data = write_ud_base + idx;
     }
 
@@ -1244,18 +1255,18 @@ pub const Session = struct {
 
     /// `FUSE_NOTIFY_INVAL_INODE`: `off < 0` = attributes only; `(0, 0)` = every page.
     pub fn notifyInvalInode(self: *Session, ino: u64, off: i64, len: i64) error{QueueFull}!void {
-        return self.sideband.notify(codec.notifyInvalInode, .{ ino, off, len });
+        return self.sideband.notify(codec.notifyInvalInode, .{ ino, off, len }, off >= 0);
     }
 
     /// `FUSE_NOTIFY_INVAL_ENTRY` (`flags`: 0 or `FUSE_EXPIRE_ONLY`).
     pub fn notifyInvalEntry(self: *Session, parent: u64, name: []const u8, flags: u32) error{QueueFull}!void {
-        return self.sideband.notify(codec.notifyInvalEntry, .{ parent, name, flags });
+        return self.sideband.notify(codec.notifyInvalEntry, .{ parent, name, flags }, true);
     }
 
     /// `FUSE_NOTIFY_PRUNE` (uapi 7.45): a pre-7.45 kernel answers EINVAL,
     /// counted `transport_notify_failed`.
     pub fn notifyPrune(self: *Session, nodeids: []const u64) error{QueueFull}!void {
-        return self.sideband.notify(codec.notifyPrune, .{nodeids});
+        return self.sideband.notify(codec.notifyPrune, .{nodeids}, true);
     }
 
     /// `FUSE_NOTIFY_INVAL_ENTRY` that is never dropped (decision 0003

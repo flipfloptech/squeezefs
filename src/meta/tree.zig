@@ -218,16 +218,17 @@ pub fn maintenanceQueueCapacity(budget_nodes: u64) usize {
     return @intCast(derive.clamp(derive.nextPow2(@max(budget_nodes, 1)), MAINTENANCE_QUEUE_FLOOR, MAINTENANCE_QUEUE_CAP));
 }
 
-/// Read `addr`'s extent through the loader and build an UNPUBLISHED node
-/// for it — an SMO successor's load-back (verifies the fresh image under
-/// `slot`'s screen and builds its snapshot zero-copy), a tree's first
-/// root. `cache.publish` maps it; the caller releases its reference.
-pub fn loadFresh(cache: *NodeCache, addr: u64, pinned: bool, slot: ?ForestSlot) node_cache.LoadError!*CachedNode {
+/// Build an UNPUBLISHED node off `image`, the bytes this mount just wrote
+/// at `addr` — an SMO successor, a tree's first root — verified under
+/// `slot`'s screen, its snapshot zero-copy over the extent buffer. The
+/// image IS the node (charter §5.3, RAM-authoritative): the device is
+/// never read back, so a device that acknowledges and drops the write
+/// (dm-flakey `drop_writes`) cannot hand the extent's old bytes to the
+/// node (decision 0003 §CL). `cache.publish` maps it; the caller releases
+/// its reference.
+pub fn writtenNode(cache: *NodeCache, addr: u64, image: []const u8, pinned: bool, slot: ?ForestSlot) node_cache.LoadError!*CachedNode {
     const buf = try snapshot.SharedBuf.createExtent(cache.gpa, cache.cfg.layout.node_size);
-    cache.loader.readExtent(cache.loader.ctx, addr, buf.data) catch |e| {
-        buf.release();
-        return e;
-    };
+    @memcpy(buf.data[0..image.len], image);
     return cache.buildNode(addr, buf, pinned, slot);
 }
 
@@ -446,7 +447,7 @@ pub const KvTree = struct {
         }, &.{}, 0, null);
         defer w.deinit(gpa);
         try cache.loader.writeImage(cache.loader.ctx, addr, w.image);
-        const root_node = try loadFresh(cache, addr, true, identity.forestSlot());
+        const root_node = try writtenNode(cache, addr, w.image, true, identity.forestSlot());
         defer root_node.release();
         try cache.publish(root_node);
         const t = try init(gpa, cache, identity, .{ .addr = addr, .seq = ns }, seq, 0);

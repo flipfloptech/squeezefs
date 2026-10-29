@@ -50,6 +50,7 @@ const node = @import("node.zig");
 const node_cache = @import("node_cache.zig");
 const node_seq = @import("node_seq.zig");
 const snapshot = @import("node_snapshot.zig");
+const bset = @import("bset.zig");
 const journal = @import("journal.zig");
 const jc = @import("journal_core.zig");
 const ledger = @import("ledger.zig");
@@ -814,58 +815,64 @@ pub fn testSmoBuildPause(t: *const KvTree, level: u8, is_root: bool, is_merge: b
 // Shared SMO plumbing.
 // ---------------------------------------------------------------------------
 
-/// Read `n`'s extent fresh from the device and verify it under
-/// `durable_tail` and `slot`'s frame screen — the fold's on-disk source.
-/// The buffer outlives the loaded view (the caller releases both).
+/// An SMO's fold source: `n`'s log as RAM holds it — every bset image its
+/// snapshot indexes, in append order, the frozen delta's frame the newest
+/// (`FrozenDelta`: its image joins the base at the freeze). The node cache
+/// is RAM-authoritative (charter §5.3: successors build from a frozen
+/// snapshot): a fold of the DEVICE log trusted the device to serve what it
+/// acknowledged, and a device that acknowledges and drops writes
+/// (dm-flakey `drop_writes`, the cut xfstests generic/311 stages under a
+/// live mount) served a shorter log — the fold refused `Corrupt` and the
+/// checkpoint tick with it (decision 0003 §CL).
 pub const Source = struct {
-    buf: *snapshot.SharedBuf,
-    loaded: node.LoadedNode,
+    snap: *snapshot.Arc(snapshot.NodeSnapshot),
 
-    pub fn load(cache: *NodeCache, addr: u64, durable_tail: u64, slot: ?node_cache.ForestSlot) node_cache.LoadError!Source {
-        const buf = try snapshot.SharedBuf.createExtent(cache.gpa, cache.cfg.layout.node_size);
-        errdefer buf.release();
-        try cache.loader.readExtent(cache.loader.ctx, addr, buf.data);
-        const loaded = try node.verifyNodeExtentScreened(cache.gpa, buf.data, cache.cfg.layout, addr, durable_tail, cache.screenFor(slot, addr), null);
-        return .{ .buf = buf, .loaded = loaded };
+    pub fn of(n: *CachedNode) Source {
+        return .{ .snap = n.snapshotLoad() };
     }
 
-    pub fn deinit(self: *Source, gpa: Allocator) void {
-        self.loaded.deinit(gpa);
-        self.buf.release();
+    pub fn deinit(self: *Source) void {
+        self.snap.release();
         self.* = undefined;
+    }
+
+    /// The bset images, oldest first.
+    pub fn bsets(self: *const Source) []const snapshot.Bytes {
+        return self.snap.value.base.value.sources;
     }
 };
 
-/// FIND-VS-A fold-source guard: an SMO's successors are folded from THIS
-/// extent's on-disk log + THIS object's frozen delta. A disk image of
-/// another incarnation (extent reuse racing a stale maintenance address)
-/// or a log view disagreeing with the object's append cursor would build
-/// successors missing acked records — refused loud; the caller's floor
-/// stands and the next cycle retries. Returns the frozen delta records
-/// (the newest fold source), owned.
-pub fn foldSourceExtra(cache: *NodeCache, n: *CachedNode, src: *const node.LoadedNode) Error![]Record {
-    const gpa = cache.gpa;
-    const d = n.lockRead(cache.io);
-    defer n.unlockRead(cache.io);
-    if (src.header.node_seq != n.node_seq) {
-        log.err("SMO fold-source incarnation mismatch at 0x{x}: disk image has node_seq {d}, the live object is {d} — refusing to fold a stale source (acked records would be dropped)", .{ n.addr, src.header.node_seq, n.node_seq });
-        return error.Corrupt;
+/// The K1 fold of `srcs`' logs (each newest first; the nodes' key spaces
+/// are disjoint, so their order is immaterial) under the elision rule at
+/// `durable_tail` and the apply floor.
+pub fn foldSources(gpa: Allocator, srcs: []const *const Source, durable_tail: u64, apply_floor: u64) Error!node.Folded {
+    var total: usize = 0;
+    for (srcs) |s| total += s.bsets().len;
+    var views: std.ArrayList(bset.BsetView) = .empty;
+    defer {
+        for (views.items) |*v| v.deinit(gpa);
+        views.deinit(gpa);
     }
-    if (src.tail_offset != d.tailOffset()) {
-        log.err("SMO fold-source log-view mismatch at 0x{x}: disk walk ends at {d}, the live object's append cursor is at {d} — refusing to fold a diverged source", .{ n.addr, src.tail_offset, d.tailOffset() });
-        return error.Corrupt;
+    try views.ensureTotalCapacity(gpa, total);
+    var horizon: u64 = 0;
+    for (srcs) |s| {
+        const images = s.bsets();
+        var i = images.len;
+        while (i > 0) {
+            i -= 1;
+            // Every image was verified at its node's load or encoded by
+            // this mount's freeze.
+            const v = bset.BsetView.parse(gpa, images[i].slice()) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Corrupt, error.ChecksumMismatch => error.Corrupt,
+            };
+            horizon = @max(horizon, v.journal_seq_horizon);
+            views.appendAssumeCapacity(v);
+        }
     }
-    const frozen = d.frozenRecords();
-    const out = try gpa.alloc(Record, frozen.len);
-    var made: usize = 0;
-    errdefer {
-        rec.deinitRecords(gpa, out[0..made]);
-        gpa.free(out);
-    }
-    for (frozen, out) |*f, *o| {
-        o.* = try f.ref().toRecord(gpa);
-        made += 1;
-    }
+    var out: node.Folded = .{ .records = .empty, .horizon = horizon };
+    errdefer out.deinit(gpa);
+    try bset.compact(gpa, views.items, durable_tail, apply_floor, &out.records);
     return out;
 }
 
@@ -1038,12 +1045,12 @@ const Build = struct {
 };
 
 /// Write one successor image at `addr` — its base frame stamped for
-/// `slot` — and load it back as an unpublished node of the slot.
+/// `slot` — and build the unpublished node of the slot off that image.
 pub fn writeSuccessor(cache: *NodeCache, params: node.NodeWriteParams, records: []const RecordRef, horizon: u64, pinned: bool, slot: ?node_cache.ForestSlot) Error!*CachedNode {
     var w = try node.writeNode(cache.gpa, cache.layoutFor(slot), params, records, horizon, null);
     defer w.deinit(cache.gpa);
     try cache.loader.writeImage(cache.loader.ctx, params.node_addr, w.image);
-    return tree.loadFresh(cache, params.node_addr, pinned, slot);
+    return tree.writtenNode(cache, params.node_addr, w.image, pinned, slot);
 }
 
 /// The §4.6 three-step node replacement (module doc). `n` is FROZEN (its
@@ -1064,16 +1071,9 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
     const is_root = t.isRoot(n);
 
     // ---- P1: build successors from the frozen snapshot, no locks.
-    var src = try Source.load(cache, n.addr, durable_tail, t.forest_slot);
-    defer src.deinit(gpa);
-    const extra = try foldSourceExtra(cache, n, &src.loaded);
-    defer {
-        rec.deinitRecords(gpa, extra);
-        gpa.free(extra);
-    }
-    const extra_refs = try refsOf(gpa, extra);
-    defer gpa.free(extra_refs);
-    var folded = try node.foldNodeSources(gpa, &.{&src.loaded}, &.{extra_refs}, durable_tail, n.cut_floor.load(.monotonic));
+    var src = Source.of(n);
+    defer src.deinit();
+    var folded = try foldSources(gpa, &.{&src}, durable_tail, n.cut_floor.load(.monotonic));
     defer folded.deinit(gpa);
     const items = folded.records.items;
     const total = folded.encodedBytes();
@@ -2029,9 +2029,13 @@ test "writeback_appends_then_compacts_then_splits: threshold appends never move 
     for (200..400) |i| try t.insert(&ikey(i), tree.testValue(i, 24, &buf));
     const b = try vol.drain(t);
     try testing.expect(a.appends >= 1 and b.appends >= 1);
-    var src = try Source.load(vol.cache, t.rootPtr().addr, 0, t.forest_slot);
-    defer src.deinit(gpa);
-    try testing.expect(src.loaded.bsetCount() >= 2);
+    {
+        const root_node = try vol.cache.get(t.rootPtr().addr);
+        defer root_node.release();
+        var src = Source.of(root_node);
+        defer src.deinit();
+        try testing.expect(src.bsets().len >= 2);
+    }
     try testing.expectEqual(root0, t.rootPtr());
 
     // Overwrite one key band until the log fills ⇒ compaction.

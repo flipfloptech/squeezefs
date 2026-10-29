@@ -30,6 +30,8 @@ const tree = @import("../meta/tree.zig");
 const key = @import("../meta/key.zig");
 const slot_state = @import("../meta/routing/slot_state.zig");
 const appender_page = @import("../meta/sym/appender_page.zig");
+const appender_dir = @import("../meta/sym/appender_dir.zig");
+const journal = @import("../meta/journal.zig");
 const device_loader = @import("../meta/device_loader.zig");
 const set_config = @import("../data/set_config.zig");
 const dir_place = @import("../meta/routing/dir_place.zig");
@@ -144,7 +146,16 @@ fn writeUuid(w: *Io.Writer, u: [16]u8) Io.Writer.Error!void {
 const status_cache_budget_bytes: u64 = 16 << 20;
 
 /// One data volume's durable reference population at the newest checkpoint.
-pub const VolCensus = struct { vol_tag: u64, references: u64, blocks: u64 };
+/// `slots_moving`: slots another appender holds whose home no longer
+/// verified at the read (a live holder moved its tree past its page) —
+/// their references are not counted, and the report says so.
+pub const VolCensus = struct { vol_tag: u64, references: u64, blocks: u64, slots_moving: u32 = 0 };
+
+/// In-process test hooks (null in the product).
+pub var test_seams: struct {
+    /// Between the census's page reads and its tree opens.
+    after_pages: ?node_cache.Hook = null,
+} = .{};
 
 /// Appender 0's newest valid page on a symmetric volume (null on a flat one).
 fn readAppender0Page(gpa: std.mem.Allocator, dev: *device_loader.DeviceLoader, sb: superblock.Superblock) ClassifyError!?appender_page.Page {
@@ -164,6 +175,46 @@ fn readAppender0Page(gpa: std.mem.Allocator, dev: *device_loader.DeviceLoader, s
     return appender_page.newestValid(imgs) catch return error.Unexpected;
 }
 
+/// Every page that homes a slot for an offline census: appender 0's, then
+/// each directory pair's newest image that is `Live` or `Recovering` — a
+/// holder's home of the slots it leases whether it lives, died, or is
+/// mid-recovery (the page the recovery installs a dead holder's roots
+/// from). Nothing on a flat volume.
+fn readHolderPages(gpa: std.mem.Allocator, dev: *device_loader.DeviceLoader, sb: superblock.Superblock, out: *std.ArrayList(appender_page.Page)) ClassifyError!void {
+    if (try readAppender0Page(gpa, dev, sb)) |p0| try out.append(gpa, p0);
+    if (!sb.symmetricPlaneStamped()) return;
+    const Reader = struct {
+        gpa: std.mem.Allocator,
+        dev: *device_loader.DeviceLoader,
+        fn read(ctx: *anyopaque, offset: u64, buf: *[appender_page.PAGE_LEN]u8) error{Io}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const img = self.dev.readRange(self.gpa, offset, appender_page.PAGE_LEN) catch return error.Io;
+            defer self.gpa.free(img);
+            @memcpy(buf, img[0..appender_page.PAGE_LEN]);
+        }
+    };
+    var rd: Reader = .{ .gpa = gpa, .dev = dev };
+    const reader: appender_dir.PageReader = .{ .ctx = &rd, .read = &Reader.read };
+    var links: std.ArrayList(appender_dir.Link) = .empty;
+    defer links.deinit(gpa);
+    appender_dir.walkChain(gpa, reader, .{ .start = sb.appender_dir.start, .len = sb.appender_dir.len }, sb.node_size, .{ .start = sb.heap.start, .len = sb.heap.len }, sb.totalExtents(), &links) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Io => error.Io,
+        error.Corrupt => error.Unexpected,
+    };
+    for (links.items) |l| {
+        var pair: u32 = 0;
+        while (pair < l.header.pairs) : (pair += 1) {
+            const id = appender_dir.appenderIdOf(l.header.chain_index, pair, l.header.pairs);
+            const p = (appender_dir.readPageOf(reader, links.items, id) catch |e| return switch (e) {
+                error.Io => error.Io,
+                error.Corrupt => error.Unexpected,
+            }) orelse continue;
+            if (p.state == .live or p.state == .recovering) try out.append(gpa, p);
+        }
+    }
+}
+
 /// The reference records of every data volume `cfg` names, read offline
 /// from EVERY slot tree of this member's forest (the native tree the
 /// ledger names on slot 0's host, every guest tree tree 0's `slot_state`
@@ -178,6 +229,7 @@ pub fn readRefCensus(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
     defer cache.deinit();
     cache.setDurableTail(rec.journal_tail_seq);
     var seq = node_seq.NodeSeqHandle.shared(rec.node_seq_watermark);
+    var moving: u32 = 0;
     var trees: std.ArrayList(*tree.KvTree) = .empty;
     defer {
         for (trees.items) |t| t.destroy();
@@ -193,12 +245,17 @@ pub fn readRefCensus(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
         defer tree.deinitKeyValues(gpa, &kvs);
         const scan = slot_state.scanRange();
         control.range(gpa, scan.start.slice(), scan.end.slice(), std.math.maxInt(usize), &kvs) catch |e| return mapTreeOpen(e);
-        // Appender 0's page is the lessee's live home of the slots it
-        // names (the two-homes law): its roots override tree 0's grant-
-        // time words.
+        // Every holder's page is the live home of the slots it leases
+        // (the two-homes law, decision 0003 §CF.5): a slot another
+        // appender holds is read at the root its page names when the page
+        // names it at the record's generation or above — the root the
+        // recovery installs for a dead holder —, else at tree 0's word
+        // (the holder has not moved it since the grant). Never at a
+        // grant-time word a page supersedes.
         var pages: std.ArrayList(appender_page.Page) = .empty;
         defer pages.deinit(gpa);
-        if (try readAppender0Page(gpa, &dev, sb)) |p0| try pages.append(gpa, p0);
+        try readHolderPages(gpa, &dev, sb, &pages);
+        if (test_seams.after_pages) |h| h.call(h.ctx);
         var roots: std.ArrayList(slot_state.GuestRoot) = .empty;
         defer roots.deinit(gpa);
         slot_state.foldGuestRoots(gpa, kvs.items, pages.items, .projected, node_seq.nodeSeqBase(sb.uuid), &roots) catch |e| return switch (e) {
@@ -207,11 +264,28 @@ pub fn readRefCensus(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
         };
         for (roots.items) |r| {
             if (r.root.addr == 0) continue;
-            try trees.append(gpa, tree.KvTree.open(gpa, cache, .{ .slot = key.guestForestSlot(r.slot) }, .{ .addr = r.root.addr, .seq = r.root.seq }, &seq) catch |e| return mapTreeOpen(e));
+            const root: tree.RootPtr = .{ .addr = r.root.addr, .seq = r.root.seq };
+            const foreign = if (r.lessee) |a| a != journal.FIXED_RING_APPENDER else false;
+            if (!foreign) {
+                try trees.append(gpa, tree.KvTree.open(gpa, cache, .{ .slot = key.guestForestSlot(r.slot) }, root, &seq) catch |e| return mapTreeOpen(e));
+                continue;
+            }
+            // A LIVE holder moves its tree past its page between the page's
+            // read and this open (its SMOs recycle the image): the slot is
+            // its holder's to count — reported, never a refusal.
+            var why: ?tree.KvTree.Stale = null;
+            const t = tree.KvTree.openAsReader(gpa, cache, .{ .slot = key.guestForestSlot(r.slot) }, root, &seq, &why) catch |e| switch (e) {
+                error.RootStale => {
+                    moving += 1;
+                    continue;
+                },
+                else => return mapTreeOpen(e),
+            };
+            try trees.append(gpa, t);
         }
     }
     for (cfg.data) |d| {
-        var census: VolCensus = .{ .vol_tag = d.vol_tag, .references = 0, .blocks = 0 };
+        var census: VolCensus = .{ .vol_tag = d.vol_tag, .references = 0, .blocks = 0, .slots_moving = moving };
         const range = key.volumeRange(d.vol_tag);
         var blocks: std.ArrayList(u64) = .empty;
         defer blocks.deinit(gpa);
@@ -345,7 +419,11 @@ pub fn writeReport(w: *Io.Writer, meta_uri: []const u8, snap: Snapshot, rec: ?le
             .refused => |reason| try w.print("  set config REFUSED: {s}\n", .{reason}),
             .config => |*conf| try conf.writeSummary(w),
         };
-        for (census) |vc| try w.print("  refs       vol-{x:0>16}: {d} reference(s) over {d} block(s)\n", .{ vc.vol_tag, vc.references, vc.blocks });
+        for (census) |vc| {
+            try w.print("  refs       vol-{x:0>16}: {d} reference(s) over {d} block(s)", .{ vc.vol_tag, vc.references, vc.blocks });
+            if (vc.slots_moving != 0) try w.print(" — {d} slot(s) a live holder moved past its page under the read are not counted", .{vc.slots_moving});
+            try w.writeByte('\n');
+        }
         try w.print("summary: v4, {d} MiB, checkpoint seq {d}, {d} inode(s) minted, {s}\n", .{ sb.volume_len >> 20, r.seq, r.next_ino -| 2, if (mounted) "MOUNTED by a live daemon (writer guard held)" else "not mounted" });
     } else {
         try w.writeAll("  ledger     NO valid record in any of the 32 slots — corruption (a v4 superblock always has one)\n");
@@ -479,7 +557,11 @@ test "the report: a blank volume is one line; a v4 volume prints the superblock,
     try writeReport(&out.writer, "sqmeta:///x", .{ .prior = .formatted, .sb = sb, .slot = .primary, .volume_len = sb.volume_len }, rec, .{ .config = conf }, &.{.{ .vol_tag = 0xfeed, .references = 3, .blocks = 2 }}, true);
     try testing.expect(std.mem.indexOf(u8, out.written(), "vol-000000000000feed active /dev/d0") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "compression lz4") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "refs       vol-000000000000feed: 3 reference(s) over 2 block(s)") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "refs       vol-000000000000feed: 3 reference(s) over 2 block(s)\n") != null);
+    out.clearRetainingCapacity();
+    // A slot a live holder moved past its page under the read is named.
+    try writeReport(&out.writer, "sqmeta:///x", .{ .prior = .formatted, .sb = sb, .slot = .primary, .volume_len = sb.volume_len }, rec, .{ .config = conf }, &.{.{ .vol_tag = 0xfeed, .references = 3, .blocks = 2, .slots_moving = 1 }}, true);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "3 reference(s) over 2 block(s) — 1 slot(s) a live holder moved past its page under the read are not counted\n") != null);
     out.clearRetainingCapacity();
     try writeReport(&out.writer, "sqmeta:///x", .{ .prior = .formatted, .sb = sb, .slot = .primary, .volume_len = sb.volume_len }, rec, .absent, &.{}, false);
     try testing.expect(std.mem.indexOf(u8, out.written(), "set config NONE") != null);

@@ -880,6 +880,31 @@ test "linux: THE OFFLINE `status` CENSUS READS A FOREIGN HOLDER'S SLOT AT ITS PA
             return e;
         };
         try testing.expectEqual(@as(u64, 2), c.references);
+        try testing.expectEqual(@as(u32, 0), c.slots_moving);
+    }
+    // 3. B moves on INSIDE the census (after its pages are read, before the
+    //    trees open) and recycles the image its page named: the slot is
+    //    reported moving, never counted at a stale root, never a refusal.
+    const MoveOn = struct {
+        bj: *KvBackend,
+        slot: u16,
+        fired: u32 = 0,
+        fn call(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fired += 1;
+            compactRootAndCover(self.bj, self.slot) catch return;
+            compactRootAndCover(self.bj, self.slot) catch return;
+        }
+    };
+    var move_on: MoveOn = .{ .bj = bj, .slot = slot };
+    status.test_seams.after_pages = .{ .ctx = &move_on, .call = &MoveOn.call };
+    defer status.test_seams = .{};
+    {
+        const c = try statusCensus(gpa, &s.env, s.paths[0], ref_vol);
+        std.debug.print("B moved on inside the census: hook fired {d}, {d} reference(s), {d} slot(s) moving\n", .{ move_on.fired, c.references, c.slots_moving });
+        try testing.expectEqual(@as(u32, 1), move_on.fired);
+        try testing.expectEqual(@as(u32, 1), c.slots_moving);
+        try testing.expectEqual(@as(u64, 0), c.references);
     }
 }
 

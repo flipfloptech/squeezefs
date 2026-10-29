@@ -10740,6 +10740,11 @@ const Holder = struct {
     }
 };
 
+test "expectSupervisorSilent sees a RECOVERED probe miss: a miss inside the grace window is silent until the daemon answers again, and `answers again after a missed probe` is its one line (rung-10-test-robustness.md, seen-not-fixed; red: the needle `missed a probe` matched no line the supervisor writes)" {
+    try expectSupervisorSilent("info(squeezefs): supervisor: /mnt/x is no longer attached (the daemon's own unmount in progress, or a lazy detach serving its holders): liveness by heartbeat from here\n");
+    try testing.expectError(error.SupervisorFired, expectSupervisorSilent("info(squeezefs): supervisor: daemon 4242 answers again after a missed probe\n"));
+}
+
 /// The supervisor's verdict lines after `from`: none of the escalation
 /// ladder may appear on an orderly cycle (charter §1.1: a daemon is never
 /// "unresponsive" for being asked to unmount).

@@ -1107,11 +1107,10 @@ pub const WritePath = struct {
             // B. Device overlay.
             if (overlay_shape and device_overlay.Overlay.pieceEligible(pc.rel, pc.len)) {
                 const vehicle: device_overlay.Vehicle = if (bytes.*) |b| .{ .bytes = b[pc.off .. pc.off + pc.len] } else .{ .slot = req.payload.slot };
-                const overwrite = self.map.lookup(req.ino, pc.block) != null;
                 try self.refuseFaulted(req.ino, fault0);
                 const handed = overlay_permit;
                 overlay_permit = null;
-                const stored = switch (try self.overlay.claim(io, .{ .ino = req.ino, .block = pc.block, .rel = pc.rel, .vehicle = vehicle, .file = file, .overwrite = overwrite, .permit = handed })) {
+                const stored = switch (try self.overlay.claim(io, .{ .ino = req.ino, .block = pc.block, .rel = pc.rel, .vehicle = vehicle, .file = file, .permit = handed })) {
                     // The claim excludes an overlapping DMA, not (3): a
                     // sibling write into this block lands beside this one.
                     .claimed => |c| landed: {
@@ -3451,7 +3450,7 @@ test "the save window: while an epoch's ONE save is in flight the block stays bo
     const proof = try w.f.dev.seam().write(wt.VOL_A, m.offset, &img);
     w.f.alloc_a.publishBlock(m.idx);
     const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-    _ = try w.wp.epochs.record(51, 1, a1, b, proof, 2 * wt.BS, block_alloc.InflightAllocGuard.register(w.f.alloc_a, m.idx), true);
+    _ = try w.wp.epochs.record(51, 1, .{ .map = a1 }, b, proof, 2 * wt.BS, block_alloc.InflightAllocGuard.register(w.f.alloc_a, m.idx), true);
     // The racing WRITE runs inside the save's window: an aligned page (the
     // W1 shape) and a half-block aligned piece (the overlay shape).
     const Racer = struct {
@@ -3605,7 +3604,7 @@ test "a save landing between an upload's reservation read and its epoch probe: t
     const proof = try w.f.dev.seam().write(wt.VOL_A, m.offset, &img);
     w.f.alloc_a.publishBlock(m.idx);
     const d1 = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-    _ = try w.wp.epochs.record(81, 0, r, d1, proof, wt.BS, block_alloc.InflightAllocGuard.register(w.f.alloc_a, m.idx), true);
+    _ = try w.wp.epochs.record(81, 0, .{ .map = r }, d1, proof, wt.BS, block_alloc.InflightAllocGuard.register(w.f.alloc_a, m.idx), true);
     // A whole-block write lands (the accumulation arm's write-through); the
     // epoch's save lands right after its upload first reads the block's
     // reservation, and R is minted to another owner at once.

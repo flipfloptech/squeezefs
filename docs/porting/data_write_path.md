@@ -380,7 +380,8 @@ fabric RTT per segment is the serialization the pipeline restructure deleted,
    `rewrite_epoch_binds_block(ino, b)` ⇒ decline (`overlay_ineligible_shadow_bound`
    on the overwrite shape — hazard 1); no RAM/staged/extent custody;
    `overlay_range_shared(…)` ⇒ decline (`overlay_ineligible_range_shared`,
-   `device_overlay.rs:189-204`).
+   `device_overlay.rs:189-204`). The port reads the overwrite shape AFTER the epoch
+   screen (the reader half of §5.4's visibility law; decision 0003 §CN).
 3. **Registry** (`:18990-19164`): `Some(Open)` ⇒ join; `Some(Frozen|terminal)` under
    OUR guard ⇒ steal the detached publisher's work (`settle_overlay_block_write_arm`)
    then decline; `None` ⇒ INSTALL: `allocate_placed_block()` (law 2 reserve-before-
@@ -804,6 +805,17 @@ shadow; closes of one ino serialize in epoch order; `Epochs.baseBinding` (the ne
 shadow else the map) is the base at every use. Taking the epoch out of sight before
 the merge, or basing on the durable map under a shadow, loses an acked overwrite
 (`write_epoch_model.CloseVisibilityModel`).
+
+The law's READER half (2026-10-29, decision 0003 §CN; the reference's meta-lock gives
+it for free): a save lands under no block guard, so a writer under (3) pairs a binding
+read with the epoch probe PROBE FIRST — a probe that sees no epoch makes the map read
+after it exact while (3) holds (no epoch starts shadowing a block without its guard;
+a save names B before it leaves sight). The overlay classifies (`overwrite`) after its
+screen, its overwrite capture re-checks first, `pickDest` probes before it reads the
+reservation, and a record's base is `Epochs.baseFor` with `RecordVerdict.base_moved`
+when the probed epoch has left sight (`write_epoch_model.ReaderOrderModel`). The map
+read first lost a lay-down's acked bytes (a Hole record over the B a save had just
+published) and parked a reservation that save had freed.
 
 ### 5.5 Transformed volumes (`crypto_compress.rs`)
 

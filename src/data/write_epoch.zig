@@ -45,6 +45,18 @@
 //! stale A), and closes of one ino serialize in epoch order
 //! (`close_settled`): the saves land B then C, each displacing exactly what
 //! it parked. `write_epoch_model.zig` proves both weakenings fail.
+//!
+//! The law's READER half (2026-10-28, the perf matrix's lay-down): a save
+//! lands under no block guard, so a writer pairs its map read with the
+//! epoch probe in one order — the probe first, the map after (`Base`,
+//! `baseFor`; the overlay's classification, the landing's reservation
+//! take-over). A map read before the probe can predate a save that landed
+//! and left sight in between: the overlay installed a Hole record over the
+//! B that save had just published (its gap seeded zeros over acked bytes,
+//! its feed parking nothing), and a record parked the reservation the save
+//! had freed. A probe that saw an epoch the record no longer finds answers
+//! `base_moved`. `write_epoch_model.zig` (`ReaderOrderModel`) proves the
+//! order and the re-check are both load-bearing.
 
 const std = @import("std");
 const Io = std.Io;
@@ -108,6 +120,9 @@ pub const stats = struct {
     /// A record answered `save_in_flight` and its caller parked on the
     /// ino's running save before recording again.
     pub var rewrite_shadow_save_waits: counters.ShardedCounter = .{};
+    /// A record answered `base_moved` (a save landed between the caller's
+    /// epoch probe and the record) and its caller re-read the base.
+    pub var rewrite_shadow_base_moved: counters.ShardedCounter = .{};
     pub var rewrite_shadow_superseded: counters.ShardedCounter = .{};
     pub var rewrite_shadow_pressure_closes: counters.ShardedCounter = .{};
     pub var rewrite_shadow_orphan_discards: counters.ShardedCounter = .{};
@@ -127,7 +142,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"rewrite_shadow_open_epochs\":{d},\"rewrite_shadow_parked_bytes\":{d},", .{ stats.rewrite_shadow_open_epochs.load(), stats.rewrite_shadow_parked_bytes.load() });
-    inline for (.{ "rewrite_shadow_swaps", "rewrite_shadow_bytes", "rewrite_shadow_fallbacks", "rewrite_shadow_fresh_records", "rewrite_shadow_width_hints", "rewrite_shadow_close_retries", "rewrite_shadow_close_waits", "rewrite_shadow_save_waits", "rewrite_shadow_superseded", "rewrite_shadow_pressure_closes", "rewrite_shadow_orphan_discards", "rewrite_shadow_idle_closes", "rewrite_blocks", "rewrite_user_bytes", "rewrite_device_write_bytes", "rewrite_shadow_fence_drops_failed_volume" }) |name| {
+    inline for (.{ "rewrite_shadow_swaps", "rewrite_shadow_bytes", "rewrite_shadow_fallbacks", "rewrite_shadow_fresh_records", "rewrite_shadow_width_hints", "rewrite_shadow_close_retries", "rewrite_shadow_close_waits", "rewrite_shadow_save_waits", "rewrite_shadow_base_moved", "rewrite_shadow_superseded", "rewrite_shadow_pressure_closes", "rewrite_shadow_orphan_discards", "rewrite_shadow_idle_closes", "rewrite_blocks", "rewrite_user_bytes", "rewrite_device_write_bytes", "rewrite_shadow_fence_drops_failed_volume" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"rewrite_shadow_fence_drops\":{d},\"rewrite_shadow_displaced_drift\":{d},\"rewrite_shadow_save_overflow\":{d}}}", .{ counters.tripwireCount("rewrite_shadow_fence_drops"), counters.tripwireCount("rewrite_shadow_displaced_drift"), counters.tripwireCount("rewrite_shadow_save_overflow") });
@@ -211,6 +226,28 @@ pub const RecordVerdict = union(enum) {
     /// drift` + `block_untracked_free_refusals`: fstests generic/247, 500
     /// blocks overwritten by O_DIRECT and mmap at once.)
     save_in_flight,
+    /// The epoch that shadowed the block at the caller's probe
+    /// (`Base.seen`) has left sight: its save landed since, so the map read
+    /// that followed the probe may predate the landing. Nothing recorded,
+    /// the guard is still the caller's: it re-reads the base (`baseFor`,
+    /// under the same block guard) and records again.
+    base_moved,
+};
+
+/// The base a record displaces, read in the order the save's visibility
+/// law needs (`Epochs.baseFor`): the epoch probe FIRST, the map after it.
+/// A save lands under no block guard and leaves sight only once the map
+/// names its B, so a probe that sees no epoch makes the map read after it
+/// exact for as long as the caller's block guard holds (no epoch can start
+/// shadowing the block without that guard); a map read taken BEFORE the
+/// probe may predate a save that landed in between — the perf matrix's
+/// lay-down parked a reservation that save had freed, and installed a Hole
+/// record over its B (2026-10-28, `rewrite_shadow_displaced_drift`).
+pub const Base = struct {
+    /// The map's binding: written, else a reservation.
+    map: ?Binding,
+    /// The newest shadow at the probe (null: no epoch shadowed the block).
+    seen: ?Binding = null,
 };
 
 pub const CloseOutcome = union(enum) {
@@ -349,15 +386,26 @@ pub const Epochs = struct {
         return self.shadowOf(ino, block) orelse map.lookup(ino, block);
     }
 
+    /// The `Base` a record of `(ino, block)` displaces, read under the
+    /// caller's block guard in the law's order: the probe, then — only when
+    /// no epoch shadows the block (a shadow outranks the map in `record`) —
+    /// the map's binding, a reservation included.
+    pub fn baseFor(self: *Epochs, map: seams.MapSeam, ino: u64, block: u32) Base {
+        const seen = self.shadowOf(ino, block);
+        if (seen != null) return .{ .map = null, .seen = seen };
+        return .{ .map = map.lookup(ino, block) orelse map.reserved(ino, block) };
+    }
+
     /// `rewrite_shadow_record`: open on the first record (KD-1.1: striped ∧
     /// prev ≠ new), park the displaced previous (purged from the read tiers
     /// by the caller), take the B offset's guard, note the size floor.
-    /// `prev` is the map's binding the caller read under its block guard;
-    /// a shadow outranks it: the open epoch's own newest B (an intra-epoch
-    /// rewrite), else the saving epoch's B (the key the running save
-    /// publishes — parked as the map's: our save displaces it; a save that
-    /// re-registers folds it back as our orphan mint).
-    pub fn record(self: *Epochs, ino: u64, block: u32, prev: ?Binding, new: Binding, proof: seams.DmaProof, min_size: u64, guard: block_alloc.InflightAllocGuard, striped: bool) Allocator.Error!RecordVerdict {
+    /// `base` is what the caller read under its block guard (`baseFor`); a
+    /// shadow outranks its map binding: the open epoch's own newest B (an
+    /// intra-epoch rewrite), else the saving epoch's B (the key the running
+    /// save publishes — parked as the map's: our save displaces it; a save
+    /// that re-registers folds it back as our orphan mint). Every verdict
+    /// but `base_moved` consumes `guard`.
+    pub fn record(self: *Epochs, ino: u64, block: u32, base: Base, new: Binding, proof: seams.DmaProof, min_size: u64, guard: block_alloc.InflightAllocGuard, striped: bool) Allocator.Error!RecordVerdict {
         if (!self.enabled or !striped) {
             var g = guard;
             g.deinit();
@@ -367,6 +415,14 @@ pub const Epochs = struct {
         defer self.lock.unlock();
         const open = self.table.get(ino);
         const closing = self.closing.get(ino);
+        // The probe saw an epoch the block has left since: its save landed
+        // after the probe, so the caller's map binding is not this record's
+        // to trust (`Base`). A probe that saw none needs no re-check: no
+        // epoch starts shadowing the block under the caller's guard.
+        if (base.seen != null and !shadows(open, block) and !shadows(closing, block)) {
+            stats.rewrite_shadow_base_moved.inc();
+            return .base_moved;
+        }
         // The ONE save publishes at most `max_displaced` blocks, and a
         // transient save folds the closing epoch's shadow into the open one
         // (`reregister`): the cap bounds their UNION, so every close — a
@@ -410,7 +466,7 @@ pub const Epochs = struct {
         }
         const own_prev = e.shadowBinding(block);
         const closing_prev: ?Binding = if (own_prev == null) (if (closing) |c| c.shadowBinding(block) else null) else null;
-        const displaced_prev: ?Binding = own_prev orelse closing_prev orelse prev;
+        const displaced_prev: ?Binding = own_prev orelse closing_prev orelse base.map;
         if (displaced_prev) |d| {
             e.displaced.appendAssumeCapacity(.{ .block = block, .origin = if (own_prev != null) .epoch else .map, .binding = d });
             e.parked_bytes += self.block_size;
@@ -791,7 +847,7 @@ test "epoch_records_are_ram_only_until_the_one_save_swap; full_coverage_auto_clo
     const m1 = try f.alloc_a.allocateBlock();
     const b0 = Binding.wholeBlock(wt.VOL_A, m0.offset, m0.stamp);
     const b1 = Binding.wholeBlock(wt.VOL_A, m1.offset, m1.stamp);
-    const v0 = try ep.record(10, 0, a0, b0, proofFor(b0, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m0.idx), true);
+    const v0 = try ep.record(10, 0, .{ .map = a0 }, b0, proofFor(b0, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m0.idx), true);
     try testing.expect(v0.shadowed.displaced_prev.?.eql(a0));
     try testing.expect(!v0.shadowed.close_owed);
     try testing.expectEqual(@as(usize, 1), ep.openCount());
@@ -803,7 +859,7 @@ test "epoch_records_are_ram_only_until_the_one_save_swap; full_coverage_auto_clo
     try testing.expectEqual(@as(usize, 0), f.map.merges.items.len);
     try testing.expectEqual(@as(usize, 0), f.frees.freed.items.len);
     try testing.expect(f.alloc_a.inflightContains(m0.idx));
-    const v1 = try ep.record(10, 1, a1, b1, proofFor(b1, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
+    const v1 = try ep.record(10, 1, .{ .map = a1 }, b1, proofFor(b1, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
     try testing.expect(v1.shadowed.close_owed); // the close-owed hint (full coverage)
     try testing.expectEqual(parked0 + 2 * wt.BS, stats.rewrite_shadow_parked_bytes.load());
     const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
@@ -827,6 +883,41 @@ test "epoch_records_are_ram_only_until_the_one_save_swap; full_coverage_auto_clo
     try testing.expectEqual(parked0, stats.rewrite_shadow_parked_bytes.load());
 }
 
+test "the base's order (the save's visibility law, reader half): `baseFor` probes before it reads the map and skips the map under a shadow; a record whose probed epoch landed since answers `base_moved` with nothing recorded and the guard still the caller's; the base read again parks what the save published" {
+    const io = testing.io;
+    const f = try wt.Fixture.init(testing.allocator, 16);
+    defer f.deinit();
+    var ep = Epochs.init(testing.allocator, wt.BS, true);
+    defer ep.deinit();
+    const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
+    const a = try f.publishBlock(12, 0, 0xAA);
+    try testing.expect(ep.baseFor(f.map.seam(), 12, 0).map.?.eql(a));
+    const m1 = try f.alloc_a.allocateBlock();
+    const b1 = Binding.wholeBlock(wt.VOL_A, m1.offset, m1.stamp);
+    _ = try ep.record(12, 0, ep.baseFor(f.map.seam(), 12, 0), b1, proofFor(b1, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
+    // Probed under the shadow: B1 seen, the map not read.
+    const probed = ep.baseFor(f.map.seam(), 12, 0);
+    try testing.expect(probed.seen.?.eql(b1) and probed.map == null);
+    // The save lands between the probe and the record.
+    try testing.expect(ep.close(io, 12, cs) == .swapped);
+    const m2 = try f.alloc_a.allocateBlock();
+    const b2 = Binding.wholeBlock(wt.VOL_A, m2.offset, m2.stamp);
+    const g2 = block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx);
+    const moved0 = stats.rewrite_shadow_base_moved.load();
+    try testing.expect(try ep.record(12, 0, probed, b2, proofFor(b2, wt.BS), 2 * wt.BS, g2, true) == .base_moved);
+    try testing.expectEqual(moved0 + 1, stats.rewrite_shadow_base_moved.load());
+    try testing.expectEqual(@as(usize, 0), ep.openCount());
+    try testing.expect(f.alloc_a.inflightContains(m2.idx));
+    // Read again: the save's B1 is the map's, and the record parks it.
+    const again = ep.baseFor(f.map.seam(), 12, 0);
+    try testing.expect(again.seen == null and again.map.?.eql(b1));
+    const v = try ep.record(12, 0, again, b2, proofFor(b2, wt.BS), 2 * wt.BS, g2, true);
+    try testing.expect(v.shadowed.displaced_prev.?.eql(b1));
+    try testing.expect(ep.close(io, 12, cs) == .swapped);
+    try testing.expectEqual(@as(usize, 2), f.frees.freed.items.len);
+    try testing.expect(f.frees.freed.items[0].eql(a) and f.frees.freed.items[1].eql(b1));
+}
+
 test "the save's frees are live owners' (decision 0003 §AH.1): an intermediate B the epoch superseded stays an unpublished mint under its guard until its free, the A key the save displaced stays held from before the save until after its free; nothing is left in flight" {
     const io = testing.io;
     const f = try wt.Fixture.init(testing.allocator, 16);
@@ -838,8 +929,8 @@ test "the save's frees are live owners' (decision 0003 §AH.1): an intermediate 
     const m2 = try f.alloc_a.allocateBlock();
     const b1 = Binding.wholeBlock(wt.VOL_A, m1.offset, m1.stamp);
     const b2 = Binding.wholeBlock(wt.VOL_A, m2.offset, m2.stamp);
-    _ = try ep.record(11, 0, a, b1, proofFor(b1, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
-    const v2 = try ep.record(11, 0, a, b2, proofFor(b2, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
+    _ = try ep.record(11, 0, .{ .map = a }, b1, proofFor(b1, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
+    const v2 = try ep.record(11, 0, .{ .map = a }, b2, proofFor(b2, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
     try testing.expect(v2.shadowed.displaced_prev.?.eql(b1)); // B1 superseded, parked as ours
     const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
     try testing.expect(ep.close(io, 11, cs) == .swapped);
@@ -859,7 +950,7 @@ test "fenced_close_publishes_nothing_and_frees_nothing; a_process_local_lease_ro
     const a0 = try f.publishBlock(20, 0, 0x11);
     const m = try f.alloc_a.allocateBlock();
     const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-    _ = try ep.record(20, 0, a0, b, proofFor(b, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
+    _ = try ep.record(20, 0, .{ .map = a0 }, b, proofFor(b, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
     // Fencing rotation: the first merge refuses with an expired token; the close re-presents the current one.
     f.map.fail_next_merge = error.FencingTokenExpired;
     const retries0 = stats.rewrite_shadow_close_retries.load();
@@ -869,7 +960,7 @@ test "fenced_close_publishes_nothing_and_frees_nothing; a_process_local_lease_ro
     const a1 = try f.publishBlock(21, 0, 0x22);
     const m1 = try f.alloc_a.allocateBlock();
     const b1 = Binding.wholeBlock(wt.VOL_A, m1.offset, m1.stamp);
-    _ = try ep.record(21, 0, a1, b1, proofFor(b1, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
+    _ = try ep.record(21, 0, .{ .map = a1 }, b1, proofFor(b1, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
     f.map.fail_next_merge = error.Transient;
     const frees_before = f.frees.freed.items.len;
     try testing.expectEqual(CloseOutcome.transient, ep.close(io, 21, cs));
@@ -880,7 +971,7 @@ test "fenced_close_publishes_nothing_and_frees_nothing; a_process_local_lease_ro
     const a2 = try f.publishBlock(22, 0, 0x33);
     const m2 = try f.alloc_a.allocateBlock();
     const b2 = Binding.wholeBlock(wt.VOL_A, m2.offset, m2.stamp);
-    _ = try ep.record(22, 0, a2, b2, proofFor(b2, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
+    _ = try ep.record(22, 0, .{ .map = a2 }, b2, proofFor(b2, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
     f.map.fail_next_merge = error.WriterGuardFenced;
     const frees_fence = f.frees.freed.items.len;
     const merges_fence = f.map.merges.items.len;
@@ -903,7 +994,7 @@ test "fenced_close_publishes_nothing_and_frees_nothing; a_process_local_lease_ro
     const a4 = try f.publishBlock(24, 0, 0x55);
     const m4 = try f.alloc_a.allocateBlock();
     const b4 = Binding.wholeBlock(wt.VOL_A, m4.offset, m4.stamp);
-    _ = try ep.record(24, 0, a4, b4, proofFor(b4, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m4.idx), true);
+    _ = try ep.record(24, 0, .{ .map = a4 }, b4, proofFor(b4, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m4.idx), true);
     f.map.fail_next_merge = error.WriterGuardFenced;
     const frees_failed = f.frees.freed.items.len;
     const merges_failed = f.map.merges.items.len;
@@ -918,7 +1009,7 @@ test "fenced_close_publishes_nothing_and_frees_nothing; a_process_local_lease_ro
     const a3 = try f.publishBlock(23, 0, 0x44);
     const m3 = try f.alloc_a.allocateBlock();
     const b3 = Binding.wholeBlock(wt.VOL_A, m3.offset, m3.stamp);
-    _ = try ep.record(23, 0, a3, b3, proofFor(b3, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m3.idx), true);
+    _ = try ep.record(23, 0, .{ .map = a3 }, b3, proofFor(b3, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m3.idx), true);
     f.map.remove(23);
     const frees_orphan = f.frees.freed.items.len;
     try testing.expectEqual(CloseOutcome.orphan_discarded, ep.close(io, 23, cs));
@@ -938,8 +1029,8 @@ test "a reclaimed ino frees EVERY key the epoch minted: a block rewritten twice 
     const m2 = try f.alloc_a.allocateBlock();
     const b1 = Binding.wholeBlock(wt.VOL_A, m1.offset, m1.stamp);
     const b2 = Binding.wholeBlock(wt.VOL_A, m2.offset, m2.stamp);
-    _ = try ep.record(24, 0, a, b1, proofFor(b1, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
-    const v2 = try ep.record(24, 0, a, b2, proofFor(b2, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
+    _ = try ep.record(24, 0, .{ .map = a }, b1, proofFor(b1, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
+    const v2 = try ep.record(24, 0, .{ .map = a }, b2, proofFor(b2, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
     try testing.expect(v2.shadowed.displaced_prev.?.eql(b1)); // B1 parked as the epoch's own
     f.map.remove(24);
     try testing.expectEqual(CloseOutcome.orphan_discarded, ep.close(io, 24, cs));
@@ -964,7 +1055,7 @@ test "the close triggers: ENOSPC pressure close frees parked supply; the idle sw
     const a0 = try f.publishBlock(30, 0, 0x11);
     const m = try f.alloc_a.allocateBlock();
     const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-    _ = try ep.record(30, 0, a0, b, proofFor(b, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
+    _ = try ep.record(30, 0, .{ .map = a0 }, b, proofFor(b, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
     const used = f.alloc_a.usedBlocks();
     try testing.expect(ep.closeAllForSpace(io, cs));
     try testing.expectEqual(used - 1, f.alloc_a.usedBlocks()); // the parked A key returned to supply
@@ -973,7 +1064,7 @@ test "the close triggers: ENOSPC pressure close frees parked supply; the idle sw
     const a1 = try f.publishBlock(31, 0, 0x22);
     const m1 = try f.alloc_a.allocateBlock();
     const b1 = Binding.wholeBlock(wt.VOL_A, m1.offset, m1.stamp);
-    _ = try ep.record(31, 0, a1, b1, proofFor(b1, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
+    _ = try ep.record(31, 0, .{ .map = a1 }, b1, proofFor(b1, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m1.idx), true);
     const now = clock.monotonicNs();
     try testing.expectEqual(@as(u32, 0), ep.closeIdle(io, now, cs));
     try testing.expectEqual(@as(u32, 1), ep.closeIdle(io, now + EPOCH_IDLE_HORIZON_MS * std.time.ns_per_ms, cs));
@@ -983,7 +1074,7 @@ test "the close triggers: ENOSPC pressure close frees parked supply; the idle sw
     const a2 = try f.publishBlock(32, 0, 0x33);
     const m2 = try f.alloc_a.allocateBlock();
     const b2 = Binding.wholeBlock(wt.VOL_A, m2.offset, m2.stamp);
-    _ = try ep.record(32, 0, a2, b2, proofFor(b2, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
+    _ = try ep.record(32, 0, .{ .map = a2 }, b2, proofFor(b2, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
     const sup0 = stats.rewrite_shadow_superseded.load();
     var orphans: [8]Binding = undefined;
     const other = Binding.wholeBlock(wt.VOL_A, 7 * wt.BS, 99); // what the outside publisher landed
@@ -1005,7 +1096,7 @@ test "the close triggers: ENOSPC pressure close frees parked supply; the idle sw
     defer off.deinit();
     const m3 = try f.alloc_a.allocateBlock();
     const b3 = Binding.wholeBlock(wt.VOL_A, m3.offset, m3.stamp);
-    try testing.expectEqual(RecordVerdict.not_shadowed, try off.record(33, 0, null, b3, proofFor(b3, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m3.idx), true));
+    try testing.expectEqual(RecordVerdict.not_shadowed, try off.record(33, 0, .{ .map = null }, b3, proofFor(b3, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m3.idx), true));
     try testing.expect(!f.alloc_a.inflightContains(m3.idx));
 }
 
@@ -1024,7 +1115,7 @@ test "a supersede of a block rewritten more times in the epoch than its orphan b
     for (&minted) |*idx| {
         const m = try f.alloc_a.allocateBlock();
         const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-        _ = try ep.record(34, 0, f.map.seam().lookup(34, 0), b, proofFor(b, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
+        _ = try ep.record(34, 0, .{ .map = f.map.seam().lookup(34, 0) }, b, proofFor(b, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
         idx.* = m.idx;
     }
     // A durable publish of block 0 outside the epoch (the upload's not-striped arm): A is the publisher's.
@@ -1058,7 +1149,7 @@ test "the save stays visible and closes of one ino serialize in epoch order: dur
     const a = try f.publishBlock(60, 0, 0xAA);
     const mb = try f.alloc_a.allocateBlock();
     const b = Binding.wholeBlock(wt.VOL_A, mb.offset, mb.stamp);
-    _ = try ep.record(60, 0, a, b, proofFor(b, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
+    _ = try ep.record(60, 0, .{ .map = a }, b, proofFor(b, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
     // The first close parks inside its save window (before the merge).
     const Gate = struct {
         var hold: std.atomic.Value(bool) = .init(true);
@@ -1087,7 +1178,7 @@ test "the save stays visible and closes of one ino serialize in epoch order: dur
     // the closing shadow B (parked as the map's), never A.
     const mc = try f.alloc_a.allocateBlock();
     const c = Binding.wholeBlock(wt.VOL_A, mc.offset, mc.stamp);
-    const v = try ep.record(60, 0, f.map.seam().lookup(60, 0), c, proofFor(c, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mc.idx), true);
+    const v = try ep.record(60, 0, .{ .map = f.map.seam().lookup(60, 0) }, c, proofFor(c, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mc.idx), true);
     try testing.expect(v.shadowed.displaced_prev.?.eql(b));
     try testing.expect(ep.shadowOf(60, 0).?.eql(c));
     try testing.expectEqual(@as(usize, 1), ep.openCount());
@@ -1122,7 +1213,7 @@ test "a transient save folds back into the next epoch: the key the next epoch pa
     const a = try f.publishBlock(61, 0, 0xAA);
     const mb = try f.alloc_a.allocateBlock();
     const b = Binding.wholeBlock(wt.VOL_A, mb.offset, mb.stamp);
-    _ = try ep.record(61, 0, a, b, proofFor(b, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
+    _ = try ep.record(61, 0, .{ .map = a }, b, proofFor(b, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
     // The save's merge is transient; a record lands in its window.
     const Racer = struct {
         var ep_: *Epochs = undefined;
@@ -1133,7 +1224,7 @@ test "a transient save folds back into the next epoch: the key the next epoch pa
             map.fail_next_merge = error.Transient;
             const mc = f_.alloc_a.allocateBlock() catch unreachable;
             c = Binding.wholeBlock(wt.VOL_A, mc.offset, mc.stamp);
-            const v = ep_.record(61, 0, map.seam().lookup(61, 0), c, proofFor(c, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f_.alloc_a, mc.idx), true) catch unreachable;
+            const v = ep_.record(61, 0, .{ .map = map.seam().lookup(61, 0) }, c, proofFor(c, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f_.alloc_a, mc.idx), true) catch unreachable;
             std.debug.assert(v.shadowed.displaced_prev.?.eql(b_)); // the closing shadow, not the map's A
         }
     };
@@ -1178,7 +1269,7 @@ test "a transient save folds into the next epoch with no allocation: an allocati
         const mb = try f.alloc_a.allocateBlock();
         b.* = Binding.wholeBlock(wt.VOL_A, mb.offset, mb.stamp);
         idx.* = mb.idx;
-        _ = try ep.record(71, @intCast(i), null, b.*, proofFor(b.*, wt.BS), 16 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
+        _ = try ep.record(71, @intCast(i), .{ .map = null }, b.*, proofFor(b.*, wt.BS), 16 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
     }
     // The save's merge is transient; a record opens the next epoch in its
     // window, then every allocation fails.
@@ -1191,7 +1282,7 @@ test "a transient save folds into the next epoch with no allocation: an allocati
             map.fail_next_merge = error.Transient;
             const mc = f_.alloc_a.allocateBlock() catch unreachable;
             c = Binding.wholeBlock(wt.VOL_A, mc.offset, mc.stamp);
-            _ = ep_.record(71, 12, null, c, proofFor(c, wt.BS), 16 * wt.BS, block_alloc.InflightAllocGuard.register(f_.alloc_a, mc.idx), true) catch unreachable;
+            _ = ep_.record(71, 12, .{ .map = null }, c, proofFor(c, wt.BS), 16 * wt.BS, block_alloc.InflightAllocGuard.register(f_.alloc_a, mc.idx), true) catch unreachable;
             fa.fail_index = fa.alloc_index;
             fa.resize_fail_index = fa.resize_index;
         }
@@ -1225,7 +1316,7 @@ test "a drift key the save displaced is freed with no allocation: an allocation 
     try f.map.create(81, .striped, 0);
     const mb = try f.alloc_a.allocateBlock();
     const b = Binding.wholeBlock(wt.VOL_A, mb.offset, mb.stamp);
-    _ = try ep.record(81, 0, null, b, proofFor(b, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
+    _ = try ep.record(81, 0, .{ .map = null }, b, proofFor(b, wt.BS), 2 * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
     // A publisher binds the block under the epoch (the visibility law
     // forbids it; the drift tripwire names it): the save displaces X,
     // which the epoch never parked.
@@ -1266,18 +1357,18 @@ test "the ONE save's width caps the shadow: the first distinct block past it ans
         const a = try f.publishBlock(70, block, 0x11);
         const m = try f.alloc_a.allocateBlock();
         const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-        try testing.expect((try ep.record(70, block, a, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true)) == .shadowed);
+        try testing.expect((try ep.record(70, block, .{ .map = a }, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true)) == .shadowed);
     }
     const a_extra = try f.publishBlock(70, block, 0x11);
     const m_extra = try f.alloc_a.allocateBlock();
     const b_extra = Binding.wholeBlock(wt.VOL_A, m_extra.offset, m_extra.stamp);
-    try testing.expectEqual(RecordVerdict.not_shadowed, try ep.record(70, block, a_extra, b_extra, proofFor(b_extra, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m_extra.idx), true));
+    try testing.expectEqual(RecordVerdict.not_shadowed, try ep.record(70, block, .{ .map = a_extra }, b_extra, proofFor(b_extra, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m_extra.idx), true));
     try testing.expect(!f.alloc_a.inflightContains(m_extra.idx));
     try testing.expectEqual(fb0 + 1, stats.rewrite_shadow_fallbacks.load());
     // A re-record of a block the epoch already shadows is still taken.
     const m_again = try f.alloc_a.allocateBlock();
     const b_again = Binding.wholeBlock(wt.VOL_A, m_again.offset, m_again.stamp);
-    try testing.expect((try ep.record(70, 0, null, b_again, proofFor(b_again, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m_again.idx), true)) == .shadowed);
+    try testing.expect((try ep.record(70, 0, .{ .map = null }, b_again, proofFor(b_again, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m_again.idx), true)) == .shadowed);
     const out = ep.close(io, 70, cs);
     try testing.expectEqual(@as(u32, seams.MergeOutcome.max_displaced + 1), out.swapped.freed); // every A key + block 0's intermediate B
     try testing.expectEqual(@as(u8, seams.MergeOutcome.max_displaced), f.map.merges.items[0].blocks);
@@ -1311,7 +1402,7 @@ test "a record for a block the CLOSING epoch shadows never takes the durable mer
     const a = try f.publishBlock(80, 0, 0xAA);
     const mb = try f.alloc_a.allocateBlock();
     const b = Binding.wholeBlock(wt.VOL_A, mb.offset, mb.stamp);
-    _ = try ep.record(80, 0, a, b, proofFor(b, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
+    _ = try ep.record(80, 0, .{ .map = a }, b, proofFor(b, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
     // In the save's window: the next epoch fills the union to the cap with
     // other blocks, one more block arrives, then a record for block 0 (the
     // upload's venue).
@@ -1328,15 +1419,15 @@ test "a record for a block the CLOSING epoch shadows never takes the durable mer
                 const ai = f_.publishBlock(80, block, 0x11) catch unreachable;
                 const m = f_.alloc_a.allocateBlock() catch unreachable;
                 const bi = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-                std.debug.assert((ep_.record(80, block, ai, bi, proofFor(bi, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, m.idx), true) catch unreachable) == .shadowed);
+                std.debug.assert((ep_.record(80, block, .{ .map = ai }, bi, proofFor(bi, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, m.idx), true) catch unreachable) == .shadowed);
             }
             const ap = f_.publishBlock(80, block, 0x11) catch unreachable;
             const mp = f_.alloc_a.allocateBlock() catch unreachable;
             p = Binding.wholeBlock(wt.VOL_A, mp.offset, mp.stamp);
-            past = ep_.record(80, block, ap, p, proofFor(p, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, mp.idx), true) catch unreachable;
+            past = ep_.record(80, block, .{ .map = ap }, p, proofFor(p, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, mp.idx), true) catch unreachable;
             const mc = f_.alloc_a.allocateBlock() catch unreachable;
             c = Binding.wholeBlock(wt.VOL_A, mc.offset, mc.stamp);
-            verdict = ep_.record(80, 0, map.seam().lookup(80, 0), c, proofFor(c, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f_.alloc_a, mc.idx), true) catch unreachable;
+            verdict = ep_.record(80, 0, .{ .map = map.seam().lookup(80, 0) }, c, proofFor(c, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f_.alloc_a, mc.idx), true) catch unreachable;
         }
     };
     Racer.ep_ = &ep;
@@ -1355,7 +1446,7 @@ test "a record for a block the CLOSING epoch shadows never takes the durable mer
     ep.awaitSaveSettled(io, 80);
     // The waiter records again: the open epoch is at the cap and no save is
     // in flight — the durable merge is now the right arm.
-    const v2 = try ep.record(80, max, f.map.seam().lookup(80, max), Racer.p, proofFor(Racer.p, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, f.alloc_a.idxOf(Racer.p.offset)), true);
+    const v2 = try ep.record(80, max, .{ .map = f.map.seam().lookup(80, max) }, Racer.p, proofFor(Racer.p, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, f.alloc_a.idxOf(Racer.p.offset)), true);
     try testing.expect(v2 == .not_shadowed);
     directPublish(io, f, 80, max, Racer.p);
     // The next epoch's save publishes C over the landed B, freeing B with
@@ -1387,7 +1478,7 @@ test "a transient save's fold never carries more than the ONE save's size: a rec
     while (block < max / 2) : (block += 1) {
         const m = try f.alloc_a.allocateBlock();
         const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-        _ = try ep.record(90, block, null, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
+        _ = try ep.record(90, block, .{ .map = null }, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
     }
     // In the save's window a writer records `max` OTHER blocks; the save is transient.
     const Racer = struct {
@@ -1401,10 +1492,10 @@ test "a transient save's fold never carries more than the ONE save's size: a rec
             while (blk < seams.MergeOutcome.max_displaced * 3 / 2) : (blk += 1) {
                 const m = f_.alloc_a.allocateBlock() catch unreachable;
                 const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-                switch (ep_.record(90, blk, null, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, m.idx), true) catch unreachable) {
+                switch (ep_.record(90, blk, .{ .map = null }, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, m.idx), true) catch unreachable) {
                     .shadowed => shadowed += 1,
                     .save_in_flight => waited.append(testing.allocator, blk) catch unreachable,
-                    .not_shadowed => unreachable,
+                    .not_shadowed, .base_moved => unreachable,
                 }
             }
         }
@@ -1428,7 +1519,7 @@ test "a transient save's fold never carries more than the ONE save's size: a rec
     for (Racer.waited.items) |blk| {
         const m = try f.alloc_a.allocateBlock();
         const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-        try testing.expect((try ep.record(90, blk, null, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true)) == .shadowed);
+        try testing.expect((try ep.record(90, blk, .{ .map = null }, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true)) == .shadowed);
     }
     try testing.expect(ep.close(io, 90, cs) == .swapped);
     block = 0;
@@ -1449,7 +1540,7 @@ test "a shadow past the ONE save's size (record caps the fold's union, so it can
     while (block < max) : (block += 1) {
         const m = try f.alloc_a.allocateBlock();
         const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-        _ = try ep.record(92, block, null, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
+        _ = try ep.record(92, block, .{ .map = null }, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
     }
     const m = try f.alloc_a.allocateBlock();
     const extra = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
@@ -1484,7 +1575,7 @@ test "record is all or nothing: an allocation failure at any of its reservations
         defer ep.deinit();
         failing.fail_index = failing.alloc_index + i;
         var g = block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx);
-        try testing.expectError(error.OutOfMemory, ep.record(91, 0, null, b, proofFor(b, wt.BS), wt.BS, g, true));
+        try testing.expectError(error.OutOfMemory, ep.record(91, 0, .{ .map = null }, b, proofFor(b, wt.BS), wt.BS, g, true));
         g.deinit();
         try testing.expectEqual(@as(usize, 0), ep.openCount());
         try testing.expectEqual(open0, stats.rewrite_shadow_open_epochs.load());
@@ -1519,7 +1610,7 @@ test "a FRESH stream rides the epoch and the close width owes ONE close per wind
         const m = try f.alloc_a.allocateBlock();
         const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
         // A sequential lay-down: every block complete, its size floor the block's end.
-        const v = try ep.record(95, block, null, b, proofFor(b, wt.BS), (@as(u64, block) + 1) * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
+        const v = try ep.record(95, block, .{ .map = null }, b, proofFor(b, wt.BS), (@as(u64, block) + 1) * wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
         try testing.expect(v == .shadowed);
         try testing.expect(v.shadowed.displaced_prev == null);
         if (v.shadowed.close_owed) {
@@ -1565,16 +1656,16 @@ test "the width hint fires once per epoch: a re-record of a shadowed block at th
     while (block < width) : (block += 1) {
         const m = try f.alloc_a.allocateBlock();
         const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-        const v = try ep.record(96, block, null, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
+        const v = try ep.record(96, block, .{ .map = null }, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true);
         try testing.expect(!v.shadowed.close_owed);
     }
     // The width-th distinct block owes the close; a rewrite of it does not.
     const m = try f.alloc_a.allocateBlock();
     const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-    try testing.expect((try ep.record(96, width, null, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true)).shadowed.close_owed);
+    try testing.expect((try ep.record(96, width, .{ .map = null }, b, proofFor(b, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m.idx), true)).shadowed.close_owed);
     const m2 = try f.alloc_a.allocateBlock();
     const b2 = Binding.wholeBlock(wt.VOL_A, m2.offset, m2.stamp);
-    const again = try ep.record(96, width, f.map.seam().lookup(96, width), b2, proofFor(b2, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
+    const again = try ep.record(96, width, .{ .map = f.map.seam().lookup(96, width) }, b2, proofFor(b2, wt.BS), 0, block_alloc.InflightAllocGuard.register(f.alloc_a, m2.idx), true);
     try testing.expect(again.shadowed.displaced_prev.?.eql(b)); // the intermediate B parked as ours
     try testing.expect(!again.shadowed.close_owed);
     // Under the save of this epoch a stream fills the next one to the
@@ -1589,7 +1680,7 @@ test "the width hint fires once per epoch: a re-record of a shadowed block at th
             while (blk <= 2 * width) : (blk += 1) {
                 const mm = f_.alloc_a.allocateBlock() catch unreachable;
                 const bb = Binding.wholeBlock(wt.VOL_A, mm.offset, mm.stamp);
-                const v = ep_.record(96, blk, null, bb, proofFor(bb, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, mm.idx), true) catch unreachable;
+                const v = ep_.record(96, blk, .{ .map = null }, bb, proofFor(bb, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, mm.idx), true) catch unreachable;
                 std.debug.assert(v == .shadowed);
                 if (blk == 2 * width) owed = v.shadowed.close_owed else std.debug.assert(!v.shadowed.close_owed);
             }

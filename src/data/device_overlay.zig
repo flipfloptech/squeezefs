@@ -814,9 +814,6 @@ pub const StoreRequest = struct {
     rel: u32,
     vehicle: Vehicle,
     file: seams.FileView,
-    /// The map's current binding of the block (the overwrite shape); the
-    /// install re-derives it under (3.5).
-    overwrite: bool,
     /// A depth-governor permit for `vehicle.len()` the caller admitted
     /// HOLDING NO BLOCK GUARD after a `.governor_full` answer; the store
     /// spends it (its CQE completes it) or returns it unspent on any
@@ -979,7 +976,6 @@ pub const Overlay = struct {
         }
         // 2. State screen.
         if (req.file.kind != .striped or !req.file.map_resident) return .declined;
-        if (req.overwrite and !self.cfg.overwrite) return .declined;
         if (self.deps.epochs.bindsBlock(req.ino, req.block)) {
             stats.overlay_ineligible_shadow_bound.inc();
             return .declined;
@@ -992,6 +988,14 @@ pub const Overlay = struct {
             stats.overlay_ineligible_ram_custody.inc();
             return .declined;
         };
+        // The classification AFTER the epoch screen (`write_epoch.Base`):
+        // a save lands under no block guard, so a map read before the
+        // screen may predate one that landed and left sight in between —
+        // a Hole record over the B it published, its gaps seeded zeros
+        // over acked bytes (the perf matrix's lay-down, 2026-10-28). A
+        // joined record keeps its install's.
+        const overwrite = if (existing) |r| r.old_binding != null else self.deps.map.lookup(req.ino, req.block) != null;
+        if (overwrite and !self.cfg.overwrite) return .declined;
         // 4. The governor permit — BEFORE a fresh install (a full pipe
         //    leaves no zero-coverage Open record behind for a sibling's
         //    one-authority settle to seed whole) and NEVER a park under the
@@ -1002,7 +1006,7 @@ pub const Overlay = struct {
             if (pre == null) pre = g.tryAdmit(len) orelse return .governor_full;
         };
         // 3. Registry: join or install.
-        const rec = existing orelse (try self.installRecord(io, req)) orelse return .declined;
+        const rec = existing orelse (try self.installRecord(io, req, overwrite)) orelse return .declined;
         // 5. Claim + accept: the permit is spent here (its CQE completes it).
         const first_page: u32 = req.rel / OVERLAY_PAGE;
         const pages: u32 = @intCast(len / OVERLAY_PAGE);
@@ -1026,12 +1030,12 @@ pub const Overlay = struct {
                 stats.overlay_ack_early_bytes.add(len);
                 const snapshot: ?[]const u8 = if (sv.class == .odirect) blk: {
                     const b = sv.extract.?(sv.ctx, io) catch {
-                        _ = self.finishStore(io, rec, ticket, permit, len, req.overwrite, false);
+                        _ = self.finishStore(io, rec, ticket, permit, len, overwrite, false);
                         return error.InputOutput;
                     };
                     break :blk b;
                 } else null;
-                self.tasks.spawn(io, ackEarlyContinuation, .{ self, io, rec, ticket, permit, sv, snapshot, len, req.overwrite }) catch {
+                self.tasks.spawn(io, ackEarlyContinuation, .{ self, io, rec, ticket, permit, sv, snapshot, len, overwrite }) catch {
                     // No unit of concurrency: the caller lands it (still
                     // acked only after the CQE — the sound fallback).
                     break :early;
@@ -1039,7 +1043,7 @@ pub const Overlay = struct {
                 return .{ .stored = .{ .coverage_complete = false, .acked_early = true } };
             }
         }
-        return .{ .claimed = .{ .rec = rec, .ticket = ticket, .permit = permit, .rel = req.rel, .vehicle = req.vehicle, .overwrite = req.overwrite } };
+        return .{ .claimed = .{ .rec = rec, .ticket = ticket, .permit = permit, .rel = req.rel, .vehicle = req.vehicle, .overwrite = overwrite } };
     }
 
     /// The claimed store's DMA and CQE, holding NO block guard (a settle
@@ -1201,7 +1205,7 @@ pub const Overlay = struct {
     /// OVERWRITE capture in ONE (3.5) section with the install (§5.1). The
     /// record is reserved BEFORE the mint: a full registry declines with
     /// nothing minted (`overlay_registry_declines`).
-    fn installRecord(self: *Overlay, io: Io, req: StoreRequest) StoreError!?*Record {
+    fn installRecord(self: *Overlay, io: Io, req: StoreRequest, overwrite: bool) StoreError!?*Record {
         if (!self.registry.reserve()) {
             stats.overlay_registry_declines.inc();
             return null;
@@ -1241,19 +1245,22 @@ pub const Overlay = struct {
             .mint = mint,
             .fence_token = self.deps.map.currentFencing(req.ino),
         };
-        if (req.overwrite) {
-            // ONE (3.5) section: capture the old binding ∧ re-check the
-            // epoch ∧ install — a capture outside the section races the
-            // epoch's feed (hazard 1).
+        if (overwrite) {
+            // ONE (3.5) section: re-check the epoch ∧ capture the old
+            // binding ∧ install — a capture outside the section races the
+            // epoch's feed (hazard 1), a capture before the re-check a save
+            // landing between them (`write_epoch.Base`).
             const g = self.deps.stripes.acquire(io, req.ino);
             defer g.release(io);
-            const old = self.deps.map.lookup(req.ino, req.block) orelse {
+            const bound = self.deps.epochs.bindsBlock(req.ino, req.block);
+            const old = (if (bound) null else self.deps.map.lookup(req.ino, req.block)) orelse {
+                if (bound) stats.overlay_ineligible_shadow_bound.inc();
                 fill.fsck_guard.?.deinit();
                 mint.abandon();
                 return null;
             };
             const old_vol = self.deps.vols.byTag(old.vol_tag);
-            if (old_vol == null or !old_vol.?.passthrough or !old.whole_block or self.deps.epochs.bindsBlock(req.ino, req.block)) {
+            if (old_vol == null or !old_vol.?.passthrough or !old.whole_block) {
                 stats.overlay_ineligible_shadow_bound.inc();
                 fill.fsck_guard.?.deinit();
                 mint.abandon();
@@ -1478,9 +1485,10 @@ pub const Overlay = struct {
             rec.fsck_guard = null;
             // A Hole record over a RESERVED block (charter §6.6): the
             // reservation is the map's key the save displaces — parked
-            // here as the A key (the gap serve stays the Hole's zeros).
-            const displaced_key = rec.old_binding orelse self.deps.map.reserved(rec.key.ino, rec.key.block);
-            const v = self.deps.epochs.record(rec.key.ino, rec.key.block, displaced_key, new_key, proof, min_size, guard, true) catch |e| switch (e) {
+            // here as the A key (the gap serve stays the Hole's zeros),
+            // read after the epoch probe (`write_epoch.Base`).
+            const base: epoch_mod.Base = if (rec.old_binding) |old| .{ .map = old } else self.deps.epochs.baseFor(self.deps.map, rec.key.ino, rec.key.block);
+            const v = self.deps.epochs.record(rec.key.ino, rec.key.block, base, new_key, proof, min_size, guard, true) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
             };
             switch (v) {
@@ -1512,6 +1520,12 @@ pub const Overlay = struct {
                     // settler's ladder retries with the guard dropped
                     // (the save lands within its own merge).
                     rec.fsck_guard = block_alloc.InflightAllocGuard.register(rec.alloc, rec.dest_idx);
+                    return error.Transient;
+                },
+                // A save landed after the probe (the guard is unconsumed):
+                // a TRANSIENT, the next attempt reads the base again.
+                .base_moved => {
+                    rec.fsck_guard = guard;
                     return error.Transient;
                 },
             }
@@ -2013,7 +2027,7 @@ test "fresh_block_segments_ride_the_overlay_and_publish_at_completion: two disjo
     pattern(&p1, 0x10);
     pattern(&p0, 0x20);
     const bytes0 = stats.overlay_store_bytes.load();
-    const o1 = try w.ov.store(io, .{ .ino = 40, .block = 0, .rel = @intCast(half), .vehicle = .{ .bytes = &p1 }, .file = TestWorld.striped(0), .overwrite = false });
+    const o1 = try w.ov.store(io, .{ .ino = 40, .block = 0, .rel = @intCast(half), .vehicle = .{ .bytes = &p1 }, .file = TestWorld.striped(0) });
     try testing.expect(!o1.stored.coverage_complete);
     try testing.expectEqual(@as(u32, 1), w.ov.registry.open_count.load(.monotonic));
     try testing.expect(w.ov.hasCustody(40, 0));
@@ -2023,7 +2037,7 @@ test "fresh_block_segments_ride_the_overlay_and_publish_at_completion: two disjo
     try testing.expectEqualSlices(u8, &p1, out[half..]);
     try testing.expect(std.mem.allEqual(u8, out[0..half], 0));
     w.f.dev.reads = 0; // the serve's dest read is a READ-path byte, not a write-path one
-    const o0 = try w.ov.store(io, .{ .ino = 40, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p0 }, .file = TestWorld.striped(0), .overwrite = false });
+    const o0 = try w.ov.store(io, .{ .ino = 40, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p0 }, .file = TestWorld.striped(0) });
     try testing.expect(o0.stored.coverage_complete);
     try testing.expectEqual(bytes0 + wt.BS, stats.overlay_store_bytes.load());
     // The guard-dropping caller drains: FREEZE (done at the CQE) → COMPLETE → no gaps → PUBLISH: one merge, the map binds dest, min_size = the block end.
@@ -2052,7 +2066,7 @@ test "partial_overlay_fsync_seeds_zeros_and_publishes_whole_block; open_overlay_
     var p: [wt.BS / 4]u8 align(4096) = undefined;
     pattern(&p, 0x33);
     const unpub0 = counters.tripwireCount("overlay_unpublished_at_fsync");
-    _ = try w.ov.store(io, .{ .ino = 41, .block = 0, .rel = wt.BS / 4, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 41, .block = 0, .rel = wt.BS / 4, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0) });
     w.f.dev.resetLedger();
     const seeds0 = stats.overlay_gap_seeds.load();
     const fresh0 = stats.overlay_epoch_feeds_fresh.load();
@@ -2092,7 +2106,7 @@ test "the fsync drain covers EVERY open record of the ino, however many: 70 bloc
     const n: u32 = 70;
     var b: u32 = 0;
     while (b < n) : (b += 1) {
-        const o = try w.ov.store(io, .{ .ino = 44, .block = b, .rel = wt.BS / 4, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(@as(u64, b) * wt.BS), .overwrite = false });
+        const o = try w.ov.store(io, .{ .ino = 44, .block = b, .rel = wt.BS / 4, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(@as(u64, b) * wt.BS) });
         try testing.expect(o == .stored);
     }
     try testing.expectEqual(@as(u32, n), w.ov.registry.open_count.load(.monotonic));
@@ -2139,21 +2153,21 @@ test "a full registry declines a fresh install BEFORE it mints (`overlay_registr
     const full0 = counters.tripwireCount("overlay_registry_full");
     const declines0 = stats.overlay_registry_declines.load();
     for (0..2) |b| {
-        const o = try w.ov.store(io, .{ .ino = 45, .block = @intCast(b), .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(@as(u64, b) * wt.BS), .overwrite = false });
+        const o = try w.ov.store(io, .{ .ino = 45, .block = @intCast(b), .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(@as(u64, b) * wt.BS) });
         try testing.expect(o == .stored);
     }
     const free0 = w.f.alloc_a.freeBlocksCount();
-    const o3 = try w.ov.store(io, .{ .ino = 45, .block = 2, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(2 * wt.BS), .overwrite = false });
+    const o3 = try w.ov.store(io, .{ .ino = 45, .block = 2, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(2 * wt.BS) });
     try testing.expect(o3 == .declined);
     try testing.expectEqual(declines0 + 1, stats.overlay_registry_declines.load());
     try testing.expectEqual(full0, counters.tripwireCount("overlay_registry_full"));
     try testing.expectEqual(free0, w.f.alloc_a.freeBlocksCount());
     // A join needs no slot.
-    const oj = try w.ov.store(io, .{ .ino = 45, .block = 1, .rel = wt.BS / 4, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(2 * wt.BS), .overwrite = false });
+    const oj = try w.ov.store(io, .{ .ino = 45, .block = 1, .rel = wt.BS / 4, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(2 * wt.BS) });
     try testing.expect(oj == .stored);
     // A retire returns the slot.
     w.ov.drainBlock(io, &w.locks, 45, 0, false, w.cs());
-    const o4 = try w.ov.store(io, .{ .ino = 45, .block = 2, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(2 * wt.BS), .overwrite = false });
+    const o4 = try w.ov.store(io, .{ .ino = 45, .block = 2, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(2 * wt.BS) });
     try testing.expect(o4 == .stored);
     try testing.expectEqual(@as(u32, 2), w.ov.registry.open_count.load(.monotonic));
     try testing.expectEqual(@as(u32, 0), w.ov.drainForIno(io, &w.locks, 45, std.math.maxInt(u64), true, w.cs()));
@@ -2168,7 +2182,7 @@ test "live_mapped_overwrite_rides_the_overlay_end_to_end: the install captures t
     var p: [wt.BS / 2]u8 align(4096) = undefined;
     pattern(&p, 0x55);
     const ow0 = stats.overlay_overwrite_installs.load();
-    const o = try w.ov.store(io, .{ .ino = 42, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(wt.BS), .overwrite = true });
+    const o = try w.ov.store(io, .{ .ino = 42, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(wt.BS) });
     try testing.expect(!o.stored.coverage_complete);
     try testing.expectEqual(ow0 + 1, stats.overlay_overwrite_installs.load());
     // Read: the covered half from dest, the gap from the OLD binding (never the dest's recycled bytes).
@@ -2218,7 +2232,7 @@ test "the whole-image gap seed (SQUEEZEFS_GAP_SEED_RANGED=0): ONE whole read of 
     const a = try w.f.publishBlock(45, 0, 0xAA);
     var p: [wt.BS / 2]u8 align(4096) = undefined;
     pattern(&p, 0x66);
-    const o = try w.ov.store(io, .{ .ino = 45, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(wt.BS), .overwrite = true });
+    const o = try w.ov.store(io, .{ .ino = 45, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(wt.BS) });
     try testing.expect(!o.stored.coverage_complete);
     w.f.dev.resetLedger();
     const whole0 = stats.overlay_gap_seed_read_bytes.load();
@@ -2243,35 +2257,35 @@ test "ineligible_shapes_decline_and_stay_byte_exact: sub-cap declines unless joi
     try w.f.map.create(43, .striped, 0);
     var small: [OVERLAY_PAGE]u8 align(4096) = @splat(1);
     const sub0 = stats.overlay_ineligible_sub_cap.load();
-    try testing.expectEqual(StoreOutcome.declined, try w.ov.store(io, .{ .ino = 43, .block = 0, .rel = 0, .vehicle = .{ .bytes = &small }, .file = TestWorld.striped(0), .overwrite = false }));
+    try testing.expectEqual(StoreOutcome.declined, try w.ov.store(io, .{ .ino = 43, .block = 0, .rel = 0, .vehicle = .{ .bytes = &small }, .file = TestWorld.striped(0) }));
     try testing.expectEqual(sub0 + 1, stats.overlay_ineligible_sub_cap.load());
     var big: [wt.BS / 2]u8 align(4096) = @splat(2);
-    _ = try w.ov.store(io, .{ .ino = 43, .block = 0, .rel = 0, .vehicle = .{ .bytes = &big }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 43, .block = 0, .rel = 0, .vehicle = .{ .bytes = &big }, .file = TestWorld.striped(0) });
     const joins0 = stats.overlay_sub_cap_joins.load();
-    try testing.expect((try w.ov.store(io, .{ .ino = 43, .block = 0, .rel = wt.BS / 2, .vehicle = .{ .bytes = &small }, .file = TestWorld.striped(0), .overwrite = false })) == .stored);
+    try testing.expect((try w.ov.store(io, .{ .ino = 43, .block = 0, .rel = wt.BS / 2, .vehicle = .{ .bytes = &small }, .file = TestWorld.striped(0) })) == .stored);
     try testing.expectEqual(joins0 + 1, stats.overlay_sub_cap_joins.load());
     // Non-aligned piece and a non-striped file.
-    try testing.expectEqual(StoreOutcome.declined, try w.ov.store(io, .{ .ino = 43, .block = 1, .rel = 100, .vehicle = .{ .bytes = &big }, .file = TestWorld.striped(0), .overwrite = false }));
-    try testing.expectEqual(StoreOutcome.declined, try w.ov.store(io, .{ .ino = 43, .block = 1, .rel = 0, .vehicle = .{ .bytes = &big }, .file = .{ .kind = .staged, .size = 0, .map_resident = true }, .overwrite = false }));
+    try testing.expectEqual(StoreOutcome.declined, try w.ov.store(io, .{ .ino = 43, .block = 1, .rel = 100, .vehicle = .{ .bytes = &big }, .file = TestWorld.striped(0) }));
+    try testing.expectEqual(StoreOutcome.declined, try w.ov.store(io, .{ .ino = 43, .block = 1, .rel = 0, .vehicle = .{ .bytes = &big }, .file = .{ .kind = .staged, .size = 0, .map_resident = true } }));
     // Shadow-bound: a block the epoch shadows declines.
     const a = try w.f.publishBlock(44, 0, 0xAA);
     const m = try w.f.alloc_a.allocateBlock();
     const bnew = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
-    _ = try w.epochs.record(44, 0, a, bnew, .{ .vol_tag = wt.VOL_A, .offset = m.offset, .len = wt.BS, .completed_ns = 1 }, wt.BS, block_alloc.InflightAllocGuard.register(w.f.alloc_a, m.idx), true);
+    _ = try w.epochs.record(44, 0, .{ .map = a }, bnew, .{ .vol_tag = wt.VOL_A, .offset = m.offset, .len = wt.BS, .completed_ns = 1 }, wt.BS, block_alloc.InflightAllocGuard.register(w.f.alloc_a, m.idx), true);
     const sb0 = stats.overlay_ineligible_shadow_bound.load();
-    try testing.expectEqual(StoreOutcome.declined, try w.ov.store(io, .{ .ino = 44, .block = 0, .rel = 0, .vehicle = .{ .bytes = &big }, .file = TestWorld.striped(wt.BS), .overwrite = true }));
+    try testing.expectEqual(StoreOutcome.declined, try w.ov.store(io, .{ .ino = 44, .block = 0, .rel = 0, .vehicle = .{ .bytes = &big }, .file = TestWorld.striped(wt.BS) }));
     try testing.expectEqual(sb0 + 1, stats.overlay_ineligible_shadow_bound.load());
     _ = w.epochs.close(io, 44, w.cs());
     // The overwrite lever off.
     const w2 = try TestWorld.init(testing.allocator, .{ .overwrite = false });
     defer w2.deinit(testing.allocator);
     _ = try w2.f.publishBlock(45, 0, 0xAA);
-    try testing.expectEqual(StoreOutcome.declined, try w2.ov.store(io, .{ .ino = 45, .block = 0, .rel = 0, .vehicle = .{ .bytes = &big }, .file = TestWorld.striped(wt.BS), .overwrite = true }));
+    try testing.expectEqual(StoreOutcome.declined, try w2.ov.store(io, .{ .ino = 45, .block = 0, .rel = 0, .vehicle = .{ .bytes = &big }, .file = TestWorld.striped(wt.BS) }));
     // ENOSPC: every block minted ⇒ the install declines to accumulation, counted; nothing installed.
     while (w2.f.alloc_a.allocateBlock()) |_| {} else |_| {}
     try w2.f.map.create(46, .striped, 0);
     const en0 = stats.overlay_enospc_declines.load();
-    try testing.expectEqual(StoreOutcome.declined, try w2.ov.store(io, .{ .ino = 46, .block = 0, .rel = 0, .vehicle = .{ .bytes = &big }, .file = TestWorld.striped(0), .overwrite = false }));
+    try testing.expectEqual(StoreOutcome.declined, try w2.ov.store(io, .{ .ino = 46, .block = 0, .rel = 0, .vehicle = .{ .bytes = &big }, .file = TestWorld.striped(0) }));
     try testing.expectEqual(en0 + 1, stats.overlay_enospc_declines.load());
     try testing.expect(!w2.ov.hasCustody(46, 0));
     // Drain 43 so nothing stays open.
@@ -2294,7 +2308,7 @@ test "the slot vehicle: WRITE_FIXED(device ← slot) lands the held bytes with z
     };
     const sv: SlotVehicle = .{ .src = .{ .qid = 0, .buf_index = 5, .len = wt.BS }, .class = .page_cache, .commit_retain = false, .ctx = &held, .extract = &Ex.extract };
     const fallbacks0 = stats.overlay_store_fallbacks.load();
-    const o = try w.ov.store(io, .{ .ino = 47, .block = 0, .rel = 0, .vehicle = .{ .slot = sv }, .file = TestWorld.striped(0), .overwrite = false });
+    const o = try w.ov.store(io, .{ .ino = 47, .block = 0, .rel = 0, .vehicle = .{ .slot = sv }, .file = TestWorld.striped(0) });
     try testing.expect(o.stored.coverage_complete);
     try testing.expect(w.f.dev.writes.items[0].fixed);
     try testing.expectEqual(fallbacks0, stats.overlay_store_fallbacks.load());
@@ -2306,7 +2320,7 @@ test "the slot vehicle: WRITE_FIXED(device ← slot) lands the held bytes with z
     try w.f.map.create(48, .striped, 0);
     w.f.dev.fail_next = error.InputOutput;
     const fb0 = stats.overlay_store_fallbacks.load();
-    const o2 = try w.ov.store(io, .{ .ino = 48, .block = 0, .rel = 0, .vehicle = .{ .slot = sv }, .file = TestWorld.striped(0), .overwrite = false });
+    const o2 = try w.ov.store(io, .{ .ino = 48, .block = 0, .rel = 0, .vehicle = .{ .slot = sv }, .file = TestWorld.striped(0) });
     try testing.expect(o2.stored.coverage_complete);
     try testing.expectEqual(fb0 + 1, stats.overlay_store_fallbacks.load());
     w.ov.drainBlock(io, &w.locks, 48, 0, false, w.cs());
@@ -2316,7 +2330,7 @@ test "the slot vehicle: WRITE_FIXED(device ← slot) lands the held bytes with z
     try w.f.map.create(49, .striped, 0);
     const used = w.f.alloc_a.usedBlocks();
     const abandons0 = block_alloc.stats.unpublished_mint_abandons.load();
-    try testing.expectEqual(StoreOutcome.declined, try w.ov.store(io, .{ .ino = 49, .block = 0, .rel = 0, .vehicle = .{ .slot = sv }, .file = TestWorld.striped(0), .overwrite = false }));
+    try testing.expectEqual(StoreOutcome.declined, try w.ov.store(io, .{ .ino = 49, .block = 0, .rel = 0, .vehicle = .{ .slot = sv }, .file = TestWorld.striped(0) }));
     try testing.expectEqual(abandons0 + 1, block_alloc.stats.unpublished_mint_abandons.load()); // the mint went back: the design working
     try testing.expectEqual(used, w.f.alloc_a.usedBlocks());
 }
@@ -2328,10 +2342,10 @@ test "a store whose DMA fails never joins coverage (law 3) and fails THIS write;
     try w.f.map.create(50, .striped, 0);
     var p: [wt.BS / 2]u8 align(4096) = undefined;
     pattern(&p, 0x99);
-    _ = try w.ov.store(io, .{ .ino = 50, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 50, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0) });
     w.f.dev.fail_next = error.InputOutput;
     w.f.dev.torn_grains = 3; // 3 pages land, then the error: a torn DMA
-    try testing.expectError(error.InputOutput, w.ov.store(io, .{ .ino = 50, .block = 0, .rel = wt.BS / 2, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false }));
+    try testing.expectError(error.InputOutput, w.ov.store(io, .{ .ino = 50, .block = 0, .rel = wt.BS / 2, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0) }));
     const rec = w.ov.registry.get(.{ .ino = 50, .block = 0 }).?;
     try testing.expectEqual(State.open, rec.core.stateNow());
     try testing.expect(!rec.core.coveredProbe(wt.BS / 2 / OVERLAY_PAGE, 1));
@@ -2340,7 +2354,7 @@ test "a store whose DMA fails never joins coverage (law 3) and fails THIS write;
     try testing.expectEqual(Overlay.ServeOutcome.served, w.ov.serve(io, 50, 0, 0, &out));
     try testing.expect(std.mem.allEqual(u8, out[wt.BS / 2 ..], 0)); // the torn bytes never escape
     // The sibling retries and completes.
-    const o = try w.ov.store(io, .{ .ino = 50, .block = 0, .rel = wt.BS / 2, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false });
+    const o = try w.ov.store(io, .{ .ino = 50, .block = 0, .rel = wt.BS / 2, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0) });
     try testing.expect(o.stored.coverage_complete);
     w.ov.drainBlock(io, &w.locks, 50, 0, false, w.cs());
     try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
@@ -2354,7 +2368,7 @@ test "the settle's never-lossy and fence arms: a transient leaves the record FRO
     pattern(&p, 0x42);
     // Transient (the injected seam): the write arm retries and lands.
     try w.f.map.create(60, .striped, 0);
-    _ = try w.ov.store(io, .{ .ino = 60, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 60, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0) });
     w.ov.settle_transients.store(2, .monotonic);
     const r0 = stats.overlay_settle_retries.load();
     w.ov.drainBlock(io, &w.locks, 60, 0, false, w.cs());
@@ -2362,7 +2376,7 @@ test "the settle's never-lossy and fence arms: a transient leaves the record FRO
     try testing.expect(w.f.map.seam().lookup(60, 0) != null);
     // Shadow off: the overwrite publishes through the durable-merge arm and frees the displaced key only after.
     const a = try w.f.publishBlock(61, 0, 0xAA);
-    _ = try w.ov.store(io, .{ .ino = 61, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(wt.BS), .overwrite = true });
+    _ = try w.ov.store(io, .{ .ino = 61, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(wt.BS) });
     const ff0 = stats.overlay_feed_fallbacks.load();
     w.ov.drainBlock(io, &w.locks, 61, 0, false, w.cs());
     try testing.expectEqual(ff0 + 1, stats.overlay_feed_fallbacks.load());
@@ -2370,7 +2384,7 @@ test "the settle's never-lossy and fence arms: a transient leaves the record FRO
     try testing.expect(w.f.frees.freed.items[0].eql(a));
     // Dead old binding: the displaced key's lifetime ended under us (a truncate freed it) ⇒ supersede, dest freed.
     const a2 = try w.f.publishBlock(62, 0, 0xBB);
-    _ = try w.ov.store(io, .{ .ino = 62, .block = 0, .rel = 0, .vehicle = .{ .bytes = p[0 .. wt.BS / 2] }, .file = TestWorld.striped(wt.BS), .overwrite = true });
+    _ = try w.ov.store(io, .{ .ino = 62, .block = 0, .rel = 0, .vehicle = .{ .bytes = p[0 .. wt.BS / 2] }, .file = TestWorld.striped(wt.BS) });
     _ = try w.f.alloc_a.freeBlock(w.f.alloc_a.idxOf(a2.offset));
     const used = w.f.alloc_a.usedBlocks();
     const dead0 = stats.overlay_superseded_dead_old_binding.load();
@@ -2379,7 +2393,7 @@ test "the settle's never-lossy and fence arms: a transient leaves the record FRO
     try testing.expectEqual(used - 1, w.f.alloc_a.usedBlocks()); // the dest went back (unpublished_mint_abandons is the design working)
     // Fence on a HEALTHY volume: must-stay-0 fires (the tripwire's line and the arm's), nothing published, nothing freed, the dest NOT freed (successor recovery owns it).
     try w.f.map.create(63, .striped, 0);
-    _ = try w.ov.store(io, .{ .ino = 63, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 63, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0) });
     w.f.map.fail_next_merge = error.WriterGuardFenced;
     const merges = w.f.map.merges.items.len;
     const used2 = w.f.alloc_a.usedBlocks();
@@ -2396,7 +2410,7 @@ test "the settle's never-lossy and fence arms: a transient leaves the record FRO
     try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
     // Reclaimed ino: the orphan dest is discarded (freed), never resurrected.
     try w.f.map.create(64, .striped, 0);
-    _ = try w.ov.store(io, .{ .ino = 64, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 64, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0) });
     w.f.map.remove(64);
     const used3 = w.f.alloc_a.usedBlocks();
     const orph0 = stats.writeback_orphan_discards_overlay.load();
@@ -2417,7 +2431,7 @@ test "the settle's backoff never parks under (3): a device that keeps failing th
     var p: [wt.BS / 2]u8 align(4096) = undefined;
     pattern(&p, 0x5A);
     try w.f.map.create(90, .striped, 0);
-    _ = try w.ov.store(io, .{ .ino = 90, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 90, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0) });
     w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
     const r0 = stats.overlay_settle_retries.load();
     const pub0 = stats.overlay_publishes.load();
@@ -2453,7 +2467,7 @@ test "the settle's backoff never parks under (3): a device that keeps failing th
         // Under OUR guard: a store meeting the frozen record steals ONE
         // attempt and declines — never the ladder under the caller's lock.
         const r1 = stats.overlay_settle_retries.load();
-        const o = try w.ov.store(io, .{ .ino = 90, .block = 0, .rel = wt.BS / 2, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false });
+        const o = try w.ov.store(io, .{ .ino = 90, .block = 0, .rel = wt.BS / 2, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0) });
         steal_declined = o == .declined;
         retries_at_steal = stats.overlay_settle_retries.load() - r1;
         // The device returns; the settler's next attempt lands.
@@ -2488,7 +2502,7 @@ test "fence immediate on every settle leg of a HEALTHY volume: a gap seed or a f
     const failed0 = stats.overlay_fence_drops_failed_volume.load();
     // The gap seed meets the fence.
     try w.f.map.create(91, .striped, 0);
-    _ = try w.ov.store(io, .{ .ino = 91, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 91, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0) });
     w.f.dev.fail_next = error.VolumeFailed;
     var fence0 = counters.tripwireCount("overlay_fence_drops");
     var retries0 = stats.overlay_settle_retries.load();
@@ -2505,7 +2519,7 @@ test "fence immediate on every settle leg of a HEALTHY volume: a gap seed or a f
     try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
     // The fsync-class flush meets the fence.
     try w.f.map.create(92, .striped, 0);
-    _ = try w.ov.store(io, .{ .ino = 92, .block = 0, .rel = 0, .vehicle = .{ .bytes = &whole }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 92, .block = 0, .rel = 0, .vehicle = .{ .bytes = &whole }, .file = TestWorld.striped(0) });
     w.f.dev.fail_next_flush = error.WriterGuardFenced;
     fence0 = counters.tripwireCount("overlay_fence_drops");
     retries0 = stats.overlay_settle_retries.load();
@@ -2522,7 +2536,7 @@ test "fence immediate on every settle leg of a HEALTHY volume: a gap seed or a f
     try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
     // A plain EIO on the same legs stays a transient the ladder retries (the never-lossy class).
     try w.f.map.create(93, .striped, 0);
-    _ = try w.ov.store(io, .{ .ino = 93, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 93, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0) });
     w.f.dev.fail_next = error.InputOutput;
     retries0 = stats.overlay_settle_retries.load();
     w.ov.drainBlock(io, &w.locks, 93, 0, false, w.cs());
@@ -2542,7 +2556,7 @@ test "a transient on a FAILED volume is the fence: a gap seed answering plain EI
     var half: [wt.BS / 2]u8 align(4096) = undefined;
     pattern(&half, 0x7F);
     try w.f.map.create(94, .striped, 0);
-    _ = try w.ov.store(io, .{ .ino = 94, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 94, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0) });
     // The device never answers again, and the volume is latched FAILED.
     w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
     w.fenced.store(true, .monotonic);
@@ -2581,7 +2595,7 @@ test "the fence's class on every W5 arm: a gap seed, a flush and a publish answe
     var failed0 = stats.overlay_fence_drops_failed_volume.load();
     // The gap seed's VolumeFailed.
     try w.f.map.create(95, .striped, 0);
-    _ = try w.ov.store(io, .{ .ino = 95, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 95, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0) });
     w.f.dev.fail_next = error.VolumeFailed;
     var used0 = w.f.alloc_a.usedBlocks();
     w.ov.drainBlock(io, &w.locks, 95, 0, false, w.cs());
@@ -2591,7 +2605,7 @@ test "the fence's class on every W5 arm: a gap seed, a flush and a publish answe
     // The fsync-class flush's WriterGuardFenced.
     failed0 = stats.overlay_fence_drops_failed_volume.load();
     try w.f.map.create(96, .striped, 0);
-    _ = try w.ov.store(io, .{ .ino = 96, .block = 0, .rel = 0, .vehicle = .{ .bytes = &whole }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 96, .block = 0, .rel = 0, .vehicle = .{ .bytes = &whole }, .file = TestWorld.striped(0) });
     w.f.dev.fail_next_flush = error.WriterGuardFenced;
     used0 = w.f.alloc_a.usedBlocks();
     w.ov.drainBlock(io, &w.locks, 96, 0, true, w.cs());
@@ -2601,7 +2615,7 @@ test "the fence's class on every W5 arm: a gap seed, a flush and a publish answe
     // The publish's WriterGuardFenced (the map's commit on a FAILED meta set).
     failed0 = stats.overlay_fence_drops_failed_volume.load();
     try w.f.map.create(97, .striped, 0);
-    _ = try w.ov.store(io, .{ .ino = 97, .block = 0, .rel = 0, .vehicle = .{ .bytes = &whole }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 97, .block = 0, .rel = 0, .vehicle = .{ .bytes = &whole }, .file = TestWorld.striped(0) });
     w.f.map.fail_next_merge = error.WriterGuardFenced;
     const merges = w.f.map.merges.items.len;
     used0 = w.f.alloc_a.usedBlocks();
@@ -2616,7 +2630,7 @@ test "the fence's class on every W5 arm: a gap seed, a flush and a publish answe
     w.fenced.store(false, .monotonic);
     failed0 = stats.overlay_fence_drops_failed_volume.load();
     try w.f.map.create(98, .striped, 0);
-    _ = try w.ov.store(io, .{ .ino = 98, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0), .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 98, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0) });
     w.f.dev.fail_next = error.VolumeFailed;
     stats.overlay_fence_drops.resetLogBudgetForTest();
     log.testing.expectErrorLogs(2);
@@ -2635,7 +2649,7 @@ test "crash windows OW-1..OW-8 as RAM cases: an unpublished dest is reclaimable 
     // OW-1: ACK, DMA landed, no publish — crash here (a half block: the
     // coverage stays incomplete so the feed does not auto-close).
     const a = try w.f.publishBlock(70, 0, 0xAA);
-    _ = try w.ov.store(io, .{ .ino = 70, .block = 0, .rel = 0, .vehicle = .{ .bytes = p[0 .. wt.BS / 2] }, .file = TestWorld.striped(wt.BS), .overwrite = true });
+    _ = try w.ov.store(io, .{ .ino = 70, .block = 0, .rel = 0, .vehicle = .{ .bytes = p[0 .. wt.BS / 2] }, .file = TestWorld.striped(wt.BS) });
     const rec = w.ov.registry.get(.{ .ino = 70, .block = 0 }).?;
     const dest_idx = rec.dest_idx;
     // The map still binds A (durable truth); the dest is allocated but the map never named it ⇒ a census frees it.
@@ -2656,7 +2670,7 @@ test "crash windows OW-1..OW-8 as RAM cases: an unpublished dest is reclaimable 
     try testing.expectEqual(@as(usize, 1), w.f.frees.freed.items.len);
     // OW-7: mid-fsync between the data barrier and the meta publish — the dest is durably WRITTEN but not NAMED: the map still binds the old key, the dest is an unpublished mint.
     const a2 = try w.f.publishBlock(71, 0, 0xBB);
-    _ = try w.ov.store(io, .{ .ino = 71, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(wt.BS), .overwrite = true });
+    _ = try w.ov.store(io, .{ .ino = 71, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(wt.BS) });
     const rec2 = w.ov.registry.get(.{ .ino = 71, .block = 0 }).?;
     try testing.expectEqual(State.frozen, rec2.core.stateNow()); // the full-coverage CQE froze it
     try w.f.dev.seam().flush(wt.VOL_A); // the data barrier
@@ -2692,7 +2706,7 @@ test "ack_early_write_returns_before_store_cqe; fsync_awaits_acked_inflight_stor
     const early0 = stats.overlay_ack_early_stores.load();
     const lost0 = counters.tripwireCount("overlay_ack_early_lost");
     const sv: SlotVehicle = .{ .src = .{ .qid = 0, .buf_index = 9, .len = wt.BS }, .class = .page_cache, .commit_retain = true, .release = &Gate.release };
-    const o = w.ov.store(io, .{ .ino = 80, .block = 0, .rel = 0, .vehicle = .{ .slot = sv }, .file = TestWorld.striped(0), .overwrite = false }) catch |e| switch (e) {
+    const o = w.ov.store(io, .{ .ino = 80, .block = 0, .rel = 0, .vehicle = .{ .slot = sv }, .file = TestWorld.striped(0) }) catch |e| switch (e) {
         else => return e,
     };
     if (!o.stored.acked_early) {
@@ -2744,7 +2758,7 @@ test "THE COMPLETION'S LAST TOUCH: a store's completion parked between its hold 
     pattern(&p, 0x1D);
     const Storer = struct {
         fn run(world: *TestWorld, io_: Io, block: u32, bytes: []const u8, out: *anyerror!StoreOutcome) void {
-            out.* = world.ov.store(io_, .{ .ino = 95, .block = block, .rel = 0, .vehicle = .{ .bytes = bytes }, .file = TestWorld.striped(@as(u64, block) * wt.BS), .overwrite = false });
+            out.* = world.ov.store(io_, .{ .ino = 95, .block = block, .rel = 0, .vehicle = .{ .bytes = bytes }, .file = TestWorld.striped(@as(u64, block) * wt.BS) });
         }
         /// The settler: a drain of block 0 (the fsync's, the write-back
         /// timer's, a sibling's steal — any of them), then a writer's fresh

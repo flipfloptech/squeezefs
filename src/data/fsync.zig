@@ -1200,7 +1200,7 @@ test "syncfs is fsync's data ladder for EVERY ino holding custody: parked blocks
     _ = try w.table.recordWrite(w.table.checkout(2, 0, false, null).?, 0, &quarter);
     _ = try w.table.recordWrite(w.table.checkout(2, 1, false, null).?, wt.BS / 2, &quarter);
     var p: [wt.BS / 2]u8 align(4096) = @splat(0x61);
-    _ = try w.ov.store(io, .{ .ino = 4, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = .{ .kind = .striped, .size = 0, .map_resident = true }, .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 4, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = .{ .kind = .striped, .size = 0, .map_resident = true } });
     w.touched.stampOrdinal(7, 0);
     const calls0 = stats.syncfs_calls.load();
     const inos0 = stats.syncfs_custody_inos.load();
@@ -1264,7 +1264,7 @@ test "in_place_dma_shapes_stamp_their_namespace and parallel legs pay the join: 
     w.touched.stampOrdinal(4, 1);
     // An open overlay record on block 0: the fsync drain publishes it with the barrier.
     var p: [wt.BS / 2]u8 align(4096) = @splat(0x61);
-    _ = try w.ov.store(io, .{ .ino = 4, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = .{ .kind = .striped, .size = 0, .map_resident = true }, .overwrite = false });
+    _ = try w.ov.store(io, .{ .ino = 4, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = .{ .kind = .striped, .size = 0, .map_resident = true } });
     const joins0 = stats.fsync_parallel_joins.load();
     const unpub0 = counters.tripwireCount("overlay_unpublished_at_fsync");
     var prof = Prof.start();

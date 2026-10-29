@@ -75,10 +75,100 @@ pub fn CloseVisibilityModel(comptime weak: Weakening) type {
     };
 }
 
+/// The law's READER half (2026-10-28, the perf matrix's lay-down;
+/// `write_epoch.Base`): the same closer (save → unbind → free A, under no
+/// block guard) against a writer under (3) that pairs a map read with the
+/// epoch probe and RECORDS a base — the key its own save will displace (an
+/// overlay record's classification, a record's parked key). The writer:
+/// probe (`seen` = the gate), read the map (`prev`), record — the shadow B
+/// while the gate holds now, else `prev`; a probe that saw the gate the
+/// record no longer finds starts over (`base_moved`). The base is WRONG
+/// iff it is not what the map binds once the closer is done (B): the next
+/// save displaces B unparked (`rewrite_shadow_displaced_drift`) and frees
+/// the stale key a second time — or, for the overlay, a Hole record seeds
+/// zeros over B's bytes. Weakenings: `map_before_probe` (the dev order:
+/// the map read first — the overlay's `overwrite` and the record's `live`)
+/// and `no_moved_check` (probe first, the landing between probe and record
+/// unchecked).
+pub const ReaderWeakening = enum { none, map_before_probe, no_moved_check };
+
+pub fn ReaderOrderModel(comptime weak: ReaderWeakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 2;
+
+        const Key = enum(u8) { a, b };
+        const CloserAction = enum(u8) { save, unbind, free };
+        const closer_order: [3]CloserAction = .{ .save, .unbind, .free };
+
+        map: Key = .a,
+        visible: bool = true,
+        a_live: bool = true,
+        pc: [2]u8 = @splat(0),
+        /// The writer's registers.
+        seen: bool = false,
+        prev: Key = .a,
+        /// The recorded base (null = not recorded yet).
+        base: ?Key = null,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return self.pc[t] == 3;
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            if (t == 0) {
+                switch (closer_order[self.pc[0]]) {
+                    .save => self.map = .b,
+                    .unbind => self.visible = false,
+                    .free => self.a_live = false,
+                }
+                self.pc[0] += 1;
+                return;
+            }
+            const probe_at: u8 = if (weak == .map_before_probe) 1 else 0;
+            switch (self.pc[1]) {
+                2 => {
+                    // `record` under the epochs' lock.
+                    if (weak == .none and self.seen and !self.visible) {
+                        self.pc[1] = 0;
+                        return;
+                    }
+                    self.base = if (self.visible) .b else self.prev;
+                },
+                else => if (self.pc[1] == probe_at) {
+                    self.seen = self.visible;
+                } else {
+                    self.prev = self.map;
+                },
+            }
+            self.pc[1] += 1;
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            const base = self.base orelse return;
+            if (base == .a and !self.a_live) return error.BaseFreed;
+        }
+
+        pub fn final(self: *const Self) !void {
+            if (self.base.? != self.map) return error.BaseNotTheMaps;
+        }
+    };
+}
+
 const explorer = @import("../model/explorer.zig");
 
 test "the save visibility model holds; unbinding before the save and basing on the map both lose acked bytes (the recorded weakenings)" {
     try explorer.expectHolds(CloseVisibilityModel(.none), .{});
     try explorer.expectFails(CloseVisibilityModel(.unbind_before_save), .{}, error.InvariantViolated);
     try explorer.expectFails(CloseVisibilityModel(.base_from_map), .{}, error.InvariantViolated);
+}
+
+test "the reader order model holds: probe, then map, then a record that starts over when the probed epoch left sight; the map read before the probe and the unchecked landing both record a freed base (the recorded weakenings)" {
+    try explorer.expectHolds(ReaderOrderModel(.none), .{});
+    try explorer.expectFails(ReaderOrderModel(.map_before_probe), .{}, error.InvariantViolated);
+    try explorer.expectFails(ReaderOrderModel(.no_moved_check), .{}, error.InvariantViolated);
 }

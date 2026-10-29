@@ -511,7 +511,7 @@ test "precedence: an open overlay record serves (composed over the old binding) 
     const v = w.comp.view();
     const a = try w.f.publishBlock(3, 0, 0xAA);
     var p: [wt.BS / 2]u8 align(4096) = @splat(0x55);
-    _ = try w.ov.store(io, .{ .ino = 3, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = .{ .kind = .striped, .size = wt.BS, .map_resident = true }, .overwrite = true });
+    _ = try w.ov.store(io, .{ .ino = 3, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = .{ .kind = .striped, .size = wt.BS, .map_resident = true } });
     var out: [wt.BS]u8 = undefined;
     try testing.expectEqual(Outcome{ .served = .device_overlay }, v.serve(io, .{ .ino = 3, .block = 0, .rel = 0, .out = &out }));
     try testing.expect(std.mem.allEqual(u8, out[0 .. wt.BS / 2], 0x55));
@@ -555,7 +555,7 @@ test "try-only (the uring worker's warm-ladder probe): a held block lock answers
     // An open overlay record: busy for the probe, served for the lane.
     _ = try w.f.publishBlock(3, 0, 0xAA);
     var p: [wt.BS / 2]u8 align(4096) = @splat(0x55);
-    _ = try w.ov.store(io, .{ .ino = 3, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = .{ .kind = .striped, .size = wt.BS, .map_resident = true }, .overwrite = true });
+    _ = try w.ov.store(io, .{ .ino = 3, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = .{ .kind = .striped, .size = wt.BS, .map_resident = true } });
     try testing.expectEqual(Outcome.busy, v.serve(io, .{ .ino = 3, .block = 0, .rel = 0, .out = &out, .try_only = true }));
     try testing.expectEqual(Outcome{ .served = .device_overlay }, v.serve(io, .{ .ino = 3, .block = 0, .rel = 0, .out = &out }));
     const cs: epoch_mod.Epochs.CloseSeams = .{ .map = w.f.map.seam(), .free = w.f.frees.seam(), .purge = .none };

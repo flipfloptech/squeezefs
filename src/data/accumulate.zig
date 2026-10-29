@@ -1291,10 +1291,13 @@ pub const DestError = enospc.PlacedError;
 
 /// `Dest` for `(ino, block)`: the reservation's takeover when the law
 /// admits it, else `enospc.allocatePlacedMint` with the caller's class.
+/// The epoch probe precedes the reservation read (`write_epoch.Base`): a
+/// reservation read first may be one a save freed in between — another
+/// owner's block by the time the image lands on it.
 pub fn pickDest(deps: UploadDeps, io: Io, ino: u64, block: u32, under_guard: bool, wait: enospc.SupplyWait) DestError!Dest {
-    if (deps.map.reserved(ino, block)) |r| takeover: {
-        if (deps.epochs.bindsBlock(ino, block)) break :takeover;
-        if (deps.custody) |c| if (c.overlay_open(c.ctx, ino, block)) break :takeover;
+    const custody = deps.epochs.bindsBlock(ino, block) or if (deps.custody) |c| c.overlay_open(c.ctx, ino, block) else false;
+    const reserved: ?Binding = if (custody) null else deps.map.reserved(ino, block);
+    if (reserved) |r| takeover: {
         const v = deps.vols.byTag(r.vol_tag) orelse break :takeover;
         if (!v.isActive()) break :takeover;
         const idx = v.alloc.idxOf(r.offset);
@@ -1537,12 +1540,12 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             // promotion in flight) takes the durable merge.
             // The map's binding, a reservation included: the epoch parks
             // it as the displaced A key (the save's fold displaces it; the
-            // destroy, never the epoch, frees it on NotFound). A takeover
-            // publishes durably at once — the same reference, no shadow —
-            // so a second landing of the block finds it written.
-            const live = deps.map.lookup(ino, block) orelse deps.map.reserved(ino, block);
+            // destroy, never the epoch, frees it on NotFound) — read after
+            // the epoch probe (`baseFor`). A takeover publishes durably at
+            // once — the same reference, no shadow — so a second landing of
+            // the block finds it written.
             if (striped and dest.reserved == null) {
-                const v = deps.epochs.record(ino, block, live, new_key, proof, min_size, fsck_guard, true) catch {
+                const v = deps.epochs.record(ino, block, deps.epochs.baseFor(deps.map, ino, block), new_key, proof, min_size, fsck_guard, true) catch {
                     dest.abandon();
                     return .stay_parked;
                 };
@@ -1560,6 +1563,9 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                         await_save = true;
                         continue :publish;
                     },
+                    // The save landed after the probe: the guard is still
+                    // ours; the base is read again.
+                    .base_moved => continue :publish,
                 }
             }
             if (!fed) {
@@ -2542,7 +2548,7 @@ test "the overwrite write-through FEEDS the rewrite epoch (no per-block merge); 
     const a3 = try w.f.publishBlock(8, 1, 0xCC);
     // Shadow block 0 of ino 8 with a mint, leaving a2 parked.
     const m = try w.f.alloc_a.allocateBlock();
-    _ = try w.epochs.record(8, 0, a2, Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp), .{ .vol_tag = wt.VOL_A, .offset = m.offset, .len = wt.BS, .completed_ns = 1 }, 2 * wt.BS, block_alloc.InflightAllocGuard.register(w.f.alloc_a, m.idx), true);
+    _ = try w.epochs.record(8, 0, .{ .map = a2 }, Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp), .{ .vol_tag = wt.VOL_A, .offset = m.offset, .len = wt.BS, .completed_ns = 1 }, 2 * wt.BS, block_alloc.InflightAllocGuard.register(w.f.alloc_a, m.idx), true);
     while (w.f.alloc_a.allocateBlock()) |_| {} else |_| {}
     const e2 = w.table.checkout(8, 1, true, a3).?;
     _ = try w.table.recordWrite(e2, 0, &data);

@@ -63,6 +63,7 @@ const uring_fs = @import("../io/uring_fs.zig");
 const superblock = @import("../meta/superblock.zig");
 const ledger = @import("../meta/ledger.zig");
 const journal_tail = @import("../meta/journal_tail.zig");
+const staging = @import("../data/staging.zig");
 const device_loader = @import("../meta/device_loader.zig");
 const node_seq = @import("../meta/node_seq.zig");
 const proc = @import("../meta/guard/proc.zig");
@@ -10659,7 +10660,7 @@ const orphan_file_bytes: usize = 256 << 10;
 /// mount's daemon and supervisor; another row's are another mountpoint's).
 fn writeCacheMemfdsOf(rig: *Rig, mp: []const u8) !usize {
     var script: [640]u8 = undefined;
-    const out = try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "n=0; for p in /proc/[0-9]*; do tr '\\0' '\\n' < $p/cmdline 2>/dev/null | grep -qxF -- '{s}' || continue; for f in $p/fd/*; do case $(readlink $f 2>/dev/null) in '/memfd:{s}'*) n=$((n + 1)) ;; esac; done; done; echo $n", .{ mp, "sqz-write-cache" }));
+    const out = try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "n=0; for p in /proc/[0-9]*; do tr '\\0' '\\n' < $p/cmdline 2>/dev/null | grep -qxF -- '{s}' || continue; for f in $p/fd/*; do case $(readlink $f 2>/dev/null) in '/memfd:{s}'*) n=$((n + 1)) ;; esac; done; done; echo $n", .{ mp, staging.Ring.Ram.MEMFD_NAME }));
     defer rig.gpa.free(out);
     return std.fmt.parseInt(usize, std.mem.trim(u8, out, " \n"), 10);
 }
@@ -10757,7 +10758,7 @@ fn orphanSupervisorRow(path: OrphanPath) !void {
         const memfds = try writeCacheMemfdsOf(rig, rig.mp);
         const t = try rig.readLog();
         defer gpa.free(t);
-        std.debug.print("\nsmoke[orphan, {t}]: the supervisor {s}; write-cache memfds held by this mount's processes: {d}; held copies: {d} ring, {d} tail\n", .{ path, if (alive(sup)) "OUTLIVED ITS MOUNT" else "exited", memfds, try heldCopies(rig, ".wcache"), try heldCopies(rig, ".jtail") });
+        std.debug.print("\nsmoke[orphan, {t}]: the supervisor {s}; write-cache memfds held by this mount's processes: {d}; held copies: {d} ring, {d} tail\n", .{ path, if (alive(sup)) "OUTLIVED ITS MOUNT" else "exited", memfds, try heldCopies(rig, staging.Ring.Ram.HELD_SUFFIX), try heldCopies(rig, ".jtail") });
         if (alive(sup)) {
             std.debug.print("--- the log since the kill ---\n{s}\n", .{t[@min(mark, t.len)..]});
             return error.SupervisorOutlivedItsMount;
@@ -10769,12 +10770,12 @@ fn orphanSupervisorRow(path: OrphanPath) !void {
         const t = try rig.readLog();
         defer gpa.free(t);
         try testing.expect(std.mem.indexOf(u8, t[mark..], "every metadata volume of this set was deleted") != null);
-        try testing.expectEqual(@as(usize, 0), try heldCopies(rig, ".wcache"));
+        try testing.expectEqual(@as(usize, 0), try heldCopies(rig, staging.Ring.Ram.HELD_SUFFIX));
         try testing.expectEqual(@as(usize, 0), try heldCopies(rig, ".jtail"));
         return;
     }
     // A teardown that drained the ring leaves no copy; a death leaves one.
-    try testing.expectEqual(@as(usize, if (path == .abort) 0 else 1), try heldCopies(rig, ".wcache"));
+    try testing.expectEqual(@as(usize, if (path == .abort) 0 else 1), try heldCopies(rig, staging.Ring.Ram.HELD_SUFFIX));
     if (path.leftAttached()) try rig.umountAfterKill();
     // The next supervised mount: every acked file, the copy adopted and gone.
     const mark2 = try rig.logLen();
@@ -10794,7 +10795,7 @@ fn orphanSupervisorRow(path: OrphanPath) !void {
     }
     try testing.expectEqual(orphan_files, exact);
     try testing.expectEqual(@as(u64, 0), lost);
-    try testing.expectEqual(@as(usize, 0), try heldCopies(rig, ".wcache"));
+    try testing.expectEqual(@as(usize, 0), try heldCopies(rig, staging.Ring.Ram.HELD_SUFFIX));
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     _ = try fsckClean(rig, @tagName(path));

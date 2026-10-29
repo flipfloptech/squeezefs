@@ -80,7 +80,6 @@ src/cli/status.zig:349 | 20 | 1dc4d34a811b80e0 | a size — OWED: derive from de
 src/cli/supervisor.zig:62 | 5 | 4aaf534f210f8ec6 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/cli/supervisor.zig:64 | 30 | 835505727e865ef6 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/cli/supervisor.zig:342 | 10 | 5dabfc8194ac4c48 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/cli/supervisor.zig:346 | 10 | 17c3222ecc0c59ec | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/cli/tune.zig:71 | 10 | 1acb21b7fe8bff6d | OWED: derive it or document it on the line (charter §1.5)
 src/cli/volume.zig:321 | 10 | 8942dd342ea6d499 | OWED: derive it or document it on the line (charter §1.5)
 src/core/counters.zig:105 | 26 | 120d7a6867b65a2e | OWED: derive it or document it on the line (charter §1.5)

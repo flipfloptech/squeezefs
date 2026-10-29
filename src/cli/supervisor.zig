@@ -71,9 +71,22 @@
 //! the guards drop, the volume's next writer replays that copy before it
 //! reads its ring, and this process retries it every tick under a
 //! non-blocking writer lock until it lands — then exits.
+//!
+//! The write cache (charter §6.1 "Staged"; decision 0003 §CV): the dead
+//! daemon's ring waits on its claim for the member's next mount for the
+//! successor grace, then moves to its held copy (`staging.Ring.Ram.
+//! persistHeldCopy`), which that mount adopts whenever it comes — so no
+//! supervisor outlives its mount holding RAM: a mount the operator or a
+//! harness detached, a successor nothing starts, a dead mount left
+//! attached all end the same way. A set whose every metadata image was
+//! deleted (no name left) can never be mounted again: what is held for it
+//! is discarded, said once. This process never restarts the daemon — the
+//! mount's argv, its identity and whether anyone still wants it are not
+//! its to judge.
 
 const std = @import("std");
 const fuzzkit = @import("../core/fuzzkit.zig");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const tick_law = @import("../sync/tick.zig");
 const clock = @import("../core/clock.zig");
@@ -95,6 +108,12 @@ pub const PROBE_INTERVAL_NS: u64 = 5 * std.time.ns_per_s;
 pub const HEARTBEAT_STALE_NS: u64 = 2 * PROBE_INTERVAL_NS;
 pub const UNRESPONSIVE_NS: u64 = 30 * std.time.ns_per_s;
 pub const ABORT_GRACE_NS: u64 = tick_law.tick_ns;
+/// How many probe intervals a dead daemon's write cache waits on its claim
+/// before it moves to its held copy (decision 0003 §CV): the escalation's
+/// own six — a successor already on its way (a unit manager's restart, an
+/// operator's `umount` + `mount`) takes the ring without a copy; past them
+/// the copy hands the next mount the same residents whenever it comes.
+pub const SUCCESSOR_GRACE_PROBES: u64 = 6;
 
 pub const Policy = struct {
     probe_interval_ns: u64 = PROBE_INTERVAL_NS,
@@ -104,17 +123,30 @@ pub const Policy = struct {
     probe_timeout_ns: u64 = PROBE_INTERVAL_NS,
     unresponsive_after_ns: u64 = UNRESPONSIVE_NS,
     heartbeat_stale_ns: u64 = HEARTBEAT_STALE_NS,
+    /// `SUCCESSOR_GRACE_PROBES` of the probe cadence.
+    successor_grace_ns: u64 = SUCCESSOR_GRACE_PROBES * PROBE_INTERVAL_NS,
     write_abort: bool = true,
     /// Where a failed replay's tail is held (`journal_tail.HeldDir`;
     /// empty = the host's runtime dir).
     held_dir: journal_tail.HeldDir = .{},
+    /// Where a dead daemon's write cache is held once no successor took it
+    /// (`journal_tail.HeldDir`, kind `write_cache`; empty = the host's
+    /// runtime dir).
+    ring_dir: journal_tail.HeldDir = .{},
 
     /// The policy a `--supervise` mount runs: the constants, the probe
-    /// cadence `SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS` when a suite sets it,
-    /// the held tails' directory the mount's successor will read.
+    /// cadence `SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS` when a suite sets it
+    /// (the successor grace follows it), the held directories the mount's
+    /// successor will read.
     pub fn fromEnv(env: *const std.process.Environ.Map) Policy {
         const ms = knobs.intKnob("SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS", u64, env);
-        return .{ .probe_interval_ns = if (ms == 0) PROBE_INTERVAL_NS else ms * std.time.ns_per_ms, .held_dir = journal_tail.HeldDir.fromEnv(env) };
+        const interval = if (ms == 0) PROBE_INTERVAL_NS else ms * std.time.ns_per_ms;
+        return .{
+            .probe_interval_ns = interval,
+            .successor_grace_ns = SUCCESSOR_GRACE_PROBES * interval,
+            .held_dir = journal_tail.HeldDir.fromEnv(env),
+            .ring_dir = journal_tail.HeldDir.fromEnvOf(env, .write_cache),
+        };
     }
 };
 
@@ -274,6 +306,18 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         write_cache_claim: ?linux.fd_t = null,
         write_cache_drained: bool = false,
         write_cache_listening: bool = false,
+        /// Where the ring goes once no successor took it (the policy's;
+        /// empty = the host's runtime dir) and how long it waits on its
+        /// claim first (decision 0003 §CV).
+        ring_dir: journal_tail.HeldDir = .{},
+        grace_ns: u64 = SUCCESSOR_GRACE_PROBES * PROBE_INTERVAL_NS,
+        ring_moves_refused: u32 = 0,
+        /// An `O_PATH` descriptor of every writer guard's device, kept to
+        /// the end: what judges the set deleted (`setDeleted`).
+        witnesses: std.ArrayList(linux.fd_t) = .empty,
+        /// A guard whose witness could not be opened: the set is never
+        /// judged deleted.
+        witness_missing: bool = false,
         /// The daemon's end closed (its death, or its exit): nothing more
         /// arrives; the queued frames were drained first.
         hup: bool = false,
@@ -300,6 +344,8 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             self.held.deinit(self.gpa);
             self.releaseGuards();
             self.guards.deinit(self.gpa);
+            for (self.witnesses.items) |w| _ = linux.close(w);
+            self.witnesses.deinit(self.gpa);
             self.dropWriteCache();
             if (self.sock) |s| _ = linux.close(s);
             self.sock = null;
@@ -361,7 +407,14 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
                 };
                 const kept = switch (frame.kind) {
                     .tail => if (self.tails.append(self.gpa, .{ .index = frame.index, .fd = fd })) true else |_| false,
-                    .guard => if (self.guards.append(self.gpa, fd)) true else |_| false,
+                    .guard => blk: {
+                        self.guards.append(self.gpa, fd) catch {
+                            self.witness_missing = true;
+                            break :blk false;
+                        };
+                        self.noteWitness(fd);
+                        break :blk true;
+                    },
                     .write_cache => blk: {
                         if (self.write_cache) |old| _ = linux.close(old);
                         self.write_cache = fd;
@@ -533,20 +586,28 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         /// the name is still ours — and hand the memfd to the member's next
         /// mount (`staging.Ring.Ram.bind` connects, takes ONE frame, then
         /// binds the claim itself); a drained or empty ring is discarded at
-        /// once. A failed replay's tails: retried every tick (`retryHeld`).
-        /// The hold has no deadline: both are acked custody (the kill -9
-        /// law), and the operator who wants them gone kills this process —
-        /// every fsync'd byte is on the data volumes already, and a held
-        /// tail's copy stays for the volume's next mount.
+        /// once. No successor within the grace: the ring moves to its held
+        /// copy, which that mount adopts whenever it comes (decision 0003
+        /// §CV) — the hold of RAM is bounded whether the dead mount is
+        /// attached, detached, or nobody will ever mount it again. A failed
+        /// replay's tails: retried every tick (`retryHeld`), their copies
+        /// standing for the volume's next mount. A set whose every
+        /// metadata image was deleted ends every hold (`setDeleted`).
         pub fn holdForSuccessor(self: *Tails) void {
             self.prepareWriteCacheHold();
             if (!self.holding()) return;
             if (self.held.items.len != 0 or self.held_memfds.items.len != 0) log.warn("supervisor: holding {d} journal tail(s) that failed to replay (pid {d}) — retried every {d} ms; the volume's next mount replays them before it admits writes", .{ self.held.items.len + self.held_memfds.items.len, linux.getpid(), self.retry_ns / std.time.ns_per_ms });
+            const ring_deadline = clock.monotonicNs() + self.grace_ns;
             var next_retry = clock.monotonicNs() + self.retry_ns;
             while (self.holding()) {
                 const now = clock.monotonicNs();
                 if (now >= next_retry) {
+                    if (self.setDeleted()) {
+                        self.discardForDeletedSet();
+                        break;
+                    }
                     self.retryHeld();
+                    if (self.write_cache != null and clock.monotonicNs() >= ring_deadline) self.moveRingToHeldCopy();
                     next_retry = clock.monotonicNs() + self.retry_ns;
                     continue;
                 }
@@ -581,7 +642,98 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             }
             self.listenWriteCacheClaim();
             if (self.write_cache == null) return;
-            log.warn("supervisor: holding the dead daemon's write cache ({d} MiB of memfd, residents unpromoted) for this member's next mount — mount the set at this mount point to recover them; kill this process (pid {d}) to discard them (every fsync'd byte is on the data volumes)", .{ memfdLen(memfd) >> 20, linux.getpid() });
+            log.warn("supervisor: holding the dead daemon's write cache ({d} MiB of memfd, residents unpromoted) for this member's next mount for {d} s, then in its held copy under {s} — mount the set at this mount point to recover them; kill this process (pid {d}) to discard them before then (every fsync'd byte is on the data volumes)", .{ memfdLen(memfd) >> 20, self.grace_ns / std.time.ns_per_s, self.ringDir().slice(), linux.getpid() });
+        }
+
+        fn ringDir(self: *const Tails) journal_tail.HeldDir {
+            return if (self.ring_dir.len != 0) self.ring_dir else journal_tail.HeldDir.runtimeOf(.write_cache);
+        }
+
+        /// No successor took the ring within the grace (decision 0003 §CV):
+        /// it moves to its held copy, then the memfd and the claim go. A
+        /// successor already queued on the claim is handed the ring instead
+        /// (before the copy) or as well (after it: its bind removes the
+        /// copy the ring supersedes); one that connects as the claim
+        /// closes is told by the close (`HolderGone`) and adopts the copy.
+        /// A copy that cannot be written keeps the ring here, retried at
+        /// the next tick and said at every doubling.
+        fn moveRingToHeldCopy(self: *Tails) void {
+            self.acceptPending();
+            const memfd = self.write_cache orelse return;
+            const claim = self.write_cache_claim orelse return;
+            const dir = self.ringDir();
+            var nb: [64]u8 = undefined;
+            var hp: staging.Ring.Ram.HeldPath = .{};
+            const copied = if (staging.Ring.Ram.claimNameOf(claim, &nb)) |name|
+                staging.Ring.Ram.persistHeldCopy(memfd, dir.slice(), name, &hp)
+            else
+                error.ClaimUnnamed;
+            // Refused: the ring stays here, said at every doubling.
+            const bytes = copied catch |e| {
+                self.ring_moves_refused += 1;
+                if (std.math.isPowerOfTwo(self.ring_moves_refused)) log.err("supervisor: the dead daemon's write cache ({d} MiB of memfd) could not be moved to its held copy under {s} ({s}) — this process (pid {d}) keeps it; retry {d}, every {d} ms", .{ memfdLen(memfd) >> 20, dir.slice(), @errorName(e), linux.getpid(), self.ring_moves_refused, self.retry_ns / std.time.ns_per_ms });
+                return;
+            };
+            log.warn("supervisor: no successor took the dead daemon's write cache within {d} s — its residents ({d} KiB) moved to {s}: this member's next mount adopts them; the memfd goes", .{ self.grace_ns / std.time.ns_per_s, bytes >> 10, hp.slice() });
+            self.acceptPending();
+            self.dropWriteCache();
+        }
+
+        /// Hand the ring to a successor already queued on the claim (never
+        /// blocks).
+        fn acceptPending(self: *Tails) void {
+            const claim = self.write_cache_claim orelse return;
+            var pfd = [_]linux.pollfd{.{ .fd = claim, .events = linux.POLL.IN, .revents = 0 }};
+            const rc = linux.poll(&pfd, 1, 0);
+            if (linux.errno(rc) == .SUCCESS and rc == 1) self.acceptSuccessor();
+        }
+
+        /// An `O_PATH` descriptor of a writer guard's device: a NEW open
+        /// file description (through `/proc/self/fd`), so it holds no lock
+        /// and the guard's release stays the guard's.
+        fn noteWitness(self: *Tails, guard: linux.fd_t) void {
+            var pb: [32]u8 = undefined;
+            const path = std.fmt.bufPrintSentinel(&pb, "/proc/self/fd/{d}", .{guard}, 0) catch {
+                self.witness_missing = true;
+                return;
+            };
+            const rc = linux.open(path, .{ .PATH = true, .CLOEXEC = true }, 0);
+            if (linux.errno(rc) != .SUCCESS) {
+                self.witness_missing = true;
+                return;
+            }
+            self.witnesses.append(self.gpa, @intCast(rc)) catch {
+                _ = linux.close(@intCast(rc));
+                self.witness_missing = true;
+            };
+        }
+
+        /// Every metadata volume the daemon held a writer guard on is a
+        /// regular file with no name left (`nlink` 0 through its witness):
+        /// no mount can ever open this set again, so nothing held for it
+        /// can reach anyone. A block device is never judged so — its node
+        /// comes back with the device.
+        pub fn setDeleted(self: *const Tails) bool {
+            if (self.witness_missing or self.witnesses.items.len == 0) return false;
+            for (self.witnesses.items) |w| {
+                var st: linux.Statx = undefined;
+                if (linux.errno(linux.statx(w, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .NLINK = true }, &st)) != .SUCCESS) return false;
+                if (!linux.S.ISREG(st.mode) or st.nlink != 0) return false;
+            }
+            return true;
+        }
+
+        /// The set is deleted (`setDeleted`): the ring, every held tail's
+        /// copy and every kept tail go, said once.
+        fn discardForDeletedSet(self: *Tails) void {
+            const ring_mib = if (self.write_cache) |fd| memfdLen(fd) >> 20 else 0;
+            log.err("supervisor: every metadata volume of this set was deleted (its image files have no name left) — no mount can ever open it again: discarding what this process held for it ({d} MiB of write cache memfd, {d} journal tail(s) that failed to replay)", .{ ring_mib, self.held.items.len + self.held_memfds.items.len });
+            self.dropWriteCache();
+            for (self.held.items) |*c| _ = linux.unlink(c.pathZ());
+            self.held.clearRetainingCapacity();
+            for (self.held_memfds.items) |t| _ = linux.close(t.fd);
+            self.held_memfds.clearRetainingCapacity();
+            self.releaseGuards();
         }
 
         /// A successor connected to the write cache's claim: one frame with
@@ -790,13 +942,14 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         const deadline = clock.monotonicNs() + ABORT_GRACE_NS;
         var status: i32 = 0;
         var reaped = false;
-        while (!reaped and clock.monotonicNs() < deadline) {
+        while (!reaped and alive(pid) and clock.monotonicNs() < deadline) {
             reaped = reap(pid, &status);
             if (!reaped) sleepNs(10 * std.time.ns_per_ms);
         }
-        if (!reaped) {
+        // Past the grace: SIGKILL, reaped at the grace's own poll.
+        if (!reaped and alive(pid)) {
             _ = linux.kill(pid, .KILL);
-            while (!reap(pid, &status)) sleepNs(10 * std.time.ns_per_ms);
+            while (!reap(pid, &status) and alive(pid)) sleepNs(10 * std.time.ns_per_ms);
         }
         log.err("supervisor: daemon {d} is dead (wait status 0x{x})", .{ pid, @as(u32, @bitCast(status)) });
         tails.replayAndRelease();
@@ -824,7 +977,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
     pub fn run(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, mountpoint: [:0]const u8, policy: Policy, heartbeat: ?*const Heartbeat, tail_sock: ?linux.fd_t) u8 {
         var name_buf: thread_name.CommBuf = undefined;
         _ = thread_name.nameCurrentThread(&name_buf, thread_comm);
-        var tails: Tails = .{ .gpa = gpa, .sock = tail_sock, .held_dir = policy.held_dir, .retry_ns = policy.probe_interval_ns };
+        var tails: Tails = .{ .gpa = gpa, .sock = tail_sock, .held_dir = policy.held_dir, .retry_ns = policy.probe_interval_ns, .ring_dir = policy.ring_dir, .grace_ns = policy.successor_grace_ns };
         defer tails.deinit();
         if (tail_sock == null) log.warn("supervisor: no tail socket — a daemon crash has the flush-window exposure (no journal tail replay)", .{});
         const conn = connectionId(mountpoint);
@@ -839,9 +992,14 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             var status: i32 = 0;
             // The daemon's end of the tail socket closed: it is exiting or
             // dead — wait for it (a blocking reap of a process already past
-            // its fd table) rather than a probe later.
+            // its fd table) rather than a probe later. A child the kernel
+            // reaped itself (`SIGCHLD` ignored in this process) answers no
+            // wait: its pid's death ends the wait.
             const reaped = if (tails.hup) blk: {
-                while (!reap(pid, &status)) sleepNs(std.time.ns_per_ms);
+                while (!reap(pid, &status)) {
+                    if (!alive(pid)) break :blk false;
+                    sleepNs(std.time.ns_per_ms);
+                }
                 break :blk true;
             } else reap(pid, &status);
             if (reaped) {
@@ -852,6 +1010,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             }
             if (!alive(pid)) {
                 tails.replayAndRelease();
+                log.info("supervisor: daemon {d} is gone (no wait status: reaped by the kernel); done", .{pid});
                 tails.holdForSuccessor();
                 return if (escalated) 1 else 0;
             }
@@ -915,26 +1074,29 @@ test "state machine: escalates exactly once after the threshold; a success re-ar
     try testing.expectEqual(Verdict{ .escalate = 30 * std.time.ns_per_s }, s.observe(1000 + 436 * std.time.ns_per_s, false, p));
 }
 
-test "the policy from the env: the constants unset; the probe seam changes the cadence alone — the probe's answer window and the heartbeat's staleness stay the watchdog tick's" {
+test "the policy from the env: the constants unset; the probe seam changes the cadence and the successor grace that counts it — the probe's answer window and the heartbeat's staleness stay the watchdog tick's" {
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
     const d = Policy.fromEnv(&env);
     try testing.expectEqual(PROBE_INTERVAL_NS, d.probe_interval_ns);
     try testing.expectEqual(PROBE_INTERVAL_NS, d.probe_timeout_ns);
+    try testing.expectEqual(SUCCESSOR_GRACE_PROBES * PROBE_INTERVAL_NS, d.successor_grace_ns);
     try env.put("SQUEEZEFS_TEST_SUPERVISOR_PROBE_MS", "250");
     const s = Policy.fromEnv(&env);
     try testing.expectEqual(250 * std.time.ns_per_ms, s.probe_interval_ns);
     try testing.expectEqual(PROBE_INTERVAL_NS, s.probe_timeout_ns);
     try testing.expectEqual(HEARTBEAT_STALE_NS, s.heartbeat_stale_ns);
     try testing.expectEqual(UNRESPONSIVE_NS, s.unresponsive_after_ns);
+    try testing.expectEqual(SUCCESSOR_GRACE_PROBES * 250 * std.time.ns_per_ms, s.successor_grace_ns);
 }
 
-test "constants: the probe reaches the daemon past the 1 s attr TTL; six probes to escalation; a heartbeat is stale after two ticks; the abort grace is one lock-plane tick" {
+test "constants: the probe reaches the daemon past the 1 s attr TTL; six probes to escalation; a heartbeat is stale after two ticks; the abort grace is one lock-plane tick; a dead daemon's write cache waits the escalation's window on its claim (30 s)" {
     try testing.expect(PROBE_INTERVAL_NS > std.time.ns_per_s);
     try testing.expectEqual(@as(u64, 6), UNRESPONSIVE_NS / PROBE_INTERVAL_NS);
     try testing.expectEqual(2 * PROBE_INTERVAL_NS, HEARTBEAT_STALE_NS);
     try testing.expect(HEARTBEAT_STALE_NS < UNRESPONSIVE_NS);
     try testing.expectEqual(tick_law.tick_ns, ABORT_GRACE_NS);
+    try testing.expectEqual(UNRESPONSIVE_NS, SUCCESSOR_GRACE_PROBES * PROBE_INTERVAL_NS);
 }
 
 test "the probe kind follows the mount's attachment: the control inode while attached, the heartbeat once detached" {
@@ -1022,4 +1184,107 @@ fn tailFrameFuzz(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: TailFrame.decode is total on arbitrary bytes" {
     try fuzzkit.fuzz({}, tailFrameFuzz, .{});
+}
+
+/// A scratch held directory and file under /build/tmp, pid-tagged (the
+/// Linux hold tests).
+const HoldScratch = struct {
+    root_buf: [96]u8 = undefined,
+    root: []const u8 = "",
+    dir_buf: [128]u8 = undefined,
+    dir: []const u8 = "",
+
+    fn init(self: *HoldScratch, tag: []const u8) !void {
+        _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, "/build/tmp", 0o755);
+        self.root = try std.fmt.bufPrint(&self.root_buf, "/build/tmp/sqz-sup-{s}-{d}-{d}", .{ tag, std.os.linux.getpid(), clock.monotonicNs() });
+        self.dir = try std.fmt.bufPrint(&self.dir_buf, "{s}/held", .{self.root});
+        try journal_tail.linux_tail.makeDirs(self.dir);
+    }
+
+    fn deinit(self: *HoldScratch) void {
+        std.Io.Dir.cwd().deleteTree(testing.io, self.root) catch {};
+    }
+
+    fn heldDir(self: *const HoldScratch) journal_tail.HeldDir {
+        var d: journal_tail.HeldDir = .{};
+        @memcpy(d.buf[0..self.dir.len], self.dir);
+        d.len = self.dir.len;
+        return d;
+    }
+};
+
+test "linux: a dead daemon's write cache no successor takes moves to its held copy once the grace is out — the copy the memfd's bytes, the claim's name free again, the hold over (decision 0003 §CV)" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the supervisor's hold is Linux only");
+    const linux = std.os.linux;
+    var scratch: HoldScratch = .{};
+    try scratch.init("ring");
+    defer scratch.deinit();
+    var uuid: [16]u8 = @splat(0x3C);
+    std.mem.writeInt(u32, uuid[0..4], @intCast(linux.getpid()), .little);
+    std.mem.writeInt(u64, uuid[4..12], @bitCast(clock.monotonicNs()), .little);
+    const marker: staging.Marker = .{ .set_uuid = uuid, .set_epoch = 1, .node_token = 0xC0, .mount_slot = 5, .appender_id = 0, .owner_pid = 4242 };
+    var refusal: staging.Ring.BindRefusal = .{};
+    var ring = try staging.Ring.Ram.bind(marker, 16 * 4096, "", &refusal);
+    // A resident's bytes past the marker's grain (the copy is byte for byte).
+    const payload: [4096]u8 = @splat(0xA5);
+    try testing.expectEqual(@as(usize, payload.len), linux.pwrite(ring.memfd, &payload, payload.len, @intCast(staging.Ring.Ram.HEADER + 3 * 4096)));
+    var tails: linux_loop.Tails = .{ .gpa = testing.allocator, .sock = null, .ring_dir = scratch.heldDir(), .grace_ns = 0, .retry_ns = 10 * std.time.ns_per_ms };
+    defer tails.deinit();
+    tails.write_cache = @intCast(linux.dup(ring.memfd));
+    tails.write_cache_claim = @intCast(linux.dup(ring.claim));
+    ring.release();
+    tails.holdForSuccessor();
+    try testing.expect(!tails.holding());
+    try testing.expectEqual(@as(?linux.fd_t, null), tails.write_cache);
+    try testing.expect(!try staging.Ring.Ram.claimHeld(marker));
+    const hp = staging.Ring.Ram.HeldPath.ofMarker(scratch.dir, marker).?;
+    try testing.expect(staging.Ring.Ram.heldCopyExists(marker, scratch.dir));
+    const rc = linux.open(hp.slice(), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var back: [4096]u8 = undefined;
+    try testing.expectEqual(@as(usize, back.len), linux.pread(fd, &back, back.len, @intCast(staging.Ring.Ram.HEADER + 3 * 4096)));
+    try testing.expectEqualSlices(u8, &payload, &back);
+    var m: [staging.MARKER_LEN]u8 = undefined;
+    try testing.expectEqual(@as(usize, m.len), linux.pread(fd, &m, m.len, 0));
+    try testing.expectEqual(@as(?staging.Marker, marker), staging.Marker.decode(&m) catch null);
+}
+
+test "linux: a set whose every metadata image lost its last name ends every hold at the next tick — the ring discarded, a held journal tail's copy removed; an image with a name left is never judged deleted (decision 0003 §CV)" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the supervisor's hold is Linux only");
+    const linux = std.os.linux;
+    var scratch: HoldScratch = .{};
+    try scratch.init("deleted");
+    defer scratch.deinit();
+    var img_buf: [160]u8 = undefined;
+    const img = try std.fmt.bufPrintSentinel(&img_buf, "{s}/meta.img", .{scratch.root}, 0);
+    const grc = linux.open(img, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(grc));
+    var tails: linux_loop.Tails = .{ .gpa = testing.allocator, .sock = null, .ring_dir = scratch.heldDir(), .retry_ns = 10 * std.time.ns_per_ms };
+    defer tails.deinit();
+    try tails.guards.append(testing.allocator, @intCast(grc));
+    tails.noteWitness(@intCast(grc));
+    try testing.expect(!tails.setDeleted());
+    // A held tail's copy standing for the volume's next mount.
+    var copy: linux_loop.Tails.HeldCopy = .{ .index = 0, .path = undefined, .len = 0 };
+    const cp = try std.fmt.bufPrintSentinel(&copy.path, "{s}/00112233445566778899aabbccddeeff.jtail", .{scratch.dir}, 0);
+    copy.len = cp.len;
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = cp, .data = "held" });
+    try tails.held.append(testing.allocator, copy);
+    // The writer guard released (the death replay's end): the witness
+    // still judges the image.
+    for (tails.guards.items) |g| _ = linux.close(g);
+    tails.guards.clearRetainingCapacity();
+    try testing.expect(!tails.setDeleted());
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(img)));
+    try testing.expect(tails.setDeleted());
+    // The discard is said loud, once.
+    const log = @import("../core/log.zig");
+    log.testing.expectErrorLogs(1);
+    tails.holdForSuccessor();
+    try log.testing.expectAllFired();
+    try testing.expect(!tails.holding());
+    var st: linux.Statx = undefined;
+    try testing.expectEqual(linux.E.NOENT, linux.errno(linux.statx(linux.AT.FDCWD, cp, 0, .{}, &st)));
 }

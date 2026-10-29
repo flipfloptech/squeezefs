@@ -93,6 +93,7 @@ const tx_mod = @import("../meta/tx.zig");
 const dlm = @import("../meta/dlm.zig");
 const jc = @import("../meta/journal_core.zig");
 const journal = @import("../meta/journal.zig");
+const journal_tail = @import("../meta/journal_tail.zig");
 const inos = @import("../meta/inos.zig");
 const ino_witness = @import("../meta/ino_witness.zig");
 const sym_moves = @import("../meta/sym/slots/moves.zig");
@@ -1225,7 +1226,13 @@ pub const DataPlane = struct {
         const ours = stagingOwnerMarker(self.backend, opts.member_identity);
         const capacity = derive.alignDown(opts.write_cache_bytes, staging.RECORD_ALIGN);
         var refusal: staging.Ring.BindRefusal = .{};
-        var ram = staging.Ring.Ram.bind(ours, capacity, &refusal) catch |e| switch (e) {
+        const held_dir = journal_tail.HeldDir.fromEnvOf(opts.env, .write_cache);
+        var ram = staging.Ring.Ram.bind(ours, capacity, held_dir.slice(), &refusal) catch |e| switch (e) {
+            error.HeldCopyUnreadable => {
+                const hp = staging.Ring.Ram.HeldPath.ofMarker(held_dir.slice(), ours);
+                log.err("write cache of mount slot {x:0>8} member {x:0>16}: this member's held copy {s} (a dead mount's ring its supervisor moved out of RAM) is unreadable — refusing (its residents are acked writes): move it aside to mount without them", .{ ours.mount_slot, ours.member, if (hp) |*p| p.slice() else held_dir.slice() });
+                return error.StagingRefused;
+            },
             error.OwnerLive => {
                 log.err("write cache of mount slot {x:0>8} member {x:0>16} (staging identity {x:0>16}): held LIVE by another mount presenting this member scope — refusing (never adopted): unmount the other, or mount at another mount point (a joiner's member scope and a derived fabric identity derive from it)", .{ ours.mount_slot, ours.member, ours.identity() });
                 return error.StagingOwnerLive;
@@ -1245,7 +1252,7 @@ pub const DataPlane = struct {
         if (self.stage.?.syncfs_keeps) log.warn("write cache: SQUEEZEFS_TEST_SYNCFS_KEEPS_STAGED — a syncfs keeps this member's residents staged (a test seam: sync(2) does not make them durable)", .{});
         const st = &self.stage.?;
         const r = &st.ram;
-        if (r.found) |f| log.info("write cache: this member's previous incarnation (appender {d}, node {x:0>16}, pid {d}) is dead — its ring ({d} MiB) handed over by its supervisor; its residents are the successor's (the scan below adopts them)", .{ f.appender_id, f.node_token, f.owner_pid, r.capacity() >> 20 });
+        if (r.found) |f| log.info("write cache: this member's previous incarnation (appender {d}, node {x:0>16}, pid {d}) is dead — its ring ({d} MiB) {s}{s}; its residents are the successor's (the scan below adopts them)", .{ f.appender_id, f.node_token, f.owner_pid, r.capacity() >> 20, if (r.from_held_copy) "adopted from the held copy its supervisor left when no successor came: " else "handed over by its supervisor", if (r.from_held_copy) r.heldCopy().? else "" });
         st.seg = staging.Segment.init(gpa, r.image(), r.backing()) catch return error.OutOfMemory;
         errdefer st.seg.deinit();
         const rep = st.seg.recover();
@@ -1293,8 +1300,13 @@ pub const DataPlane = struct {
             log.err("write cache of mount slot {x:0>8}: cannot probe the member's claim ({s})", .{ ours.mount_slot, @errorName(e) });
             return error.StagingRefused;
         };
-        if (!held) return;
-        log.err("write cache of mount slot {x:0>8} member {x:0>16}: a supervisor holds this member's ring from a crashed mount — its residents are acked writes this mount, without a write cache, cannot serve; refusing: mount the set `--daemon --supervise` with the write cache on to recover them (or kill that supervisor to discard them)", .{ ours.mount_slot, ours.member });
+        if (held) {
+            log.err("write cache of mount slot {x:0>8} member {x:0>16}: a supervisor holds this member's ring from a crashed mount — its residents are acked writes this mount, without a write cache, cannot serve; refusing: mount the set `--daemon --supervise` with the write cache on to recover them (or kill that supervisor to discard them)", .{ ours.mount_slot, ours.member });
+            return error.StagingHeldForSuccessor;
+        }
+        const held_dir = journal_tail.HeldDir.fromEnvOf(opts.env, .write_cache);
+        if (!staging.Ring.Ram.heldCopyExists(ours, held_dir.slice())) return;
+        log.err("write cache of mount slot {x:0>8} member {x:0>16}: a crashed mount's ring is held under {s} (its supervisor moved it out of RAM when no successor came) — its residents are acked writes this mount, without a write cache, cannot serve; refusing: mount the set `--daemon --supervise` with the write cache on to recover them (or remove the copy to discard them)", .{ ours.mount_slot, ours.member, held_dir.slice() });
         return error.StagingHeldForSuccessor;
     }
 
@@ -1408,6 +1420,18 @@ pub const DataPlane = struct {
     pub fn writeCacheFds(self: *const DataPlane) ?struct { memfd: linux.fd_t, claim: linux.fd_t } {
         const st = &(self.stage orelse return null);
         return .{ .memfd = st.ram.memfd, .claim = st.ram.claim };
+    }
+
+    /// The write cache's memfd is the supervisor's (`mount` announced it):
+    /// the held copy the bind adopted — or found superseded by the ring the
+    /// claim handed over — goes now, never earlier: until this instant a
+    /// crash of this process would lose the ring the copy still holds
+    /// (decision 0003 §CV).
+    pub fn writeCacheHandedOver(self: *DataPlane) void {
+        const st = &(self.stage orelse return);
+        var pbuf: [linux.PATH_MAX]u8 = undefined;
+        const path = std.fmt.bufPrint(&pbuf, "{s}", .{st.ram.heldCopy() orelse return}) catch return;
+        if (st.ram.dropHeldCopy()) log.info("write cache: the held copy {s} removed (the ring it held is this mount's supervisor's now)", .{path}) else log.err("write cache: the held copy {s} could not be removed — it is OLDER than this mount's ring: remove it by hand before this member's next mount, which would adopt it once no supervisor holds the claim", .{path});
     }
 
     /// After the dismount pass: the write cache holds no record (every

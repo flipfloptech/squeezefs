@@ -216,6 +216,11 @@ pub fn detach(gpa: std.mem.Allocator, io: Io, opts: Options, stderr: *Io.Writer)
     // C1: a new session, the shell's streams released, then the daemon.
     _ = linux.close(pipe_a[0]);
     _ = linux.setsid();
+    // An ignored SIGCHLD survives exec: the kernel would reap the daemon
+    // itself and the supervisor could neither reap it nor name its wait
+    // status. The default disposition, inherited by the daemon too.
+    var chld_default: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 };
+    _ = linux.sigaction(.CHLD, &chld_default, null);
     redirectStdinToNull();
     redirectStdioTo(opts.log_fd);
     const pipe_b = makePipe() orelse {

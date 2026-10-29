@@ -50,6 +50,7 @@ const wire_auth = @import("../wire/auth.zig");
 const data_superblock = @import("../data/data_superblock.zig");
 const foreign_signature = @import("../meta/foreign_signature.zig");
 const journal_tail = @import("../meta/journal_tail.zig");
+const staging = @import("../data/staging.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("cli/format is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -375,7 +376,10 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
             p.stderr.print("squeezefs format: {s}: {s}\n", .{ mp, formatErrorText(e) }) catch {};
             return cli.exit_failed;
         };
-        if (overwritten[i]) |old| sweepHeldTail(p.env, mp, old);
+        if (overwritten[i]) |old| {
+            sweepHeldTail(p.env, mp, old);
+            sweepHeldRings(p.io, p.env, mp, old.set_uuid);
+        }
     }
 
     // The summary.
@@ -409,6 +413,35 @@ fn sweepHeldTail(env: *const std.process.Environ.Map, mp: []const u8, old: journ
         .removed => |h| log.info("format: {s}: removed the held journal tail of the volume it overwrote ({s}: {d} acked window(s) of a failed replay, that volume's metadata — destroyed with it)", .{ mp, path, h.windows }),
         .foreign => log.warn("format: {s}: the held journal tail named for the volume it overwrote ({s}) names another volume — left in place", .{ mp, path }),
         .failed => |e| log.warn("format: {s}: the held journal tail of the volume it overwrote ({s}) could not be removed ({s}) — it stays until the host reboots (its uuid never recurs)", .{ mp, path, @errorName(e) }),
+    }
+}
+
+/// The held write caches of the set the volume `mp` was a member of
+/// (decision 0003 §CV), removed once the format overwrote it: their claim
+/// names the old set's identity, which no mount presents again, so they
+/// would stay in the host's runtime directory until reboot.
+fn sweepHeldRings(io: Io, env: *const std.process.Environ.Map, mp: []const u8, old_set: [16]u8) void {
+    const dir = journal_tail.HeldDir.fromEnvOf(env, .write_cache);
+    var d = Io.Dir.cwd().openDir(io, dir.slice(), .{ .iterate = true }) catch return;
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch null) |ent| {
+        if (!std.mem.endsWith(u8, ent.name, staging.Ring.Ram.HELD_SUFFIX)) continue;
+        var pbuf: [journal_tail.PATH_CAP]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&pbuf, "{s}/{s}", .{ dir.slice(), ent.name }, 0) catch continue;
+        const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) continue;
+        var head: [staging.MARKER_LEN]u8 = undefined;
+        const n = linux.pread(@intCast(rc), &head, head.len, 0);
+        _ = linux.close(@intCast(rc));
+        if (linux.errno(n) != .SUCCESS or n != head.len) continue;
+        const m = staging.Marker.decode(&head) catch continue;
+        if (!std.mem.eql(u8, &m.set_uuid, &old_set)) continue;
+        if (linux.errno(linux.unlink(path)) == .SUCCESS) {
+            log.info("format: {s}: removed the held write cache {s} of the set it overwrote (a crashed mount's residents — destroyed with the set)", .{ mp, path });
+        } else {
+            log.warn("format: {s}: the held write cache {s} of the set it overwrote could not be removed — it stays until the host reboots (no mount presents that set again)", .{ mp, path });
+        }
     }
 }
 

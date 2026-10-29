@@ -53,6 +53,7 @@ const knobs = @import("../core/knobs.zig");
 const log = @import("../core/log.zig");
 const budget = @import("../mem/budget.zig");
 const jc = @import("../meta/journal_core.zig");
+const journal_tail = @import("../meta/journal_tail.zig");
 const tick = @import("../sync/tick.zig");
 const futex = @import("../sync/futex.zig");
 const layout = @import("layout.zig");
@@ -2418,9 +2419,10 @@ pub const GenerationAbaModel = struct {
 // ---------------------------------------------------------------------------
 
 pub const Ring = if (builtin.os.tag == .linux) struct {
-    /// `lseek(2)`'s hole-reporting whence (std's `SEEK` carries only
+    /// `lseek(2)`'s hole-reporting whences (std's `SEEK` carries only
     /// SET/CUR/END).
     const SEEK_DATA: u32 = 3;
+    const SEEK_HOLE: u32 = 4;
 
     /// The memfd's mapping: the punch and the hole scan over it.
     pub const MappedSegment = struct {
@@ -2454,7 +2456,7 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         }
     };
 
-    pub const BindError = error{ OpenFailed, MapFailed, GrowFailed, OwnerLive, ForeignOwner };
+    pub const BindError = error{ OpenFailed, MapFailed, GrowFailed, OwnerLive, ForeignOwner, HeldCopyUnreadable };
 
     /// What a refused bind found (the log names the holder).
     pub const BindRefusal = struct { owner: ?Marker = null };
@@ -2466,14 +2468,59 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         mapped: MappedSegment,
         verdict: BindVerdict,
         found: ?Marker,
+        /// This member's held copy the bind adopted (`from_held_copy`) or
+        /// found superseded by the ring the claim handed over: removed once
+        /// the ring is the supervisor's (`dropHeldCopy`), never before.
+        held_copy: ?HeldPath = null,
+        from_held_copy: bool = false,
 
         /// The marker's grain; the image follows.
         pub const HEADER: u64 = RECORD_ALIGN;
         pub const MEMFD_NAME = "sqz-write-cache";
         pub const CLAIM_PREFIX = "squeezefs-staging-";
+        /// A dead member's ring its supervisor moved out of RAM when no
+        /// successor took it within the grace (decision 0003 §CV):
+        /// `<held dir>/<claim name>.wcache`, the memfd's image at its own
+        /// offsets — a sparse file whose holes are the ring's. One per
+        /// member scope.
+        pub const HELD_SUFFIX = ".wcache";
+
+        pub const HeldPath = struct {
+            buf: [linux.PATH_MAX]u8 = undefined,
+            len: usize = 0,
+
+            pub fn slice(self: *const HeldPath) [:0]const u8 {
+                return self.buf[0..self.len :0];
+            }
+
+            pub fn of(dir: []const u8, claim_name: []const u8) ?HeldPath {
+                var p: HeldPath = .{};
+                p.len = (std.fmt.bufPrintSentinel(&p.buf, "{s}/{s}" ++ HELD_SUFFIX, .{ dir, claim_name }, 0) catch return null).len;
+                return p;
+            }
+
+            /// The member scope's copy; null when `dir` is empty (none is
+            /// looked for).
+            pub fn ofMarker(dir: []const u8, ours: Marker) ?HeldPath {
+                if (dir.len == 0) return null;
+                var nbuf: [64]u8 = undefined;
+                return of(dir, claimName(&nbuf, ours.identity(), ours.mount_slot, ours.member));
+            }
+
+            fn exists(self: *const HeldPath) bool {
+                var st: linux.Statx = undefined;
+                return linux.errno(linux.statx(linux.AT.FDCWD, self.slice(), 0, .{}, &st)) == .SUCCESS;
+            }
+        };
         /// The successor's wait for the supervisor's handover frame, and the
         /// bound retries while the supervisor's socket closes behind it.
         const HANDOVER_WAIT_MS: i32 = 5_000;
+        /// Rounds of that wait a listening holder may stay silent (a
+        /// supervisor replaying its daemon's tails, or moving the ring to
+        /// its held copy) before the bind gives up: six — the supervisor's
+        /// own escalation window (30 s), past which a silent holder is as
+        /// wedged as a daemon would be.
+        const HANDOVER_BUSY_ROUNDS: u32 = 6;
         const CLAIM_RETRIES: u32 = 200;
         const CLAIM_RETRY_NS: u64 = 10 * std.time.ns_per_ms;
 
@@ -2520,8 +2567,11 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         /// not listen is a LIVE daemon (`OwnerLive` — after the retries: a
         /// supervisor between its daemon's death and its `listen` is caught
         /// by them); a listening one is the supervisor of a dead one, which
-        /// answers one frame with the memfd.
-        fn receiveFromSupervisor(ours: Marker) BindError!linux.fd_t {
+        /// answers one frame with the memfd. A holder that closes the
+        /// connection without a frame is GONE (`HolderGone`: its supervisor
+        /// moved the ring to the held copy, or was killed) — the name is
+        /// free again; one silent past the wait is BUSY (`HolderBusy`).
+        fn receiveFromSupervisor(ours: Marker) (BindError || error{ HolderGone, HolderBusy })!linux.fd_t {
             const rl = @import("../ipc/rendezvous_linux.zig");
             const c = seqpacket() orelse return error.OpenFailed;
             defer _ = linux.close(c);
@@ -2541,45 +2591,106 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
             }
             var pfd = [_]linux.pollfd{.{ .fd = c, .events = linux.POLL.IN, .revents = 0 }};
             const prc = linux.poll(&pfd, 1, HANDOVER_WAIT_MS);
-            if (linux.errno(prc) != .SUCCESS or prc == 0) return error.OwnerLive;
+            if (linux.errno(prc) != .SUCCESS) return error.OwnerLive;
+            if (prc == 0) return error.HolderBusy;
             var buf: [16]u8 = undefined;
-            const got = rl.recvCtl(c, &buf) catch return error.OwnerLive;
+            const got = rl.recvCtl(c, &buf) catch |e| return if (e == error.Eof) error.HolderGone else error.OwnerLive;
             return got.fd orelse error.OwnerLive;
         }
 
-        /// Bind THIS member's write cache: the claim taken (fresh: a new
-        /// memfd of `capacity`, the marker stamped); the claim held by a
-        /// supervisor: its memfd adopted — the marker read off grain 0 and
-        /// judged (`bindVerdict`: a foreign member's ring is refused, never
+        /// Bind THIS member's write cache: the claim taken — this member's
+        /// held copy adopted if its supervisor left one (decision 0003
+        /// §CV), else fresh (a new memfd of `capacity`, the marker
+        /// stamped); the claim held by a supervisor: its memfd adopted. An
+        /// adopted ring's marker is read off grain 0 and judged
+        /// (`bindVerdict`: a foreign member's ring is refused, never
         /// adopted; a dead one wiped), the recovered size kept whatever
         /// `capacity` says now (the pool and the tables follow the image);
-        /// held by a live daemon: refused `OwnerLive`.
-        pub fn bind(ours: Marker, want_capacity: u64, refusal: *BindRefusal) BindError!Ram {
+        /// held by a live daemon: refused `OwnerLive`. `held_dir` is where
+        /// a held copy is looked for (empty: nowhere).
+        pub fn bind(ours: Marker, want_capacity: u64, held_dir: []const u8, refusal: *BindRefusal) BindError!Ram {
             refusal.* = .{};
             assert(derive.isAligned(want_capacity, RECORD_ALIGN) and want_capacity >= RECORD_ALIGN);
-            if (try tryClaim(ours)) |fresh_claim| {
-                errdefer _ = linux.close(fresh_claim);
-                const memfd = try createMemfd(HEADER + want_capacity);
+            const held = HeldPath.ofMarker(held_dir, ours);
+            var gone: u32 = 0;
+            var busy: u32 = 0;
+            while (true) {
+                if (try tryClaim(ours)) |claim| {
+                    errdefer _ = linux.close(claim);
+                    if (held) |hp| if (try loadHeldCopy(hp.slice())) |copy| {
+                        var mapped = copy.mapped;
+                        errdefer {
+                            mapped.close();
+                            _ = linux.close(copy.memfd);
+                        }
+                        const j = try judge(&mapped, ours, refusal);
+                        return .{ .memfd = copy.memfd, .claim = claim, .mapped = mapped, .verdict = j.verdict, .found = j.found, .held_copy = hp, .from_held_copy = true };
+                    };
+                    const memfd = try createMemfd(HEADER + want_capacity);
+                    errdefer _ = linux.close(memfd);
+                    var mapped = try mapMemfd(memfd);
+                    errdefer mapped.close();
+                    stampMarker(mapped.map, ours);
+                    return .{ .memfd = memfd, .claim = claim, .mapped = mapped, .verdict = .absent, .found = null };
+                }
+                const memfd = receiveFromSupervisor(ours) catch |e| switch (e) {
+                    error.HolderGone => {
+                        gone += 1;
+                        if (gone == CLAIM_RETRIES) {
+                            stats.staging_owner_live_refusals.inc();
+                            return error.OwnerLive;
+                        }
+                        continue;
+                    },
+                    error.HolderBusy => {
+                        busy += 1;
+                        if (busy == HANDOVER_BUSY_ROUNDS) {
+                            stats.staging_owner_live_refusals.inc();
+                            return error.OwnerLive;
+                        }
+                        continue;
+                    },
+                    error.OwnerLive => {
+                        stats.staging_owner_live_refusals.inc();
+                        return error.OwnerLive;
+                    },
+                    else => |be| return be,
+                };
                 errdefer _ = linux.close(memfd);
                 var mapped = try mapMemfd(memfd);
                 errdefer mapped.close();
-                stampMarker(mapped.map, ours);
-                return .{ .memfd = memfd, .claim = fresh_claim, .mapped = mapped, .verdict = .absent, .found = null };
+                const j = try judge(&mapped, ours, refusal);
+                // Our own claim: the supervisor closes its socket right after
+                // the handover; the name frees with it.
+                var tries: u32 = 0;
+                const own_claim: linux.fd_t = while (true) : (tries += 1) {
+                    if (try tryClaim(ours)) |fd| break fd;
+                    if (tries == CLAIM_RETRIES) {
+                        refusal.owner = j.found;
+                        stats.staging_owner_live_refusals.inc();
+                        return error.OwnerLive;
+                    }
+                    const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(CLAIM_RETRY_NS) };
+                    _ = linux.nanosleep(&ts, null);
+                };
+                // A copy left beside a ring the claim handed over is older
+                // custody (the ring was adopted from it, or a supervisor
+                // handed the ring to a successor after writing it): this
+                // ring supersedes it.
+                const superseded: ?HeldPath = if (held) |hp| (if (hp.exists()) hp else null) else null;
+                return .{ .memfd = memfd, .claim = own_claim, .mapped = mapped, .verdict = j.verdict, .found = j.found, .held_copy = superseded };
             }
-            const memfd = receiveFromSupervisor(ours) catch |e| {
-                if (e == error.OwnerLive) stats.staging_owner_live_refusals.inc();
-                return e;
-            };
-            errdefer _ = linux.close(memfd);
-            var mapped = try mapMemfd(memfd);
-            errdefer mapped.close();
+        }
+
+        /// An adopted ring's marker judged (`bind`'s doc).
+        fn judge(mapped: *MappedSegment, ours: Marker, refusal: *BindRefusal) BindError!struct { verdict: BindVerdict, found: ?Marker } {
             const found: ?Marker = Marker.decode(mapped.map[0..MARKER_LEN]) catch null;
             const verdict: BindVerdict = if (found == null) .dead else bindVerdict(found, ours);
             switch (verdict) {
                 .absent, .match => {},
                 .upgrade => stampMarker(mapped.map, ours),
                 .dead => {
-                    wipeRam(&mapped);
+                    wipeRam(mapped);
                     stampMarker(mapped.map, ours);
                     stats.staging_generation_discards.inc();
                 },
@@ -2589,20 +2700,150 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
                     return error.ForeignOwner;
                 },
             }
-            // Our own claim: the supervisor closes its socket right after
-            // the handover; the name frees with it.
-            var tries: u32 = 0;
-            const own_claim: linux.fd_t = while (true) : (tries += 1) {
-                if (try tryClaim(ours)) |fd| break fd;
-                if (tries == CLAIM_RETRIES) {
-                    refusal.owner = found;
-                    stats.staging_owner_live_refusals.inc();
-                    return error.OwnerLive;
+            return .{ .verdict = verdict, .found = found };
+        }
+
+        /// This member's held copy read into a fresh sealed memfd of the
+        /// copy's size, its data runs alone (`SEEK_DATA`/`SEEK_HOLE`: the
+        /// holes stay unpaged); null when there is none. The copy stays
+        /// until the new ring is the supervisor's (`dropHeldCopy`): a crash
+        /// before that instant finds it again.
+        fn loadHeldCopy(path: [:0]const u8) BindError!?struct { memfd: linux.fd_t, mapped: MappedSegment } {
+            const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .NOENT => return null,
+                else => return error.HeldCopyUnreadable,
+            }
+            const fd: linux.fd_t = @intCast(rc);
+            defer _ = linux.close(fd);
+            var st: linux.Statx = undefined;
+            if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS) return error.HeldCopyUnreadable;
+            if (st.size < HEADER + RECORD_ALIGN or !derive.isAligned(st.size, RECORD_ALIGN)) return error.HeldCopyUnreadable;
+            const memfd = try createMemfd(st.size);
+            errdefer _ = linux.close(memfd);
+            var mapped = try mapMemfd(memfd);
+            errdefer mapped.close();
+            var off: u64 = 0;
+            while (off < st.size) {
+                const data = seekData(fd, off) orelse break;
+                const end = @min(seekHole(fd, data) orelse st.size, st.size);
+                var at: u64 = data;
+                while (at < end) {
+                    const n = linux.pread(fd, mapped.map[@intCast(at)..].ptr, @intCast(end - at), @intCast(at));
+                    switch (linux.errno(n)) {
+                        .SUCCESS => if (n == 0) return error.HeldCopyUnreadable else {
+                            at += n;
+                        },
+                        .INTR => {},
+                        else => return error.HeldCopyUnreadable,
+                    }
                 }
-                const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(CLAIM_RETRY_NS) };
-                _ = linux.nanosleep(&ts, null);
+                off = end;
+            }
+            return .{ .memfd = memfd, .mapped = mapped };
+        }
+
+        /// `lseek(SEEK_DATA)` / `lseek(SEEK_HOLE)` on `fd`; null at the end
+        /// (`ENXIO`) or on an error.
+        fn seekData(fd: linux.fd_t, off: u64) ?u64 {
+            const rc = linux.lseek(fd, @intCast(off), SEEK_DATA);
+            return if (linux.errno(rc) == .SUCCESS) @intCast(rc) else null;
+        }
+
+        fn seekHole(fd: linux.fd_t, off: u64) ?u64 {
+            const rc = linux.lseek(fd, @intCast(off), SEEK_HOLE);
+            return if (linux.errno(rc) == .SUCCESS) @intCast(rc) else null;
+        }
+
+        /// The held copy this bind adopted or superseded, if any.
+        pub fn heldCopy(self: *const Ram) ?[:0]const u8 {
+            return if (self.held_copy) |*hp| hp.slice() else null;
+        }
+
+        /// The ring is the supervisor's now (`mount` announced it): the
+        /// held copy goes. True when one was removed.
+        pub fn dropHeldCopy(self: *Ram) bool {
+            const hp = &(self.held_copy orelse return false);
+            const removed = linux.errno(linux.unlink(hp.slice())) == .SUCCESS;
+            self.held_copy = null;
+            return removed;
+        }
+
+        /// Whether this member's held copy exists (a cache-less mount's
+        /// probe: it refuses to serve those residents' files without them).
+        pub fn heldCopyExists(ours: Marker, held_dir: []const u8) bool {
+            const hp = HeldPath.ofMarker(held_dir, ours) orelse return false;
+            return hp.exists();
+        }
+
+        pub const PersistError = error{ StatFailed, MapFailed, DirFailed, CreateFailed, WriteFailed, PathTooLong };
+
+        /// The supervisor's half (decision 0003 §CV): a dead daemon's ring
+        /// copied to its held path — every data run of the memfd at its own
+        /// offset, written beside the final name, flushed, renamed onto it.
+        /// A copy already there is this member's older custody (the ring
+        /// in hand was adopted from it or superseded it: a bind takes the
+        /// copy whenever it takes the claim), so the rename replaces it.
+        /// Returns the bytes copied.
+        pub fn persistHeldCopy(memfd: linux.fd_t, dir: []const u8, claim_name: []const u8, out: *HeldPath) PersistError!u64 {
+            var st: linux.Statx = undefined;
+            if (linux.errno(linux.statx(memfd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS) return error.StatFailed;
+            const len: usize = @intCast(st.size);
+            const m = linux.mmap(null, len, .{ .READ = true }, .{ .TYPE = .SHARED }, memfd, 0);
+            if (linux.errno(m) != .SUCCESS) return error.MapFailed;
+            const src: [*]const u8 = @ptrFromInt(m);
+            defer _ = linux.munmap(src, len);
+            journal_tail.linux_tail.makeDirs(dir) catch return error.DirFailed;
+            out.* = HeldPath.of(dir, claim_name) orelse return error.PathTooLong;
+            var tmp_buf: [linux.PATH_MAX]u8 = undefined;
+            const tmp = std.fmt.bufPrintSentinel(&tmp_buf, "{s}.{d}.tmp", .{ out.slice(), linux.getpid() }, 0) catch return error.PathTooLong;
+            const rc = linux.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
+            if (linux.errno(rc) != .SUCCESS) return error.CreateFailed;
+            const fd: linux.fd_t = @intCast(rc);
+            var keep = false;
+            defer if (!keep) {
+                _ = linux.unlink(tmp);
             };
-            return .{ .memfd = memfd, .claim = own_claim, .mapped = mapped, .verdict = verdict, .found = found };
+            defer _ = linux.close(fd);
+            if (linux.errno(linux.ftruncate(fd, @intCast(len))) != .SUCCESS) return error.WriteFailed;
+            var copied: u64 = 0;
+            var off: u64 = 0;
+            while (off < len) {
+                const data = seekData(memfd, off) orelse break;
+                const end = @min(seekHole(memfd, data) orelse len, len);
+                var at: u64 = data;
+                while (at < end) {
+                    const n = linux.pwrite(fd, src + @as(usize, @intCast(at)), @intCast(end - at), @intCast(at));
+                    switch (linux.errno(n)) {
+                        .SUCCESS => if (n == 0) return error.WriteFailed else {
+                            at += n;
+                        },
+                        .INTR => {},
+                        else => return error.WriteFailed,
+                    }
+                }
+                copied += end - data;
+                off = end;
+            }
+            if (linux.errno(linux.fsync(fd)) != .SUCCESS) return error.WriteFailed;
+            if (linux.errno(linux.renameat2(linux.AT.FDCWD, tmp, linux.AT.FDCWD, out.slice(), .{})) != .SUCCESS) return error.WriteFailed;
+            keep = true;
+            return copied;
+        }
+
+        /// The member scope's claim name read back off a bound claim socket
+        /// (the supervisor holds the fd, not the marker).
+        pub fn claimNameOf(claim: linux.fd_t, buf: *[64]u8) ?[]const u8 {
+            var addr: linux.sockaddr.un = undefined;
+            var len: linux.socklen_t = @sizeOf(linux.sockaddr.un);
+            if (linux.errno(linux.getsockname(claim, @ptrCast(&addr), &len)) != .SUCCESS) return null;
+            const off = @sizeOf(linux.sa_family_t);
+            if (len <= off + 1 or addr.path[0] != 0) return null;
+            const name = addr.path[1 .. len - off];
+            if (!std.mem.startsWith(u8, name, CLAIM_PREFIX) or name.len > buf.len) return null;
+            @memcpy(buf[0..name.len], name);
+            return buf[0..name.len];
         }
 
         /// Whether another holds this member's claim (a supervisor of a
@@ -4057,7 +4298,7 @@ test "linux: the write cache (charter §6.1 'Staged', 2026-10-21) — the ring i
     const next: Marker = .{ .set_uuid = uuid, .set_epoch = 1, .node_token = 0xA0, .mount_slot = 7, .appender_id = 0, .owner_pid = 2222 };
     const live0 = stats.staging_owner_live_refusals.load();
     var refusal: Ring.BindRefusal = .{};
-    var a = try Ring.Ram.bind(owner, cap, &refusal);
+    var a = try Ring.Ram.bind(owner, cap, "", &refusal);
     try testing.expectEqual(BindVerdict.absent, a.verdict);
     try testing.expectEqual(cap, a.capacity());
     try testing.expectEqual(@as(?Marker, owner), Marker.decode(a.mapped.map[0..MARKER_LEN]) catch null);
@@ -4074,7 +4315,7 @@ test "linux: the write cache (charter §6.1 'Staged', 2026-10-21) — the ring i
         try testing.expectEqual(@as(usize, 3), seg.live());
     }
     // A second mount of this member while the first lives: refused.
-    try testing.expectError(error.OwnerLive, Ring.Ram.bind(next, cap, &refusal));
+    try testing.expectError(error.OwnerLive, Ring.Ram.bind(next, cap, "", &refusal));
     try testing.expectEqual(live0 + 1, stats.staging_owner_live_refusals.load());
     // A second MEMBER (another fabric identity on this host, the same set
     // and slot — the one that preempts a stopped holder past T_owner):
@@ -4082,7 +4323,7 @@ test "linux: the write cache (charter §6.1 'Staged', 2026-10-21) — the ring i
     {
         var second = next;
         second.member = memberIdentity("nqn.2014-08.org.nvmexpress:uuid:b0b0", "b0b0");
-        var ring_b = try Ring.Ram.bind(second, cap, &refusal);
+        var ring_b = try Ring.Ram.bind(second, cap, "", &refusal);
         defer ring_b.release();
         try testing.expectEqual(BindVerdict.absent, ring_b.verdict);
         try testing.expect(ring_b.memfd != a.memfd);
@@ -4108,7 +4349,7 @@ test "linux: the write cache (charter §6.1 'Staged', 2026-10-21) — the ring i
         }
     };
     const t = try std.Thread.spawn(.{}, Supervisor.run, .{ sup_claim, sup_memfd });
-    var b = try Ring.Ram.bind(next, cap / 2, &refusal);
+    var b = try Ring.Ram.bind(next, cap / 2, "", &refusal);
     t.join();
     var b_open = true;
     defer if (b_open) b.release();
@@ -4136,10 +4377,147 @@ test "linux: the write cache (charter §6.1 'Staged', 2026-10-21) — the ring i
     // A clean release frees the claim: the next bind of the member is fresh.
     b.release();
     b_open = false;
-    var c = try Ring.Ram.bind(next, cap, &refusal);
+    var c = try Ring.Ram.bind(next, cap, "", &refusal);
     defer c.release();
     try testing.expectEqual(BindVerdict.absent, c.verdict);
     try testing.expect(!Ring.Ram.holdsData(c.memfd));
+}
+
+/// A dead daemon's supervisor in a thread (the held-copy test): hand the
+/// memfd to the one successor that connects, or close that connection
+/// without a frame (the supervisor that moved the ring to its held copy
+/// meanwhile); then the claim and the memfd go.
+const TestHolder = struct {
+    fn handOver(claim: linux.fd_t, memfd: linux.fd_t) void {
+        const rl = @import("../ipc/rendezvous_linux.zig");
+        _ = linux.listen(claim, 1);
+        const rc = linux.accept4(claim, null, null, linux.SOCK.CLOEXEC);
+        if (linux.errno(rc) == .SUCCESS) {
+            const conn: linux.fd_t = @intCast(rc);
+            rl.sendCtl(conn, &.{ 3, 0, 0 }, memfd) catch {};
+            _ = linux.close(conn);
+        }
+        _ = linux.close(claim);
+        _ = linux.close(memfd);
+    }
+
+    fn closeWithoutFrame(claim: linux.fd_t, memfd: linux.fd_t) void {
+        _ = linux.listen(claim, 1);
+        const rc = linux.accept4(claim, null, null, linux.SOCK.CLOEXEC);
+        if (linux.errno(rc) == .SUCCESS) _ = linux.close(@intCast(rc));
+        _ = linux.close(claim);
+        _ = linux.close(memfd);
+    }
+};
+
+test "linux: the write cache's held copy (decision 0003 §CV) — a dead member's ring its supervisor moved out of RAM: the claim name read back off the bound claim; the copy is the memfd's data runs at their own offsets, sparse; a cache-less probe sees it; the member's next bind, the claim free, ADOPTS it — every resident recovered whole, the copy kept until the ring is the supervisor's, then removed; a copy left beside a ring the claim hands over is superseded and removed at the same instant; a holder that closes the connection without a frame is gone — the bind takes the free claim and the copy" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "staging: Linux only");
+    const gpa = testing.allocator;
+    var uuid: [16]u8 = @splat(0x5E);
+    std.mem.writeInt(u32, uuid[0..4], @intCast(linux.getpid()), .little);
+    std.mem.writeInt(u64, uuid[4..12], @bitCast(clock.monotonicNs()), .little);
+    const cap: u64 = 64 * 4096;
+    const owner: Marker = .{ .set_uuid = uuid, .set_epoch = 1, .node_token = 0xB0, .mount_slot = 3, .appender_id = 0, .owner_pid = 1111 };
+    const next: Marker = .{ .set_uuid = uuid, .set_epoch = 1, .node_token = 0xB0, .mount_slot = 3, .appender_id = 0, .owner_pid = 2222 };
+    _ = linux.mkdirat(linux.AT.FDCWD, "/build/tmp", 0o755);
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/build/tmp/sqz-wcache-held-{d}-{x}", .{ linux.getpid(), uuid[4] });
+    defer std.Io.Dir.cwd().deleteTree(testing.io, root) catch {};
+    var dir_buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "{s}/a/b", .{root});
+    var refusal: Ring.BindRefusal = .{};
+    var a = try Ring.Ram.bind(owner, cap, dir, &refusal);
+    try testing.expectEqual(BindVerdict.absent, a.verdict);
+    try testing.expect(!a.from_held_copy and a.heldCopy() == null);
+    {
+        var seg = try Segment.init(gpa, a.image(), a.backing());
+        defer seg.deinit();
+        var p = Pool.init(gpa, .none);
+        defer p.deinit();
+        for (1..4) |i| _ = try stageWrite(&p, &seg, null, tkey(@intCast(i), i), "a resident", 0, .none);
+        _ = try stageWrite(&p, &seg, null, tkey(2, 2), "re-staged", 0, .none);
+    }
+    // The death; no successor within the grace: the supervisor moves the
+    // ring to its held copy and lets the memfd and the claim go.
+    var sup_memfd: linux.fd_t = @intCast(linux.dup(a.memfd));
+    var sup_claim: linux.fd_t = @intCast(linux.dup(a.claim));
+    a.release();
+    var nb: [64]u8 = undefined;
+    var nb2: [64]u8 = undefined;
+    const name = Ring.Ram.claimNameOf(sup_claim, &nb).?;
+    try testing.expectEqualStrings(Ring.Ram.claimName(&nb2, owner.identity(), owner.mount_slot, owner.member), name);
+    var hp: Ring.Ram.HeldPath = .{};
+    const copied = try Ring.Ram.persistHeldCopy(sup_memfd, dir, name, &hp);
+    try testing.expectEqualStrings((Ring.Ram.HeldPath.ofMarker(dir, next) orelse unreachable).slice(), hp.slice());
+    {
+        var st: linux.Statx = undefined;
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, hp.slice(), 0, .{ .SIZE = true, .BLOCKS = true }, &st)));
+        try testing.expectEqual(Ring.Ram.HEADER + cap, st.size);
+        // Sparse: the marker's grain and the records' runs, never the
+        // empty image.
+        try testing.expect(copied >= Ring.Ram.HEADER and copied < st.size / 2);
+        try testing.expect(st.blocks * 512 < st.size / 2);
+    }
+    try testing.expect(Ring.Ram.heldCopyExists(next, dir));
+    _ = linux.close(sup_memfd);
+    _ = linux.close(sup_claim);
+    // The member's next bind: the claim free — the copy adopted.
+    var b = try Ring.Ram.bind(next, cap / 2, dir, &refusal);
+    var b_open = true;
+    defer if (b_open) b.release();
+    try testing.expect(b.from_held_copy);
+    try testing.expectEqual(BindVerdict.match, b.verdict);
+    try testing.expectEqual(owner, b.found.?);
+    try testing.expectEqual(cap, b.capacity());
+    {
+        var seg = try Segment.init(gpa, b.image(), b.backing());
+        defer seg.deinit();
+        const rep = seg.recover();
+        try testing.expectEqual(@as(u64, 3), rep.adopted);
+        try testing.expectEqual(@as(u64, 0), rep.torn);
+        const l = seg.get(tkey(2, 2)).?;
+        try testing.expectEqualStrings("re-staged", l.bytes());
+        l.release();
+    }
+    // Until the ring is the supervisor's the copy stays (a crash here finds
+    // it again); then it goes.
+    try testing.expect(Ring.Ram.heldCopyExists(next, dir));
+    try testing.expect(b.dropHeldCopy());
+    try testing.expect(!Ring.Ram.heldCopyExists(next, dir));
+    try testing.expect(!b.dropHeldCopy());
+    // Superseded: b dies, its supervisor holds the ring, and a copy is left
+    // beside it; the next bind takes the ring over the claim and the copy
+    // goes at the same instant.
+    sup_memfd = @intCast(linux.dup(b.memfd));
+    sup_claim = @intCast(linux.dup(b.claim));
+    b.release();
+    b_open = false;
+    _ = try Ring.Ram.persistHeldCopy(sup_memfd, dir, name, &hp);
+    const t = try std.Thread.spawn(.{}, TestHolder.handOver, .{ sup_claim, sup_memfd });
+    var c = try Ring.Ram.bind(next, cap, dir, &refusal);
+    t.join();
+    var c_open = true;
+    defer if (c_open) c.release();
+    try testing.expect(!c.from_held_copy);
+    try testing.expectEqual(BindVerdict.match, c.verdict);
+    try testing.expectEqualStrings(hp.slice(), c.heldCopy().?);
+    try testing.expect(c.dropHeldCopy());
+    try testing.expect(!Ring.Ram.heldCopyExists(next, dir));
+    // Gone: c dies; its supervisor writes the copy, then closes the one
+    // connection without a frame and lets the claim go — the bind retries,
+    // takes the free claim and adopts the copy.
+    sup_memfd = @intCast(linux.dup(c.memfd));
+    sup_claim = @intCast(linux.dup(c.claim));
+    c.release();
+    c_open = false;
+    _ = try Ring.Ram.persistHeldCopy(sup_memfd, dir, name, &hp);
+    const t2 = try std.Thread.spawn(.{}, TestHolder.closeWithoutFrame, .{ sup_claim, sup_memfd });
+    var d = try Ring.Ram.bind(next, cap, dir, &refusal);
+    t2.join();
+    defer d.release();
+    try testing.expect(d.from_held_copy);
+    try testing.expectEqual(BindVerdict.match, d.verdict);
+    try testing.expect(d.dropHeldCopy());
 }
 
 test "tie: the write cache's sizing — the table one item per smallest record (2 grains) a shard, at least 16; the index grows on demand to exactly the table at the sealed ring's bound (27 GiB over 32 shards: 110,592 a shard)" {

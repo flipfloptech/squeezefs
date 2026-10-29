@@ -550,31 +550,54 @@ pub fn hasSupervisor() bool {
 /// the supervisor (its SIGKILL included) and dies with the host, whose
 /// power cut is §5.2's window. Root's `/run/squeezefs/journal-tails`,
 /// another uid's `/run/user/<uid>/squeezefs/journal-tails`;
-/// `SQUEEZEFS_TEST_JOURNAL_TAIL_DIR` moves it into a rig's work dir.
+/// `SQUEEZEFS_TEST_JOURNAL_TAIL_DIR` moves it into a rig's work dir. A dead
+/// mount's write cache no successor took is held beside it, in
+/// `…/squeezefs/write-cache` (decision 0003 §CV; the seam's directory holds
+/// both kinds, told apart by their suffixes).
 pub const HeldDir = struct {
     buf: [PATH_CAP]u8 = undefined,
     len: usize = 0,
+
+    pub const Kind = enum {
+        journal_tails,
+        write_cache,
+
+        fn leaf(self: Kind) []const u8 {
+            return switch (self) {
+                .journal_tails => "journal-tails",
+                .write_cache => "write-cache",
+            };
+        }
+    };
 
     pub fn slice(self: *const HeldDir) []const u8 {
         return self.buf[0..self.len];
     }
 
     pub fn fromEnv(env: *const std.process.Environ.Map) HeldDir {
+        return fromEnvOf(env, .journal_tails);
+    }
+
+    pub fn fromEnvOf(env: *const std.process.Environ.Map, kind: Kind) HeldDir {
         var d: HeldDir = .{};
         if (knobs.parseStr(env.get("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR"))) |raw| if (!std.mem.eql(u8, raw, "off")) {
-            d.len = (std.fmt.bufPrint(&d.buf, "{s}", .{raw}) catch return runtime()).len;
+            d.len = (std.fmt.bufPrint(&d.buf, "{s}", .{raw}) catch return runtimeOf(kind)).len;
             return d;
         };
-        return runtime();
+        return runtimeOf(kind);
     }
 
     pub fn runtime() HeldDir {
+        return runtimeOf(.journal_tails);
+    }
+
+    pub fn runtimeOf(kind: Kind) HeldDir {
         var d: HeldDir = .{};
         const uid: u32 = if (builtin.os.tag == .linux) std.os.linux.geteuid() else 0;
         const text = if (uid == 0)
-            std.fmt.bufPrint(&d.buf, "/run/squeezefs/journal-tails", .{})
+            std.fmt.bufPrint(&d.buf, "/run/squeezefs/{s}", .{kind.leaf()})
         else
-            std.fmt.bufPrint(&d.buf, "/run/user/{d}/squeezefs/journal-tails", .{uid});
+            std.fmt.bufPrint(&d.buf, "/run/user/{d}/squeezefs/{s}", .{ uid, kind.leaf() });
         d.len = (text catch unreachable).len;
         return d;
     }
@@ -984,8 +1007,9 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         }
     }
 
-    /// `mkdir -p` with mode 0700 (the copies are a volume's metadata).
-    fn makeDirs(dir: []const u8) PersistError!void {
+    /// `mkdir -p` with mode 0700 (the copies are a volume's metadata, or a
+    /// member's acked unsynced bytes: the write cache's held copy).
+    pub fn makeDirs(dir: []const u8) error{DirFailed}!void {
         var buf: [PATH_CAP + 1]u8 = undefined;
         if (dir.len == 0 or dir.len > PATH_CAP) return error.DirFailed;
         @memcpy(buf[0..dir.len], dir);
@@ -1928,17 +1952,23 @@ test "linux: a JOINED ring's death replay is JUDGED too (decision 0003 BS.16) �
     tail.release(d_slot);
 }
 
-test "the held dir: the seam names it; root's is /run/squeezefs/journal-tails; another uid's under /run/user/<uid>; the copy's name is the volume uuid in hex" {
+test "the held dir: the seam names it for both kinds; root's is /run/squeezefs/journal-tails, a write cache's /run/squeezefs/write-cache; another uid's under /run/user/<uid>; the copy's name is the volume uuid in hex" {
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
     try env.put("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", "/build/tmp/x/tails");
     try testing.expectEqualStrings("/build/tmp/x/tails", HeldDir.fromEnv(&env).slice());
+    try testing.expectEqualStrings("/build/tmp/x/tails", HeldDir.fromEnvOf(&env, .write_cache).slice());
     try env.put("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", "off");
     const d = HeldDir.fromEnv(&env);
+    const w = HeldDir.fromEnvOf(&env, .write_cache);
     const uid: u32 = if (builtin.os.tag == .linux) std.os.linux.geteuid() else 0;
-    if (uid == 0) try testing.expectEqualStrings("/run/squeezefs/journal-tails", d.slice()) else {
+    if (uid == 0) {
+        try testing.expectEqualStrings("/run/squeezefs/journal-tails", d.slice());
+        try testing.expectEqualStrings("/run/squeezefs/write-cache", w.slice());
+    } else {
         var b: [64]u8 = undefined;
         try testing.expectEqualStrings(try std.fmt.bufPrint(&b, "/run/user/{d}/squeezefs/journal-tails", .{uid}), d.slice());
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&b, "/run/user/{d}/squeezefs/write-cache", .{uid}), w.slice());
     }
     var hb: [PATH_CAP]u8 = undefined;
     const uuid: [16]u8 = .{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };

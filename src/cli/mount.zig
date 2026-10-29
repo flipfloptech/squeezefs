@@ -1224,6 +1224,7 @@ fn announceWriteCache(plane: *plane_mod.DataPlane) void {
         return;
     };
     log.info("write cache: the memfd and its claim handed to the supervisor (a crash of this process keeps every resident for this member's next mount)", .{});
+    plane.writeCacheHandedOver();
 }
 
 fn announceWriteCacheDrained() void {

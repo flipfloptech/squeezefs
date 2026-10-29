@@ -32,7 +32,7 @@
 //!   `/dev/fuse` inside the session's `mount(2)`; anyone else receives it
 //!   from `fusermount3` (`fusermount.zig`) → `Session.mount` (INIT,
 //!   geometry, `enable_uring`, workers, the arm barrier) → the plane's zc
-//!   legs armed from the session's buffer mode → the interception host →
+//!   legs armed from the session's zero-copy verdict → the interception host →
 //!   THE BUDGET SAMPLER, last: it reads every registered source without a
 //!   lock, so it starts once the last registrant exists and is stopped and
 //!   JOINED first on every exit (its `defer` sits below every

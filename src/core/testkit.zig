@@ -37,7 +37,7 @@ pub const Class = enum {
     no_root,
     /// A capability is missing from the effective set (CAP_SYS_ADMIN for mount(2), CAP_IPC_LOCK for fixed buffers).
     no_cap,
-    /// A device node is missing (/dev/fuse, /dev/loop-control, /dev/ng*, /dev/nvme-fabrics, a kmbuf-capable ring).
+    /// A device node is missing (/dev/fuse, /dev/loop-control, /dev/ng*, /dev/nvme-fabrics).
     no_device,
     /// A NIC fact is missing (a multi-queue NIC, a route, a channels control).
     no_nic,

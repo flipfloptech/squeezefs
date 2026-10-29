@@ -24,4 +24,4 @@ esac
 $B format --force ${F[@]+"${F[@]}"} "$META" "sqdata://$T/ost0,$T/ost1" > $SET/format-$P.log 2>&1 || { tail -5 $SET/format-$P.log; exit 1; }
 : > $LOG
 $B mount --daemon --supervise --log-file $LOG -o default_permissions,allow_other,fsname=squeezefs-dev "$META" $MNT
-grep -E "buffer mode" $LOG | sed 's/.*drain group(s) (width 1), //'
+grep -E "bufpool present" $LOG | sed 's/.*payload [0-9]* B, //'

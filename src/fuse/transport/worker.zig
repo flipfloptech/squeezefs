@@ -1386,11 +1386,6 @@ pub const Group = struct {
         return true;
     }
 
-    /// This ring's fixed-buffer index of the ent's zero-copy slot.
-    fn zcSlot(_: *const Group, ent_idx: u16) u16 {
-        return zcSlotOf(ent_idx);
-    }
-
     /// The gent's bounce window in the session slab (zc only).
     fn bounce(self: *Group, gent: u32) []u8 {
         const s = self.shared.slab orelse return &.{};
@@ -2073,7 +2068,7 @@ pub const Group = struct {
             self.onRegisterRefused(member_slot, ent_idx, .AGAIN, now);
             return;
         };
-        prepRegister(sqe, m.qid, &self.iovs[gent], if (self.shared.zeroCopy()) self.zcSlot(ent_idx) else 0, gent);
+        prepRegister(sqe, m.qid, &self.iovs[gent], if (self.shared.zeroCopy()) zcSlotOf(ent_idx) else 0, gent);
         m.slots.onRegisterSubmitted(ent_idx);
         registers.inc();
         self.noteInitialPush(m);
@@ -2206,7 +2201,7 @@ pub const Group = struct {
         }
         // The slot's index in THIS ring's table (the pool shifts it by one);
         // a pooled hold's store reads the POOL buffer by its user address.
-        const e = self.zcSlot(self.entIdxOf(gent));
+        const e = zcSlotOf(self.entIdxOf(gent));
         const pool_src: ?[*]u8 = if (!fetch and pend.kind == .direct_store and self.held_pool[gent]) self.poolWindow(gent).ptr else null;
         var done: u32 = 0;
         var i: u32 = 0;

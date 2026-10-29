@@ -1,8 +1,8 @@
 //! The ONE retry ladder of the write path (`docs/porting/data_write_path.md`
 //! §13 Q13/Q14): a bounded-exponential backoff value type — `base << min(
 //! attempt, shift_cap)` clamped at `cap`, barking at power-of-two attempts
-//! — used by the overlay settle, the ACK-early continuation and the
-//! writeback requeue, each instance naming its reason. The reference carried
+//! — used by the overlay settle and the writeback requeue, each instance
+//! naming its reason. The reference carried
 //! three shapes for one condition (`SETTLE_RETRIES = 24` borrowed from the
 //! rebind ladder, `min(1 ms << a, 50 ms)`, `WRITEBACK_MAX_ATTEMPTS = 4` with
 //! a wrapping counter as control flow); here a ladder either retries forever

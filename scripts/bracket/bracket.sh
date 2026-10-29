@@ -149,7 +149,7 @@ ROW_NEEDS_SHIM=${ROW_NEEDS_SHIM:-0}
 # (`ROW_FORMAT_OPTS`); an explicit --format-opts still wins.
 [ -n "$FORMAT_OPTS" ] || FORMAT_OPTS=${ROW_FORMAT_OPTS:-}
 # The budget must clear the daemon's UNRECLAIMABLE floor (≈ 2.7 GiB on this
-# geometry: 9 queues × 32 MiB kmbuf rings + payload arenas + per-lane read
+# geometry: 9 queues × 32 MiB buffer pools + header arenas + per-lane read
 # slabs + fiber stacks) or the mount runs Red from its first tick and sheds —
 # a leg that ran under pressure is INVALID (`mem_budget_green`).
 if [ -z "$BUDGET_MB" ]; then BUDGET_MB=6144; fi

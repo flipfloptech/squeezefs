@@ -22,9 +22,8 @@
 //! SAME body the 64 B `ParkedRing` runs (decision 0002 row 12: never
 //! copied).
 //!
-//! What it is not: FUSE. The REGISTER / COMMIT_AND_FETCH / RELEASE codec,
-//! the kmbuf opcode ladder (37/38 on 6.19-sqz vs 38/39 on 7.1/7.2-sqz,
-//! fuse_kmbuf_zc §2.1) and the slot table belong to the transport; this
+//! What it is not: FUSE. The ADD_QUEUE / ADD_BUFPOOL / REGISTER /
+//! COMMIT_AND_FETCH codec and the slot table belong to the transport; this
 //! module only guarantees the bytes land where the kernel reads them.
 
 const std = @import("std");
@@ -77,7 +76,8 @@ pub const Sqe128 = extern struct {
     /// `uring_cmd_flags`.
     rw_flags: u32,
     user_data: u64,
-    /// The fixed-buffer slot (the kmbuf `fixed_buf_id` on a FUSE REGISTER).
+    /// The fixed-buffer slot (the pool index on a FUSE ADD_BUFPOOL, a zc slot
+    /// on a bridge).
     buf_index: u16,
     personality: u16,
     /// `splice_fd_in` / `file_index`.
@@ -107,7 +107,7 @@ pub const Cqe32 = extern struct {
     user_data: u64,
     /// `-errno` when negative.
     res: i32,
-    /// `IORING_CQE_F_*`; the kmbuf buffer id rides the high 16 bits under
+    /// `IORING_CQE_F_*`; a provided buffer's id rides the high 16 bits under
     /// `IORING_CQE_F_BUFFER`.
     flags: u32,
     /// The two extra words of a 32 B CQE: a `URING_CMD`'s second result
@@ -409,9 +409,8 @@ pub const Ring128 = struct {
 
     // ---- registration -----------------------------------------------------
 
-    /// `io_uring_register` with the opcode as a number, so a PROBE-resolved
-    /// opcode (the kmbuf pair, charter §12) composes without a binding
-    /// change. Every typed registration below is this call.
+    /// `io_uring_register` with the opcode as a number. Every typed
+    /// registration below is this call.
     pub fn registerRaw(self: *Ring128, opcode: u32, arg: ?*const anyopaque, nr_args: u32) errors.Error!void {
         const rc = linux.io_uring_register(self.fd, @fromBackingInt(opcode), arg, nr_args);
         if (linux.errno(rc) != .SUCCESS) return errors.fromErrno(linux.errno(rc));
@@ -434,9 +433,9 @@ pub const Ring128 = struct {
     }
 
     /// A fixed-buffer table of `n` EMPTY slots (`IORING_RSRC_REGISTER_SPARSE`,
-    /// 5.19+): the zc shape — one slot per ring entry the kernel fills with a
-    /// request's pages at delivery (fuse_kmbuf_zc §4.1), the headers buffer
-    /// at index `depth` through `registerBuffersUpdate`.
+    /// 5.19+): the transport's table — the buffer pool at slot 0 through
+    /// `registerBuffersUpdate`, then one zc slot per ring entry the kernel
+    /// fills with a request's pages at delivery (fuse_mainline_pools.md §3).
     pub fn registerBuffersSparse(self: *Ring128, n: u32) errors.Error!void {
         const reg: linux.io_uring_rsrc_register = .{ .nr = n, .flags = linux.IORING_RSRC_REGISTER_SPARSE, .resv2 = 0, .data = 0, .tags = 0 };
         try self.registerRaw(@backingInt(linux.IORING_REGISTER.REGISTER_BUFFERS2), &reg, @sizeOf(linux.io_uring_rsrc_register));
@@ -553,7 +552,7 @@ pub fn prepWrite(sqe: *Sqe128, file: File, buf: []const u8, off: u64) void {
 /// `READ_FIXED` of `len` bytes at file offset `off` into registered slot
 /// `buf_index` at `addr`: a user address inside the registered iovec, or —
 /// for a kernel-registered zc slot (`imu->ubuf == 0`) — the BYTE OFFSET into
-/// the slot (the ublk convention; fuse_kmbuf_zc §4.1).
+/// the slot (the ublk convention; fuse_mainline_pools.md §4).
 pub fn prepReadFixed(sqe: *Sqe128, file: File, buf_index: u16, off: u64, len: u32, addr: u64) void {
     prepRw(sqe, .READ_FIXED, file, addr, len, off);
     sqe.buf_index = buf_index;

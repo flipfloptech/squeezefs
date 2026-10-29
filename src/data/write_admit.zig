@@ -2329,6 +2329,8 @@ test "the fallocate'd lay-down through the device overlay (the perf matrix's fio
     const r0 = seam.reserved(90, 0).?;
     const r1 = seam.reserved(90, 1).?;
     const r2 = seam.reserved(90, 2).?;
+    const landings0 = device_overlay.stats.overlay_reserved_landings.load();
+    const declines0 = device_overlay.stats.overlay_reserved_landing_declines.load();
     // A recycled block's previous owner left its bytes in every reservation.
     const stale: [wt.BS]u8 = @splat(0xEE);
     for ([_]Binding{ r0, r1, r2 }) |r| _ = try w.f.dev.seam().write(r.vol_tag, r.offset, &stale);
@@ -2366,6 +2368,7 @@ test "the fallocate'd lay-down through the device overlay (the perf matrix's fio
     try testing.expectEqual(added0, w.f.map.refs_added);
     try testing.expectEqual(@as(u64, 0), w.f.map.refs_released);
     try testing.expectEqual(@as(usize, 0), w.f.frees.freed.items.len);
+    try testing.expectEqual(landings0 + 2, device_overlay.stats.overlay_reserved_landings.load());
     // Block 2's reservation is shared by a clone: the record mints fresh,
     // and the save displaces the reservation (the clone's share stands).
     const on_a = r2.vol_tag == wt.VOL_A;
@@ -2383,6 +2386,7 @@ test "the fallocate'd lay-down through the device overlay (the perf matrix's fio
     try testing.expectEqualSlices(u8, &whole, &got);
     try testing.expectEqual(@as(usize, 1), w.f.frees.freed.items.len);
     try testing.expect(w.f.frees.freed.items[0].sameRef(r2, wt.BS));
+    try testing.expectEqual(declines0 + 1, device_overlay.stats.overlay_reserved_landing_declines.load());
     try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
 }
 
@@ -3620,11 +3624,16 @@ test "a save landing between a piece's map read and the overlay's epoch screen (
     const drift0 = counters.tripwireCount("rewrite_shadow_displaced_drift");
     const untracked0 = counters.tripwireCount("block_untracked_free_refusals");
     // fio's lay-down: the file fallocate'd whole (block 0 RESERVED), then
-    // written in O_DIRECT pieces; two halves here.
+    // written in O_DIRECT pieces; two halves here. The reservation is
+    // shared by a clone, so the overlay mints fresh and the save displaces
+    // it — the path every reservation took before §CR, and the one a
+    // shared reservation still takes.
     try w.f.map.create(80, .striped, wt.BS);
     _ = try w.wp.reserveRange(io, 80, 0, 0, false);
     const r = w.f.map.bindingAt(80, 0).?;
     try testing.expect(r.unwritten);
+    const r_alloc = w.f.vols.byTag(r.vol_tag).?.alloc;
+    try testing.expect(r_alloc.incrementRefcount(r_alloc.idxOf(r.offset)));
     var first: [wt.BS / 2]u8 align(4096) = undefined;
     fill(&first, 0x11);
     var second: [wt.BS / 2]u8 align(4096) = undefined;
@@ -3654,7 +3663,8 @@ test "a save landing between a piece's map read and the overlay's epoch screen (
     try testing.expectEqual(untracked0, counters.tripwireCount("block_untracked_free_refusals"));
     try SaveLands.freedOnce(w.f.frees.freed.items, r);
     for (w.f.frees.freed.items) |f| try testing.expect(!f.sameRef(final, wt.BS));
-    try testing.expectEqual(@as(u64, 1), w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks());
+    // The final block and the clone's share of the reservation.
+    try testing.expectEqual(@as(u64, 2), w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks());
 }
 
 test "a save landing between an upload's reservation read and its epoch probe: the landing never takes over the reservation the save freed (another owner minted it since) and no record parks it — the other owner's block keeps its bytes and its one reference, drift 0, every key freed once" {

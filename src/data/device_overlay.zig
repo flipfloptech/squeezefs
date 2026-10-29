@@ -10,7 +10,9 @@
 //! ONE transaction flips map + refs, or FEEDS the rewrite epoch for an
 //! overwrite; the displaced binding is freed only after the durable
 //! publish. Always a fresh destination, never in place: a crash mid-DMA
-//! into a mapped offset would tear durable bytes. Volatile: no
+//! into a mapped offset would tear durable bytes — save the file's own
+//! fallocate RESERVATION, whose bytes are nobody's: a Hole record over it
+//! lands in it and flips it (`reservationVerdict`). Volatile: no
 //! on-disk form, no incompat bit, no journal record.
 //!
 //! Measured (`design-overlay-overwrite.md:1216`): 4 MiB aligned overwrite
@@ -154,6 +156,10 @@ pub const stats = struct {
     pub var overlay_ineligible_ram_custody: counters.ShardedCounter = .{};
     pub var overlay_sub_cap_joins: counters.ShardedCounter = .{};
     pub var overlay_enospc_declines: counters.ShardedCounter = .{};
+    /// Records installed IN the file's reservation (no mint), and the
+    /// reservations another owner shared (the fresh-mint path took them).
+    pub var overlay_reserved_landings: counters.ShardedCounter = .{};
+    pub var overlay_reserved_landing_declines: counters.ShardedCounter = .{};
     /// A fresh install found every record taken (`registryCapacity`): the
     /// piece took the next arm, nothing minted.
     pub var overlay_registry_declines: counters.ShardedCounter = .{};
@@ -203,14 +209,15 @@ pub const stats = struct {
     pub var overlay_store_superseded_under_guard: counters.Tripwire = .init("overlay_store_superseded_under_guard");
     pub var overlay_state_word_corrupt: counters.Tripwire = .init("overlay_state_word_corrupt");
     pub var overlay_registry_full: counters.Tripwire = .init("overlay_registry_full");
+    pub var overlay_reserved_landing_lost: counters.Tripwire = .init("overlay_reserved_landing_lost");
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"overlay_open\":{d},\"overlay_inflight_bytes\":{d},", .{ stats.overlay_open.load(), stats.overlay_inflight_bytes.load() });
-    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_registry_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_epoch_feeds_fresh", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "overlay_teardown_quiesce_waits", "writeback_orphan_discards_overlay", "overlay_fence_drops_failed_volume" }) |name| {
+    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_reserved_landings", "overlay_reserved_landing_declines", "overlay_registry_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_epoch_feeds_fresh", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "overlay_teardown_quiesce_waits", "writeback_orphan_discards_overlay", "overlay_fence_drops_failed_volume" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "overlay_fence_drops", "overlay_unpublished_at_fsync", "overlay_teardown_wait_overlong", "overlay_teardown_nonterminal", "overlay_install_race_under_guard", "overlay_store_superseded_under_guard", "overlay_state_word_corrupt", "overlay_registry_full" }, 0..) |name, i| {
+    inline for (.{ "overlay_fence_drops", "overlay_unpublished_at_fsync", "overlay_teardown_wait_overlong", "overlay_teardown_nonterminal", "overlay_install_race_under_guard", "overlay_store_superseded_under_guard", "overlay_state_word_corrupt", "overlay_registry_full", "overlay_reserved_landing_lost" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, counters.tripwireCount(name) });
     }
@@ -490,8 +497,14 @@ pub const Record = struct {
     core: Core,
     /// `null` ⇔ fresh/hole (gaps are zeros — law 5); IMMUTABLE.
     old_binding: ?Binding,
-    /// The unpublished destination.
+    /// The unpublished destination (the written twin of the reservation
+    /// when `reserved`).
     dest: Binding,
+    /// The destination IS the file's reservation (`reservationVerdict`):
+    /// no mint, no fsck guard (the layout references it), the settle flips
+    /// it durably — never the epoch, whose orphan discard would free a
+    /// block the layout names.
+    reserved: bool = false,
     dest_idx: u64,
     alloc: *block_alloc.BlockAllocator,
     ordinal: u32,
@@ -1122,7 +1135,9 @@ pub const Overlay = struct {
     /// guard + mint owner, the slot vehicle needs the direct leg, the
     /// OVERWRITE capture in ONE (3.5) section with the install (§5.1). The
     /// record is reserved BEFORE the mint: a full registry declines with
-    /// nothing minted (`overlay_registry_declines`).
+    /// nothing minted (`overlay_registry_declines`). A Hole over the file's
+    /// own RESERVATION mints nothing: the record lands in it
+    /// (`reservationVerdict`).
     fn installRecord(self: *Overlay, io: Io, req: StoreRequest, overwrite: bool) StoreError!?*Record {
         if (!self.registry.reserve()) {
             stats.overlay_registry_declines.inc();
@@ -1130,6 +1145,32 @@ pub const Overlay = struct {
         }
         var promised = true;
         defer if (promised) self.registry.unreserve();
+        // Read after `claim`'s epoch probe, under the block guard: exact
+        // (`write_epoch.Base`).
+        if (!overwrite) if (self.deps.map.reserved(req.ino, req.block)) |res| switch (self.reservationVerdict(req, res)) {
+            .take => |t| {
+                var fill: Record = .{
+                    .key = .{ .ino = req.ino, .block = req.block },
+                    .core = Core.init(@intCast(self.cfg.block_size), self.registry.births.fetchAdd(1, .monotonic) + 1),
+                    .old_binding = null,
+                    .dest = res.withUnwritten(false),
+                    .dest_idx = t.idx,
+                    .alloc = t.alloc,
+                    .ordinal = t.ordinal,
+                    .fsck_guard = null,
+                    .mint = null,
+                    .fence_token = self.deps.map.currentFencing(req.ino),
+                    .reserved = true,
+                };
+                promised = false;
+                const r = self.registry.install(fill.key, &fill) catch |e| return self.installFailed(e, &fill, null);
+                stats.overlay_installs.inc();
+                stats.overlay_reserved_landings.inc();
+                return r;
+            },
+            .mint => {},
+            .decline => return null,
+        };
         const pm = enospc.allocatePlacedMint(self.deps.picker, .{ .ino = req.ino, .block = req.block }, io, self.deps.valve, self.deps.pressure_hook, true, .none) catch |e| switch (e) {
             error.StorageFull => {
                 stats.overlay_enospc_declines.inc();
@@ -1197,14 +1238,71 @@ pub const Overlay = struct {
         return r;
     }
 
-    fn installFailed(_: *Overlay, e: error{ Exists, Full }, fill: *Record, mint: *block_alloc.MintedBlockGuard) ?*Record {
+    fn installFailed(_: *Overlay, e: error{ Exists, Full }, fill: *Record, mint: ?*block_alloc.MintedBlockGuard) ?*Record {
         switch (e) {
             error.Exists => stats.overlay_install_race_under_guard.fire("a record appeared under the writer's block guard"),
             error.Full => stats.overlay_registry_full.fire("an install holding a reservation found the overlay registry full"),
         }
-        fill.fsck_guard.?.deinit();
-        mint.abandon();
+        if (fill.fsck_guard) |*g| g.deinit();
+        if (mint) |m| m.abandon();
+        // A reservation stands, re-stabilized (content unchanged).
+        if (fill.reserved) fill.alloc.publishBlock(fill.dest_idx);
         return null;
+    }
+
+    pub const ReservationVerdict = union(enum) {
+        /// The record's destination is the reservation: the sole-owner
+        /// verdict passed and the word is retired until the settle's
+        /// publish (W1's fence pair, `beginPatchSoleOwner`).
+        take: struct { alloc: *block_alloc.BlockAllocator, idx: u64, ordinal: u32 },
+        /// A fresh mint, whose save displaces the reservation: another
+        /// owner shares it (a clone), its volume is not active, or the
+        /// plane refused the retire.
+        mint,
+        /// The piece is not the overlay's: the stored image is not the
+        /// payload on a transformed volume, or the slot vehicle has no
+        /// direct leg — the accumulation arm lands it in place
+        /// (`accumulate.pickDest`).
+        decline,
+    };
+
+    /// THE RESERVATION'S LANDING through the overlay (charter §6.6;
+    /// decision 0003 §CR): a Hole record over a block the file RESERVED and
+    /// this mount owns alone writes into the reserved block itself. Its
+    /// bytes are nobody's (every reader serves the binding as zeros), so the
+    /// "never in place" law's tear cannot happen: a crash before the
+    /// settle's flip leaves the binding unwritten and the acked bytes
+    /// absent, never torn. The settle seeds the gaps with zeros in it and
+    /// flips the flag durably — the same reference, no mint, no free, no
+    /// epoch. A fresh dest here held the reservation AND the dest until the
+    /// save displaced the former: a fallocate'd lay-down peaked at twice its
+    /// size (2,130 blocks for 1,024; on a set the reservations filled, the
+    /// fresh mints met `StorageFull`).
+    fn reservationVerdict(self: *Overlay, req: StoreRequest, res: Binding) ReservationVerdict {
+        const v = self.deps.vols.byTag(res.vol_tag) orelse return .mint;
+        if (!v.isActive()) return .mint;
+        if (!v.passthrough or (req.vehicle == .slot and !self.deps.device.canWriteFixed())) return .decline;
+        const idx = v.alloc.idxOf(res.offset);
+        const sole = v.alloc.beginPatchSoleOwner(idx) catch return .mint;
+        if (!sole) {
+            // Re-stabilize under the NEW generation (content unchanged).
+            v.alloc.publishBlock(idx);
+            stats.overlay_reserved_landing_declines.inc();
+            return .mint;
+        }
+        return .{ .take = .{ .alloc = v.alloc, .idx = idx, .ordinal = v.ordinal } };
+    }
+
+    /// The belt before a reservation's landing seeds or flips anything:
+    /// the map still binds the reserved block and no epoch shadows it. The
+    /// record is the block's write custody (W1, the accumulation arm and a
+    /// reservation decline it; a shape change settles it before its clip),
+    /// so a miss is a "cannot happen" — the record supersedes, nothing is
+    /// written, flipped or freed. Under (3), the probe first.
+    fn reservationStands(self: *Overlay, rec: *const Record) bool {
+        if (self.deps.epochs.bindsBlock(rec.key.ino, rec.key.block)) return false;
+        const cur = self.deps.map.reserved(rec.key.ino, rec.key.block) orelse return false;
+        return cur.sameRef(rec.dest, self.cfg.block_size);
     }
 
     // ---- §3.7 the settle ----
@@ -1379,6 +1477,15 @@ pub const Overlay = struct {
                 return .superseded;
             }
         }
+        if (rec.reserved and !self.reservationStands(rec)) {
+            var detail: [128]u8 = undefined;
+            const text = std.fmt.bufPrint(&detail, "a reservation's in-place record lost its reservation: ino {d} block {d}", .{ rec.key.ino, rec.key.block }) catch "a reservation's in-place record lost its reservation";
+            stats.overlay_reserved_landing_lost.fire(text);
+            stats.overlay_supersessions.inc();
+            _ = rec.core.supersede();
+            self.teardown(rec);
+            return .superseded;
+        }
         if (gaps.len != 0) self.seedGaps(rec, gaps) catch |e| return self.deviceLegFailed(rec, e, "gap seed");
         // FLUSH (fsync class only).
         if (barrier) self.deps.device.flush(rec.dest.vol_tag) catch |e| return self.deviceLegFailed(rec, e, "flush");
@@ -1393,7 +1500,10 @@ pub const Overlay = struct {
         // (planned from the touched word) covers a fed block before the
         // save names it.
         if (self.deps.touched) |t| t(self.deps.touched_ctx, rec.key.ino, rec.ordinal);
-        {
+        // A reservation's landing takes the durable arm (charter §6.6: the
+        // written twin publishes at once, the same reference — never
+        // shadowed, so a second landing of the block finds it written).
+        if (!rec.reserved) {
             // Arm (a) FEED — an overwrite (`old_binding`: the displaced key
             // parks) and a FRESH record alike (`write_epoch` module doc: the
             // save names a fresh block for the first time; the reference
@@ -1401,10 +1511,10 @@ pub const Overlay = struct {
             // epoch (continuous C2/C3 visibility).
             const guard = rec.fsck_guard.?;
             rec.fsck_guard = null;
-            // A Hole record over a RESERVED block (charter §6.6): the
-            // reservation is the map's key the save displaces — parked
-            // here as the A key (the gap serve stays the Hole's zeros),
-            // read after the epoch probe (`write_epoch.Base`).
+            // A Hole record over a reservation another owner shares
+            // (charter §6.6): the reservation is the map's key the save
+            // displaces — parked here as the A key (the gap serve stays the
+            // Hole's zeros), read after the epoch probe (`write_epoch.Base`).
             const base: epoch_mod.Base = if (rec.old_binding) |old| .{ .map = old } else self.deps.epochs.baseFor(self.deps.map, rec.key.ino, rec.key.block);
             const v = self.deps.epochs.record(rec.key.ino, rec.key.block, base, new_key, proof, min_size, guard, true) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,

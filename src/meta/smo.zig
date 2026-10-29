@@ -1737,6 +1737,51 @@ pub const TestVolume = struct {
         return error.RetryBudgetExhausted;
     }
 
+    /// `commit` split at its reservation: two windows reserved in one
+    /// order apply in the other (§AW.4). The entry's range is held open in
+    /// the in-flight registry (it holds the checkpoint tail back) until
+    /// `applyReserved` applies the record at the reserved stamp and writes
+    /// the entry.
+    pub const Reserved = struct {
+        frames: [1]journal.RecordFrame,
+        reg: jc.InflightRegistry.Registered,
+    };
+
+    pub fn reserveCommit(self: *TestVolume, t: *KvTree, k: []const u8, kind: rec.RecordKind, value: []const u8) !Reserved {
+        assert(self.cfg.journaled);
+        const tag_kind: u8 = switch (t.identity) {
+            .control => key.TREE_CONTROL,
+            .slot => try key.slotTreeKeyKind(k),
+        };
+        var frames = [_]journal.RecordFrame{.{ .tag = key.tagFor(tag_kind, 0), .key = k, .kind = @fromBackingInt(@intCast(@backingInt(kind))), .seq = 0, .value = value }};
+        const adm = self.core.tryAdmit(try journal.entryLenFor(&frames), .user) orelse return error.RingFull;
+        const r = try self.journal.reserve(adm);
+        frames[0].seq = r.seq_base;
+        return .{ .frames = frames, .reg = r };
+    }
+
+    pub fn applyReserved(self: *TestVolume, t: *KvTree, r: *const Reserved) !void {
+        const Fixed = struct {
+            stamp_: tree.Stamp,
+            fn stamp(ctx: *anyopaque) Allocator.Error!tree.Stamp {
+                const s: *@This() = @ptrCast(@alignCast(ctx));
+                return s.stamp_;
+            }
+        };
+        const f = r.frames[0];
+        var fixed: Fixed = .{ .stamp_ = .{ .seq = r.reg.seq_base, .entry_start = r.reg.res.start } };
+        var attempt: u32 = 0;
+        while (attempt < node.RETRY_BUDGET) : (attempt += 1) {
+            const leaf = try t.resolveLeaf(f.key);
+            defer leaf.release();
+            switch (try t.applyAtSeqClass(leaf, f.key, tree.kindOf(f.kind), f.value, .{ .reserve = .{ .ctx = &fixed, .stamp = Fixed.stamp } }, false)) {
+                .applied => return self.journal.commitEntry(r.reg.res, &r.frames),
+                .stale => continue,
+            }
+        }
+        return error.RetryBudgetExhausted;
+    }
+
     // ---- crash replay ----
 
     /// A ledger record's content: roots, the tail replay starts at, the

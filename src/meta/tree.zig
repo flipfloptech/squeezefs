@@ -1950,6 +1950,38 @@ test "replay LWW gate: a replayed record at-or-below the node's newest seq for i
     try testing.expectEqual(@as(u64, 77), (try rec.InodeValue.decode(folded)).size);
 }
 
+test "replay keeps a straggler Δ the node never saw (§AW.4 across a crash): W1 reserved before W2, W2's Δ applied and flushed by a checkpoint whose tail W1's open reservation holds back, W1's Δ applied after it — the crash replay folds W1's fields under W2's, as the live fold did (a gate skipping every seq at or below the node's newest for the key dropped W1's size and mtime)" {
+    const gpa = testing.allocator;
+    var vol = try smo.TestVolume.init(gpa, .{ .journaled = true });
+    defer vol.deinit();
+    const t = try vol.createTree(.native);
+    const k = ikey(9);
+    const base: rec.InodeValue = .{ .mode = 0o100644, .nlink = 1, .size = 10, .atime = 10, .mtime = 10, .ctime = 10 };
+    try vol.commit(t, &k, .put, &base.encode());
+    _ = try vol.checkpoint();
+    // W1: a size claim with its times; W2, reserved after it: an atime.
+    const d1 = (rec.InodeDelta{ .mask = rec.DELTA_SIZE | rec.DELTA_TIMES, .fields = .{ .size = 4096, .mtime = 1001, .ctime = 1001 } }).encode();
+    const d2 = (rec.InodeDelta{ .mask = rec.DELTA_ATIME, .fields = .{ .atime = 2002 } }).encode();
+    const w1 = try vol.reserveCommit(t, &k, .delta, d1.slice());
+    const w2 = try vol.reserveCommit(t, &k, .delta, d2.slice());
+    try testing.expect(w1.reg.seq_base < w2.reg.seq_base);
+    try vol.applyReserved(t, &w2);
+    // The cycle flushes W2's Δ to the node; W1's open range holds the
+    // tail at or below its entry.
+    const led = try vol.checkpoint();
+    try testing.expect(led.tail <= w1.reg.res.start);
+    try vol.applyReserved(t, &w1);
+    const want: rec.InodeValue = .{ .mode = 0o100644, .nlink = 1, .size = 4096, .atime = 2002, .mtime = 1001, .ctime = 1001 };
+    try expectLookup(t, &k, &want.encode());
+    var re = try vol.crashReplay(led);
+    defer re.deinit();
+    try expectLookup(re.treeOf(.native), &k, &want.encode());
+    // A second replay over the replayed trees changes nothing: every
+    // record is now held at its own seq.
+    _ = try replayEntries(gpa, re.trees.items, re.recovery.entries);
+    try expectLookup(re.treeOf(.native), &k, &want.encode());
+}
+
 test "a journal frame's kind maps 1:1 onto the record kind (put, delta, delete)" {
     try testing.expectEqual(RecordKind.put, kindOf(.put));
     try testing.expectEqual(RecordKind.delta, kindOf(.delta));

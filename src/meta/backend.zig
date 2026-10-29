@@ -5741,6 +5741,92 @@ test "§AW.4 two windows apply in either order, with the checkpointer's freeze b
     for (names) |n| try testing.expect(try dentryPresent(be2, n));
 }
 
+/// The parent's (ino 1) folded inode value.
+fn parentInode(be: *KvBackend) !record.InodeValue {
+    const got = (try be.lookup(testing.allocator, key.TREE_INODES, &key.inodeKey(1))) orelse return error.TestExpectedLive;
+    defer testing.allocator.free(got);
+    return record.InodeValue.decode(got);
+}
+
+test "§AW.4 across a crash: W1 (a create, its parent's Δtimes 1001) held at its self-apply turn, W2 (a later window: the parent's Δatime 2002) applied and acked, the parent's leaf frozen to the device (the checkpointer's lock window), W1 released and landed, the image cut there — the reopened cut replays W1's Δ BELOW the node's newer frame: mtime 1001 and atime 2002, as the live mount read them (an at-or-below-newest replay gate kept W2's atime and lost W1's mtime)" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "aw4-crash", "600000");
+    defer v.destroy();
+    // No age-triggered cycle may cover W1 before the cut.
+    try v.env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "600000");
+    var dst_buf: [160]u8 = undefined;
+    const dst = try std.fmt.bufPrint(&dst_buf, "{s}.cut", .{v.path()});
+    defer unlinkPath(dst);
+    var ino1: u64 = 0;
+    {
+        const be = try v.open();
+        defer be.close();
+        _ = try commitCreate(be, "base");
+        try be.checkpointNow();
+        try testing.expectEqual(@as(u64, 1000), (try parentInode(be)).mtime);
+        const Committer = struct {
+            fn run(b: *KvBackend, t: *KvTx, out: *?anyerror, done: *std.atomic.Value(u32)) void {
+                out.* = if (b.commit(t)) |_| null else |e| e;
+                done.store(1, .release);
+            }
+        };
+        const t1 = try be.begin(@src());
+        t1.kernel_origin = true;
+        ino1 = try stageCreateAt(be, t1, "w1", 0, 1001);
+        conveyor.test_seams.hold_member_ino.store(ino1, .release);
+        var out1: ?anyerror = error.TestNotRun;
+        var done1 = std.atomic.Value(u32).init(0);
+        const th1 = try std.Thread.spawn(.{}, Committer.run, .{ be, t1, &out1, &done1 });
+        var released = false;
+        defer if (!released) {
+            conveyor.test_seams.hold_member_ino.store(0, .release);
+            conveyor.test_seams.apply_release.notifyWaiters(be.io);
+            th1.join();
+        };
+        while (conveyor.test_seams.member_held.load(.acquire) == 0) std.Thread.yield() catch {};
+        conveyor.test_seams.member_held.store(0, .release);
+        // W2, reserved after W1: applied and acked while W1 waits.
+        const t2 = try be.begin(@src());
+        t2.kernel_origin = true;
+        try t2.stageDelta(key.TREE_INODES, &key.inodeKey(1), .{ .mask = record.DELTA_ATIME, .fields = .{ .atime = 2002 } });
+        try be.commit(t2);
+        try testing.expectEqual(@as(u32, 0), done1.load(.acquire));
+        // The checkpointer's lock window on the parent's leaf: W2's Δ
+        // reaches the device in a frame of its own.
+        {
+            const t = be.treeForKey(key.TREE_INODES, &key.inodeKey(1)) orelse return error.TestUnexpectedResult;
+            const leaf = try t.resolveLeaf(&key.inodeKey(1));
+            defer leaf.release();
+            {
+                const d = leaf.lockWrite(be.io);
+                defer leaf.unlockWrite(be.io);
+                try testing.expect((try leaf.freezeLocked(d, be.cache.cfg.layout)) != null);
+            }
+            try testing.expect(try be.cache.appendFrozen(leaf));
+        }
+        conveyor.test_seams.hold_member_ino.store(0, .release);
+        conveyor.test_seams.apply_release.notifyWaiters(be.io);
+        th1.join();
+        released = true;
+        try testing.expectEqual(@as(?anyerror, null), out1);
+        const live = try parentInode(be);
+        try testing.expectEqual(@as(u64, 1001), live.mtime);
+        try testing.expectEqual(@as(u64, 2002), live.atime);
+        // W1's entry lands; no cycle runs before the cut.
+        try be.fsync();
+        try snapshotImage(v.path(), dst);
+    }
+    const copy = try KvBackend.open(gpa, v.io(), dst, .{ .env = &v.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .index = 1 });
+    defer copy.close();
+    try testing.expect(!copy.replayStats().clean_unmount);
+    try testing.expect(try present(copy, ino1));
+    try testing.expect(try dentryPresent(copy, "w1"));
+    const got = try parentInode(copy);
+    try testing.expectEqual(@as(u64, 2002), got.atime);
+    try testing.expectEqual(@as(u64, 1001), got.mtime);
+    try testing.expectEqual(@as(u64, 1001), got.ctime);
+}
+
 test "the manager's record-seq space is monotone across its INCARNATIONS (charter §5.5 'monotone across rings'): a seq offset raised during a mount (a departing member's slot floor) survives a clean unmount in appender 0's page — the reopen's registry continues at or above the old frontier, so a Put the new incarnation stamps outranks the old incarnation's Put of the same key before and after a freeze and across another reopen (the by-seq fold's premise; the control tree's lease record across terms)" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "seq-offset-remount", "600000");

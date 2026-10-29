@@ -3505,6 +3505,35 @@ test "the write cache over the ONE cache core (owner ruling 2026-10-21): a stage
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"write_cache_insert_refusals\":1,") != null);
 }
 
+test "an in-place append or overwrite leaves its resident the write cache's to promote: the drain's eviction for the bound promotes the record the ring still holds, whatever generation the in-place write stamped (red: the sink judged by the cache entry's generation, which an in-place write never bumps — the entry was dropped unpromoted while the record stayed resident and charged, out of the cache's reach until an fsync or the dismount)" {
+    const gpa = testing.allocator;
+    var kicks: Kicks = .{};
+    var r = try ramSegment(gpa, 64 * 4096);
+    defer gpa.free(r.image);
+    defer r.seg.deinit();
+    kicks.seg = &r.seg;
+    var pool = Pool.init(gpa, kicks.hooks());
+    defer pool.deinit();
+    var sink: PromoteSink = .{ .pool = &pool, .hooks = kicks.hooks() };
+    const bound: u64 = 8 * 8192;
+    const c = try WriteCache.init(gpa, &sink, bound, 1, writeCacheItems(bound, 1), null);
+    defer c.deinit();
+    const v: [100]u8 = @splat(1);
+    const tail: [50]u8 = @splat(2);
+    _ = try stageWrite(&pool, &r.seg, c, tkey(1, 1), &v, 0, .append);
+    _ = try stageWrite(&pool, &r.seg, c, tkey(2, 2), &v, 0, .none);
+    // Key 1 grows in place, key 2 is overwritten in place: fresh
+    // generations in the pool, the same cache entries.
+    try testing.expect((try appendStaged(&pool, &r.seg, tkey(1, 1), v.len, &tail, 0)) != null);
+    try testing.expect((try overwriteStaged(&pool, &r.seg, testing.io, tkey(2, 2), 0, &tail, 0)) != null);
+    const promoted0 = kicks.promoted;
+    _ = c.evictUntil(0);
+    // Both promoted, both gone from the ring and from the cache.
+    try testing.expectEqual(promoted0 + 2, kicks.promoted);
+    try testing.expect(r.seg.get(tkey(1, 1)) == null and r.seg.get(tkey(2, 2)) == null);
+    try testing.expectEqual(@as(u64, 0), c.currentBytes());
+}
+
 test "the live cells' value-hash states are gauged (R5): N staged records carry N × @sizeOf(ValueHash) in staging_cell_state_bytes, an in-place append replaces a state for a state, a release frees it, deinit frees the rest; the bound is the cell population × the state, under one grain per record; the component is attribution-only" {
     const gpa = testing.allocator;
     const cap = 64 * 4096;

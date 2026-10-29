@@ -28,6 +28,7 @@ const dlm = @import("dlm.zig");
 const key = @import("key.zig");
 const tx = @import("tx.zig");
 const economy = @import("economy.zig");
+const record = @import("record.zig");
 const route_table = @import("routing/route_table.zig");
 
 const Atomic = std.atomic.Value;
@@ -36,6 +37,8 @@ const assert = std.debug.assert;
 
 /// The dentry type byte of a directory (`economy.ftByte`).
 const DT_DIR: u8 = economy.ftByte(economy.S.IFDIR);
+/// An ino-major key's leading key ino.
+const INO_LEN = @sizeOf(u64);
 
 pub const stats = struct {
     /// fsync/fdatasync of one inode through the set (`MetaSet.fsyncIno`).
@@ -87,14 +90,14 @@ pub const Deps = struct {
 
     fn note(d: *Deps, s: tx.Staged) void {
         switch (s.tree_id) {
-            key.TREE_INODES, key.TREE_XATTRS, key.TREE_BLOCK_MAP => if (s.key.len >= 8) d.add(std.mem.readInt(u64, s.key[0..8], .big)),
-            key.TREE_BLOCK_REFS => if (s.key.len >= key.BLOCK_REF_OWNER_OFF + 8) d.add(std.mem.readInt(u64, s.key[key.BLOCK_REF_OWNER_OFF..][0..8], .big)),
+            key.TREE_INODES, key.TREE_XATTRS, key.TREE_BLOCK_MAP => if (s.key.len >= INO_LEN) d.add(std.mem.readInt(u64, s.key[0..INO_LEN], .big)),
+            key.TREE_BLOCK_REFS => if (s.key.len >= key.BLOCK_REF_OWNER_OFF + INO_LEN) d.add(std.mem.readInt(u64, s.key[key.BLOCK_REF_OWNER_OFF..][0..INO_LEN], .big)),
             key.TREE_DENTRIES => {
                 if (s.kind != .put) return;
-                // `child_ino u64 LE ‖ file_type u8 ‖ …` (record.DentryValue).
-                if (s.value.len < 9) return d.setOverflow();
-                const child = std.mem.readInt(u64, s.value[0..8], .little);
-                if (s.value[8] == DT_DIR) d.chain = true;
+                if (s.value.len < @sizeOf(record.DentryValueHeader)) return d.setOverflow();
+                const h = std.mem.bytesToValue(record.DentryValueHeader, s.value[0..@sizeOf(record.DentryValueHeader)]);
+                const child = std.mem.readInt(u64, &h.child_ino_le, .little);
+                if (h.file_type == DT_DIR) d.chain = true;
                 if (!route_table.isRoutable(child)) return d.setOverflow();
                 d.add(route_table.effectiveIno(child));
             },
@@ -200,7 +203,6 @@ test {
 }
 
 const testing = std.testing;
-const record = @import("record.zig");
 
 fn stagedTx(gpa: Allocator) !*tx.KvTx {
     const t = try gpa.create(tx.KvTx);

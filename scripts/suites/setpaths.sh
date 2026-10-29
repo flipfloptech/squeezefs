@@ -42,6 +42,10 @@
 # SET_DIR (the set's logs) and SET_ID, plus the slice paths.
 SUITE_META_MIB=${SUITE_META_MIB:-1024}
 SUITE_DATA_GIB=${SUITE_DATA_GIB:-8}
+# Metadata members of a set (1 or 2): with 2 the metadata slice is split in
+# halves, `-meta` and `-meta1`, one set of two members (decision 0003 §CH's
+# runs: a file's fsync on a set whose members are both busy).
+SUITE_META_MEMBERS=${SUITE_META_MEMBERS:-1}
 SUITE_SETS_DIR=${SUITE_SETS_DIR:-}
 # The product's floors (`squeezefs format`'s refusals; measured on 7e0792a,
 # docs/evidence/rung-10-small-volume.md): a metadata volume formats from
@@ -132,8 +136,11 @@ suite_dev_name() {
 
 suite_slice_paths() {
   SLICE_META=/dev/mapper/sqz-$SET_ID-meta
+  SLICE_META1=/dev/mapper/sqz-$SET_ID-meta1
   SLICE_D0=/dev/mapper/sqz-$SET_ID-d0
   SLICE_D1=/dev/mapper/sqz-$SET_ID-d1
+  # The set's metadata URI: every member's slice.
+  if [ "$SUITE_META_MEMBERS" = 2 ]; then SLICE_META_URI="sqmeta://$SLICE_META,$SLICE_META1"; else SLICE_META_URI="sqmeta://$SLICE_META"; fi
 }
 
 # The set whose `-meta` slice stands over `$1` (a dm device), by name.
@@ -150,7 +157,7 @@ suite_set_id_over() {
 # Bytes of the fixed layout: the loop sets' images, the three slices at the floor.
 suite_set_bytes() { echo $(( (SUITE_META_MIB << 20) + 2 * (SUITE_DATA_GIB << 30) )); }
 # Bytes of the smallest set the product formats.
-suite_set_min_bytes() { echo $(( (SUITE_META_MIN_MIB + 2 * SUITE_DATA_MIN_MIB) << 20 )); }
+suite_set_min_bytes() { echo $(( (SUITE_META_MEMBERS * SUITE_META_MIN_MIB + 2 * SUITE_DATA_MIN_MIB) << 20 )); }
 
 # The layout over a device of `$1` 512 B sectors: `<meta sectors> <data
 # sectors>` (each data slice), every slice a 1 MiB multiple. At or above the
@@ -163,7 +170,7 @@ suite_set_min_bytes() { echo $(( (SUITE_META_MIN_MIB + 2 * SUITE_DATA_MIN_MIB) <
 suite_slice_layout() {
   local total=$1 ss=512 meta data fixed floor min_meta min_data
   fixed=$(( (SUITE_META_MIB << 20) / ss )); floor=$(( (SUITE_DATA_GIB << 30) / ss ))
-  min_meta=$(( (SUITE_META_MIN_MIB << 20) / ss )); min_data=$(( (SUITE_DATA_MIN_MIB << 20) / ss ))
+  min_meta=$(( (SUITE_META_MEMBERS * SUITE_META_MIN_MIB << 20) / ss )); min_data=$(( (SUITE_DATA_MIN_MIB << 20) / ss ))
   if [ "$total" -ge $(( fixed + 2 * floor )) ]; then
     meta=$fixed
   else
@@ -181,7 +188,12 @@ suite_slices_up() {
   local dev=$1 start=0 spec name len total meta data
   total=$(blockdev --getsz "$dev") || { echo "$(basename "$0"): $dev: no size" >&2; exit 1; }
   read -r meta data < <(suite_slice_layout "$total") || { echo "$(basename "$0"): $dev holds $((total * 512)) B; the smallest set is $(suite_set_min_bytes) B — a ${SUITE_META_MIN_MIB} MiB metadata volume (the 8 MiB journal floor + 12 heap extents) and two ${SUITE_DATA_MIN_MIB} MiB data volumes (three 4 MiB chunks each, two reserved)" >&2; exit 1; }
-  for spec in "meta:$meta" "d0:$data" "d1:$data"; do
+  local specs=("meta:$meta")
+  if [ "$SUITE_META_MEMBERS" = 2 ]; then
+    local half=$(( meta / 2 / 2048 * 2048 ))
+    specs=("meta:$half" "meta1:$(( meta - half ))")
+  fi
+  for spec in "${specs[@]}" "d0:$data" "d1:$data"; do
     name=sqz-$SET_ID-${spec%%:*}; len=${spec#*:}
     if dmsetup info "$name" >/dev/null 2>&1; then
       dmsetup suspend "$name" && dmsetup load "$name" --table "0 $len linear $dev $start" && dmsetup resume "$name"
@@ -196,6 +208,6 @@ suite_slices_up() {
 # dmsetup's retries), so the test's own dm device above them can go.
 suite_slices_down() {
   local s
-  for s in d1 d0 meta; do dmsetup info "sqz-$SET_ID-$s" >/dev/null 2>&1 && dmsetup remove --retry "sqz-$SET_ID-$s" 2>/dev/null; done
+  for s in d1 d0 meta1 meta; do dmsetup info "sqz-$SET_ID-$s" >/dev/null 2>&1 && dmsetup remove --retry "sqz-$SET_ID-$s" 2>/dev/null; done
   return 0
 }

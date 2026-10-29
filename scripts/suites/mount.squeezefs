@@ -186,7 +186,7 @@ while :; do
   # diagnosis and go to stderr.
   # `--supervise`: the release posture's external supervisor (common.sh's
   # `suite_mount` says why) — a death gets its wait status, a wedge its dump.
-  out=$("$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$all" "sqmeta://$SLICE_META" "$dir" 2>&1 9>&-) && { mount_tagged; exit 0; }
+  out=$("$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$all" "$SLICE_META_URI" "$dir" 2>&1 9>&-) && { mount_tagged; exit 0; }
   rc=$?
   if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' <<< "$out"; then
     echo "$(date +%s) mount $dir: kmbuf ENOMEM (fragmented venue); compacting memory, retry $attempt/3" >> "$SET_DIR/mounts.log"
@@ -245,7 +245,7 @@ while :; do
     cpid=$(grep -o 'stale writer claim (id=[0-9a-f]*, pid=[0-9]*' "$log" | head -1 | grep -o 'pid=[0-9]*' | cut -d= -f2)
     if [ -n "$cpid" ] && { [ ! -d "/proc/$cpid" ] || grep -q 'State:.*Z' "/proc/$cpid/status" 2>/dev/null; }; then
       echo "$(date +%s) DAEMON DIED: claim pid $cpid is gone; clearing the claim (operator attestation: the set is the harness's) and retrying $attempt/3" | tee -a "$SET_DIR/mounts.log" >> "$SET_DIR/daemon-died"
-      "$SQZ_BIN" claim clear "sqmeta://$SLICE_META" >> "$SET_DIR/mounts.log" 2>&1 || true
+      "$SQZ_BIN" claim clear "$SLICE_META_URI" >> "$SET_DIR/mounts.log" 2>&1 || true
       continue
     fi
   fi

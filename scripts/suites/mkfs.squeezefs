@@ -51,7 +51,7 @@ trap suite_slices_down EXIT
 # the diagnosis and goes to stderr with the exit code.
 [ "$SUITE_SINGLE_WRITER" = 1 ] && extra+=(--single-writer)
 rc=0
-out=$("$SQZ_BIN" format "${extra[@]}" "sqmeta://$SLICE_META" "sqdata://$SLICE_D0,$SLICE_D1" 2>&1) || rc=$?
+out=$("$SQZ_BIN" format "${extra[@]}" "$SLICE_META_URI" "sqdata://$SLICE_D0,$SLICE_D1" 2>&1) || rc=$?
 if [ "$rc" = 0 ]; then
   printf '%s\n' "$(date +%s) format $dev" "$out" >> "$SET_DIR/formats.log"
   exit 0

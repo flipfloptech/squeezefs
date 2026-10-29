@@ -76,3 +76,27 @@ law's current classes and posture. 20 × green beside the full smoke's 16 shards
 
 §CE.9: a bind racing a kernel truncate of the same inode (its regrow announced by the leading fire,
 not awaited); the harness's missing preload hook; finding 3's per-open bind round trip.
+
+## The A-B-B-A (2026-10-29, quiet host on AC, the RAM-NVMe perf mount, 2 MDT + 2 OST, dist builds)
+
+`dev` `d80407c` against the branch (`c7ccd5f`), legs A B B A, three arms per leg — a plain mount,
+`-o interception`, and `-o interception` with the shim preloaded into every rank
+(`mpirun -x LD_PRELOAD=…/libsqueezefs_il.so`) — `mdtest -n 10000 -u -i 1`, gate lock and every build slot
+held, tctl ≤ 70 °C, fsck clean after all 40 runs; k ops/s, the mean of two legs per arm:
+
+| | icpt -np 32 dev → branch | icpt -np 64 | preload -np 32 | preload -np 64 |
+|---|---|---|---|---|
+| directory stat | 4,371 → 13,782 (+215 %) | 1,481 → 8,378 (+466 %) | 4,922 → 11,555 (+135 %) | 1,379 → 8,465 (+514 %) |
+| directory rename | 225 → 271 (+20 %) | 275 → 292 (+6 %) | 239 → 275 (+15 %) | 268 → 299 (+12 %) |
+| directory removal | 239 → 290 (+21 %) | 250 → 300 (+20 %) | 243 → 289 (+19 %) | 250 → 301 (+21 %) |
+| file creation | 256 → 251 (−2 %) | 258 → 256 (−1 %) | **63 → 140 (+122 %)** | **41 → 144 (+257 %)** |
+| file stat | 4,137 → 10,050 (+143 %) | 1,822 → 8,207 (+350 %) | 2,620 → 11,875 (+353 %) | 1,711 → 11,545 (+575 %) |
+| file read | 861 → 892 (+4 %) | 881 → 904 (+3 %) | 252 → 260 (+3 %) | 247 → 268 (+8 %) |
+| file removal | 286 → 321 (+12 %) | 285 → 340 (+19 %) | 267 → 322 (+21 %) | 288 → 348 (+21 %) |
+
+The plain arm (the code path this change leaves alone) over three rounds (`ittl-abba`, `-abba2`, `-abba3`;
+one -np 64 branch run of round 2 lost a rank to the desktop's `RLIMIT_RTTIME 0` in the benchmark
+script, since lifted): every row within ± 5 % of `dev` but the kernel-cached stat rows, whose legs swing
+± 30 % on `dev` itself (file stat −3 % / +3 %, directory stat +9 % / −5 % at -np 32 / 64 over all legs).
+Directory creation is +1–8 % in every interception arm. Landed (gate 165 green, 75/75). Sessions:
+`/build/perf/ittl-abba/`, `ittl-abba2/`, `ittl-abba3/`.

@@ -408,19 +408,19 @@ pub fn lookup(gpa: Allocator, sources: []const BsetView, k: []const u8) rec.Fold
 /// group by key → `compactFold` under the tombstone-elision and lineage
 /// rules. The output is strictly `(key, seq)`-ascending — directly
 /// buildable into a fresh bset.
-pub fn compact(gpa: Allocator, sources: []const BsetView, durable_tail: u64, out: *std.ArrayList(Record)) rec.FoldError!void {
+pub fn compact(gpa: Allocator, sources: []const BsetView, durable_tail: u64, apply_floor: u64, out: *std.ArrayList(Record)) rec.FoldError!void {
     var it = try merge(gpa, sources);
     defer it.deinit(gpa);
     var group: std.ArrayList(RecordRef) = .empty;
     defer group.deinit(gpa);
     while (it.next()) |r| {
         if (group.items.len != 0 and !std.mem.eql(u8, group.items[0].key, r.key)) {
-            try rec.compactFold(gpa, group.items, durable_tail, out);
+            try rec.compactFold(gpa, group.items, durable_tail, apply_floor, out);
             group.clearRetainingCapacity();
         }
         try group.append(gpa, r);
     }
-    try rec.compactFold(gpa, group.items, durable_tail, out);
+    try rec.compactFold(gpa, group.items, durable_tail, apply_floor, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -920,7 +920,7 @@ test "n-way merge reverses same-key runs within one source; compaction keeps the
     try testing.expectEqual(@as(?RecordRef, null), it.next());
     var out: std.ArrayList(Record) = .empty;
     defer freeAll(gpa, &out);
-    try compact(gpa, &sources, 4, &out);
+    try compact(gpa, &sources, 4, rec.FOLD_ALL, &out);
     try testing.expectEqual(@as(usize, 2), out.items.len);
     try testing.expectEqual(RecordKind.delete, out.items[0].kind);
     try testing.expectEqual(@as(u64, 8), out.items[0].seq);
@@ -1001,19 +1001,19 @@ test "property: the memoized n-way merge matches the reference order under long 
         // merge + compact ≡ per-key groups of the sorted reference + compactFold.
         var via_merge: std.ArrayList(Record) = .empty;
         defer freeAll(gpa, &via_merge);
-        try compact(gpa, views, 0, &via_merge);
+        try compact(gpa, views, 0, rec.FOLD_ALL, &via_merge);
         var via_sort: std.ArrayList(Record) = .empty;
         defer freeAll(gpa, &via_sort);
         var group: std.ArrayList(RecordRef) = .empty;
         defer group.deinit(gpa);
         for (all.items) |m| {
             if (group.items.len != 0 and !std.mem.eql(u8, group.items[0].key, m.rec.key)) {
-                try rec.compactFold(gpa, group.items, 0, &via_sort);
+                try rec.compactFold(gpa, group.items, 0, rec.FOLD_ALL, &via_sort);
                 group.clearRetainingCapacity();
             }
             try group.append(gpa, m.rec);
         }
-        try rec.compactFold(gpa, group.items, 0, &via_sort);
+        try rec.compactFold(gpa, group.items, 0, rec.FOLD_ALL, &via_sort);
         try testing.expectEqual(via_sort.items.len, via_merge.items.len);
         for (via_sort.items, via_merge.items) |a, b| try testing.expect(a.ref().eql(b.ref()));
     }
@@ -1068,7 +1068,7 @@ test "compact emits a buildable folded output; a second compaction is a fixed po
     // checkpoint-covered ⇒ elided; the seq-8 tombstone survives.
     var out: std.ArrayList(Record) = .empty;
     defer freeAll(gpa, &out);
-    try compact(gpa, &sources, 6, &out);
+    try compact(gpa, &sources, 6, rec.FOLD_ALL, &out);
     try testing.expectEqual(@as(usize, 3), out.items.len);
     try testing.expectEqualSlices(u8, &key.inodeKey(1), out.items[0].key);
     try testing.expectEqual(RecordKind.put, out.items[0].kind);
@@ -1089,7 +1089,7 @@ test "compact emits a buildable folded output; a second compaction is a fixed po
     try testing.expectEqual(@as(usize, 3), reparsed.len());
     var twice: std.ArrayList(Record) = .empty;
     defer freeAll(gpa, &twice);
-    try compact(gpa, &.{reparsed}, 6, &twice);
+    try compact(gpa, &.{reparsed}, 6, rec.FOLD_ALL, &twice);
     try testing.expectEqual(out.items.len, twice.items.len);
     for (out.items, twice.items) |a, b| try testing.expect(a.ref().eql(b.ref()));
 }
@@ -1104,7 +1104,7 @@ test "compaction of an inode-delta chain stays a single record" {
     defer view.deinit(gpa);
     var out: std.ArrayList(Record) = .empty;
     defer freeAll(gpa, &out);
-    try compact(gpa, &.{view}, 0, &out);
+    try compact(gpa, &.{view}, 0, rec.FOLD_ALL, &out);
     try testing.expectEqual(@as(usize, 1), out.items.len);
     try testing.expectEqual(RecordKind.put, out.items[0].kind);
     try testing.expectEqual(@as(u64, 3), out.items[0].seq);
@@ -1139,7 +1139,7 @@ test "compaction preserves the lineage a live link claims (versioned layout chai
     defer view.deinit(gpa);
     var folded: std.ArrayList(Record) = .empty;
     defer freeAll(gpa, &folded);
-    try compact(gpa, &.{view}, 0, &folded);
+    try compact(gpa, &.{view}, 0, rec.FOLD_ALL, &folded);
     try testing.expectEqual(@as(usize, 2), folded.items.len);
     // A LIVE later link committed against the pre-compaction head (0x12).
     var d3: rec.LayoutDelta = .{ .file_type = "striped", .size = 4096, .block_prefix = "be://data", .entries = &.{.{ .block = 3, .key = "be://data:d" }} };
@@ -1278,7 +1278,7 @@ test "the committed FIND-VS-A fixture is the generator's bytes; it parses, every
     // legal elision) keeps every live key.
     var out: std.ArrayList(Record) = .empty;
     defer freeAll(gpa, &out);
-    try compact(gpa, &.{view}, findvsa_fixture_horizon + 1, &out);
+    try compact(gpa, &.{view}, findvsa_fixture_horizon + 1, rec.FOLD_ALL, &out);
     var distinct: usize = 1;
     for (1..view.len()) |j| {
         if (!std.mem.eql(u8, view.record(j - 1).key, view.record(j).key)) distinct += 1;

@@ -46,7 +46,15 @@ pub const stats = struct {
     /// `meta_kv_layout_delta_folds`: layout delta records applied onto a
     /// base at read/compaction/replay time, one per delta.
     pub var meta_kv_layout_delta_folds: counters.ShardedCounter = .{};
+    /// Inode Δs a compaction kept verbatim at or past the apply floor
+    /// (`compactFold`'s retention rule): records of windows that may still
+    /// have a straggler below them.
+    pub var meta_kv_compact_retained_deltas: counters.ShardedCounter = .{};
 };
+
+/// `compactFold`'s apply floor when nothing is in flight: every seq is
+/// applied, everything folds.
+pub const FOLD_ALL: u64 = std.math.maxInt(u64);
 
 // ---------------------------------------------------------------------------
 // Bounds-checked little-endian reader (design §9): every length is checked
@@ -1486,7 +1494,18 @@ fn encodeLayoutXattr(gpa: Allocator, name: []const u8, layout: *const Layout) Al
 /// link, claim restamped to 0 (it is now its segment's first link). The
 /// folded value is byte-equal either way. A prefix folding to a tombstone
 /// or to nothing keeps the plain algebra.
-pub fn compactFold(gpa: Allocator, group_newest_first: []const RecordRef, durable_tail: u64, out: *std.ArrayList(Record)) FoldError!void {
+///
+/// Retention rule (§AW.4 across a compaction): every seq below
+/// `apply_floor` is applied; a window at or past it may still land a record
+/// of the key UNDER a newer one (two windows apply in either order). The
+/// inode Δs at or past the floor over a live base stay VERBATIM above the
+/// folded `Put` of everything below them, so a straggler Δ folds among them
+/// by seq — folded into the `Put` at their seq, they would shadow it. Only
+/// the Δtime class shares a key between windows in flight (a `Put` or a
+/// `Delete` takes the key's exclusive guard; a layout link the ino's), so a
+/// base that folds to a tombstone or to nothing, and the layout class, keep
+/// the plain algebra. `FOLD_ALL`: nothing in flight.
+pub fn compactFold(gpa: Allocator, group_newest_first: []const RecordRef, durable_tail: u64, apply_floor: u64, out: *std.ArrayList(Record)) FoldError!void {
     if (group_newest_first.len == 0) return;
     const first = group_newest_first[0];
     const k = first.key;
@@ -1507,6 +1526,27 @@ pub fn compactFold(gpa: Allocator, group_newest_first: []const RecordRef, durabl
                 out.appendAssumeCapacity(.{ .key = link_key, .seq = first.seq, .kind = .delta, .value = restamped });
                 return;
             }
+        }
+    }
+    var keep: usize = 0;
+    while (keep < group_newest_first.len) : (keep += 1) {
+        const r = group_newest_first[keep];
+        if (r.kind != .delta or r.seq < apply_floor or isLayoutDelta(r.value)) break;
+    }
+    if (keep != 0) {
+        var below = try foldNewestFirst(gpa, group_newest_first[keep..]);
+        defer below.deinit(gpa);
+        if (below == .put) {
+            const p = below.put;
+            try out.ensureUnusedCapacity(gpa, 1 + keep);
+            out.appendAssumeCapacity(try Record.put(gpa, k, p.seq, p.value));
+            var i = keep;
+            while (i > 0) {
+                i -= 1;
+                out.appendAssumeCapacity(try group_newest_first[i].toRecord(gpa));
+            }
+            stats.meta_kv_compact_retained_deltas.add(keep);
+            return;
         }
     }
     var folded = try foldNewestFirst(gpa, group_newest_first);
@@ -2345,15 +2385,15 @@ test "compact fold: tombstone elision respects the durable-tail boundary (seq < 
         deinitRecords(gpa, out.items);
         out.deinit(gpa);
     }
-    try compactFold(gpa, &.{d.ref()}, 8, &out);
+    try compactFold(gpa, &.{d.ref()}, 8, FOLD_ALL, &out);
     try testing.expectEqual(@as(usize, 0), out.items.len);
-    try compactFold(gpa, &.{d.ref()}, 7, &out);
+    try compactFold(gpa, &.{d.ref()}, 7, FOLD_ALL, &out);
     try testing.expectEqual(@as(usize, 1), out.items.len);
     try testing.expectEqual(RecordKind.delete, out.items[0].kind);
     try testing.expectEqual(@as(u64, 7), out.items[0].seq);
     try testing.expectEqualSlices(u8, &fold_key, out.items[0].key);
     try testing.expectEqual(@as(usize, 0), out.items[0].value.len);
-    try compactFold(gpa, &.{d.ref()}, 0, &out);
+    try compactFold(gpa, &.{d.ref()}, 0, FOLD_ALL, &out);
     try testing.expectEqual(@as(usize, 2), out.items.len);
 }
 
@@ -2368,7 +2408,7 @@ test "compact fold emits one folded Put or nothing per key" {
     // Delta + base ⇒ one folded Put carrying the newest seq.
     var recs = [_]Record{ try tTimes(5, 50, 55), try tPut(2, iv(1)) };
     defer deinitRecords(gpa, &recs);
-    try compactFold(gpa, refs(&recs, &rbuf), 0, &out);
+    try compactFold(gpa, refs(&recs, &rbuf), 0, FOLD_ALL, &out);
     try testing.expectEqual(@as(usize, 1), out.items.len);
     try testing.expectEqual(RecordKind.put, out.items[0].kind);
     try testing.expectEqual(@as(u64, 5), out.items[0].seq);
@@ -2378,7 +2418,7 @@ test "compact fold emits one folded Put or nothing per key" {
     // Shadowed Puts collapse to the newest.
     var recs2 = [_]Record{ try tPut(5, iv(2)), try tPut(2, iv(1)) };
     defer deinitRecords(gpa, &recs2);
-    try compactFold(gpa, refs(&recs2, &rbuf), 0, &out);
+    try compactFold(gpa, refs(&recs2, &rbuf), 0, FOLD_ALL, &out);
     try testing.expectEqual(@as(usize, 2), out.items.len);
     try testing.expectEqual(@as(u64, 5), out.items[1].seq);
     try testing.expectEqualSlices(u8, &iv(2).encode(), out.items[1].value);
@@ -2386,16 +2426,16 @@ test "compact fold emits one folded Put or nothing per key" {
     const before = stats.meta_kv_delta_orphans.load();
     var recs3 = [_]Record{try tTimes(5, 50, 55)};
     defer deinitRecords(gpa, &recs3);
-    try compactFold(gpa, refs(&recs3, &rbuf), 0, &out);
+    try compactFold(gpa, refs(&recs3, &rbuf), 0, FOLD_ALL, &out);
     try testing.expectEqual(@as(usize, 2), out.items.len);
     try testing.expectEqual(before + 1, stats.meta_kv_delta_orphans.load());
     // Tombstone below the tail shadows the Put AND elides: the key vanishes.
     var recs4 = [_]Record{ try tDel(7), try tPut(3, iv(1)) };
     defer deinitRecords(gpa, &recs4);
-    try compactFold(gpa, refs(&recs4, &rbuf), 8, &out);
+    try compactFold(gpa, refs(&recs4, &rbuf), 8, FOLD_ALL, &out);
     try testing.expectEqual(@as(usize, 2), out.items.len);
     // Empty group is a no-op.
-    try compactFold(gpa, &.{}, 0, &out);
+    try compactFold(gpa, &.{}, 0, FOLD_ALL, &out);
     try testing.expectEqual(@as(usize, 2), out.items.len);
 }
 
@@ -2485,7 +2525,7 @@ test "compact fold lineage rule: a versioned layout head compacts to Put + the l
         deinitRecords(gpa, out.items);
         out.deinit(gpa);
     }
-    try compactFold(gpa, &group, 0, &out);
+    try compactFold(gpa, &group, 0, FOLD_ALL, &out);
     try testing.expectEqual(@as(usize, 2), out.items.len);
     try testing.expectEqual(RecordKind.put, out.items[0].kind);
     try testing.expectEqual(@as(u64, 2), out.items[0].seq);
@@ -2519,11 +2559,11 @@ test "compact fold lineage rule: a versioned layout head compacts to Put + the l
         deinitRecords(gpa, out2.items);
         out2.deinit(gpa);
     }
-    try compactFold(gpa, &.{ group[0], .{ .key = &fold_key, .seq = 2, .kind = .delete, .value = &.{} } }, 0, &out2);
+    try compactFold(gpa, &.{ group[0], .{ .key = &fold_key, .seq = 2, .kind = .delete, .value = &.{} } }, 0, FOLD_ALL, &out2);
     try testing.expectEqual(@as(usize, 1), out2.items.len);
     try testing.expectEqual(RecordKind.delete, out2.items[0].kind);
     const orphans_before = stats.meta_kv_delta_orphans.load();
-    try compactFold(gpa, &.{group[0]}, 0, &out2);
+    try compactFold(gpa, &.{group[0]}, 0, FOLD_ALL, &out2);
     try testing.expectEqual(@as(usize, 1), out2.items.len);
     try testing.expectEqual(orphans_before + 1, stats.meta_kv_delta_orphans.load());
     // An unversioned chain stays a single record.
@@ -2534,7 +2574,7 @@ test "compact fold lineage rule: a versioned layout head compacts to Put + the l
         deinitRecords(gpa, out3.items);
         out3.deinit(gpa);
     }
-    try compactFold(gpa, &.{ .{ .key = &fold_key, .seq = 2, .kind = .delta, .value = unv }, group[2] }, 0, &out3);
+    try compactFold(gpa, &.{ .{ .key = &fold_key, .seq = 2, .kind = .delta, .value = unv }, group[2] }, 0, FOLD_ALL, &out3);
     try testing.expectEqual(@as(usize, 1), out3.items.len);
     try testing.expectEqual(RecordKind.put, out3.items[0].kind);
 }
@@ -2702,12 +2742,12 @@ fn modelLiveState(gpa: Allocator, records: []const Record) !LiveState {
     return state;
 }
 
-fn compactHistory(gpa: Allocator, records: []const Record, durable_tail: u64, out: *std.ArrayList(Record)) !void {
+fn compactHistory(gpa: Allocator, records: []const Record, durable_tail: u64, apply_floor: u64, out: *std.ArrayList(Record)) !void {
     var group: std.ArrayList(RecordRef) = .empty;
     defer group.deinit(gpa);
     for (1..7) |idx| {
         try groupNewestFirst(gpa, records, idx, &group);
-        try compactFold(gpa, group.items, durable_tail, out);
+        try compactFold(gpa, group.items, durable_tail, apply_floor, out);
     }
 }
 
@@ -2745,7 +2785,7 @@ test "property: replay reproduces RAM is ONE fold theorem — live(compact(histo
                 deinitRecords(gpa, compacted.items);
                 compacted.deinit(gpa);
             }
-            try compactHistory(gpa, history.items, tail, &compacted);
+            try compactHistory(gpa, history.items, tail, FOLD_ALL, &compacted);
             var replay_input: std.ArrayList(Record) = .empty;
             defer {
                 deinitRecords(gpa, replay_input.items);
@@ -2761,10 +2801,86 @@ test "property: replay reproduces RAM is ONE fold theorem — live(compact(histo
                 deinitRecords(gpa, twice.items);
                 twice.deinit(gpa);
             }
-            try compactHistory(gpa, compacted.items, tail, &twice);
+            try compactHistory(gpa, compacted.items, tail, FOLD_ALL, &twice);
             try testing.expect(recordsEql(compacted.items, twice.items));
         }
     }
+}
+
+test "property: a compaction at apply floor F keeps every straggler's place — live(compact(history, F) ∪ S) == live(history ∪ S) for any Δ stragglers S at unused seqs ≥ F (two windows apply in either order, §AW.4); below F the plain fold; a second compaction at the same floor is a fixed point" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x57A6);
+    const r = prng.random();
+    const Gen = struct {
+        fn delta(g: Allocator, rr: std.Random, k: []const u8, seq: u64) !Record {
+            return Record.delta(g, k, seq, switch (rr.intRangeLessThan(u8, 0, 4)) {
+                0 => InodeDelta.times(seq * 10, seq * 10 + 1),
+                1 => InodeDelta.ctime(seq * 10 + 2),
+                2 => .{ .mask = DELTA_ATIME, .fields = .{ .atime = seq * 10 + 3 } },
+                else => .{ .mask = DELTA_SIZE | DELTA_TIMES, .fields = .{ .size = seq * 4096, .mtime = seq * 10 + 4, .ctime = seq * 10 + 5 } },
+            });
+        }
+    };
+    const retained0 = stats.meta_kv_compact_retained_deltas.load();
+    for (0..200) |_| {
+        // The history at even seqs; a straggler takes an odd one.
+        const n: u64 = 60;
+        var history: std.ArrayList(Record) = .empty;
+        defer {
+            deinitRecords(gpa, history.items);
+            history.deinit(gpa);
+        }
+        for (1..n + 1) |i| {
+            const seq = 2 * i;
+            const k = key.inodeKey(r.intRangeAtMost(u64, 1, 6));
+            try history.append(gpa, switch (r.intRangeLessThan(u8, 0, 10)) {
+                0...3 => try Record.put(gpa, &k, seq, &iv(seq).encode()),
+                4...8 => try Gen.delta(gpa, r, &k, seq),
+                else => try Record.delete(gpa, &k, seq),
+            });
+        }
+        const floor = r.intRangeAtMost(u64, 1, 2 * n + 2);
+        var compacted: std.ArrayList(Record) = .empty;
+        defer {
+            deinitRecords(gpa, compacted.items);
+            compacted.deinit(gpa);
+        }
+        try compactHistory(gpa, history.items, 0, floor, &compacted);
+        var twice: std.ArrayList(Record) = .empty;
+        defer {
+            deinitRecords(gpa, twice.items);
+            twice.deinit(gpa);
+        }
+        try compactHistory(gpa, compacted.items, 0, floor, &twice);
+        try testing.expect(recordsEql(compacted.items, twice.items));
+        var with_s: std.ArrayList(Record) = .empty;
+        defer {
+            deinitRecords(gpa, with_s.items);
+            with_s.deinit(gpa);
+        }
+        var compacted_s: std.ArrayList(Record) = .empty;
+        defer {
+            deinitRecords(gpa, compacted_s.items);
+            compacted_s.deinit(gpa);
+        }
+        for (history.items) |*h| try with_s.append(gpa, try h.ref().toRecord(gpa));
+        for (compacted.items) |*c| try compacted_s.append(gpa, try c.ref().toRecord(gpa));
+        const lo = floor | 1;
+        var seq = lo;
+        while (seq <= 2 * n + 1) : (seq += 2) {
+            if (!r.boolean()) continue;
+            const k = key.inodeKey(r.intRangeAtMost(u64, 1, 6));
+            const s1 = try Gen.delta(gpa, r, &k, seq);
+            try with_s.append(gpa, s1);
+            try compacted_s.append(gpa, try s1.ref().toRecord(gpa));
+        }
+        var want = try modelLiveState(gpa, with_s.items);
+        defer want.deinit(gpa);
+        var got = try modelLiveState(gpa, compacted_s.items);
+        defer got.deinit(gpa);
+        try testing.expect(want.eql(&got));
+    }
+    try testing.expect(stats.meta_kv_compact_retained_deltas.load() > retained0);
 }
 
 test "property: encode∘decode = id for every value codec under a deterministic PRNG" {

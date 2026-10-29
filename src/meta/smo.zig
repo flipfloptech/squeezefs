@@ -215,6 +215,13 @@ pub const SmoJournal = struct {
         return self.reg.reserveRegistered(self.core, adm);
     }
 
+    /// `node_cache.ApplyFloor` over this ring's registry (the test volume's
+    /// cache; a mount's is its backend's).
+    pub fn applyFloorOf(ctx: *anyopaque) u64 {
+        const self: *SmoJournal = @ptrCast(@alignCast(ctx));
+        return self.reg.appliedBelowSeq(self.core);
+    }
+
     /// Write one entry after release and complete its reservation on
     /// either outcome (an unwritten range still completes for the
     /// watermark; replay's checksum walk drops it). A device write failure
@@ -915,6 +922,7 @@ pub fn freezeForSmo(cache: *NodeCache, n: *CachedNode) Error!?ForcedFreezeGuard 
     const frozen = try n.freezeLocked(d, cache.cfg.layout);
     if (frozen != null) return .{ .n = n, .armed = false };
     n.state.beginForcedFreeze() catch return null;
+    n.cut_floor.store(cache.applyFloor(), .monotonic);
     return .{ .n = n, .armed = true };
 }
 
@@ -1065,7 +1073,7 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
     }
     const extra_refs = try refsOf(gpa, extra);
     defer gpa.free(extra_refs);
-    var folded = try node.foldNodeSources(gpa, &.{&src.loaded}, &.{extra_refs}, durable_tail);
+    var folded = try node.foldNodeSources(gpa, &.{&src.loaded}, &.{extra_refs}, durable_tail, n.cut_floor.load(.monotonic));
     defer folded.deinit(gpa);
     const items = folded.records.items;
     const total = folded.encodedBytes();
@@ -1598,6 +1606,7 @@ pub const TestVolume = struct {
         const table = try gpa.create(tree.TreeTable);
         errdefer gpa.destroy(table);
         table.* = try tree.TreeTable.init(gpa, &.{});
+        if (cfg.journaled) cache.installApplyFloor(.{ .ctx = j, .call = SmoJournal.applyFloorOf });
         return .{
             .gpa = gpa,
             .cfg = cfg,

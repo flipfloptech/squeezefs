@@ -319,6 +319,14 @@ pub const Hook = struct {
     call: *const fn (ctx: *anyopaque) void,
 };
 
+/// The seq every record below which is applied (the mount's ring's
+/// `InflightRegistry.appliedBelowSeq`): a freeze cut records it for the
+/// compaction that folds the cut (`record.compactFold`'s retention rule).
+pub const ApplyFloor = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque) u64,
+};
+
 /// Placement + policy for one volume's node cache.
 pub const Config = struct {
     layout: NodeLayout,
@@ -674,6 +682,11 @@ pub const CachedNode = struct {
     /// `clock.monotonicNs()` of the crossing that queued the node (0 =
     /// none): the freeze that takes it records `meta_kv_threshold_to_freeze`.
     maintenance_queued_ns: std.atomic.Value(u64),
+    /// The cache's apply floor at the latest freeze CUT (a new frozen delta
+    /// or a forced freeze), written under the node write lock: every record
+    /// a compaction of the cut folds was applied by then, and a straggler
+    /// still to land on it is at or past this seq.
+    cut_floor: std.atomic.Value(u64),
 
     /// Build from a verified extent (`loaded` borrows `buf`; both are
     /// consumed). Born clean with one reference, the caller's.
@@ -743,6 +756,7 @@ pub const CachedNode = struct {
             .forest_slot = .init(no_forest_slot),
             .maintenance_queued = .init(false),
             .maintenance_queued_ns = .init(0),
+            .cut_floor = .init(rec.FOLD_ALL),
         };
         if (pinned) cache.pinned_nodes.add(1);
         // The extent buffer's own reference: the sources hold theirs.
@@ -1332,6 +1346,7 @@ pub const CachedNode = struct {
             error.AlreadyFreezing => error.FreezeRefusedAlreadyFreezing,
             error.Superseded => error.FreezeRefusedSuperseded,
         };
+        self.cut_floor.store(self.cache.applyFloor(), .monotonic);
         // W-A restore: between the successful `beginFreeze` and the
         // `dirty.frozen = ...` publication, EVERY error path leaves the
         // overlay untouched — so the only state to restore is the word.
@@ -1610,6 +1625,9 @@ pub const NodeCache = struct {
     /// and the mutation gates.
     env: epoch_core.NodeEnv,
     lease: LeaseGate = .unarmed,
+    /// The conveyor's apply floor (null: nothing in flight — a standalone
+    /// tree, a reader, the transient control cache).
+    apply_floor: ?ApplyFloor = null,
     /// The frame screen's and stamp's ONE source (installed at the slot
     /// plane's prime, BEFORE the first frame writer of the open).
     frames: ?FrameSeam = null,
@@ -1696,6 +1714,19 @@ pub const NodeCache = struct {
 
     pub fn installLeaseGate(self: *NodeCache, gate: LeaseGate) void {
         self.lease = gate;
+    }
+
+    /// Installed once the mount's ring registry stands; carried across a
+    /// joiner's cache swap.
+    pub fn installApplyFloor(self: *NodeCache, floor: ApplyFloor) void {
+        self.apply_floor = floor;
+    }
+
+    /// Every record seq below the answer is applied (`FOLD_ALL` with no
+    /// conveyor).
+    pub fn applyFloor(self: *const NodeCache) u64 {
+        const f = self.apply_floor orelse return rec.FOLD_ALL;
+        return f.call(f.ctx);
     }
 
     /// The frame seam: once, at the slot plane's prime — every frame

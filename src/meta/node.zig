@@ -856,10 +856,11 @@ fn maxSeq(records: []const RecordRef) u64 {
 /// Fold the source nodes' whole bset logs plus each caller's frozen-delta
 /// records (`extras[i]`, the newest source for node `i`; strictly `(key,
 /// seq)` ascending; empty legal) with the single K1 algebra under the
-/// tombstone-elision rule at `durable_tail`. Newest sources FIRST: every
-/// extra image, then every node's views newest-first. Key spaces of distinct
+/// tombstone-elision rule at `durable_tail` and the retention rule at
+/// `apply_floor` (`record.compactFold`). Newest sources FIRST: every extra
+/// image, then every node's views newest-first. Key spaces of distinct
 /// nodes are disjoint, so the order across nodes is immaterial.
-pub fn foldNodeSources(gpa: Allocator, srcs: []const *const LoadedNode, extras: []const []const RecordRef, durable_tail: u64) FoldError!Folded {
+pub fn foldNodeSources(gpa: Allocator, srcs: []const *const LoadedNode, extras: []const []const RecordRef, durable_tail: u64, apply_floor: u64) FoldError!Folded {
     assert(srcs.len == extras.len);
     var images: std.ArrayList([]u8) = .empty;
     defer {
@@ -895,14 +896,14 @@ pub fn foldNodeSources(gpa: Allocator, srcs: []const *const LoadedNode, extras: 
     for (views.items) |*v| horizon = @max(horizon, v.journal_seq_horizon);
     var out: Folded = .{ .records = .empty, .horizon = horizon };
     errdefer out.deinit(gpa);
-    try bset.compact(gpa, views.items, durable_tail, &out.records);
+    try bset.compact(gpa, views.items, durable_tail, apply_floor, &out.records);
     return out;
 }
 
 /// `f(N)`: the encoded bytes `N`'s log plus `extra` fold to under the
 /// elision rule at `durable_tail` — the merge rule's measure.
 pub fn foldBytes(gpa: Allocator, src: *const LoadedNode, extra: []const RecordRef, durable_tail: u64) FoldError!usize {
-    var folded = try foldNodeSources(gpa, &.{src}, &.{extra}, durable_tail);
+    var folded = try foldNodeSources(gpa, &.{src}, &.{extra}, durable_tail, rec.FOLD_ALL);
     defer folded.deinit(gpa);
     return folded.encodedBytes();
 }
@@ -920,7 +921,7 @@ fn checkFreshDestination(src: *const LoadedNode, dst_addr: u64, diag: ?*Refusal)
 /// signal is reachable exactly when `extra` folds in).
 pub fn compactNode(gpa: Allocator, layout: NodeLayout, src: *const LoadedNode, extra: []const RecordRef, dst_addr: u64, dst_node_seq: u64, durable_tail: u64, diag: ?*Refusal) FoldError!WrittenNode {
     try checkFreshDestination(src, dst_addr, diag);
-    var folded = try foldNodeSources(gpa, &.{src}, &.{extra}, durable_tail);
+    var folded = try foldNodeSources(gpa, &.{src}, &.{extra}, durable_tail, rec.FOLD_ALL);
     defer folded.deinit(gpa);
     if (folded.records.items.len > 0) {
         const image_len = NODE_PAGE + bset.pageAlign(FRAME_LEN + bset.BSET_HEADER_LEN + folded.encodedBytes());
@@ -988,7 +989,7 @@ pub fn splitNode(gpa: Allocator, layout: NodeLayout, src: *const LoadedNode, ext
     try checkFreshDestination(src, left.node_addr, diag);
     try checkFreshDestination(src, right.node_addr, diag);
     if (left.node_addr == right.node_addr) return refuse(diag, .{ .split_same_destination = left.node_addr });
-    var folded = try foldNodeSources(gpa, &.{src}, &.{extra}, durable_tail);
+    var folded = try foldNodeSources(gpa, &.{src}, &.{extra}, durable_tail, rec.FOLD_ALL);
     defer folded.deinit(gpa);
     const items = folded.records.items;
     if (items.len < 2) return refuse(diag, .{ .split_too_few = items.len });
@@ -1040,7 +1041,7 @@ pub fn mergeNodes(gpa: Allocator, layout: NodeLayout, left: *const LoadedNode, r
     try checkFreshDestination(right, dst_addr, diag);
     if (left.header.tree_id != right.header.tree_id or left.header.level != right.header.level) return refuse(diag, .merge_identity_mismatch);
     if (!adjacentSiblings(left, right)) return refuse(diag, .merge_not_adjacent);
-    var folded = try foldNodeSources(gpa, &.{ left, right }, &.{ extra_left, extra_right }, durable_tail);
+    var folded = try foldNodeSources(gpa, &.{ left, right }, &.{ extra_left, extra_right }, durable_tail, rec.FOLD_ALL);
     defer folded.deinit(gpa);
     if (folded.records.items.len > 0) {
         const image_len = NODE_PAGE + bset.pageAlign(FRAME_LEN + bset.BSET_HEADER_LEN + folded.encodedBytes());
@@ -2124,7 +2125,7 @@ test "finding 41: a split never cuts a same-key group (a versioned layout chain'
     defer src.deinit(gpa);
     // The fold keeps both of B's records, and the raw byte cut would land
     // between them; cohesion moves it.
-    var folded = try foldNodeSources(gpa, &.{&src}, &.{&.{}}, 0);
+    var folded = try foldNodeSources(gpa, &.{&src}, &.{&.{}}, 0, rec.FOLD_ALL);
     defer folded.deinit(gpa);
     try testing.expectEqual(@as(usize, 3), folded.records.items.len);
     try testing.expectEqual(@as(?usize, 1), splitCut(folded.records.items));

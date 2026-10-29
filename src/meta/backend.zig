@@ -754,6 +754,7 @@ pub const KvBackend = struct {
         // sorts below the old one's.
         if (sb.symmetricPlaneStamped()) be.reg.recoverSeqOffset(try sym.bind.AppenderSet.page0SeqOffset(be));
         try be.alignRingHead();
+        be.cache.installApplyFloor(be.applyFloorSource());
 
         // 9. The slot plane (the door from the first commit; the cycle's
         // publication hooks read it), the lane, the checkpointer, the
@@ -1143,6 +1144,7 @@ pub const KvBackend = struct {
         be.reg = try jc.InflightRegistry.init(gpa, standing.head_pos, conveyor.queueCapacity(standing.geo.pages));
         errdefer be.reg.deinit();
         be.reg.recoverSeqOffset(standing.seq_offset);
+        be.cache.installApplyFloor(be.applyFloorSource());
         // The grant mirror: every extent claimed but the granted runs.
         be.alloc = alloc_ext.ExtentAllocator.grantMirror(gpa, sb.totalExtents(), sym.joined.MIRROR_RESERVE_EXTENTS, alloc_ext.pending_free_cap, standing.granted) catch return error.OutOfMemory;
         errdefer be.alloc.deinit();
@@ -1584,11 +1586,13 @@ pub const KvBackend = struct {
         be.trees.deinit();
         be.cache_swap.lock();
         defer be.cache_swap.unlock();
+        const apply_floor = be.cache.apply_floor;
         be.cache.deinit();
         be.mounted.deinit(be.gpa);
         be.mounted = fresh;
         be.trees = try tree.TreeTable.init(be.gpa, &.{});
         be.cache = try node_cache.NodeCache.init(be.gpa, be.io, .{ .layout = be.layout, .heap_base = be.sb.heap.start, .budget_bytes = be.cache_budget_bytes }, be.dev.loader());
+        if (apply_floor) |f| be.cache.installApplyFloor(f);
         be.cache.setDurableTail(fresh.journal_tail_seq);
         try be.openControlProjection();
     }
@@ -2063,6 +2067,17 @@ pub const KvBackend = struct {
     fn smoCompletedHook(ctx: *anyopaque) void {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
         be.lane.kick();
+    }
+
+    /// The node cache's apply floor: this mount's ring is the one source
+    /// of every record its writable trees receive.
+    fn applyFloorSource(be: *KvBackend) node_cache.ApplyFloor {
+        return .{ .ctx = be, .call = applyFloorHook };
+    }
+
+    fn applyFloorHook(ctx: *anyopaque) u64 {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        return be.reg.appliedBelowSeq(&be.core);
     }
 
     fn laneRollbackHook(ctx: ?*anyopaque, span: jc.SeqSpan, window: jc.Reservation) void {

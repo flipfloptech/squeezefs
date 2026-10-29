@@ -584,9 +584,9 @@ pub const Notify = struct {
     }
 };
 
-/// An open reservation: `[start, padded_end)`; `resident`: the journal
-/// tail holds it whole (§BX).
-const Open = struct { start: u64, padded_end: u64, resident: bool = false };
+/// An open reservation: `[start, padded_end)`; `seq_base`: its first record
+/// stamp; `resident`: the journal tail holds it whole (§BX).
+const Open = struct { start: u64, padded_end: u64, seq_base: u64, resident: bool = false };
 
 /// The in-flight reservation registry (`docs/porting/kv_journal_ledger.md`
 /// §2.7): `minInflightStart` feeds the checkpoint tail rule (a tx between its
@@ -661,12 +661,12 @@ pub const InflightRegistry = struct {
         std.debug.assert(self.open.items.len == 0 or self.open.items[self.open.items.len - 1].start < res.start);
         // Allocates only past the pre-sized capacity (a growing conveyor),
         // amortised; the steady state is `appendAssumeCapacity`.
-        try self.open.append(self.gpa, .{ .start = res.start, .padded_end = res.paddedEnd() });
-        // Every open one before it resident: this one is the first that is not.
-        if (self.resident_upto.load(.monotonic) == std.math.maxInt(u64)) self.resident_upto.store(res.start, .seq_cst);
         // Monotonic suffices: the registry lock orders this read against
         // `raiseSeqFloor`'s RMW, which runs under the same lock.
         const seq_base = res.start +| self.seq_offset.load(.monotonic);
+        try self.open.append(self.gpa, .{ .start = res.start, .padded_end = res.paddedEnd(), .seq_base = seq_base });
+        // Every open one before it resident: this one is the first that is not.
+        if (self.resident_upto.load(.monotonic) == std.math.maxInt(u64)) self.resident_upto.store(res.start, .seq_cst);
         return .{ .res = res, .seq_base = seq_base };
     }
 
@@ -741,6 +741,20 @@ pub const InflightRegistry = struct {
         self.lock.lock();
         defer self.lock.unlock();
         return if (self.open.items.len == 0) std.math.maxInt(u64) else self.open.items[0].start;
+    }
+
+    /// Every record seq below the answer is APPLIED: the oldest open
+    /// reservation's first stamp (a window is open from its reservation to
+    /// its completion, which follows its RAM apply), else the ring's next
+    /// stamp. Open windows' bases ascend (reserved in position order under
+    /// this lock, the offset monotone). A compaction folds only below it
+    /// (`record.compactFold`'s retention): a window open now may still land
+    /// a record of the key under any newer one.
+    pub fn appliedBelowSeq(self: *InflightRegistry, core: *const JournalCore) u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.open.items.len != 0) return self.open.items[0].seq_base;
+        return core.headPos() +| self.seq_offset.load(.monotonic);
     }
 
     pub fn openCount(self: *InflightRegistry) usize {

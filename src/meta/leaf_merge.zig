@@ -581,7 +581,7 @@ pub fn smoMerge(t: *KvTree, ctx: *SmoContext, parent: *CachedNode, left: *Cached
     defer gpa.free(refs_r);
     // The two key spaces are disjoint, so the cross-node view order is
     // immaterial to the per-key fold.
-    var folded = try node.foldNodeSources(gpa, &.{ &src_l.loaded, &src_r.loaded }, &.{ refs_l, refs_r }, durable_tail);
+    var folded = try node.foldNodeSources(gpa, &.{ &src_l.loaded, &src_r.loaded }, &.{ refs_l, refs_r }, durable_tail, @min(left.cut_floor.load(.monotonic), right.cut_floor.load(.monotonic)));
     defer folded.deinit(gpa);
     if (folded.encodedBytes() > layout.mergePairCapacity()) {
         // Stale candidate (records landed since the estimate): a clean

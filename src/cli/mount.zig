@@ -74,8 +74,7 @@
 //! hook), a failed spawn after the session armed (`defer
 //! session.deinit()`), and the FAILED verdict. What no daemon code can
 //! cover: an EXTERNAL `umount(8)` (a type-`fuse` mount gets no DESTROY —
-//! the kernel aborts the connection and reclaims any retained ent itself,
-//! `transport_retained_kernel_drained`) and the signals that run no
+//! the kernel aborts the connection itself) and the signals that run no
 //! teardown (`daemon.zig`).
 
 const std = @import("std");
@@ -792,7 +791,7 @@ fn mountMain(ctx: *Ctx) u8 {
         // (it owns both on every path). The typed refusal with an operator
         // remedy names it on the refusal line itself (the `--daemon`
         // invoker sees only this).
-        if (e == error.KmbufRingEnomem) return ctx.failed("the FUSE session could not arm at {s}: {f}", .{ ctx.mountpoint, session_refusal });
+        if (e == error.BufpoolAbsent) return ctx.failed("the FUSE session could not arm at {s}: {f}", .{ ctx.mountpoint, session_refusal });
         return ctx.failed("the FUSE session could not arm at {s} ({s}) — see the log", .{ ctx.mountpoint, @errorName(e) });
     };
     var session_live = true;
@@ -904,7 +903,7 @@ fn mountMain(ctx: *Ctx) u8 {
     //    is freed on every exit of this function; the serve-path teardown
     //    below stops it first for the same reason. The thread reads every
     //    source without a lock: a source freed under it kills the daemon
-    //    in `samplerMain → current` (the kmbuf ENOMEM bring-up of the R5
+    //    in `samplerMain → current` (a late bring-up refusal of the R5
     //    crash row died there with the plane already closed). The `.stats`
     //    renderer's census walks (/proc, /sys) ride the same thread
     //    (decision 0003 §CC.1); the renderer (`vs`) outlives the sampler

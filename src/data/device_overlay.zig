@@ -9,8 +9,8 @@
 //! DMA from an owned buffer); CQE ⇒ the range joins coverage; completion ⇒
 //! ONE transaction flips map + refs, or FEEDS the rewrite epoch for an
 //! overwrite; the displaced binding is freed only after the durable
-//! publish. Always a fresh destination, never in place: ACK-early + a crash
-//! mid-DMA into a mapped offset would tear durable bytes. Volatile: no
+//! publish. Always a fresh destination, never in place: a crash mid-DMA
+//! into a mapped offset would tear durable bytes. Volatile: no
 //! on-disk form, no incompat bit, no journal record.
 //!
 //! Measured (`design-overlay-overwrite.md:1216`): 4 MiB aligned overwrite
@@ -60,8 +60,7 @@
 //! Must-stay-0: `overlay_fence_drops` (a fence drop on a HEALTHY volume;
 //! the same drop while the volume is FAILED or a device fenced is the
 //! counted `overlay_fence_drops_failed_volume` — owner ruling 2026-10-19),
-//! `overlay_unpublished_at_fsync`,
-//! `overlay_ack_early_lost`; tripwires `overlay_teardown_nonterminal`,
+//! `overlay_unpublished_at_fsync`; tripwires `overlay_teardown_nonterminal`,
 //! `overlay_install_race_under_guard`, `overlay_store_superseded_under_
 //! guard`, `overlay_state_word_corrupt` (Q15).
 
@@ -107,9 +106,6 @@ pub const SETTLE_LADDER: retry.Ladder = .{ .base_ns = 1 * std.time.ns_per_ms, .c
 /// The read/drain venue's bounded form: 24 attempts (the rebind ladder's own
 /// `MAX_REBINDS`: past it the read escalates to the serialized settle).
 pub const SETTLE_RETRIES: u32 = 24;
-/// ACK-early continuation: acked custody retries until it lands —
-/// `min(10 ms << min(a, 7), 1 s)`; 1 s is the fence bound's floor.
-pub const ACK_EARLY_LADDER: retry.Ladder = .{ .base_ns = 10 * std.time.ns_per_ms, .cap_ns = 1 * std.time.ns_per_s };
 /// A settle waiting this long on an in-flight store names the leaked
 /// claim loudly — never a hang (the 2026-08-13 fused-lane wedge class).
 pub const SETTLE_BARK_NS: u64 = 30 * std.time.ns_per_s;
@@ -144,9 +140,6 @@ pub const stats = struct {
     /// CQE-counted: the closure quantity (≈ user bytes on the eligible row).
     pub var overlay_store_bytes: counters.ShardedCounter = .{};
     pub var overlay_overwrite_bytes: counters.ShardedCounter = .{};
-    pub var overlay_ack_early_stores: counters.ShardedCounter = .{};
-    pub var overlay_ack_early_bytes: counters.ShardedCounter = .{};
-    pub var overlay_ack_early_retries: counters.ShardedCounter = .{};
     pub var overlay_short_stores: counters.ShardedCounter = .{};
     pub var overlay_store_fallbacks: counters.ShardedCounter = .{};
     pub var overlay_claim_conflicts: counters.ShardedCounter = .{};
@@ -204,7 +197,6 @@ pub const stats = struct {
     // Must-stay-0: a fence drop on a HEALTHY volume.
     pub var overlay_fence_drops: counters.Tripwire = .init("overlay_fence_drops");
     pub var overlay_unpublished_at_fsync: counters.Tripwire = .init("overlay_unpublished_at_fsync");
-    pub var overlay_ack_early_lost: counters.Tripwire = .init("overlay_ack_early_lost");
     pub var overlay_teardown_wait_overlong: counters.Tripwire = .init("overlay_teardown_wait_overlong");
     pub var overlay_teardown_nonterminal: counters.Tripwire = .init("overlay_teardown_nonterminal");
     pub var overlay_install_race_under_guard: counters.Tripwire = .init("overlay_install_race_under_guard");
@@ -215,10 +207,10 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"overlay_open\":{d},\"overlay_inflight_bytes\":{d},", .{ stats.overlay_open.load(), stats.overlay_inflight_bytes.load() });
-    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_ack_early_stores", "overlay_ack_early_bytes", "overlay_ack_early_retries", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_registry_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_epoch_feeds_fresh", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "overlay_teardown_quiesce_waits", "writeback_orphan_discards_overlay", "overlay_fence_drops_failed_volume" }) |name| {
+    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_registry_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_epoch_feeds_fresh", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "overlay_teardown_quiesce_waits", "writeback_orphan_discards_overlay", "overlay_fence_drops_failed_volume" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "overlay_fence_drops", "overlay_unpublished_at_fsync", "overlay_ack_early_lost", "overlay_teardown_wait_overlong", "overlay_teardown_nonterminal", "overlay_install_race_under_guard", "overlay_store_superseded_under_guard", "overlay_state_word_corrupt", "overlay_registry_full" }, 0..) |name, i| {
+    inline for (.{ "overlay_fence_drops", "overlay_unpublished_at_fsync", "overlay_teardown_wait_overlong", "overlay_teardown_nonterminal", "overlay_install_race_under_guard", "overlay_store_superseded_under_guard", "overlay_state_word_corrupt", "overlay_registry_full" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, counters.tripwireCount(name) });
     }
@@ -733,9 +725,6 @@ pub const Config = struct {
     close_barrier: bool = false,
     /// `SQUEEZEFS_OVERLAY_DEPTH_GOVERNOR`.
     depth_governor: bool = true,
-    /// `SQUEEZEFS_ZC_ACK_EARLY` / `_ODIRECT`.
-    ack_early: bool = true,
-    ack_early_odirect: bool = false,
     /// `SQUEEZEFS_ZC_HOLD_OVERLAY`: an overlay-class write is HELD in its
     /// zero-copy slot at delivery (the plane's hold gate) and stored by
     /// `WRITE_FIXED(device ← slot)`; off = extracted at delivery (the
@@ -778,19 +767,11 @@ pub const Deps = struct {
     touched_ctx: ?*anyopaque = null,
 };
 
-/// The payload's stability class at mint (the §3.4 stability law).
-pub const PayloadClass = enum { page_cache, odirect };
-
 pub const SlotVehicle = struct {
     src: seams.HeldSource,
-    class: PayloadClass,
-    /// The transport's retention probe is present (COMMIT_RETAIN).
-    commit_retain: bool,
     ctx: ?*anyopaque = null,
     /// The fallback bytes (one bridge, memoized by the transport).
     extract: ?*const fn (ctx: ?*anyopaque, io: Io) anyerror![]const u8 = null,
-    /// `z.release_payload()` exactly once, last (the ACK-early continuation).
-    release: ?*const fn (ctx: ?*anyopaque) void = null,
 };
 
 /// Q8: the store takes a vehicle from the request; tests construct the
@@ -826,8 +807,6 @@ pub const StoreOutcome = union(enum) {
         /// The block's coverage completed on this CQE: the caller drops its
         /// guard and drains (publishes) the block.
         coverage_complete: bool,
-        /// ACK-early: the DMA lands on a detached continuation.
-        acked_early: bool,
     },
     /// The range is claimed under the caller's (3); the caller DROPS (3)
     /// and `land`s it: the claim, not the guard, excludes an overlapping
@@ -1019,30 +998,6 @@ pub const Overlay = struct {
         pre = null;
         if (permit != null) stats.overlay_governed_stores.inc();
         stats.overlay_inflight_bytes.add(len);
-        // 6. ACK-early: a sound (page-cache) held slot under retention
-        //    lands on a detached continuation; the O_DIRECT class only
-        //    under its opt-in, as a SNAPSHOT (the 2026-08-09 aliasing).
-        if (req.vehicle == .slot) early: {
-            const sv = req.vehicle.slot;
-            const early = self.cfg.ack_early and sv.commit_retain and (sv.class == .page_cache or (self.cfg.ack_early_odirect and sv.extract != null));
-            if (early) {
-                stats.overlay_ack_early_stores.inc();
-                stats.overlay_ack_early_bytes.add(len);
-                const snapshot: ?[]const u8 = if (sv.class == .odirect) blk: {
-                    const b = sv.extract.?(sv.ctx, io) catch {
-                        _ = self.finishStore(io, rec, ticket, permit, len, overwrite, false);
-                        return error.InputOutput;
-                    };
-                    break :blk b;
-                } else null;
-                self.tasks.spawn(io, ackEarlyContinuation, .{ self, io, rec, ticket, permit, sv, snapshot, len, overwrite }) catch {
-                    // No unit of concurrency: the caller lands it (still
-                    // acked only after the CQE — the sound fallback).
-                    break :early;
-                };
-                return .{ .stored = .{ .coverage_complete = false, .acked_early = true } };
-            }
-        }
         return .{ .claimed = .{ .rec = rec, .ticket = ticket, .permit = permit, .rel = req.rel, .vehicle = req.vehicle, .overwrite = overwrite } };
     }
 
@@ -1109,18 +1064,18 @@ pub const Overlay = struct {
         rec.inflight_change.notifyWaitersAfter(io, HoldDrop{ .ov = self, .io = io, .core = &rec.core, .ticket = ticket });
         // `rec` is not ours past this line: a settler's quiesce may have
         // retired it and its slot may already host another record.
-        if (!success) return .{ .stored = .{ .coverage_complete = false, .acked_early = false } };
+        if (!success) return .{ .stored = .{ .coverage_complete = false } };
         stats.overlay_stores.inc();
         stats.overlay_store_bytes.add(len);
         if (overwrite) stats.overlay_overwrite_bytes.add(len);
         return switch (verdict) {
-            .covered => |c| .{ .stored = .{ .coverage_complete = c.coverage_complete, .acked_early = false } },
+            .covered => |c| .{ .stored = .{ .coverage_complete = c.coverage_complete } },
             .superseded => blk: {
                 // Every terminal transition awaits `inflight`, which this store held.
                 stats.overlay_store_superseded_under_guard.fire("a store completed on a record that went terminal while it was in flight");
-                break :blk .{ .stored = .{ .coverage_complete = false, .acked_early = false } };
+                break :blk .{ .stored = .{ .coverage_complete = false } };
             },
-            .not_covered => .{ .stored = .{ .coverage_complete = false, .acked_early = false } },
+            .not_covered => .{ .stored = .{ .coverage_complete = false } },
         };
     }
 
@@ -1158,43 +1113,6 @@ pub const Overlay = struct {
         _ = self.announce_held.fetchAdd(1, .release);
         n.waitUncancelable(io);
         _ = self.announce_held.fetchSub(1, .release);
-    }
-
-    /// The ACK-early continuation: retry-forever on the ladder; the fence
-    /// latch is the ONE legal drop (`overlay_fence_drops`); a dead ring
-    /// falls back to the pooled vehicle with the ACK-time bytes, else
-    /// `overlay_ack_early_lost` loud; coverage publishes at the REAL CQE;
-    /// the payload is released exactly once, last.
-    fn ackEarlyContinuation(self: *Overlay, io: Io, rec: *Record, ticket: Ticket, permit: ?pipeline.Permit, sv: SlotVehicle, snapshot: ?[]const u8, len: u64, overwrite: bool) Io.Cancelable!void {
-        defer if (sv.release) |r| r(sv.ctx);
-        var ladder = ACK_EARLY_LADDER;
-        const dest_off = rec.dest.offset + ticket.first_page * OVERLAY_PAGE;
-        while (true) {
-            const attempt: StoreError!void = if (snapshot) |b| self.dmaBytes(rec, dest_off, b) else self.dmaVehicle(io, rec, dest_off, .{ .slot = sv });
-            if (attempt) |_| {
-                _ = self.finishStore(io, rec, ticket, permit, len, overwrite, true);
-                return;
-            } else |e| switch (e) {
-                error.WriterGuardFenced, error.VolumeFailed => {
-                    self.noteFenceDrop(rec.key.ino, rec.key.block, "the acked store", @errorName(e), "an acked store met the fence before landing on a HEALTHY volume");
-                    _ = self.finishStore(io, rec, ticket, permit, len, overwrite, false);
-                    return;
-                },
-                error.WorkerShutdown => {
-                    // The ring died: the ACK-time bytes through the pooled vehicle.
-                    if (snapshot == null and sv.extract == null) {
-                        stats.overlay_ack_early_lost.fire("acked bytes unreachable after the ring died");
-                        _ = self.finishStore(io, rec, ticket, permit, len, overwrite, false);
-                        return;
-                    }
-                },
-                else => {},
-            }
-            stats.overlay_ack_early_retries.inc();
-            const step = ladder.next();
-            if (ladder.shouldBark()) log.warn("overlay ino {d} block {d}: acked store not landed after {d} attempts — retrying (acked custody is never dropped)", .{ rec.key.ino, rec.key.block, ladder.attempts() });
-            try io.sleep(.{ .nanoseconds = @intCast(step.backoff_ns) }, .awake);
-        }
     }
 
     /// INSTALL: `allocate_placed_block` (reserve-before-DMA; `StorageFull`
@@ -1794,7 +1712,7 @@ pub const Overlay = struct {
         return true;
     }
 
-    /// The future law: a read intersecting an acked-but-incomplete store
+    /// The future law: a read intersecting a claimed-but-incomplete store
     /// waits for the store — never an uncovered old-map gap. Event wait on
     /// `inflight_change` (Q4: no yield spin).
     fn awaitPages(_: *Overlay, io: Io, rec: *Record, first_page: u32, pages: u32) void {
@@ -2306,7 +2224,7 @@ test "the slot vehicle: WRITE_FIXED(device ← slot) lands the held bytes with z
             return b;
         }
     };
-    const sv: SlotVehicle = .{ .src = .{ .qid = 0, .buf_index = 5, .len = wt.BS }, .class = .page_cache, .commit_retain = false, .ctx = &held, .extract = &Ex.extract };
+    const sv: SlotVehicle = .{ .src = .{ .qid = 0, .buf_index = 5, .len = wt.BS }, .ctx = &held, .extract = &Ex.extract };
     const fallbacks0 = stats.overlay_store_fallbacks.load();
     const o = try w.ov.store(io, .{ .ino = 47, .block = 0, .rel = 0, .vehicle = .{ .slot = sv }, .file = TestWorld.striped(0) });
     try testing.expect(o.stored.coverage_complete);
@@ -2680,7 +2598,7 @@ test "crash windows OW-1..OW-8 as RAM cases: an unpublished dest is reclaimable 
     _ = w.epochs.close(io, 71, w.cs());
 }
 
-test "ack_early_write_returns_before_store_cqe; fsync_awaits_acked_inflight_store; read_waits_for_acked_inflight_store (the future law); the payload is released exactly once" {
+test "read_waits_for_inflight_store (the future law): a claimed store whose DMA is still in flight is waited on by an intersecting reader — never an uncovered gap — and the drain publishes after its CQE" {
     const io = testing.io;
     const w = try TestWorld.init(testing.allocator, .{});
     defer w.deinit(testing.allocator);
@@ -2690,37 +2608,31 @@ test "ack_early_write_returns_before_store_cqe; fsync_awaits_acked_inflight_stor
     try w.f.dev.registerSlot(9, &held);
     const Gate = struct {
         var hold: std.atomic.Value(bool) = .init(true);
-        var released: std.atomic.Value(u32) = .init(0);
         var landed: std.atomic.Value(bool) = .init(false);
         fn hook(_: *anyopaque, _: *wt.FakeDevice, _: u64, _: u64, _: u64) void {
             // Hold the CQE until the test lets it go.
             while (hold.load(.acquire)) std.Thread.yield() catch {};
             landed.store(true, .release);
         }
-        fn release(_: ?*anyopaque) void {
-            _ = released.fetchAdd(1, .acq_rel);
-        }
     };
     var dummy: u8 = 0;
     w.f.dev.hook = .{ .ctx = &dummy, .call = &Gate.hook };
-    const early0 = stats.overlay_ack_early_stores.load();
-    const lost0 = counters.tripwireCount("overlay_ack_early_lost");
-    const sv: SlotVehicle = .{ .src = .{ .qid = 0, .buf_index = 9, .len = wt.BS }, .class = .page_cache, .commit_retain = true, .release = &Gate.release };
-    const o = w.ov.store(io, .{ .ino = 80, .block = 0, .rel = 0, .vehicle = .{ .slot = sv }, .file = TestWorld.striped(0) }) catch |e| switch (e) {
-        else => return e,
+    const sv: SlotVehicle = .{ .src = .{ .qid = 0, .buf_index = 9, .len = wt.BS } };
+    const c = switch (try w.ov.claim(io, .{ .ino = 80, .block = 0, .rel = 0, .vehicle = .{ .slot = sv }, .file = TestWorld.striped(0) })) {
+        .claimed => |claimed| claimed,
+        else => return error.TestUnexpectedResult,
     };
-    if (!o.stored.acked_early) {
-        // No unit of concurrency on this executor: the sound fallback acked after the CQE.
-        Gate.hold.store(false, .release);
-        w.ov.drainBlock(io, &w.locks, 80, 0, false, w.cs());
-        return;
-    }
-    // ACKed before the CQE landed.
-    try testing.expect(!Gate.landed.load(.acquire));
-    try testing.expectEqual(early0 + 1, stats.overlay_ack_early_stores.load());
+    const Lander = struct {
+        fn run(io_: Io, ov: *Overlay, cl: Claimed, res: *StoreError!StoreOutcome) void {
+            res.* = ov.land(io_, cl);
+        }
+    };
+    var landed: StoreError!StoreOutcome = .declined;
+    const lt = try std.Thread.spawn(.{}, Lander.run, .{ io, &w.ov, c, &landed });
     const rec = w.ov.registry.get(.{ .ino = 80, .block = 0 }).?;
     try testing.expect(rec.core.rangeInflight(0, 1));
-    // A reader intersecting the acked store WAITS for it (never an uncovered gap); the fsync drain awaits it too.
+    try testing.expect(!Gate.landed.load(.acquire));
+    // A reader intersecting the in-flight store WAITS for it.
     const Reader = struct {
         fn run(io_: Io, ov: *Overlay, out: *[wt.BS]u8, res: *Overlay.ServeOutcome) void {
             res.* = ov.serve(io_, 80, 0, 0, out);
@@ -2732,13 +2644,12 @@ test "ack_early_write_returns_before_store_cqe; fsync_awaits_acked_inflight_stor
     while (rec.inflight_change.waiters(io) == 0) try std.Thread.yield();
     Gate.hold.store(false, .release);
     th.join();
+    lt.join();
+    try testing.expect((try landed).stored.coverage_complete);
     try testing.expectEqual(Overlay.ServeOutcome.served, res);
     try testing.expectEqualSlices(u8, &held, &out);
     w.ov.drainBlock(io, &w.locks, 80, 0, true, w.cs());
     try testing.expect(w.f.map.seam().lookup(80, 0) != null);
-    try w.ov.tasks.wait(io);
-    try testing.expectEqual(@as(u32, 1), Gate.released.load(.acquire));
-    try testing.expectEqual(lost0, counters.tripwireCount("overlay_ack_early_lost"));
     w.f.dev.hook = null;
 }
 

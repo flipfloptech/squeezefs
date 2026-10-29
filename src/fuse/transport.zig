@@ -1,6 +1,6 @@
 //! The FUSE-over-io_uring transport (charter §4; `docs/porting/
 //! fuse_uring_transport.md`): the slot state machine with its payload-lease
-//! commit gate, the per-worker commit-cell queue, the drain-group workers,
+//! commit gate, the per-worker commit-cell queue, the queue workers,
 //! the session (mount, the ordered INIT bring-up, the classical sideband,
 //! notify, teardown) and the `Filesystem` vtable the transport calls.
 //!
@@ -21,7 +21,6 @@ pub const probes = @import("transport/probes.zig");
 pub const pass_stamps = @import("transport/pass_stamps.zig");
 
 // ---- Linux only ----
-pub const kmbuf = if (is_linux) @import("transport/kmbuf.zig") else struct {};
 pub const worker = if (is_linux) @import("transport/worker.zig") else struct {};
 pub const session = if (is_linux) @import("transport/session.zig") else struct {};
 
@@ -41,7 +40,6 @@ test {
     _ = probes;
     _ = pass_stamps;
     if (is_linux) {
-        _ = kmbuf;
         _ = worker;
         _ = session;
     }

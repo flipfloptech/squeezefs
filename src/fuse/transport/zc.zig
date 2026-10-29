@@ -1,16 +1,10 @@
-//! The buffer-mode lattice's PURE pieces (charter §3 "Capability
-//! discipline", §4 "Buffer-mode lattice"; `docs/porting/fuse_kmbuf_zc.md`
-//! §3–§7): the kmbuf index laws and the CQE-bid attachment law, the
-//! zero-copy slot direction, the paged-opcode mirror with its PROBE latch,
-//! the hold predicate and the payload stability class, the bridge deadline
-//! ledger with its cancel-once latch, the cancel-CQE ladder and the fused
-//! run-queue. Portable value types; the worker composes them over its ring.
-//!
-//! Nothing here is keyed to a kernel TRACK (decision 0002 ledger: the
-//! reference's per-track opcode mirror was an ABI inference). What differs
-//! per kernel is resolved by a probe: the kmbuf opcode pair by the ladder in
-//! `probes.zig`, the readdir class's pagedness by the first bridge's own
-//! verdict (`ReaddirLatch`).
+//! The zero-copy transport's PURE pieces (charter §4 "Buffer pools and
+//! zero-copy"; `docs/porting/fuse_mainline_pools.md` §3–§4,
+//! `fuse_kmbuf_zc.md` §4.4, §7): the zero-copy slot direction as the
+//! kernel states it, the hold predicate and class, the bridge's NOWAIT
+//! pieces, the bridge deadline ledger with its cancel-once latch, the
+//! cancel-CQE ladder and the fused run-queue. Portable value types; the
+//! worker composes them over its ring.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -21,9 +15,6 @@ const derive = @import("../../core/derive.zig");
 // Constants with their reasons.
 // ---------------------------------------------------------------------------
 
-/// `sizeof(fuse_uring_req_header)`: the kernel maps header `i` of a kmbuf
-/// queue at `fixed_buf_id × 288` into fixed buffer index 0 (`+ depth` under zc).
-pub const HEADER_STRIDE: usize = @sizeOf(abi.fuse_uring_req_header);
 /// The bridge deadline: the D1.b op-watchdog threshold's transport twin
 /// (a bridge is a device-class op; a slot a DMA never completes is the same
 /// wedge the watchdog names). A documented constant, not a knob (0002 Q9).
@@ -42,73 +33,11 @@ pub const HOLD_ALIGN: u64 = 4096;
 pub const FUSED_POLL_MAX: u8 = 4;
 
 comptime {
-    std.debug.assert(HEADER_STRIDE == 288);
     std.debug.assert(BRIDGE_SCAN_PERIOD_NS > 0);
 }
 
 // ---------------------------------------------------------------------------
-// kmbuf index laws (porting spec §3.2)
-// ---------------------------------------------------------------------------
-
-/// The kernel requires a power of two below 65536; `max(…, 1)` so a depth
-/// of 1 registers one buffer.
-pub fn ringEntriesFor(depth: u32) u32 {
-    const n: u32 = @intCast(derive.nextPow2(@max(depth, 1)));
-    std.debug.assert(n < 65536);
-    return n;
-}
-
-/// The headers region: `depth × 288` rounded to the page (a page-granular
-/// anonymous mapping to register as a fixed buffer).
-pub fn headersSpan(depth: u32, page: usize) usize {
-    return @intCast(derive.alignUp(@as(u64, depth) * HEADER_STRIDE, page));
-}
-
-/// Fixed-table index of the headers buffer: 0 under BufRing; `depth` under
-/// zero-copy (indices `0..depth` are the per-ent sparse slots).
-pub fn headersIndex(zero_copy: bool, depth: u32) u16 {
-    return if (zero_copy) @intCast(depth) else abi.FUSE_URING_FIXED_HEADERS_OFFSET;
-}
-
-/// The REGISTER `init.flags` word per mode: zc never rides without BUF_RING,
-/// retention never without ZERO_COPY (the kernel refuses both EINVAL).
-pub fn initFlags(zero_copy: bool, retention: bool) u16 {
-    var f: u16 = abi.FUSE_URING_BUF_RING;
-    if (zero_copy) f |= abi.FUSE_URING_ZERO_COPY;
-    if (zero_copy and retention) f |= abi.FUSE_URING_PAYLOAD_RETENTION;
-    return f;
-}
-
-/// The attachment law (porting spec §3.4): a delivery CQE flagged
-/// `IORING_CQE_F_BUFFER` re-points the ent's attached kmbuf buffer to the
-/// bid in its high 16 bits; an unflagged CQE KEEPS the current attachment
-/// (the kernel reuses the buffer across consecutive payload-carrying
-/// requests and recycles it only when a payload-less one is fetched — a
-/// stale attachment can only precede a payload-less delivery, whose reply
-/// never writes the payload region). A bid at or past `ring_entries` is a
-/// protocol breach the caller shuts down on.
-pub const Attachment = struct {
-    bid: ?u32 = null,
-
-    pub const Note = union(enum) { kept, repointed: u32, breach: u32 };
-
-    pub fn note(self: *Attachment, cqe_flags: u32, ring_entries: u32) Note {
-        if (cqe_flags & abi.IORING_CQE_F_BUFFER == 0) return .kept;
-        const bid: u32 = cqe_flags >> abi.IORING_CQE_BUFFER_SHIFT;
-        if (bid >= ring_entries) return .{ .breach = bid };
-        self.bid = bid;
-        return .{ .repointed = bid };
-    }
-
-    /// The attached buffer's byte window in the region, or null.
-    pub fn window(self: Attachment, region: []u8, buf_size: usize, payload_len: usize) []u8 {
-        const bid = self.bid orelse return &.{};
-        return region[@as(usize, bid) * buf_size ..][0..payload_len];
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Zero-copy: slot direction and the paged mirror (porting spec §4.1–4.2)
+// Zero-copy: the slot direction (fuse_mainline_pools.md §3)
 // ---------------------------------------------------------------------------
 
 /// What the kernel installed in a zc slot at delivery: nothing (a copyable
@@ -118,44 +47,14 @@ pub const Attachment = struct {
 /// into it is `-EFAULT` — the direction law).
 pub const Dir = enum(u8) { none, dest, source };
 
-/// The readdir class's pagedness (`fuse_readdir_alloc_buf` sets `out_pages`
-/// on some kernel trees, not others) resolved by the FIRST bridge on a
-/// readdir-class slot: `-EFAULT` ⇒ the slot was never registered (copyable);
-/// a full-length completion ⇒ paged. Latched per session, never guessed
-/// from a track.
-pub const ReaddirLatch = enum(u8) { unresolved, paged, copyable };
-
-/// The opcodes whose reply body rides the app's pages on EVERY kernel tree
-/// that zero-copies (`fuse_read_args_fill` / `fuse_readlink_page` set
-/// `out_pages`), the readdir class by the latch (optimistic while
-/// unresolved: the bridge IS the probe), and the one in-paged opcode (WRITE
-/// data pages).
-pub fn outPaged(op: abi.Opcode, latch: ReaddirLatch) bool {
-    return switch (op) {
-        .read, .readlink => true,
-        .readdir, .readdirplus => latch != .copyable,
-        else => false,
-    };
-}
-
-pub fn inPaged(op: abi.Opcode) bool {
-    return op == .write;
-}
-
-pub fn dirOf(op: abi.Opcode, latch: ReaddirLatch) Dir {
-    if (inPaged(op)) return .source;
-    if (outPaged(op, latch)) return .dest;
-    return .none;
-}
-
-/// The mainline rung's direction (fuse_mainline_pools.md §4): the kernel
-/// STATES a zero-copied delivery in `fuse_uring_ent_in_out.flags`
-/// (`FUSE_URING_ENT_ZERO_COPY`) — the quirk-3 resolution, no opcode mirror,
-/// no readdir latch — and zero-copies exactly READ (`out_pages`: a DEST)
-/// and WRITE (`in_pages`: a SOURCE); any other opcode flagged is a kernel
-/// the daemon does not know, read as copyable (the flag is then a lie the
-/// commit's EIO guard meets, never a bridge into a slot that is not there).
-pub fn mainlineDirOf(op: abi.Opcode, ent_flags: u64) Dir {
+/// The slot's direction (fuse_mainline_pools.md §4): the kernel STATES a
+/// zero-copied delivery in `fuse_uring_ent_in_out.flags`
+/// (`FUSE_URING_ENT_ZERO_COPY`) — no opcode mirror — and zero-copies
+/// exactly READ (`out_pages`: a DEST) and WRITE (`in_pages`: a SOURCE);
+/// any other opcode flagged is a kernel the daemon does not know, read as
+/// copyable (the flag is then a lie the commit's EIO guard meets, never a
+/// bridge into a slot that is not there).
+pub fn dirOf(op: abi.Opcode, ent_flags: u64) Dir {
     if (ent_flags & abi.FUSE_URING_ENT_ZERO_COPY == 0) return .none;
     return switch (op) {
         .write => .source,
@@ -165,7 +64,7 @@ pub fn mainlineDirOf(op: abi.Opcode, ent_flags: u64) Dir {
 }
 
 // ---------------------------------------------------------------------------
-// The hold predicate and the stability class (porting spec §4.4, §5.2)
+// The hold predicate and class (porting spec §4.4)
 // ---------------------------------------------------------------------------
 
 /// The hold SHAPE as a pure predicate on the request (the transport's
@@ -253,23 +152,6 @@ pub fn parseSysfsUnsigned(text: []const u8) ?u64 {
     if (t.len == 0) return null;
     return std.fmt.parseInt(u64, t, 10) catch null;
 }
-
-/// The stability law (porting spec §5.2): page-cache folios are sound after
-/// an ACK-early (a later modification is a redirty = a new WRITE);
-/// O_DIRECT/GUP pages are NOT (the app owns them again at write(2)'s return
-/// and the DMA samples them later) — a `.direct_gup` payload refuses
-/// `replyRetain`. Stamped at delivery from the write's wire bits:
-/// `odirect = (open flags & O_DIRECT) ∧ !(write_flags & FUSE_WRITE_CACHE)`.
-pub const PayloadClass = enum(u8) {
-    page_cache,
-    direct_gup,
-
-    pub fn classify(open_flags: u32, write_flags: u32) PayloadClass {
-        const o_direct: u32 = @bitCast(linux.O{ .DIRECT = true });
-        if (open_flags & o_direct != 0 and write_flags & abi.FUSE_WRITE_CACHE == 0) return .direct_gup;
-        return .page_cache;
-    }
-};
 
 /// `fuse_candidate(len, ceiling, on) = on ∧ len > 0 ∧ len ≤ ceiling`
 /// (ceiling inclusive; zero-length never).
@@ -432,62 +314,16 @@ test "fuzz: the queue attribute parser (parseSysfsUnsigned) is total on arbitrar
     try fuzzkit.fuzz({}, sysfsUnsignedFuzz, .{ .corpus = &.{ fuzzkit.slice("1020\n"), fuzzkit.slice(""), fuzzkit.slice("-1"), fuzzkit.slice("18446744073709551616") } });
 }
 
-test "kmbuf indexing: header stride 288, ring_entries = next_pow2(depth) ≥ 1, the headers span is page-granular, the headers index is 0 under BufRing and depth under zc, zc never rides without BUF_RING and retention never without zc" {
-    try testing.expectEqual(@as(usize, 288), HEADER_STRIDE);
-    try testing.expectEqual(@as(u32, 1), ringEntriesFor(0));
-    try testing.expectEqual(@as(u32, 1), ringEntriesFor(1));
-    try testing.expectEqual(@as(u32, 4), ringEntriesFor(3));
-    try testing.expectEqual(@as(u32, 32), ringEntriesFor(32));
-    try testing.expectEqual(@as(u32, 64), ringEntriesFor(33));
-    try testing.expectEqual(@as(usize, 4096), headersSpan(4, 4096));
-    try testing.expectEqual(@as(usize, 12288), headersSpan(32, 4096));
-    try testing.expectEqual(@as(u16, 0), headersIndex(false, 32));
-    try testing.expectEqual(@as(u16, 32), headersIndex(true, 32));
-    try testing.expectEqual(abi.FUSE_URING_BUF_RING, initFlags(false, false));
-    try testing.expectEqual(abi.FUSE_URING_BUF_RING, initFlags(false, true));
-    try testing.expectEqual(abi.FUSE_URING_BUF_RING | abi.FUSE_URING_ZERO_COPY, initFlags(true, false));
-    try testing.expectEqual(abi.FUSE_URING_BUF_RING | abi.FUSE_URING_ZERO_COPY | abi.FUSE_URING_PAYLOAD_RETENTION, initFlags(true, true));
-}
-
-test "the attachment law: a flagged CQE re-points, an unflagged one keeps, an out-of-range bid is a breach; the window addresses region + bid × buf_size" {
-    var a: Attachment = .{};
-    var region: [4 * 64]u8 = undefined;
-    for (&region, 0..) |*b, i| b.* = @intCast(i / 64);
-    try testing.expectEqual(Attachment.Note.kept, a.note(0, 4));
-    try testing.expectEqual(@as(usize, 0), a.window(&region, 64, 16).len);
-    try testing.expectEqual(Attachment.Note{ .repointed = 2 }, a.note(abi.IORING_CQE_F_BUFFER | (2 << 16), 4));
-    try testing.expectEqual(@as(u8, 2), a.window(&region, 64, 16)[0]);
-    try testing.expectEqual(Attachment.Note.kept, a.note(0, 4));
-    try testing.expectEqual(@as(?u32, 2), a.bid);
-    try testing.expectEqual(Attachment.Note{ .breach = 4 }, a.note(abi.IORING_CQE_F_BUFFER | (4 << 16), 4));
-    try testing.expectEqual(@as(?u32, 2), a.bid);
-    try testing.expectEqual(Attachment.Note{ .repointed = 0 }, a.note(abi.IORING_CQE_F_BUFFER, 4));
-    try testing.expectEqual(@as(u8, 0), a.window(&region, 64, 16)[0]);
-}
-
-test "the paged mirror is not track-keyed: READ/READLINK out-paged always, WRITE in-paged, the readdir class optimistic until the latch says copyable, everything else none" {
-    try testing.expectEqual(Dir.dest, dirOf(.read, .unresolved));
-    try testing.expectEqual(Dir.dest, dirOf(.readlink, .copyable));
-    try testing.expectEqual(Dir.source, dirOf(.write, .unresolved));
-    try testing.expectEqual(Dir.dest, dirOf(.readdir, .unresolved));
-    try testing.expectEqual(Dir.dest, dirOf(.readdirplus, .paged));
-    try testing.expectEqual(Dir.none, dirOf(.readdir, .copyable));
-    try testing.expectEqual(Dir.none, dirOf(.readdirplus, .copyable));
-    try testing.expectEqual(Dir.none, dirOf(.getattr, .unresolved));
-    try testing.expectEqual(Dir.none, dirOf(.lookup, .paged));
-    try testing.expect(!inPaged(.read) and inPaged(.write));
-}
-
-test "the mainline direction is the kernel's word, not a mirror: ENT_ZERO_COPY on a READ is a DEST slot, on a WRITE a SOURCE; unflagged READ/WRITE copy through the pool; a flagged opcode the kernel does not zero-copy (readdir, readlink) reads copyable" {
+test "the slot direction is the kernel's word, not a mirror: ENT_ZERO_COPY on a READ is a DEST slot, on a WRITE a SOURCE; unflagged READ/WRITE copy through the pool; a flagged opcode the kernel does not zero-copy (readdir, readlink) reads copyable" {
     const f = abi.FUSE_URING_ENT_ZERO_COPY;
-    try testing.expectEqual(Dir.dest, mainlineDirOf(.read, f));
-    try testing.expectEqual(Dir.source, mainlineDirOf(.write, f));
-    try testing.expectEqual(Dir.none, mainlineDirOf(.read, 0));
-    try testing.expectEqual(Dir.none, mainlineDirOf(.write, 0));
-    try testing.expectEqual(Dir.none, mainlineDirOf(.readdir, f));
-    try testing.expectEqual(Dir.none, mainlineDirOf(.readlink, f));
-    try testing.expectEqual(Dir.none, mainlineDirOf(.getattr, f | 2));
-    try testing.expectEqual(Dir.dest, mainlineDirOf(.read, f | 2));
+    try testing.expectEqual(Dir.dest, dirOf(.read, f));
+    try testing.expectEqual(Dir.source, dirOf(.write, f));
+    try testing.expectEqual(Dir.none, dirOf(.read, 0));
+    try testing.expectEqual(Dir.none, dirOf(.write, 0));
+    try testing.expectEqual(Dir.none, dirOf(.readdir, f));
+    try testing.expectEqual(Dir.none, dirOf(.readlink, f));
+    try testing.expectEqual(Dir.none, dirOf(.getattr, f | 2));
+    try testing.expectEqual(Dir.dest, dirOf(.read, f | 2));
 }
 
 test "the hold shape: 4 KiB alignment, within one block, zero length never, no bound of its own (a whole-payload 1 MiB write holds, a 4 MiB block-sized write holds); the class splits on PATCH_MAX = block/8 — at or under it W1, above it the overlay" {
@@ -537,14 +373,6 @@ test "the bridge's NOWAIT pieces: no ceiling or a fitting DMA is one piece; nvme
     try testing.expectEqual(@as(?u64, 1020), parseSysfsUnsigned("1020\n"));
     try testing.expectEqual(@as(?u64, null), parseSysfsUnsigned("\n"));
     try testing.expectEqual(@as(?u64, null), parseSysfsUnsigned("x"));
-}
-
-test "the stability class: O_DIRECT without FUSE_WRITE_CACHE is direct_gup; a writeback-cache write is page_cache even with O_DIRECT; a plain write is page_cache" {
-    const o_direct: u32 = @bitCast(linux.O{ .DIRECT = true });
-    try testing.expectEqual(PayloadClass.direct_gup, PayloadClass.classify(o_direct, 0));
-    try testing.expectEqual(PayloadClass.page_cache, PayloadClass.classify(o_direct, abi.FUSE_WRITE_CACHE));
-    try testing.expectEqual(PayloadClass.page_cache, PayloadClass.classify(0, 0));
-    try testing.expectEqual(PayloadClass.page_cache, PayloadClass.classify(@bitCast(linux.O{ .ACCMODE = .WRONLY }), 0));
 }
 
 test "fuse_candidate: on ∧ 0 < len ≤ ceiling (inclusive)" {

@@ -187,7 +187,6 @@ data.data_superblock.test.fuzz: the data superblock decoders are total on arbitr
 data.data_superblock.test.the format plan: zero chunk 0 (sector 0 first) and the last chunk, the tail copy with a barrier, sector 0 last with a barrier; applied to an image it classifies from the primary; the prefix before the last step reads Blank	21854	21844
 data.data_superblock.test.the wire is 128 B at the spec's offsets; encode∘decode = id; the sector's padding is under the checksum; capacity reserves two chunks; a passthrough volume's chunk is its block	33	34
 data.device_overlay.test.a store whose DMA fails never joins coverage (law 3) and fails THIS write; a torn DMA leaves the uncovered range served from zeros; the record stays Open for the sibling	1598	1586
-data.device_overlay.test.ack_early_write_returns_before_store_cqe; fsync_awaits_acked_inflight_store; read_waits_for_acked_inflight_store (the future law); the payload is released exactly once	2131	2204
 data.device_overlay.test.crash windows OW-1..OW-8 as RAM cases: an unpublished dest is reclaimable by the census (refcount 1, never named by the map), the old image intact; the fed-but-unsaved epoch ≡ OW-1; a swap durable with frees not run leaves a tracked A key the census free-lists; OW-7 durably written ≠ durably named	2781	2771
 data.device_overlay.test.fence immediate on every settle leg: a gap seed or a flush answering VolumeFailed/WriterGuardFenced tears the record down FenceDropped at once — no retry, nothing published, the dest not freed, the must-stay-0 fired	3719	2213
 data.device_overlay.test.fresh_block_segments_ride_the_overlay_and_publish_at_completion: two disjoint pieces (end first) → one record, coverage completes, ONE merge, stores ≈ user bytes, no extraction, zero gap seeds	2523	2505
@@ -196,6 +195,7 @@ data.device_overlay.test.live_mapped_overwrite_rides_the_overlay_end_to_end: the
 data.device_overlay.test.overlay_core: coverage publishes only on a successful complete (law 3); the completion fires exactly once at full union; overlapping in-flight stores are unrepresentable (§3.3); generations are strictly monotone per accepted segment	9	10
 data.device_overlay.test.overlay_core: freeze refuses new stores and the in-flight set drains to publishable; law 9 rollback requires terminal ∧ empty; fence_drop is terminal and never publishable; fed is reachable only from the freeze	16	16
 data.device_overlay.test.partial_overlay_fsync_seeds_zeros_and_publishes_whole_block; open_overlay_reads_serve_acked_bytes_and_zero_gaps; the fsync sequence runs FREEZE → COMPLETE → SEED → FLUSH → PUBLISH with the barrier before the merge	1899	1873
+data.device_overlay.test.read_waits_for_inflight_store (the future law): a claimed store whose DMA is still in flight is waited on by an intersecting reader — never an uncovered gap — and the drain publishes after its CQE	2131	2204
 data.device_overlay.test.the fsync drain covers EVERY open record of the ino, however many: 70 blocks each with an open record (more than one enumeration page) all publish, none left (repro-port: LTP fs_fill — xfs on a loop device over a 300 MiB file — fired overlay_unpublished_at_fsync five times)	11266	11200
 data.device_overlay.test.the settle's backoff never parks under (3): a device that keeps failing the gap seed leaves the record FROZEN never-lossy and the settler sleeps with the guard dropped — a sibling takes the guard mid-ladder, a store's steal is ONE attempt; when the device returns the settle lands once with the gap zero-seeded	3362	1983
 data.device_overlay.test.the settle's never-lossy and fence arms: a transient leaves the record FROZEN and retries on the ladder; a dead old binding supersedes and frees the dest; a fence publishes nothing, frees nothing (must-stay-0 fired); a reclaimed ino discards the orphan	6656	2233
@@ -615,7 +615,7 @@ fuse.abi.test.spec table pins: in_header 40 (total_extlen@36), out_header 16, at
 fuse.abi.test.the wire is little-endian native: a u32 at offset 0 lands low byte first	6	6
 fuse.abi.test.time limits: the whole-second interior of the i64-ns word, conservative by one second on the floor	1	2
 fuse.abi.test.totality: every decoder returns or null on every length 0..300 (deterministic)	296	296
-fuse.abi.test.uring ABI pins: req header 288 (op_in@128, ring_ent@256), cmd_req 24 (qid@16, union u16@18, queue_depth@20), ent_in_out 32, buf_reg 40, SQE128 placement	18	19
+fuse.abi.test.uring ABI pins (uapi 7.46): req header 288 (op_in@128, ring_ent@256), ent_in_out 32 (offset@20), cmd_req 40 (padding[6]@18, union@24: bufpool uaddr@24 len@32 reserved@36 | ent_zero_copy_buf_index u16@24), ADD_QUEUE 3 / ADD_BUFPOOL 4, HAS_IO_URING_BUFPOOL = flags2 bit 11, FOPEN_IO_URING_ZERO_COPY = 1<<8	18	19
 fuse.abi.test.uring command and init-flag constants: REGISTER 1, COMMIT_AND_FETCH 2, RELEASE_PAYLOAD 3; BUF_RING/ZERO_COPY/RETENTION 1/2/4; COMMIT_RETAIN 1; kmbuf opcode pairs 37/38 and 38/39; mmap offset law	1	2
 fuse.codec.test.INIT decode: the 16-byte prefix suffices; flags2 is read iff INIT_EXT ∧ len ≥ 20, else 0; the 64-byte form decodes whole; < 16 is refused	7	8
 fuse.codec.test.INIT reply asks for FUSE_SYNCFS (FUSE_HAS_SYNCFS, flags2 bit 12) iff the kernel offered it — offered only to a /dev/fuse opener with CAP_SYS_ADMIN in the initial user namespace — and only beside the request timeout (0003 §Z); without INIT_EXT it is not negotiated	2	2
@@ -649,14 +649,9 @@ fuse.geometry.test.an explicit depth bypasses the payload ladder: env depth 8 wi
 fuse.geometry.test.budget ladder degrades payload before violating the depth floor: 819 MiB → depth 6 @ 4 MiB; 256 MiB → depth 4 @ 2 MiB/512 pages; 64 MiB and cap 0 → depth 4 @ 1 MiB	3	4
 fuse.geometry.test.default shape is byte-identical: (32q, 1 MiB, limit 256, cap 2 GiB) → depth 32, payload 1 MiB, max_pages 256, mb 1024, ct 768, arena 1 GiB	8	9
 fuse.geometry.test.desired max_write: explicit verbatim, else max(block, 1 MiB) in [4096, u32::MAX] (a 64 KiB block keeps the 1 MiB floor; a 4 MiB block asks 4 MiB)	1	1
-fuse.geometry.test.drain groups: holes {4,6,14,16,22,24,30} on one node ⇒ 5 node chunks (6,6,6,6,1) + ONE residual group of the holes	325	325
-fuse.geometry.test.drain groups: kmbuf/zc force width 1 (singletons); an explicit width 3 on nodes of 4 ⇒ [[0,1,2],[3],[4,5,6],[7]] — never spanning a node	597	597
-fuse.geometry.test.drain groups: membership not contiguity — interleaved node = cpu % 2 on 32q ⇒ 8 groups of 4, plan[0] = [0,2,4,6]	295	295
-fuse.geometry.test.drain groups: node = cpu / 16 ⇒ 8 contiguous groups of 4; one node 64q ⇒ 4 of 16; 32q ⇒ 4 of 8; 4q ⇒ 4 singletons	1272	1274
-fuse.geometry.test.drain groups: qid_is_cpu = false never consults node_of — 5q ⇒ singletons, 32q ⇒ 4 of 8 at the machine width	568	568
 fuse.geometry.test.drain width = max(n/4, 1); sq entries = max(next_pow2(width × depth + 8), 16)	1	0
 fuse.geometry.test.fuzz: the max_pages_limit sysfs parser is total on arbitrary text	5	4
-fuse.geometry.test.gauges publish the armed plan as levels (zero before) and the drain-group shape	278	279
+fuse.geometry.test.gauges publish the armed plan as levels (zero before) and the rings per queue	278	279
 fuse.geometry.test.knob faces: Inputs read the rows through the registry; absent derives; the cap follows SQUEEZEFS_TRANSPORT_MEM_MAX/PCT	791	791
 fuse.geometry.test.max_background is bounded by the u16 wire field, never a fixed 256: (512q × 32) → 16384; (65535/32 + 1 queues…) saturates at 65535 only through the clamp	1	1
 fuse.geometry.test.mount-option overrides: mb/ct 96/80 verbatim; mb 100 alone → ct 75; 0/0 → policy	1	1
@@ -773,21 +768,16 @@ fuse.transport.filesystem_vtable.test.EchoFs: lookup/getattr/read on the fixed t
 fuse.transport.filesystem_vtable.test.EchoFs: the hold gate is a pure predicate (scratch only, and only when declared); the direct leg is null; a HELD write is extracted lazily through its face and lands; SETATTR stores an explicit mtime	19	20
 fuse.transport.filesystem_vtable.test.the handle routes each reply kind through the Tx face; failWith maps a typed error through the ONE table (EAGAIN for backpressure, EIO for a dead ring)	2	2
 fuse.transport.probes.test.FUSE_TIME_LIMITS: bit 62 offered is the probe	1	1
-fuse.transport.probes.test.linux: the ladders live on this kernel — kmbuf present with its pair (logged), the sparse table registers, CapEff reads this process's capability	5	5
-fuse.transport.probes.test.one kmbuf rung: register 0 ∧ repeat EEXIST ∧ mmap ⇒ confirmed; EINVAL/ENOENT quiet refusals, any other errno loud; a success without EEXIST or without the mmap is a foreign success	4	4
-fuse.transport.probes.test.the kmbuf ladder: the venue pair (38/39) is probed first; confirmed short-circuits; a quiet refusal then confirmed ⇒ the second pair; every rung refused ⇒ absent; a foreign success never arms	12	12
-fuse.transport.probes.test.the lattice table: auto takes the highest confirmed rung; user always; an explicit bufring/zc the probes refuse is a typed refusal naming the probe — never a downgrade	5	5
-fuse.transport.probes.test.the retention verdict table: ENOTCONN/ENOENT present; EINVAL/EOPNOTSUPP/0/positive/EBUSY/EAGAIN/no answer absent	3	3
-fuse.transport.probes.test.the ring exists at reply time iff enable_uring reads Y after the daemon's write: the first mount after boot (offer absent, parameter N when INIT was sent) still arms zc; an unreadable parameter falls back to the offer	0	2
+fuse.transport.probes.test.linux: the drivers live on this kernel — the sparse table registers, CapEff reads this process's capability, the seam forces it absent	5	5
 fuse.transport.probes.test.the zc surface is a conjunction of kmbuf, CapEff bit 21 and the sparse table; CapEff parses from /proc/self/status text	9	10
 fuse.transport.slot.test.REGISTER failures back off 1, 2, 4 … 64 ms (monotone, ≥ base, ≤ max) then retire on the 8th; success resets; the nearest deadline bounds the park and is consumed once due	96	96
 fuse.transport.slot.test.THE LAW: a double reply is refused not overwritten; a foreign commit id is refused with the owed request intact; a parked commit still owes and refuses a second	83	83
+fuse.transport.slot.test.a commit CQE EAGAIN on a replied slot re-pushes the same commit id (back to delivered, owing again); on any other state it is nothing	97	98
 fuse.transport.slot.test.a held lease answers heldSource with the slot coordinates and extracts through its face exactly once per call; a lease in hand copies its data and has no held source	5	5
 fuse.transport.slot.test.a second delivery on an owing slot reports the displaced request and is accepted; a REGISTER over an owing slot and a failed push are abandonments (the tripwire)	95	92
 fuse.transport.slot.test.applyReply: a fitting reply is applied whole (header in in_out, out then body in the payload, payload_sz exact); a body already in place is not copied; an oversize reply becomes header-only -EIO, never a truncated body	9	9
 fuse.transport.slot.test.deliver then commit walks the state machine; the owed count is derived from the states; the foreign words follow	95	96
 fuse.transport.slot.test.failEnt synthesizes exactly once for an owing or parked slot (the second call is nothing); a replied slot synthesizes nothing	94	94
-fuse.transport.slot.test.retain commit parks the slot until RELEASE re-arms it (owes no reply, keeps its commit id published for the release's economy check; retain_commits − releases ≡ outstanding); a refused retain is the tripwire and recovers to a plain re-commit; release on an unretained slot is inert; EAGAIN re-pushes the same commit	97	98
 fuse.transport.slot.test.the lease drop runs the ONE wake law: a drop with a parked commit pays the write once, a second producer elides, a drop with nothing parked wakes nobody	4	4
 fuse.transport.slot.test.the lease gate: parks while leased and unparks after the drop; ready when the lease already dropped; the re-check clears parked; a non-final token drop never wakes	12	13
 fuse.transport.slot_model.test.lease gate (one lease): commit exactly once, never while leased; a park always has its wake — and release/acquire alone (no fence) parks without a wake	1234	1234
@@ -799,13 +789,9 @@ fuse.transport.slot_model.test.wake coalescer: two publications are never strand
 fuse.transport.test_0	1	2
 fuse.transport.zc.test.fuse_candidate: on ∧ 0 < len ≤ ceiling (inclusive)	2	2
 fuse.transport.zc.test.hold_candidate: strict half-payload bound, 4 KiB alignment, zero length never; the W1 shape caps at block/8 within one block	1	2
-fuse.transport.zc.test.kmbuf indexing: header stride 288, ring_entries = next_pow2(depth) ≥ 1, the headers span is page-granular, the headers index is 0 under BufRing and depth under zc, zc never rides without BUF_RING and retention never without zc	1	3
-fuse.transport.zc.test.the attachment law: a flagged CQE re-points, an unflagged one keeps, an out-of-range bid is a breach; the window addresses region + bid × buf_size	3	4
 fuse.transport.zc.test.the cancel-CQE ladder: pend gone ⇒ nothing; 0 ⇒ await the original; -ENOENT with a live pend ⇒ synthesize the lost completion; -EALREADY or anything else ⇒ restamp	2	2
 fuse.transport.zc.test.the deadline ledger: stamp is fresh once, re-stamp is not, clear returns the share, overdue yields each ent exactly once per pend lifetime, a fresh stamp re-arms the cancel latch	208	208
 fuse.transport.zc.test.the fused run-queue is a bounded FIFO: refusal at capacity is the demotion signal, pops come in order, wrap-around holds	79	80
-fuse.transport.zc.test.the paged mirror is not track-keyed: READ/READLINK out-paged always, WRITE in-paged, the readdir class optimistic until the latch says copyable, everything else none	2	2
-fuse.transport.zc.test.the stability class: O_DIRECT without FUSE_WRITE_CACHE is direct_gup; a writeback-cache write is page_cache even with O_DIRECT; a plain write is page_cache	10	11
 gates.census.test.a fuzz test that calls std.testing.fuzz directly is seen as not using the kit	1645	1645
 gates.census.test.the fuzz closure: a fuzz test's identifiers, the helpers it reaches (to a fixpoint) and the A.b pairs; covers() by name, by pair, by container+method	4945	4940
 gates.census.test.the naming law: pub decode/parse/from over a const byte slice is a decoder; a mutable slice, a private fn and an unrelated name are not; a method is Container.name	1164	1164

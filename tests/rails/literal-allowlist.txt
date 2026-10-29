@@ -233,7 +233,6 @@ src/fuse/transport/filesystem_vtable.zig:756 | 4096 | 69d9b46c56cad900 | a table
 src/fuse/transport/filesystem_vtable.zig:756 | 512 | 69d9b46c56cad900 | a table entry (switch/range arm) — the codec or classification table
 src/fuse/transport/filesystem_vtable.zig:756 | 512 | 69d9b46c56cad900 | a table entry (switch/range arm) — the codec or classification table
 src/fuse/transport/filesystem_vtable.zig:756 | 8 | 69d9b46c56cad900 | a table entry (switch/range arm) — the codec or classification table
-src/fuse/transport/probes.zig:109 | 4096 | 277cb3a1e441829a | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/probes.zig:218 | 16 | fdaf85634b7a5a4a | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/session.zig:349 | 32 | ff473acf7e9bc9ff | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/fuse/transport/session.zig:789 | 64 | a414ade14d826dad | OWED: derive it or document it on the line (charter §1.5)

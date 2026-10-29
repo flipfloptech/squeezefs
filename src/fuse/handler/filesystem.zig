@@ -36,7 +36,6 @@ const Io = std.Io;
 const abi = @import("../abi.zig");
 const codec = @import("../codec.zig");
 const slot = @import("../transport/slot.zig");
-const zc = @import("../transport/zc.zig");
 const errors = @import("../../core/errors.zig");
 const economy = @import("../../meta/economy.zig");
 const op_guard = @import("op_guard.zig");
@@ -272,7 +271,6 @@ pub const WriteArgs = struct { ino: u64, fh: u64, offset: u64, data: []const u8,
 /// the slot source for a direct device store and the memoized extraction.
 pub const HeldPayload = struct {
     src: slot.HeldSource,
-    class: zc.PayloadClass,
     ctx: ?*anyopaque,
     extract: *const fn (ctx: ?*anyopaque, io: Io) anyerror![]const u8,
 };

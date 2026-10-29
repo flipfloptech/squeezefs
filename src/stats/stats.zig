@@ -368,7 +368,6 @@ pub const covered = [_]Covered{
     .{ .path = "src/fuse/transport/slot.zig", .by = "src/fuse/transport/session.zig" },
     .{ .path = "src/fuse/transport/worker.zig", .by = "src/fuse/transport/session.zig" },
     .{ .path = "src/fuse/transport/commit_queue.zig", .by = "src/fuse/transport/session.zig" },
-    .{ .path = "src/fuse/transport/kmbuf.zig", .by = "src/fuse/transport/session.zig" },
     .{ .path = "src/fuse/transport/probes.zig", .by = "src/fuse/transport/session.zig" },
     .{ .path = "src/fuse/geometry.zig", .by = "src/fuse/transport/session.zig" },
     .{ .path = "src/data/accumulate.zig", .by = "src/data/plane.zig" },

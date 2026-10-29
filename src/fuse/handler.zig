@@ -259,13 +259,8 @@ const RecordingTx = struct {
         self.fails += 1;
         self.last_errno = errno;
     }
-    fn submitRetain(ctx: *anyopaque, _: fsv.Handle, _: codec.Reply) void {
-        const self: *RecordingTx = @ptrCast(@alignCast(ctx));
-        self.replies += 1;
-    }
-    fn releaseRetained(_: *anyopaque, _: fsv.Handle) void {}
     fn tx(self: *RecordingTx) fsv.Tx {
-        return .{ .ctx = self, .submit = submit, .submit_fd_body = submitFdBody, .submit_prefilled = submitPrefilled, .fail = fail, .submit_retain = submitRetain, .release_retained = releaseRetained };
+        return .{ .ctx = self, .submit = submit, .submit_fd_body = submitFdBody, .submit_prefilled = submitPrefilled, .fail = fail };
     }
 };
 

@@ -5147,42 +5147,42 @@ pub const DataPlane = struct {
 
 const testing = std.testing;
 
-test "the hold gate's verdict by class (charter §6.2 items 1–2 on PATCH_MAX = block/8): the W1 class holds a non-extending, non-adjacent aligned write within one block and declines an extending or stream-adjacent one; the overlay class holds the streaming write — extending, stream-adjacent, both payload classes — iff the arm is on; a straddling write, an empty one and a non-striped file never hold" {
+test "the hold gate's verdict by class (charter §6.2 items 1–2 on PATCH_MAX = block/8): the W1 class holds a non-extending, non-adjacent aligned write within one block and declines an extending or stream-adjacent one; the overlay class holds the streaming write — extending, stream-adjacent — iff the arm is on; a straddling write, an empty one and a non-striped file never hold" {
     const bs: u64 = 4 << 20;
     const facts: DataPlane.HoldFacts = .{ .block_size = bs, .patch_max = bs / 8, .prev_end = 0, .overlay_hold = true };
     const striped: shape_table.Snap = .{ .size = 3 * bs, .striped_passthrough = true };
     const hint = struct {
-        fn at(offset: u64, len: u32, class: zc.PayloadClass) fsv.HoldHint {
-            return .{ .ino = 7, .offset = offset, .len = len, .class = class };
+        fn at(offset: u64, len: u32) fsv.HoldHint {
+            return .{ .ino = 7, .offset = offset, .len = len };
         }
     };
     // W1: ≤ PATCH_MAX, inside the file, not adjacent to the previous write.
-    try testing.expectEqual(@as(?zc.HoldClass, .w1), DataPlane.holdVerdict(hint.at(4096, 4096, .page_cache), striped, facts));
-    try testing.expectEqual(@as(?zc.HoldClass, .w1), DataPlane.holdVerdict(hint.at(bs - (bs / 8), @intCast(bs / 8), .direct_gup), striped, facts));
+    try testing.expectEqual(@as(?zc.HoldClass, .w1), DataPlane.holdVerdict(hint.at(4096, 4096), striped, facts));
+    try testing.expectEqual(@as(?zc.HoldClass, .w1), DataPlane.holdVerdict(hint.at(bs - (bs / 8), @intCast(bs / 8)), striped, facts));
     // W1 declines: extending; stream-adjacent (the previous write ended here).
-    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(3 * bs, 4096, .page_cache), striped, facts));
+    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(3 * bs, 4096), striped, facts));
     var adjacent = facts;
     adjacent.prev_end = 8192;
-    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(8192, 4096, .page_cache), striped, adjacent));
-    // The overlay class: a 1 MiB piece — extending the file, stream-adjacent, O_DIRECT — holds.
+    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(8192, 4096), striped, adjacent));
+    // The overlay class: a 1 MiB piece — extending the file, stream-adjacent — holds.
     const mib: u32 = 1 << 20;
-    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(0, mib, .page_cache), striped, facts));
-    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(3 * bs, mib, .direct_gup), striped, facts));
+    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(0, mib), striped, facts));
+    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(3 * bs, mib), striped, facts));
     adjacent.prev_end = 3 * bs + mib;
-    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(3 * bs + mib, mib, .direct_gup), striped, adjacent));
-    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(bs, @intCast(bs), .page_cache), striped, facts)); // a block-sized write
+    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(3 * bs + mib, mib), striped, adjacent));
+    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(bs, @intCast(bs)), striped, facts)); // a block-sized write
     // The overlay class declines with its arm off (the control arm, a transformed set, the lever at 0).
     var off = facts;
     off.overlay_hold = false;
-    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(0, mib, .page_cache), striped, off));
+    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(0, mib), striped, off));
     // Never: a straddling write, an empty one, a file that is not striped on a passthrough set.
-    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(bs - mib + 4096, mib, .page_cache), striped, facts));
-    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(0, 0, .page_cache), striped, facts));
-    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(0, mib, .page_cache), .{ .size = 3 * bs, .striped_passthrough = false }, facts));
+    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(bs - mib + 4096, mib), striped, facts));
+    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(0, 0), striped, facts));
+    try testing.expectEqual(@as(?zc.HoldClass, null), DataPlane.holdVerdict(hint.at(0, mib), .{ .size = 3 * bs, .striped_passthrough = false }, facts));
     // The patch-OFF control arm (PATCH_MAX 0): every aligned shape is the overlay's.
     var patch_off = facts;
     patch_off.patch_max = 0;
-    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(4096, 4096, .page_cache), striped, patch_off));
+    try testing.expectEqual(@as(?zc.HoldClass, .overlay), DataPlane.holdVerdict(hint.at(4096, 4096), striped, patch_off));
 }
 
 // fstests generic/464 (`write_shared_class_violation` ×193 in one run, every

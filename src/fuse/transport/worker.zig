@@ -1,64 +1,51 @@
-//! The drain-group worker (charter §4 "Bring-up", "Drain groups",
-//! "Delivery", "Worker pass", "Buffer-mode lattice", "Teardown";
+//! The queue worker (charter §4 "Bring-up", "Rings per queue", "Delivery",
+//! "Worker pass", "Buffer pools and zero-copy", "Teardown";
 //! `docs/porting/fuse_uring_transport.md` §1, §2, §5, §8, §11;
-//! `fuse_kmbuf_zc.md` §3–§7): one OS thread `sqz-fuse-ur<qid>` per drain
-//! group owning ONE SQE128 io_uring (`ParkedRing128`), the member queues'
-//! slot tables, the 288 B ent headers, the payload buffers of the session's
-//! BUFFER MODE and the group's commit-cell queue. Linux only.
+//! `fuse_mainline_pools.md` §2–§5): one OS thread `sqz-fuse-ur<qid>` per
+//! ring of a queue owning ONE SQE128 io_uring (`ParkedRing128`), the
+//! queue's slot table for its share of the depth, the 288 B ent headers and
+//! the ring's commit-cell queue. Linux only.
 //!
 //! The pass, verbatim in the model-checked order (§8.1): drain → DISARM →
 //! pump the commit cells through the per-ent gate → pump the handlers'
-//! bridge requests (lazy extractions, releases) → mid-pass reap of finished
-//! bridges → poll ONE fused handler frame → unpark scan → the bridge
-//! deadline scan → re-arm the standing READ → the 100 ms backstop iff the
-//! group owes any reply, a bridge is pending or a fused frame is queued →
+//! bridge requests (lazy extractions, direct stores) → mid-pass reap of
+//! finished bridges → poll ONE fused handler frame → unpark scan → the
+//! bridge deadline scan → re-arm the standing READ → the 100 ms backstop iff
+//! the ring owes any reply, a bridge is pending or a fused frame is queued →
 //! ONE `io_uring_enter` carrying every SQE this pass pushed and the wait
 //! (unbounded only when idle and owing nothing; non-blocking when work is in
 //! hand) → reap → per CQE: the wake, the error ladder, a DELIVERY, a bridge
-//! or cancel completion, a RELEASE verdict → re-REGISTER and the backoff
-//! retries. Commits BATCH: a push only appends to the SQ, the loop-bottom
-//! enter flushes (31 → 9 `io_uring_enter` per create on the reference).
+//! or cancel completion → re-REGISTER and the backoff retries. Commits
+//! BATCH: a push only appends to the SQ, the loop-bottom enter flushes (31 →
+//! 9 `io_uring_enter` per create on the reference).
 //!
-//! THE BUFFER MODES (one per session, decided ONCE by the probes):
-//!   - `UserEnts` (stock): two REGISTER iovecs `[header, arena buffer]`; the
-//!     kernel GUPs the arena per 4 KiB at every copy.
-//!   - `BufRing` (kmbuf): the headers are fixed buffer index 0, the payload
-//!     is a buffer the kernel SELECTS from its own ring at bgid 0 and hands
-//!     over as a KERNEL address through the CQE bid (`zc.Attachment`); the
-//!     12.8 % + 2.6 % per-4 KiB lock→GUP→unlock term of client cycles is
-//!     gone (measured on the kern EXA read row). Width 1: the ring's fixed
-//!     index 0 and bgid 0 serve exactly one queue.
-//!   - `ZeroCopy`: + a sparse fixed-buffer table the kernel fills with the
-//!     app's pages at delivery (`imu->ubuf = 0`: `addr` is the byte offset
-//!     into the slot). Paged READ bodies move in by `READ_FIXED(fd → slot)`
-//!     — the direct device leg, the fd-source leg from a MAP_SHARED fill
-//!     pool, or the bounce leg from the session's memfd slab (daemon CPU/GiB
-//!     −24 % measured on the fd-source leg). Paged WRITE payloads are HELD
-//!     in the slot when the filesystem's gate admits the shape — the W1
-//!     class (≤ PATCH_MAX; holding W1-ineligible shapes measured 0.45×) or
-//!     the overlay class (above it: the streaming write lands by
-//!     `WRITE_FIXED(device ← slot)`, charter §6.2 item 1) — and extracted
-//!     at delivery otherwise. Bridges are
-//!     deadline-bounded (30 s, AsyncCancel once, must-stay-0 cancels), and
-//!     the commit FOLLOWS the bridge CQE: the slot stays Delivered until then.
+//! THE BUFFER POOL (Linux ≥ 7.3, uapi 7.46): the queue's region of the
+//! session's `Pool` is registered at fixed index `Pool.POOL_INDEX` on every
+//! ring of the queue; the queue's first ring hands it over by `ADD_QUEUE`
+//! + a REGISTERED `ADD_BUFPOOL`; every REGISTER (the 288 B header iovec and
+//! a `{NULL, 0}` payload iovec) and COMMIT carries `IORING_URING_CMD_FIXED`
+//! and the pool's index; a request's payload sits at the header's `offset`
+//! into the region. With CAP_SYS_ADMIN the queue is created ZERO-COPY: a
+//! sparse slot per entry at `1 + ent` the kernel fills with the app's pages
+//! for a READ or WRITE of a file opened with `FOPEN_IO_URING_ZERO_COPY`
+//! (`FUSE_URING_ENT_ZERO_COPY` states it per delivery; `imu->ubuf = 0`:
+//! `addr` is the byte offset into the slot). Paged READ bodies move in by
+//! `READ_FIXED(fd → slot)` — the direct device leg, the fd-source leg from
+//! a MAP_SHARED fill pool, or the bounce leg from the session's memfd slab
+//! (daemon CPU/GiB −24 % measured on the fd-source leg). Paged WRITE
+//! payloads are HELD in the slot when the filesystem's gate admits the
+//! shape — the W1 class (≤ PATCH_MAX; holding W1-ineligible shapes measured
+//! 0.45×) or the overlay class (above it: the streaming write lands by
+//! `WRITE_FIXED(device ← slot)`, charter §6.2 item 1) — and extracted at
+//! delivery otherwise; a WRITE the kernel COPIED into the pool is held in
+//! its pool buffer the same way (`WRITE_FIXED(device ← pool)`). Bridges are
+//! deadline-bounded (30 s, AsyncCancel once, must-stay-0 cancels), and the
+//! commit FOLLOWS the bridge CQE: the slot stays Delivered until then.
 //!
 //! THE ARM BARRIER COUNTS SUBMISSIONS, NOT COMPLETIONS: a REGISTER's CQE is
 //! not an ack — the kernel parks the ent and completes it only when it
 //! DELIVERS a request on it, and it routes requests to the ring only once
 //! `is_ring_ready()` observes EVERY queue armed.
-//!
-//! TEARDOWN RELEASES EVERY RETAINED SLOT WHILE THE CONNECTION IS LIVE: a
-//! retained ent (`replyRetain`, the ACK-early arm) the kernel reclaims at
-//! its own teardown is logged `fuse-uring: … teardown with retained zc
-//! payloads` and its still-registered fixed buffer pins the io_uring exit —
-//! the exiting process sits in D state until the container is recreated.
-//! So the drain RELEASEs every `retained` slot and reaps the verdicts
-//! BEFORE it publishes `drained` (the session's `umount2` waits for it).
-//! What the daemon cannot cover: an exit that runs no teardown (SIGKILL,
-//! SIGABRT) and an EXTERNAL `umount(8)` of a type-`fuse` mount — the kernel
-//! sends no DESTROY there (`fc->destroy` is fuseblk/virtiofs only) and
-//! aborts the connection outright, so a retained slot at that instant is
-//! the kernel's drain's (counted `transport_retained_kernel_drained`).
 //!
 //! Why a dedicated thread and not an `exec.Lane`: `Lane` owns std's 64 B
 //! `ParkedRing`; the FUSE uring command needs the 80 B command area of an
@@ -82,8 +69,6 @@ const geometry = @import("../geometry.zig");
 const pass_stamps = @import("pass_stamps.zig");
 const slot = @import("slot.zig");
 const zc = @import("zc.zig");
-const kmbuf = @import("kmbuf.zig");
-const probes = @import("probes.zig");
 const commit_queue = @import("commit_queue.zig");
 const fsv = @import("filesystem_vtable.zig");
 const counters = @import("../../core/counters.zig");
@@ -126,21 +111,21 @@ pub const DRAIN_LEASE_BUDGET_NS: u64 = 100 * std.time.ns_per_ms;
 pub const RESIDENCY_NS: u64 = 30 * std.time.ns_per_s;
 pub const RESIDENCY_PARK_NS: u64 = 10 * std.time.ns_per_ms;
 
-/// How long the drain waits for its RELEASE CQEs: the kernel answers a
-/// RELEASE_PAYLOAD inline in the submitting enter (`fuse_uring_cmd` returns
-/// the verdict, never -EIOCBQUEUED), so the wait is one enter and the bound
-/// only guards a dead ring; a lapse is loud (the slot is then the kernel's
-/// and its reclaim pins the exit).
-pub const TEARDOWN_RELEASE_BOUND_NS: u64 = 2 * std.time.ns_per_s;
 /// Read fusion ceiling: `max(payload / 8, 4096)` — two wakes and two
 /// schedules ≈ 5–10 µs ≈ 50–100 KiB at ~10 GB/s of merge copy (128 KiB at
 /// a 1 MiB payload).
 pub fn fusionCeiling(payload_sz: u32) u32 {
     return @max(payload_sz / 8, 4096);
 }
-/// The arena stride: each ent's payload page-aligned so the kernel's GUP
-/// and a later fixed-buffer registration see whole pages (one vma).
+/// The pool's and the bounce slab's alignment: page-aligned spans so the
+/// fixed-buffer registration sees whole pages (one vma).
 pub const ARENA_ALIGN: usize = 4096;
+/// `sizeof(fuse_uring_req_header)`: ent `i`'s header at `i × 288`.
+pub const HEADER_STRIDE: usize = @sizeOf(abi.fuse_uring_req_header);
+
+comptime {
+    assert(HEADER_STRIDE == 288);
+}
 
 /// CQE `res` errnos that mean the connection is gone.
 pub fn isDisconnect(e: linux.E) bool {
@@ -318,18 +303,9 @@ pub var commit_batch_commits: counters.ShardedCounter = .{};
 pub const commit_batch_labels = [_][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "le16", "le32", "gt32" };
 pub var commit_batch: [commit_batch_labels.len]std.atomic.Value(u64) = @splat(.init(0));
 
-// ---- the kmbuf / zero-copy families (`transport_kmbuf_*`, `transport_zc_*`) ----
+// ---- the pool and zero-copy families (`transport_pool_*`, `transport_zc_*`) ----
 
-/// `transport_kmbuf_attached_deliveries`: deliveries whose payload was read
-/// at the kernel address the CQE bid named (no user arena, no GUP).
-pub var kmbuf_attached_deliveries: counters.ShardedCounter = .{};
-/// `transport_kmbuf_attachment_breach` (must-stay-0): a CQE bid at or past
-/// the ring — a protocol breach; the session shuts down.
-pub var kmbuf_attachment_breach: counters.Tripwire = .init("transport_kmbuf_attachment_breach");
-
-// ---- the mainline pool family (`transport_pool_*`) ----
-
-/// `transport_pool_deliveries`: MainlinePool deliveries that named a pool
+/// `transport_pool_deliveries`: deliveries that named a pool
 /// buffer (the header's `offset` with a payload or a reply window).
 pub var pool_deliveries: counters.ShardedCounter = .{};
 /// `transport_pool_zc_deliveries`: deliveries flagged `FUSE_URING_ENT_ZERO_COPY`
@@ -348,7 +324,7 @@ pub var pool_offset_off_boundary: counters.Tripwire = .init("transport_pool_offs
 /// `initRing`'s enter).
 pub var pool_setup_late_cqes: counters.Tripwire = .init("transport_pool_setup_late_cqes");
 /// `transport_pool_queues_added`: queues created by ADD_QUEUE + ADD_BUFPOOL
-/// (= `transport_queues` on an armed MainlinePool session).
+/// (= `transport_queues` on an armed session).
 pub var pool_queues_added: counters.ShardedCounter = .{};
 /// `transport_pool_zc_unarmed` (must-stay-0): a delivery flagged zero-copy
 /// on a session whose queues were created copying — the request is
@@ -395,9 +371,9 @@ pub var zc_direct_leg_recheck_withdrawn: counters.ShardedCounter = .{};
 pub var zc_direct_leg_dma_bytes: counters.ShardedCounter = .{};
 pub var zc_direct_leg_serve_bytes: counters.ShardedCounter = .{};
 /// `transport_write_window_bytes`: WRITE payload bytes delivered from the
-/// ring's own window — the UserEnts arena or the BufRing attached buffer —
-/// the non-zc modes' term of the admission ledger (a zc session's payloads
-/// are the extraction and direct-store terms instead).
+/// ring's own window — the pool buffer — the copying session's term of the
+/// admission ledger (a zc session's payloads are the extraction and
+/// direct-store terms instead).
 pub var write_window_bytes: counters.ShardedCounter = .{};
 /// `transport_zc_write_directs` / `_bytes` / `_failures`: held WRITE
 /// payloads landed by `WRITE_FIXED(slot → device)` — the sole-owner patch
@@ -414,11 +390,8 @@ pub var zc_write_direct_refusals: counters.ShardedCounter = .{};
 /// the copy arm (a non-zc session, a fused frame).
 pub var zc_fd_source_copies: counters.ShardedCounter = .{};
 /// `transport_zc_fallbacks` (≈ 0): a bounce bridge failed and the reply
-/// degraded to the kmbuf attachment or header-only EIO.
+/// degraded to header-only EIO.
 pub var zc_fallbacks: counters.ShardedCounter = .{};
-/// `transport_zc_readdir_latch`: 0 unresolved, 1 paged, 2 copyable — the
-/// readdir class's pagedness as the first bridge probed it.
-pub var zc_readdir_latch: counters.Gauge = .{};
 /// `transport_zc_bridges`: bridge SQEs pushed; `transport_zc_bridge_pends`:
 /// live pends (0 at quiesce).
 pub var zc_bridges: counters.ShardedCounter = .{};
@@ -437,27 +410,6 @@ pub var bridge_orphans: counters.Tripwire = .init("transport_zc_bridge_orphans")
 pub var bridge_restamps: counters.ShardedCounter = .{};
 /// `transport_zc_scan_max_age_ms`: the oldest live bridge's age at the last scan.
 pub var scan_max_age_ms: counters.Gauge = .{};
-/// `transport_zc_release_inert`: a release for a slot that was not retained
-/// (the retain was refused and committed plain, or a teardown race).
-pub var zc_release_inert: counters.ShardedCounter = .{};
-/// `transport_retained_released_at_teardown`: retained slots the drain
-/// RELEASEd itself — the RELEASE CQE answered 0 while the connection was
-/// still live. The kernel's own reclaim of a retained ent (`fuse-uring: …
-/// teardown with retained zc payloads`) pins the exiting process; an
-/// orderly exit never leaves one.
-pub var retained_released_at_teardown: counters.ShardedCounter = .{};
-/// `transport_retained_kernel_drained`: retained slots the drain found on
-/// a connection already gone, or whose RELEASE met one (`-ENOTCONN`: an
-/// external `umount(8)`, a sysfs abort or a lazy detach beat the drain) —
-/// the kernel's drain owns them. Non-zero only on a disconnect the kernel
-/// began: an external `umount(8)`, or the end of a lazily detached mount
-/// (`squeezefs umount --lazy`) once its last holder left.
-pub var retained_kernel_drained: counters.ShardedCounter = .{};
-/// `transport_zc_releases_inflight`: RELEASE SQEs pushed whose CQE is not
-/// yet reaped — the RELEASE ledger's closure term (`releases − verdicts`),
-/// 0 at quiesce.
-pub var releases_inflight: counters.Gauge = .{};
-
 fn noteCommitBatch(n: u32) void {
     if (n == 0) return;
     commit_batch_flushes.inc();
@@ -470,10 +422,10 @@ fn noteCommitBatch(n: u32) void {
 // user_data tags
 // ---------------------------------------------------------------------------
 
-/// `setup`: a MainlinePool queue's ADD_QUEUE / ADD_BUFPOOL, reaped
-/// synchronously in `initRing` (the kernel answers inline); one reaching
-/// the pass is counted and dropped.
-pub const OpKind = enum(u8) { register = 1, commit = 2, bridge = 3, cancel = 4, release = 5, setup = 6 };
+/// `setup`: a queue's ADD_QUEUE / ADD_BUFPOOL, reaped synchronously in
+/// `initRing` (the kernel answers inline); one reaching the pass is counted
+/// and dropped.
+pub const OpKind = enum(u8) { register = 1, commit = 2, bridge = 3, cancel = 4, setup = 5 };
 
 pub fn tagOf(kind: OpKind, gent: u32) u64 {
     return (uring128.Tag{ .kind = @backingInt(kind), .a = @intCast(gent), .b = 0, .c = 0 }).pack();
@@ -489,62 +441,17 @@ pub fn decodeTag(ud: u64) ?DecodedTag {
 }
 
 // ---------------------------------------------------------------------------
-// The FUSE uring command (byte-exact; porting spec §1.5–1.6, kmbuf §3.3)
+// The FUSE uring command (byte-exact; porting spec §1.5–1.6,
+// fuse_mainline_pools.md §1)
 // ---------------------------------------------------------------------------
 
-fn cmdBytes(commit_id: u64, qid: u16, union_flags: u16, queue_depth: u16) [uring128.cmd_len]u8 {
+fn cmdBytes(req: abi.fuse_uring_cmd_req) [uring128.cmd_len]u8 {
     var cmd: [uring128.cmd_len]u8 = @splat(0);
-    const req: abi.fuse_uring_cmd_req = .{ .flags = 0, .commit_id = commit_id, .qid = qid, .init_flags = union_flags, .queue_depth = queue_depth, .padding = @splat(0) };
     cmd[0..@sizeOf(abi.fuse_uring_cmd_req)].* = abi.encode(req);
     return cmd;
 }
 
-/// A REGISTER for a UserEnts ent: `addr` = the 2-iovec array, `len` = 2,
-/// `buf_index` 0, the command `{flags 0, commit_id 0, qid}`.
-pub fn prepRegister(sqe: *uring128.Sqe128, qid: u16, iovs: *const [2]RegIov, gent: u32) void {
-    const cmd = cmdBytes(0, qid, 0, 0);
-    uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_REGISTER, &cmd);
-    sqe.addr = @intFromPtr(iovs);
-    sqe.len = abi.REGISTER_IOVEC_COUNT;
-    sqe.buf_index = 0;
-    sqe.user_data = tagOf(.register, gent);
-}
-
-/// A REGISTER for a kmbuf / zero-copy ent: NO iovecs; `init.flags` = the
-/// mode word, `init.queue_depth` = depth under zc (the kernel refuses zc
-/// with a zero depth), `buf_index` = the ent index (the kernel reads
-/// `fixed_buf_id` from it: the header at `ent × 288`, the zc slot at `ent`).
-pub fn prepRegisterKmbuf(sqe: *uring128.Sqe128, qid: u16, ent_idx: u16, init_flags: u16, queue_depth: u16, gent: u32) void {
-    const cmd = cmdBytes(0, qid, init_flags, queue_depth);
-    uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_REGISTER, &cmd);
-    sqe.buf_index = ent_idx;
-    sqe.user_data = tagOf(.register, gent);
-}
-
-/// COMMIT_AND_FETCH: no iovecs; the reply rides in the ent. `commit_flags`
-/// is 0 or `FUSE_URING_COMMIT_RETAIN` (the union u16 at cmd offset 18).
-pub fn prepCommit(sqe: *uring128.Sqe128, qid: u16, commit_id: u64, gent: u32, commit_flags: u16) void {
-    const cmd = cmdBytes(commit_id, qid, commit_flags, 0);
-    uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_COMMIT_AND_FETCH, &cmd);
-    sqe.user_data = tagOf(.commit, gent);
-}
-
-/// RELEASE_PAYLOAD (opcode 3): ends a retention by its commit id.
-pub fn prepRelease(sqe: *uring128.Sqe128, qid: u16, commit_id: u64, gent: u32) void {
-    const cmd = cmdBytes(commit_id, qid, 0, 0);
-    uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_RELEASE_PAYLOAD, &cmd);
-    sqe.user_data = tagOf(.release, gent);
-}
-
-// ---- the mainline buffer-pool UAPI (uapi 7.46; fuse_mainline_pools.md §1) ----
-
-fn mainlineCmdBytes(req: abi.fuse_uring_cmd_req_mainline) [uring128.cmd_len]u8 {
-    var cmd: [uring128.cmd_len]u8 = @splat(0);
-    cmd[0..@sizeOf(abi.fuse_uring_cmd_req_mainline)].* = abi.encode(req);
-    return cmd;
-}
-
-/// A REGISTER's iovec pair on the mainline rung: `iov[0]` the 288 B header,
+/// A REGISTER's iovec pair: `iov[0]` the 288 B header,
 /// `iov[1]` `{NULL, 0}` — the kernel refuses any payload iovec on a pool
 /// queue (`payload->iov_base || payload->iov_len` ⇒ EINVAL). The same bytes
 /// as `std.posix.iovec` with a nullable base.
@@ -564,7 +471,7 @@ fn markPoolFixed(sqe: *uring128.Sqe128) void {
 
 /// ADD_QUEUE (opcode 3): create `qid`, zero-copy iff `zero_copy` (CAP_SYS_ADMIN).
 pub fn prepAddQueue(sqe: *uring128.Sqe128, qid: u16, zero_copy: bool) void {
-    const cmd = mainlineCmdBytes(abi.fuse_uring_cmd_req_mainline.addQueue(qid, zero_copy));
+    const cmd = cmdBytes(abi.fuse_uring_cmd_req.addQueue(qid, zero_copy));
     uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_ADD_QUEUE, &cmd);
     sqe.user_data = tagOf(.setup, 0);
 }
@@ -572,17 +479,17 @@ pub fn prepAddQueue(sqe: *uring128.Sqe128, qid: u16, zero_copy: bool) void {
 /// ADD_BUFPOOL (opcode 4): hand `qid` its pool region, REGISTERED (the
 /// FIXED flag + the pool's index on this ring).
 pub fn prepAddBufpool(sqe: *uring128.Sqe128, qid: u16, region: []const u8) void {
-    const cmd = mainlineCmdBytes(abi.fuse_uring_cmd_req_mainline.addBufpool(qid, @intFromPtr(region.ptr), @intCast(region.len)));
+    const cmd = cmdBytes(abi.fuse_uring_cmd_req.addBufpool(qid, @intFromPtr(region.ptr), @intCast(region.len)));
     uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_ADD_BUFPOOL, &cmd);
     markPoolFixed(sqe);
     sqe.user_data = tagOf(.setup, 1);
 }
 
-/// A REGISTER on the mainline rung: the header iovec pair, the FIXED pool
-/// index, `ent_zero_copy_buf_index` = the entry's zc slot (0 on a queue
-/// created without zero-copy — the kernel refuses a non-zero index there).
-pub fn prepRegisterMainline(sqe: *uring128.Sqe128, qid: u16, iovs: *const [2]RegIov, zc_slot: u16, gent: u32) void {
-    const cmd = mainlineCmdBytes(abi.fuse_uring_cmd_req_mainline.register(qid, zc_slot));
+/// A REGISTER: the header iovec pair, the FIXED pool index,
+/// `ent_zero_copy_buf_index` = the entry's zc slot (0 on a queue created
+/// without zero-copy — the kernel refuses a non-zero index there).
+pub fn prepRegister(sqe: *uring128.Sqe128, qid: u16, iovs: *const [2]RegIov, zc_slot: u16, gent: u32) void {
+    const cmd = cmdBytes(abi.fuse_uring_cmd_req.register(qid, zc_slot));
     uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_REGISTER, &cmd);
     sqe.addr = @intFromPtr(iovs);
     sqe.len = abi.REGISTER_IOVEC_COUNT;
@@ -590,10 +497,10 @@ pub fn prepRegisterMainline(sqe: *uring128.Sqe128, qid: u16, iovs: *const [2]Reg
     sqe.user_data = tagOf(.register, gent);
 }
 
-/// COMMIT_AND_FETCH on the mainline rung: the FIXED pool index on every
-/// commit (the kernel imports the reply payload through it).
-pub fn prepCommitMainline(sqe: *uring128.Sqe128, qid: u16, commit_id: u64, gent: u32) void {
-    const cmd = mainlineCmdBytes(abi.fuse_uring_cmd_req_mainline.commit(qid, commit_id));
+/// COMMIT_AND_FETCH: the FIXED pool index on every commit (the kernel
+/// imports the reply payload through it).
+pub fn prepCommit(sqe: *uring128.Sqe128, qid: u16, commit_id: u64, gent: u32) void {
+    const cmd = cmdBytes(abi.fuse_uring_cmd_req.commit(qid, commit_id));
     uring128.prepUringCmd(sqe, .{ .fixed = 0 }, abi.FUSE_IO_URING_CMD_COMMIT_AND_FETCH, &cmd);
     markPoolFixed(sqe);
     sqe.user_data = tagOf(.commit, gent);
@@ -608,18 +515,14 @@ pub fn prepPoolStore(sqe: *uring128.Sqe128, fd: linux.fd_t, off: u64, len: u32, 
 }
 
 /// The zero-copy slot of ring-local entry `ent_idx` in this ring's
-/// fixed-buffer table: the entry itself on the legacy rung (the headers sit
-/// at `depth`), `1 + ent_idx` on the mainline rung (the pool sits at 0).
-pub fn zcSlotOf(mode: geometry.BufferMode, ent_idx: u16) u16 {
-    return switch (mode) {
-        .mainline_pool => Pool.POOL_INDEX + 1 + ent_idx,
-        .zero_copy, .buf_ring, .user_ents => ent_idx,
-    };
+/// fixed-buffer table: `1 + ent_idx` (the pool sits at 0).
+pub fn zcSlotOf(ent_idx: u16) u16 {
+    return Pool.POOL_INDEX + 1 + ent_idx;
 }
 
-/// The sparse fixed-buffer table a mainline ring registers: the pool slot
-/// plus one zc slot per entry on a zero-copy queue.
-pub fn mainlineTableSlots(zero_copy: bool, depth: u32) u32 {
+/// The sparse fixed-buffer table a ring registers: the pool slot plus one
+/// zc slot per entry on a zero-copy queue.
+pub fn tableSlots(zero_copy: bool, depth: u32) u32 {
     return 1 + (if (zero_copy) depth else 0);
 }
 
@@ -804,7 +707,37 @@ pub const Slab = struct {
     }
 };
 
-/// The MainlinePool payload pool (charter §4 amended 2026-10-21;
+/// The 288 B ent headers, back to back, page-granular: what the two
+/// REGISTER iovecs point at (`iov[0]`); the kernel writes the request's
+/// `fuse_in_header ‖ op_in ‖ ent_in_out` there at delivery and reads the
+/// reply's there at commit.
+pub const Headers = struct {
+    span: []align(std.heap.page_size_min) u8,
+    depth: u32,
+
+    pub fn init(depth: u32, page: usize) error{HeadersMapFailed}!Headers {
+        const len: usize = @intCast(derive.alignUp(@as(u64, depth) * HEADER_STRIDE, page));
+        const rc = linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        if (linux.errno(rc) != .SUCCESS) {
+            log.err("transport: mmap of the {d}-byte headers region failed ({t})", .{ len, linux.errno(rc) });
+            return error.HeadersMapFailed;
+        }
+        const ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(rc);
+        return .{ .span = ptr[0..len], .depth = depth };
+    }
+
+    pub fn deinit(self: *Headers) void {
+        _ = linux.munmap(self.span.ptr, self.span.len);
+        self.* = undefined;
+    }
+
+    pub fn at(self: *Headers, ent: u32) *abi.fuse_uring_req_header {
+        assert(ent < self.depth);
+        return @ptrCast(@alignCast(self.span.ptr + @as(usize, ent) * HEADER_STRIDE));
+    }
+};
+
+/// The payload pool (charter §4 amended 2026-10-21;
 /// `docs/porting/fuse_mainline_pools.md` §3): ONE anonymous mapping for
 /// every queue, `depth × payload_sz` per queue at `qid × queue_span`,
 /// page-aligned, THP-hinted. A queue's span is handed to the kernel ONCE
@@ -817,9 +750,9 @@ pub const Slab = struct {
 /// index the kernel recorded. `depth` buffers per queue = one per entry
 /// across the queue's rings, so the kernel never parks a fetch for want of
 /// a buffer. Session-owned: it outlives every group (a handler may read a
-/// request's payload after its worker exited — the kmbuf region's law).
+/// request's payload after its worker exited).
 /// Pinned once by the registration (the kernel GUPs it), never per request:
-/// the memory the arena gauge accounts on this rung.
+/// the memory the arena gauge accounts.
 pub const Pool = struct {
     span: []align(ARENA_ALIGN) u8,
     nqueues: u32,
@@ -894,39 +827,31 @@ pub const Shared = struct {
     nqueues: u32,
     /// qid == CPU id (the kernel's possible-CPU count): home the handler on it.
     qid_is_cpu: bool,
-    /// `SQUEEZEFS_FUSE_READ_FUSION` ∧ a zero-copy session (never on UserEnts).
+    /// `SQUEEZEFS_FUSE_READ_FUSION` ∧ a zero-copy session.
     read_fusion_on: bool,
     /// `SQUEEZEFS_FUSE_SQPOLL`: the kernel submission poller (A/B lever).
     sqpoll: bool,
     /// The topology for lane homing (null node when unknown).
     node_of: *const fn (ctx: ?*const anyopaque, cpu: u32) ?u32,
     node_ctx: ?*const anyopaque,
-    /// The lattice rung (decided ONCE by the probes) and its resources.
-    mode: geometry.BufferMode = .user_ents,
-    kmbuf_opcodes: ?abi.KmbufRegisterOpcodes = null,
-    /// The slots take the app's pages: the legacy ZeroCopy rung, or
-    /// MainlinePool whose queues are created zero-copy (`probes.zeroCopyArmed`).
+    /// The slots take the app's pages: the pool's queues are created
+    /// zero-copy (`probes.zcVerdict`).
     zc_armed: bool = false,
-    /// MainlinePool: the session's pool (`Pool`), and per queue whether its
-    /// first ring already issued ADD_QUEUE + ADD_BUFPOOL (the session starts
+    /// The session's pool (`Pool`), and per queue whether its first ring
+    /// already issued ADD_QUEUE + ADD_BUFPOOL (the session starts
     /// the groups in order, so a queue's later rings read it set; a clear
     /// flag there is a bring-up bug, failed loud rather than met as the
     /// kernel's EINVAL).
     pool: ?*Pool = null,
     pool_added: []std.atomic.Value(bool) = &.{},
-    /// Payload retention negotiated (zc ∧ the RELEASE probe present).
-    retention: bool = false,
     page: usize = 4096,
     /// The volume's block size: the W1 shape's `block/8` cap.
     block_size: u64 = 4 * derive.MiB,
-    /// The executor's `Io`: the kmbuf ENOMEM retry waits through it.
+    /// The executor's `Io`: the handlers' bridge cells park through it.
     io: Io,
     slab: ?*Slab = null,
     /// The bridge deadline (the constant, or the test seam's).
     bridge_deadline_ns: u64 = zc.BRIDGE_DEADLINE_NS,
-    /// The readdir class's pagedness, latched by the first bridge (one per
-    /// session: the kernel's FUSE tree is one fact).
-    readdir_latch: std.atomic.Value(u8) = .init(@backingInt(zc.ReaddirLatch.unresolved)),
     /// The session's liveness: flipped once by `shutdown`; every worker
     /// drains when it reads false.
     active: std.atomic.Value(bool) = .init(true),
@@ -938,7 +863,7 @@ pub const Shared = struct {
     /// The arm barrier: member rings (one per queue per ring) whose
     /// REGISTERs were all PUSHED; complete at `nqueues × rings_per_queue`.
     queues_registered: std.atomic.Value(u32) = .init(0),
-    /// Rings (groups, workers) registered on each queue (`geometry.ringsPerQueue`).
+    /// Rings (groups, workers) registered on each queue (`geometry.RINGS_PER_QUEUE_DERIVED` or the lever).
     rings_per_queue: u32 = 1,
     /// Completed by the worker that pushes the last queue's REGISTERs, or by
     /// a failing worker.
@@ -946,9 +871,6 @@ pub const Shared = struct {
     /// `SQUEEZEFS_TEST_FUSE_REGISTER_REFUSE`: the next N REGISTER pushes are
     /// answered as refused without reaching the kernel.
     register_refuse_remaining: std.atomic.Value(u32) = .init(0),
-    /// `SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM`: every kmbuf ring registration
-    /// answers ENOMEM without reaching the kernel.
-    test_kmbuf_enomem: bool = false,
     /// `SQUEEZEFS_TEST_READ_ZERO_FILL`: the boundary ruler — every READ is
     /// answered at its delivery with no filesystem (`serveZeroFill`).
     test_read_zero_fill: ReadZeroFill = .off,
@@ -1019,31 +941,9 @@ pub const Shared = struct {
         return self.active.load(.acquire);
     }
 
-    /// The legacy kmbuf rungs (the per-ring buffer ring + fixed headers).
-    pub fn usesKmbuf(self: *const Shared) bool {
-        return probes.usesKmbuf(self.mode);
-    }
-
-    /// The mainline pool rung (ADD_QUEUE/ADD_BUFPOOL, the pool at
-    /// `Pool.POOL_INDEX`, `IORING_URING_CMD_FIXED` on every command).
-    pub fn mainline(self: *const Shared) bool {
-        return self.mode == .mainline_pool;
-    }
-
-    /// The slots take the app's pages (either stratum).
+    /// The slots take the app's pages.
     pub fn zeroCopy(self: *const Shared) bool {
         return self.zc_armed;
-    }
-
-    pub fn readdirLatch(self: *const Shared) zc.ReaddirLatch {
-        return @fromBackingInt(@intCast(self.readdir_latch.load(.acquire)));
-    }
-
-    fn latchReaddir(self: *Shared, v: zc.ReaddirLatch) void {
-        if (self.readdir_latch.cmpxchgStrong(@backingInt(zc.ReaddirLatch.unresolved), @backingInt(v), .acq_rel, .acquire) == null) {
-            zc_readdir_latch.set(@backingInt(v));
-            log.info("transport: readdir class probed {t} by its first bridge", .{v});
-        }
     }
 };
 
@@ -1072,9 +972,6 @@ const Pend = struct {
     /// paged READ bridges its zero-completed pages: `len` ≥ `reply_len`);
     /// 0 = `len`.
     reply_len: u32 = 0,
-    /// Readdir-class slot while the latch is unresolved: a -EFAULT here is
-    /// the probe's "copyable" verdict, not a failure.
-    readdir_probe: bool = false,
     /// The filesystem's completion hook (the direct leg's post-DMA recheck,
     /// an fd-source serve's pin release), run at the CQE.
     hook: ?fsv.CompletionHook = null,
@@ -1141,6 +1038,8 @@ pub const Group = struct {
     gpa: std.mem.Allocator,
     shared: *Shared,
     index: u16,
+    /// The queue this ring serves (one member: the pool's index serves one
+    /// queue per ring).
     members: []Member,
     /// This ring's entries per member queue (its share of the queue's depth).
     depth: u32,
@@ -1150,20 +1049,13 @@ pub const Group = struct {
     ring_base: u16,
     payload_len: usize,
     stride: usize,
-    /// UserEnts: ONE anonymous mapping for every member's payload buffers.
-    arena: []align(ARENA_ALIGN) u8,
-    headers: kmbuf.Headers,
-    /// Per gent, the REGISTER's iovec pair (UserEnts: header + arena
-    /// buffer; MainlinePool: header + `{NULL, 0}`; unused under kmbuf).
+    headers: Headers,
+    /// Per gent, the REGISTER's iovec pair: header + `{NULL, 0}`.
     iovs: [][2]RegIov,
     cells: commit_queue.Queue,
     /// The group's ring: built ON the worker thread (`SINGLE_ISSUER`).
     ring: uring128.ParkedRing128 = undefined,
     ring_rung: usize = 0,
-    /// kmbuf / zc resources, registered on the ring (worker thread).
-    kmb: ?kmbuf.Kmbuf = null,
-    /// Per gent: the attached kmbuf buffer (the CQE-bid law).
-    attached: []zc.Attachment,
     /// Per gent: the in-flight bridge, its deadline stamp, the reply parked
     /// behind it (a handler's cell or the worker's own message), the held
     /// WRITE's length, the fused frame, the extraction cell.
@@ -1175,8 +1067,8 @@ pub const Group = struct {
     /// into the slot by `commitReady` before the next delivery).
     meta_out: codec.OutBuf = undefined,
     held_len: []u32,
-    /// Per gent: the held WRITE sits in the POOL buffer (mainline, copied
-    /// by the kernel), so its direct store reads the pool at `POOL_INDEX`
+    /// Per gent: the held WRITE sits in the POOL buffer (copied by the
+    /// kernel), so its direct store reads the pool at `POOL_INDEX`
     /// by user address, not the zc slot by offset.
     held_pool: []bool,
     /// Per gent: the bounce window's page-rounded high-water since its
@@ -1194,14 +1086,9 @@ pub const Group = struct {
     /// Per gent: the hook a probe's fd-source serve attached for the bridge
     /// `commitReadyZc` pushes.
     hooks: []?fsv.CompletionHook,
-    /// Handler → worker inboxes: lazy extractions, direct stores and
-    /// releases (gents).
+    /// Handler → worker inboxes: lazy extractions and direct stores (gents).
     extract_inbox: mpmc.BoundedMpmc(u32),
     store_inbox: mpmc.BoundedMpmc(u32),
-    release_inbox: mpmc.BoundedMpmc(u32),
-    /// Per gent: the in-flight RELEASE was the drain's, not a handler's —
-    /// one RELEASE per retention, so one flag.
-    release_teardown: []bool,
     last_scan_ns: u64 = 0,
     /// The NOWAIT ceilings of the fds this worker bridged to (worker thread only).
     ceilings: NowaitCeilings = .{},
@@ -1256,39 +1143,29 @@ pub const Group = struct {
     reap_origin: ReapOrigin = .busy,
     disconnected: bool = false,
     protocol_rejected: bool = false,
-    /// This group's RELEASE SQEs pushed and not yet answered (the drain
-    /// waits for 0 before the session may unmount).
-    releases_pending: u32 = 0,
 
-    pub const InitError = std.mem.Allocator.Error || error{ArenaMapFailed};
-    /// `KmbufRingEnomem`: the kmbuf ring's region allocation refused after
-    /// every retry (`kmbuf.Error`), typed so the daemon's refusal can name
-    /// the levers. `MainlinePoolRefused`: the kernel refused ADD_QUEUE or
-    /// ADD_BUFPOOL after the bufpool probe read present (the post-probe
-    /// refusal; on a legacy kernel under the test seam, the opcode
-    /// collision's ENOTCONN).
-    pub const StartError = error{ ThreadSpawnFailed, RingSetupFailed, KmbufRingEnomem, MainlinePoolRefused };
-    const RingError = error{ RingSetupFailed, KmbufRingEnomem, MainlinePoolRefused };
+    pub const InitError = std.mem.Allocator.Error || error{HeadersMapFailed};
+    /// `PoolRefused`: the kernel refused ADD_QUEUE or ADD_BUFPOOL after the
+    /// bufpool probe read present (the post-probe refusal).
+    pub const StartError = error{ ThreadSpawnFailed, RingSetupFailed, PoolRefused };
+    const RingError = error{ RingSetupFailed, PoolRefused };
     /// The `started` word: the worker thread stores it once, `start` reads it.
     const Started = enum(u32) {
         starting = 0,
         armed = 1,
         ring_failed = 2,
-        kmbuf_enomem = 3,
-        pool_refused = 4,
+        pool_refused = 3,
 
         fn ofRingError(e: RingError) Started {
             return switch (e) {
-                error.KmbufRingEnomem => .kmbuf_enomem,
-                error.MainlinePoolRefused => .pool_refused,
+                error.PoolRefused => .pool_refused,
                 error.RingSetupFailed => .ring_failed,
             };
         }
 
         fn toStartError(self: Started) StartError {
             return switch (self) {
-                .kmbuf_enomem => error.KmbufRingEnomem,
-                .pool_refused => error.MainlinePoolRefused,
+                .pool_refused => error.PoolRefused,
                 else => error.RingSetupFailed,
             };
         }
@@ -1300,15 +1177,10 @@ pub const Group = struct {
         const gents: usize = @as(usize, qids.len) * depth;
         const payload_len: usize = shared.plan.payload_sz;
         const stride: usize = @intCast(derive.alignUp(payload_len, ARENA_ALIGN));
-        // Width 1 under kmbuf/zc and the mainline pool: the fixed index 0 /
-        // bgid 0 / the pool index serve one queue.
-        assert(!shared.mode.ringPerQueue() or qids.len == 1);
-        // A second ring on a queue exists only there (the kernel's per-source
-        // buffer ring, patch 0030; mainline's per-queue pool); UserEnts
-        // groups take the whole depth.
-        assert(share.base == 0 or shared.mode.ringPerQueue());
+        // One queue per ring: the pool's fixed index serves one queue.
+        assert(qids.len == 1);
         assert(share.base + depth <= shared.plan.depth);
-        assert(!shared.mainline() or shared.pool != null);
+        assert(shared.pool != null);
 
         const self = try gpa.create(Group);
         errdefer gpa.destroy(self);
@@ -1321,11 +1193,9 @@ pub const Group = struct {
             .ring_base = share.base,
             .payload_len = payload_len,
             .stride = stride,
-            .arena = &.{},
             .headers = undefined,
             .iovs = &.{},
             .cells = undefined,
-            .attached = &.{},
             .pends = &.{},
             .deadlines = undefined,
             .bridge_parked = &.{},
@@ -1341,8 +1211,6 @@ pub const Group = struct {
             .hooks = &.{},
             .extract_inbox = undefined,
             .store_inbox = undefined,
-            .release_inbox = undefined,
-            .release_teardown = &.{},
             .affinity = affinity,
         };
         const members = try gpa.alloc(Member, qids.len);
@@ -1360,48 +1228,23 @@ pub const Group = struct {
             built += 1;
         }
         self.members = members;
-        self.headers = kmbuf.Headers.init(@intCast(gents), shared.page) catch return error.ArenaMapFailed;
+        self.headers = try Headers.init(@intCast(gents), shared.page);
         errdefer self.headers.deinit();
         self.iovs = try gpa.alloc([2]RegIov, gents);
         errdefer gpa.free(self.iovs);
-        if (shared.mode == .user_ents) {
-            // Born zeroed, page-aligned, non-aliasing; THP-hinted.
-            const span = stride * gents;
-            const rc = linux.mmap(null, span, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
-            if (linux.errno(rc) != .SUCCESS) {
-                log.err("transport: group {d}: mmap of the {d}-byte payload arena failed ({t})", .{ index, span, linux.errno(rc) });
-                return error.ArenaMapFailed;
-            }
-            const base: [*]align(ARENA_ALIGN) u8 = @ptrFromInt(rc);
-            self.arena = base[0..span];
-            _ = linux.madvise(self.arena.ptr, self.arena.len, linux.MADV.HUGEPAGE);
-        }
-        errdefer if (self.arena.len > 0) {
-            _ = linux.munmap(self.arena.ptr, self.arena.len);
-        };
         for (0..gents) |g| {
             const h = self.headers.at(@intCast(g));
             h.* = abi.zeroed(abi.fuse_uring_req_header);
             // The kernel reads the ent's payload length at REGISTER.
             h.ring_ent_in_out.payload_sz = @intCast(payload_len);
-            switch (shared.mode) {
-                .user_ents => self.iovs[g] = .{
-                    .{ .base = @ptrCast(h), .len = @sizeOf(abi.fuse_uring_req_header) },
-                    .{ .base = self.arenaPtr(@intCast(g)), .len = payload_len },
-                },
-                // The pool queue takes no payload iovec: `{NULL, 0}`.
-                .mainline_pool => self.iovs[g] = .{
-                    .{ .base = @ptrCast(h), .len = @sizeOf(abi.fuse_uring_req_header) },
-                    .{ .base = null, .len = 0 },
-                },
-                .buf_ring, .zero_copy => {},
-            }
+            // The pool queue takes no payload iovec: `{NULL, 0}`.
+            self.iovs[g] = .{
+                .{ .base = @ptrCast(h), .len = @sizeOf(abi.fuse_uring_req_header) },
+                .{ .base = null, .len = 0 },
+            };
         }
         self.cells = try commit_queue.Queue.init(gpa, gents, self.waker());
         errdefer self.cells.deinit(gpa);
-        self.attached = try gpa.alloc(zc.Attachment, gents);
-        errdefer gpa.free(self.attached);
-        @memset(self.attached, .{});
         self.pends = try gpa.alloc(?Pend, gents);
         errdefer gpa.free(self.pends);
         @memset(self.pends, null);
@@ -1441,11 +1284,6 @@ pub const Group = struct {
         @memset(self.hooks, null);
         self.store_inbox = try mpmc.BoundedMpmc(u32).init(gpa, gents);
         errdefer self.store_inbox.deinit(gpa);
-        self.release_inbox = try mpmc.BoundedMpmc(u32).init(gpa, gents);
-        errdefer self.release_inbox.deinit(gpa);
-        self.release_teardown = try gpa.alloc(bool, gents);
-        errdefer gpa.free(self.release_teardown);
-        @memset(self.release_teardown, false);
         if (shared.handlers_on_worker) {
             // One fiber per owed slot (RES-18: the kernel's backpressure)
             // plus the lane's slack for a handler's own helpers.
@@ -1480,17 +1318,7 @@ pub const Group = struct {
             l.deinit();
             self.lane = null;
         }
-        if (self.started.load(.acquire) == @backingInt(Started.armed)) {
-            // The kmbuf region holds every in-flight request's payload (a
-            // LOOKUP's name, a WRITE's data): unmapped only here, once no
-            // handler can still read it — never at the worker's exit, which
-            // `close` reaches with handlers mid-request.
-            if (self.kmb) |*k| k.teardown(&self.ring.ring);
-            self.kmb = null;
-            self.ring.deinit();
-        }
-        self.gpa.free(self.release_teardown);
-        self.release_inbox.deinit(self.gpa);
+        if (self.started.load(.acquire) == @backingInt(Started.armed)) self.ring.deinit();
         self.store_inbox.deinit(self.gpa);
         self.gpa.free(self.hooks);
         self.gpa.free(self.store_cells);
@@ -1507,9 +1335,7 @@ pub const Group = struct {
         self.gpa.free(self.bridge_parked);
         self.deadlines.deinit(self.gpa);
         self.gpa.free(self.pends);
-        self.gpa.free(self.attached);
         self.cells.deinit(self.gpa);
-        if (self.arena.len > 0) _ = linux.munmap(self.arena.ptr, self.arena.len);
         self.gpa.free(self.iovs);
         self.headers.deinit();
         for (self.members) |*m| {
@@ -1520,53 +1346,27 @@ pub const Group = struct {
         self.gpa.destroy(self);
     }
 
-    pub fn arenaBytes(self: *const Group) u64 {
-        return self.arena.len;
-    }
-
-    fn arenaPtr(self: *Group, gent: u32) [*]u8 {
-        return self.arena.ptr + @as(usize, gent) * self.stride;
-    }
-
     /// The ent's payload window the handler serves into / the worker
-    /// applies a reply into: the copy window (`copyWindow`), or — on a zc
+    /// applies a reply into: the pool buffer (`poolWindow`), or — on a zc
     /// slot holding the app's READ destination pages — the bounce window
-    /// (the body is staged here and bridged into the slot). Empty when a
-    /// kmbuf ent has no attachment (a payload-less request: its reply is
-    /// header-only).
+    /// (the body is staged here and bridged into the slot).
     pub fn window(self: *Group, gent: u32) []u8 {
         if (self.shared.zeroCopy()) {
             const m = self.memberOf(gent);
             const e = self.entIdxOf(gent);
             if (m.slots.ent(e).dir == .dest) return self.bounce(gent);
         }
-        return self.copyWindow(gent);
+        return self.poolWindow(gent);
     }
 
     /// The window the kernel COPIES through for this ent's current request
     /// (the in-payload at delivery, the out-struct and a copied body at
-    /// commit): the arena buffer (UserEnts), the attached kmbuf buffer
-    /// (BufRing / ZeroCopy), the pool buffer at the header's `offset`
-    /// (MainlinePool — re-read per delivery: the kernel rewrites the word
-    /// each time, 0 when none was selected, in which case nothing is ever
-    /// written through it).
-    fn copyWindow(self: *Group, gent: u32) []u8 {
-        return switch (self.shared.mode) {
-            .user_ents => self.arenaPtr(gent)[0..self.payload_len],
-            .buf_ring, .zero_copy => self.attachedWindow(gent),
-            .mainline_pool => self.poolWindow(gent),
-        };
-    }
-
-    fn attachedWindow(self: *Group, gent: u32) []u8 {
-        const k = &(self.kmb orelse return &.{});
-        return self.attached[gent].window(k.region, k.buf_size, self.payload_len);
-    }
-
-    /// The pool buffer the header's `offset` names (validated at delivery
-    /// by `poolOffsetOk`; a window read before any delivery is offset 0 —
-    /// the queue's first buffer, which nothing writes through before a
-    /// delivery names it).
+    /// commit): the pool buffer the header's `offset` names — re-read per
+    /// delivery: the kernel rewrites the word each time, 0 when none was
+    /// selected, in which case nothing is ever written through it
+    /// (validated at delivery by `poolOffsetOk`; a window read before any
+    /// delivery is offset 0 — the queue's first buffer, which nothing
+    /// writes through before a delivery names it).
     fn poolWindow(self: *Group, gent: u32) []u8 {
         const p = self.shared.pool orelse return &.{};
         const off = self.headerOf(gent).ring_ent_in_out.offset;
@@ -1587,8 +1387,8 @@ pub const Group = struct {
     }
 
     /// This ring's fixed-buffer index of the ent's zero-copy slot.
-    fn zcSlot(self: *const Group, ent_idx: u16) u16 {
-        return zcSlotOf(self.shared.mode, ent_idx);
+    fn zcSlot(_: *const Group, ent_idx: u16) u16 {
+        return zcSlotOf(ent_idx);
     }
 
     /// The gent's bounce window in the session slab (zc only).
@@ -1627,7 +1427,7 @@ pub const Group = struct {
     }
 
     /// The pass half: punch every populated window whose ent owes nothing
-    /// (registered, replied or retained — no handler holds its window, no
+    /// (registered or replied — no handler holds its window, no
     /// bridge moves through it) and went idle ≥ `min` ticks ago. Worker
     /// thread only: the ent states are its own.
     fn trimIdleWindows(self: *Group) void {
@@ -1816,8 +1616,6 @@ pub const Group = struct {
         if (self.lane) |l| {
             l.attachDriven() catch {
                 log.err("transport: group {d}: its driven handler lane's ring could not be built — the mount fails", .{self.index});
-                if (self.kmb) |*k| k.teardown(&self.ring.ring);
-                self.kmb = null;
                 _ = self.shared.barrier.complete(.failed);
                 self.started.store(@backingInt(Started.ring_failed), .release);
                 futex.wakeAll(&self.started);
@@ -2101,7 +1899,6 @@ pub const Group = struct {
             while (self.cells.pop()) |gent| self.handleCommitCell(gent);
             self.pumpExtracts();
             self.pumpStores();
-            while (self.release_inbox.tryPop()) |_| {}
             if (l.liveFibers() == 0) return;
             if (l.drivenRunnable() or self.selfPending()) continue;
             const now = clock.monotonicNs();
@@ -2166,7 +1963,7 @@ pub const Group = struct {
     };
 
     fn initRing(self: *Group) RingError!void {
-        const entries: u16 = @intCast(geometry.sqEntries(@intCast(self.members.len), self.depth, if (self.shared.zeroCopy()) zc.BRIDGE_PIECES_MAX else 0));
+        const entries: u16 = @intCast(geometry.sqEntries(self.depth, if (self.shared.zeroCopy()) zc.BRIDGE_PIECES_MAX else 0));
         const ladder: []const u32 = if (self.shared.sqpoll) &sqpoll_ladder else &uring128.taskrun_ladder_flags;
         self.ring = uring128.ParkedRing128.initProbing(self.gpa, entries, ladder, &self.ring_rung) catch return error.RingSetupFailed;
         errdefer self.ring.deinit();
@@ -2176,42 +1973,26 @@ pub const Group = struct {
             log.err("transport: group {d}: register_files([fuse_fd, eventfd]) refused ({s}) — the ring cannot carry the FUSE command", .{ self.index, @errorName(e) });
             return error.RingSetupFailed;
         };
-        if (self.shared.usesKmbuf()) {
-            // Post-probe: a refusal here fails the mount loud (charter §3);
-            // the ENOMEM class keeps its type (kmbuf logged the remedy).
-            self.kmb = kmbuf.Kmbuf.setup(&self.ring.ring, self.shared.io, &self.headers, self.shared.kmbuf_opcodes.?, self.shared.zeroCopy(), self.shared.plan.payload_sz, self.shared.page, self.shared.test_kmbuf_enomem) catch |e| {
-                if (e == error.KmbufRingEnomem) return error.KmbufRingEnomem;
-                log.err("transport: group {d}: the {t} buffer setup refused ({s}) after the probe confirmed it — the mount fails", .{ self.index, self.shared.mode, @errorName(e) });
-                return error.RingSetupFailed;
-            };
-        }
-        // A worker that never starts never reaches `deinit`'s teardown.
-        errdefer if (self.kmb) |*k| {
-            k.teardown(&self.ring.ring);
-            self.kmb = null;
-        };
-        if (self.shared.mainline()) try self.setupMainlinePool();
+        try self.setupPool();
         if (!self.ring.armWake()) return error.RingSetupFailed;
         const posture = if (self.shared.sqpoll) "sqpoll" else uring128.taskrun_ladder[self.ring_rung].name;
-        log.info("transport: group {d} (qids {d}..{d}, {d} members × depth {d} at slots {d}.., {t}) ring armed on rung {d} ({s}), sq {d}, payload {d} B, arena {d} B, kmbuf {d} B, pool {d} B", .{ self.index, self.members[0].qid, self.members[self.members.len - 1].qid, self.members.len, self.depth, self.ring_base, self.shared.mode, self.ring_rung, posture, entries, self.payload_len, self.arena.len, if (self.kmb) |k| k.pinnedBytes() else 0, if (self.shared.pool) |p| p.queueSpan() else 0 });
+        log.info("transport: group {d} (qid {d}, depth {d} at slots {d}.., zero-copy {}) ring armed on rung {d} ({s}), sq {d}, payload {d} B, pool {d} B", .{ self.index, self.members[0].qid, self.depth, self.ring_base, self.shared.zeroCopy(), self.ring_rung, posture, entries, self.payload_len, self.shared.pool.?.queueSpan() });
     }
 
-    /// The mainline rung's per-ring setup (fuse_mainline_pools.md §3): the
+    /// The per-ring pool setup (fuse_mainline_pools.md §2): the
     /// fixed-buffer table (the queue's pool region at `POOL_INDEX`, one
     /// sparse zc slot per entry on a zero-copy queue), then — on the queue's
     /// FIRST ring only — `ADD_QUEUE` (zero-copy iff armed) and the
     /// REGISTERED `ADD_BUFPOOL`, both answered inline in one enter and
     /// checked before any REGISTER; a later ring of the queue finds the
     /// pool added (the session starts the rings in order). Every refusal
-    /// is post-probe and fails the mount loud, typed `MainlinePoolRefused`
-    /// (a kernel that offered bit 43 and refuses these is a protocol
-    /// breach; the test seam on a legacy kernel meets its RELEASE_PAYLOAD
-    /// here — the opcode collision answered ENOTCONN, never a REGISTER).
-    fn setupMainlinePool(self: *Group) RingError!void {
+    /// is post-probe and fails the mount loud, typed `PoolRefused` (a kernel
+    /// that offered bit 43 and refuses these is a protocol breach).
+    fn setupPool(self: *Group) RingError!void {
         const pool = self.shared.pool.?;
         const qid = self.members[0].qid;
         const region = pool.queueRegion(qid);
-        const slots = mainlineTableSlots(self.shared.zeroCopy(), self.depth);
+        const slots = tableSlots(self.shared.zeroCopy(), self.depth);
         self.ring.ring.registerBuffersSparse(slots) catch |e| {
             log.err("transport: group {d}: the fixed-buffer table ({d} slots) refused ({s}) — the mount fails", .{ self.index, slots, @errorName(e) });
             return error.RingSetupFailed;
@@ -2236,7 +2017,7 @@ pub const Group = struct {
         prepAddBufpool(p_sqe, qid, region);
         _ = self.ring.ring.submitAndWait(2) catch |e| {
             log.err("transport: group {d}: submitting ADD_QUEUE/ADD_BUFPOOL for queue {d} failed ({s}) — the mount fails", .{ self.index, qid, @errorName(e) });
-            return error.MainlinePoolRefused;
+            return error.PoolRefused;
         };
         var cqes: [2]uring128.Cqe32 = undefined;
         const n = self.ring.ring.copyCqes(&cqes, 2) catch 0;
@@ -2250,8 +2031,8 @@ pub const Group = struct {
         const qr = queue_res orelse -@as(i32, @intCast(@backingInt(linux.E.TIME)));
         const pr = pool_res orelse -@as(i32, @intCast(@backingInt(linux.E.TIME)));
         if (qr != 0 or pr != 0) {
-            log.err("transport: group {d}: queue {d}: ADD_QUEUE(zero_copy={}) → {d}, ADD_BUFPOOL({d} B at index {d}) → {d} — refused after the bufpool probe read present; the mount fails (the probe is the only degrade point, charter §3; ENOTCONN here is a legacy kernel answering RELEASE_PAYLOAD to opcode 3 — the collision guard)", .{ self.index, qid, zc_on, qr, pool.queueSpan(), Pool.POOL_INDEX, pr });
-            return error.MainlinePoolRefused;
+            log.err("transport: group {d}: queue {d}: ADD_QUEUE(zero_copy={}) → {d}, ADD_BUFPOOL({d} B at index {d}) → {d} — refused after the bufpool probe read present; the mount fails (the probe is the only degrade point, charter §3)", .{ self.index, qid, zc_on, qr, pool.queueSpan(), Pool.POOL_INDEX, pr });
+            return error.PoolRefused;
         }
         added.store(true, .release);
         pool_queues_added.inc();
@@ -2292,14 +2073,7 @@ pub const Group = struct {
             self.onRegisterRefused(member_slot, ent_idx, .AGAIN, now);
             return;
         };
-        switch (self.shared.mode) {
-            .buf_ring, .zero_copy => {
-                const flags = zc.initFlags(self.shared.zeroCopy(), self.shared.retention);
-                prepRegisterKmbuf(sqe, m.qid, ent_idx, flags, if (self.shared.zeroCopy()) @intCast(self.depth) else 0, gent);
-            },
-            .mainline_pool => prepRegisterMainline(sqe, m.qid, &self.iovs[gent], if (self.shared.zeroCopy()) self.zcSlot(ent_idx) else 0, gent),
-            .user_ents => prepRegister(sqe, m.qid, &self.iovs[gent], gent),
-        }
+        prepRegister(sqe, m.qid, &self.iovs[gent], if (self.shared.zeroCopy()) self.zcSlot(ent_idx) else 0, gent);
         m.slots.onRegisterSubmitted(ent_idx);
         registers.inc();
         self.noteInitialPush(m);
@@ -2346,7 +2120,7 @@ pub const Group = struct {
             m.slots.abandon(e);
             return;
         };
-        if (self.shared.mainline()) prepCommitMainline(sqe, m.qid, commit_id, gent) else prepCommit(sqe, m.qid, commit_id, gent, 0);
+        prepCommit(sqe, m.qid, commit_id, gent);
         m.slots.onCommitSubmitted(e);
         self.bounce_idle_tick[gent] = mem_budget.authority.ticks();
         ring_replies.inc();
@@ -2355,55 +2129,6 @@ pub const Group = struct {
         if (cell.done_ns != 0) {
             held_write_to_commit_ns.record(clock.monotonicNs() -| cell.done_ns);
             cell.done_ns = 0;
-        }
-    }
-
-    /// The RETAIN commit: the request ends, the slot's pages stay
-    /// registered, the cmd parks kernel-side (its CQE is the delivery after
-    /// the RELEASE). A release that arrived early fires right behind it in
-    /// the same batch (release never precedes its commit).
-    fn pushCommitRetain(self: *Group, gent: u32, commit_id: u64) void {
-        const m = self.memberOf(gent);
-        const e = self.entIdxOf(gent);
-        const sqe = self.takeSqe() orelse {
-            m.slots.abandon(e);
-            return;
-        };
-        prepCommit(sqe, m.qid, commit_id, gent, abi.FUSE_URING_COMMIT_RETAIN);
-        m.slots.onCommitSubmittedRetained(e);
-        self.bounce_idle_tick[gent] = mem_budget.authority.ticks();
-        ring_replies.inc();
-        self.commits_pushed += 1;
-        const cell = &self.store_cells[gent];
-        if (cell.done_ns != 0) {
-            held_write_to_commit_ns.record(clock.monotonicNs() -| cell.done_ns);
-            cell.done_ns = 0;
-        }
-        if (m.slots.ent(e).release_pending) self.pushRelease(gent, commit_id, .handler);
-    }
-
-    const ReleaseOrigin = enum { handler, teardown };
-
-    fn pushRelease(self: *Group, gent: u32, commit_id: u64, origin: ReleaseOrigin) void {
-        const m = self.memberOf(gent);
-        const e = self.entIdxOf(gent);
-        const sqe = self.takeSqe() orelse return;
-        prepRelease(sqe, m.qid, commit_id, gent);
-        m.slots.onReleaseSubmitted(e);
-        self.release_teardown[gent] = origin == .teardown;
-        self.releases_pending += 1;
-        releases_inflight.add(1);
-    }
-
-    /// RELEASE every retained slot of this group — the drain's half of the
-    /// retention law: a retained ent the kernel reclaims itself pins the
-    /// exiting process. Idempotent: a released slot is `replied`.
-    fn releaseRetainedAll(self: *Group) void {
-        for (self.members, 0..) |*m, ms| {
-            for (m.slots.ents, 0..) |*ent, e| switch (ent.state) {
-                .retained => |cid| self.pushRelease(self.gentOf(@intCast(ms), @intCast(e)), cid, .teardown),
-                else => {},
-            };
         }
     }
 
@@ -2443,7 +2168,7 @@ pub const Group = struct {
         self.bridge_parked[gent] = .none;
     }
 
-    // ---- bridges (porting spec kmbuf §7) ----
+    // ---- bridges (porting spec fuse_kmbuf_zc.md §7) ----
 
     fn stallSource(self: *Group) ?linux.fd_t {
         var left = self.shared.bridge_stall_remaining.load(.monotonic);
@@ -2525,7 +2250,7 @@ pub const Group = struct {
     /// body up to it; the bridge moves the padded length into the
     /// installed pages (the kernel copy path's page_zeroing) while the
     /// commit's payload length stays the body's.
-    fn bridgeBounce(self: *Group, gent: u32, body: []const u8, readdir_probe: bool, zero_pad: u32) bool {
+    fn bridgeBounce(self: *Group, gent: u32, body: []const u8, zero_pad: u32) bool {
         const win = self.bounce(gent);
         if (body.len > win.len) return false;
         if (body.ptr != win.ptr) {
@@ -2534,7 +2259,7 @@ pub const Group = struct {
         }
         const dma: u32 = @intCast(@min(win.len, @max(body.len, zero_pad)));
         if (dma > body.len) @memset(win[body.len..dma], 0);
-        return self.pushBridge(gent, .{ .kind = .reply_bounce, .len = dma, .reply_len = @intCast(body.len), .readdir_probe = readdir_probe }, self.bounceFd(gent), self.bounceOffset(gent), true);
+        return self.pushBridge(gent, .{ .kind = .reply_bounce, .len = dma, .reply_len = @intCast(body.len) }, self.bounceFd(gent), self.bounceOffset(gent), true);
     }
 
     /// The bridge deadline scan (every `BRIDGE_SCAN_PERIOD` while a pend is
@@ -2585,8 +2310,6 @@ pub const Group = struct {
         const m = self.memberOf(gent);
         const e = self.entIdxOf(gent);
         const ok = res >= 0 and @as(u32, @intCast(res)) == pend.len;
-        const efault = res == -@as(i32, @intCast(@backingInt(linux.E.FAULT)));
-        if (pend.readdir_probe and pend.kind == .reply_bounce) self.shared.latchReaddir(if (ok) .paged else if (efault) .copyable else .unresolved);
         switch (pend.kind) {
             .reply_bounce, .reply_fd => {
                 const msg = self.parkedMsg(gent) orelse {
@@ -2607,19 +2330,9 @@ pub const Group = struct {
                     // Restage the keepalive body through the bounce (the
                     // view is pinned until the hook runs, AFTER the copy).
                     zc_fd_body_fallbacks.inc();
-                    const restaged = self.bridgeBounce(gent, msg.body, false, msg.zero_pad);
+                    const restaged = self.bridgeBounce(gent, msg.body, msg.zero_pad);
                     if (pend.hook) |h| _ = h.run(false, &.{});
                     if (restaged) return;
-                }
-                if (pend.readdir_probe and efault) {
-                    // The kernel never registered the slot: the body goes to
-                    // the kmbuf attachment like any copyable reply.
-                    const win = self.attachedWindow(gent);
-                    if (win.len > 0 and slot.applyReply(self.headerOf(gent), win, msg.asReply())) {
-                        self.pushCommit(gent, msg.slot.commit_id);
-                        self.resumeParked(gent);
-                        return;
-                    }
                 }
                 zc_fallbacks.inc();
                 log.warn("transport: queue {d} ent {d}: {t} bridge of {d} bytes answered {d} — header-only EIO", .{ m.qid, e, pend.kind, pend.len, res });
@@ -2713,7 +2426,7 @@ pub const Group = struct {
         }
     }
 
-    // ---- the handlers' bridge requests (lazy extraction, release) ----
+    // ---- the handlers' bridge requests (lazy extraction, direct store) ----
 
     /// The held slot's face (`slot.HeldFace.extract`): any thread. Posts
     /// the gent, wakes the worker, parks on the cell's event.
@@ -2767,8 +2480,7 @@ pub const Group = struct {
             const e = self.entIdxOf(gent);
             const ent = m.slots.ent(e);
             const cell = &self.store_cells[gent];
-            const live = ent.owing() != null or ent.state == .retained;
-            if (!ent.held or !live or cell.len == 0 or cell.len > self.held_len[gent]) {
+            if (!ent.held or ent.owing() == null or cell.len == 0 or cell.len > self.held_len[gent]) {
                 cell.res = -@as(i32, @intCast(@backingInt(linux.E.NOENT)));
                 cell.event.set(self.shared.io);
                 continue;
@@ -2783,23 +2495,16 @@ pub const Group = struct {
         }
     }
 
-    /// A RELEASE from the handler (`Session.releaseRetained`): any thread.
-    pub fn requestRelease(self: *Group, gent: u32) void {
-        if (!self.release_inbox.tryPush(gent)) return;
-        if (self.wakeSelf()) slot.wake_writes.inc() else slot.wakes_elided.inc();
-    }
-
     /// Pump the lazy extractions: `WRITE_FIXED(slot → slab)` for a held
-    /// slot (delivered, parked or retained — the pages stay registered
-    /// until the plain commit or the RELEASE); refusals answer the cell now.
+    /// slot (delivered or parked — the pages stay registered until the
+    /// commit); refusals answer the cell now.
     fn pumpExtracts(self: *Group) void {
         while (self.extract_inbox.tryPop()) |gent| {
             const m = self.memberOf(gent);
             const e = self.entIdxOf(gent);
             const ent = m.slots.ent(e);
             const cell = &self.extract_cells[gent];
-            const live = ent.owing() != null or ent.state == .retained;
-            if (!ent.held or !live) {
+            if (!ent.held or ent.owing() == null) {
                 cell.res = -@as(i32, @intCast(@backingInt(linux.E.NOENT)));
                 cell.event.set(self.shared.io);
                 continue;
@@ -2809,43 +2514,6 @@ pub const Group = struct {
                 cell.event.set(self.shared.io);
             }
         }
-    }
-
-    /// Pump the releases AFTER the pass's commits: a retained slot releases
-    /// now; a slot still owing (its RETAIN commit not yet pushed) parks the
-    /// release behind that commit; anything else is inert.
-    fn pumpReleases(self: *Group) void {
-        while (self.release_inbox.tryPop()) |gent| {
-            const m = self.memberOf(gent);
-            const e = self.entIdxOf(gent);
-            const ent = m.slots.ent(e);
-            switch (ent.state) {
-                .retained => |cid| self.pushRelease(gent, cid, .handler),
-                .delivered, .parked => ent.release_pending = true,
-                else => zc_release_inert.inc(),
-            }
-        }
-    }
-
-    /// A RELEASE CQE: 0 is the kernel's acceptance; a disconnect errno
-    /// means the connection died first and the kernel's drain owns the
-    /// slot (counted, never the tripwire); anything else is the
-    /// must-stay-0 failure (ENOENT a double release, EBUSY a live commit).
-    fn handleReleaseCqe(self: *Group, gent: u32, res: i32) void {
-        self.releases_pending -|= 1;
-        releases_inflight.sub(1);
-        if (res == 0) {
-            if (self.release_teardown[gent]) retained_released_at_teardown.inc();
-            return;
-        }
-        cqe_errors.inc();
-        const e: linux.E = @fromBackingInt(@as(u16, @intCast(-res)));
-        if (isDisconnect(e)) {
-            retained_kernel_drained.inc();
-            self.disconnected = true;
-            return;
-        }
-        self.releaseFailure(gent, e);
     }
 
     // ---- the commit path ----
@@ -2866,10 +2534,7 @@ pub const Group = struct {
         const hdr = self.headerOf(gent);
         const payload = self.window(gent);
         switch (msg.kind) {
-            .reply, .reply_retain => {
-                if (msg.kind == .reply_retain) slot.retain_refused_class.inc();
-                _ = slot.applyReply(hdr, payload, msg.asReply());
-            },
+            .reply => _ = slot.applyReply(hdr, payload, msg.asReply()),
             .fd_body => {
                 // No zc slot to bridge into: the body view is the reply.
                 commit_queue.fd_body_fallbacks.inc();
@@ -2885,16 +2550,14 @@ pub const Group = struct {
                 }
             },
             .fail => slot.applyErrorHeader(hdr, msg.header.unique, msg.errno),
-            .release => unreachable, // releases ride their own inbox
         }
         self.pushCommit(gent, msg.slot.commit_id);
     }
 
-    /// The zero-copy commit routing (porting spec kmbuf §4.3–4.4, §5.3):
+    /// The zero-copy commit routing (porting spec fuse_kmbuf_zc.md §4.3–4.4):
     /// a paged READ body moves through the slot (bridged: the commit parks
-    /// until the CQE); a WRITE slot takes no body (the direction law); a
-    /// RETAIN commit only for a held `.page_cache` WRITE on a
-    /// retention-armed queue; everything else lands in the kmbuf attachment.
+    /// until the CQE); a WRITE slot takes no body (the direction law);
+    /// everything else lands in the pool buffer.
     fn commitReadyZc(self: *Group, gent: u32, msg: *const commit_queue.Msg, parked: ParkedReply) void {
         const hdr = self.headerOf(gent);
         const m = self.memberOf(gent);
@@ -2919,7 +2582,7 @@ pub const Group = struct {
                 zc_replies.inc();
                 self.pushCommit(gent, msg.slot.commit_id);
             },
-            .reply, .fd_body, .reply_retain => {
+            .reply, .fd_body => {
                 const r = msg.asReply();
                 if (dir == .dest) {
                     // A paged reply: header-extra bytes have nowhere to go.
@@ -2942,13 +2605,12 @@ pub const Group = struct {
                         self.pushCommit(gent, msg.slot.commit_id);
                         return;
                     }
-                    const probe = self.readdirProbe(gent);
                     const hook = self.hooks[gent];
                     self.hooks[gent] = null;
                     const pushed = if (msg.kind == .fd_body)
-                        self.pushBridge(gent, .{ .kind = .reply_fd, .len = @intCast(r.body.len), .readdir_probe = probe, .hook = hook }, msg.fd, msg.fd_off, true)
+                        self.pushBridge(gent, .{ .kind = .reply_fd, .len = @intCast(r.body.len), .hook = hook }, msg.fd, msg.fd_off, true)
                     else
-                        self.bridgeBounce(gent, r.body, probe, r.zero_pad);
+                        self.bridgeBounce(gent, r.body, r.zero_pad);
                     if (!pushed) {
                         if (hook) |h| _ = h.run(false, &.{});
                     }
@@ -2973,27 +2635,11 @@ pub const Group = struct {
                     return;
                 }
                 if (msg.kind == .fd_body) commit_queue.fd_body_fallbacks.inc();
-                const win = self.copyWindow(gent);
+                const win = self.poolWindow(gent);
                 _ = slot.applyReply(hdr, win, r);
-                if (msg.kind == .reply_retain) {
-                    if (dir == .source and ent.held and ent.class == .page_cache and self.shared.retention) {
-                        self.pushCommitRetain(gent, msg.slot.commit_id);
-                        return;
-                    }
-                    slot.retain_refused_class.inc();
-                    log.warn("transport: queue {d} ent {d}: replyRetain refused (dir {t}, held {}, class {t}, retention {}) — committed plain", .{ m.qid, e, dir, ent.held, ent.class, self.shared.retention });
-                }
                 self.pushCommit(gent, msg.slot.commit_id);
             },
-            .release => unreachable,
         }
-    }
-
-    /// Whether this slot's bridge is the readdir class's first (the probe).
-    fn readdirProbe(self: *Group, gent: u32) bool {
-        if (self.shared.readdirLatch() != .unresolved) return false;
-        const op = (abi.decodePrefix(abi.fuse_in_header, &self.headerOf(gent).in_out) orelse return false).op();
-        return op == .readdir or op == .readdirplus;
     }
 
     /// One pumped cell: admit → the per-ent gate → commit now or park.
@@ -3100,7 +2746,7 @@ pub const Group = struct {
             // 2–3. The READ CQE already drained the counter; disarm, then scan.
             _ = self.ring.service();
             // 4. Pump every published cell through the gate; then the
-            //    handlers' bridge requests; releases after the commits.
+            //    handlers' bridge requests.
             var pass_msgs: u32 = 0;
             while (self.cells.pop()) |gent| {
                 pass_msgs += 1;
@@ -3108,13 +2754,12 @@ pub const Group = struct {
             }
             self.pumpExtracts();
             self.pumpStores();
-            self.pumpReleases();
             // 4a. The driven handler lane (decision 0003 §AB.3): its wake
             //     DISARMED → its inbox → its timers → the fibers ready at
             //     entry run HERE.
             self.pumpLane();
             // 4a'. What those fibers published (reply cells, bridge
-            //      requests, releases) goes through the gate in THIS pass:
+            //      requests) goes through the gate in THIS pass:
             //      its SQEs ride this pass's enter. These pops are not
             //      `pass_msgs` (they owe no loop): a cell a foreign thread
             //      published meanwhile carries its own coalesced wake.
@@ -3123,7 +2768,6 @@ pub const Group = struct {
                 while (self.cells.pop()) |gent| self.handleCommitCell(gent);
                 self.pumpExtracts();
                 self.pumpStores();
-                self.pumpReleases();
             }
             // 4b. The idle-trim request, if the sampler left one.
             self.trimIdleWindows();
@@ -3355,17 +2999,11 @@ pub const Group = struct {
         switch (tag.kind) {
             .bridge => return self.handleBridgeCqe(tag.gent, cqe.res),
             .cancel => return self.handleCancelCqe(tag.gent, cqe.res),
-            .release => return self.handleReleaseCqe(tag.gent, cqe.res),
             .register, .commit => {},
             .setup => unreachable,
         }
         if (cqe.res < 0) return self.handleCqeError(tag, cqe.err());
-        self.deliver(tag.gent, tag.kind == .register, cqe.flags);
-    }
-
-    fn releaseFailure(self: *Group, gent: u32, e: linux.E) void {
-        slot.release_failures.fire("RELEASE_PAYLOAD answered nonzero");
-        log.err("transport: queue {d} ent {d}: RELEASE_PAYLOAD answered {t} ({s})", .{ self.memberOf(gent).qid, self.entIdxOf(gent), e, if (e == .NOENT) "a double release" else if (e == .BUSY) "raced a live commit" else "unexpected" });
+        self.deliver(tag.gent, tag.kind == .register);
     }
 
     /// The CQE error ladder (porting spec §8.2), in order.
@@ -3376,13 +3014,6 @@ pub const Group = struct {
         const now = clock.monotonicNs();
         if (isDisconnect(e)) {
             self.disconnected = true;
-            return;
-        }
-        // A RETAIN commit the kernel refused: the must-stay-0 tripwire and a
-        // plain re-commit of the applied reply (before the protocol arm).
-        if (tag.kind == .commit and e == .INVAL and m.slots.ent(ent_idx).state == .retained) {
-            m.slots.onRetainRefused(ent_idx, now);
-            self.pushCommit(tag.gent, m.slots.ent(ent_idx).owing().?.commit_id);
             return;
         }
         if (isProtocolRejection(e)) {
@@ -3421,28 +3052,14 @@ pub const Group = struct {
         }
     }
 
-    // ---- delivery (porting spec §5; kmbuf §3.4, §4.4) ----
+    // ---- delivery (porting spec §5; fuse_mainline_pools.md §3) ----
 
-    fn deliver(self: *Group, gent: u32, from_register: bool, cqe_flags: u32) void {
+    fn deliver(self: *Group, gent: u32, from_register: bool) void {
         const m = self.memberOf(gent);
         const ent_idx = self.entIdxOf(gent);
         const hdr = self.headerOf(gent);
         const now = clock.monotonicNs();
         if (from_register) m.slots.noteRegisterSuccess(ent_idx);
-        if (self.kmb) |*k| {
-            // The attachment law: flagged re-points, unflagged keeps, a bid
-            // past the ring is a breach.
-            switch (self.attached[gent].note(cqe_flags, k.ring_entries)) {
-                .kept => {},
-                .repointed => kmbuf_attached_deliveries.inc(),
-                .breach => |bid| {
-                    kmbuf_attachment_breach.fire("CQE buffer id past the kmbuf ring");
-                    log.err("transport: queue {d} ent {d}: kmbuf bid {d} ≥ ring entries {d} — protocol breach, the session fails", .{ m.qid, ent_idx, bid, k.ring_entries });
-                    _ = self.shared.shutdown();
-                    return;
-                },
-            }
-        }
         const unique = std.mem.readInt(u64, hdr.in_out[8..16], .little);
         var commit_id = hdr.ring_ent_in_out.commit_id;
         if (commit_id == 0) commit_id = unique;
@@ -3468,48 +3085,41 @@ pub const Group = struct {
             return self.failEnt(gent, .IO);
         }
         const announced: usize = hdr.ring_ent_in_out.payload_sz;
-        if (self.shared.mainline()) {
-            // The pool offset law, then the direction: mainline states a
-            // zero-copied delivery in the header (`FUSE_URING_ENT_ZERO_COPY`)
-            // and zero-copies READ (the slot a DEST) and WRITE (a SOURCE) only
-            // — no opcode mirror, no readdir latch.
-            if (!self.poolOffsetOk(gent)) {
-                pool_offset_breach.fire("pool offset past the queue's region");
-                log.err("transport: queue {d} ent {d}: pool offset {d} + payload {d} past the queue's {d}-byte region — protocol breach, the session fails", .{ m.qid, ent_idx, hdr.ring_ent_in_out.offset, self.payload_len, self.shared.pool.?.queueSpan() });
-                _ = self.shared.shutdown();
-                return;
-            }
-            pool_deliveries.inc();
-            const op = (abi.decodePrefix(abi.fuse_in_header, &hdr.in_out) orelse return self.failEnt(gent, .INVAL)).op();
-            ent.dir = zc.mainlineDirOf(op, hdr.ring_ent_in_out.flags);
-            if (ent.dir != .none) {
-                if (!self.shared.zeroCopy()) {
-                    // The kernel zero-copied on a queue this session created
-                    // copying: no slab, no slot to bridge — refuse the one request.
-                    pool_zc_unarmed.fire("ENT_ZERO_COPY on a session without zero-copy");
-                    return self.failEnt(gent, .IO);
-                }
-                pool_zc_deliveries.inc();
-            }
-            if (ent.dir == .source and announced > 0) return self.deliverPagedWrite(gent, announced);
-            // A WRITE the kernel copied into the pool: hold it THERE when the
-            // shape and the filesystem's gate admit it — the pool is a
-            // registered buffer, so the device write reads it directly.
-            if (op == .write and announced > 0 and self.tryHoldPooled(gent, announced)) return;
-        } else if (self.shared.zeroCopy()) {
-            const op = (abi.decodePrefix(abi.fuse_in_header, &hdr.in_out) orelse return self.failEnt(gent, .INVAL)).op();
-            ent.dir = zc.dirOf(op, self.shared.readdirLatch());
-            if (ent.dir == .source and announced > 0) return self.deliverPagedWrite(gent, announced);
+        // The pool offset law, then the direction: the kernel states a
+        // zero-copied delivery in the header (`FUSE_URING_ENT_ZERO_COPY`)
+        // and zero-copies READ (the slot a DEST) and WRITE (a SOURCE) only.
+        if (!self.poolOffsetOk(gent)) {
+            pool_offset_breach.fire("pool offset past the queue's region");
+            log.err("transport: queue {d} ent {d}: pool offset {d} + payload {d} past the queue's {d}-byte region — protocol breach, the session fails", .{ m.qid, ent_idx, hdr.ring_ent_in_out.offset, self.payload_len, self.shared.pool.?.queueSpan() });
+            _ = self.shared.shutdown();
+            return;
         }
-        // The in-payload is always in the copy window (a DEST slot's request
+        pool_deliveries.inc();
+        const op = (abi.decodePrefix(abi.fuse_in_header, &hdr.in_out) orelse return self.failEnt(gent, .INVAL)).op();
+        ent.dir = zc.dirOf(op, hdr.ring_ent_in_out.flags);
+        if (ent.dir != .none) {
+            if (!self.shared.zeroCopy()) {
+                // The kernel zero-copied on a queue this session created
+                // copying: no slab, no slot to bridge — refuse the one request.
+                pool_zc_unarmed.fire("ENT_ZERO_COPY on a session without zero-copy");
+                return self.failEnt(gent, .IO);
+            }
+            pool_zc_deliveries.inc();
+        }
+        if (ent.dir == .source and announced > 0) return self.deliverPagedWrite(gent, announced);
+        // A WRITE the kernel copied into the pool: hold it THERE when the
+        // shape and the filesystem's gate admit it — the pool is a
+        // registered buffer, so the device write reads it directly.
+        if (op == .write and announced > 0 and self.tryHoldPooled(gent, announced)) return;
+        // The in-payload is always in the pool buffer (a DEST slot's request
         // carries none: its header rode `op_in`).
-        const win = self.copyWindow(gent);
+        const win = self.poolWindow(gent);
         const capped = @min(announced, win.len);
         self.deliverParsed(gent, win[0..capped], capped, null);
     }
 
     /// A paged WRITE on a zero-copy slot: the bytes sit in the slot, the
-    /// kmbuf attachment holds nothing. HELD iff the shape (`zc.holdShape`)
+    /// pool buffer holds nothing. HELD iff the shape (`zc.holdShape`)
     /// and the filesystem's pure gate say so (the lease carries the slot);
     /// else extracted at delivery (`WRITE_FIXED(slot → slab)`) and
     /// dispatched at the CQE over the bounce bytes. A held slot costs the
@@ -3523,15 +3133,14 @@ pub const Group = struct {
         const ent = m.slots.ent(ent_idx);
         if (announced > self.payload_len) return self.failEnt(gent, .IO);
         const win = abi.decodePrefix(abi.fuse_write_in, &hdr.op_in) orelse return self.failEnt(gent, .INVAL);
-        ent.class = zc.PayloadClass.classify(win.flags, win.write_flags);
-        const hint: fsv.HoldHint = .{ .ino = std.mem.readInt(u64, hdr.in_out[16..24], .little), .offset = win.offset, .len = win.size, .class = ent.class };
+        const hint: fsv.HoldHint = .{ .ino = std.mem.readInt(u64, hdr.in_out[16..24], .little), .offset = win.offset, .len = win.size };
         const hold = @as(usize, win.size) == announced and
             zc.holdShape(win.offset, win.size, self.shared.block_size) and
             self.shared.fs.writeHoldEligible(hint);
         if (hold) {
             ent.held = true;
             self.held_len[gent] = win.size;
-            const lease = slot.PayloadLease.acquireHeld(&ent.lease, self.waker(), win.size, ent.class, m.qid, self.slotIdx(ent_idx), gent, self.heldFace());
+            const lease = slot.PayloadLease.acquireHeld(&ent.lease, self.waker(), win.size, m.qid, self.slotIdx(ent_idx), gent, self.heldFace());
             self.deliverParsed(gent, &.{}, announced, lease);
             return;
         }
@@ -3540,7 +3149,7 @@ pub const Group = struct {
         }
     }
 
-    /// A WRITE delivered through the mainline pool (no zc flag: the kernel
+    /// A WRITE delivered through the pool (no zc flag: the kernel
     /// copied the bytes into the queue's pool buffer, a registered buffer
     /// of this ring): HELD in the pool iff the shape (`zc.holdShape`) and
     /// the filesystem's gate say so — the handler then stores it by
@@ -3559,13 +3168,12 @@ pub const Group = struct {
         if (@as(usize, win.size) != announced) return false;
         const pool_win = self.poolWindow(gent);
         if (win.size > pool_win.len) return false;
-        ent.class = zc.PayloadClass.classify(win.flags, win.write_flags);
-        const hint: fsv.HoldHint = .{ .ino = std.mem.readInt(u64, hdr.in_out[16..24], .little), .offset = win.offset, .len = win.size, .class = ent.class };
+        const hint: fsv.HoldHint = .{ .ino = std.mem.readInt(u64, hdr.in_out[16..24], .little), .offset = win.offset, .len = win.size };
         if (!zc.holdShape(win.offset, win.size, self.shared.block_size) or !self.shared.fs.writeHoldEligible(hint)) return false;
         ent.held = true;
         self.held_len[gent] = win.size;
         self.held_pool[gent] = true;
-        const lease = slot.PayloadLease.acquireHeldPooled(&ent.lease, self.waker(), pool_win[0..win.size], ent.class, m.qid, self.slotIdx(ent_idx), gent, self.heldFace());
+        const lease = slot.PayloadLease.acquireHeldPooled(&ent.lease, self.waker(), pool_win[0..win.size], m.qid, self.slotIdx(ent_idx), gent, self.heldFace());
         self.deliverParsed(gent, pool_win[0..announced], announced, lease);
         return true;
     }
@@ -3584,7 +3192,7 @@ pub const Group = struct {
     /// (after a direct leg fell through): the header is intact.
     fn redeliver(self: *Group, gent: u32) void {
         const hdr = self.headerOf(gent);
-        const win = self.copyWindow(gent);
+        const win = self.poolWindow(gent);
         const capped = @min(@as(usize, hdr.ring_ent_in_out.payload_sz), win.len);
         const delivery = codec.Delivery.fromRing(&hdr.in_out, &hdr.op_in, win[0..capped], capped) catch return self.failEnt(gent, .INVAL);
         const parsed = codec.parse(delivery) catch |e| return self.failEnt(gent, codec.parseErrno(e));
@@ -3596,7 +3204,7 @@ pub const Group = struct {
     }
 
     /// Parse and route a delivered request. `payload` is the copyable body
-    /// (the arena / attached / bounce bytes); `payload_len` the authoritative
+    /// (the pool / bounce bytes); `payload_len` the authoritative
     /// body length (a held slot: `> payload.len`); `held` the held lease.
     fn deliverParsed(self: *Group, gent: u32, payload: []const u8, payload_len: usize, held: ?slot.PayloadLease) void {
         const m = self.memberOf(gent);
@@ -3686,8 +3294,8 @@ pub const Group = struct {
         self.dispatch(gent, req, sref, null);
     }
 
-    /// A served READ reply: into the window (UserEnts/BufRing — the arena
-    /// or the attached buffer), or bridged through the slot (zc).
+    /// A served READ reply: into the window (the pool buffer), or bridged
+    /// through the slot (zc).
     fn commitRead(self: *Group, gent: u32, req: fsv.Request, in: abi.fuse_read_in, reply: codec.Reply) void {
         var r = codec.replyRead(req.unique(), reply.body, in.size);
         r.zero_pad = self.zeroReadTail(gent, in, r.body.len);
@@ -3792,7 +3400,7 @@ pub const Group = struct {
     /// requested length (no bytes move — the round trip alone); `bounce`,
     /// and `prefilled` wherever there is no dest slot, zero-fills the window
     /// and takes the served-READ reply path (one memory-source bridge under
-    /// zc, the kmbuf/arena copy elsewhere).
+    /// zc, the pool copy elsewhere).
     fn serveZeroFill(self: *Group, gent: u32, req: fsv.Request, in: abi.fuse_read_in) void {
         fast_dispatch_serves.inc();
         const n: u32 = @intCast(@min(@as(usize, in.size), self.payload_len));
@@ -3882,8 +3490,6 @@ pub const Group = struct {
             self.store_cells[g].res = -@as(i32, @intCast(@backingInt(linux.E.NOTCONN)));
             self.store_cells[g].event.set(self.shared.io);
         }
-        // A handler's release still queued is subsumed by step 3.
-        while (self.release_inbox.tryPop()) |_| {}
         // 2. Final messages: every published cell still queued joins the
         //    parked ones; a leased ent gets the whole-group bounded wait.
         while (self.cells.pop()) |gent| self.handleCommitCell(gent);
@@ -3917,56 +3523,16 @@ pub const Group = struct {
                 if (m.slots.ent(ent_idx).owing() != null) self.failEnt(gent, .IO);
             }
         }
-        // 5. RELEASE every retained slot while the connection is live — after
-        //    every commit of this drain (a RETAIN an unparked cell just pushed
-        //    precedes its RELEASE in SQ order). A retained ent the kernel
-        //    reclaims at its own teardown pins the exiting process
-        //    (`fuse-uring: … teardown with retained zc payloads`); after a
-        //    disconnect the kernel's drain already owns them (counted).
-        if (!self.disconnected) self.releaseRetainedAll() else self.countKernelDrained();
-        // 6. One flush for the whole drain, then the RELEASE verdicts: the
-        //    kernel answers them inside that enter, so the reap is immediate
-        //    and the session may unmount only once every RELEASE is reaped
-        //    (a RELEASE after `umount2` meets a stopped queue).
+        // 5. One flush for the whole drain.
         self.flushNonBlocking();
-        self.awaitReleases();
-        // 7. The session may unmount now.
+        // 6. The session may unmount now.
         self.drained.store(1, .release);
         futex.wakeAll(&self.drained);
-        // 8. Residency.
+        // 7. Residency.
         self.residency();
         // Anything still owed when residency lapsed is the honest tripwire.
         for (self.members) |*m| {
             for (m.slots.ents, 0..) |*ent, e| if (ent.owing() != null) m.slots.abandon(@intCast(e));
-        }
-    }
-
-    /// The drain found the connection already gone: every retained slot is
-    /// the kernel's drain's (its RELEASE would answer -ENOTCONN).
-    fn countKernelDrained(self: *Group) void {
-        for (self.members) |*m| {
-            for (m.slots.ents) |*ent| if (ent.state == .retained) retained_kernel_drained.inc();
-        }
-    }
-
-    /// Reap this group's teardown RELEASE CQEs (`releases_pending` → 0):
-    /// inline with the flush in practice; bounded parks on the ring guard a
-    /// dead ring, and a lapse is loud (the slot is then the kernel's).
-    fn awaitReleases(self: *Group) void {
-        const deadline = clock.monotonicNs() + TEARDOWN_RELEASE_BOUND_NS;
-        while (self.releases_pending > 0 and !self.disconnected and !self.ring.isDead()) {
-            self.reapQuiet();
-            if (self.releases_pending == 0) return;
-            const now = clock.monotonicNs();
-            if (now >= deadline) {
-                log.warn("transport: group {d}: {d} teardown RELEASE(s) unanswered after {d} ms — the kernel reclaims those slots at its teardown", .{ self.index, self.releases_pending, TEARDOWN_RELEASE_BOUND_NS / std.time.ns_per_ms });
-                return;
-            }
-            _ = self.ring.armWake();
-            _ = self.armLaneWake();
-            _ = self.park(@min(RESIDENCY_PARK_NS, deadline - now));
-            _ = self.ring.service();
-            self.pumpLane();
         }
     }
 
@@ -3997,9 +3563,8 @@ pub const Group = struct {
     }
 
     /// Reap during the drain: wakes consumed, deliveries answered ENOTCONN
-    /// header-only, RELEASE verdicts accounted, a refused RETAIN re-committed
-    /// plain (the request is still live kernel-side), errors noted for the
-    /// disconnect verdict, bridge/cancel CQEs dropped (their pends are gone).
+    /// header-only, errors noted for the disconnect verdict, bridge/cancel
+    /// CQEs dropped (their pends are gone).
     fn reapQuiet(self: *Group) void {
         var cqes: [64]uring128.Cqe32 = undefined;
         while (true) {
@@ -4017,21 +3582,9 @@ pub const Group = struct {
                 if (uring128.Tag.isReserved(cqe.user_data)) continue;
                 const tag = decodeTag(cqe.user_data) orelse continue;
                 if (tag.gent >= self.headers.depth) continue;
-                if (tag.kind == .release) {
-                    self.handleReleaseCqe(tag.gent, cqe.res);
-                    continue;
-                }
                 if (cqe.res < 0) {
                     cqe_errors.inc();
-                    const e = cqe.err();
-                    if (isDisconnect(e)) {
-                        self.disconnected = true;
-                    } else if (tag.kind == .commit and e == .INVAL and self.memberOf(tag.gent).slots.ent(self.entIdxOf(tag.gent)).state == .retained) {
-                        const m = self.memberOf(tag.gent);
-                        const ent_idx = self.entIdxOf(tag.gent);
-                        m.slots.onRetainRefused(ent_idx, clock.monotonicNs());
-                        self.pushCommit(tag.gent, m.slots.ent(ent_idx).owing().?.commit_id);
-                    }
+                    if (isDisconnect(cqe.err())) self.disconnected = true;
                     continue;
                 }
                 if (tag.kind != .register and tag.kind != .commit) continue;
@@ -4127,35 +3680,8 @@ fn handlerMain(fs: fsv.Filesystem, req: fsv.Request, handle: fsv.Handle, lease: 
 
 const testing = std.testing;
 
-test "REGISTER SQE bytes: URING_CMD on fixed file 0, cmd_op 1 at +8, the 2-iovec array at +16 with len 2 at +24, buf_index 0, qid at +64, the union u16 at +66 zero; COMMIT carries commit_id at +56 and cmd_op 2" {
+test "bridge SQE bytes: READ_FIXED(fd → slot) and WRITE_FIXED(slot → fd) carry the slot index, the file offset and the slot's byte offset in `addr`, under the bridge tag" {
     var sqe: uring128.Sqe128 = undefined;
-    var iovs: [2]RegIov = .{ .{ .base = @ptrFromInt(0x1000), .len = 288 }, .{ .base = @ptrFromInt(0x2000), .len = 1 << 20 } };
-    prepRegister(&sqe, 7, &iovs, 3);
-    const raw: *const [128]u8 = @ptrCast(&sqe);
-    try testing.expectEqual(@backingInt(linux.IORING_OP.URING_CMD), raw[0]);
-    try testing.expect(raw[1] & linux.IOSQE_FIXED_FILE != 0);
-    try testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, raw[4..8], .little));
-    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, raw[8..12], .little));
-    try testing.expectEqual(@intFromPtr(&iovs), std.mem.readInt(u64, raw[16..24], .little));
-    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, raw[24..28], .little));
-    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, raw[40..42], .little));
-    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, raw[48..56], .little));
-    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, raw[56..64], .little));
-    try testing.expectEqual(@as(u16, 7), std.mem.readInt(u16, raw[64..66], .little));
-    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, raw[66..68], .little));
-    for (raw[72..128]) |b| try testing.expectEqual(@as(u8, 0), b);
-    try testing.expectEqual(tagOf(.register, 3), sqe.user_data);
-
-    prepCommit(&sqe, 7, 0xDEAD_BEEF, 3, 0);
-    const c: *const [128]u8 = @ptrCast(&sqe);
-    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, c[8..12], .little));
-    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, c[16..24], .little));
-    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, c[24..28], .little));
-    try testing.expectEqual(@as(u64, 0xDEAD_BEEF), std.mem.readInt(u64, c[56..64], .little));
-    try testing.expectEqual(@as(u16, 7), std.mem.readInt(u16, c[64..66], .little));
-    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, c[66..68], .little));
-    try testing.expectEqual(tagOf(.commit, 3), sqe.user_data);
-
     prepBridgeFetch(&sqe, 9, 8192, 4096, 5, 11, 0);
     try testing.expectEqual(linux.IORING_OP.READ_FIXED, sqe.opcode);
     try testing.expectEqual(@as(i32, 9), sqe.fd);
@@ -4177,38 +3703,13 @@ test "REGISTER SQE bytes: URING_CMD on fixed file 0, cmd_op 1 at +8, the 2-iovec
     try testing.expectEqual(tagOf(.bridge, 12), sqe.user_data);
 }
 
-test "kmbuf / zc / retention SQE bytes: a kmbuf REGISTER carries no iovecs, init.flags at +66, queue_depth at +68 (zc only) and buf_index = ent at +40; a RETAIN commit sets the union u16 to 1; RELEASE_PAYLOAD is cmd_op 3 with the retained commit id" {
-    var sqe: uring128.Sqe128 = undefined;
-    prepRegisterKmbuf(&sqe, 7, 5, zc.initFlags(false, false), 0, 3);
-    const raw: *const [128]u8 = @ptrCast(&sqe);
-    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, raw[8..12], .little));
-    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, raw[16..24], .little));
-    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, raw[24..28], .little));
-    try testing.expectEqual(@as(u16, 5), std.mem.readInt(u16, raw[40..42], .little));
-    try testing.expectEqual(@as(u16, 7), std.mem.readInt(u16, raw[64..66], .little));
-    try testing.expectEqual(abi.FUSE_URING_BUF_RING, std.mem.readInt(u16, raw[66..68], .little));
-    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, raw[68..70], .little));
-    prepRegisterKmbuf(&sqe, 7, 5, zc.initFlags(true, true), 32, 3);
-    try testing.expectEqual(abi.FUSE_URING_BUF_RING | abi.FUSE_URING_ZERO_COPY | abi.FUSE_URING_PAYLOAD_RETENTION, std.mem.readInt(u16, raw[66..68], .little));
-    try testing.expectEqual(@as(u16, 32), std.mem.readInt(u16, raw[68..70], .little));
-    for (raw[72..128]) |b| try testing.expectEqual(@as(u8, 0), b);
-    prepCommit(&sqe, 7, 0x77, 3, abi.FUSE_URING_COMMIT_RETAIN);
-    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, raw[8..12], .little));
-    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, raw[66..68], .little));
-    try testing.expectEqual(@as(u64, 0x77), std.mem.readInt(u64, raw[56..64], .little));
-    prepRelease(&sqe, 7, 0x77, 3);
-    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, raw[8..12], .little));
-    try testing.expectEqual(@as(u64, 0x77), std.mem.readInt(u64, raw[56..64], .little));
-    try testing.expectEqual(@as(u16, 7), std.mem.readInt(u16, raw[64..66], .little));
-    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, raw[66..68], .little));
-    try testing.expectEqual(tagOf(.release, 3), sqe.user_data);
-}
-
-test "mainline SQE bytes (uapi 7.46): ADD_QUEUE is cmd_op 3 with the zero-copy bit in flags at +48 and no FIXED flag; ADD_BUFPOOL is cmd_op 4 with uaddr at +72, len at +80, reserved 0 at +84, IORING_URING_CMD_FIXED at +28 and buf_index 0; a REGISTER carries the header iovec pair (payload {NULL, 0}), FIXED + buf_index 0 and ent_zero_copy_buf_index at +72 = 1 + ent on a zc queue; a COMMIT carries FIXED + buf_index 0 with commit_id at +56; the slot and table laws" {
+test "the uring command SQE bytes (uapi 7.46): every command is URING_CMD on fixed file 0; ADD_QUEUE is cmd_op 3 with the zero-copy bit in flags at +48 and no FIXED flag; ADD_BUFPOOL is cmd_op 4 with uaddr at +72, len at +80, reserved 0 at +84, IORING_URING_CMD_FIXED at +28 and buf_index 0; a REGISTER carries the header iovec pair (payload {NULL, 0}), FIXED + buf_index 0 and ent_zero_copy_buf_index at +72 = 1 + ent on a zc queue; a COMMIT carries FIXED + buf_index 0 with commit_id at +56; the slot and table laws" {
     var sqe: uring128.Sqe128 = undefined;
     const raw: *[128]u8 = @ptrCast(&sqe);
     prepAddQueue(&sqe, 9, true);
     try testing.expectEqual(@as(u8, @backingInt(linux.IORING_OP.URING_CMD)), raw[0]);
+    try testing.expect(raw[1] & linux.IOSQE_FIXED_FILE != 0);
+    try testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, raw[4..8], .little));
     try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, raw[8..12], .little));
     try testing.expectEqual(abi.FUSE_URING_ADD_QUEUE_ZERO_COPY, std.mem.readInt(u64, raw[48..56], .little));
     try testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, raw[64..66], .little));
@@ -4229,14 +3730,14 @@ test "mainline SQE bytes (uapi 7.46): ADD_QUEUE is cmd_op 3 with the zero-copy b
     try testing.expectEqual(tagOf(.setup, 1), sqe.user_data);
     var hdr: abi.fuse_uring_req_header = abi.zeroed(abi.fuse_uring_req_header);
     const iovs: [2]RegIov = .{ .{ .base = @ptrCast(&hdr), .len = 288 }, .{ .base = null, .len = 0 } };
-    prepRegisterMainline(&sqe, 9, &iovs, zcSlotOf(.mainline_pool, 5), 3);
+    prepRegister(&sqe, 9, &iovs, zcSlotOf(5), 3);
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, raw[8..12], .little));
     try testing.expectEqual(@intFromPtr(&iovs), std.mem.readInt(u64, raw[16..24], .little));
     try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, raw[24..28], .little));
     try testing.expectEqual(abi.IORING_URING_CMD_FIXED, std.mem.readInt(u32, raw[28..32], .little));
     try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, raw[40..42], .little));
     try testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, raw[64..66], .little));
-    // The legacy union's bytes (+66, +68) are mainline padding: zero.
+    // The command's padding (+66..+72): zero.
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, raw[66..70], .little));
     try testing.expectEqual(@as(u16, 6), std.mem.readInt(u16, raw[72..74], .little));
     for (raw[74..128]) |b| try testing.expectEqual(@as(u8, 0), b);
@@ -4244,23 +3745,30 @@ test "mainline SQE bytes (uapi 7.46): ADD_QUEUE is cmd_op 3 with the zero-copy b
     // The iovec pair's second entry is {NULL, 0} on the wire.
     const iov_bytes: *const [32]u8 = @ptrCast(&iovs);
     for (iov_bytes[16..32]) |b| try testing.expectEqual(@as(u8, 0), b);
-    prepCommitMainline(&sqe, 9, 0x77, 3);
+    prepCommit(&sqe, 9, 0x77, 3);
     try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, raw[8..12], .little));
     try testing.expectEqual(@as(u64, 0x77), std.mem.readInt(u64, raw[56..64], .little));
     try testing.expectEqual(abi.IORING_URING_CMD_FIXED, std.mem.readInt(u32, raw[28..32], .little));
     try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, raw[40..42], .little));
     for (raw[66..128]) |b| try testing.expectEqual(@as(u8, 0), b);
     try testing.expectEqual(tagOf(.commit, 3), sqe.user_data);
-    // The slot law: the pool at 0 shifts every zc slot by one on mainline;
-    // the legacy rungs keep ent = slot (their headers sit at depth).
-    try testing.expectEqual(@as(u16, 1), zcSlotOf(.mainline_pool, 0));
-    try testing.expectEqual(@as(u16, 32), zcSlotOf(.mainline_pool, 31));
-    try testing.expectEqual(@as(u16, 31), zcSlotOf(.zero_copy, 31));
-    try testing.expectEqual(@as(u32, 33), mainlineTableSlots(true, 32));
-    try testing.expectEqual(@as(u32, 1), mainlineTableSlots(false, 32));
+    // The slot law: the pool at 0 shifts every zc slot by one.
+    try testing.expectEqual(@as(u16, 1), zcSlotOf(0));
+    try testing.expectEqual(@as(u16, 32), zcSlotOf(31));
+    try testing.expectEqual(@as(u32, 33), tableSlots(true, 32));
+    try testing.expectEqual(@as(u32, 1), tableSlots(false, 32));
 }
 
-test "the mainline pool: one span, a queue's region at qid × depth × payload_sz, a window at the header's offset within it, null past the region; offsets on the payload_sz grid are the boundaries" {
+test "headers: page-granular span, ent i at base + i × 288" {
+    var h = try Headers.init(5, 4096);
+    defer h.deinit();
+    try testing.expectEqual(@as(usize, 4096), h.span.len);
+    try testing.expectEqual(@intFromPtr(h.span.ptr) + 4 * 288, @intFromPtr(h.at(4)));
+    h.at(3).ring_ent_in_out.payload_sz = 77;
+    try testing.expectEqual(@as(u32, 77), std.mem.readInt(u32, h.span[3 * 288 + 256 + 16 ..][0..4], .little));
+}
+
+test "the pool: one span, a queue's region at qid × depth × payload_sz, a window at the header's offset within it, null past the region; offsets on the payload_sz grid are the boundaries" {
     var p = try Pool.init(3, 4, 8192);
     defer p.deinit();
     try testing.expectEqual(@as(u64, 3 * 4 * 8192), p.bytes());
@@ -4277,7 +3785,7 @@ test "the mainline pool: one span, a queue's region at qid × depth × payload_s
 }
 
 test "tags: every op kind round-trips for ents 0, 1, 31, 255 and 16383; the wake/reserved values and a foreign kind decode to null (the unknown-tag tripwire's input)" {
-    for ([_]OpKind{ .register, .commit, .bridge, .cancel, .release, .setup }) |k| {
+    for ([_]OpKind{ .register, .commit, .bridge, .cancel, .setup }) |k| {
         for ([_]u32{ 0, 1, 31, 255, 16383 }) |g| {
             const d = decodeTag(tagOf(k, g)).?;
             try testing.expectEqual(k, d.kind);

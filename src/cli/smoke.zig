@@ -23,8 +23,8 @@
 //! step runs the library's `smoke:` tests with the emitted-bin directory as
 //! the cwd, so the smoke always drives the binary of the same build (the
 //! unit run from the repository root finds no binary and skips). Root,
-//! `/dev/fuse`, `CAP_SYS_ADMIN` and the 7.2.6-sqz venue are required;
-//! anything less skips LOUDLY.
+//! `/dev/fuse`, `CAP_SYS_ADMIN` and a Linux >= 7.3 venue are required;
+//! anything less skips LOUDLY (a pre-7.3 kernel is the daemon's loud refusal).
 //!
 //! The durability contract the kill matrix pins is the COALESCED one
 //! (charter §5.2–§5.3, `meta/backend.zig` module doc): no `fsync` is
@@ -11135,11 +11135,9 @@ test "smoke: `umount --lazy`'s verdict under MOUNT-ID CHURN — the kernel reiss
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
 }
 
-test "smoke: a LATE bring-up refusal — the kmbuf ring answers ENOMEM (the seam) after the data plane registered its budget sources: the daemon exits 1 (never a signal) with the typed refusal naming the region's pages and the levers that shrink it, nothing stays mounted or held, and the R5 sampler, ticking at its stop under its seam, reads no freed source; a clean mount → umount under the same sampler seam exits 0" {
+test "smoke: a LATE bring-up refusal — the kernel offers no FUSE buffer pools (the seam: a pre-7.3 kernel's INIT) after the data plane registered its budget sources: the daemon exits 1 (never a signal) with the typed refusal naming FUSE_HAS_IO_URING_BUFPOOL, Linux >= 7.3 and the running release, nothing stays mounted or held, and the R5 sampler, ticking at its stop under its seam, reads no freed source; a clean mount → umount under the same sampler seam exits 0" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
-    // The registration is reached only where the probe confirmed kmbuf.
-    if (transport.probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() == null) return testkit.skip(@src(), .no_kernel_feature, "no kmbuf register opcode on this kernel");
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -11150,28 +11148,24 @@ test "smoke: a LATE bring-up refusal — the kmbuf ring answers ENOMEM (the seam
     // safety panic) instead of racing the 1 Hz tick.
     try rig.env.put("SQUEEZEFS_TEST_MEM_SAMPLER_TICK_ON_STOP", "1");
     // 1. The refusal: the plane is open (its tiers and pools registered)
-    //    when the session's first worker meets ENOMEM after the retry
-    //    ladder; the exit is a clean 1 and the stderr line is the remedy.
+    //    when the session's INIT meets no bufpool offer; the exit is a
+    //    clean 1 and the stderr line names the kernel the mount needs.
     {
-        try rig.env.put("SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM", "1");
+        try rig.env.put("SQUEEZEFS_TEST_FUSE_BUFPOOL_ABSENT", "1");
         const r = try rig.squeezefs(&.{ "mount", rig.meta_uri, rig.mp });
         defer rig.freeRun(r);
         if (r.term != .exited) std.debug.print("\n--- the refused mount died ({f}) instead of exiting ---\n{s}\n", .{ r.term, r.stderr });
         try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
         try testing.expect(std.mem.indexOf(u8, r.stderr, "squeezefs mount: the FUSE session could not arm at ") != null);
-        // The precise levers (decision 0003 §AG.4): the region's pages,
-        // never a contiguous-page shortage.
-        try testing.expect(std.mem.indexOf(u8, r.stderr, ": kmbuf ring registration ENOMEM: a queue's region takes ") != null);
-        for ([_][]const u8{ "SQUEEZEFS_FUSE_MAX_WRITE", "SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH", "SQUEEZEFS_FUSE_BUFFER_MODE=user" }) |lever| try testing.expect(std.mem.indexOf(u8, r.stderr, lever) != null);
-        try testing.expect(std.mem.indexOf(u8, r.stderr, "contiguous") == null);
-        // The retry ladder ran its bounded course before the refusal.
-        try testing.expectEqual(@as(usize, transport.kmbuf.REGISTER_RETRIES), std.mem.count(u8, r.stderr, "refused ENOMEM — retry "));
+        var uts: linux.utsname = undefined;
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.uname(&uts)));
+        for ([_][]const u8{ "FUSE_HAS_IO_URING_BUFPOOL", "Linux >= 7.3", std.mem.sliceTo(&uts.release, 0) }) |needle| try testing.expect(std.mem.indexOf(u8, r.stderr, needle) != null);
         try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
         try testing.expect(!status_verb.writerGuardHeld(testing.io, rig.img));
     }
     // 2. The same sampler seam over a clean cycle: the stop's tick reads
     //    live sources on the serve-path teardown too; exit 0.
-    try rig.env.put("SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM", "0");
+    try rig.env.put("SQUEEZEFS_TEST_FUSE_BUFPOOL_ABSENT", "0");
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
     try rig.umount();
@@ -11892,7 +11886,7 @@ fn printRates(label: []const u8, tail: []const u8) void {
     const dev_write_seg = dev_seg[(std.mem.indexOf(u8, dev_seg, "\"write_pipeline_phase_ns\":") orelse 0)..];
     const exec_seg = tail[(std.mem.indexOf(u8, tail, "stats exec: ") orelse 0)..];
     const wp_seg = tail[(std.mem.indexOf(u8, tail, "\"write_pipeline_phase_ns\":") orelse 0)..];
-    std.debug.print("smoke[{s}]: waits: overlay teardown waits {d} (ack-early stores {d}, retries {d}, overlong {d}), bridge cancels {d}, direct-store failures {d}, staged identity retries {d}, settle lost {d}, hold ceremonies {d}, prefetch fibers {d}, pipeline admission waits {d}, parked gate waits {d}\n", .{ label, numberAfter(tail, "\"overlay_teardown_waits\":") orelse 0, numberAfter(tail, "\"overlay_ack_early_stores\":") orelse 0, numberAfter(tail, "\"overlay_ack_early_retries\":") orelse 0, numberAfter(tail, "\"overlay_teardown_wait_overlong\":") orelse 0, numberAfter(tail, "\"transport_zc_bridge_cancels\":") orelse 0, numberAfter(tail, "\"transport_zc_write_direct_failures\":") orelse 0, numberAfter(tail, "\"staged_identity_retries\":") orelse 0, numberAfter(tail, "\"read_settle_lost_serialized\":") orelse 0, numberAfter(tail, "\"hold_ceremony_fibers\":") orelse 0, numberAfter(tail, "\"prefetch_fibers\":") orelse 0, numberAfter(tail, "\"write_pipeline_admission_waits\":") orelse 0, numberAfter(tail, "\"parked_gate_waits\":") orelse 0 });
+    std.debug.print("smoke[{s}]: waits: overlay teardown waits {d} (overlong {d}), bridge cancels {d}, direct-store failures {d}, staged identity retries {d}, settle lost {d}, hold ceremonies {d}, prefetch fibers {d}, pipeline admission waits {d}, parked gate waits {d}\n", .{ label, numberAfter(tail, "\"overlay_teardown_waits\":") orelse 0, numberAfter(tail, "\"overlay_teardown_wait_overlong\":") orelse 0, numberAfter(tail, "\"transport_zc_bridge_cancels\":") orelse 0, numberAfter(tail, "\"transport_zc_write_direct_failures\":") orelse 0, numberAfter(tail, "\"staged_identity_retries\":") orelse 0, numberAfter(tail, "\"read_settle_lost_serialized\":") orelse 0, numberAfter(tail, "\"hold_ceremony_fibers\":") orelse 0, numberAfter(tail, "\"prefetch_fibers\":") orelse 0, numberAfter(tail, "\"write_pipeline_admission_waits\":") orelse 0, numberAfter(tail, "\"parked_gate_waits\":") orelse 0 });
     std.debug.print("smoke[{s}]: write pipeline legs' slowest buckets: admit_wait {s}, detach_lag {s}, lock_wait {s}, dma {s}, publish {s}, total {s}\n", .{ label, histMaxBucket(wp_seg, "\"admit_wait\":"), histMaxBucket(wp_seg, "\"detach_lag\":"), histMaxBucket(wp_seg, "\"lock_wait\":"), histMaxBucket(wp_seg, "\"dma\":"), histMaxBucket(wp_seg, "\"publish\":"), histMaxBucket(wp_seg, "\"total\":") });
     std.debug.print("smoke[{s}]: device legs' slowest buckets: read fill queue {s} / service {s}, write queue {s} / service {s}; read serve total {s}; the longest fiber poll {s}\n", .{ label, histMaxBucket(dev_seg, "\"dev_queue\":"), histMaxBucket(dev_seg, "\"dev_service\":"), histMaxBucket(dev_write_seg, "\"dev_queue\":"), histMaxBucket(dev_write_seg, "\"dev_service\":"), histMaxBucket(tail, "\"read_serve_phase_ns\":{\"total\":"), histMaxBucket(exec_seg, "\"exec_poll_ns\":") });
     std.debug.print("smoke[{s}]: fsync legs' slowest buckets: data_flush {s}, data_barrier {s}, meta_barrier {s}; conveyor tx queue wait {s}, pass {s}, window {s}; the checkpoint's device barrier {s}; staging backing msync {s}, punch+madvise {s}\n", .{ label, histMaxBucket(tail, "\"data_flush\":"), histMaxBucket(tail, "\"data_barrier\":"), histMaxBucket(tail, "\"meta_barrier\":"), histMaxBucket(meta_seg, "\"meta_tx_queue_wait\":"), histMaxBucket(meta_seg, "\"meta_pass_total\":"), histMaxBucket(meta_seg, "\"meta_window_total\":"), histMaxBucket(meta_seg, "\"meta_barrier\":"), histMaxBucket(tail, "\"backing_sync\":"), histMaxBucket(tail, "\"backing_reclaim\":") });
@@ -11953,20 +11947,15 @@ fn refCensus(report: []const u8) RefCensus {
     return out;
 }
 
-/// The daemon's transport stratum, read off its INIT line in `seg` (the
-/// log up to `ready`) and judged against the kernel: the kmbuf ladder run
-/// here (the legacy ZeroCopy rung's carrier) or the bufpool offer the line
-/// reports (MainlinePool, Linux ≥ 7.3) makes a root mount zero-copy and
-/// arms the zc legs; a stock kernel offers neither, mounts UserEnts and
-/// keeps them off — the row judges whichever stratum the kernel offers,
-/// and a kernel with a carrier whose session is not zero-copy is red.
+/// Whether the daemon's session is zero-copy, read off its INIT line in
+/// `seg` (the log up to `ready`): every session runs the buffer pools
+/// (`bufpool present`), and a root mount (the row's: CAP_SYS_ADMIN) creates
+/// its queues zero-copy and arms the zc legs — a session that is not is red.
 fn sessionZeroCopy(seg: []const u8) !bool {
-    const at = std.mem.indexOf(u8, seg, "buffer mode ") orelse return error.InitLineMissing;
+    const at = std.mem.indexOf(u8, seg, "bufpool present") orelse return error.InitLineMissing;
     const line = seg[at .. std.mem.indexOfScalarPos(u8, seg, at, '\n') orelse seg.len];
     const zc = std.mem.indexOf(u8, line, "zero-copy true") != null;
-    const kmbuf = transport.probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() != null;
-    const bufpool = std.mem.indexOf(u8, line, "bufpool present") != null;
-    try testing.expectEqual(kmbuf or bufpool, zc);
+    try testing.expect(zc);
     return zc;
 }
 
@@ -13822,8 +13811,8 @@ test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — 
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
     // The kernel forwards syncfs to a plain /dev/fuse server only once INIT
-    // negotiated FUSE_HAS_SYNCFS (upstream 7.47; the venue's 7.2.6-sqz
-    // through scripts/kernel/patches-7.2/0027): without it `sync -f` never
+    // negotiated FUSE_HAS_SYNCFS (upstream 7.47; the venue's 7.3 through
+    // scripts/kernel/patches-mainline/0006): without it `sync -f` never
     // reaches the daemon and the row has nothing to judge.
     {
         const st = try rig.stats();
@@ -13974,10 +13963,10 @@ fn pwriteAll(fd: linux.fd_t, data: []const u8, off: u64) !void {
 const close_drain_script = "head -c 4096 \"$1/image\" > g && cat g > /dev/null && head -c {d} \"$1/image\" > f && head -c {d} \"$1/image\" >> g && echo written";
 const close_drain_check = "if head -c {d} \"$1/image\" | cmp -s - f; then echo f-whole; else echo f-LOST; fi; if {{ head -c 4096 \"$1/image\"; head -c {d} \"$1/image\"; }} | cmp -s - g; then echo g-whole; else echo g-LOST; fi";
 
-/// The no-open posture, pinned on every stratum (decision 0003 §BE.3): a
-/// MainlinePool zero-copy mount serves opens under SQUEEZEFS_FUSE_ZC_OPEN's
-/// default (mainline grants zero-copy per open file), so a §AF row judging
-/// zero-message opens holds the lever at 0 — inert on the legacy rungs.
+/// The no-open posture, pinned (decision 0003 §BE.3): a zero-copy mount
+/// serves opens under SQUEEZEFS_FUSE_ZC_OPEN's default (the kernel grants
+/// zero-copy per open file), so a §AF row judging zero-message opens holds
+/// the lever at 0.
 fn pinNoOpen(rig: *Rig) !void {
     try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "1");
     try rig.env.put("SQUEEZEFS_FUSE_ZC_OPEN", "0");
@@ -15460,7 +15449,7 @@ test "smoke: INODE FLAGS — IMMUTABLE AND APPEND-ONLY ARE LAWS, NOT HINTS (char
     try inodeFlagsRow(false);
 }
 
-test "smoke: INODE FLAGS UNDER NO-OPEN (SQUEEZEFS_FUSE_NO_OPEN=1, the zero-message posture of the 7.2 rungs): the same row — the kernel asks no OPEN, so a write-intent open of an immutable or append-only file SUCCEEDS and the first write, truncate or O_TRUNC's SETATTR is where the law answers EPERM; every other refusal, the remount and the fsck as before" {
+test "smoke: INODE FLAGS UNDER NO-OPEN (SQUEEZEFS_FUSE_NO_OPEN=1 with SQUEEZEFS_FUSE_ZC_OPEN=0, the zero-message posture): the same row — the kernel asks no OPEN, so a write-intent open of an immutable or append-only file SUCCEEDS and the first write, truncate or O_TRUNC's SETATTR is where the law answers EPERM; every other refusal, the remount and the fsck as before" {
     if (venueMissing(testing.io)) |why| return testkit.skipWhy(@src(), why);
     try inodeFlagsRow(true);
 }

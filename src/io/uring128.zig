@@ -28,7 +28,6 @@
 //! module only guarantees the bytes land where the kernel reads them.
 
 const std = @import("std");
-const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const page_size_min = std.heap.page_size_min;
@@ -478,50 +477,12 @@ pub const Ring128 = struct {
         return probe;
     }
 
-    /// Register a buffer ring through a caller-resolved opcode: stock
-    /// `REGISTER_PBUF_RING` (22) with `ring_addr` a user mapping, or the
-    /// kmbuf pair's register opcode (a probe verdict — fuse_kmbuf_zc §2.1)
-    /// with `BufReg.ring_addr`'s low u32 read as `buf_size`. The 40 B
-    /// argument rides in a ZEROED 256 B scratch: a foreign occupant of a
-    /// probed opcode that reads a wider struct (7.1's `io_uring_bpf` reads
-    /// 72 B) sees zeros, never stack garbage.
-    pub fn registerBufRing(self: *Ring128, opcode: u32, reg: BufReg) errors.Error!void {
-        var scratch: [256]u8 = @splat(0);
-        @memcpy(scratch[0..@sizeOf(BufReg)], std.mem.asBytes(&reg));
-        try self.registerRaw(opcode, &scratch, 1);
-    }
-
-    /// Map a kernel-owned region of this ring at a magic mmap offset (the
-    /// kmbuf buffer region at `IORING_OFF_KMBUF_RING | (bgid << 16)`):
-    /// shared, populated, read-write. Released with `munmapRegion`.
-    pub fn mmapRegion(self: *Ring128, offset: u64, len: usize) errors.Error![]align(page_size_min) u8 {
-        return mapRing(self.fd, len, offset);
-    }
-
+    /// Unmap a page-aligned region a ring user mapped beside the ring (the
+    /// zcrx refill region).
     pub fn munmapRegion(region: []align(page_size_min) u8) void {
         unmap(region);
     }
 };
-
-/// `struct io_uring_buf_reg` (uapi, 40 B). Stock `REGISTER_PBUF_RING`
-/// reads `ring_addr` whole; the sqz kmbuf tracks read its low u32 as
-/// `buf_size` (page-aligned) — the union `{ u64 ring_addr; u32 buf_size; }`
-/// of the kernel series, flattened.
-pub const BufReg = extern struct {
-    ring_addr: u64,
-    /// A power of two below 65536.
-    ring_entries: u32,
-    bgid: u16,
-    flags: u16,
-    resv: [3]u64,
-};
-
-comptime {
-    std.debug.assert(@sizeOf(BufReg) == 40);
-    std.debug.assert(@offsetOf(BufReg, "ring_entries") == 8);
-    std.debug.assert(@offsetOf(BufReg, "bgid") == 12);
-    std.debug.assert(@offsetOf(BufReg, "flags") == 14);
-}
 
 fn mapRing(fd: linux.fd_t, len: usize, offset: u64) errors.Error![]align(page_size_min) u8 {
     const rc = linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .POPULATE = true }, fd, @intCast(offset));
@@ -1275,44 +1236,6 @@ test "a TIMEOUT op completes -ETIME after its span" {
     try reap(&ring, &cqes);
     try testing.expectEqual(@as(u64, 21), cqes[0].user_data);
     try testing.expectEqual(negErrno(.TIME), cqes[0].res);
-}
-
-test "registerBufRing through the raw opcode: stock PBUF_RING registers once and refuses the same bgid again with EEXIST" {
-    var ring = try Ring128.init(16, 0);
-    defer ring.deinit();
-    const len = 8 * @sizeOf(linux.io_uring_buf);
-    const rc = linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
-    defer _ = linux.munmap(@ptrFromInt(rc), len);
-    const reg: BufReg = .{ .ring_addr = rc, .ring_entries = 8, .bgid = 9, .flags = 0, .resv = @splat(0) };
-    const pbuf_ring = @backingInt(linux.IORING_REGISTER.REGISTER_PBUF_RING);
-    try ring.registerBufRing(pbuf_ring, reg);
-    try testing.expectError(error.PathAlreadyExists, ring.registerBufRing(pbuf_ring, reg));
-}
-
-test "the kmbuf rung on an sqz kernel: the register opcode takes a page buf_size, repeats EEXIST, and the region maps at 0x88000000 | (bgid << 16); a stock kernel refuses every rung" {
-    var ring = try Ring128.init(8, 0);
-    defer ring.deinit();
-    const page: u32 = @intCast(std.heap.pageSize());
-    const reg: BufReg = .{ .ring_addr = page, .ring_entries = 8, .bgid = 7, .flags = 0, .resv = @splat(0) };
-    // fuse_kmbuf_zc §2.1: 37 on 6.19-sqz, 38 on 7.1/7.2-sqz. A stock
-    // kernel's 37/38 are BPF_FILTER/LAST (EINVAL); 6.19's 38 is the kmbuf
-    // UNREGISTER (ENOENT): refusals, never a false positive.
-    const rung: u32 = for ([_]u32{ 37, 38 }) |opcode| {
-        if (ring.registerBufRing(opcode, reg)) |_| break opcode else |e| switch (e) {
-            error.InvalidArgument, error.FileNotFound => continue,
-            else => return e,
-        }
-    } else {
-        return testkit.skip(@src(), .no_kernel_feature, "no kmbuf register opcode on this kernel (stock stratum)");
-    };
-    log.debug("uring128: kmbuf register opcode {d} confirmed", .{rung});
-    try testing.expectError(error.PathAlreadyExists, ring.registerBufRing(rung, reg));
-    const region = try ring.mmapRegion(0x88000000 | (@as(u64, 7) << 16), 8 * page);
-    defer Ring128.munmapRegion(region);
-    try testing.expectEqual(@as(usize, 8 * page), region.len);
-    region[0] = 0x5A;
-    try testing.expectEqual(@as(u8, 0x5A), region[0]);
 }
 
 test "Tag: pack/unpack round-trips every field; the top kind is the protocol's and a full request tag sits below reserved_ud" {

@@ -4528,7 +4528,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// `data`.
         fn stripedPayload(self: *Self, a: filesystem.WriteArgs) Error!write_admit.Payload {
             if (a.held) |h| {
-                if (self.data.canStoreHeld()) return .{ .slot = .{ .src = h.src, .class = if (h.class == .direct_gup) .odirect else .page_cache, .commit_retain = false, .ctx = h.ctx, .extract = h.extract } };
+                if (self.data.canStoreHeld()) return .{ .slot = .{ .src = h.src, .ctx = h.ctx, .extract = h.extract } };
                 return .{ .bytes = try self.payloadBytes(a) };
             }
             if (a.placed) |p| return .{ .placed = p };

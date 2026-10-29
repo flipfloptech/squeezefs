@@ -1,9 +1,9 @@
 //! FUSE-over-io_uring transport geometry — the ONE pure derivation of the
 //! queue count, ring depth, `max_write`/`max_pages`/`payload_sz`,
-//! `max_background`/`congestion_threshold`, the drain-group plan and the
-//! per-group SQ size (charter §4 "Geometry" + "Drain groups";
+//! `max_background`/`congestion_threshold`, the rings per queue and the
+//! per-ring SQ size (charter §4 "Geometry" + "Rings per queue";
 //! `docs/porting/fuse_abi_session.md` §3, `fuse_uring_transport.md` §1.7,
-//! §3, §12, §14). Resolved ONCE, before the INIT reply is serialized, and
+//! §12, §14). Resolved ONCE, before the INIT reply is serialized, and
 //! published as the `transport_*` level gauges when the session arms.
 //!
 //! Every input is injected (`Inputs`): the kernel's possible CPU count, the
@@ -19,10 +19,11 @@
 //!   fc->max_pages   = min(limit, max(arg->max_pages, 1))
 //!   fc->max_write   = max(4096, arg->max_write)
 //!   ring->max_payload_sz = max(FUSE_MIN_READ_BUFFER, fc->max_write, fc->max_pages × PAGE)
-//!   REGISTER refuses iov[1].iov_len < ring->max_payload_sz
-//! so `payload_sz == max_payload_sz` makes REGISTER acceptance structural
-//! (the pre-fix planner pinned 256 pages while advertising `max_pages =
-//! u16::MAX`: every REGISTER refused on a raised-sysctl box, mount failed).
+//!   ADD_BUFPOOL splits the pool into len / ring->max_payload_sz buffers
+//! so `payload_sz == max_payload_sz` makes the pool's buffer `k` sit at
+//! `k × payload_sz` (fuse_mainline_pools.md §2; the pre-fix planner pinned
+//! 256 pages while advertising `max_pages = u16::MAX`: every user-ents
+//! REGISTER refused on a raised-sysctl box, mount failed).
 
 const std = @import("std");
 const fuzzkit = @import("../core/fuzzkit.zig");
@@ -327,11 +328,6 @@ pub fn resolveInputs(facts: derive.Facts, env: *const std.process.Environ.Map, b
     };
 }
 
-/// `SQUEEZEFS_FUSE_DRAIN_GROUP`: an explicit width (never spans a node).
-pub fn drainGroupWidthOverride(env: *const std.process.Environ.Map) ?u32 {
-    return knobs.optIntKnob("SQUEEZEFS_FUSE_DRAIN_GROUP", u32, env);
-}
-
 // ---------------------------------------------------------------------------
 // Published gauges (LEVELS: zero until a session arms, stored once).
 // ---------------------------------------------------------------------------
@@ -354,10 +350,6 @@ pub const Gauges = struct {
     /// `transport_max_readahead`: the kernel's, echoed verbatim and never
     /// consulted (the prefetch window is independent of it).
     max_readahead: counters.Gauge = .{},
-    /// `transport_drain_groups`
-    drain_groups: counters.Gauge = .{},
-    /// `transport_drain_group_width`: `groups == queues` ⇒ the lever is inert.
-    drain_group_width: counters.Gauge = .{},
     /// `fuse_uring_rings_per_queue`: the rings (workers) registered on each
     /// kernel queue, 1 or `MAX_RINGS_PER_QUEUE`.
     rings_per_queue: counters.Gauge = .{},
@@ -373,11 +365,6 @@ pub const Gauges = struct {
         self.max_readahead.set(max_readahead);
     }
 
-    pub fn publishDrainGroups(self: *Gauges, groups: *const DrainGroups) void {
-        self.drain_groups.set(groups.count());
-        self.drain_group_width.set(groups.maxWidth());
-    }
-
     pub fn publishRingsPerQueue(self: *Gauges, rings: u32) void {
         self.rings_per_queue.set(rings);
     }
@@ -387,48 +374,7 @@ pub const Gauges = struct {
 pub var gauges: Gauges = .{};
 
 // ---------------------------------------------------------------------------
-// Drain groups (charter §4; fuse_uring_transport.md §3)
-// ---------------------------------------------------------------------------
-
-/// The buffer-mode lattice (charter §4, amended 2026-10-21): `mainline_pool`
-/// is the PRIMARY rung — mainline's buffer-pool UAPI (Linux ≥ 7.3: one user
-/// pool per queue, registered on each of the queue's rings, per-entry
-/// zero-copy slots granted per open file); `buf_ring` / `zero_copy` are the
-/// TRANSITIONAL rungs of the 7.2-sqz kmbuf series. Every rung but
-/// `user_ents` registers per ring per queue, so those sessions keep width 1.
-pub const BufferMode = enum {
-    user_ents,
-    buf_ring,
-    zero_copy,
-    mainline_pool,
-
-    /// A ring serves ONE queue (the per-ring buffer resources are the queue's).
-    pub fn ringPerQueue(m: BufferMode) bool {
-        return m != .user_ents;
-    }
-};
-
-/// `max(n / 4, 1)`: the cpus/4 drain-parallelism slope. Measured 2026-08-05
-/// on a 32-possible single-node box: widths 1–8 at IOPS par on a ~340 k
-/// ceiling, width 8 halving drain cost (commit batch 1.48 → 2.98 SQEs per
-/// enter, eventfd wakes/op 0.687 → 0.340); whole-node width −15 % on the
-/// single-thread drain ceiling; one context per CPU anti-scaled (32×8 =
-/// 273 k vs 8×32 = 357 k IOPS).
-pub fn drainGroupWidth(n: u32) u32 {
-    return @max(n / 4, 1);
-}
-
-/// `BufRing | ZeroCopy | MainlinePool ⇒ 1` (a ring's pool or buffer ring is
-/// one queue's); `UserEnts ⇒ the explicit knob`, else derived.
-pub fn forcedWidth(mode: BufferMode, explicit: ?u32) ?u32 {
-    return switch (mode) {
-        .buf_ring, .zero_copy, .mainline_pool => 1,
-        .user_ents => if (explicit) |w| @intCast(derive.clamp(w, 1, MAX_QUEUES)) else null,
-    };
-}
-
-// ---------------------------------------------------------------------------
-// Rings per queue (series patch 0030; rung-10-workers-per-queue)
+// Rings per queue (rung-10-workers-per-queue)
 // ---------------------------------------------------------------------------
 
 /// The most io_urings (each a `sqz-fuse-ur<qid>` worker with its own ring)
@@ -442,8 +388,7 @@ pub fn forcedWidth(mode: BufferMode, explicit: ?u32) ?u32 {
 /// a queue whose first two are saturated, which that row's are.
 pub const MAX_RINGS_PER_QUEUE: u32 = 4;
 
-/// The derived count on a kmbuf/zc session whose kernel has patch 0030: the
-/// workers ONE submitter keeps busy. The kernel picks a request's queue by
+/// The derived count: the workers ONE submitter keeps busy. The kernel picks a request's queue by
 /// the submitting task's CPU (`task_cpu`), so one submitter's whole depth
 /// lands on one queue, and its entry pick is LIFO over the queue's available
 /// entries, so a later ring's entries are taken only once the earlier rings'
@@ -459,39 +404,23 @@ pub const MAX_RINGS_PER_QUEUE: u32 = 4;
 /// cores and gave back 5 % on the read row (its lock contention: fio and
 /// four workers on one `queue->lock`) — the A/B room above. A static cores
 /// ÷ queues cannot say it: the queues ARE the CPUs (charter §4), so the
-/// ratio is 1 on every host; the two per-op costs scale together.
-pub const RINGS_PER_QUEUE_DERIVED: u32 = 3;
-
-/// The derived count: `RINGS_PER_QUEUE_DERIVED` where the kernel's FEATURES
-/// probe reads `RINGS_PER_QUEUE` present (series patch 0030) AND the mode
-/// pins a ring to one queue (kmbuf/zc: the per-ring buffer ring is what the
-/// patch makes per-source); 1 on UserEnts (a ring there already serves a
-/// drain group of queues) and wherever the probe reads absent (the kernel
-/// would accept the second REGISTER and recycle buffers into the wrong ring).
-/// Two rings became the default 2026-10-19 once their three train reds were
-/// pinned (`rung-10-workers-per-queue.md`: the shared-hot-dir row's by-design
+/// ratio is 1 on every host; the two per-op costs scale together. Measured
+/// on the 7.2-sqz kmbuf series (its patch 0030 made a ring per source); the
+/// buffer pool needs no patch — the pool is user memory every ring of the
+/// queue registers at the same index and the kernel keys a buffer by its
+/// offset, not by a ring — and the per-op cost ratio is the same daemon
+/// against the same submitter, so the count carries over, to be re-measured
+/// on 7.3 (`rung-10-fuse-mainline-uapi.md`'s plan). Two rings became the
+/// default 2026-10-19 once their three train reds were pinned
+/// (`rung-10-workers-per-queue.md`: the shared-hot-dir row's by-design
 /// wait; the kill matrix's umount2 racing the kernel's release of the
 /// SIGKILLed daemon, waited out; the fsck C4 orphan — a ring record a kill
 /// left between a promotion's commit and its ring release, judged at
-/// dismount since `rung-10-dismount-corpse.md`) and the write row was the
-/// thermal throttle (cooled: 0.99×; reads 1.11× / 1.70× / 1.29×).
-/// On `mainline_pool` the count needs no kernel patch: the pool is user
-/// memory every ring of the queue registers at the same index and the
-/// kernel keys a buffer by its offset, not by a ring — so the derived 3
-/// applies there as the legacy measurement carried over (the per-op cost
-/// ratio is the same daemon against the same submitter), to be re-measured
-/// on 7.3 (`rung-10-fuse-mainline-uapi.md`'s plan).
-pub fn ringsPerQueue(mode: BufferMode, rings_feature: bool) u32 {
-    return switch (mode) {
-        .buf_ring, .zero_copy => if (rings_feature) RINGS_PER_QUEUE_DERIVED else 1,
-        .mainline_pool => RINGS_PER_QUEUE_DERIVED,
-        .user_ents => 1,
-    };
-}
+/// dismount since `rung-10-dismount-corpse.md`).
+pub const RINGS_PER_QUEUE_DERIVED: u32 = 3;
 
 /// Explicit wins verbatim over the derivation (the registry's range is
-/// 1..MAX_RINGS_PER_QUEUE; the session refuses an explicit count above
-/// what the probe admits BEFORE calling this).
+/// 1..MAX_RINGS_PER_QUEUE).
 pub fn resolveRingsPerQueue(explicit: ?u32, derived: u32) u32 {
     return explicit orelse derived;
 }
@@ -502,15 +431,11 @@ pub fn resolveRingsPerQueue(explicit: ?u32, derived: u32) u32 {
 /// count.
 pub const RingShare = struct { base: u16, depth: u32 };
 
-/// The split of `depth` over `rings`, PINNED-EXACT: a ring's kmbuf region
-/// is `nextPow2(share) × payload` (the kernel's buffer ring takes a power
-/// of two of entries, `zc.ringEntriesFor`), so an even split pins more than
-/// the queue would alone — 32 over three rings as 11/11/10 pinned 16 + 16 +
-/// 16 MiB per queue instead of 32 (+512 MiB per mount at the default depth,
-/// rung-10-write-iops wave 2's gate). The shares are HALVINGS: start from the
-/// whole depth and, until there are `rings` shares, split the largest into
-/// ceil/floor halves; `nextPow2(ceil(e / 2)) ≤ nextPow2(e) / 2`, so the sum
-/// of the regions never exceeds the one-ring region. Ring 0 takes the
+/// The split of `depth` over `rings` as HALVINGS: start from the whole
+/// depth and, until there are `rings` shares, split the largest into
+/// ceil/floor halves (the shape the measured 3-ring rows ran: chosen when
+/// each ring pinned a power-of-two kmbuf region of its share; the pool
+/// holds `depth` buffers per queue whatever the split). Ring 0 takes the
 /// largest share (the kernel's LIFO entry pick fills it first: it is the
 /// hot ring), every ring at least one entry while `depth ≥ rings` (a ring
 /// with no entry would never REGISTER and the arm barrier would never
@@ -534,125 +459,14 @@ pub fn ringShare(depth: u32, rings: u32, ring: u32) RingShare {
     return .{ .base = @intCast(base), .depth = shares[ring] };
 }
 
-/// `node_of(cpu)`: the NUMA node of a CPU, null for an unknown (offline or
-/// isolated possible CPU — sysfs cpulists carry only online CPUs).
-pub const Topology = struct {
-    ctx: ?*const anyopaque = null,
-    node_of: *const fn (ctx: ?*const anyopaque, cpu: u32) ?u32,
-
-    pub fn nodeOf(self: Topology, cpu: u32) ?u32 {
-        return self.node_of(self.ctx, cpu);
-    }
-};
-
-/// The plan: `qids` holds every qid exactly once, group `i` is
-/// `qids[bounds[i]..bounds[i + 1]]`, ascending within a group.
-pub const DrainGroups = struct {
-    qids: []u16,
-    bounds: []u32,
-
-    pub fn deinit(self: *DrainGroups, gpa: std.mem.Allocator) void {
-        gpa.free(self.qids);
-        gpa.free(self.bounds);
-        self.* = undefined;
-    }
-
-    pub fn count(self: *const DrainGroups) usize {
-        return self.bounds.len - 1;
-    }
-
-    pub fn group(self: *const DrainGroups, i: usize) []const u16 {
-        return self.qids[self.bounds[i]..self.bounds[i + 1]];
-    }
-
-    pub fn maxWidth(self: *const DrainGroups) usize {
-        var w: usize = 0;
-        for (0..self.count()) |i| w = @max(w, self.group(i).len);
-        return w;
-    }
-};
-
-/// Partition `0..nqueues` by NUMA node MEMBERSHIP (never contiguity: 2-socket
-/// boxes number CPUs round-robin, so a run-based plan silently produced 32
-/// singletons in the field), nodes in ascending id, each node set chunked at
-/// `forced ?? drainGroupWidth(set.len)`; qids with no node (and every qid
-/// when `qid_is_cpu` is false — a testing queue count is not a CPU id, so
-/// `node_of` is never consulted) form a RESIDUAL set chunked at the machine
-/// width `drainGroupWidth(nqueues)`. Startup only: allocates the plan.
-pub fn drainGroupPlan(gpa: std.mem.Allocator, nqueues: u32, qid_is_cpu: bool, topology: Topology, forced: ?u32) std.mem.Allocator.Error!DrainGroups {
-    std.debug.assert(nqueues >= 1 and nqueues <= MAX_QUEUES);
-    // Node id per qid; `unknown` for the residual set.
-    const unknown = std.math.maxInt(u32);
-    const node = try gpa.alloc(u32, nqueues);
-    defer gpa.free(node);
-    for (node, 0..) |*n, q| n.* = if (qid_is_cpu) (topology.nodeOf(@intCast(q)) orelse unknown) else unknown;
-
-    const qids = try gpa.alloc(u16, nqueues);
-    errdefer gpa.free(qids);
-    var bounds: std.ArrayList(u32) = .empty;
-    errdefer bounds.deinit(gpa);
-    try bounds.append(gpa, 0);
-    var filled: u32 = 0;
-
-    // Ascending node order: visit the smallest unvisited node id each pass.
-    var current: u32 = 0;
-    var passes: u32 = 0;
-    while (passes <= nqueues) : (passes += 1) {
-        var next: u32 = unknown;
-        for (node) |n| if (n >= current and n < next) {
-            next = n;
-        };
-        if (next == unknown) break;
-        const set_len = blk: {
-            var c: u32 = 0;
-            for (node) |n| if (n == next) {
-                c += 1;
-            };
-            break :blk c;
-        };
-        const width = forced orelse drainGroupWidth(set_len);
-        try chunkInto(gpa, node, next, width, qids, &filled, &bounds);
-        current = next + 1;
-    }
-    // The residual set at the machine span.
-    const residual_len = blk: {
-        var c: u32 = 0;
-        for (node) |n| if (n == unknown) {
-            c += 1;
-        };
-        break :blk c;
-    };
-    if (residual_len > 0) {
-        const width = forced orelse drainGroupWidth(nqueues);
-        try chunkInto(gpa, node, unknown, width, qids, &filled, &bounds);
-    }
-    std.debug.assert(filled == nqueues);
-    return .{ .qids = qids, .bounds = try bounds.toOwnedSlice(gpa) };
-}
-
-/// Append the qids whose node is `which`, ascending, in chunks of `width`.
-fn chunkInto(gpa: std.mem.Allocator, node: []const u32, which: u32, width: u32, qids: []u16, filled: *u32, bounds: *std.ArrayList(u32)) std.mem.Allocator.Error!void {
-    var in_chunk: u32 = 0;
-    for (node, 0..) |n, q| {
-        if (n != which) continue;
-        qids[filled.*] = @intCast(q);
-        filled.* += 1;
-        in_chunk += 1;
-        if (in_chunk == width) {
-            try bounds.append(gpa, filled.*);
-            in_chunk = 0;
-        }
-    }
-    if (in_chunk != 0) try bounds.append(gpa, filled.*);
-}
-
-/// Per-group SQ entries: `max(next_pow2(width × depth × (1 + bridge_pieces) + 8), 16)`
-/// — every member's REGISTERs or commits plus the wake PollAdd, and under
-/// zero copy every ent's bridge in up to `bridge_pieces` SQEs
-/// (`zc.BRIDGE_PIECES_MAX`; 1 on a session without bridges); the CQ is sized
-/// `sq × 2` by the ring binding. Clamped to the kernel's `IORING_MAX_ENTRIES`.
-pub fn sqEntries(width: u32, depth: u32, bridge_pieces: u32) u32 {
-    const want = derive.nextPow2(@as(u64, width) * depth * (1 + @as(u64, bridge_pieces)) + 8);
+/// Per-ring SQ entries: `max(next_pow2(depth × (1 + bridge_pieces) + 8), 16)`
+/// — every entry's REGISTER or commit plus the wake PollAdd, and under zero
+/// copy every entry's bridge in up to `bridge_pieces` SQEs
+/// (`zc.BRIDGE_PIECES_MAX`; 0 on a session without bridges); the CQ is
+/// sized `sq × 2` by the ring binding. Clamped to the kernel's
+/// `IORING_MAX_ENTRIES`.
+pub fn sqEntries(depth: u32, bridge_pieces: u32) u32 {
+    const want = derive.nextPow2(@as(u64, depth) * (1 + @as(u64, bridge_pieces)) + 8);
     return @intCast(@min(@max(want, 16), 32768)); // IORING_MAX_ENTRIES: the kernel's SQ ceiling
 }
 
@@ -926,19 +740,16 @@ test "knob faces: Inputs read the rows through the registry; absent derives; the
     try testing.expectEqual(@as(?u32, null), in.env_depth);
     try testing.expectEqual(@as(u32, 1 * MiB), in.desired_max_write);
     try testing.expectEqual(1 * GiB, in.buffer_cap);
-    try testing.expectEqual(@as(?u32, null), drainGroupWidthOverride(&env));
     try env.put("SQUEEZEFS_TEST_FUSE_QUEUES", "4");
     try env.put("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH", "8");
     try env.put("SQUEEZEFS_FUSE_MAX_WRITE", "2097152");
     try env.put("SQUEEZEFS_TRANSPORT_MEM_PCT", "50");
-    try env.put("SQUEEZEFS_FUSE_DRAIN_GROUP", "3");
     in = resolveInputs(facts, &env, 64 * 1024, 8 * GiB, 1024, 96, 80);
     try testing.expectEqual(@as(?u32, 4), in.env_queues);
     try testing.expectEqual(@as(?u32, 8), in.env_depth);
     try testing.expectEqual(@as(u32, 2 * MiB), in.desired_max_write);
     try testing.expectEqual(4 * GiB, in.buffer_cap);
     try testing.expectEqual(@as(?u16, 96), in.max_background_override);
-    try testing.expectEqual(@as(?u32, 3), drainGroupWidthOverride(&env));
     const p = plan(in);
     try testing.expectEqual(@as(u32, 4), p.nqueues);
     try testing.expectEqual(@as(u32, 8), p.depth);
@@ -946,7 +757,7 @@ test "knob faces: Inputs read the rows through the registry; absent derives; the
     try testing.expectEqual(@as(u16, 96), p.max_background);
 }
 
-test "gauges publish the armed plan as levels (zero before) and the drain-group shape" {
+test "gauges publish the armed plan as levels (zero before) and the rings per queue" {
     var g: Gauges = .{};
     try testing.expectEqual(@as(u64, 0), g.queues.load());
     const p = plan(in32(1 * MiB, 256, 2 * GiB));
@@ -959,172 +770,28 @@ test "gauges publish the armed plan as levels (zero before) and the drain-group 
     try testing.expectEqual(@as(u64, 1 * MiB), g.max_write.load());
     try testing.expectEqual(@as(u64, 256), g.max_pages.load());
     try testing.expectEqual(@as(u64, 131072), g.max_readahead.load());
-    var groups = try drainGroupPlan(testing.allocator, 32, true, one_node, null);
-    defer groups.deinit(testing.allocator);
-    g.publishDrainGroups(&groups);
-    try testing.expectEqual(@as(u64, 4), g.drain_groups.load());
-    try testing.expectEqual(@as(u64, 8), g.drain_group_width.load());
+    g.publishRingsPerQueue(RINGS_PER_QUEUE_DERIVED);
+    try testing.expectEqual(@as(u64, RINGS_PER_QUEUE_DERIVED), g.rings_per_queue.load());
 }
 
-// ---- drain groups ----
-
-fn nodeInterleaved(_: ?*const anyopaque, cpu: u32) ?u32 {
-    return cpu % 2;
-}
-fn nodeBy16(_: ?*const anyopaque, cpu: u32) ?u32 {
-    return cpu / 16;
-}
-fn nodeZero(_: ?*const anyopaque, _: u32) ?u32 {
-    return 0;
-}
-fn nodeOfFour(_: ?*const anyopaque, cpu: u32) ?u32 {
-    return cpu / 4;
-}
-const holes = [_]u32{ 4, 6, 14, 16, 22, 24, 30 };
-fn nodeWithHoles(_: ?*const anyopaque, cpu: u32) ?u32 {
-    for (holes) |h| if (h == cpu) return null;
-    return 0;
-}
-fn nodeNever(_: ?*const anyopaque, _: u32) ?u32 {
-    @panic("node_of consulted with qid_is_cpu = false");
-}
-const one_node: Topology = .{ .node_of = nodeZero };
-
-fn expectCoverage(g: *const DrainGroups, nqueues: u32) !void {
-    var seen = try testing.allocator.alloc(bool, nqueues);
-    defer testing.allocator.free(seen);
-    @memset(seen, false);
-    var leads_with_zero: usize = 0;
-    for (0..g.count()) |i| {
-        const grp = g.group(i);
-        try testing.expect(grp.len >= 1);
-        if (grp[0] == 0) leads_with_zero += 1;
-        for (grp, 0..) |q, k| {
-            try testing.expect(!seen[q]);
-            seen[q] = true;
-            if (k > 0) try testing.expect(grp[k - 1] < q);
-        }
-    }
-    for (seen) |s| try testing.expect(s);
-    // Exactly one group leads with qid 0 (the SQPOLL leader election keys on it).
-    try testing.expectEqual(@as(usize, 1), leads_with_zero);
-}
-
-test "drain groups: membership not contiguity — interleaved node = cpu % 2 on 32q ⇒ 8 groups of 4, plan[0] = [0,2,4,6]" {
-    var g = try drainGroupPlan(testing.allocator, 32, true, .{ .node_of = nodeInterleaved }, null);
-    defer g.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 8), g.count());
-    try testing.expectEqualSlices(u16, &.{ 0, 2, 4, 6 }, g.group(0));
-    try testing.expectEqualSlices(u16, &.{ 24, 26, 28, 30 }, g.group(3));
-    try testing.expectEqualSlices(u16, &.{ 1, 3, 5, 7 }, g.group(4));
-    try expectCoverage(&g, 32);
-}
-
-test "drain groups: node = cpu / 16 ⇒ 8 contiguous groups of 4; one node 64q ⇒ 4 of 16; 32q ⇒ 4 of 8; 4q ⇒ 4 singletons" {
-    var a = try drainGroupPlan(testing.allocator, 32, true, .{ .node_of = nodeBy16 }, null);
-    defer a.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 8), a.count());
-    try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3 }, a.group(0));
-    try testing.expectEqualSlices(u16, &.{ 16, 17, 18, 19 }, a.group(4));
-    try expectCoverage(&a, 32);
-    var b = try drainGroupPlan(testing.allocator, 64, true, one_node, null);
-    defer b.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 4), b.count());
-    try testing.expectEqual(@as(usize, 16), b.group(0).len);
-    try expectCoverage(&b, 64);
-    var c = try drainGroupPlan(testing.allocator, 32, true, one_node, null);
-    defer c.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 4), c.count());
-    try testing.expectEqual(@as(usize, 8), c.maxWidth());
-    try expectCoverage(&c, 32);
-    var d = try drainGroupPlan(testing.allocator, 4, true, one_node, null);
-    defer d.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 4), d.count());
-    try testing.expectEqual(@as(usize, 1), d.maxWidth());
-    try expectCoverage(&d, 4);
-}
-
-test "drain groups: kmbuf/zc force width 1 (singletons); an explicit width 3 on nodes of 4 ⇒ [[0,1,2],[3],[4,5,6],[7]] — never spanning a node" {
-    try testing.expectEqual(@as(?u32, 1), forcedWidth(.buf_ring, null));
-    try testing.expectEqual(@as(?u32, 1), forcedWidth(.zero_copy, 7));
-    try testing.expectEqual(@as(?u32, null), forcedWidth(.user_ents, null));
-    try testing.expectEqual(@as(?u32, 3), forcedWidth(.user_ents, 3));
-    try testing.expectEqual(@as(?u32, 512), forcedWidth(.user_ents, 4096));
-    var a = try drainGroupPlan(testing.allocator, 32, true, one_node, forcedWidth(.buf_ring, null));
-    defer a.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 32), a.count());
-    try testing.expectEqual(@as(usize, 1), a.maxWidth());
-    var b = try drainGroupPlan(testing.allocator, 8, true, .{ .node_of = nodeOfFour }, 3);
-    defer b.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 4), b.count());
-    try testing.expectEqualSlices(u16, &.{ 0, 1, 2 }, b.group(0));
-    try testing.expectEqualSlices(u16, &.{3}, b.group(1));
-    try testing.expectEqualSlices(u16, &.{ 4, 5, 6 }, b.group(2));
-    try testing.expectEqualSlices(u16, &.{7}, b.group(3));
-    try expectCoverage(&b, 8);
-}
-
-test "drain groups: qid_is_cpu = false never consults node_of — 5q ⇒ singletons, 32q ⇒ 4 of 8 at the machine width" {
-    var a = try drainGroupPlan(testing.allocator, 5, false, .{ .node_of = nodeNever }, null);
-    defer a.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 5), a.count());
-    try expectCoverage(&a, 5);
-    var b = try drainGroupPlan(testing.allocator, 32, false, .{ .node_of = nodeNever }, null);
-    defer b.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 4), b.count());
-    try testing.expectEqual(@as(usize, 8), b.maxWidth());
-    try expectCoverage(&b, 32);
-}
-
-test "drain groups: holes {4,6,14,16,22,24,30} on one node ⇒ 5 node chunks (6,6,6,6,1) + ONE residual group of the holes" {
-    var g = try drainGroupPlan(testing.allocator, 32, true, .{ .node_of = nodeWithHoles }, null);
-    defer g.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 6), g.count());
-    try testing.expectEqual(@as(usize, 6), g.group(0).len);
-    try testing.expectEqual(@as(usize, 6), g.group(3).len);
-    try testing.expectEqual(@as(usize, 1), g.group(4).len);
-    try testing.expectEqualSlices(u16, &.{ 4, 6, 14, 16, 22, 24, 30 }, g.group(5));
-    try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3, 5, 7 }, g.group(0));
-    try expectCoverage(&g, 32);
-}
-
-test "drain width = max(n/4, 1); sq entries = max(next_pow2(width × depth × (1 + pieces) + 8), 16), at most the kernel's 32768" {
-    try testing.expectEqual(@as(u32, 8), drainGroupWidth(32));
-    try testing.expectEqual(@as(u32, 1), drainGroupWidth(3));
-    try testing.expectEqual(@as(u32, 1), drainGroupWidth(0));
-    try testing.expectEqual(@as(u32, 128), drainGroupWidth(512));
+test "sq entries = max(next_pow2(depth × (1 + pieces) + 8), 16), at most the kernel's 32768" {
     // No bridges (pieces 0): the register/commit shape alone.
-    try testing.expectEqual(@as(u32, 512), sqEntries(8, 32, 0));
-    try testing.expectEqual(@as(u32, 64), sqEntries(1, 32, 0));
-    try testing.expectEqual(@as(u32, 16), sqEntries(1, 4, 0));
-    try testing.expectEqual(@as(u32, 16), sqEntries(1, 8, 0));
-    try testing.expectEqual(@as(u32, 32), sqEntries(1, 9, 0));
-    try testing.expectEqual(@as(u32, 16), sqEntries(1, 1, 0));
-    // 128 × 32 + 8 = 4104 → the next power of two above it.
-    try testing.expectEqual(@as(u32, 8192), sqEntries(128, 32, 0));
-    try testing.expectEqual(@as(u32, 4096), sqEntries(127, 32, 0));
+    try testing.expectEqual(@as(u32, 64), sqEntries(32, 0));
+    try testing.expectEqual(@as(u32, 16), sqEntries(4, 0));
+    try testing.expectEqual(@as(u32, 16), sqEntries(8, 0));
+    try testing.expectEqual(@as(u32, 32), sqEntries(9, 0));
+    try testing.expectEqual(@as(u32, 16), sqEntries(1, 0));
     // A zero-copy ring: every ent's bridge in up to 8 pieces beside its commit (16 × 9 + 8 = 152 → 256).
-    try testing.expectEqual(@as(u32, 256), sqEntries(1, 16, 8));
-    try testing.expectEqual(@as(u32, 512), sqEntries(1, 32, 8));
-    // The kernel's ceiling holds at any width.
-    try testing.expectEqual(@as(u32, 32768), sqEntries(128, 32, 8));
+    try testing.expectEqual(@as(u32, 256), sqEntries(16, 8));
+    try testing.expectEqual(@as(u32, 512), sqEntries(32, 8));
+    // The kernel's ceiling holds at any depth.
+    try testing.expectEqual(@as(u32, 32768), sqEntries(1 << 13, 8));
 }
 
-test "rings per queue: 3 where the FEATURES probe reads present on kmbuf/zc (the workers one submitter keeps busy: the daemon's ≈ 7 µs per op over the submitter's ≈ 2.5, rounded up), 1 on UserEnts and wherever it reads absent; explicit wins up to the ceiling of 4; the shares split the depth ceil/rest with the queue's depth unchanged and ring 1's base at ring 0's depth" {
+test "rings per queue: the derived 3 (the workers one submitter keeps busy: the daemon's ≈ 7 µs per op over the submitter's ≈ 2.5, rounded up); explicit wins up to the ceiling of 4; the shares split the depth by halvings with the queue's depth unchanged, ring 0 the largest, the bases contiguous" {
     try testing.expectEqual(@as(u32, 3), RINGS_PER_QUEUE_DERIVED);
     try testing.expectEqual(@as(u32, 4), MAX_RINGS_PER_QUEUE);
     try testing.expect(RINGS_PER_QUEUE_DERIVED <= MAX_RINGS_PER_QUEUE);
-    try testing.expectEqual(@as(u32, 3), ringsPerQueue(.zero_copy, true));
-    try testing.expectEqual(@as(u32, 3), ringsPerQueue(.buf_ring, true));
-    try testing.expectEqual(@as(u32, 1), ringsPerQueue(.user_ents, true));
-    try testing.expectEqual(@as(u32, 1), ringsPerQueue(.zero_copy, false));
-    try testing.expectEqual(@as(u32, 1), ringsPerQueue(.buf_ring, false));
-    // MainlinePool needs no FEATURES patch: the pool is user memory every
-    // ring registers at one index; the derived count applies either way.
-    try testing.expectEqual(@as(u32, 3), ringsPerQueue(.mainline_pool, false));
-    try testing.expectEqual(@as(u32, 3), ringsPerQueue(.mainline_pool, true));
-    try testing.expect(BufferMode.mainline_pool.ringPerQueue() and !BufferMode.user_ents.ringPerQueue());
-    try testing.expectEqual(@as(?u32, 1), forcedWidth(.mainline_pool, 5));
     try testing.expectEqual(@as(u32, 1), resolveRingsPerQueue(1, 2));
     try testing.expectEqual(@as(u32, 2), resolveRingsPerQueue(2, 1));
     try testing.expectEqual(@as(u32, 2), resolveRingsPerQueue(null, 2));
@@ -1143,10 +810,7 @@ test "rings per queue: 3 where the FEATURES probe reads present on kmbuf/zc (the
     try testing.expectEqual(RingShare{ .base = 16, .depth = 16 }, ringShare(32, 2, 1));
     try testing.expectEqual(RingShare{ .base = 2, .depth = 2 }, ringShare(4, 2, 1));
     try testing.expectEqual(RingShare{ .base = 3, .depth = 2 }, ringShare(5, 2, 1));
-    // Three and four rings: halvings of the largest — 32 is 16/8/8 and
-    // 8/8/8/8, ring 0 the largest, bases contiguous, the depth whole, and
-    // the kmbuf regions (nextPow2 of each share) never pin more than the
-    // one-ring region does (the pinned-exactness tie).
+    // Three and four rings: halvings of the largest — 32 is 16/8/8 and 8/8/8/8.
     try testing.expectEqual(RingShare{ .base = 0, .depth = 16 }, ringShare(32, 3, 0));
     try testing.expectEqual(RingShare{ .base = 16, .depth = 8 }, ringShare(32, 3, 1));
     try testing.expectEqual(RingShare{ .base = 24, .depth = 8 }, ringShare(32, 3, 2));
@@ -1155,7 +819,6 @@ test "rings per queue: 3 where the FEATURES probe reads present on kmbuf/zc (the
         for ([_]u32{ 3, 4 }) |rings| {
             if (depth < rings) continue;
             var sum: u32 = 0;
-            var pinned: u64 = 0;
             var prev: u32 = std.math.maxInt(u32);
             for (0..rings) |ring| {
                 const s = ringShare(depth, rings, @intCast(ring));
@@ -1163,13 +826,10 @@ test "rings per queue: 3 where the FEATURES probe reads present on kmbuf/zc (the
                 try testing.expect(s.depth >= 1 and s.depth <= prev);
                 prev = s.depth;
                 sum += s.depth;
-                pinned += derive.nextPow2(s.depth);
             }
             try testing.expectEqual(depth, sum);
-            try testing.expect(pinned <= derive.nextPow2(depth));
         }
     }
-    try testing.expectEqual(RingShare{ .base = 24, .depth = 8 }, ringShare(32, 4, 3));
 }
 
 test "the plan is total over a sweep of shapes and every result satisfies the kernel mirror" {

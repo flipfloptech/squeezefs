@@ -109,8 +109,6 @@ pub const Config = struct {
                 .gap_seed_ranged = knobs.boolKnob("SQUEEZEFS_GAP_SEED_RANGED", env),
                 .close_barrier = knobs.boolKnob("SQUEEZEFS_OVERLAY_CLOSE_BARRIER", env),
                 .depth_governor = knobs.boolKnob("SQUEEZEFS_OVERLAY_DEPTH_GOVERNOR", env),
-                .ack_early = knobs.boolKnob("SQUEEZEFS_ZC_ACK_EARLY", env),
-                .ack_early_odirect = knobs.boolKnob("SQUEEZEFS_ZC_ACK_EARLY_ODIRECT", env),
                 .hold_slot = knobs.boolKnob("SQUEEZEFS_ZC_HOLD_OVERLAY", env),
             },
             .rewrite_shadow = knobs.boolKnob("SQUEEZEFS_REWRITE_SHADOW", env),
@@ -130,8 +128,6 @@ pub const Config = struct {
         if (self.overlay.close_barrier) log.info("write path: A/B lever SQUEEZEFS_OVERLAY_CLOSE_BARRIER=1 (the OW-8 posture)", .{});
         if (!self.overlay.depth_governor) log.info("write path: A/B lever SQUEEZEFS_OVERLAY_DEPTH_GOVERNOR=0", .{});
         if (!self.overlay.gap_seed_ranged) log.info("write path: A/B lever SQUEEZEFS_GAP_SEED_RANGED=0", .{});
-        if (!self.overlay.ack_early) log.info("write path: A/B lever SQUEEZEFS_ZC_ACK_EARLY=0", .{});
-        if (self.overlay.ack_early_odirect) log.info("write path: SQUEEZEFS_ZC_ACK_EARLY_ODIRECT=1 (the held-GUP snapshot opt-in)", .{});
         if (!self.overlay.hold_slot) log.info("write path: A/B lever SQUEEZEFS_ZC_HOLD_OVERLAY=0 (overlay-class writes extracted at delivery)", .{});
         if (!self.rewrite_shadow) log.info("write path: A/B lever SQUEEZEFS_REWRITE_SHADOW=0 (per-block durable publishes)", .{});
         switch (self.depth_override) {

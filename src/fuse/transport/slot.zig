@@ -126,26 +126,7 @@ pub fn resetOverlongEpisodeForTest() void {
 /// slot (`fuse_resend`'s double delivery); counted beside the abandonment
 /// it implies.
 pub var requests_displaced: counters.ShardedCounter = .{};
-/// `transport_zc_retain_commits` / `transport_zc_releases` /
-/// `transport_zc_retained_outstanding`: RETAIN commits submitted (the
-/// ACK-early engagement counter), RELEASE_PAYLOAD SQEs submitted, and their
-/// difference (0 at quiesce — the closure law).
-pub var retain_commits: counters.ShardedCounter = .{};
-pub var releases: counters.ShardedCounter = .{};
-pub var retained_outstanding: counters.Gauge = .{};
-/// `transport_zc_release_failures` (must-stay-0): a RELEASE CQE other than
-/// 0 — ENOENT a double release, EBUSY a release that raced a live commit.
-pub var release_failures: counters.Tripwire = .init("transport_zc_release_failures");
-/// `transport_zc_retain_refused` (must-stay-0): the kernel answered a RETAIN
-/// commit -EINVAL; the slot re-committed plain (the submit site mirrors the
-/// kernel's checks, so this never fires).
-pub var retain_refused: counters.Tripwire = .init("transport_zc_retain_refused");
-/// `transport_zc_retain_refused_class`: a `replyRetain` the submit site
-/// refused — a `.direct_gup` payload (the stability law: snapshot first),
-/// a slot whose pages are not a held WRITE, or a session without retention
-/// — committed plain instead.
-pub var retain_refused_class: counters.ShardedCounter = .{};
-/// `transport_pool_write_holds`: mainline WRITEs held in their POOL buffer
+/// `transport_pool_write_holds`: WRITEs held in their POOL buffer
 /// (copied there by the kernel, stored to the device straight from it —
 /// no zc slot, no daemon copy); a subset of `transport_zc_write_holds`.
 pub var pool_write_holds: counters.ShardedCounter = .{};
@@ -336,8 +317,7 @@ pub const HeldSource = struct { qid: u16, buf_index: u16, len: u32 };
 /// Under zero-copy a W1-eligible payload is HELD (`held`): `data` is empty,
 /// the bytes sit in the slot; the handler consumes them by `heldSource()`
 /// (a direct `WRITE_FIXED(device ← slot)`) or `extract()` (lazily, counted
-/// `transport_zc_write_lazy_extractions`). `class` is the stability law's
-/// stamp: only `.page_cache` may `replyRetain`.
+/// `transport_zc_write_lazy_extractions`).
 pub const PayloadLease = struct {
     state: *LeaseState,
     data: []const u8,
@@ -345,7 +325,6 @@ pub const PayloadLease = struct {
     waker: Waker,
     held: bool = false,
     held_len: u32 = 0,
-    class: zc.PayloadClass = .page_cache,
     qid: u16 = 0,
     ent_idx: u16 = 0,
     gent: u32 = 0,
@@ -363,11 +342,10 @@ pub const PayloadLease = struct {
     /// Worker side at a HELD delivery (zero-copy, the gate admitted the
     /// shape): no bytes in hand, the slot coordinates and the bridge face
     /// instead.
-    pub fn acquireHeld(state: *LeaseState, waker: Waker, held_len: u32, class: zc.PayloadClass, qid: u16, ent_idx: u16, gent: u32, face: HeldFace) PayloadLease {
+    pub fn acquireHeld(state: *LeaseState, waker: Waker, held_len: u32, qid: u16, ent_idx: u16, gent: u32, face: HeldFace) PayloadLease {
         var l = acquire(state, &.{}, waker);
         l.held = true;
         l.held_len = held_len;
-        l.class = class;
         l.qid = qid;
         l.ent_idx = ent_idx;
         l.gent = gent;
@@ -378,12 +356,12 @@ pub const PayloadLease = struct {
     }
 
     /// Worker side at a HELD delivery whose bytes are ALSO in hand (the
-    /// mainline pool: a WRITE the kernel copied into the queue's pool, a
+    /// pool: a WRITE the kernel copied into the queue's pool, a
     /// registered buffer the ring can `WRITE_FIXED` from directly — charter
     /// §6.2 item 1's lever (b) with no zc slot): the direct leg has its
     /// coordinates, `bytes` answers `data` with no bridge.
-    pub fn acquireHeldPooled(state: *LeaseState, waker: Waker, data: []const u8, class: zc.PayloadClass, qid: u16, ent_idx: u16, gent: u32, face: HeldFace) PayloadLease {
-        var l = acquireHeld(state, waker, @intCast(data.len), class, qid, ent_idx, gent, face);
+    pub fn acquireHeldPooled(state: *LeaseState, waker: Waker, data: []const u8, qid: u16, ent_idx: u16, gent: u32, face: HeldFace) PayloadLease {
+        var l = acquireHeld(state, waker, @intCast(data.len), qid, ent_idx, gent, face);
         l.data = data;
         pool_write_holds.inc();
         return l;
@@ -450,10 +428,6 @@ pub const State = union(enum) {
     /// COMMIT_AND_FETCH submitted; the kernel owns the ent again (its CQE is
     /// the next delivery).
     replied: u64,
-    /// COMMIT with RETAIN submitted (zc ACK-early): the request ended
-    /// kernel-side, the slot pages stay registered, the cmd is parked (no
-    /// CQE); owes one RELEASE_PAYLOAD. Compiled, inert until retention lands.
-    retained: u64,
     /// 8 consecutive REGISTER failures; out of rotation.
     retired,
 };
@@ -468,13 +442,8 @@ pub const Ent = struct {
     /// What the kernel installed in this ent's zc slot at the current
     /// delivery (`.none` on a non-zc session).
     dir: zc.Dir = .none,
-    /// The stability class of the current WRITE payload.
-    class: zc.PayloadClass = .page_cache,
     /// The current WRITE payload is HELD in the slot (never extracted yet).
     held: bool = false,
-    /// A RELEASE arrived before the RETAIN commit was pushed: fire it right
-    /// after that commit, in the same batch (release never precedes commit).
-    release_pending: bool = false,
     /// Consecutive REGISTER failures (reset on success).
     failures: u8 = 0,
     /// Monotonic deadline of the pending re-REGISTER; 0 = none.
@@ -550,9 +519,7 @@ pub const SlotTable = struct {
         e.failures = 0;
         e.retry_at_ns = 0;
         e.dir = .none;
-        e.class = .page_cache;
         e.held = false;
-        e.release_pending = false;
         publishOwed(e, .{ .unique = unique, .commit_id = commit_id }, now_ns);
     }
 
@@ -563,8 +530,8 @@ pub const SlotTable = struct {
     }
 
     /// A commit message arrived for `commit_id`: accepted iff the slot is
-    /// `delivered` with that exact id. Everything else (parked, replied,
-    /// retained, a foreign id) is refused — never an overwrite, never a
+    /// `delivered` with that exact id. Everything else (parked, replied, a
+    /// foreign id) is refused — never an overwrite, never a
     /// second COMMIT.
     pub fn admitCommit(self: *SlotTable, ent_idx: u16, commit_id: u64) Admit {
         const e = self.ent(ent_idx);
@@ -615,62 +582,6 @@ pub const SlotTable = struct {
         const o = e.owing() orelse unreachable; // every commit push follows an admitted or synthesized owed request
         e.state = .{ .replied = o.commit_id };
         publishOwed(e, null, 0);
-    }
-
-    /// COMMIT with RETAIN pushed (retention): the request ended kernel-side,
-    /// the slot owes no reply but still owes a RELEASE — the commit id stays
-    /// published (the release's economy check names it); `owed_since_ns`
-    /// clears (the watchdog names replies, not retentions).
-    pub fn onCommitSubmittedRetained(self: *SlotTable, ent_idx: u16) void {
-        const e = self.ent(ent_idx);
-        const o = e.owing() orelse unreachable;
-        e.state = .{ .retained = o.commit_id };
-        e.owed_commit_id.store(o.commit_id, .release);
-        e.owed_since_ns.store(0, .release);
-        retain_commits.inc();
-        retained_outstanding.add(1);
-    }
-
-    /// A RELEASE for `commit_id`: accepted iff the slot is `retained` with
-    /// that id (the kernel would answer ENOENT/EBUSY otherwise).
-    pub fn admitRelease(self: *SlotTable, ent_idx: u16, commit_id: u64) Admit {
-        const e = self.ent(ent_idx);
-        switch (e.state) {
-            .retained => |cid| if (cid == commit_id) return .accept,
-            else => {},
-        }
-        return .refuse_stale;
-    }
-
-    /// RELEASE_PAYLOAD pushed; inert on any other state (a teardown race).
-    pub fn onReleaseSubmitted(self: *SlotTable, ent_idx: u16) void {
-        const e = self.ent(ent_idx);
-        switch (e.state) {
-            .retained => |cid| {
-                e.state = .{ .replied = cid };
-                e.release_pending = false;
-                publishOwed(e, null, 0);
-                releases.inc();
-                retained_outstanding.sub(1);
-            },
-            else => {},
-        }
-    }
-
-    /// A commit CQE `-EINVAL` while retained: recover by a plain re-commit
-    /// (the ent still holds its applied reply). The must-stay-0 tripwire.
-    pub fn onRetainRefused(self: *SlotTable, ent_idx: u16, now_ns: u64) void {
-        const e = self.ent(ent_idx);
-        switch (e.state) {
-            .retained => |cid| {
-                retain_refused.fire("kernel refused a RETAIN commit with -EINVAL");
-                retained_outstanding.sub(1);
-                e.release_pending = false;
-                e.state = .{ .delivered = .{ .unique = 0, .commit_id = cid } };
-                publishOwed(e, .{ .unique = 0, .commit_id = cid }, now_ns);
-            },
-            else => {},
-        }
     }
 
     /// A commit CQE `EAGAIN`/`EINTR`: re-push the SAME commit, never
@@ -961,51 +872,18 @@ test "a second delivery on an owing slot reports the displaced request and is ac
     try log.testing.expectAllFired();
 }
 
-test "retain commit parks the slot until RELEASE re-arms it (owes no reply, keeps its commit id published for the release's economy check; retain_commits − releases ≡ outstanding); a refused retain is the tripwire and recovers to a plain re-commit; release on an unretained slot is inert; EAGAIN re-pushes the same commit" {
-    log.testing.expectErrorLogs(1);
+test "a commit CQE EAGAIN on a replied slot re-pushes the same commit id (back to delivered, owing again); on any other state it is nothing" {
     var t = try freshTable();
     defer t.deinit(testing.allocator);
-    const rc = retain_commits.load();
-    const rl = releases.load();
-    const out = retained_outstanding.load();
-    t.onDeliver(0, 77, 77, 1);
-    t.onCommitSubmittedRetained(0);
-    try testing.expectEqual(State{ .retained = 77 }, t.ent(0).state);
-    try testing.expectEqual(@as(u32, 0), t.owedCount());
-    try testing.expectEqual(@as(u64, 77), t.ent(0).owed_commit_id.load(.acquire));
-    try testing.expectEqual(@as(u64, 0), t.ent(0).owed_since_ns.load(.acquire));
-    try testing.expectEqual(rc + 1, retain_commits.load());
-    try testing.expectEqual(out + 1, retained_outstanding.load());
-    try testing.expectEqual(Admit.refuse_stale, t.admitCommit(0, 77));
-    try testing.expectEqual(Admit.refuse_stale, t.admitRelease(0, 78));
-    try testing.expectEqual(Admit.accept, t.admitRelease(0, 77));
-    try testing.expectEqual(Fail.nothing, t.failEnt(0));
-    t.onReleaseSubmitted(0);
-    try testing.expectEqual(State{ .replied = 77 }, t.ent(0).state);
-    try testing.expectEqual(@as(u64, 0), t.ent(0).owed_commit_id.load(.acquire));
-    try testing.expectEqual(rl + 1, releases.load());
-    try testing.expectEqual(out, retained_outstanding.load());
-    try testing.expectEqual(Admit.refuse_stale, t.admitRelease(0, 77));
-    // Inert elsewhere.
-    t.onReleaseSubmitted(0);
-    try testing.expectEqual(State{ .replied = 77 }, t.ent(0).state);
-    try testing.expectEqual(rl + 1, releases.load());
-    // Retain refused ⇒ the tripwire, re-commit with the same id.
     t.onDeliver(1, 79, 79, 1);
-    t.onCommitSubmittedRetained(1);
-    retain_refused.resetLogBudgetForTest();
-    const refused = retain_refused.load();
-    t.onRetainRefused(1, 5);
-    try testing.expectEqual(refused + 1, retain_refused.load());
-    try testing.expectEqual(out, retained_outstanding.load());
-    try testing.expectEqual(State{ .delivered = .{ .unique = 0, .commit_id = 79 } }, t.ent(1).state);
     try testing.expectEqual(Admit.accept, t.admitCommit(1, 79));
     t.onCommitSubmitted(1);
-    // EAGAIN on a replied slot ⇒ the same commit id comes back to delivered.
     try testing.expectEqual(@as(?u64, 79), t.onCommitRetry(1, 6));
+    try testing.expectEqual(State{ .delivered = .{ .unique = 0, .commit_id = 79 } }, t.ent(1).state);
+    try testing.expectEqual(@as(u64, 79), t.ent(1).owed_commit_id.load(.acquire));
     try testing.expectEqual(@as(?u64, null), t.onCommitRetry(1, 7));
     t.onCommitSubmitted(1);
-    try log.testing.expectAllFired();
+    try testing.expectEqual(@as(?u64, null), t.onCommitRetry(2, 8));
 }
 
 test "a held lease answers heldSource with the slot coordinates and extracts through its face exactly once per call; a lease in hand copies its data and has no held source" {
@@ -1028,10 +906,9 @@ test "a held lease answers heldSource with the slot coordinates and extracts thr
     var face: Face = .{};
     var s: LeaseState = .{};
     const holds = zc_write_holds.load();
-    const l = PayloadLease.acquireHeld(&s, waker, 8, .direct_gup, 2, 5, 9, .{ .ctx = &face, .extract = Face.extract });
+    const l = PayloadLease.acquireHeld(&s, waker, 8, 2, 5, 9, .{ .ctx = &face, .extract = Face.extract });
     try testing.expectEqual(holds + 1, zc_write_holds.load());
     try testing.expectEqual(HeldSource{ .qid = 2, .buf_index = 5, .len = 8 }, l.heldSource().?);
-    try testing.expectEqual(zc.PayloadClass.direct_gup, l.class);
     var dst: [16]u8 = undefined;
     try testing.expectEqual(@as(usize, 8), try l.extract(testing.io, &dst));
     try testing.expectEqualSlices(u8, "heldbyte", dst[0..8]);
@@ -1048,7 +925,7 @@ test "a held lease answers heldSource with the slot coordinates and extracts thr
     // is never asked, both hold counters move.
     var s3: LeaseState = .{};
     const pooled0 = pool_write_holds.load();
-    const pooled = PayloadLease.acquireHeldPooled(&s3, waker, "pooledby", .page_cache, 2, 6, 10, .{ .ctx = &face, .extract = Face.extract });
+    const pooled = PayloadLease.acquireHeldPooled(&s3, waker, "pooledby", 2, 6, 10, .{ .ctx = &face, .extract = Face.extract });
     try testing.expectEqual(holds + 2, zc_write_holds.load());
     try testing.expectEqual(pooled0 + 1, pool_write_holds.load());
     try testing.expectEqual(HeldSource{ .qid = 2, .buf_index = 6, .len = 8 }, pooled.heldSource().?);

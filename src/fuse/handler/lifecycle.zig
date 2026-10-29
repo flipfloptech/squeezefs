@@ -505,7 +505,7 @@ pub fn Dispatcher(comptime Transport: type) type {
                     return lp.bytes(io);
                 }
             };
-            return .{ .src = l.heldSource().?, .class = l.class, .ctx = @ptrCast(@constCast(l)), .extract = &Thunk.extract };
+            return .{ .src = l.heldSource().?, .ctx = @ptrCast(@constCast(l)), .extract = &Thunk.extract };
         }
 
         fn run(self: *Self, req: codec.Request, meta: Meta, c: *Ctx, out: *codec.OutBuf, lease: ?Transport.PayloadLease) Error!codec.Reply {
@@ -1490,7 +1490,7 @@ test "heldPayload points INTO the caller's lease and its extract reaches the slo
         }
     };
     var state: transport_slot.LeaseState = .{};
-    var lease: ?transport_slot.PayloadLease = transport_slot.PayloadLease.acquireHeld(&state, .{ .ctx = null, .wake = &Face.wake }, 4096, .page_cache, 2, 5, 7, .{ .ctx = null, .extract = &Face.extract });
+    var lease: ?transport_slot.PayloadLease = transport_slot.PayloadLease.acquireHeld(&state, .{ .ctx = null, .wake = &Face.wake }, 4096, 2, 5, 7, .{ .ctx = null, .extract = &Face.extract });
     const held = Dispatcher(HeldLoopback).heldPayload(&lease).?;
     try testing.expectEqual(@as(*anyopaque, @ptrCast(&lease.?)), held.ctx.?);
     try testing.expectEqual(@as(u16, 2), held.src.qid);

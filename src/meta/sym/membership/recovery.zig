@@ -1723,6 +1723,29 @@ test "every crash window: a recovery that fails right after each step's durable 
     }
 }
 
+test "a recovery rolled back after its tree-0 step holds the recovered slots' coherence and quarantines their custody exactly as the un-rolled-back run (decision 0003 §CF.4): the re-run absorbs both slots from tree 0 and leaves each with the same coherence deadline and the same RAM custody quarantine, the quarantine counters moved as once" {
+    const gpa = testing.allocator;
+    // The un-rolled-back run's end state: the reference.
+    const ref = try Fixture.init(gpa, true);
+    defer ref.deinit();
+    try testing.expectEqual(Outcome.acted, ref.driver.recoverDead(ref.death()));
+    const q0 = stats.slot_custody_quarantines_installed.load();
+    const f = try Fixture.init(gpa, true);
+    defer f.deinit();
+    f.driver.seams.fail_at = .tree0;
+    try testing.expectEqual(Outcome.failed, f.driver.recoverDead(f.death()));
+    f.driver.seams.fail_at = null;
+    try testing.expectEqual(Outcome.acted, f.driver.recoverDead(f.death()));
+    for ([_]u16{ 10, 11 }) |s| {
+        const want = ref.rv.coherence.get(s).?;
+        const got = f.rv.coherence.get(s) orelse return error.TestCoherenceNotHeld;
+        try testing.expectEqual(want, got);
+        try testing.expect(std.mem.indexOfScalar(u16, f.rv.quarantined.items, s) != null);
+    }
+    try testing.expectEqual(ref.rv.quarantined.items.len, f.rv.quarantined.items.len);
+    try testing.expectEqual(q0 + 2, stats.slot_custody_quarantines_installed.load());
+}
+
 test "an EARLY record quarantines the recovered slots' custody for T_owner + 2 × skew_max past the record, durably beside the Unleased and in RAM; a rejoined member (listed live) is never recovered and its record is retired; a page that moved under the poll's snapshot is skipped; a window violation refuses loud" {
     const gpa = testing.allocator;
     const f = try Fixture.init(gpa, true);

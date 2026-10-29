@@ -10749,7 +10749,9 @@ test "expectSupervisorSilent sees a RECOVERED probe miss: a miss inside the grac
 /// ladder may appear on an orderly cycle (charter §1.1: a daemon is never
 /// "unresponsive" for being asked to unmount).
 fn expectSupervisorSilent(text: []const u8) !void {
-    inline for (.{ "missed a probe", "heartbeat stale", "unresponsive for", "is dead (wait status", "detaching lazily" }) |needle| {
+    // A miss inside the grace window is silent until the daemon answers
+    // again: "answers again after a missed probe" is that miss's one line.
+    inline for (.{ "missed a probe", "after a missed probe", "heartbeat stale", "unresponsive for", "is dead (wait status", "detaching lazily" }) |needle| {
         if (std.mem.indexOf(u8, text, needle)) |i| {
             std.debug.print("\n--- the supervisor/transport fired on an orderly cycle: '{s}' ---\n{s}\n", .{ needle, text[i..@min(text.len, i + 400)] });
             return error.SupervisorFired;

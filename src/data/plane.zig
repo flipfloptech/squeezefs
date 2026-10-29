@@ -637,6 +637,13 @@ pub const DataPlane = struct {
         self.foreign_layout = f;
     }
 
+    /// Bind (or, with null, unbind BEFORE the filesystem goes) the corpse
+    /// gather as the reclaimer's upstream supply (`reclaim.Reclaimer.
+    /// Upstream`, decision 0003 §CR).
+    pub fn bindCorpseSupply(self: *DataPlane, u: ?*const reclaim.Reclaimer.Upstream) void {
+        self.reclaimer.bindUpstream(u);
+    }
+
     /// The token recall's data-plane half (`wire_plane.RecallSink`; spec
     /// `sym_tokens_intents_striping.md` §1.7 step 2): the recalled
     /// object's carried `layout` value (the raw layout, as the token

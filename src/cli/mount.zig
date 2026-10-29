@@ -564,6 +564,12 @@ fn mountMain(ctx: *Ctx) u8 {
         .promote_kill_after_commit = knobs.boolKnob("SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT", env),
     }) catch return ctx.failed("out of memory mounting the filesystem", .{});
     defer fs.unmount();
+    // The corpse gather is the data plane's upstream supply (decision 0003
+    // §CR): a full store kicks its destroy. Unbound before the filesystem
+    // goes (the serve path unbinds it before the plane closes).
+    const corpse_upstream = fs.corpseUpstream();
+    plane.bindCorpseSupply(&corpse_upstream);
+    defer if (plane_open) plane.bindCorpseSupply(null);
     // The `.stats`/`.config`/`.trace` renderer: every family's source the
     // daemon owns (the session joins once it is up); the op-trace ring
     // armed from its row with the derived geometry.
@@ -1120,6 +1126,7 @@ fn mountMain(ctx: *Ctx) u8 {
     // The plane closes BEFORE the backend's final checkpoint (the dismount
     // pass's promotions were layout transactions); the `defer`s unwind the
     // filesystem and the tables after it.
+    plane.bindCorpseSupply(null);
     plane_open = false;
     plane.close();
     be_open = false;
@@ -1556,9 +1563,14 @@ const ReclaimCadence = struct {
             defer trace.finish();
             var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
             if (clock.monotonicNs() < next_tick_ns) {
-                self.fs.reclaimDrainFull(&ctx) catch |e| log.err("reclaim cadence: drain failed: {t}", .{e});
+                // A full store kicked the gather (decision 0003 §CR): the
+                // tail too, now; else full batches alone.
+                if (self.fs.takeCorpseKick()) {
+                    self.fs.reclaimDrainKicked(&ctx) catch |e| log.err("reclaim cadence: drain failed: {t}", .{e});
+                } else self.fs.reclaimDrainFull(&ctx) catch |e| log.err("reclaim cadence: drain failed: {t}", .{e});
                 continue;
             }
+            _ = self.fs.takeCorpseKick();
             self.fs.reclaimDrain(&ctx) catch |e| log.err("reclaim cadence: drain failed: {t}", .{e});
             next_tick_ns = clock.monotonicNs() + RECLAIM_CADENCE_NS;
             self.drainIdleOwed(&ctx);

@@ -137,6 +137,7 @@ const write_admit = @import("../../data/write_admit.zig");
 const seams = @import("../../data/write_seams.zig");
 const size_epoch = @import("../../data/size_epoch.zig");
 const fsync_mod = @import("../../data/fsync.zig");
+const reclaim_mod = @import("../../data/reclaim.zig");
 const ipc_wire = @import("../../ipc/wire.zig");
 const ring_inodes = @import("../../ipc/ring_inodes.zig");
 
@@ -381,6 +382,12 @@ pub var fuse_reclaim_queue_overflow: counters.ShardedCounter = .{};
 /// refused (`NoSpaceLeft`), each kept gathered for the cadence's next tick
 /// (the mount's sweep defers the same way) — the space class, never lost.
 pub var fuse_reclaim_space_deferrals: counters.ShardedCounter = .{};
+/// `fuse_reclaim_kicked_drains`: gathers destroyed before their tick
+/// because an allocation met a full store with them gathered (the data
+/// plane's ENOSPC valve kicked them, `corpseUpstream`); `fuse_reclaim_
+/// gathered`: corpses gathered or inside a destroy pass now.
+pub var fuse_reclaim_kicked_drains: counters.ShardedCounter = .{};
+pub var fuse_reclaim_gathered: counters.Gauge = .{};
 /// `fuse_forget_judgements_deferred`: a forget whose try-only inode read
 /// would have parked the drain worker (`WouldBlock`: the leaf not
 /// resident, an SMO window) or refused; the ino joined the gather for the
@@ -764,6 +771,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// deferred corpses to the tick: each retry may run the admission's
         /// return-room cycles.
         space_deferred: std.atomic.Value(bool) = .init(false),
+        /// Corpses gathered or inside a destroy pass (`corpseUpstream`):
+        /// raised at the gather, lowered once a pass's frees reached the
+        /// data plane (a deferred corpse rejoins the gather first).
+        corpses_pending: std.atomic.Value(usize) = .init(0),
+        /// The data plane's ENOSPC valve asked for the gather's destroy
+        /// before the tick (`kickCorpses`).
+        corpse_kick: std.atomic.Value(bool) = .init(false),
         next_fh: std.atomic.Value(u64) = .init(1),
         /// From the INIT reply.
         minor: u32 = abi.FUSE_KERNEL_MINOR_VERSION,
@@ -2389,9 +2403,56 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     self.destroyCorpses(c, &.{ino}, null) catch |e| log.err("kv_fs: inline corpse destroy of ino {d} failed: {t}", .{ ino, e });
                     return;
                 };
+                self.noteCorpsesPending(1);
                 full = self.reclaim.items.len >= RECLAIM_BATCH;
             }
             if (full) self.reclaim_wake.notifyOne(self.io);
+        }
+
+        fn noteCorpsesPending(self: *Self, n: usize) void {
+            fuse_reclaim_gathered.set(self.corpses_pending.fetchAdd(n, .acq_rel) + n);
+        }
+
+        fn noteCorpsesDone(self: *Self, n: usize) void {
+            fuse_reclaim_gathered.set(self.corpses_pending.fetchSub(n, .acq_rel) - n);
+        }
+
+        /// THE GATHER AS SUPPLY (decision 0003 §CR): the data plane's
+        /// upstream (`reclaim.Reclaimer.Upstream`) — a delete's blocks wait
+        /// in the gather for a full batch or the reclaim tick (up to 5 s:
+        /// `rm` of 32 fallocate'd files and an immediate lay-down saw three
+        /// of four reservations refused ENOSPC with the rm's blocks
+        /// gathered, none destroyed). Pending while a corpse is gathered or
+        /// inside a destroy pass (its frees reach the plane at the pass's
+        /// end); the kick wakes the cadence for the tail now — never a
+        /// destroy on the caller's thread (`gatherCorpse`'s law). Bound by
+        /// the mount once `self` stands at its address.
+        pub fn corpseUpstream(self: *Self) reclaim_mod.Reclaimer.Upstream {
+            return .{ .ctx = self, .pending = &corpsesPendingOf, .kick = &kickCorpses };
+        }
+
+        fn corpsesPendingOf(ctx: *anyopaque) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return self.corpses_pending.load(.acquire) != 0;
+        }
+
+        fn kickCorpses(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (!self.corpse_kick.swap(true, .acq_rel)) self.reclaim_wake.notifyOne(self.io);
+        }
+
+        /// The cadence's wake asked for the tail (`kickCorpses`): consumed.
+        pub fn takeCorpseKick(self: *Self) bool {
+            return self.corpse_kick.swap(false, .acq_rel);
+        }
+
+        /// The kicked drain: every gathered corpse, the tail under
+        /// `RECLAIM_BATCH` included, before the tick. While a full heap
+        /// defers destroys the tick keeps them (`space_deferred`).
+        pub fn reclaimDrainKicked(self: *Self, c: *Ctx) Error!void {
+            if (self.space_deferred.load(.acquire)) return;
+            fuse_reclaim_kicked_drains.inc();
+            return self.drainGather(c, 1, false);
         }
 
         /// Destroy every gathered corpse, `RECLAIM_BATCH` per entry (the
@@ -2425,6 +2486,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 }
                 if (n == 0) break;
                 var deferred: Deferred = .{};
+                // The pass's frees reached the plane (or it failed): its
+                // corpses leave the pending count after a deferred one
+                // rejoined the gather.
+                defer self.noteCorpsesDone(n);
                 try self.destroyCorpses(c, batch[0..n], &deferred);
                 if (deferred.n != 0) {
                     self.regather(deferred.slice());
@@ -2459,7 +2524,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.reclaim.appendSlice(self.gpa, inos_) catch {
                 fuse_reclaim_queue_overflow.inc();
                 log.warn("kv_fs: {d} deferred corpse(s) could not rejoin the gather (out of memory) — the next mount's sweep destroys them", .{inos_.len});
+                return;
             };
+            self.noteCorpsesPending(inos_.len);
         }
 
         /// One warning per episode; every deferral counted.
@@ -10690,6 +10757,47 @@ test "a FORGET that fills the corpse gather destroys nothing on the forgetting t
     try testing.expectEqual(commits1 + 2, h.store.commits);
     try testing.expectEqual(inodes0, h.store.countKind(key.TREE_INODES));
     try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
+}
+
+test "the corpse gather is the data plane's upstream supply (decision 0003 §CR): pending from the gather until the pass that destroys it returns, a corpse the full heap defers still pending; the kick wakes the cadence once and its drain takes the tail under a batch before the tick" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const up = h.fs.corpseUpstream();
+    try testing.expect(!up.pending(up.ctx));
+    const inodes0 = h.store.countKind(key.TREE_INODES);
+    var name_buf: [16]u8 = undefined;
+    for (0..3) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "k{d}", .{i});
+        const ino = try h.create(1, name, 0o644);
+        try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = name } }, 1).errno());
+        h.release(ino);
+        h.forget(ino, 1);
+    }
+    try testing.expectEqual(@as(usize, 3), h.fs.reclaim.items.len);
+    try testing.expect(up.pending(up.ctx));
+    try testing.expectEqual(@as(u64, 3), fuse_reclaim_gathered.load());
+    // The kick: the cadence's permit stands, the flag consumed once.
+    up.kick(up.ctx);
+    up.kick(up.ctx);
+    var wake = h.fs.reclaim_wake.notified();
+    try testing.expect(wake.enable(testing.io));
+    try testing.expect(h.fs.takeCorpseKick());
+    try testing.expect(!h.fs.takeCorpseKick());
+    var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
+    var win: [16]u8 = undefined;
+    var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
+    // The full-batch drain leaves the tail; the kicked drain takes it.
+    try h.fs.reclaimDrainFull(&c);
+    try testing.expect(up.pending(up.ctx));
+    const kicked0 = fuse_reclaim_kicked_drains.load();
+    try h.fs.reclaimDrainKicked(&c);
+    tr.finish();
+    try testing.expectEqual(kicked0 + 1, fuse_reclaim_kicked_drains.load());
+    try testing.expectEqual(inodes0, h.store.countKind(key.TREE_INODES));
+    try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
+    try testing.expect(!up.pending(up.ctx));
+    try testing.expectEqual(@as(u64, 0), fuse_reclaim_gathered.load());
 }
 
 test "the corpse sweep at mount: an unlinked file whose FORGET died with the daemon (nlink 0, no dentry) is destroyed by the next mount's sweep with its layout; live files are untouched; a clean store sweeps nothing" {

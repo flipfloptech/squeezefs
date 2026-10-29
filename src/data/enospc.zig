@@ -278,6 +278,10 @@ pub const Valve = struct {
         const V = struct {
             fn drain(ctx: *anyopaque, io: Io) u64 {
                 const rr: *reclaim.Reclaimer = @ptrCast(@alignCast(ctx));
+                // A delete's corpses gathered upstream: their destroy starts
+                // now, their frees join the hold this drain forces (a later
+                // pass, the park's next slice, sees them).
+                rr.kickUpstream();
                 return rr.drainSync(io);
             }
             fn finished(ctx: *anyopaque) u64 {

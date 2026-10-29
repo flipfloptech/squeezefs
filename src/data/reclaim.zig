@@ -492,11 +492,15 @@ pub const stats = struct {
     pub var block_free_durable_releases: counters.ShardedCounter = .{};
     pub var block_free_durable_forced: counters.ShardedCounter = .{};
     pub var block_free_durable_held: counters.Gauge = .{};
+    /// The ENOSPC valve found frees gathered UPSTREAM of the hold (a
+    /// filesystem's corpses awaiting their destroy, `Upstream`) and kicked
+    /// their destroy.
+    pub var block_free_upstream_kicks: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "terminal_frees", "block_free_reclaim_queued", "block_free_reclaim_elided", "block_free_discards", "block_free_discard_bytes", "block_free_file_punches", "block_free_punch_bytes", "block_free_reclaim_skipped", "block_free_reclaim_batches", "block_free_reclaim_commands", "block_free_reclaim_sync_drains", "block_free_reclaim_cap_parks", "block_free_reclaim_cap_overflow", "block_free_reclaim_supply_drains", "block_free_reclaim_deferred_ticks", "block_free_trim_discards", "block_free_trim_bytes", "block_free_debt_pressure_drains", "block_free_debt_drain_passes", "block_free_debt_fruitless_passes", "block_free_reclaim_fence_halts", "block_free_durable_holds", "block_free_durable_releases", "block_free_durable_forced" }) |name| {
+    inline for (.{ "terminal_frees", "block_free_reclaim_queued", "block_free_reclaim_elided", "block_free_discards", "block_free_discard_bytes", "block_free_file_punches", "block_free_punch_bytes", "block_free_reclaim_skipped", "block_free_reclaim_batches", "block_free_reclaim_commands", "block_free_reclaim_sync_drains", "block_free_reclaim_cap_parks", "block_free_reclaim_cap_overflow", "block_free_reclaim_supply_drains", "block_free_reclaim_deferred_ticks", "block_free_trim_discards", "block_free_trim_bytes", "block_free_debt_pressure_drains", "block_free_debt_drain_passes", "block_free_debt_fruitless_passes", "block_free_reclaim_fence_halts", "block_free_durable_holds", "block_free_durable_releases", "block_free_durable_forced", "block_free_upstream_kicks" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "block_free_reclaim_queue_bytes", "block_free_elided_debt_bytes", "block_free_reclaim_drain_rate", "block_free_reclaim_arrival_rate", "block_free_reclaim_queue_cap", "block_free_reclaim_park_bound_ms", "block_free_debt_drain_rate", "block_free_debt_pace_ms", "block_free_durable_held" }) |name| {
@@ -666,6 +670,8 @@ pub const Reclaimer = struct {
     hold_sealed: std.ArrayList(Held) = .empty,
     /// Both lists' population (the valve's and the parks' supply in sight).
     held: Atomic(u64) = .init(0),
+    /// Frees gathered upstream of the hold (`Upstream`); null = none bound.
+    upstream: Atomic(?*const Upstream) = .init(null),
 
     pub fn init(gpa: Allocator, cfg: Config) Allocator.Error!*Reclaimer {
         const self = try gpa.create(Reclaimer);
@@ -1124,9 +1130,44 @@ pub const Reclaimer = struct {
         self.dismounted.store(true, .release);
     }
 
-    /// `!fence_halted ∧ (len > 0 ∨ processing > 0 ∨ held > 0)`.
+    /// `!fence_halted ∧ (len > 0 ∨ processing > 0 ∨ held > 0 ∨ upstream)`.
     pub fn pending(self: *Reclaimer) bool {
-        return !self.fenceHalted() and (self.len.load(.acquire) > 0 or self.processing.load(.acquire) > 0 or self.held.load(.acquire) > 0);
+        return !self.fenceHalted() and (self.len.load(.acquire) > 0 or self.processing.load(.acquire) > 0 or self.held.load(.acquire) > 0 or self.upstreamPending());
+    }
+
+    /// Frees on their way to this reclaimer that no word here counts yet:
+    /// the filesystem's corpse gather — unlinked files whose destroy waits
+    /// for a full batch or the reclaim tick (`kv_fs.gatherCorpse`, up to
+    /// one 5 s tick). They are supply in sight: `pending` sees them (the
+    /// latch stays inert, a `.visible_supply` mint parks), and the ENOSPC
+    /// valve kicks their destroy before it judges — a full store never
+    /// answers ENOSPC while a delete's blocks wait for a tick (the perf
+    /// matrix's `rm` + lay-down: three of four reservations refused with
+    /// the rm's 64 blocks gathered). The kick never waits: the destroy
+    /// runs on the filesystem's own fiber, and its frees enter the hold.
+    pub const Upstream = struct {
+        ctx: *anyopaque,
+        pending: *const fn (*anyopaque) bool,
+        kick: *const fn (*anyopaque) void,
+    };
+
+    /// Bound once the filesystem is up, unbound before it is torn down
+    /// (the mount's serve path).
+    pub fn bindUpstream(self: *Reclaimer, u: ?*const Upstream) void {
+        self.upstream.store(u, .release);
+    }
+
+    fn upstreamPending(self: *Reclaimer) bool {
+        const u = self.upstream.load(.acquire) orelse return false;
+        return u.pending(u.ctx);
+    }
+
+    /// The valve's first act: a gathered upstream's destroy, kicked.
+    pub fn kickUpstream(self: *Reclaimer) void {
+        const u = self.upstream.load(.acquire) orelse return;
+        if (!u.pending(u.ctx)) return;
+        stats.block_free_upstream_kicks.inc();
+        u.kick(u.ctx);
     }
 
     pub fn finishedTotal(self: *const Reclaimer) u64 {
@@ -2161,6 +2202,84 @@ test "a full store whose frees wait for their records' barrier never answers ENO
     // With nothing held the valve's verdict stands: terminal, no barrier.
     try testing.expectError(error.StorageFull, enospc.allocateWithValve(f.alloc, io, enospc.Valve.fromReclaimer(f.r)));
     try testing.expectEqual(@as(u64, 1), g.forces);
+}
+
+/// A filesystem's corpse gather as the reclaimer's upstream: `kick` hands
+/// the destroy to another thread (the cadence's fiber in the product),
+/// which frees `idx` through the reclaimer and empties the gather.
+const FakeGather = struct {
+    r: *Reclaimer,
+    alloc: *BlockAllocator,
+    idx: ?u64,
+    gathered: Atomic(bool) = .init(true),
+    kicked: Atomic(bool) = .init(false),
+    kicks: Atomic(u32) = .init(0),
+
+    fn upstream(self: *FakeGather) Reclaimer.Upstream {
+        return .{ .ctx = self, .pending = &pending, .kick = &kick };
+    }
+
+    fn pending(ctx: *anyopaque) bool {
+        const self: *FakeGather = @ptrCast(@alignCast(ctx));
+        return self.gathered.load(.acquire);
+    }
+
+    fn kick(ctx: *anyopaque) void {
+        const self: *FakeGather = @ptrCast(@alignCast(ctx));
+        _ = self.kicks.fetchAdd(1, .acq_rel);
+        self.kicked.store(true, .release);
+    }
+
+    /// The destroy: once kicked, the corpse's block freed (into the hold),
+    /// then the gather empty — a pass's frees precede its corpses leaving
+    /// the count (`kv_fs.drainGather`).
+    fn destroyer(self: *FakeGather) void {
+        while (!self.kicked.load(.acquire)) std.atomic.spinLoopHint();
+        if (self.idx) |idx| _ = self.r.freeBlock(testing.io, 0, idx, self.alloc.stampOf(idx));
+        self.gathered.store(false, .release);
+    }
+};
+
+test "a full store with a delete's corpses gathered UPSTREAM of the hold never answers ENOSPC (decision 0003 §CR): the gather is supply in sight — the latch stays inert, the valve kicks the destroy, a `.visible_supply` mint parks until its frees land and mints the freed block; a gather whose destroy frees nothing is judged at the wall; nothing upstream ⇒ terminal at once" {
+    const io = testing.io;
+    const enospc = @import("enospc.zig");
+    var f = try Fixture.init(.{ .budget_bytes = test_budget, .batch_ms = 0 }, .bdev_discard, 8);
+    defer f.deinit();
+    var g: FakeGate = .{};
+    f.r.setDurableGate(g.gate());
+    try f.mintPublished(8);
+    try testing.expectError(error.StorageFull, f.alloc.allocateBlock());
+    try testing.expect(f.alloc.freshSupplyExhausted());
+    // The rm's corpse holds block 6; its destroy waits for the tick.
+    g.hwm = 3;
+    var gather: FakeGather = .{ .r = f.r, .alloc = f.alloc, .idx = 6 };
+    const up = gather.upstream();
+    f.r.bindUpstream(&up);
+    defer f.r.bindUpstream(null);
+    try testing.expect(f.r.pending());
+    try testing.expect(!f.alloc.freshSupplyExhausted()); // inert: supply in sight
+    const kicks0 = stats.block_free_upstream_kicks.load();
+    const t = try std.Thread.spawn(.{}, FakeGather.destroyer, .{&gather});
+    const m = try enospc.allocateBlockGraceBounded(f.alloc, io, enospc.Valve.fromReclaimer(f.r), .visible_supply, null);
+    t.join();
+    try testing.expectEqual(@as(u64, 6), m.idx);
+    f.alloc.publishBlock(6);
+    try testing.expect(gather.kicks.load(.acquire) >= 1);
+    try testing.expect(stats.block_free_upstream_kicks.load() > kicks0);
+    try testing.expect(!f.r.pending());
+    // A gather whose destroy frees nothing (an inline file's corpse): the
+    // park is the wall's, then the loud refusal.
+    log.testing.expectErrorLogs(1);
+    var empty: FakeGather = .{ .r = f.r, .alloc = f.alloc, .idx = null };
+    empty.kicked.store(true, .release);
+    const up2 = empty.upstream();
+    f.r.bindUpstream(&up2);
+    try testing.expectError(error.StorageFull, enospc.allocateBlockGraceBounded(f.alloc, io, enospc.Valve.fromReclaimer(f.r), .visible_supply, null));
+    try log.testing.expectAllFired();
+    // Nothing upstream: terminal at once.
+    f.r.bindUpstream(null);
+    try testing.expectError(error.StorageFull, enospc.allocateBlockGraceBounded(f.alloc, io, enospc.Valve.fromReclaimer(f.r), .visible_supply, null));
+    try testing.expect(f.alloc.freshSupplyExhausted());
 }
 
 test "trim_drains_debt_with_counted_commands_and_returns_offsets; stale debt never discards an owned block; a fenced daemon never trims" {

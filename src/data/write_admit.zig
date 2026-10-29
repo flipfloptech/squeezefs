@@ -2311,6 +2311,81 @@ test "the fallocate reservation under a FULL store: a write inside the reservati
     try testing.expectEqual(@as(u32, 1), r.reserved);
 }
 
+test "the fallocate'd lay-down through the device overlay (the perf matrix's fio lay-down, decision 0003 §CR): an overlay piece into a sole-owned RESERVATION lands in the reserved block itself — no fresh mint, the allocator's census never above the reservation — and its settle flips the flag (the same reference, no ±ref, no free, no epoch); a record settled partial seeds its gap with zeros IN the reserved block (never its previous owner's bytes); a clone-shared reservation keeps the fresh-mint path" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, true);
+    defer w.deinit(testing.allocator);
+    const drift0 = counters.tripwireCount("rewrite_shadow_displaced_drift");
+    try w.f.map.create(90, .striped, 3 * wt.BS);
+    _ = try w.wp.reserveRange(io, 90, 0, 2, false);
+    const used = struct {
+        fn of(x: *World) u64 {
+            return x.f.alloc_a.usedBlocks() + x.f.alloc_b.usedBlocks();
+        }
+    }.of;
+    const used0 = used(w);
+    const added0 = w.f.map.refs_added;
+    const seam = w.f.map.seam();
+    const r0 = seam.reserved(90, 0).?;
+    const r1 = seam.reserved(90, 1).?;
+    const r2 = seam.reserved(90, 2).?;
+    // A recycled block's previous owner left its bytes in every reservation.
+    const stale: [wt.BS]u8 = @splat(0xEE);
+    for ([_]Binding{ r0, r1, r2 }) |r| _ = try w.f.dev.seam().write(r.vol_tag, r.offset, &stale);
+    // Block 0: two O_DIRECT halves, each the overlay's.
+    var first: [wt.BS / 2]u8 align(4096) = undefined;
+    fill(&first, 0x11);
+    var second: [wt.BS / 2]u8 align(4096) = undefined;
+    fill(&second, 0x77);
+    const o1 = try w.wp.write(io, .{ .ino = 90, .offset = 0, .payload = .{ .bytes = &first }, .class = .shared, .file = World.striped(3 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o1.count(.overlay));
+    try testing.expectEqual(used0, used(w)); // no second block
+    const o2 = try w.wp.write(io, .{ .ino = 90, .offset = wt.BS / 2, .payload = .{ .bytes = &second }, .class = .shared, .file = World.striped(3 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o2.count(.overlay));
+    try testing.expectEqual(used0, used(w));
+    w.wp.overlay.drainBlock(io, &w.wp.locks, 90, 0, false, w.wp.closeSeams());
+    try testing.expect(!w.wp.epochs.bindsBlock(90, 0));
+    const b0 = seam.lookup(90, 0).?;
+    try testing.expect(!b0.unwritten and b0.sameRef(r0, wt.BS));
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(b0.vol_tag, b0.offset, &got);
+    try testing.expectEqualSlices(u8, &first, got[0 .. wt.BS / 2]);
+    try testing.expectEqualSlices(u8, &second, got[wt.BS / 2 ..]);
+    // Block 1: one half, then the write-back timer's drain settles the
+    // record partial — its gap seeded with zeros in the reserved block.
+    const o3 = try w.wp.write(io, .{ .ino = 90, .offset = wt.BS, .payload = .{ .bytes = &first }, .class = .shared, .file = World.striped(3 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o3.count(.overlay));
+    w.wp.overlay.drainBlock(io, &w.wp.locks, 90, 1, false, w.wp.closeSeams());
+    try testing.expect(!w.wp.epochs.bindsBlock(90, 1));
+    const b1 = seam.lookup(90, 1).?;
+    try testing.expect(!b1.unwritten and b1.sameRef(r1, wt.BS));
+    w.f.dev.peek(b1.vol_tag, b1.offset, &got);
+    try testing.expectEqualSlices(u8, &first, got[0 .. wt.BS / 2]);
+    try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..], 0));
+    try testing.expectEqual(used0, used(w));
+    try testing.expectEqual(added0, w.f.map.refs_added);
+    try testing.expectEqual(@as(u64, 0), w.f.map.refs_released);
+    try testing.expectEqual(@as(usize, 0), w.f.frees.freed.items.len);
+    // Block 2's reservation is shared by a clone: the record mints fresh,
+    // and the save displaces the reservation (the clone's share stands).
+    const on_a = r2.vol_tag == wt.VOL_A;
+    const alloc2 = if (on_a) w.f.alloc_a else w.f.alloc_b;
+    try testing.expect(alloc2.incrementRefcount(alloc2.idxOf(r2.offset)));
+    var whole: [wt.BS]u8 align(4096) = undefined;
+    fill(&whole, 0x33);
+    const o4 = try w.wp.write(io, .{ .ino = 90, .offset = 2 * wt.BS, .payload = .{ .bytes = &whole }, .class = .shared, .file = World.striped(3 * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o4.count(.overlay));
+    try testing.expectEqual(used0 + 1, used(w));
+    w.wp.flushIno(io, 90);
+    const b2 = seam.lookup(90, 2).?;
+    try testing.expect(!b2.sameRef(r2, wt.BS));
+    w.f.dev.peek(b2.vol_tag, b2.offset, &got);
+    try testing.expectEqualSlices(u8, &whole, &got);
+    try testing.expectEqual(@as(usize, 1), w.f.frees.freed.items.len);
+    try testing.expect(w.f.frees.freed.items[0].sameRef(r2, wt.BS));
+    try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
+}
+
 test "the per-piece ladder (the accumulation control arm, overlay off): out-of-order O_DIRECT-style pieces of one block complete the coverage union and write through once; a partial tail parks; W2 parks a small non-adjacent write compactly and escalates at 25 %; the shared-mode handoff trips on an extending Shared write" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, false);

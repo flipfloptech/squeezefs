@@ -3488,6 +3488,151 @@ test "the save window: while an epoch's ONE save is in flight the block stays bo
     try testing.expectEqual(@as(u64, 2), w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks());
 }
 
+/// The closer of the reader-order rows: the ino's epoch save lands from
+/// inside a map read's window (`wt.ReadHook`), as another thread's save
+/// does while a writer holds the block guard — or, when no read of the
+/// block's binding precedes the writer's epoch probe (the law's order), at
+/// `settle`, before the drain (a writer's own close may have landed it
+/// first). With `realloc` set, the reservation the save freed is minted at
+/// once by another owner who writes `0xCC` over it.
+const SaveLands = struct {
+    var wp: *WritePath = undefined;
+    var map: *wt.RamMap = undefined;
+    var ino: u64 = 0;
+    var realloc: ?Binding = null;
+    var landed: bool = false;
+
+    fn hook(_: *anyopaque, _: *wt.RamMap) void {
+        land();
+    }
+
+    fn land() void {
+        landed = true;
+        _ = wp.epochs.close(testing.io, ino, wp.closeSeams());
+        const r = realloc orelse return;
+        const v = wp.vols.byTag(r.vol_tag).?;
+        const idx = (v.alloc.allocateBlockBelow(v.alloc.idxOf(r.offset) + 1) catch unreachable).?;
+        std.debug.assert(idx == v.alloc.idxOf(r.offset));
+        v.alloc.publishBlock(idx);
+        const theirs: [wt.BS]u8 = @splat(0xCC);
+        _ = wp.device.write(r.vol_tag, r.offset, &theirs) catch unreachable;
+    }
+
+    fn arm(w: *World, i: u64, block: u32, read: @FieldType(wt.ReadHook, "read"), r: ?Binding) void {
+        wp = w.wp;
+        map = &w.f.map;
+        ino = i;
+        realloc = r;
+        landed = false;
+        w.f.map.after_read = .{ .ino = i, .block = block, .read = read, .ctx = w, .call = &hook };
+    }
+
+    fn settle() void {
+        map.after_read = null;
+        if (!landed) land();
+    }
+
+    /// Every key freed at most once, `key` among them exactly once.
+    fn freedOnce(frees: []const Binding, key: Binding) !void {
+        var n: usize = 0;
+        for (frees, 0..) |f, i| {
+            if (f.eql(key)) n += 1;
+            for (frees[i + 1 ..]) |g| try testing.expect(!f.eql(g));
+        }
+        try testing.expectEqual(@as(usize, 1), n);
+    }
+};
+
+test "a save landing between a piece's map read and the overlay's epoch screen (the perf matrix's lay-down, 2026-10-28): the record over the block the save just published is never a Hole record — the piece's untouched half reads the first write's bytes, never a zero seed; every save displaces what it parked (drift 0), every key freed once" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, true);
+    defer w.deinit(testing.allocator);
+    const drift0 = counters.tripwireCount("rewrite_shadow_displaced_drift");
+    const untracked0 = counters.tripwireCount("block_untracked_free_refusals");
+    // fio's lay-down: the file fallocate'd whole (block 0 RESERVED), then
+    // written in O_DIRECT pieces; two halves here.
+    try w.f.map.create(80, .striped, wt.BS);
+    _ = try w.wp.reserveRange(io, 80, 0, 0, false);
+    const r = w.f.map.bindingAt(80, 0).?;
+    try testing.expect(r.unwritten);
+    var first: [wt.BS / 2]u8 align(4096) = undefined;
+    fill(&first, 0x11);
+    var second: [wt.BS / 2]u8 align(4096) = undefined;
+    fill(&second, 0x77);
+    // The first half lands on a Hole record over the reservation, and the
+    // write-back timer settles the record partial: its gap seeded with
+    // zeros, its dest fed to the epoch (R parked).
+    const o1 = try w.wp.write(io, .{ .ino = 80, .offset = 0, .payload = .{ .bytes = &first }, .class = .shared, .file = World.striped(wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o1.count(.overlay));
+    w.wp.overlay.drainBlock(io, &w.wp.locks, 80, 0, false, w.wp.closeSeams());
+    try testing.expect(w.wp.epochs.bindsBlock(80, 0));
+    // The second half: the epoch's save lands right after the writer's
+    // first read of the block's binding.
+    SaveLands.arm(w, 80, 0, .lookup, null);
+    _ = try w.wp.write(io, .{ .ino = 80, .offset = wt.BS / 2, .payload = .{ .bytes = &second }, .class = .shared, .file = World.striped(wt.BS) });
+    SaveLands.settle();
+    w.wp.flushIno(io, 80);
+    try testing.expectEqual(@as(usize, 0), w.wp.epochs.openCount());
+    try testing.expect(!w.wp.epochs.holds(80));
+    const final = w.f.map.bindingAt(80, 0).?;
+    try testing.expect(!final.unwritten);
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(final.vol_tag, final.offset, &got);
+    try testing.expectEqualSlices(u8, &first, got[0 .. wt.BS / 2]);
+    try testing.expectEqualSlices(u8, &second, got[wt.BS / 2 ..]);
+    try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
+    try testing.expectEqual(untracked0, counters.tripwireCount("block_untracked_free_refusals"));
+    try SaveLands.freedOnce(w.f.frees.freed.items, r);
+    for (w.f.frees.freed.items) |f| try testing.expect(!f.sameRef(final, wt.BS));
+    try testing.expectEqual(@as(u64, 1), w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks());
+}
+
+test "a save landing between an upload's reservation read and its epoch probe: the landing never takes over the reservation the save freed (another owner minted it since) and no record parks it — the other owner's block keeps its bytes and its one reference, drift 0, every key freed once" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const drift0 = counters.tripwireCount("rewrite_shadow_displaced_drift");
+    const untracked0 = counters.tripwireCount("block_untracked_free_refusals");
+    try w.f.map.create(81, .striped, wt.BS);
+    _ = try w.wp.reserveRange(io, 81, 0, 0, false);
+    const r = w.f.map.bindingAt(81, 0).?;
+    const r_alloc = w.f.vols.byTag(r.vol_tag).?.alloc;
+    const r_idx = r_alloc.idxOf(r.offset);
+    // An epoch shadows block 0 with D1 (a landed partial image), R parked.
+    var img: [wt.BS]u8 = undefined;
+    fill(&img, 0x31);
+    const m = try w.f.alloc_a.allocateBlock();
+    const proof = try w.f.dev.seam().write(wt.VOL_A, m.offset, &img);
+    w.f.alloc_a.publishBlock(m.idx);
+    const d1 = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+    _ = try w.wp.epochs.record(81, 0, r, d1, proof, wt.BS, block_alloc.InflightAllocGuard.register(w.f.alloc_a, m.idx), true);
+    // A whole-block write lands (the accumulation arm's write-through); the
+    // epoch's save lands right after its upload first reads the block's
+    // reservation, and R is minted to another owner at once.
+    SaveLands.arm(w, 81, 0, .reserved, r);
+    var p: [wt.BS]u8 align(4096) = undefined;
+    fill(&p, 0x55);
+    _ = try w.wp.write(io, .{ .ino = 81, .offset = 0, .payload = .{ .bytes = &p }, .class = .shared, .file = World.striped(wt.BS) });
+    SaveLands.settle();
+    w.wp.flushIno(io, 81);
+    try testing.expectEqual(@as(usize, 0), w.wp.epochs.openCount());
+    try testing.expect(!w.wp.epochs.holds(81));
+    // The other owner's block: its bytes, its one reference.
+    var theirs: [wt.BS]u8 = undefined;
+    w.f.dev.peek(r.vol_tag, r.offset, &theirs);
+    try testing.expect(std.mem.allEqual(u8, &theirs, 0xCC));
+    try testing.expectEqual(@as(?u32, 1), r_alloc.refcount(r_idx));
+    const final = w.f.map.bindingAt(81, 0).?;
+    try testing.expect(!final.sameRef(r, wt.BS));
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(final.vol_tag, final.offset, &got);
+    try testing.expectEqualSlices(u8, &p, &got);
+    try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
+    try testing.expectEqual(untracked0, counters.tripwireCount("block_untracked_free_refusals"));
+    try SaveLands.freedOnce(w.f.frees.freed.items, r);
+    try SaveLands.freedOnce(w.f.frees.freed.items, d1);
+}
+
 test "the one-authority screen never parks under (3): a write meeting an overlay record whose settle keeps failing drops the block guard for the settle's ladder (a sibling takes the guard mid-ladder) and restarts its ladder once the record landed — the write acks, the record fed to the epoch whose save publishes it" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, true);

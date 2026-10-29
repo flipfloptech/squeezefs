@@ -236,6 +236,18 @@ pub const MergeHook = struct {
     call: *const fn (ctx: *anyopaque, map: *RamMap) void,
 };
 
+/// Runs ONCE right after the next `read` of `(ino, block)` answered, its
+/// lock released — the window between an arm's map read and its next step,
+/// where another thread's save lands (a save runs under no block guard; the
+/// hook may merge: it is disarmed first).
+pub const ReadHook = struct {
+    ino: u64,
+    block: u32,
+    read: enum { lookup, reserved },
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, map: *RamMap) void,
+};
+
 pub const RamMap = struct {
     gpa: Allocator,
     chunk: u64 = BS,
@@ -249,6 +261,7 @@ pub const RamMap = struct {
     /// Order of merges against the device trace (an fsync's DUR-1 pin).
     on_merge: ?*const fn (*RamMap) void = null,
     before_merge: ?MergeHook = null,
+    after_read: ?ReadHook = null,
     /// The product merge's law (decision 0003 §AH.1): every displaced
     /// binding held in flight from before the publish, the outcome carrying
     /// the holds for the caller to drop after its frees. Null = none.
@@ -325,6 +338,12 @@ pub const RamMap = struct {
     /// The product's law: a reservation is a hole to `lookup`.
     fn lookup(ctx: *anyopaque, ino: u64, block: u32) ?Binding {
         const self: *RamMap = @ptrCast(@alignCast(ctx));
+        const m = self.lookupLocked(ino, block);
+        self.afterRead(ino, block, .lookup);
+        return m;
+    }
+
+    fn lookupLocked(self: *RamMap, ino: u64, block: u32) ?Binding {
         self.lock.lockUncancelable(std.testing.io);
         defer self.lock.unlock(std.testing.io);
         if (self.fault_lookups != 0 and ino == self.fault_ino) {
@@ -339,11 +358,22 @@ pub const RamMap = struct {
 
     fn reserved(ctx: *anyopaque, ino: u64, block: u32) ?Binding {
         const self: *RamMap = @ptrCast(@alignCast(ctx));
-        self.lock.lockUncancelable(std.testing.io);
-        defer self.lock.unlock(std.testing.io);
-        const f = self.files.get(ino) orelse return null;
-        const m = f.map.get(block) orelse return null;
-        return if (m.unwritten) m else null;
+        const m = blk: {
+            self.lock.lockUncancelable(std.testing.io);
+            defer self.lock.unlock(std.testing.io);
+            const f = self.files.get(ino) orelse break :blk null;
+            const x = f.map.get(block) orelse break :blk null;
+            break :blk if (x.unwritten) x else null;
+        };
+        self.afterRead(ino, block, .reserved);
+        return m;
+    }
+
+    fn afterRead(self: *RamMap, ino: u64, block: u32, read: @FieldType(ReadHook, "read")) void {
+        const h = self.after_read orelse return;
+        if (h.ino != ino or h.block != block or h.read != read) return;
+        self.after_read = null;
+        h.call(h.ctx, self);
     }
 
     /// The raw binding at `block`, flag and all (a test's oracle).

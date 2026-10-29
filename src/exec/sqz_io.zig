@@ -97,6 +97,24 @@ pub fn fuseCapacity(geometry: FuseGeometry, fuse_lanes: u32) u32 {
     return @intCast(geometry.q_depth * derive.ceilDiv(geometry.nqueues, @max(fuse_lanes, 1)) + spawn_slack);
 }
 
+/// The optional fan-out (`Io.async`, `Io.Group.async`) a FUSE lane holds at
+/// once (`Lane.spawnOptional`), on top of `fuseCapacity`: one fiber per CPU
+/// — the widest such fan-out the product starts is a bulk promotion pass
+/// (`DataPlane.promotionPassWidth`, one per CPU), started by a handler on
+/// its own lane; past it the fan-out runs inline (`async`'s contract), so
+/// it never holds the fibers the lane keeps for its slots' handlers
+/// (rung-10-open-count-stranded: 32 members per pass took them and the
+/// transport answered a RELEASE EAGAIN).
+pub fn fanoutSlack(cpus: u32) u32 {
+    return @max(1, cpus);
+}
+
+/// A FUSE lane's population: its slots' handlers, its helpers' slack and
+/// the optional fan-out's (`fuseCapacity` + `fanoutSlack`).
+pub fn fuseLaneCapacity(geometry: FuseGeometry, fuse_lanes: u32, cpus: u32) u32 {
+    return fuseCapacity(geometry, fuse_lanes) + fanoutSlack(cpus);
+}
+
 pub const Options = struct {
     /// The process environment (knobs); null = an empty map owned here.
     env: ?*const std.process.Environ.Map = null,
@@ -295,12 +313,15 @@ pub const SqzIo = struct {
             const home: u16 = @intCast(cpu);
             const node = self.topo.node_of[cpu];
             const stack_size = fiber_mod.stackSizeFor(.fuse, page);
+            const capacity = capacityFromBudget(fuseLaneCapacity(options.fuse.?, fuse_count, self.facts.cpus), options.budget_bytes, stack_size);
             lanes[built] = try Lane.init(gpa, .{
                 .index = i,
                 .class = .fuse,
                 .home_cpu = home,
                 .node = if (node == placement.no_node) null else node,
-                .fiber_capacity = capacityFromBudget(fuseCapacity(options.fuse.?, fuse_count), options.budget_bytes, stack_size),
+                .fiber_capacity = capacity,
+                // A budget clamp shrinks the fan-out's share first.
+                .optional_cap = @min(fanoutSlack(self.facts.cpus), capacity -| fuseCapacity(options.fuse.?, fuse_count)),
                 .stack_size = stack_size,
                 .page = page,
                 .affinity = if (self.config.numa) placement.scopedAffinityCpus(self.config.scope, home, lane_cpus, &self.topo) else null,
@@ -779,8 +800,9 @@ pub const SqzIo = struct {
         base_vtable.crashHandler(userdata);
     }
 
-    fn spawnFuture(self: *SqzIo, context: []const u8, start: *const fn (*const anyopaque, *anyopaque) void) Io.ConcurrentError!*Fiber {
+    fn spawnFuture(self: *SqzIo, context: []const u8, start: *const fn (*const anyopaque, *anyopaque) void, optional: bool) Io.ConcurrentError!*Fiber {
         const lane = self.pickLane() orelse abortAllDead("meta");
+        if (optional) return lane.spawnOptional(.future, .{ .future = start }, context, null, .unblocked);
         return lane.spawn(.future, .{ .future = start }, context, null, .unblocked);
     }
 
@@ -790,7 +812,7 @@ pub const SqzIo = struct {
             start(context.ptr, result.ptr);
             return null;
         }
-        const f = self.spawnFuture(context, start) catch {
+        const f = self.spawnFuture(context, start, true) catch {
             // `async` may run inline: the result is populated, `await` is a no-op.
             start(context.ptr, result.ptr);
             return null;
@@ -805,7 +827,7 @@ pub const SqzIo = struct {
         assert(context.len <= fiber_mod.max_context_size);
         assert(result_alignment.compare(.lte, fiber_mod.max_result_align));
         assert(context_alignment.compare(.lte, fiber_mod.max_context_align));
-        return @ptrCast(try self.spawnFuture(context, start));
+        return @ptrCast(try self.spawnFuture(context, start, false));
     }
 
     /// Park until `f` published its result: a fiber awaiter registers
@@ -846,10 +868,11 @@ pub const SqzIo = struct {
         await(userdata, any_future, result, result_alignment);
     }
 
-    fn spawnGroupMember(self: *SqzIo, g: *Io.Group, context: []const u8, start: *const fn (*const anyopaque) void) Io.ConcurrentError!void {
+    fn spawnGroupMember(self: *SqzIo, g: *Io.Group, context: []const u8, start: *const fn (*const anyopaque) void, optional: bool) Io.ConcurrentError!void {
         const lane = self.pickLane() orelse abortAllDead("meta");
         group_mod.addMember(g);
-        _ = lane.spawn(.group, .{ .group = start }, context, g, .unblocked) catch |err| {
+        const spawned = if (optional) lane.spawnOptional(.group, .{ .group = start }, context, g, .unblocked) else lane.spawn(.group, .{ .group = start }, context, g, .unblocked);
+        _ = spawned catch |err| {
             group_mod.removeMember(g);
             return err;
         };
@@ -858,14 +881,14 @@ pub const SqzIo = struct {
     fn groupAsync(userdata: ?*anyopaque, g: *Io.Group, context: []const u8, context_alignment: Alignment, start: *const fn (*const anyopaque) void) void {
         const self = ownerOf(userdata);
         if (context.len > fiber_mod.max_context_size or context_alignment.compare(.gt, fiber_mod.max_context_align)) return start(context.ptr);
-        self.spawnGroupMember(g, context, start) catch start(context.ptr);
+        self.spawnGroupMember(g, context, start, true) catch start(context.ptr);
     }
 
     fn groupConcurrent(userdata: ?*anyopaque, g: *Io.Group, context: []const u8, context_alignment: Alignment, start: *const fn (*const anyopaque) void) Io.ConcurrentError!void {
         const self = ownerOf(userdata);
         assert(context.len <= fiber_mod.max_context_size);
         assert(context_alignment.compare(.lte, fiber_mod.max_context_align));
-        return self.spawnGroupMember(g, context, start);
+        return self.spawnGroupMember(g, context, start, false);
     }
 
     fn groupAwait(userdata: ?*anyopaque, g: *Io.Group, token: *anyopaque) Io.Cancelable!void {
@@ -1172,6 +1195,11 @@ fn waitQuiescent(sqz: *SqzIo) void {
 test "capacity derivations: the fuse formula from the geometry, the budget eighth, the meta default" {
     try testing.expectEqual(@as(u32, 32 * 2 + spawn_slack), fuseCapacity(.{ .nqueues = 8, .q_depth = 32 }, 4));
     try testing.expectEqual(@as(u32, 4 * 1 + spawn_slack), fuseCapacity(.{ .nqueues = 4, .q_depth = 4 }, 4));
+    // The optional fan-out's share: one per CPU (a bulk promotion pass's
+    // width), at least one; a FUSE lane holds it beside the slots and slack.
+    try testing.expectEqual(@as(u32, 32), fanoutSlack(32));
+    try testing.expectEqual(@as(u32, 1), fanoutSlack(0));
+    try testing.expectEqual(@as(u32, 32 * 2 + spawn_slack + 8), fuseLaneCapacity(.{ .nqueues = 8, .q_depth = 32 }, 4, 8));
     // 1 GiB / 8 / 1 MiB = 128 < 256 requested.
     try testing.expectEqual(@as(u32, 128), capacityFromBudget(256, derive.GiB, derive.MiB));
     try testing.expectEqual(@as(u32, 64), capacityFromBudget(64, derive.GiB, derive.MiB));
@@ -1180,22 +1208,22 @@ test "capacity derivations: the fuse formula from the geometry, the budget eight
     try testing.expectEqual(@as(u32, 256), meta_capacity_default);
 }
 
-test "the stack reserve of the venue's population is the per-lane in-flight ceilings summed: 9 queues × depth 32 on 9 lanes = 9 × (32 + slack) fuse slots, 2 × 256 meta, 16 main (+16 lease); the reserve is virtual, the gauge counts what the kernel may hold" {
+test "the stack reserve of the venue's population is the per-lane in-flight ceilings summed: 9 queues × depth 32 on 9 lanes of 9 CPUs = 9 × (32 + slack + 9 fan-out) fuse slots, 2 × 256 meta, 16 main (+16 lease); the reserve is virtual, the gauge counts what the kernel may hold" {
     const page: usize = 4096;
     const fuse_lanes: u32 = 9;
-    const fuse_slots = fuse_lanes * fuseCapacity(.{ .nqueues = 9, .q_depth = 32 }, fuse_lanes);
-    try testing.expectEqual(@as(u32, 9 * 48), fuse_slots);
+    const fuse_slots = fuse_lanes * fuseLaneCapacity(.{ .nqueues = 9, .q_depth = 32 }, fuse_lanes, 9);
+    try testing.expectEqual(@as(u32, 9 * 57), fuse_slots);
     const meta_slots = placement.metaLanesFrom(9) * meta_capacity_default;
     try testing.expectEqual(@as(u32, 512), meta_slots);
     const handler_stack = fiber_mod.stackSizeFor(.fuse, page) + page;
     const big_stack = fiber_mod.stackSizeFor(.main, page) + page;
     // The whole-population reserve the venue's 752 MB gauge was converging
-    // to (every slot touched once): (432 + 512 + 16) handler-class stacks
-    // + 16 main-class = 1,077,739,520 B ≈ 1.0 GiB of VIRTUAL reserve; the
-    // kernel holds only touched pages (the measured deepest frame under
-    // fsstress: 205 KiB), and the idle trim returns those.
+    // to (every slot touched once, before the fan-out's share): (513 + 512
+    // + 16) handler-class stacks + 16 main-class = 1,163,005,952 B ≈ 1.1 GiB
+    // of VIRTUAL reserve; the kernel holds only touched pages (the measured
+    // deepest frame under fsstress: 205 KiB), and the idle trim returns those.
     const reserve = (fuse_slots + meta_slots + lease_capacity_default) * handler_stack + main_capacity_default * big_stack;
-    try testing.expectEqual(@as(usize, 1_077_739_520), reserve);
+    try testing.expectEqual(@as(usize, 1_163_005_952), reserve);
     // Capacity never exceeds the budget's eighth: a 4 GiB budget holds the
     // full meta population at 1 MiB stacks, a 1 GiB budget halves it.
     try testing.expectEqual(meta_capacity_default, capacityFromBudget(meta_capacity_default, 4 * derive.GiB, fiber_mod.stackSizeFor(.meta, page)));

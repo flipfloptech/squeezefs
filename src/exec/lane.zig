@@ -173,6 +173,10 @@ pub const Options = struct {
     /// owner thread (a FUSE drain worker) `attachDriven`s it and runs it
     /// from its pass (`pumpDriven`).
     driven: bool = false,
+    /// The fibers optional fan-out (`spawnOptional`: `Io.async`,
+    /// `Io.Group.async`) may hold at once; null = no bound of its own (it
+    /// shares the whole capacity). A FUSE lane's is `sqz_io.fanoutSlack`.
+    optional_cap: ?u32 = null,
 };
 
 /// Set on a lane thread for its lifetime.
@@ -246,6 +250,10 @@ pub const Lane = struct {
     in_flight: u32 = 0,
     /// Fibers between spawn and recycle.
     live: std.atomic.Value(u32) = .init(0),
+    /// `Options.optional_cap` and the optional fibers between spawn and
+    /// recycle (`spawnOptional`; `fanout_slack_model.zig`).
+    optional_cap: ?u32,
+    optional_live: std.atomic.Value(u32) = .init(0),
     /// The idle clock the recycled slots are stamped with: the budget
     /// sampler's tick count (a test points it at its own).
     clock: *const std.atomic.Value(u64) = &mem_budget.authority.tick_count,
@@ -313,6 +321,7 @@ pub const Lane = struct {
             .ring_entries = options.ring_entries orelse ringEntriesFor(options.fiber_capacity),
             .resident = options.resident,
             .driven = options.driven,
+            .optional_cap = options.optional_cap,
         };
         self.name = commNameFor(&self.name_src, options.class, options.index);
         self.inbox = try mpmc.BoundedMpmc(Msg).init(gpa, 2 * options.fiber_capacity);
@@ -553,12 +562,38 @@ pub const Lane = struct {
     /// refusal is the lane's capacity — `error.ConcurrencyUnavailable`, which
     /// the transport answers EAGAIN-class (0002 row 10).
     pub fn spawn(self: *Lane, kind: fiber_mod.Kind, start_fn: fiber_mod.Start, context: []const u8, group: ?*Io.Group, protection: fiber_mod.Protection) SpawnError!*Fiber {
+        return self.spawnSlot(kind, start_fn, context, group, protection, false);
+    }
+
+    /// A spawn the caller may run inline instead (`Io.async`,
+    /// `Io.Group.async`): refused past `optional_cap` optional fibers, so an
+    /// optional fan-out never holds the fibers a FUSE lane keeps for the
+    /// handlers its slots deliver (charter §4's capacity law) — the
+    /// refusal is `async`'s inline run. The bound is a reservation on one
+    /// word: the RMW claims a unit, an over-claim gives it back
+    /// (`fanout_slack_model.zig`; monotonic — the word guards a bound and
+    /// publishes nothing, and RMWs on one word are totally ordered).
+    pub fn spawnOptional(self: *Lane, kind: fiber_mod.Kind, start_fn: fiber_mod.Start, context: []const u8, group: ?*Io.Group, protection: fiber_mod.Protection) SpawnError!*Fiber {
+        const cap = self.optional_cap orelse return self.spawnSlot(kind, start_fn, context, group, protection, false);
+        if (self.optional_live.fetchAdd(1, .monotonic) >= cap) {
+            _ = self.optional_live.fetchSub(1, .monotonic);
+            stats.fanout_inline.of(self.class).inc();
+            return error.ConcurrencyUnavailable;
+        }
+        return self.spawnSlot(kind, start_fn, context, group, protection, true) catch |e| {
+            _ = self.optional_live.fetchSub(1, .monotonic);
+            return e;
+        };
+    }
+
+    fn spawnSlot(self: *Lane, kind: fiber_mod.Kind, start_fn: fiber_mod.Start, context: []const u8, group: ?*Io.Group, protection: fiber_mod.Protection, optional: bool) SpawnError!*Fiber {
         if (!self.alive.load(.acquire)) return error.ConcurrencyUnavailable;
         const f = self.free.tryPop() orelse {
             stats.spawn_refused.of(self.class).inc();
             return error.ConcurrencyUnavailable;
         };
         self.claimForSpawn(f);
+        f.optional = optional;
         const group_canceled = if (group) |g| group_mod.isCanceled(g) else false;
         f.arm(kind, start_fn, context, group, group_canceled, protection, self.stack_size, self.page) catch {
             self.claims[f.slot].store(CLAIM_FREE, .release);
@@ -596,6 +631,7 @@ pub const Lane = struct {
     /// (the quiescence barrier `finalize` and the tests' waits read).
     pub fn recycle(self: *Lane, f: *Fiber) void {
         f.recordHighWater();
+        const optional = f.optional;
         f.reset(self, f.slot);
         f.idle_tick = self.clock.load(.monotonic);
         stats.fibers_live.of(self.class).sub(1);
@@ -604,6 +640,7 @@ pub const Lane = struct {
         // mid-flight on the wrap cell (`mpmc.pushSpin`).
         self.free.pushSpin(f);
         _ = self.live.fetchSub(1, .monotonic);
+        if (optional) _ = self.optional_live.fetchSub(1, .monotonic);
     }
 
     /// The pages the kernel holds for this lane's stacks, measured

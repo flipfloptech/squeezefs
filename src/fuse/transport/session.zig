@@ -921,11 +921,16 @@ const Sideband = struct {
                 sideband_requests.inc();
                 const req: fsv.Request = .{ .header = d.header, .op = parsed };
                 const handle: fsv.Handle = .{ .tx = &s.tx, .slot = .classical, .unique = d.header.unique, .window = &.{} };
-                const lane = s.exec.homeLane(null, null);
-                s.exec.spawnGroupOn(lane, &s.handler_group, handlerMain, .{ s.fs, req, handle }) catch {
+                // A lane at its capacity walks the rotation: an EAGAIN is a
+                // lost RELEASE (the kernel never re-sends one).
+                const lanes = @max(s.exec.fuseLanes().len, 1);
+                for (0..lanes) |i| {
+                    if (s.exec.spawnGroupOn(s.exec.homeLane(null, null), &s.handler_group, handlerMain, .{ s.fs, req, handle })) |_| break else |_| {}
+                    if (i == 0) worker.dispatch_fallbacks.inc();
+                } else {
                     worker.dispatch_refused.inc();
                     self.replyInline(codec.replyError(d.header.unique, .AGAIN));
-                };
+                }
             },
         }
     }
@@ -2454,6 +2459,7 @@ pub const Session = struct {
         try field(w, "transport_fast_dispatch_demotes", worker.fast_dispatch_demotes.load());
         try field(w, "transport_fused_read_fusions", worker.fused_read_fusions.load());
         try field(w, "transport_fused_read_demotions", worker.fused_read_demotions.load());
+        try field(w, "transport_dispatch_fallbacks", worker.dispatch_fallbacks.load());
         try field(w, "transport_dispatch_refused", worker.dispatch_refused.load());
         try field(w, "transport_handler_dispatches_own", worker.handler_dispatches_own.load());
         try field(w, "transport_handler_dispatches_foreign", worker.handler_dispatches_foreign.load());
@@ -3325,6 +3331,7 @@ test "e2e: A RELEASE NEVER MEETS A FULL LANE — the closing CPU's handler lane 
     while (true) rig.io_exec.spawnGroupOn(lane, &holders, H.park, .{ &gate, io }) catch break;
     const releases0 = rig.fs.file_releases.load(.monotonic);
     const refused0 = worker.dispatch_refused.load();
+    const fallbacks0 = worker.dispatch_fallbacks.load();
     var result: anyerror!void = {};
     const t = try std.Thread.spawn(.{}, H.readHello, .{ rig, lane.home_cpu.?, &result });
     t.join();
@@ -3333,6 +3340,8 @@ test "e2e: A RELEASE NEVER MEETS A FULL LANE — the closing CPU's handler lane 
     const served = waitUntil(&H.Served{ .fs = rig.fs, .want = releases0 + 1 }, H.Served.pred, 5 * std.time.ns_per_s);
     try testing.expectEqual(refused0, worker.dispatch_refused.load());
     try testing.expect(served);
+    // The handler lane refused it; the worker's own lane took it.
+    try testing.expect(worker.dispatch_fallbacks.load() > fallbacks0);
 }
 
 test "e2e: EchoFs mounts over the ring — INIT negotiated FUSE_OVER_IO_URING, enable_uring reads Y, every queue armed, stat/open/read from a helper thread arrive over the RING (the sideband saw no request), replies byte-exact, the geometry the kernel accepted equals the plan" {

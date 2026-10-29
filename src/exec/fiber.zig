@@ -330,6 +330,9 @@ pub const Fiber = struct {
     lane: *Lane,
     /// Index in `lane.fibers`.
     slot: u32,
+    /// Spawned as optional fan-out (`Lane.spawnOptional`): its recycle
+    /// returns one unit of the lane's `optional_cap`.
+    optional: bool,
     stack: ?Stack,
     /// The budget tick of this slot's last recycle (the idle clock the
     /// stack trim reads); written by `Lane.recycle` before the push.
@@ -369,6 +372,7 @@ pub const Fiber = struct {
             .watch_replaced = false,
             .lane = lane,
             .slot = slot,
+            .optional = false,
             .stack = f.stack,
             .idle_tick = f.idle_tick,
             .result = undefined,

@@ -203,8 +203,13 @@ pub var fused_read_fusions: counters.ShardedCounter = .{};
 pub var fused_read_demotions: counters.ShardedCounter = .{};
 pub var fused_read_late_demotions: counters.ShardedCounter = .{};
 pub var fused_polls: counters.ShardedCounter = .{};
-/// `transport_dispatch_refused`: a handler lane refused the spawn (its
-/// capacity); the request was answered EAGAIN-class (0002 row 10).
+/// `transport_dispatch_fallbacks`: the chosen handler lane was at its fiber
+/// capacity and the handler ran on the worker's own lane or the rotation
+/// (`Group.spawnHandler`).
+pub var dispatch_fallbacks: counters.ShardedCounter = .{};
+/// `transport_dispatch_refused`: every candidate lane refused the spawn;
+/// the request was answered EAGAIN-class (0002 row 10). 0 while a lane has
+/// room — a RELEASE answered so is lost (the kernel never re-sends it).
 pub var dispatch_refused: counters.ShardedCounter = .{};
 /// `transport_handler_dispatches_{own,foreign}` (decision 0003 §AB.3): a
 /// handler spawned on the worker's OWN lane (it runs on this thread; its
@@ -3810,20 +3815,45 @@ pub const Group = struct {
         if (place.spread) stream_spreads.inc();
         const cpu: ?u16 = if (self.shared.qid_is_cpu and !place.spread) m.qid else null;
         const own = if (onWorkerLane(req.op, self.shared.no_open, place.own)) self.lane else null;
-        const lane = own orelse self.shared.exec.homeLane(cpu, self.shared.nodeOf(m.qid));
-        if (own != null) {
+        const first = own orelse self.shared.exec.homeLane(cpu, self.shared.nodeOf(m.qid));
+        const lane = self.spawnHandler(first, .{ self.shared.fs, req, handle, lease }) orelse {
+            dispatch_refused.inc();
+            // Nothing is parked yet: the drop wakes nobody.
+            if (lease) |l| l.release();
+            self.failEnt(gent, .AGAIN);
+            return;
+        };
+        if (lane == self.lane) {
             handler_dispatches_own.inc();
             _ = self.dispatches_own.fetchAdd(1, .monotonic);
         } else {
             handler_dispatches_foreign.inc();
             _ = self.dispatches_foreign.fetchAdd(1, .monotonic);
         }
-        self.shared.exec.spawnGroupOn(lane, self.shared.handler_group, handlerMain, .{ self.shared.fs, req, handle, lease }) catch {
-            dispatch_refused.inc();
-            // Nothing is parked yet: the drop wakes nobody.
-            if (lease) |l| l.release();
-            self.failEnt(gent, .AGAIN);
+    }
+
+    /// A request's handler fiber on `first`; a lane at its fiber capacity
+    /// hands it to the worker's own lane — whose population is one fiber per
+    /// slot of this group plus the slack, and every handler there holds one
+    /// of those slots (RES-18), so a slot's handler always finds room — then
+    /// to the rotation. The answer is never EAGAIN while a lane has room:
+    /// the kernel discards a RELEASE's answer and never re-sends it, so a
+    /// refused RELEASE was a lost one (rung-10-open-count-stranded). Null =
+    /// every candidate refused.
+    fn spawnHandler(self: *Group, first: *exec.Lane, args: std.meta.ArgsTuple(@TypeOf(handlerMain))) ?*exec.Lane {
+        const sqz = self.shared.exec;
+        const g = self.shared.handler_group;
+        if (sqz.spawnGroupOn(first, g, handlerMain, args)) |_| return first else |_| {}
+        dispatch_fallbacks.inc();
+        if (self.lane) |l| if (l != first) {
+            if (sqz.spawnGroupOn(l, g, handlerMain, args)) |_| return l else |_| {}
         };
+        for (0..sqz.fuseLanes().len) |_| {
+            const l = sqz.homeLane(null, null);
+            if (l == first) continue;
+            if (sqz.spawnGroupOn(l, g, handlerMain, args)) |_| return l else |_| {}
+        }
+        return null;
     }
 
     // ---- teardown (porting spec §11.2) ----

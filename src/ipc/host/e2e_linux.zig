@@ -1123,3 +1123,255 @@ test "smoke: THE DIRECT ARM — mount -o interception=direct → a root session 
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
     rig.passed = true;
 }
+
+/// The daemon's FUSE requests of one class so far (`fuse_op_latency_ns`'s
+/// histogram count: every request the daemon answered, any lane).
+fn opCount(text: []const u8, class: []const u8) !u64 {
+    const fam = std.mem.indexOf(u8, text, "\"fuse_op_latency_ns\":{") orelse return error.StatMissing;
+    var kb: [64]u8 = undefined;
+    const at = std.mem.indexOfPos(u8, text, fam, try std.fmt.bufPrint(&kb, "\"{s}\":{{", .{class})) orelse return error.StatMissing;
+    return numberAfter(text[at..], "\"count\":") orelse error.StatMissing;
+}
+
+/// LOOKUP + GETATTR the daemon answered so far.
+fn attrAsks(rig: *Rig) !u64 {
+    const text = try rig.stats();
+    defer rig.gpa.free(text);
+    return try opCount(text, "lookup") + try opCount(text, "getattr");
+}
+
+/// `stat(2)`'s request: the basic fields.
+const basic_stats: linux.STATX = .{ .TYPE = true, .MODE = true, .NLINK = true, .UID = true, .GID = true, .ATIME = true, .MTIME = true, .CTIME = true, .INO = true, .SIZE = true, .BLOCKS = true };
+
+fn statOf(rig: *Rig, name: []const u8) !linux.Statx {
+    var pb: [256]u8 = undefined;
+    const p = try rig.filePath(&pb, name);
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, p.ptr, 0, basic_stats, &st)) != .SUCCESS) return error.StatFailed;
+    return st;
+}
+
+fn fstatOf(fd: linux.fd_t) !linux.Statx {
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, basic_stats, &st)) != .SUCCESS) return error.StatFailed;
+    return st;
+}
+
+fn nsOf(t: linux.statx_timestamp) u64 {
+    return @as(u64, @intCast(t.sec)) * std.time.ns_per_s + t.nsec;
+}
+
+/// Polls `fd`'s kernel view until `done` holds; the bound is far inside
+/// `T_owner` (45 s) and past the window (1 s), so a view the TTL alone
+/// refreshes fails it.
+fn awaitKernelView(fd: linux.fd_t, ctx: anytype, comptime done: fn (@TypeOf(ctx), linux.Statx) bool) !void {
+    const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (true) {
+        if (done(ctx, try fstatOf(fd))) return;
+        if (clock.monotonicNs() >= deadline) return error.TestKernelViewStale;
+        sleepMs(20);
+    }
+}
+
+/// The coarse realtime clock (the daemon's stamp clock) past `ns`.
+fn awaitCoarseClockPast(ns: u64) void {
+    while (@as(u64, @bitCast(clock.realtimeCoarseNs())) <= ns) sleepMs(1);
+}
+
+/// Polls `fd`'s kernel reads at offset 0 until they show `want` (the
+/// bound of `awaitKernelView`).
+fn awaitKernelBytes(fd: linux.fd_t, want: []const u8) !void {
+    var got: [4096]u8 = undefined;
+    const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (true) {
+        try testing.expectEqual(want.len, linux.pread(fd, &got, want.len, 0));
+        if (std.mem.eql(u8, got[0..want.len], want)) return;
+        if (clock.monotonicNs() >= deadline) return error.TestKernelPagesStale;
+        sleepMs(20);
+    }
+}
+
+test "smoke: THE INTERCEPTION TTL (decision 0003 §CE) — an -o interception mount with no peer is ISOLATED: past the charter's 1 s class a directory stat, a file stat and a removal reach the daemon no more than on a plain mount, a binding with no ring I/O leaves the kernel's cache whole; with T_owner in force a kernel reader on another fd sees a ring writer's grow at once, its mtime and bytes after an overwrite within the window, a kernel truncate's regrow at once, a ring read's atime, another process's stat the same; a dirty unbind invalidates; fsck clean" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet();
+    try rig.spawnMount();
+    _ = try rig.awaitLog("ready: ", 0, ready_wait_ns);
+    _ = try rig.awaitLog("ipc: interception armed", 0, ready_wait_ns);
+    var pb: [256]u8 = undefined;
+    var nb: [64]u8 = undefined;
+
+    // 1. A tree through the kernel, each name stat'd once (the kernel's
+    //    cache warm); then the charter's 1 s class lapses.
+    const N = 24;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir((try rig.filePath(&pb, "t")).ptr, 0o755)));
+    for (0..N) |i| {
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir((try rig.filePath(&pb, try std.fmt.bufPrint(&nb, "t/d{d}", .{i}))).ptr, 0o755)));
+        _ = linux.close(try rig.openOnMount(try std.fmt.bufPrint(&nb, "t/f{d}", .{i}), .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }));
+        _ = try statOf(rig, try std.fmt.bufPrint(&nb, "t/d{d}", .{i}));
+        _ = try statOf(rig, try std.fmt.bufPrint(&nb, "t/f{d}", .{i}));
+    }
+    sleepMs(1200);
+    // 2. Directory and file stats past the 1 s class: the kernel's cache
+    //    answers (a peered mount re-asks every name: ≥ 2N LOOKUPs). A
+    //    `.stats` read is itself a LOOKUP: one read's cost is measured and
+    //    taken off each delta.
+    const asks0 = try attrAsks(rig);
+    const one_read = (try attrAsks(rig)) - asks0;
+    const asks1 = try attrAsks(rig);
+    for (0..N) |i| {
+        _ = try statOf(rig, try std.fmt.bufPrint(&nb, "t/d{d}", .{i}));
+        _ = try statOf(rig, try std.fmt.bufPrint(&nb, "t/f{d}", .{i}));
+    }
+    const stat_asks = (try attrAsks(rig)) - asks1 - one_read;
+    std.debug.print("smoke[interception-ttl]: {d} stats past 1 s asked the daemon {d} LOOKUP/GETATTR (a .stats read costs {d})\n", .{ 2 * N, stat_asks, one_read });
+    try testing.expect(stat_asks <= 2);
+    //    Removal of half of them: no revalidation either.
+    const asks2 = try attrAsks(rig);
+    for (0..N / 2) |i| {
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.rmdir((try rig.filePath(&pb, try std.fmt.bufPrint(&nb, "t/d{d}", .{i}))).ptr)));
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink((try rig.filePath(&pb, try std.fmt.bufPrint(&nb, "t/f{d}", .{i}))).ptr)));
+    }
+    const rm_asks = (try attrAsks(rig)) - asks2 - one_read;
+    std.debug.print("smoke[interception-ttl]: {d} removals asked {d} LOOKUP/GETATTR\n", .{ N, rm_asks });
+    try testing.expect(rm_asks <= 2);
+
+    // 3. A session; a binding with no ring I/O leaves the kernel's cache
+    //    whole: the next stat of the file is the kernel's own. (A second
+    //    binding's answer orders the first one's unbind before it: the ctl
+    //    socket is one sequence.)
+    const fd = try rig.openOnMount("t/f20", .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+    var fd_open = true;
+    defer if (fd_open) {
+        _ = linux.close(fd);
+    };
+    const fd2 = try rig.openOnMount("t/f21", .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+    var fd2_open = true;
+    defer if (fd2_open) {
+        _ = linux.close(fd2);
+    };
+    const blob = try rig.il0Blob();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("SQUEEZEFS_TEST_IPC_ALLOW_DIRTY", "1");
+    try env.put("SQUEEZEFS_TEST_IL_OP_TIMEOUT_MS", "20000");
+    var refusal: ?client.Refusal = null;
+    var s = client.Session.establish(gpa, &blob, fd, .{ .build_commit = blob.buildCommit(), .mount_uid = linux.geteuid(), .env = &env }, &refusal) catch |e| {
+        std.debug.print("\n--- establish failed: {s} (refusal {any}) ---\n", .{ @errorName(e), refusal });
+        return e;
+    };
+    var s_live = true;
+    defer if (s_live) s.teardown();
+    _ = try fstatOf(fd);
+    _ = try fstatOf(fd2);
+    const asks3 = try attrAsks(rig);
+    {
+        const x1 = try s.bind(fd, .mount);
+        s.unbind(x1.id);
+        const x2 = try s.bind(fd2, .mount);
+        s.unbind(x2.id);
+    }
+    _ = try statOf(rig, "t/f20");
+    const bind_asks = (try attrAsks(rig)) - asks3 - one_read;
+    std.debug.print("smoke[interception-ttl]: two binds and unbinds with no ring I/O cost {d} LOOKUP/GETATTR\n", .{bind_asks});
+    try testing.expectEqual(@as(u64, 0), bind_asks);
+
+    // 4. Coherence under T_owner. A kernel reader on another fd holds the
+    //    file's attrs and pages; the ring writer's GROW is announced before
+    //    its ack: the reader's fstat sees the size at once, the mtime with it.
+    const kfd = try rig.openOnMount("t/f20", .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+    var kfd_open = true;
+    defer if (kfd_open) {
+        _ = linux.close(kfd);
+    };
+    const st0 = try fstatOf(kfd);
+    try testing.expectEqual(@as(u64, 0), st0.size);
+    const b = try s.bind(fd, .mount);
+    var page: [4096]u8 = undefined;
+    const fill: [8192]u8 = @splat(0x5a);
+    try testing.expectEqual(@as(usize, 8192), try served(s.pwrite(b.id, &fill, 0)));
+    const st1 = try fstatOf(kfd);
+    try testing.expectEqual(@as(u64, 8192), st1.size);
+    try testing.expect(nsOf(st1.mtime) > nsOf(st0.mtime));
+    var back: [4096]u8 = undefined;
+    try testing.expectEqual(@as(usize, 4096), linux.pread(kfd, &back, back.len, 0));
+    try testing.expect(std.mem.eql(u8, &back, fill[0..4096]));
+    //    An overwrite inside the size (suppressed inside the window, or its
+    //    next fire): the reader's mtime and bytes move within the window,
+    //    never after the long class. (The daemon stamps with the coarse
+    //    clock: the overwrite's stamp must lie past the grow's.)
+    awaitCoarseClockPast(nsOf(st1.mtime));
+    pattern(&page, 0x7700);
+    try testing.expectEqual(@as(usize, 4096), try served(s.pwrite(b.id, &page, 0)));
+    try awaitKernelView(kfd, nsOf(st1.mtime), struct {
+        fn f(m: u64, st: linux.Statx) bool {
+            return nsOf(st.mtime) > m;
+        }
+    }.f);
+    try awaitKernelBytes(kfd, &page);
+    //    Another process's stat: the same kernel view.
+    {
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "stat", "-c", "%s", try rig.filePath(&pb, "t/f20") }, .environ_map = &rig.env });
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        try testing.expectEqualStrings("8192", std.mem.trim(u8, r.stdout, "\n"));
+    }
+    //    A truncate through the kernel, then the ring regrows the file
+    //    below its old high-water: announced as the grow it is.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(kfd, 0)));
+    try testing.expectEqual(@as(u64, 0), (try fstatOf(kfd)).size);
+    try testing.expectEqual(@as(usize, 4096), try served(s.pwrite(b.id, &page, 0)));
+    try testing.expectEqual(@as(u64, 4096), (try fstatOf(kfd)).size);
+    //    A dirty unbind: an overwrite (suppressed unless the window turned),
+    //    then the unbind — the reader's pages move without another write.
+    pattern(&page, 0x9900);
+    const fires0 = try rig.stat("ipc_inval_unbind_fires");
+    const sup0 = try rig.stat("ipc_inval_suppressed");
+    try testing.expectEqual(@as(usize, 4096), try served(s.pwrite(b.id, &page, 0)));
+    const suppressed = (try rig.stat("ipc_inval_suppressed")) > sup0;
+    s.unbind(b.id);
+    if (suppressed) try rig.awaitStat("ipc_inval_unbind_fires", fires0 + 1);
+    try awaitKernelBytes(kfd, &page);
+    //    A ring read on a file the kernel never read, written since its
+    //    birth (relatime): the reader on another fd sees its atime move.
+    const kfd2 = try rig.openOnMount("t/f21", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    var kfd2_open = true;
+    defer if (kfd2_open) {
+        _ = linux.close(kfd2);
+    };
+    const b2 = try s.bind(fd2, .mount);
+    try testing.expectEqual(@as(usize, 4096), try served(s.pwrite(b2.id, &page, 0)));
+    const a0 = nsOf((try fstatOf(kfd2)).atime);
+    try testing.expectEqual(@as(usize, 4096), try served(s.pread(b2.id, &back, 0)));
+    try testing.expect(std.mem.eql(u8, &back, &page));
+    try awaitKernelView(kfd2, a0, struct {
+        fn f(a: u64, st: linux.Statx) bool {
+            return nsOf(st.atime) > a;
+        }
+    }.f);
+    s.unbind(b2.id);
+    try testing.expectEqual(@as(u64, 0), try rig.stat("invariant_tripwires"));
+
+    // 5. The orderly umount; fsck finds nothing.
+    s_live = false;
+    s.teardown();
+    kfd_open = false;
+    _ = linux.close(kfd);
+    kfd2_open = false;
+    _ = linux.close(kfd2);
+    fd_open = false;
+    _ = linux.close(fd);
+    fd2_open = false;
+    _ = linux.close(fd2);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    const r = try std.process.run(gpa, io, .{ .argv = &.{ rig.bin, "fsck", "--offline", rig.meta_uri }, .environ_map = &rig.env });
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    if (!r.term.success()) std.debug.print("\nfsck: {s}{s}\n", .{ r.stdout, r.stderr });
+    try testing.expect(r.term.success());
+    rig.passed = true;
+}

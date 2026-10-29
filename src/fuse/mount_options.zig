@@ -120,15 +120,19 @@ pub fn envExplicitTtls(env: *const std.process.Environ.Map) u4 {
 /// the recall (`INVAL_ENTRY` per name, `INVAL_INODE` per object), this
 /// daemon's own non-kernel changes (a served step or ship, a job, a tool)
 /// at the conveyor's terminal outcome. On an ISOLATED mount — no peer
-/// writer (a `--single-writer` set; a manager no member has joined) and no
-/// interception host (its limiter's window IS the attr TTL) — the TTL so
-/// bounds no live path, only an invalidation that could not be delivered,
-/// which the law makes impossible (a full sideband owes an `INC_EPOCH`; the
-/// attrs notifies wait for their reserved cells). Each class no knob or
-/// `-o` names derives to `isolated_ns` = `T_owner`: the longest any
-/// coherence protocol of the set waits without an answer (the token
-/// recall's deadline), so no kernel view outlives the protocols' own
-/// window. A PEERED mount keeps the charter's classes (1 s): a peer that
+/// writer (a `--single-writer` set; a manager no member has joined) — the
+/// TTL so bounds no live path, only an invalidation that could not be
+/// delivered, which the law makes impossible (a full sideband owes an
+/// `INC_EPOCH`; the attrs notifies wait for their reserved cells). An
+/// interception host does not make a mount peered (decision 0003 §CE): its
+/// ring changes regular files alone, through a binding, and its limiter
+/// invalidates every change it makes (`ipc/host/inval.zig`); a regular
+/// file's SETATTR or LINK reply there takes the base attr class
+/// (`KvFs.attrTtlFor`: the kernel installs it unchecked).
+/// Each class no knob or `-o` names derives to `isolated_ns` = `T_owner`:
+/// the longest any coherence protocol of the set waits without an answer
+/// (the token recall's deadline), so no kernel view outlives the
+/// protocols' own window. A PEERED mount keeps the charter's classes (1 s): a peer that
 /// loses its lease, or a recall that cannot reach this mount, is bounded
 /// by them as before — the names make every live path stricter. The
 /// posture is one-way: the first join flips it (`enterPeered`, which then

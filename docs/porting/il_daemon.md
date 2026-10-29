@@ -623,6 +623,25 @@ sideband queue is counted, never awaited); the high-water and last-fire words li
 per-ino table (the reference's unreclaimed `scc::HashMap` grows one entry per ring-written ino for
 the mount's life — `:577–587` records the ceiling; §8 quirks 4, 8).
 
+DIVERGED (2026-10-28, decision 0003 §CE — the reference's interception mount kept every kernel TTL
+at 1 s, so its limiter leaned on expiry, and the port never advertises `FUSE_AUTO_INVAL_DATA`, so
+no TTL ever refreshed a page): the mount is ISOLATED for the TTL law, every class `T_owner` (a
+regular file's SETATTR/LINK reply excepted: the base attr class, `KvFs.attrTtlFor`), and the
+limiter drives coherence by invalidation alone, never dropping a fire. `P:src/ipc/ring_inodes.zig`
+is the mount-owned table of words `{hwm u48, gen u3, last_fire_s u13}`. `P:src/ipc/host/inval.zig`:
+BIND fires nothing (the binding's first write is due); a write: due ⇒ `Whole` (leading edge),
+grew ⇒ awaited `AttrsOnly`, else suppressed: its binding ROW is marked dirty (`Binding.dirty`; the
+clean → dirty edge raises the session's sweep flag) and a row read dead (SeqCst, after the mark:
+`inval.Row`) fires `Whole` itself; the ctl poller's TRAILING sweep once per window
+(`IpcHost.sweepDirty`: flag lowered, then the rows), UNBIND and a session's teardown fire `Whole`
+for a dirty row (`fireIfDirty`, a swap: once); a kernel size set (`KvFs.noteSizeSet`: truncate,
+`O_TRUNC`, collapse/insert) sets the high-water to the new size and moves `gen` — a write admitted
+before it (gen read before its admission) raises nothing; a ring read that parked an access time
+(`note_read` → true, or `Ctx.atime_parked` on the handoff) fires `AttrsOnly`; `QueueFull` falls back
+to the reserved attrs-only cells (`Session.notifyAttrs`). Models: `P:src/ipc/ring_inodes_model.zig`
+(the unbind's Dekker; the sweep's mark-then-flag order). Counters `ipc_inval_unbind_fires`,
+`ipc_inval_sweep_fires`, `ipc_inval_dead_binding_fires`, `ipc_inval_atime`.
+
 ### 3.4 The write path entry the service calls
 
 The ring write enters the write handler's body with the severed payload as its source —

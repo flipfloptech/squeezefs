@@ -128,6 +128,7 @@ const slot = @import("../fuse/transport/slot.zig");
 const counters = @import("../core/counters.zig");
 const stats = @import("../stats/stats.zig");
 const ipc_host = @import("../ipc/host.zig");
+const ring_inodes = @import("../ipc/ring_inodes.zig");
 const ipc_rl = @import("../ipc/rendezvous_linux.zig");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
@@ -508,13 +509,14 @@ fn mountMain(ctx: *Ctx) u8 {
     var plane_open = true;
     defer if (plane_open) plane.close();
     const flush_interval_ms = checkpoint.flushIntervalMsFromEnv(env);
-    // The TTL law (decision 0003 §AB.2): a joiner, a reader and an
-    // interception mount start (and stay) PEERED; a manager or a
-    // `--single-writer` set starts ISOLATED until a member joins.
+    // The TTL law (decision 0003 §AB.2): a joiner and a reader start
+    // (and stay) PEERED; a manager or a `--single-writer` set starts
+    // ISOLATED until a member joins — an interception mount too (§CE): the
+    // host's limiter invalidates every change its ring makes.
     var coherence: KernelCoherence = .{
         .io = io,
         .gpa = gpa,
-        .law = mount_options.TtlLaw.init(ctx.opts.ttls, ctx.opts.explicit_ttls | mount_options.envExplicitTtls(env), mount_options.isolatedTtlNs(lease_clock.T_OWNER_MS), reader or be.volumes[0].joined != null or ctx.opts.interception),
+        .law = mount_options.TtlLaw.init(ctx.opts.ttls, ctx.opts.explicit_ttls | mount_options.envExplicitTtls(env), mount_options.isolatedTtlNs(lease_clock.T_OWNER_MS), reader or be.volumes[0].joined != null),
         .opens = &opens,
     };
     coherence.init() catch return ctx.failed("out of memory (the kernel view's queue)", .{});
@@ -522,9 +524,15 @@ fn mountMain(ctx: *Ctx) u8 {
     for (be.volumes) |vol| if (vol.sym) |s| {
         s.manager.peer_gate = &coherence.gate;
     };
+    // The interception host's ring table (decision 0003 §CE): the host's
+    // limiter keeps its words there, a kernel size set through the
+    // filesystem lowers their high-water; it outlives both.
+    var ring: ?ring_inodes.Table = if (ctx.opts.interception and !reader) ring_inodes.Table.init(gpa, op_guard.INODE_GUARD_STRIPES) catch return ctx.failed("out of memory (the interception ring table)", .{}) else null;
+    defer if (ring) |*r| r.deinit(gpa);
     var fs = BackendFs.mount(gpa, io, be, plane, .{
         .ttls = ctx.opts.ttls,
         .ttl_law = &coherence.law,
+        .ring = if (ring) |*r| r else null,
         .page_size = facts.page_size,
         .dlm_stripes = dlm.resolveWidth(env, facts, fuse_geometry.Q_DEPTH_DESIRED),
         .uid = ctx.opts.uid,
@@ -844,7 +852,8 @@ fn mountMain(ctx: *Ctx) u8 {
             .probe = plane.probe(),
             .shared_enabled = op_guard.sharedEnabled(env),
             .opens = &opens,
-            .notify = .{ .ctx = session, .call = &invalThunk, .sync = &invalSyncThunk },
+            .notify = .{ .ctx = session, .call = &invalThunk, .sync = &invalSyncThunk, .attrs = &invalAttrsThunk },
+            .ring = &ring.?,
             .our_commit = ctx.p.build.commit,
             .mount_dev = mount_dev,
             .mount_uid = ctx.opts.uid,
@@ -1750,6 +1759,12 @@ fn invalThunk(ctx: ?*anyopaque, ino: u64, off: i64, len: i64) error{QueueFull}!v
 fn invalSyncThunk(ctx: ?*anyopaque, ino: u64) void {
     const session: *Session = @ptrCast(@alignCast(ctx.?));
     session.notifyAttrsAwaited(ino);
+}
+
+/// The invalidator's never-dropped attrs-only notify (a reserved cell).
+fn invalAttrsThunk(ctx: ?*anyopaque, ino: u64) void {
+    const session: *Session = @ptrCast(@alignCast(ctx.?));
+    session.notifyAttrs(ino);
 }
 
 /// The mounted root's `st_dev` (the fd screen's mount authority): an

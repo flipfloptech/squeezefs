@@ -227,12 +227,21 @@ pub const stats = struct {
     pub var ipc_direct_write_notes: counters.ShardedCounter = .{};
     pub var ipc_direct_writes_recalled: counters.ShardedCounter = .{};
 
-    // ---- coherence (KD-11's residual windows) ----
+    // ---- coherence (KD-11's residual windows; decision 0003 §CE) ----
     pub var ipc_inval_notifies: counters.ShardedCounter = .{};
     pub var ipc_inval_attrs_only: counters.ShardedCounter = .{};
     pub var ipc_inval_suppressed: counters.ShardedCounter = .{};
-    /// The sideband queue refused a notify (counted, never awaited).
+    /// The sideband's shared cells were full: the notify fell back to the
+    /// attrs-only reserved cells (never dropped).
     pub var ipc_inval_queue_full: counters.ShardedCounter = .{};
+    /// Whole invalidations an UNBIND (or a teardown) fired for a dirty row.
+    pub var ipc_inval_unbind_fires: counters.ShardedCounter = .{};
+    /// Whole invalidations the window's trailing sweep fired for a dirty row.
+    pub var ipc_inval_sweep_fires: counters.ShardedCounter = .{};
+    /// Whole invalidations a write fired because its binding was already gone.
+    pub var ipc_inval_dead_binding_fires: counters.ShardedCounter = .{};
+    /// Attrs-only invalidations for an access time a ring read parked.
+    pub var ipc_inval_atime: counters.ShardedCounter = .{};
 };
 
 /// The per-lane closures (module doc), as booleans.

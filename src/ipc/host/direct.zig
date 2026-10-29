@@ -202,6 +202,10 @@ const Pending = struct {
     len: u32,
     nodeid: u64,
     offset: u64,
+    /// A write's binding id and the ring table's size-set generation read
+    /// before its admission (`inval.Invalidator.onWrite`).
+    binding: u64 = 0,
+    gen: u3 = 0,
     in_use: bool,
 };
 
@@ -623,6 +627,9 @@ pub const Engine = struct {
     /// severs and hands off.
     pub fn tryInlineWrite(self: *Engine, owner: u16, op: DataOp, key_ino: u64, c: Completion) bool {
         const len = op.desc.len;
+        // Before the admission: a kernel size set after it outdates this
+        // write's end (`ring_inodes.Table.sizeSet`).
+        const gen = self.inval.table.genOf(op.binding.ino);
         const verdict = self.wp.beginDirectWrite(self.io, key_ino, op.desc.offset, len) catch |e| {
             // The fence pair's device verdict is terminal for THIS write.
             c.fail(errors.toErrno(e));
@@ -681,7 +688,7 @@ pub const Engine = struct {
             const file: uring128.File = if (self.fixed_files) .{ .fixed = vol.ordinal } else .{ .raw = self.vol_fds[vol.ordinal] };
             uring128.prepWrite(sqe, file, src, d.begun.dest);
             sqe.user_data = idx;
-            shard.slab[idx] = .{ .c = c, .kind = .{ .write = .{ .direct = d, .slab = slab } }, .len = len, .nodeid = op.binding.ino, .offset = op.desc.offset, .in_use = true };
+            shard.slab[idx] = .{ .c = c, .kind = .{ .write = .{ .direct = d, .slab = slab } }, .len = len, .nodeid = op.binding.ino, .offset = op.desc.offset, .binding = op.desc.binding, .gen = gen, .in_use = true };
             _ = shard.inflight.fetchAdd(1, .monotonic);
         }
         _ = shard.pending_submits.fetchAdd(1, .release);
@@ -789,7 +796,7 @@ pub const Engine = struct {
             stats.ipc_bytes_in.add(p.len);
             if (self.opens) |o| o.noteDurableWrite(p.nodeid);
             // A grow announces its size to the kernel BEFORE the ack (POSIX-8).
-            _ = self.inval.onWrite(p.nodeid, p.offset + p.len, clock.realtimeCoarseS());
+            _ = self.inval.onWrite(p.nodeid, p.offset + p.len, clock.realtimeCoarseS(), p.gen, p.c.session.ringRow(p.binding));
             p.c.complete(@intCast(p.len));
         } else |e| {
             stats.ipc_dd_write_dma_errors.inc();
@@ -818,12 +825,14 @@ const slot_core = @import("../slot_core.zig");
 const kv_fs = @import("../../fuse/handler/kv_fs.zig");
 const op_trace = @import("../../fuse/handler/op_trace.zig");
 const filesystem = @import("../../fuse/handler/filesystem.zig");
+const ring_inodes = @import("../ring_inodes.zig");
 
 const Lab = struct {
     f: *wt.Fixture,
     stripes: layout_mod.MetaStripes = .{},
     wp: *write_admit.WritePath,
     pool: severed_pool.SeveredPool,
+    ring: ring_inodes.Table,
     inval: inval_mod.Invalidator,
     fd: linux.fd_t,
     path_buf: [96]u8 = undefined,
@@ -848,8 +857,9 @@ const Lab = struct {
         errdefer l.wp.deinit(testing.io);
         l.pool = try severed_pool.SeveredPool.init(gpa, wt.BS, 8);
         errdefer l.pool.deinit();
-        l.inval = try inval_mod.Invalidator.init(gpa, 64, .{ .ctx = null, .call = &noInval, .sync = &OrderProbe.sync }, 1000);
-        errdefer l.inval.deinit(gpa);
+        l.ring = try ring_inodes.Table.init(gpa, 64);
+        errdefer l.ring.deinit(gpa);
+        l.inval = inval_mod.Invalidator.init(&l.ring, .{ .ctx = null, .call = &noInval, .sync = &OrderProbe.sync, .attrs = &noAttrs }, 1000);
         _ = linux.mkdir("/build/tmp", 0o755);
         const p = try std.fmt.bufPrintSentinel(&l.path_buf, "/build/tmp/sqz-dd-lane-{d}.img", .{linux.getpid()}, 0);
         l.path_len = p.len;
@@ -861,11 +871,12 @@ const Lab = struct {
     }
 
     fn noInval(_: ?*anyopaque, _: u64, _: i64, _: i64) error{QueueFull}!void {}
+    fn noAttrs(_: ?*anyopaque, _: u64) void {}
 
     fn deinit(self: *Lab, gpa: Allocator) void {
         _ = linux.close(self.fd);
         _ = linux.unlink(self.path_buf[0..self.path_len :0]);
-        self.inval.deinit(gpa);
+        self.ring.deinit(gpa);
         self.pool.deinit();
         self.wp.deinit(testing.io);
         self.f.deinit();
@@ -1130,7 +1141,7 @@ const NoteProbe = struct {
         calls += 1;
         var quiet: op_trace.OpTrace = .{ .unique = 0, .class = .other, .profiling = false, .t_entry = 0 };
         var c: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &quiet, .wd_slot = null, .window = &.{} };
-        fs.note_read(&c, .{ .ino = b.ino, .flags = b.openFlags() });
+        _ = fs.note_read(&c, .{ .ino = b.ino, .flags = b.openFlags() });
     }
 };
 

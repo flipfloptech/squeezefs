@@ -136,6 +136,7 @@ const seams = @import("../../data/write_seams.zig");
 const size_epoch = @import("../../data/size_epoch.zig");
 const fsync_mod = @import("../../data/fsync.zig");
 const ipc_wire = @import("../../ipc/wire.zig");
+const ring_inodes = @import("../../ipc/ring_inodes.zig");
 
 const Ctx = filesystem.Ctx;
 const Error = filesystem.Error;
@@ -438,6 +439,10 @@ pub const Options = struct {
     ttls: mount_options.Ttls = .{},
     /// The mount's TTL law (decision 0003 §AB.2); null = `ttls` always.
     ttl_law: ?*const mount_options.TtlLaw = null,
+    /// An interception mount's ring table (decision 0003 §CE): a kernel
+    /// size set lowers its announced high-water; a regular file's unchecked
+    /// reply takes `ttls`' attr class. Null = no interception host.
+    ring: ?*const ring_inodes.Table = null,
     /// The page: `fuse_attr.blksize`.
     page_size: u32 = 4096,
     /// The 4a stripe width (`dlm.resolveWidth` at the daemon).
@@ -645,6 +650,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         data: *Data,
         ttls: mount_options.Ttls,
         ttl_law: ?*const mount_options.TtlLaw,
+        ring: ?*const ring_inodes.Table,
         inline_max: u64,
         block_size: u64,
         geo: layout.Geometry,
@@ -775,6 +781,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .data = data,
                 .ttls = opts.ttls,
                 .ttl_law = opts.ttl_law,
+                .ring = opts.ring,
                 .inline_max = data.inlineMax(),
                 .block_size = data.blockSize(),
                 .geo = data.geometry(),
@@ -1281,27 +1288,29 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// mode (no cadence) journals it at fsync, fsyncdir and the
         /// dismount. The record in hand leaves carrying the stamp. Never
         /// an error: an allocation refusal loses a lazy stamp, counted.
-        fn touchAtime(self: *Self, local: u64, v: *InodeValue) void {
+        /// True = a stamp parked.
+        fn touchAtime(self: *Self, local: u64, v: *InodeValue) bool {
             const law = self.atime_law.current();
             const stamp = now();
-            if (!atime.needsUpdate(law, economy.isDirMode(v.mode), .{ .atime = v.atime, .mtime = v.mtime, .ctime = v.ctime }, stamp)) return;
+            if (!atime.needsUpdate(law, economy.isDirMode(v.mode), .{ .atime = v.atime, .mtime = v.mtime, .ctime = v.ctime }, stamp)) return false;
             switch (self.pending.parkAtime(local, stamp) catch {
                 fuse_atime_touches_dropped.inc();
-                return;
+                return false;
             }) {
                 .parked => {},
                 .parked_wake_drain => self.times_drain_wake.notifyOne(self.io),
             }
             v.atime = stamp;
             fuse_atime_touches.inc();
+            return true;
         }
 
         /// `file_accessed`: a read through a description (READ, READDIR,
         /// READDIRPLUS) judges its open flags first — `O_NOATIME` never
         /// moves atime, whatever the mount's law (`atime.fileAccessed`).
-        fn fileAccessed(self: *Self, local: u64, v: *InodeValue, open_flags: u32) void {
-            if (!atime.fileAccessed(open_flags)) return;
-            self.touchAtime(local, v);
+        fn fileAccessed(self: *Self, local: u64, v: *InodeValue, open_flags: u32) bool {
+            if (!atime.fileAccessed(open_flags)) return false;
+            return self.touchAtime(local, v);
         }
 
         /// A READ served off the interception host's ring fast path
@@ -1314,19 +1323,21 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// (a hot file: one park per drain tick), a busy stripe parks
         /// nothing (never a spin on those threads). The ring binds regular
         /// files alone, so nodiratime never applies here. A description
-        /// opened `O_NOATIME` parks nothing.
-        pub fn note_read(self: *Self, _: *Ctx, a: filesystem.NoteReadArgs) void {
-            if (!atime.fileAccessed(a.flags)) return;
+        /// opened `O_NOATIME` parks nothing. True = a stamp or a candidate
+        /// parked (the host announces it to the kernel, decision 0003 §CE).
+        pub fn note_read(self: *Self, _: *Ctx, a: filesystem.NoteReadArgs) bool {
+            if (!atime.fileAccessed(a.flags)) return false;
             const law = self.atime_law.current();
-            if (law.read_only or law.posture == .noatime) return;
-            const local = localOf(a.ino) catch return;
+            if (law.read_only or law.posture == .noatime) return false;
+            const local = localOf(a.ino) catch return false;
             const rule: economy.AtimeRule = if (law.posture == .strictatime) .judged else .relatime;
             const parked = self.pending.parkAtimeIfAbsent(local, now(), rule) catch {
                 fuse_atime_touches_dropped.inc();
-                return;
-            } orelse return;
+                return false;
+            } orelse return false;
             if (parked == .parked_wake_drain) self.times_drain_wake.notifyOne(self.io);
             fuse_atime_touches.inc();
+            return true;
         }
 
         // ---- inode flags: the law's checks (`inode_flags.zig`) ----
@@ -1452,7 +1463,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         fn entryOf(self: *Self, global: u64, v: InodeValue) filesystem.Entry {
-            return .{ .nodeid = global, .generation = self.generationOf(global), .entry_ttl_ns = self.ttlsNow().entryTtlFor(economy.isDirMode(v.mode)), .attr_ttl_ns = self.attrTtlFor(v), .attr = self.attrOf(global, v) };
+            return self.entryInstalled(global, v, .checked);
+        }
+
+        fn entryInstalled(self: *Self, global: u64, v: InodeValue, install: AttrInstall) filesystem.Entry {
+            return .{ .nodeid = global, .generation = self.generationOf(global), .entry_ttl_ns = self.ttlsNow().entryTtlFor(economy.isDirMode(v.mode)), .attr_ttl_ns = self.attrTtlFor(v, install), .attr = self.attrOf(global, v) };
         }
 
         /// The generation every entry reply of `global` carries
@@ -1461,19 +1476,45 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return if (global == inos.ROOT_INO) 0 else self.entry_generation;
         }
 
-        fn attrReply(self: *Self, global: u64, v: InodeValue) filesystem.Attr {
-            return .{ .attr_ttl_ns = self.attrTtlFor(v), .attr = self.attrOf(global, v) };
+        fn attrReply(self: *Self, global: u64, v: InodeValue, install: AttrInstall) filesystem.Attr {
+            return .{ .attr_ttl_ns = self.attrTtlFor(v, install), .attr = self.attrOf(global, v) };
         }
 
-        /// The attr TTL a record is served with: the mount's, except for a
-        /// file carrying S_ISUID/S_ISGID — KILLPRIV_V2 is the daemon's
+        /// How the kernel installs a reply's attributes. `checked`: a
+        /// LOOKUP, GETATTR or READDIRPLUS reply is dropped when an
+        /// invalidation of the inode landed after the request began
+        /// (`attr_version`), so the ring's invalidations cover it.
+        /// `unchecked`: a SETATTR or LINK reply is installed whatever
+        /// landed meanwhile (`fuse_do_setattr`, `create_new_entry`).
+        const AttrInstall = enum { checked, unchecked };
+
+        /// The attr TTL a record is served with: the mount's, except
+        /// (1) a file carrying S_ISUID/S_ISGID — KILLPRIV_V2 is the daemon's
         /// (module doc), the WRITE reply carries no attrs and the kernel
         /// invalidates none on it, so a cached mode would outlive the clear
         /// (fstests generic/355: stat after a priv-killing write showed
         /// -rwSr-Sr--). 0 = every stat of such a file asks; they are rare.
-        fn attrTtlFor(self: *const Self, v: InodeValue) u64 {
-            if (v.mode & (S.ISUID | S.ISGID) != 0 and v.mode & S.IFMT == S.IFREG) return 0;
-            return self.ttlsNow().attr_ns;
+        /// (2) On an interception mount (decision 0003 §CE) an `unchecked`
+        /// reply of a regular file takes the charter's class (`ttls`): the
+        /// ring's invalidations drive the kernel's view of a file its
+        /// bindings change, and an unchecked reply formed before a bind
+        /// may be installed after the binding's first invalidation landed.
+        fn attrTtlFor(self: *const Self, v: InodeValue, install: AttrInstall) u64 {
+            if (v.mode & S.IFMT != S.IFREG) return self.ttlsNow().attr_ns;
+            if (v.mode & (S.ISUID | S.ISGID) != 0) return 0;
+            const ns = self.ttlsNow().attr_ns;
+            if (install == .unchecked and self.ring != null) return @min(ns, self.ttls.attr_ns);
+            return ns;
+        }
+
+        /// A size-setting commit of `local` is about to land, under its
+        /// exclusive guards: the data plane's size epoch (`DataPlane.
+        /// noteSizeSet`) and the ring's announced high-water — a ring write
+        /// that regrows the file past `size` is announced as the grow it is
+        /// (decision 0003 §CE).
+        fn noteSizeSet(self: *Self, local: u64, size: u64) Error!void {
+            try self.data.noteSizeSet(local);
+            if (self.ring) |r| r.sizeSet(globalOf(local), size);
         }
 
         /// The classes a reply takes now (the law's posture, else `ttls`).
@@ -2637,7 +2678,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             };
             const folded = if (economy.isDirMode(v.mode)) try self.foldIfStriped(a.ino, v) else v;
             c.stage(.meta_backend_done);
-            return self.attrReply(a.ino, folded);
+            return self.attrReply(a.ino, folded, .checked);
         }
 
         pub fn setattr(self: *Self, c: *Ctx, a: filesystem.SetattrArgs) Error!filesystem.Attr {
@@ -2668,7 +2709,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     try self.data.barrierData(self.io, &.{local});
                 }
                 const rep = try self.shipRecord(a.ino, .{ .setattr = .{ .mode = req.mode, .uid = req.uid, .gid = req.gid, .size = req.size, .atime = req.atime, .mtime = req.mtime, .ctime = req.ctime, .kill_suidgid = a.attr.kill_suidgid } });
-                return self.attrReply(a.ino, rep.inode orelse return error.FileNotFound);
+                // The holder set the size (no guard of this mount's held
+                // it): the ring's high-water follows (decision 0003 §CE).
+                if (req.size) |sz| if (self.ring) |r| r.sizeSet(a.ino, sz);
+                return self.attrReply(a.ino, rep.inode orelse return error.FileNotFound, .unchecked);
             }
             var after: AfterCommit = .{};
             defer self.dropAfter(&after);
@@ -2714,7 +2758,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 // a write whose bytes landed before this moment claims no
                 // size past it; a write-back unit formed before it merges
                 // nothing at or past the new end (`DataPlane.noteSizeSet`).
-                try self.data.noteSizeSet(local);
+                try self.noteSizeSet(local, sz);
                 stored.size = self.claimedSize(local, stored);
                 old_size = stored.size;
                 try self.stageTruncate(c, t, local, stored, sz, &after);
@@ -2731,7 +2775,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 self.restoreStaged(&after);
                 if (layout_lock) |g| g.release(self.io);
                 layout_lock = null;
-                return self.attrReply(a.ino, out.value);
+                return self.attrReply(a.ino, out.value, .unchecked);
             }
             if (a.attr.kill_suidgid) {
                 var v = out.value;
@@ -2757,7 +2801,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 self.afterCommit(&after);
                 self.data.noteShape(local, sz, if (kind == .striped) .striped else .inline_);
             }
-            return self.attrReply(a.ino, out.value);
+            return self.attrReply(a.ino, out.value, .unchecked);
         }
 
         // ---- fallocate (charter §6.6; decision 0003 §BH) ----
@@ -3141,7 +3185,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
-            try self.data.noteSizeSet(local);
+            try self.noteSizeSet(local, new_size);
             var stored = try self.readInode(local);
             stored.size = self.claimedSize(local, stored);
             const stamp = now();
@@ -3174,7 +3218,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const local = try localOf(a.ino);
             var v = try self.readInode(local);
             if (v.mode & S.IFMT != S.IFLNK) return error.InvalidArgument;
-            self.touchAtime(local, &v);
+            _ = self.touchAtime(local, &v);
             const target = (try self.xattrValue(local, economy.SYMLINK_XATTR)) orelse return error.InputOutput;
             defer self.gpa.free(target);
             if (target.len > c.window.len) return error.NameTooLong;
@@ -3788,7 +3832,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (try self.resumeOpen(c)) |_| {
                 const child = try localOf(a0.ino);
                 _ = self.pending.retire(child);
-                return self.entryOf(a0.ino, try self.readInode(child));
+                return self.entryInstalled(a0.ino, try self.readInode(child), .unchecked);
             }
             // The striped prelude: the new name keys its stripe.
             var a = a0;
@@ -3831,7 +3875,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 return e;
             };
             _ = self.pending.retire(child);
-            return self.entryOf(a.ino, out.child);
+            return self.entryInstalled(a.ino, out.child, .unchecked);
         }
 
         /// The cross-owner link: the count FIRST (its witness at the file's
@@ -3850,7 +3894,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             noteSubjects(c, a.ino, null);
             const done = try self.runPlan(c, &plan);
             _ = self.pending.retire(child);
-            return self.entryOf(a.ino, done.inode(0) orelse cv);
+            return self.entryInstalled(a.ino, done.inode(0) orelse cv, .unchecked);
         }
 
         pub fn open(self: *Self, c: *Ctx, a: filesystem.OpenArgs) Error!filesystem.Opened {
@@ -3893,7 +3937,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 errdefer if (t_owned) self.store.abandon(t);
                 var stored = try self.readInode(local);
                 // The size epoch moves before the clip (as the truncate's).
-                try self.data.noteSizeSet(local);
+                try self.noteSizeSet(local, 0);
                 stored.size = self.claimedSize(local, stored);
                 try self.stageTruncate(c, t, local, stored, 0, &after);
                 stored.size = 0;
@@ -3927,7 +3971,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const local = try localOf(a.ino);
             c.stage(.meta_backend_start);
             var v = try self.readInode(local);
-            self.fileAccessed(local, &v, a.flags);
+            if (self.fileAccessed(local, &v, a.flags)) c.atime_parked = true;
             v.size = self.claimedSize(local, v);
             if (a.offset >= v.size) {
                 c.stage(.meta_backend_done);
@@ -5133,7 +5177,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (virtual_inodes.isReservedCookie(a.offset)) return .{ .len = 0 };
             // The directory was read (every page of a listing is a read;
             // nodiratime and an O_NOATIME directory fd spare it).
-            self.fileAccessed(dir, &dv, a.flags);
+            _ = self.fileAccessed(dir, &dv, a.flags);
             const pos = key.decodeReaddirCookie(a.offset) catch return error.InvalidArgument;
             var plain = codec.DirentWriter.init(c.window, a.size);
             var rich = codec.DirentPlusWriter.init(c.window, a.size);
@@ -5988,6 +6032,74 @@ test "a file carrying S_ISUID/S_ISGID is served with attr TTL 0 on GETATTR, LOOK
     const a2 = abi.decodeExact(abi.fuse_attr_out, g2.outBytes()) orelse return error.TestBadReply;
     try testing.expectEqual(@as(u32, S.IFREG | 0o755), a2.attr.mode);
     try testing.expectEqual(ttl / std.time.ns_per_s, a2.attr_valid);
+}
+
+test "an interception mount is isolated (decision 0003 §CE): under its law every class is T_owner — directories, entries, regular files' attrs on LOOKUP and GETATTR — while a SETATTR or LINK reply of a regular file (installed unchecked) takes the charter's attr class; a kernel size set moves the ring's high-water; a peered law is the charter's classes everywhere" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const short = h.fs.ttls.attr_ns;
+    const long = mount_options.isolatedTtlNs(45_000);
+    try testing.expect(short < long);
+    var law = mount_options.TtlLaw.init(h.fs.ttls, 0, long, false);
+    var ring = try ring_inodes.Table.init(testing.allocator, 64);
+    defer ring.deinit(testing.allocator);
+    h.fs.ttl_law = &law;
+    h.fs.ring = &ring;
+    const s_of = struct {
+        fn attrValid(c: Loopback.Captured) !u64 {
+            const a = abi.decodeExact(abi.fuse_attr_out, c.outBytes()) orelse return error.TestBadReply;
+            return a.attr_valid * std.time.ns_per_s + a.attr_valid_nsec;
+        }
+        fn entryValid(e: abi.fuse_entry_out) u64 {
+            return e.entry_valid * std.time.ns_per_s + e.entry_valid_nsec;
+        }
+        fn entryAttrValid(e: abi.fuse_entry_out) u64 {
+            return e.attr_valid * std.time.ns_per_s + e.attr_valid_nsec;
+        }
+    };
+    const d = try h.mkdir(1, "d");
+    const f = try h.create(d, "f", 0o644);
+    var other = f + 1;
+    while (ring.stripeOf(other) == ring.stripeOf(f)) other += 1;
+    // The isolated classes everywhere: a directory and a file.
+    const de = try h.entry(h.lookup(1, "d"));
+    try testing.expectEqual(long, s_of.entryValid(de));
+    try testing.expectEqual(long, s_of.entryAttrValid(de));
+    try testing.expectEqual(long, try s_of.attrValid(h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, d)));
+    const fe = try h.entry(h.lookup(d, "f"));
+    try testing.expectEqual(long, s_of.entryValid(fe));
+    try testing.expectEqual(long, s_of.entryAttrValid(fe));
+    try testing.expectEqual(long, try s_of.attrValid(h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f)));
+    // SETATTR and LINK replies of a regular file are installed unchecked:
+    // the window's class; a directory's SETATTR keeps the mount's.
+    var sa = abi.zeroed(abi.fuse_setattr_in);
+    sa.valid = abi.FATTR_MODE;
+    sa.mode = 0o600;
+    try testing.expectEqual(short, try s_of.attrValid(h.setattr(f, sa)));
+    sa.mode = 0o755;
+    try testing.expectEqual(long, try s_of.attrValid(h.setattr(d, sa)));
+    const le = try h.entry(h.call(.{ .link = .{ .oldnodeid = f, .newname = "f2" } }, d));
+    try testing.expectEqual(long, s_of.entryValid(le));
+    try testing.expectEqual(short, s_of.entryAttrValid(le));
+    // A truncate through the kernel: the ring's high-water is the new
+    // size and its generation moved (a ring write admitted before it
+    // raises nothing past it).
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, "0123456789", 0).errno());
+    ring.word(f).store(@bitCast(ring_inodes.Word{ .hwm = 10, .gen = 0, .last_fire_s = 0 }), .seq_cst);
+    var tr = abi.zeroed(abi.fuse_setattr_in);
+    tr.valid = abi.FATTR_SIZE;
+    tr.size = 3;
+    _ = try h.attr(h.setattr(f, tr));
+    const w: ring_inodes.Word = @bitCast(ring.word(f).load(.seq_cst));
+    try testing.expectEqual(@as(u48, 3), w.hwm);
+    try testing.expectEqual(@as(u3, 1), w.gen);
+    try testing.expectEqual(@as(u64, 0), ring.word(other).load(.seq_cst));
+    // A member joined: the peered classes everywhere.
+    try testing.expect(law.enterPeered());
+    try testing.expectEqual(short, try s_of.attrValid(h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, d)));
+    try testing.expectEqual(short, s_of.entryValid(try h.entry(h.lookup(d, "f"))));
+    try testing.expectEqual(short, try s_of.attrValid(h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f)));
 }
 
 test "the drain worker's try-only LOOKUP / GETATTR (decision 0003 §AB.1) answers exactly what the lane answers — a present name's entry with its lookup reference noted, an absent name's negative entry, a GETATTR's attrs; a virtual or dot name declines to the lane" {
@@ -10308,13 +10420,13 @@ test "charter §4 'Access time' — a read the handler never sees (the intercept
     _ = try h.fs.drainPendingTimes(&ctx);
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
     const t0 = fuse_atime_touches.load();
-    h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
+    try testing.expect(h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 }));
     try testing.expectEqual(t0 + 1, fuse_atime_touches.load());
     try testing.expectEqual(@as(u64, 1), h.fs.pending.len());
     // The candidate does not show over a settled record...
     try testing.expectEqual(past + 10, (try h.getattr(f)).atime);
     // ...a second note parks nothing (one per drain tick)...
-    h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
+    try testing.expect(!h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 }));
     try testing.expectEqual(t0 + 1, fuse_atime_touches.load());
     // ...and the drain drops it: no Δ, the stored record unmoved.
     try testing.expectEqual(@as(u64, 0), try h.fs.drainPendingTimes(&ctx));
@@ -10325,7 +10437,7 @@ test "charter §4 'Access time' — a read the handler never sees (the intercept
     written.mtime = past + 20;
     written.ctime = past + 20;
     _ = try h.attr(h.setattr(f, written));
-    h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
+    _ = h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
     const shown = try h.getattr(f);
     try testing.expect(shown.atime >= past + 20);
     try testing.expectEqual(past + 20, shown.mtime);
@@ -10337,13 +10449,13 @@ test "charter §4 'Access time' — a read the handler never sees (the intercept
     // strictatime: the candidate is judged — it lands over a settled record.
     _ = try h.attr(h.setattr(f, settled));
     _ = h.fs.atime_law.set(.{ .posture = .strictatime });
-    h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
+    _ = h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
     try testing.expect((try h.getattr(f)).atime > past + 10);
     try testing.expectEqual(@as(u64, 1), try h.fs.drainPendingTimes(&ctx));
     // noatime: nothing parks.
     _ = h.fs.atime_law.set(.{ .posture = .noatime });
     const t1 = fuse_atime_touches.load();
-    h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
+    try testing.expect(!h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 }));
     try testing.expectEqual(t1, fuse_atime_touches.load());
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
 }
@@ -10381,7 +10493,7 @@ test "charter §4 'Access time' — O_NOATIME (LTP open12): under strictatime a 
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .readdir = dir_in }, d).errno());
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .readdirplus = dir_in }, d).errno());
     try testing.expectEqual(past, (try h.getattr(d)).atime);
-    h.fs.note_read(&ctx, .{ .ino = f, .flags = o_noatime });
+    _ = h.fs.note_read(&ctx, .{ .ino = f, .flags = o_noatime });
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
     try testing.expectEqual(t0, fuse_atime_touches.load());
     try testing.expectEqual(past, (try h.getattr(f)).atime);
@@ -10396,7 +10508,7 @@ test "charter §4 'Access time' — O_NOATIME (LTP open12): under strictatime a 
     try testing.expectEqual(t0 + 2, fuse_atime_touches.load());
     _ = try h.fs.drainPendingTimes(&ctx);
     _ = try h.attr(h.setattr(f, back));
-    h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
+    _ = h.fs.note_read(&ctx, .{ .ino = f, .flags = 0 });
     try testing.expect((try h.getattr(f)).atime > past);
     try testing.expectEqual(t0 + 3, fuse_atime_touches.load());
     // READLINK: the mount's law alone.

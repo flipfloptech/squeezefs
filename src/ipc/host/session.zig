@@ -28,6 +28,7 @@ const doorbell = @import("../doorbell.zig");
 const wire = @import("../wire.zig");
 const rendezvous = @import("../rendezvous.zig");
 const shm = @import("../shm.zig");
+const inval = @import("inval.zig");
 const stats = @import("stats.zig").stats;
 
 /// Bindings per session: 4 × the default `RLIMIT_NOFILE` soft limit (1024)
@@ -48,6 +49,10 @@ pub const Binding = struct {
     /// `F_SETFL` toggle of it, as of `O_DIRECT`).
     noatime: bool = false,
     live: Atomic(bool) = .init(false),
+    /// A ring write of this binding the limiter's window suppressed: the
+    /// kernel may hold pages or times it changed until a whole fire — the
+    /// window's trailing sweep, the UNBIND, the teardown (`inval.zig`).
+    dirty: Atomic(bool) = .init(false),
 
     /// The description's open flags as the handler's arms read them — the
     /// kernel's `fuse_read_in.flags` / `fuse_write_in.flags` for a bound fd.
@@ -105,6 +110,9 @@ pub const Session = struct {
     direct_granted: bool = false,
     direct_write_granted: bool = false,
     poisoned: Atomic(bool) = .init(false),
+    /// Some row went dirty since the last trailing sweep (raised on a row's
+    /// clean → dirty edge, after the mark; `IpcHost.sweepDirty`).
+    sweep: Atomic(bool) = .init(false),
     /// The handoff fibers (joined at teardown).
     group: Io.Group = .init,
 
@@ -181,11 +189,13 @@ pub const Session = struct {
     }
 
     /// UNBIND: the row dies (a later op naming it is a descriptor reject);
-    /// answers the ino it bound, null for an unknown or dead id.
+    /// answers the ino it bound, null for an unknown or dead id. SeqCst:
+    /// the row is dead before its dirty mark is read (the Dekker pair with
+    /// a write's `inval.Row`).
     pub fn unbind(self: *Session, id: u64) ?u64 {
         if (id == 0 or id > self.bindings.len) return null;
         const b = &self.bindings[@intCast(id - 1)];
-        if (!b.live.swap(false, .acq_rel)) return null;
+        if (!b.live.swap(false, .seq_cst)) return null;
         stats.ipc_unbinds.inc();
         return b.ino;
     }
@@ -198,11 +208,23 @@ pub const Session = struct {
         return b;
     }
 
-    /// Is `ino` bound by any live row of this session?
-    pub fn bindsIno(self: *Session, ino: u64) bool {
-        const n: usize = @intCast(@min(self.next_binding.load(.monotonic) - 1, self.bindings.len));
-        for (self.bindings[0..n]) |*b| if (b.live.load(.acquire) and b.ino == ino) return true;
-        return false;
+    /// The row `id` names, live or not; null for an id outside the table.
+    pub fn row(self: *Session, id: u64) ?*Binding {
+        if (id == 0 or id > self.bindings.len) return null;
+        return &self.bindings[@intCast(id - 1)];
+    }
+
+    /// The rows issued so far (live or not).
+    pub fn rows(self: *Session) []Binding {
+        return self.bindings[0..@intCast(@min(self.next_binding.load(.monotonic) - 1, self.bindings.len))];
+    }
+
+    /// A ring write's view of its binding (`inval.Row`): the row's
+    /// liveness and dirty mark, this session's teardown and sweep flag.
+    /// `id` was screened at the op's dequeue.
+    pub fn ringRow(self: *Session, id: u64) inval.Row {
+        const r = self.row(id).?;
+        return .{ .torn_down = &self.torn_down, .live = &r.live, .dirty = &r.dirty, .sweep = &self.sweep };
     }
 
     // ---- the in-flight ledger and the completion ----
@@ -284,7 +306,7 @@ pub const TestSession = struct {
     }
 };
 
-test "bindings: ids are dense from 1, a dead row is a descriptor reject, the table refuses past its bound; bindsIno sees live rows only; the row's open flags carry O_DIRECT and O_NOATIME as screened" {
+test "bindings: ids are dense from 1, a dead row is a descriptor reject, the table refuses past its bound; the ring row reads a row dead once unbound and every row dead once the session tears down; the row's open flags carry O_DIRECT and O_NOATIME as screened" {
     var ts = try TestSession.init(testing.allocator, .{ .ring_entries = 8, .slots = 4, .arena_bytes = 8 * layout.PAGE_BYTES, .max_op_bytes = layout.PAGE_BYTES });
     defer ts.deinit();
     const s = ts.s;
@@ -302,11 +324,16 @@ test "bindings: ids are dense from 1, a dead row is a descriptor reject, the tab
     try testing.expectEqual(@as(u32, @bitCast(o)), s.binding(3).?.openFlags());
     try testing.expectEqual(@as(?u64, 79), s.unbind(3));
     try testing.expect(s.binding(0) == null and s.binding(4) == null);
-    try testing.expect(s.bindsIno(78));
+    try testing.expect(s.ringRow(2).alive());
     try testing.expectEqual(@as(?u64, 78), s.unbind(2));
     try testing.expect(s.unbind(2) == null);
     try testing.expect(s.binding(2) == null);
-    try testing.expect(!s.bindsIno(78));
+    try testing.expect(!s.ringRow(2).alive());
+    try testing.expectEqual(@as(usize, 3), s.rows().len);
+    try testing.expect(s.ringRow(1).alive());
+    s.torn_down.store(true, .seq_cst);
+    try testing.expect(!s.ringRow(1).alive());
+    s.torn_down.store(false, .seq_cst);
     try testing.expectEqual(@as(u64, BINDINGS_PER_SESSION), s.bindings.len);
 }
 

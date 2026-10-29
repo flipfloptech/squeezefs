@@ -731,12 +731,13 @@ pub const DataPlaneSink = struct {
     /// posture still applies to it (charter §4 "Access time") — the
     /// filesystem's `note_read` parks what it must and never waits (the
     /// handler arms stamp inside `read` itself); the bound description's
-    /// `O_NOATIME` spares it.
+    /// `O_NOATIME` spares it. A parked stamp is announced to the kernel,
+    /// whose cached attributes may be the mount's long class (§CE).
     fn noteRead(self: *DataPlaneSink, b: *const session_mod.Binding) void {
         // No op trace: this is not an op (no clock read, no latency row).
         var quiet: op_trace.OpTrace = .{ .unique = 0, .class = .other, .profiling = false, .t_entry = 0 };
         var ctx = self.ctxFor(&quiet, &.{});
-        self.fs.vtable.note_read(self.fs.impl, &ctx, .{ .ino = b.ino, .flags = b.openFlags() });
+        if (self.fs.vtable.note_read(self.fs.impl, &ctx, .{ .ino = b.ino, .flags = b.openFlags() })) self.inval.onAtime(b.ino);
     }
 
     /// The read handoff: the FULL handler on a lane homed on the session's
@@ -795,6 +796,7 @@ pub const DataPlaneSink = struct {
         defer trace.finish();
         var ctx = self.ctxFor(&trace, op.window);
         const r = self.fs.vtable.read(self.fs.impl, &ctx, .{ .ino = op.binding.ino, .fh = 0, .offset = op.desc.offset, .size = op.desc.len, .flags = op.binding.openFlags() }) catch |e| return c.fail(errors.toErrno(e));
+        if (ctx.atime_parked) self.inval.onAtime(op.binding.ino);
         // The handler's window IS the arena: landed in place.
         stats.ipc_read_dest_serves.inc();
         stats.ipc_read_demote_bytes.add(r.len);
@@ -864,7 +866,7 @@ pub const DataPlaneSink = struct {
     /// lock, the same arms (`kv_fs.write` → `WritePath.write`), the
     /// binding's `kill_priv` as `FUSE_WRITE_KILL_SUIDGID`, a `sync`
     /// durability binding's barrier BEFORE its DONE, the ledger, the
-    /// completion, THEN the KD-11 invalidation.
+    /// KD-11 invalidation, THEN the completion.
     fn writeHandoff(self: *DataPlaneSink, op: DataOp, c: Completion, sev: Severed) void {
         defer self.dropSevered(sev);
         var trace = op_trace.OpTrace.begin(0, .write);
@@ -872,6 +874,9 @@ pub const DataPlaneSink = struct {
         var ctx = self.ctxFor(&trace, &.{});
         const nodeid = op.binding.ino;
         const end = op_guard.validateRange(op.desc.offset, op.desc.len, self.max_file_size) catch |e| return c.fail(errors.toErrno(e));
+        // Before the admission: a kernel size set after it outdates this
+        // write's end (`ring_inodes.Table.sizeSet`).
+        const gen = self.inval.table.genOf(nodeid);
         const bytes = sev.bytes();
         const written = blk: {
             var adm = op_guard.admitWrite(self.guards, self.io, self.probe, self.shared_enabled, nodeid, op.desc.offset, end);
@@ -905,7 +910,7 @@ pub const DataPlaneSink = struct {
         stats.ipc_ops_write.inc();
         stats.ipc_bytes_in.add(written);
         // A grow announces its size to the kernel BEFORE the ack (POSIX-8).
-        _ = self.inval.onWrite(nodeid, op.desc.offset + written, clock.realtimeCoarseS());
+        _ = self.inval.onWrite(nodeid, op.desc.offset + written, clock.realtimeCoarseS(), gen, c.session.ringRow(op.desc.binding));
         c.complete(@intCast(written));
     }
 

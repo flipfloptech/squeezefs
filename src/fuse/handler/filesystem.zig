@@ -71,6 +71,10 @@ pub const Ctx = struct {
     /// host's handoffs (KD-11) — so its commits are `kernel_told`: never
     /// invalidated back, with the ack posture of a non-kernel origin.
     kernel_told: bool = false,
+    /// Out: the op parked an access time (a READ under the mount's atime
+    /// posture) — the IPC host's handoff announces it to the kernel, whose
+    /// cached attributes may be the mount's long class (decision 0003 §CE).
+    atime_parked: bool = false,
 
     /// Stamp a stage: the trace moves (a clock read only under profiling)
     /// and the watchdog station follows (one relaxed store).
@@ -357,8 +361,11 @@ pub const VTable = struct {
     /// `read` (the interception host's ring fast path, charter §7) tells
     /// the filesystem so the mount's atime posture applies to it too
     /// (charter §4 "Access time": the law is the file's, not the path's).
-    /// Never blocks, never fails; the default notes nothing.
-    note_read: *const fn (*anyopaque, *Ctx, NoteReadArgs) void = &defaults.note_read,
+    /// Never blocks, never fails; the default notes nothing. True = a stamp
+    /// or a candidate parked that the kernel's cached attributes do not
+    /// show (the interception host announces it, decision 0003 §CE; the
+    /// FUSE legs need not — the kernel invalidates atime after every READ).
+    note_read: *const fn (*anyopaque, *Ctx, NoteReadArgs) bool = &defaults.note_read,
 };
 
 /// `flags`: the reading description's open flags as the leg holds them
@@ -370,7 +377,9 @@ const defaults = struct {
     fn init(_: *anyopaque, _: *Ctx, _: InitArgs) Error!void {}
     fn destroy(_: *anyopaque, _: *Ctx, _: DestroyArgs) void {}
     fn forget(_: *anyopaque, _: *Ctx, _: ForgetArgs) void {}
-    fn note_read(_: *anyopaque, _: *Ctx, _: NoteReadArgs) void {}
+    fn note_read(_: *anyopaque, _: *Ctx, _: NoteReadArgs) bool {
+        return false;
+    }
     fn enosys(comptime Args: type, comptime Reply: type) fn (*anyopaque, *Ctx, Args) Error!Reply {
         return struct {
             fn f(_: *anyopaque, _: *Ctx, _: Args) Error!Reply {

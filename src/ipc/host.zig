@@ -58,6 +58,7 @@ const rl = @import("rendezvous_linux.zig");
 const shm = @import("shm.zig");
 const doorbell = @import("doorbell.zig");
 const ipc = @import("ipc.zig");
+const ring_inodes = @import("ring_inodes.zig");
 
 pub const stats = @import("host/stats.zig");
 pub const severed_pool = @import("host/severed_pool.zig");
@@ -118,8 +119,13 @@ pub const Deps = struct {
     probe: op_guard.Probe,
     shared_enabled: bool,
     opens: *open_table.OpenTable,
-    /// `Session.notifyInvalInode` (the KD-11 invalidator's hook).
+    /// `Session.notifyInvalInode` and its attrs-only kin (the KD-11
+    /// invalidator's hook).
     notify: inval.Hook,
+    /// The mount's ring table (`ring_inodes.zig`, decision 0003 §CE): the
+    /// limiter keeps its words there, the filesystem's size sets lower
+    /// their high-water. Outlives the host.
+    ring: *const ring_inodes.Table,
     our_commit: []const u8,
     /// The mount root's device (`rendezvous_linux.deviceOf`, resolved
     /// BEFORE the host arms — decision 0002 row 309).
@@ -251,13 +257,12 @@ pub const IpcHost = struct {
         errdefer gpa.free(self.owner_load);
         @memset(self.owner_load, 0);
         self.partition(ceiling);
-        // The pools and the invalidator.
+        // The pools and the invalidator (over the mount's ring table).
         self.pool = try severed_pool.SeveredPool.init(gpa, @intCast(geometry.max_op_bytes), severed_pool.poolSlots(arena_cap, geometry.max_op_bytes));
         errdefer self.pool.deinit();
         self.placed = try placed.Registry.init(gpa, &d.plane.wp.table.pool, @intCast(d.block_size), placed.assemblyCapBytes(d.budget_bytes));
         errdefer self.placed.deinit();
-        self.inval = try inval.Invalidator.init(gpa, op_guard.INODE_GUARD_STRIPES, d.notify, inval.Invalidator.windowMsFromEnv(d.env));
-        errdefer self.inval.deinit(gpa);
+        self.inval = inval.Invalidator.init(d.ring, d.notify, inval.Invalidator.windowMsFromEnv(d.env));
         mem_budget.authority.register(mem_budget.Component.init("ipc_session_arenas", 0, 1, .{ .gauge = &hs.ipc_arena_bytes }, .{ .ctx = self, .call = &shedFn }));
         mem_budget.authority.register(self.pool.component());
         mem_budget.authority.register(self.placed.component());
@@ -439,7 +444,6 @@ pub const IpcHost = struct {
             dd.deinit();
             self.gpa.free(fds);
         }
-        self.inval.deinit(self.gpa);
         self.placed.deinit();
         self.pool.deinit();
         self.gpa.free(self.owner_load);
@@ -717,6 +721,9 @@ pub const IpcHost = struct {
         const owners = self.gpa.alloc(*Session, self.sessions.len) catch return;
         defer self.gpa.free(owners);
         const tick_ms: i32 = @intCast(reapTickNs(rendezvous.IDLE_REAP_NS) / std.time.ns_per_ms);
+        // The limiter's trailing sweep, once per window (decision 0003 §CE).
+        const sweep_ns = self.inval.windowNs();
+        var next_sweep = clock.monotonicNs() + sweep_ns;
         while (!self.stop.load(.acquire)) {
             fds[0] = .{ .fd = self.poll_efd, .events = linux.POLL.IN, .revents = 0 };
             var n: usize = 1;
@@ -731,16 +738,21 @@ pub const IpcHost = struct {
                     n += 1;
                 };
             }
-            const rc = linux.poll(fds.ptr, @intCast(n), tick_ms);
+            const to_sweep_ms: i32 = @intCast((next_sweep -| clock.monotonicNs()) / std.time.ns_per_ms + 1);
+            const rc = linux.poll(fds.ptr, @intCast(n), @min(tick_ms, to_sweep_ms));
             const ready: usize = if (linux.errno(rc) == .SUCCESS) rc else 0;
             if (fds[0].revents != 0) {
                 var drain: u64 = 0;
                 _ = linux.read(self.poll_efd, std.mem.asBytes(&drain), 8);
             }
+            const now = clock.monotonicNs();
+            const sweep = now >= next_sweep;
+            if (sweep) next_sweep = now + sweep_ns;
             var i: usize = 1;
             while (i < n) : (i += 1) {
                 const s = owners[i - 1];
                 if (fds[i].revents != 0 and !s.torn_down.load(.acquire)) self.handleCtl(s, fds[i].revents);
+                if (sweep and !s.torn_down.load(.acquire)) self.sweepDirty(s);
                 if (s.poisoned.load(.acquire)) self.teardown(s, "poisoned");
                 _ = s.map.releaseRef();
             }
@@ -789,9 +801,11 @@ pub const IpcHost = struct {
                             return;
                         };
                         s.touch(clock.monotonicNs());
+                        // The limiter's word BEFORE the answer: no ring write
+                        // of the binding precedes it (decision 0003 §CE).
+                        self.inval.onBind(ok.ino, self.sizeOf(ok.ino), clock.realtimeCoarseS());
                         const reply: wire.BindOk = .{ .rights = ok.rights, .binding_id = id, .ino = ok.ino, .durability_granted = @backingInt(durability) };
                         rl.sendCtl(s.ctl, wire.frameBytes(&reply), null) catch {};
-                        self.inval.onBind(ok.ino, self.sizeOf(ok.ino), clock.realtimeCoarseS());
                     },
                     .refuse => |class| {
                         ipc.countRefusal(class);
@@ -804,7 +818,7 @@ pub const IpcHost = struct {
                 const req = wire.decodeFixed(wire.Unbind, frame) catch return self.malformed(s);
                 if (s.unbind(req.binding_id)) |ino| {
                     self.write_leases.release(s, ino);
-                    if (!self.inoBoundAnywhere(ino)) self.inval.onLastUnbind(ino, clock.realtimeCoarseS());
+                    if (self.inval.fireIfDirty(ino, &s.row(req.binding_id).?.dirty)) hs.ipc_inval_unbind_fires.inc();
                 }
             },
             .direct_hello => {
@@ -844,7 +858,7 @@ pub const IpcHost = struct {
                         var quiet: op_trace.OpTrace = .{ .unique = 0, .class = .other, .profiling = false, .t_entry = 0 };
                         var ctx: filesystem.Ctx = .{ .unique = 0, .uid = linux.geteuid(), .gid = linux.getegid(), .pid = @intCast(linux.getpid()), .io = self.d.io, .trace = &quiet, .wd_slot = null, .window = &.{} };
                         const b = s.binding(req.binding_id).?;
-                        self.d.fs.vtable.note_read(self.d.fs.impl, &ctx, .{ .ino = b.ino, .flags = b.openFlags() });
+                        if (self.d.fs.vtable.note_read(self.d.fs.impl, &ctx, .{ .ino = b.ino, .flags = b.openFlags() })) self.inval.onAtime(b.ino);
                     },
                     .refused => |class| {
                         direct_lease.countRefusal(class);
@@ -862,7 +876,7 @@ pub const IpcHost = struct {
                     // the kernel's cache told (KD-11), the volumes touched
                     // for the fsync barrier.
                     self.d.opens.noteDurableWrite(b.ino);
-                    _ = self.inval.onWrite(b.ino, note.max_end, clock.realtimeCoarseS());
+                    _ = self.inval.onWrite(b.ino, note.max_end, clock.realtimeCoarseS(), null, s.ringRow(note.binding_id));
                     if (self.d.plane.wp.patchDeps().touched) |t| {
                         var mask = note.vols_mask;
                         while (mask != 0) : (mask &= mask - 1) t.stamp(t.ctx, route_table.effectiveIno(b.ino), @ctz(mask));
@@ -894,13 +908,15 @@ pub const IpcHost = struct {
         return info.size;
     }
 
-    fn inoBoundAnywhere(self: *IpcHost, ino: u64) bool {
-        self.reg_lock.lockUncancelable(self.io);
-        defer self.reg_lock.unlock(self.io);
-        for (self.sessions) |maybe| if (maybe) |s| {
-            if (!s.torn_down.load(.acquire) and s.bindsIno(ino)) return true;
-        };
-        return false;
+    /// The window's trailing sweep over one session (decision 0003 §CE):
+    /// every row a suppressed write marked since the last sweep fires whole
+    /// (the flag is lowered BEFORE the rows are read: a row marked during
+    /// the scan raises it again for the next sweep).
+    fn sweepDirty(self: *IpcHost, s: *Session) void {
+        if (!s.sweep.swap(false, .seq_cst)) return;
+        for (s.rows()) |*r| {
+            if (self.inval.fireIfDirty(r.ino, &r.dirty)) hs.ipc_inval_sweep_fires.inc();
+        }
     }
 
     /// Sessions idle ≥ the window: a silent generation bump, the teardown
@@ -975,7 +991,12 @@ pub const IpcHost = struct {
     /// Exactly once (module doc). The caller holds a share of `s` it
     /// releases itself; the registry's share drops here after the join.
     fn teardown(self: *IpcHost, s: *Session, reason: []const u8) void {
-        if (s.torn_down.swap(true, .acq_rel)) return;
+        // SeqCst: the session is dead before its rows' dirty marks are read
+        // (a write still in flight reads it dead and fires its own).
+        if (s.torn_down.swap(true, .seq_cst)) return;
+        for (s.rows()) |*r| {
+            if (self.inval.fireIfDirty(r.ino, &r.dirty)) hs.ipc_inval_unbind_fires.inc();
+        }
         {
             self.reg_lock.lockUncancelable(self.io);
             defer self.reg_lock.unlock(self.io);

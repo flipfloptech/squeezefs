@@ -194,7 +194,8 @@ pub const ring = struct {
             };
             var quiet: op_trace.OpTrace = .{ .unique = 0, .class = .other, .profiling = false, .t_entry = 0 };
             var c: Ctx = .{ .unique = req.header.unique, .uid = req.header.uid, .gid = req.header.gid, .pid = req.header.pid, .io = b.d.io, .trace = &quiet, .wd_slot = null, .window = &.{}, .kernel = true };
-            b.d.fs.vtable.note_read(b.d.fs.impl, &c, .{ .ino = req.nodeid(), .flags = flags });
+            // The kernel invalidates its own atime after a READ: nothing to announce.
+            _ = b.d.fs.vtable.note_read(b.d.fs.impl, &c, .{ .ino = req.nodeid(), .flags = flags });
         }
 
         /// The direct device leg with its post-DMA recheck hook.

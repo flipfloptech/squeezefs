@@ -23,6 +23,8 @@ pub const doorbell = @import("doorbell.zig");
 pub const doorbell_model = @import("doorbell_model.zig");
 pub const write_lease_core = @import("write_lease_core.zig");
 pub const write_lease_model = @import("write_lease_model.zig");
+pub const ring_inodes = @import("ring_inodes.zig");
+pub const ring_inodes_model = @import("ring_inodes_model.zig");
 pub const wire = @import("wire.zig");
 pub const sizing = @import("sizing.zig");
 pub const rendezvous = @import("rendezvous.zig");
@@ -120,6 +122,8 @@ test {
     _ = doorbell_model;
     _ = write_lease_core;
     _ = write_lease_model;
+    _ = ring_inodes;
+    _ = ring_inodes_model;
     _ = wire;
     _ = sizing;
     _ = rendezvous;

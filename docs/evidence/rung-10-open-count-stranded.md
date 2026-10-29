@@ -49,3 +49,15 @@ fstests test set's teardown logged `residency backstop lapsed` once per group (9
 are not counted against the slack; a handler they crowd out takes the fallback (0 fallbacks in 50 runs). (d) A rig
 writes ≈ 19 GiB of real blocks (fsstress's gap zeros): two rigs at once filled `/build/tmp` and failed the metadata
 devices ENOSPC (the harness's) — two bisect runs and two of ours stalled so.
+
+## The A-B-B-A (2026-10-29, quiet host on AC, the RAM-NVMe perf mount, 2 MDT + 2 OST, dist builds)
+
+`dev` `5b86c9f` against the fix (`9a84e3d`), two rounds of legs A B B A, mdtest `-n 10000 -u -i 1` plain and
+`-w 4096 -e 4096` at -np 32 and 64, fsck clean after all 32 runs; k ops/s, the mean of four legs per arm.
+Every row within ± 5 % of `dev` (file creation −1.4 / +1.2 / +0.9 / −0.3 %, file removal +2.5 / −0.6 /
++0.6 / +4.5 %, file read +6.6 / +4.2 / +3.8 / −1.8 %) but ONE: plain directory creation at -np 32,
+−10.0 % (`dev` 278 / 251 / 289 / 293, the fix 251 / 247 / 254 / 248), while the same row reads +2.0 % at
+-np 64 and −1.1 % in the 4 KiB shape at -np 32. Landed as a correctness fix (gate 176 green, 75/75): the
+regression it closes answers EAGAIN to applications; the mkdir row is OWED — measured with counters
+(`exec_fanout_inline`, `transport_dispatch_fallbacks` per phase) and recovered on a follow-up branch.
+Sessions: `/build/perf/occ-abba/`, `occ-abba2/`.

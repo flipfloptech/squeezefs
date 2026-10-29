@@ -49,3 +49,16 @@ No piece of `UserEnts` had a 7.3-only reason to stay.
 The zc rows that skipped without kmbuf now run on the pool: zc READ moved 1,048,576 B with zero daemon
 copies, the fused poll took 16 fusions, the measured row read 1.00 enters/request copying vs 3.04 zero-copy,
 the owed spin hit 58 times.
+
+## The A-B-B-A (2026-10-29, quiet host on AC, the RAM-NVMe perf mount, 2 MDT + 2 OST, dist builds)
+
+`dev` `6415dc1` against `35a0b82`. **fio matrix** (one `baseline.sh ram-sqz` psync session per leg, legs
+dev / the fallocate branch / this / this / the fallocate branch / dev): every 4 KiB and 1 MiB row within
+± 4.5 % of `dev` (4k randread QD1 +4.5 %, ×32 +0.2 %, ×32×4 −1.0 %; 4k randwrite +1.8 / −0.1 / −0.3 %; 1 MiB
+seq read −0.8 / −1.5 %, write −1.9 / +1.2 %; 4 MiB write −3.7 %), 64 KiB +5.2 % read / +8.2 % write.
+**mdtest** `-n 10000 -u -i 1` at -np 32 over three rounds (6 legs per arm), plain / `-w 4096 -e 4096`:
+directory creation −0.1 / +0.3 %, removal +1.7 / −0.8 %, file creation +2.2 / +1.2 %, read +2.3 / +1.4 %,
+removal −1.8 / −0.2 %; -np 64 (one round) within the legs' spread. fsck clean after every run. Landed
+(gate 181 red on an unrelated timing row — DEFRAG --fold … `awaitJobMidRun` JobCompletedEarly, fixed on
+its own branch — and gate 182 green on the identical tree). Sessions: `/build/perf/mx/results.tsv`
+(`ram-sqz-rrc*`), `/build/perf/rc-md/`, `d7-md2/`, `d7-md3/`.

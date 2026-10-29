@@ -3546,7 +3546,7 @@ fn stagingRecoveredOf(log_text: []const u8, member_root_tail: []const u8) ?u64 {
     return last;
 }
 
-test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN write cache (0003 §T.1 over the memfd ring): A (the manager) stages 200 files, B joins beside A's LIVE ring and recovers 0 records; B's dismount promotes its own 8 files, A's dismount A's 200 — every one sha-equal after a remount; fsck --offline --scrub 0 findings" {
+test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN write cache (0003 §T.1 over the memfd ring): A (the manager) stages 200 files, B joins beside A's LIVE ring and recovers 0 records; B's dismount promotes its own 8 files, A's dismount A's 200 — every one sha-equal after a remount; fsck --offline --scrub 0 findings; every read of a member's residents follows an outside syncfs of both mounts (a host-wide sync(2), 0003 §CF.6: the members hold their residents under the seam)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -3555,6 +3555,9 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
     try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
     var t_owner_text: [8]u8 = undefined;
     try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    // The row's law is what B's join and dismount do to A's LIVE residents:
+    // both members keep theirs across any syncfs (decision 0003 §CF.6).
+    try rig.env.put("SQUEEZEFS_TEST_SYNCFS_KEEPS_STAGED", "1");
     try rig.formatSet(true);
     try rig.createImage();
     try rig.mountAsSet(&.{});
@@ -3574,6 +3577,9 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
     const a_staged = blk: {
         const sa = try rig.stats();
         defer gpa.free(sa);
+        // The outside syncfs reached A (FUSE_HAS_SYNCFS negotiated): the
+        // seam's hold, not a missed sync, is what keeps the residents.
+        try testing.expect((numberAfter(sa, "\"fuse_syncfs\":") orelse 0) >= 1);
         break :blk numberAfter(sa, "\"current_staged_write_bytes\":") orelse 0;
     };
     try testing.expect(a_staged >= scope_a_files * 64 * 1024);

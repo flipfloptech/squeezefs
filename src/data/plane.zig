@@ -400,6 +400,9 @@ const Staging = struct {
     /// The bound at the mount (the memfd's capacity: the knob over the
     /// budget the mount resolved); the live bound never exceeds it.
     bound: u64,
+    /// `SQUEEZEFS_TEST_SYNCFS_KEEPS_STAGED`: a syncfs leaves the residents
+    /// resident (the member-scope row's hold against a host-wide sync).
+    syncfs_keeps: bool,
     /// A sweep task is spawned or running (`sweepRing`): one at a time.
     sweep_armed: Atomic(bool) = .init(false),
     /// A drain task (`evictUntil` through the promote sink) is spawned or
@@ -1227,7 +1230,8 @@ pub const DataPlane = struct {
             },
         };
         errdefer ram.release();
-        self.stage = .{ .ram = ram, .marker = ours, .seg = undefined, .pool = undefined, .sink = undefined, .cache = undefined, .pct = knobs.intKnob("SQUEEZEFS_WRITE_CACHE_PCT", u64, opts.env), .bound = undefined };
+        self.stage = .{ .ram = ram, .marker = ours, .seg = undefined, .pool = undefined, .sink = undefined, .cache = undefined, .pct = knobs.intKnob("SQUEEZEFS_WRITE_CACHE_PCT", u64, opts.env), .bound = undefined, .syncfs_keeps = knobs.boolKnob("SQUEEZEFS_TEST_SYNCFS_KEEPS_STAGED", opts.env) };
+        if (self.stage.?.syncfs_keeps) log.warn("write cache: SQUEEZEFS_TEST_SYNCFS_KEEPS_STAGED — a syncfs keeps this member's residents staged (a test seam: sync(2) does not make them durable)", .{});
         const st = &self.stage.?;
         const r = &st.ram;
         if (r.found) |f| log.info("write cache: this member's previous incarnation (appender {d}, node {x:0>16}, pid {d}) is dead — its ring ({d} MiB) handed over by its supervisor; its residents are the successor's (the scan below adopts them)", .{ f.appender_id, f.node_token, f.owner_pid, r.capacity() >> 20 });
@@ -2089,10 +2093,10 @@ pub const DataPlane = struct {
     /// epochs' saves. The meta barrier is the filesystem's (store-wide).
     pub fn syncfs(self: *DataPlane, io: Io, prof: *fsync_mod.SyncfsProf) Error!void {
         var ctx = self.wp.fsyncCtx();
-        if (self.stage) |*st| {
+        if (self.stage) |*st| if (!st.syncfs_keeps) {
             ctx.promotion = st.pool.hooks;
             ctx.staged_segment = &st.seg;
-        }
+        };
         fsync_mod.syncfs(ctx, self.gpa, io, prof) catch |e| return switch (e) {
             error.NoSpaceLeft => error.NoSpaceLeft,
             error.InputOutput, error.IntentBarrierFailed, error.MetaBarrierFailed => blk: {

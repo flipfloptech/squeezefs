@@ -196,6 +196,11 @@ pub const FlushResult = struct {
     /// Fresh images the structural seam wrote (the per-image unit's count).
     images: u64 = 0,
     failure: FlushFailure = .none,
+
+    /// The error a `.failed` result fails the cycle with.
+    pub fn cycleError(r: FlushResult) CycleError {
+        return failureError(r.failure);
+    }
 };
 
 pub const FlushMode = enum {

@@ -765,14 +765,21 @@ pub fn writeEntryAfterRelease(j: *SmoJournal, r: jc.InflightRegistry.Registered,
 /// is 0); `0` = off; unarmed cost is one monotonic load per SMO.
 pub var test_smo_build_pause_tree: std.atomic.Value(u64) = .init(0);
 
-/// 1 ⇒ the next `smoReplace` fails right after its in-window reservation,
-/// as an allocation there would (self-disarming); unarmed cost is one
-/// monotonic load per SMO.
-pub var test_fail_after_reserve: std.atomic.Value(u32) = .init(0);
+/// Nonzero ⇒ the next `smoReplace` fails right after its in-window
+/// reservation with the error whose `@intFromError` it holds, as a call
+/// there would (self-disarming; `testFailAfterReserveArm`); unarmed cost is
+/// one monotonic load per SMO.
+pub var test_fail_after_reserve: std.atomic.Value(ErrorInt) = .init(0);
+const ErrorInt = @Int(.unsigned, @bitSizeOf(anyerror));
 
-fn failAfterReserveForTest() error{OutOfMemory}!void {
-    if (test_fail_after_reserve.load(.monotonic) == 0) return;
-    if (test_fail_after_reserve.cmpxchgStrong(1, 0, .acq_rel, .monotonic) == null) return error.OutOfMemory;
+pub fn testFailAfterReserveArm(e: Error) void {
+    test_fail_after_reserve.store(@intFromError(e), .release);
+}
+
+fn failAfterReserveForTest() Error!void {
+    const armed = test_fail_after_reserve.load(.monotonic);
+    if (armed == 0) return;
+    if (test_fail_after_reserve.cmpxchgStrong(armed, 0, .acq_rel, .monotonic) == null) return @errorCast(@errorFromInt(armed));
 }
 
 fn pauseArmFor(t: *const KvTree) u64 {
@@ -3086,6 +3093,45 @@ test "AN SMO NEVER READS BACK WHAT THE DEVICE ACKNOWLEDGED (xfstests generic/311
     for (0..80) |i| try expectLookup(t, &ikey(i), tree.testValue(i * 11 + round, 40, &buf));
     for ([_]u64{ 1000, (1000 + k) / 2, k - 1 }) |p| try expectLookup(t, &ikey(p), tree.testValue(p, 40, &buf));
     try testing.expect(std.mem.eql(u8, cut.?, vol.ram.bytes));
+}
+
+test "THE SMO SEAM REPORTS ITS FAILURE AS ITSELF (decision 0003 §CS; generic/311's `kv checkpoint tick failed … Corrupt` was a device that dropped writes) — a full node handed by the checkpoint's flush step to the seam's SMO, which fails past its in-window reservation with an injected class (`test_fail_after_reserve`): an allocation answers OutOfMemory, a cancelled wait Canceled, a full flight table FlightTableFull, an exhausted revalidate budget RetryBudgetExhausted — never Corrupt; the node stays live and serves every key, and once unarmed the same flush replaces it (red on 5b86c9f: every class but the device's, the space's and the allocator's read Corrupt)" {
+    const gpa = testing.allocator;
+    var vol = try TestVolume.init(gpa, .{});
+    defer vol.deinit();
+    const t = try vol.createTree(.native);
+    var seam_ctx: CheckpointSeam = .{ .ctx = &vol.ctx, .trees = vol.table };
+    var flusher: checkpoint_cycle.CacheFlusher = .{ .cache = vol.cache, .smo = seam_ctx.seam() };
+    const sink = flusher.sink();
+    var buf: [64]u8 = undefined;
+    const n = try vol.cache.get(t.rootPtr().addr);
+    defer n.release();
+    var round: u64 = 0;
+    while (true) : (round += 1) {
+        for (0..80) |i| try t.insert(&ikey(i), tree.testValue(i * 11 + round, 40, &buf));
+        const d = n.lockRead(testing.io);
+        const full = d.projectedLogEnd(vol.layout, 0) > vol.layout.node_size;
+        n.unlockRead(testing.io);
+        if (full) break;
+        const r = sink.flush(sink.ctx, n, .{ .mode = .threshold });
+        try testing.expectEqual(checkpoint_cycle.FlushDisposition.appended, r.disposition);
+        try testing.expect(round < 10_000);
+    }
+    defer test_fail_after_reserve.store(0, .release);
+    for ([_]Error{ error.OutOfMemory, error.Canceled, error.FlightTableFull, error.RetryBudgetExhausted }) |injected| {
+        testFailAfterReserveArm(injected);
+        const r = sink.flush(sink.ctx, n, .{ .mode = .checkpoint, .keep_exempt = true });
+        try testing.expectEqual(@as(ErrorInt, 0), test_fail_after_reserve.load(.acquire));
+        try testing.expectEqual(checkpoint_cycle.FlushDisposition.failed, r.disposition);
+        try testing.expectEqual(@as(anyerror, injected), @as(anyerror, r.cycleError()));
+        try testing.expect(!n.state.isSuperseded());
+        for (0..80) |i| try expectLookup(t, &ikey(i), tree.testValue(i * 11 + round, 40, &buf));
+    }
+    const c0 = stats.meta_kv_node_compactions.load();
+    const r = sink.flush(sink.ctx, n, .{ .mode = .checkpoint, .keep_exempt = true });
+    try testing.expectEqual(checkpoint_cycle.FlushDisposition.replaced, r.disposition);
+    try testing.expectEqual(c0 + 1, stats.meta_kv_node_compactions.load());
+    for (0..80) |i| try expectLookup(t, &ikey(i), tree.testValue(i * 11 + round, 40, &buf));
 }
 
 fn sweepThrough(seam_ctx: *CheckpointSeam) checkpoint_cycle.SweepReport {

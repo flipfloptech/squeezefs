@@ -5119,7 +5119,7 @@ test "§BX.9 an SMO that fails past its in-window reservation leaves nothing ope
         _ = try commitCreate(be, try std.fmt.bufPrint(&nb, "base-{d}", .{i}));
     }
     try be.checkpointNow();
-    smo.test_fail_after_reserve.store(1, .release);
+    smo.testFailAfterReserveArm(error.OutOfMemory);
     defer smo.test_fail_after_reserve.store(0, .release);
     // 4 KiB xattr values per create push the native leaf past its in-place
     // log: the threshold drain replaces it. A commit answered at its landing

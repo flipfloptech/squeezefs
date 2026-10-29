@@ -354,6 +354,9 @@ const SlotPlan = struct {
     seq_floor: u64,
     window_max_ino: u64 = 0,
     begun: bool = false,
+    /// Step 7's `Unleased{flushed root}` for the slot landed: tree 0 names
+    /// the installed tree, so a rollback keeps it (decision 0003 §CF.2).
+    recorded: bool = false,
 };
 
 pub const Driver = struct {
@@ -668,6 +671,7 @@ pub const Driver = struct {
                 try recs.append(gpa, .{ .put = .{ .key = cr.custodyQuarantineKey(pl.slot).slice(), .value = &qv } });
             }
             try self.vol.vt.controlEntry(self.vol.ctx, recs.items);
+            pl.recorded = true;
             try self.vol.vt.noteUnleased(self.vol.ctx, pl.slot, state);
             // The frame screen's rule 2 reads the tails just made durable.
             try table.recordTails(pl.slot, pl.g, tails);
@@ -927,8 +931,10 @@ const Rollback = struct {
             // (1) Releasing{dead} → Leased{dead}: a first touch is refused
             // in either state; the re-run begins the release again.
             table.abortRelease(pl.slot);
-            // (4) the slot's RAM tree discarded and restored (or removed).
-            self.driver.vol.vt.restoreTree(self.driver.vol.ctx, pl.slot, pl.prior);
+            // (4) the slot's RAM tree discarded and restored (or removed) —
+            // unless tree 0 already names its flushed root: the re-run
+            // absorbs that slot and installs nothing, so the tree stays.
+            if (!pl.recorded) self.driver.vol.vt.restoreTree(self.driver.vol.ctx, pl.slot, pl.prior);
         }
         // The held retirements stay allocated: the restored tree may reach
         // them, and the re-run's census judges them afresh.
@@ -1633,7 +1639,7 @@ test "the §5.9 procedure end to end over RAM images: preempt (no device: the ta
     try testing.expect(total.count >= 1);
 }
 
-test "every crash window: a recovery that fails right after each step's durable effects leaves a state the re-run converges from; a failure between the mark and the table release ROLLS BACK (the table back to leased{dead} — first touches still refused —, the slot's tree restored to its pre-install root or removed when adopted fresh, the page still Recovering)" {
+test "every crash window: a recovery that fails right after each step's durable effects leaves a state the re-run converges from; a failure between the mark and the table release ROLLS BACK (the table back to leased{dead} — first touches still refused —, the slot's tree restored to its pre-install root or removed when adopted fresh unless tree 0 already names its flushed root, the page still Recovering)" {
     const gpa = testing.allocator;
     inline for (@typeInfo(Step).@"enum".field_values) |value| {
         const step: Step = @fromBackingInt(@intCast(value));

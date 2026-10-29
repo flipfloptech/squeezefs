@@ -68,3 +68,13 @@ HOT DIRECTORY ACROSS DAEMONS`, `THE KILL ROWS` (a)–(c): green. No lock-free co
 
 A mount reused for several mdtest runs slows run over run, the profile in `kv_fs.forgetParent` /
 `rememberParent` (the `parents` memo map, tombstone-heavy after a run's removals) — §CM.5.
+
+## The census's A-B-B-A (2026-10-29)
+
+`dev` `d95fe92` against the census (`20d75c9`), legs A B B A, mdtest `-n 10000 -u -i 1` plain and `-w 4096 -e
+4096` at -np 32 and 64 — the wedged run's exact shape and posture (the RAM-NVMe perf mount, quiet, cooled),
+so the round doubled as a reproduction attempt: no wedge in 16 runs, fsck clean in all. Every row within
+± 6 % of `dev` (plain file removal at -np 64 +9 %), so the census costs nothing measurable. The host was on
+BATTERY for this round (both arms ~20 % below the AC rates, equally); a first round that ran beside two
+agents' rigs outside the venue was discarded. Landed as diagnostics (gate 178 green, 75/75); the wedge stays
+OPEN until a census line names its wait. Sessions: `/build/perf/jw-abba2/`.

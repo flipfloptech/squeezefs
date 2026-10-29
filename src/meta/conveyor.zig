@@ -5970,6 +5970,59 @@ test "an escaped record (a freeze raced the failed write) is compensated through
     try testing.expect(try Harness.replayedPresent(&r, base));
 }
 
+test "a rollback whose record ESCAPED below a NEWER record of its key still undoes its own fields: window A's Δsize frozen into the base, window B's Δatime (a newer seq) applied after it, A's write fails — A's size is gone and B's atime stands, live and after a reopen (judging 'escaped' by the key's newest seq left A's size standing: B's seq is past A's span)" {
+    const h = try Harness.create(.{}, null, false);
+    defer h.destroy();
+    const pk = key.inodeKey(99);
+    {
+        var t = tx.KvTx.init(h.gpa, @src());
+        try t.stagePut(key.TREE_INODES, &pk, &(record.InodeValue{ .mode = 0o100644, .nlink = 1, .size = 10, .atime = 10, .mtime = 10, .ctime = 10 }).encode());
+        try h.cv.commit(&t);
+    }
+    _ = try h.checkpoint();
+    const Parent = struct {
+        fn of(t: *KvTree) !record.InodeValue {
+            const got = (try t.lookup(testing.allocator, &key.inodeKey(99))) orelse return error.TestExpectedLive;
+            defer testing.allocator.free(got);
+            return record.InodeValue.decode(got);
+        }
+    };
+    const before = try Parent.of(h.treeOf(.native));
+    h.lane.hold = true;
+    var ta = tx.KvTx.init(h.gpa, @src());
+    try ta.stageDelta(key.TREE_INODES, &pk, .{ .mask = record.DELTA_SIZE, .fields = .{ .size = 4242 } });
+    var da: Done = .init;
+    var ea = try h.cv.build(&ta, &da);
+    try h.cv.enqueueOne(&ea, ea.q.len);
+    h.cv.leadIfElected();
+    // A's Δ escapes the open overlay: a flush pass freezes and appends it.
+    for (h.vol.trees.items) |tr| try h.vol.flushPass(tr);
+    var tb = tx.KvTx.init(h.gpa, @src());
+    try tb.stageDelta(key.TREE_INODES, &pk, .{ .mask = record.DELTA_ATIME, .fields = .{ .atime = 777 } });
+    var db: Done = .init;
+    var eb = try h.cv.build(&tb, &db);
+    try h.cv.enqueueOne(&eb, eb.q.len);
+    h.cv.leadIfElected();
+    try testing.expectEqual(@as(usize, 2), h.lane.heldCount());
+    try testing.expectEqual(@as(u64, 4242), (try Parent.of(h.treeOf(.native))).size);
+    h.lane.failWindow(0);
+    h.lane.land(1);
+    h.lane.pump();
+    try testing.expectError(error.JournalWriteFailed, try da.recvOutcome(testing.io));
+    try try db.recvOutcome(testing.io);
+    h.lane.hold = false;
+    const live = try Parent.of(h.treeOf(.native));
+    try testing.expectEqual(before.size, live.size);
+    try testing.expectEqual(@as(u64, 777), live.atime);
+    // The escaped Δ on the device, B's entry and the compensation fold to
+    // the same.
+    var r = try h.reopen();
+    defer r.deinit();
+    const replayed = try Parent.of(r.treeOf(.native));
+    try testing.expectEqual(before.size, replayed.size);
+    try testing.expectEqual(@as(u64, 777), replayed.atime);
+}
+
 // generic/475 under dm-error: the second failed window's rollback found
 // an escaped record and its compensation entry's write met the dead device
 // — before this a divergence TRIPWIRE on a volume no rung had latched yet.

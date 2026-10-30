@@ -5717,6 +5717,64 @@ test "smoke: THE KILL ROWS (a) OVERLAPPING SUCCESSOR (charter §5.5 death and re
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+test "smoke: THE KILL ROWS (a) EARLY SUCCESSOR (charter §5.5 death and recovery; decision 0003 §DA) — kill -9 B (a file written, strict) and remount B AT ONCE, before A evicts it (T_owner 10 s: B's page Live, no death record): the successor's JoinAppender is Deferred until A evicts B and recovers its region, then it joins on a fresh page (joined_rejoins 0), reads B's file whole, its first cross-owner mkdir lands, it unmounts clean (exit 0); tripwires 0 on both (red: the joined open refused the mount at its census — `PredecessorLive`, the mount `Busy`)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{successor_row_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var env_b = try envWith(gpa, &rig.env, &kill_row_b_env);
+    defer env_b.deinit();
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    b.env = &env_b;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const mk = try rig.onMount("mkdir a-dir");
+        gpa.free(mk);
+    }
+    {
+        const w = try b.onMount("mkdir a-dir/own && echo body > a-dir/own/f && echo ok");
+        gpa.free(w);
+    }
+    try b.kill();
+    const mark_b = try b.logLen();
+    try b.spawn(&.{});
+    _ = try b.awaitLog("ready: ", mark_b, kill_row_wait_ns);
+    {
+        const out = try b.onMount("cat a-dir/own/f && mkdir a-dir/b2 && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("body\nok\n", out);
+    }
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try expectMustStayZero(ta);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"appender_recoveries\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dead_members_acted\":"));
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try expectMustStayZero(tb);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"joined_rejoins\":"));
+        const bl = try b.readLog();
+        defer gpa.free(bl);
+        const deferred = std.mem.indexOf(u8, bl[mark_b..], "JoinAppender deferred by the manager") != null;
+        std.debug.print("\nsmoke: kill rows (a) early successor: the remount's JoinAppender {s} (A: appender_join_live_incarnation_deferrals {d}) — A: appender_recoveries 1, dead_members_acted 1; B: joined_rejoins 0, its file whole\n", .{ if (deferred) "deferred over its predecessor's Live page until its recovery" else "came after its predecessor's recovery (no deferral: the window was not met)", numberAfter(ta, "\"appender_join_live_incarnation_deferrals\":") orelse 0 });
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B PARKS-AND-RECLAIMS at T_self (acks held at the pre-admission gate, park expiries 0) → remount A (the D0 ladder: the same-host dead-pid proof, A wins volume 0 again at term 2, the grace window open, the allocation leases taken over from the dead incarnation) → B's reclaim lands in the grace window, its manager link re-points, the held writes drain and every storm file is whole on both" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

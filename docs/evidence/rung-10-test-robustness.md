@@ -44,3 +44,32 @@ recovery-, request-deadline-, `DIAL_TIMEOUT`- and exiting-holder-derived bounds.
 again after a missed probe` (a recovered miss is invisible to its rows); the retention teardown's
 `close < 2 s` and the seam-armed looped stage row's ≤ 1 s op latency; `enospc`'s freer racing the 1 s wall
 floor; the nvme-dev close ceilings and two 30 s poll caps (anti-hang).
+
+**4. A job's mid-run act meets a held job (§CO.26–CO.30; branch `test/defrag-job-hold` off `1df4bdd`).**
+Gate 181 (a branch touching neither defrag nor jobs) went red in THE DEFRAG row: `awaitJobMidRun` met
+`JobCompletedEarly` — `defrag --meta` at 1 % finished between `job resume` and the row's 50 ms poll. The jobs
+matrix's drains (phase 3's `throttle 25`/`pause`, phase 5's kill) and the rekey row's B → C kill polled the
+same way, and phase 3 had already tolerated "the job is terminal". New seam `SQUEEZEFS_TEST_JOB_TASK_HOLD`
+(`off` | a job type): a job of that type parks in `fabric.taskDone` after each task — Running, the task
+counted, where the duty park sits — until a pause, a cancel or the fabric's stop ends the step (the hold
+stands again on the next run) or `job throttle … 100` releases it for good. Each row arms the one type it
+acts on (`defrag_meta`, `evacuate_volume`, `rekey`), awaits the hold's log line, acts, and sets `off` before
+the remount that adopts the job; the polls and the terminal tolerance are deleted.
+
+**Red on `1df4bdd`**, each row's window given the host's worst pace (it waits ≤ 180 s for the job to complete
+before it looks): 5/5 red — DEFRAG 2a `JobStateNotReached`, 2b `JobCompletedEarly` (gate 181's), matrix
+phase 3 `job throttle 25` refused (terminal), phase 5 and rekey `expect(mid)`. The fix with the same windows:
+5/5 green, each job still held after 180 s. Unit (fabric): retune keeps the hold, pause/resume re-holds,
+unthrottle completes, cancel and the fabric's stop free a held worker, other types never hold.
+
+| the three rows' binary | beside | runs | load |
+|---|---|---|---|
+| `bb8362d` (the code commit before its rebase) | the full smoke's 16 shards in passes + 16 busy loops | **23/23** | 54–185 |
+| `bb8362d` | nothing of this work's (other worktrees' builds) | **20/20** | 4–29 |
+| `b1e69b4`, `d8fb922` (the seam's first name) | shards + busy loops | 43/43 | 30–146 |
+| `d8fb922` | nothing of this work's | 20/20 | 19–66 |
+
+The first name, `SQUEEZEFS_TEST_JOB_HOLD`, strictly prefixed `…_HOLD_SUBMISSION`: the knob registry's
+collision law refused it. On `bb8362d`: units (`ops.jobs`, `ops.defrag`, `ops.lifecycle`, `dutyPark`,
+`core.knobs`) 149 + 3 skipped, fmt, rails, the full smoke 169/175 (6 skipped). Rebased onto `90094f4`: the
+units 149/149, fmt, rails 29, the three rows ×3, the full smoke 170/176 (6 skipped).

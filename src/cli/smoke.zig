@@ -4736,6 +4736,13 @@ const kill_row_kill_after: usize = 200;
 /// the row read a completed storm as "refused before the park").
 const kill_row_storm_stop = "storm.stop";
 const kill_row_storm_count = "storm.count";
+/// THE KILL ROWS (a)'s member B acks after the landing (decision 0003
+/// §CX): B is a foreground joiner — no supervisor holds its journal tail —
+/// so under the coalesced cadence a commit it acked ahead of the landing is
+/// lost to its `kill -9` (charter §5.2: the power-cut window; §BB.7), and
+/// the row's law "every file B acked is whole on A" holds only when every
+/// ack follows the landing: the strict cadence.
+const kill_row_b_env = [_][2][]const u8{.{ "SQUEEZEFS_META_FLUSH_INTERVAL_MS", "0" }};
 /// How long a daemon's recovery / park / reclaim is given to show in
 /// `.stats`: `T_owner` (3 s) + the reclaim cadence (5 s) + the recovery
 /// bound (≈ 1.1 s) + the next tick, with headroom for a debug venue.
@@ -5317,9 +5324,12 @@ test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒
     try rig.formatSet(true);
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
+    var env_b = try envWith(gpa, &rig.env, &kill_row_b_env);
+    defer env_b.deinit();
     const b = try Peer.init(rig, "b");
     defer b.deinit();
     b.node = kill_peer_node;
+    b.env = &env_b;
     try b.spawn(&.{});
     _ = try b.awaitReady();
     try killRowTarSource(rig);
@@ -5461,7 +5471,7 @@ test "smoke: THE KILL ROWS (a) HELD WRITE (charter §5.2 the ack point; decision
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
     const h = kill_row_held_file;
-    var env_b = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", std.fmt.comptimePrint("{d}", .{kill_row_held_file + 1}) }});
+    var env_b = try envWith(gpa, &rig.env, &(kill_row_b_env ++ [_][2][]const u8{.{ "SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", std.fmt.comptimePrint("{d}", .{kill_row_held_file + 1}) }}));
     defer env_b.deinit();
     const b = try Peer.init(rig, "b");
     defer b.deinit();

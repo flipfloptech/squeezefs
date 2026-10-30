@@ -2186,15 +2186,17 @@ pub const DataPlane = struct {
     /// windows — all supply, never a deficit (`Volumes.reachableFreeBytes`),
     /// LESS the write cache's residents' claim on it (`staging.StoreClaim`:
     /// custody the next promotion lands on fresh blocks,
-    /// `enospc.storeCoversRing`) — so the free `df` shows is what a write
-    /// is admitted against. Block 0 (the superblock chunk) is outside the
-    /// capacity shown.
+    /// `enospc.storeCoversRing`) rounded up to the block
+    /// (`enospc.freeBesideRing`) — so the free `df` shows is what a
+    /// whole-block mint (a reservation, decision 0003 §CZ) is admitted
+    /// against, and a staged write's byte-grain admission at most one block
+    /// more. Block 0 (the superblock chunk) is outside the capacity shown.
     pub fn statfs(self: *DataPlane) ?Space {
         if (self.vols.n() == 0) return null;
         var total: u64 = 0;
         for (self.vols.rows[0..self.vols.n()]) |r| total += (r.?.alloc.capacityBlocks() - 1) * self.block_size;
         const claim = if (self.stage) |*st| st.pool.claimedBytes() else 0;
-        return .{ .total_bytes = total, .free_bytes = self.vols.reachableFreeBytes(self.block_size) -| claim };
+        return .{ .total_bytes = total, .free_bytes = enospc.freeBesideRing(self.vols.reachableFreeBytes(self.block_size), claim, self.block_size) };
     }
 
     // ---- staging (the ring) ----

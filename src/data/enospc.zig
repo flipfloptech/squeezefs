@@ -179,6 +179,21 @@ pub fn storeCoversRing(free_bytes: u64, ring_bytes: u64, extra: u64) bool {
     return free_bytes >= ring_bytes +| extra;
 }
 
+/// THE FREE `df` SHOWS beside the write cache's claim: the store's free
+/// bytes (whole blocks) less the claim rounded UP to the block — the room
+/// whole-block mints may still take with the claim covered: for `k ≥ 1`,
+/// `k × block ≤ freeBesideRing(free, ring, block)` ⟺
+/// `storeCoversRing(free, ring, k × block)`, so a reservation of `df`'s
+/// available fits beside the residents. WHY: shown in bytes, one 64 KiB
+/// resident left `df` 4 MiB − 64 KiB above that room, and generic/103's
+/// `falloc` of `df`'s available less 512 KiB needed the block the
+/// resident's promotion lands on.
+pub fn freeBesideRing(free_bytes: u64, ring_bytes: u64, block: u64) u64 {
+    assert(block > 0);
+    const ring_blocks = ring_bytes / block + @intFromBool(ring_bytes % block != 0);
+    return free_bytes -| (ring_blocks *| block);
+}
+
 /// The write path's decision for the WHOLE write ahead of every block
 /// future (FC:L20845-20881): fresh custody is refused while the set is
 /// latched exhausted (`freshSupplyExhausted`) or while the write cache's
@@ -777,6 +792,28 @@ test "THE WRITE CACHE'S CLAIM ON THE STORE: the ring's footprint plus the write'
     try testing.expect(!storeCoversRing(10, 11, 0)); // the store shrank under the ring: no fresh custody
     try testing.expect(storeCoversRing(0, 0, 0)); // an empty ring claims nothing
     try testing.expect(!storeCoversRing(std.math.maxInt(u64) - 1, std.math.maxInt(u64), 1));
+}
+
+test "THE FREE `df` SHOWS beside the ring (decision 0003 §CZ): the free blocks less the claim rounded up to the block — an empty ring shows every block, a 64 KiB resident one block fewer, a claim one byte past a block two; it saturates; and it is exactly what whole-block mints are admitted against: `k × block ≤ shown` ⟺ `storeCoversRing(free, ring, k × block)` for every `k ≥ 1`" {
+    const b: u64 = 4 << 20;
+    try testing.expectEqual(10 * b, freeBesideRing(10 * b, 0, b));
+    try testing.expectEqual(9 * b, freeBesideRing(10 * b, 64 << 10, b));
+    try testing.expectEqual(9 * b, freeBesideRing(10 * b, b, b));
+    try testing.expectEqual(8 * b, freeBesideRing(10 * b, b + 1, b));
+    try testing.expectEqual(@as(u64, 0), freeBesideRing(b, 64 << 10, b)); // generic/103's last block is the resident's
+    try testing.expectEqual(@as(u64, 0), freeBesideRing(2 * b, 3 * b, b)); // an over-committed ring shows nothing
+    try testing.expectEqual(@as(u64, 0), freeBesideRing(b, std.math.maxInt(u64), b));
+    const rings = [_]u64{ 0, 1, 4095, 4096, 64 << 10, b - 1, b, b + 1, 2 * b, 3 * b - 7 };
+    var free_blocks: u64 = 0;
+    while (free_blocks <= 6) : (free_blocks += 1) {
+        for (rings) |ring| {
+            var k: u64 = 1;
+            while (k <= 7) : (k += 1) {
+                const free = free_blocks * b;
+                try testing.expectEqual(storeCoversRing(free, ring, k * b), k * b <= freeBesideRing(free, ring, b));
+            }
+        }
+    }
 }
 
 test "THE FULL-STORE EPISODE is one open and one close: the first refusal opens it (counted full_store_episodes), later refusals and interleaved landings within the quiet wall keep it open, a landing a full wall after the last refusal closes it with the tally; a refusal after the close opens the next" {

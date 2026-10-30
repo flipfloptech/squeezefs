@@ -188,6 +188,10 @@ pub const stats = struct {
     /// side's custody (a parked buffer, an overlay record, an epoch's
     /// shadow binds them at its landing).
     pub var fallocate_custody_skips: counters.ShardedCounter = .{};
+    /// `fallocate_claim_enospc_refusals`: reservations refused ENOSPC
+    /// because their next block would leave the write cache's claim on the
+    /// store uncovered (`WritePath.reservationCovered`; decision 0003 §CZ).
+    pub var fallocate_claim_enospc_refusals: counters.ShardedCounter = .{};
     /// `parked_gate_wall_supply_visible`: walls of refused cold flushes
     /// that ended with fresh supply in sight on some volume — the write
     /// stays parked and the wall restarts, never ENOSPC on a store with
@@ -226,7 +230,7 @@ pub fn noteInlineWrite(len: u64) void {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "write_resolve_fault_refusals", "parked_gate_wall_supply_visible", "parked_gate_wall_plane_stalls", "parked_gate_stall_answers", "write_short_counts", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed", "fallocate_custody_skips" }) |name| {
+    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals", "write_resolve_fault_refusals", "parked_gate_wall_supply_visible", "parked_gate_wall_plane_stalls", "parked_gate_stall_answers", "write_short_counts", "write_gap_zero_bytes", "fallocate_blocks_reserved", "fallocate_blocks_zeroed", "fallocate_custody_skips", "fallocate_claim_enospc_refusals" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"write_shared_class_violation\":{d},", .{counters.tripwireCount("write_shared_class_violation")});
@@ -1664,6 +1668,36 @@ pub const WritePath = struct {
         }
     }
 
+    /// THE RESERVATION BESIDE THE RING (charter §6.2's store-covers-ring
+    /// law; decision 0003 §CZ): a reservation's next block is fresh custody,
+    /// admitted only while the store less that block still covers the
+    /// write cache's claim (`enospc.storeCoversRing(free, ring, block)`) —
+    /// the residents are custody the next promotion lands on fresh blocks.
+    /// Uncovered while the valve still has supply the free count does not
+    /// hold (a reclaim drain, a delete's corpses gathered upstream:
+    /// `Valve.pending`), ONE valve pass a slice converts it (the upstream
+    /// kicked, the queue drained, the barrier pulled) up to the mint's wall
+    /// — a delete's blocks are supply in sight here as at the mint (§CR.4);
+    /// nothing in sight ⇒ uncovered at once. True with no write cache or an
+    /// empty ring: the mint decides. WHY: the reservation never read the
+    /// claim — generic/103's `falloc` took the block a 64 KiB resident's
+    /// promotion needed and the dismount pass FAILED it.
+    fn reservationCovered(self: *WritePath, io: Io) bool {
+        const claim = self.ring_claim orelse return true;
+        const bs = self.cfg.block_size;
+        const started = clock.monotonicNs();
+        const wall_ns = enospc.pressureParkWallMs(0) * std.time.ns_per_ms;
+        while (true) {
+            const ring = claim.load();
+            if (ring == 0 or enospc.storeCoversRing(self.vols.reachableFreeBytes(bs), ring, bs)) return true;
+            const v = self.valve orelse return false;
+            if (!v.vtable.pending(v.ctx) or clock.monotonicNs() - started >= wall_ns) return false;
+            _ = v.vtable.drain(v.ctx, io);
+            if (enospc.storeCoversRing(self.vols.reachableFreeBytes(bs), claim.load(), bs)) return true;
+            io.sleep(.fromMilliseconds(@intCast(enospc.pressureParkSliceMs(0))), .awake) catch {};
+        }
+    }
+
     pub const Reserved = struct {
         /// Holes bound to fresh UNWRITTEN blocks.
         reserved: u32 = 0,
@@ -1678,9 +1712,11 @@ pub const WritePath = struct {
     /// `zero_existing` (ZERO_RANGE) every WRITTEN block of the range flips
     /// to its unwritten twin in the same merges — the same reference, no
     /// device I/O — and leaves every read tier. A block already reserved is
-    /// left alone. The mint waits for visible supply as the upload's does;
-    /// a full store refuses ENOSPC with the chunk's mints returned and the
-    /// earlier chunks standing (fallocate is idempotent). The caller holds
+    /// left alone. Every fresh block keeps the write cache's claim covered
+    /// (`reservationCovered`); the mint waits for visible supply as the
+    /// upload's does; a full store — or the claim — refuses ENOSPC with the
+    /// chunk's mints returned and the earlier chunks standing (fallocate is
+    /// idempotent). The caller holds
     /// the inode's exclusive op guard with its write custody settled, so
     /// no landing races the flip; the 4a guards are not held (the merge
     /// takes the (3.5) stripe and the (3.7) layout lock).
@@ -1729,6 +1765,10 @@ pub const WritePath = struct {
                     n += 1;
                     n_flips += 1;
                     continue;
+                }
+                if (!self.reservationCovered(io)) {
+                    stats.fallocate_claim_enospc_refusals.inc();
+                    return error.NoSpaceLeft;
                 }
                 const pm = self.reserveMint(io, ino, blk) catch |e| return switch (e) {
                     error.StorageFull, error.NoHealthyBackends => error.NoSpaceLeft,
@@ -2309,6 +2349,115 @@ test "the fallocate reservation under a FULL store: a write inside the reservati
     _ = try w.f.alloc_a.freeBlock(5);
     const r = try w.wp.reserveRange(io, 41, 0, 0, false);
     try testing.expectEqual(@as(u32, 1), r.reserved);
+}
+
+/// A write cache's claim on the store for the reservation rows: the bytes
+/// `WritePath.ring_claim` reads.
+const TestClaim = struct {
+    bytes: u64,
+
+    fn load(ctx: *anyopaque) u64 {
+        const self: *TestClaim = @ptrCast(@alignCast(ctx));
+        return self.bytes;
+    }
+
+    fn ringClaim(self: *TestClaim) WritePath.RingClaim {
+        return .{ .ctx = self, .bytes = &load };
+    }
+};
+
+fn usedBlocksOf(w: *World) u64 {
+    return w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks();
+}
+
+/// Each fixture volume's block 0 taken, as a device's superblock chunk is:
+/// the free count (`Volumes.reachableFreeBytes`, which leaves block 0 out
+/// of the capacity) is then every block the mints can take.
+fn takeSuperblockChunks(w: *World) !void {
+    _ = try w.f.alloc_a.allocateBlock();
+    _ = try w.f.alloc_b.allocateBlock();
+}
+
+test "the fallocate reservation beside the write cache's claim (decision 0003 §CZ; fstests generic/103): every fresh block keeps the claim covered — a reservation that would take the block a 4 KiB resident's promotion lands on refuses ENOSPC (fallocate_claim_enospc_refusals) with its chunk's mints returned; one block fewer lands and leaves that block free; the next block refuses, and so does a whole-block claim; an empty ring claims nothing and the mint decides" {
+    const io = testing.io;
+    const w = try World.initSized(testing.allocator, .sync_inline, false, 8, 4);
+    defer w.deinit(testing.allocator);
+    try takeSuperblockChunks(w);
+    var claim: TestClaim = .{ .bytes = wt.BS / 16 };
+    w.wp.ring_claim = claim.ringClaim();
+    try w.f.map.create(50, .striped, 0);
+    try w.f.map.create(51, .striped, 0);
+    const free_blocks: u32 = @intCast(w.f.vols.reachableFreeBytes(wt.BS) / wt.BS);
+    // One chunk: a refusal returns every mint of the call.
+    try testing.expect(free_blocks >= 2 and free_blocks <= seams.MergeOutcome.max_displaced);
+    const refusals0 = stats.fallocate_claim_enospc_refusals.load();
+    const used0 = usedBlocksOf(w);
+    try testing.expectError(error.NoSpaceLeft, w.wp.reserveRange(io, 50, 0, free_blocks - 1, false));
+    try testing.expectEqual(refusals0 + 1, stats.fallocate_claim_enospc_refusals.load());
+    try testing.expectEqual(used0, usedBlocksOf(w));
+    try testing.expect(w.f.map.seam().reserved(50, 0) == null);
+    const r = try w.wp.reserveRange(io, 50, 0, free_blocks - 2, false);
+    try testing.expectEqual(free_blocks - 1, r.reserved);
+    try testing.expectEqual(wt.BS, w.f.vols.reachableFreeBytes(wt.BS));
+    try testing.expectError(error.NoSpaceLeft, w.wp.reserveRange(io, 51, 0, 0, false));
+    claim.bytes = wt.BS; // an own-block resident: its block and the reservation's are two
+    try testing.expectError(error.NoSpaceLeft, w.wp.reserveRange(io, 51, 0, 0, false));
+    try testing.expectEqual(refusals0 + 3, stats.fallocate_claim_enospc_refusals.load());
+    try testing.expectEqual(wt.BS, w.f.vols.reachableFreeBytes(wt.BS));
+    claim.bytes = 0;
+    const r2 = try w.wp.reserveRange(io, 51, 0, 0, false);
+    try testing.expectEqual(@as(u32, 1), r2.reserved);
+    try testing.expectEqual(refusals0 + 3, stats.fallocate_claim_enospc_refusals.load());
+}
+
+test "the reservation beside the claim waits for supply in sight (decision 0003 §CZ, §CR.4): uncovered while the valve still holds a free the count does not (a delete's block on its way), ONE valve pass converts it and the reservation lands; uncovered with nothing in sight — no valve, or a valve with nothing pending — it refuses at once, no drain" {
+    const io = testing.io;
+    const w = try World.initSized(testing.allocator, .sync_inline, false, 8, 4);
+    defer w.deinit(testing.allocator);
+    try takeSuperblockChunks(w);
+    var claim: TestClaim = .{ .bytes = wt.BS / 16 };
+    w.wp.ring_claim = claim.ringClaim();
+    for ([_]u64{ 60, 61, 62 }) |ino| try w.f.map.create(ino, .striped, 0);
+    // A block a delete freed, still on its way to the free list.
+    const on_its_way = try w.f.alloc_a.allocateBlock();
+    const free_blocks: u32 = @intCast(w.f.vols.reachableFreeBytes(wt.BS) / wt.BS);
+    _ = try w.wp.reserveRange(io, 60, 0, free_blocks - 2, false);
+    try testing.expectEqual(wt.BS, w.f.vols.reachableFreeBytes(wt.BS));
+    const refusals0 = stats.fallocate_claim_enospc_refusals.load();
+    try testing.expectError(error.NoSpaceLeft, w.wp.reserveRange(io, 61, 0, 0, false));
+    const FreeOnDrain = struct {
+        alloc: *block_alloc.BlockAllocator,
+        idx: u64,
+        drained: bool = false,
+        drains: u32 = 0,
+        fn drain(ctx: *anyopaque, _: Io) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.drains += 1;
+            if (self.drained) return 0;
+            self.drained = true;
+            _ = self.alloc.freeBlock(self.idx) catch unreachable;
+            return 1;
+        }
+        fn finished(ctx: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return @intFromBool(self.drained);
+        }
+        fn pending(ctx: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return !self.drained;
+        }
+        const vtable: enospc.Valve.VTable = .{ .drain = &drain, .finished = &finished, .pending = &pending };
+    };
+    var fv: FreeOnDrain = .{ .alloc = w.f.alloc_a, .idx = on_its_way.idx };
+    w.wp.valve = .{ .ctx = &fv, .vtable = &FreeOnDrain.vtable };
+    const r = try w.wp.reserveRange(io, 61, 0, 0, false);
+    try testing.expectEqual(@as(u32, 1), r.reserved);
+    try testing.expect(fv.drained);
+    try testing.expectEqual(wt.BS, w.f.vols.reachableFreeBytes(wt.BS));
+    const drains = fv.drains;
+    try testing.expectError(error.NoSpaceLeft, w.wp.reserveRange(io, 62, 0, 0, false));
+    try testing.expectEqual(drains, fv.drains);
+    try testing.expectEqual(refusals0 + 2, stats.fallocate_claim_enospc_refusals.load());
 }
 
 test "the fallocate'd lay-down through the device overlay (the perf matrix's fio lay-down, decision 0003 §CR): an overlay piece into a sole-owned RESERVATION lands in the reserved block itself — no fresh mint, the allocator's census never above the reservation — and its settle flips the flag (the same reference, no ±ref, no free, no epoch); a record settled partial seeds its gap with zeros IN the reserved block (never its previous owner's bytes); a clone-shared reservation keeps the fresh-mint path" {

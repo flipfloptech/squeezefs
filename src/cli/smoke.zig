@@ -17066,6 +17066,101 @@ test "smoke: A DELETED FILE'S PARKED BYTES NEVER WAIT FOR THEIR OWN DESTROY (dec
     _ = try fsckClean(rig, "the clean unmount after the corpse's custody");
 }
 
+/// The store's free blocks off the mount's `.stats` (Σ capacity − used over
+/// the data plane's `volumes` rows), one line `free N`.
+const store_free_blocks_sh =
+    \\grep -o '"used_blocks":[0-9]*,"free_blocks":[0-9]*,"virgin_blocks":[0-9]*,"capacity_blocks":[0-9]*' .stats | awk -F'[:,]' '{f += $8 - $2} END {print "free " f}'
+    \\
+;
+
+test "smoke: A RESERVATION LEAVES THE WRITE CACHE ROOM TO LAND (fstests generic/103; decision 0003 §CR.7 (a); charter §6.2's store-covers-ring law) — a supervised two-volume set of 2 × 48 4 MiB blocks, the write cache ON: a 64 KiB file written and never synced (one resident: a packed slot's claim on the store) → generic/103's `_consume_freesp`: `falloc` of `df`'s available less 512 KiB succeeds silently and the store keeps a free block for the resident → a `falloc` of one more block answers ENOSPC by the claim (fallocate_claim_enospc_refusals), nothing reserved → orderly unmount: the dismount pass promotes the resident (0 failed, no error line) → remount: the 64 KiB byte-exact → unmount, fsck clean; no tripwire (red on dev: `df` subtracted the claim in bytes and the reservation never read it — the `falloc` took every free block and the dismount promotion FAILED its one resident: 'data store FULL … 0 B free in sight')" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    try rig.formatSetSized(true, &.{}, fallocate_row_data_bytes);
+    try rig.mountAsSet(&.{});
+    _ = try rig.awaitReady(0);
+    const mark = try rig.logLen();
+    // 1. One resident: 64 KiB, never synced.
+    rig.gpa.free(try rig.onMountTimed(
+        \\head -c 65536 /dev/urandom > "$1/val"
+        \\dd if="$1/val" of=attrval bs=64k status=none
+    , 60));
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        const staged = numberAfter(t, "\"current_staged_write_bytes\":") orelse return error.StatMissing;
+        std.debug.print("\nsmoke[reservation vs the ring]: the resident: {d} B staged\n", .{staged});
+        try testing.expect(staged > 0);
+    }
+    // 2. generic/103's `_consume_freesp`: `df`'s available less 512 KiB.
+    const reserved0: u64 = blk: {
+        const out = try rig.onMountTimed(
+            \\avail=$(df -B1 --output=avail . | tail -1 | tr -d ' ')
+            \\out=$(xfs_io -fc "falloc 0 $((avail / 1024 - 512))k" spc 2>&1) || true
+            \\echo "avail $avail falloc '$out' size $(stat -c %s spc)"
+            \\
+        ++ store_free_blocks_sh, 120);
+        defer gpa.free(out);
+        std.debug.print("smoke[reservation vs the ring]: generic/103's fill:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, " falloc '' size ") != null);
+        const free = numberAfter(out, "free ") orelse return error.StatMissing;
+        // The resident's packed slot lands on a fresh block: the store keeps one.
+        try testing.expect(free >= 1);
+        const t = try rig.stats();
+        defer gpa.free(t);
+        break :blk numberAfter(t, "\"fallocate_blocks_reserved\":") orelse return error.StatMissing;
+    };
+    // 3. One block more than the claim leaves: ENOSPC, nothing reserved.
+    {
+        const out = try rig.onMountTimed(
+            \\xfs_io -fc "falloc 0 4m" more 2>&1 || true
+            \\
+        ++ store_free_blocks_sh, 60);
+        defer gpa.free(out);
+        std.debug.print("smoke[reservation vs the ring]: one block more:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "No space left on device") != null);
+        try testing.expect((numberAfter(out, "free ") orelse 0) >= 1);
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expectEqual(@as(?u64, reserved0), numberAfter(t, "\"fallocate_blocks_reserved\":"));
+        try testing.expect((numberAfter(t, "\"fallocate_claim_enospc_refusals\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"invariant_tripwires\":"));
+    }
+    // 4. The orderly unmount promotes the resident.
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        const errors = std.mem.count(u8, seg, "error(");
+        if (errors != 0) std.debug.print("--- the daemon's alert lines ---\n{s}\n", .{seg});
+        try testing.expectEqual(@as(usize, 0), errors);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, seg, "TRIPWIRE"));
+        try testing.expect(std.mem.indexOf(u8, seg, "data store FULL") == null);
+        const d = try dismountLineOf(seg);
+        std.debug.print("smoke[reservation vs the ring]: the dismount pass: {d} promoted, {d} failed\n", .{ d.promoted, d.failed });
+        try testing.expectEqual(@as(u64, 1), d.promoted);
+        try testing.expectEqual(@as(u64, 0), d.failed);
+    }
+    // 5. The resident's bytes, from the data volumes.
+    const mark2 = try rig.logLen();
+    try rig.mountAsSet(&.{});
+    _ = try rig.awaitReady(mark2);
+    {
+        const out = try rig.onMountTimed("cmp -s \"$1/val\" attrval && echo whole || echo differs\n", 60);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("whole\n", out);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the clean unmount after the reservation beside the ring");
+}
+
 test "smoke: A PUNCH, A ZERO RANGE AND A SAME-SIZE TRUNCATE SURVIVE A POWER CUT (fstests generic/695, 092; charter §6.6) — a set over device-mapper slices of 4 MiB blocks: generic/092's `falloc -k 0 12m` + `pwrite 0 5m` + `truncate 5m` returns the reservation past EOF (`df` 12 → 8 MiB) and `falloc -k 5m 5m` + `truncate 7m` keeps it (12 MiB); generic/695's `truncate 12M` + `pwrite -S 0xab 2M 8M` + sync, then `fpunch 2M 2M` + `fpunch 8M 2M` + fsync (and the same with `fzero`) reads zeros at [2M, 4M) and [8M, 10M) around the 0xab of [4M, 8M) → dm-flakey drops every write (the power cut) → unmount → the working table → fsck --offline --scrub clean → remount: every file byte-exact as fsync'd → clean unmount; no error line, no tripwire (red on dev: `fpunch 8M 2M` and `fzero 8M 2M` — a range starting ON a block boundary and ending inside it — zeroed nothing, read 0xab before and after the cut; the same-size truncate kept the reservation, `df` 12)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

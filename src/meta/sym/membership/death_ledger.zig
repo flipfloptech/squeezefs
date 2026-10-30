@@ -189,11 +189,21 @@ pub const Ledger = struct {
     /// `retire_joiners_death_record` (charter §5.5; the porting spec's
     /// JoinAppender service edge): a standing record naming the joining
     /// pair is a PREDECESSOR's — retired, with its `recovered:` rows, before
-    /// the join writes a page Live. Answers whether a record stood; a store
-    /// that refuses the retirement defers the join (the joiner retries). The
-    /// poll that sees the Live page re-reads the record and finds it gone.
-    pub fn retireJoiner(self: *Ledger, identity: WriterIdentity) error{ Deferred, Io }!bool {
+    /// the join writes a page Live, so no poll ever acts on the joiner's
+    /// fresh page. Only once the predecessor's recovery is SETTLED on every
+    /// volume (decision 0003 §CY): each managed volume's hook, and every
+    /// volume no hook covers by its `recovered:` row — else `Deferred`,
+    /// nothing written: the record stays the trigger of the recovery owed
+    /// or in flight, and the joiner retries. Answers whether a record stood.
+    pub fn retireJoiner(self: *Ledger, identity: WriterIdentity, volumes: []const VolumeHook) error{ Deferred, Io }!bool {
         if ((try self.readDeath(identity)) == null) return false;
+        var v: u16 = 0;
+        while (v < self.set_width) : (v += 1) {
+            const settled = for (volumes) |h| {
+                if (h.vol == v) break h.recoverySettled(h.ctx, identity);
+            } else try self.isRecovered(identity, v);
+            if (!settled) return error.Deferred;
+        }
         alloc_lease.retireDeathRecords(self.store.control, self.gpa, identity, self.set_width) catch |e| return switch (e) {
             error.WindowFull => error.Deferred,
             error.Io, error.OutOfMemory => error.Io,
@@ -294,6 +304,10 @@ pub const VolumeHook = struct {
     recoverDead: *const fn (ctx: *anyopaque, death: Death) RecoverOutcome,
     /// A `Live` / `Recovering` page under the identity still stands.
     regionPending: *const fn (ctx: *anyopaque, identity: WriterIdentity) bool,
+    /// The identity's recovery on this volume is done (no page under it, or
+    /// its page Recovered with `recovered:` written): a successor's join may
+    /// retire the record as far as this volume goes.
+    recoverySettled: *const fn (ctx: *anyopaque, identity: WriterIdentity) bool,
 };
 
 /// The hand-off of recovered slots' open intents to the cross-owner
@@ -517,8 +531,11 @@ const FakeVolume = struct {
         for (self.pending.items) |p| if (p.sameMount(id)) return true;
         return false;
     }
+    fn isSettled(ctx: *anyopaque, id: WriterIdentity) bool {
+        return !isPending(ctx, id);
+    }
     fn hook(self: *FakeVolume) VolumeHook {
-        return .{ .ctx = self, .vol = self.vol, .releaseRecovered = &release, .recoverDead = &recover, .regionPending = &isPending };
+        return .{ .ctx = self, .vol = self.vol, .releaseRecovered = &release, .recoverDead = &recover, .regionPending = &isPending, .recoverySettled = &isSettled };
     }
 };
 
@@ -584,7 +601,7 @@ test "the writer: the home shard's eviction records a death ONCE (a reader's id 
     try testing.expect((try l2.readDeath(wid(2))) == null);
 }
 
-test "a JoinAppender retires the joining pair's standing death record and its recovered rows before the page goes Live (the join is the newer incarnation, whatever its writer id): answers whether one stood; another pair's record stands" {
+test "a JoinAppender retires the joining pair's standing death record and its recovered rows only once the predecessor's recovery is settled on every volume (decision 0003 §CY): a managed volume by its hook, any other by its recovered: row — else Deferred with nothing written; answers whether a record stood; another pair's record stands" {
     const gpa = testing.allocator;
     var rs = RamLedgerStore.init(gpa);
     defer rs.deinit();
@@ -592,17 +609,30 @@ test "a JoinAppender retires the joining pair's standing death record and its re
     defer l.deinit();
     l.recordDeath(wid(1), .{ .epoch = 5, .ts_realtime_ns = 1, .pr_key = 0, .early = false });
     l.recordDeath(wid(2), .{ .epoch = 6, .ts_realtime_ns = 1, .pr_key = 0, .early = false });
-    try testing.expect(try l.recordRecovered(wid(1), 0, 3, 2));
+    l.recordDeath(wid(3), .{ .epoch = 7, .ts_realtime_ns = 1, .pr_key = 0, .early = false });
+    // Volume 1 is no hook's: its recovery is known by its row.
     try testing.expect(try l.recordRecovered(wid(1), 1, 3, 2));
-    // A successor of the same pair (another incarnation's writer id).
+    var v0: FakeVolume = .{ .vol = 0 };
+    defer v0.pending.deinit(gpa);
+    try v0.pending.append(gpa, wid(1));
+    const hooks = [_]VolumeHook{v0.hook()};
+    // A successor of the pair (another incarnation's writer id).
     const successor: WriterIdentity = .{ .node_token = wid(1).node_token, .mount_slot = wid(1).mount_slot, .writer_id = 0x77 };
+    // Volume 0's recovery owed: Deferred, the record and its row standing.
     const retired0 = stats.dead_members_retired_rejoined.load();
-    try testing.expect(try l.retireJoiner(successor));
+    try testing.expectError(error.Deferred, l.retireJoiner(successor, &hooks));
+    try testing.expect((try l.readDeath(wid(1))) != null);
+    try testing.expect(try l.isRecovered(wid(1), 1));
+    // Settled everywhere: retired with its rows.
+    v0.pending.clearRetainingCapacity();
+    try testing.expect(try l.retireJoiner(successor, &hooks));
     try testing.expectEqual(retired0 + 1, stats.dead_members_retired_rejoined.load());
     try testing.expect((try l.readDeath(wid(1))) == null);
-    try testing.expect(!(try l.isRecovered(wid(1), 0)));
     try testing.expect(!(try l.isRecovered(wid(1), 1)));
-    try testing.expect(!(try l.retireJoiner(successor)));
+    try testing.expect(!(try l.retireJoiner(successor, &hooks)));
+    // Volume 1 with no row for the pair: Deferred.
+    try testing.expectError(error.Deferred, l.retireJoiner(wid(3), &hooks));
+    try testing.expect((try l.readDeath(wid(3))) != null);
     try testing.expect((try l.readDeath(wid(2))) != null);
 }
 

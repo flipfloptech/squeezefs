@@ -862,7 +862,6 @@ pub const WirePlane = struct {
         m.owner.bindRows(m.rows.store());
         m.ledger = death_ledger.Ledger.init(gpa, m.ledger_store.store(), @intCast(set.volumes.len), identity, t_owner_ms);
         errdefer m.ledger.deinit();
-        for (m.faces) |*face| face.join_retire = .{ .ctx = self, .retire = &retireJoinerFn };
         m.death_fanout = .{ .plane = self, .ledger = m.ledger.deathSink() };
         m.owner.bindDeathSink(m.death_fanout.sink());
         m.owner_svc = .{ .owner = &m.owner, .now = &nowMsFn, .generation = .{ .ctx = null, .read = &configGenerationFn } };
@@ -885,6 +884,7 @@ pub const WirePlane = struct {
         m.bindings = bindings;
         m.hooks = hooks;
         m.projection = .{ .ledger = &m.ledger, .volumes = hooks[0..n_bound], .vol_tags = &.{}, .adoption = m.adoption.seam() };
+        for (m.faces) |*face| face.join_retire = .{ .ctx = self, .retire = &retireJoinerFn };
         m.rename_lease = .{ .io = self.io, .store = m.rename_store.store(), .term = term, .own_id = sym0.region0().appenderId() };
         m.rename_svc = .{ .lease = &m.rename_lease };
         // The holder-decided handover over the wire (charter §5.5): every
@@ -1956,13 +1956,14 @@ pub const WirePlane = struct {
     }
 
     /// `join_ladder.JoinRetire` at the ledger volume: the joining pair's
-    /// standing death record retired before its page goes Live.
+    /// standing death record retired before its page goes Live, once the
+    /// predecessor's recovery is settled on every volume (else `Deferred`).
     fn retireJoinerFn(ctx: *anyopaque, identity: page.Identity) manager.VerbError!void {
         const self: *WirePlane = @ptrCast(@alignCast(ctx));
         const m = self.mgr orelse return;
         if (!isVol0ManagerFn(self)) return;
         const id: death_ledger.WriterIdentity = .{ .node_token = identity.node_token, .mount_slot = identity.mount_slot, .writer_id = identity.writer_id };
-        if (try m.ledger.retireJoiner(id)) log.warn("cluster wire: JoinAppender by node 0x{x} / mount slot {d} RETIRED the identity's standing death record — the join is its newer incarnation (the predecessor's regions are the recovery's)", .{ identity.node_token, identity.mount_slot });
+        if (try m.ledger.retireJoiner(id, m.projection.volumes)) log.warn("cluster wire: JoinAppender by node 0x{x} / mount slot {d} RETIRED the identity's standing death record — the join is its newer incarnation (the predecessor's regions are the recovery's)", .{ identity.node_token, identity.mount_slot });
     }
 
     /// The registrant key of a roster member (a file substrate holds no

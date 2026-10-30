@@ -428,6 +428,21 @@ pub const Driver = struct {
         return null;
     }
 
+    /// May a successor's join retire the identity's death record as far as
+    /// this volume goes (decision 0003 §CY)? Its page here is gone (none,
+    /// Free) or Recovered with its `recovered:` row — the recovery's last
+    /// step — written. A Live or Recovering page, or a Recovered one whose
+    /// row is not yet written, is the predecessor's recovery still owed or
+    /// in flight; a read that fails answers false (the join defers).
+    pub fn recoverySettled(self: *Driver, identity: WriterIdentity) bool {
+        const p = (self.findPage(identity) catch return false) orelse return true;
+        return switch (p.state) {
+            .free => true,
+            .live, .recovering => false,
+            .recovered => self.mount.ledger.isRecovered(identity, self.vol.vt.vol(self.vol.ctx)) catch false,
+        };
+    }
+
     /// `regionPending`: a Live/Recovering page under the identity.
     pub fn regionPending(self: *Driver, identity: WriterIdentity) bool {
         const p = (self.findPage(identity) catch return true) orelse return false;
@@ -973,7 +988,7 @@ pub const PollBinding = struct {
     namedAsHolder: *const fn (ctx: *anyopaque, identity: WriterIdentity) bool,
 
     pub fn hook(self: *PollBinding) death_ledger.VolumeHook {
-        return .{ .ctx = self, .vol = self.driver.vol.vt.vol(self.driver.vol.ctx), .releaseRecovered = &release, .recoverDead = &recover, .regionPending = &pending };
+        return .{ .ctx = self, .vol = self.driver.vol.vt.vol(self.driver.vol.ctx), .releaseRecovered = &release, .recoverDead = &recover, .regionPending = &pending, .recoverySettled = &settled };
     }
 
     fn release(ctx: *anyopaque) u32 {
@@ -988,6 +1003,11 @@ pub const PollBinding = struct {
             .skipped => .skipped,
             .failed => .failed,
         };
+    }
+
+    fn settled(ctx: *anyopaque, identity: WriterIdentity) bool {
+        const self: *PollBinding = @ptrCast(@alignCast(ctx));
+        return self.driver.recoverySettled(identity);
     }
 
     fn pending(ctx: *anyopaque, identity: WriterIdentity) bool {

@@ -468,24 +468,44 @@ pub const JoinedSet = struct {
         self.joiner = join_ladder.Joiner.init(gpa, &self.wire);
         errdefer self.joiner.deinit();
         try self.awaitManagerListener(page0);
-        // 3. Rung 5: the region over the wire.
-        self.joiner.joinRegion(.{
-            .identity = identity,
-            .ring_want_bytes = try ringAsk(be),
-            .home_volume = be.stamp.member_position,
-            .volume_base = node_seq.nodeSeqBase(be.sb.uuid),
-            .grain = be.dev.mode.grain(),
-            .ring0_head = be.mounted.journal_tail_seq,
-        }) catch |e| return switch (e) {
-            error.Capacity => blk: {
-                log.err("meta volume {s}: JoinAppender refused for capacity — the lever is the metadata volume COUNT", .{be.path});
-                break :blk error.Capacity;
-            },
-            error.Rejected => error.Rejected,
-            error.Deferred, error.Io => error.Io,
-            error.Corrupt => error.Corrupt,
-            error.OutOfMemory => error.OutOfMemory,
-        };
+        // 3. Rung 5: the region over the wire. A Deferred join — the
+        // manager's ring 0 full for a beat, or this pair's predecessor still
+        // owed or in its recovery (its death record standing, decision 0003
+        // §CY) — is retried up to the park bound.
+        const join_deadline = clock.monotonicNs() + self.park_gate.t_park_max_ms * std.time.ns_per_ms;
+        var join_deferrals: u64 = 0;
+        while (true) {
+            self.joiner.joinRegion(.{
+                .identity = identity,
+                .ring_want_bytes = try ringAsk(be),
+                .home_volume = be.stamp.member_position,
+                .volume_base = node_seq.nodeSeqBase(be.sb.uuid),
+                .grain = be.dev.mode.grain(),
+                .ring0_head = be.mounted.journal_tail_seq,
+            }) catch |e| {
+                if (e == error.Deferred and clock.monotonicNs() < join_deadline) {
+                    if (join_deferrals == 0) log.info("meta volume {s}: JoinAppender deferred by the manager — its ring 0 full, or this mount's predecessor (node 0x{x}, mount slot 0x{x}) not yet recovered; retrying for up to {d} ms", .{ be.path, identity.node_token, identity.mount_slot, self.park_gate.t_park_max_ms });
+                    join_deferrals += 1;
+                    be.io.sleep(.fromMilliseconds(ENDPOINT_POLL_STEP_MS), .awake) catch {};
+                    continue;
+                }
+                return switch (e) {
+                    error.Deferred => blk: {
+                        log.err("meta volume {s}: JoinAppender still deferred after {d} ms ({d} retries) — the manager has not recovered this mount's predecessor", .{ be.path, self.park_gate.t_park_max_ms, join_deferrals });
+                        break :blk error.Io;
+                    },
+                    error.Capacity => blk: {
+                        log.err("meta volume {s}: JoinAppender refused for capacity — the lever is the metadata volume COUNT", .{be.path});
+                        break :blk error.Capacity;
+                    },
+                    error.Rejected => error.Rejected,
+                    error.Io => error.Io,
+                    error.Corrupt => error.Corrupt,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+            };
+            break;
+        }
         const jr = &self.joiner.region.?;
         for (jr.grant.unclaimed.items) |e| {
             self.granted_bits.set(@intCast(e));

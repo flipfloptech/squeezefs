@@ -941,11 +941,12 @@ pub fn settleEntry(tree0: ?cr.SlotState, entry: page.SlotEntry, page_owner: Appe
 
 /// The JOINED arm's projection law (0003 §T.2): a tree-0 projection row
 /// naming the joiner's OWN appender id is a previous incarnation's lease —
-/// the joined open refuses a `Live` page under its identity
-/// (`PredecessorLive`) and the hint hands a rejoin the same id, so this
-/// incarnation holds exactly what the manager grants it over the wire. The
-/// row loads `unleased` (its words the cold floor): a first touch asks the
-/// manager, the live truth. Every other row is the projection verbatim.
+/// a join never adopts another incarnation's `Live` page (the manager
+/// defers it until that page's recovery, 0003 §DA) and the hint hands a
+/// rejoin the same id, so this incarnation holds exactly what the manager
+/// grants it over the wire. The row loads `unleased` (its words the cold
+/// floor): a first touch asks the manager, the live truth. Every other row
+/// is the projection verbatim.
 pub fn joinedProjectionRow(row: cr.SlotState, me: AppenderId) cr.SlotState {
     return joinedProjectionRowOf(row, &.{me});
 }

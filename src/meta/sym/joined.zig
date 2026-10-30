@@ -169,9 +169,6 @@ pub const OpenError = error{
     Capacity,
     /// A `Joined` word failed the screen, or the wire schema refused.
     Rejected,
-    /// This mount slot's previous incarnation is Live and unrecovered:
-    /// its ring is the recovery driver's before a rejoin may replay it.
-    PredecessorLive,
     Io,
     Corrupt,
     OutOfMemory,
@@ -410,16 +407,13 @@ pub const JoinedSet = struct {
         const mount_slot = joinerMountSlot(mountpoint);
         const identity = join.identityFor(local, mount_slot);
         const wire_identity: verbs.WireIdentity = .{ .node_token = identity.node_token, .writer_id = identity.writer_id, .mount_slot = identity.mount_slot, .reserved = 0 };
-        // 1. The census: `writers_known`, a Live page under THIS mount slot
-        // (a predecessor's unrecovered ring), the manager's identity off
-        // appender 0's page.
+        // 1. The census: `writers_known`, the manager's identity off
+        // appender 0's page. A previous incarnation's page Live under this
+        // mount slot is the manager's to judge at the JoinAppender — under
+        // its verb lock, where no other join can slip between the look and
+        // the act: Deferred until that page's recovery (decision 0003 §DA).
         var writers_known: u64 = 1;
-        var own_live: ?page.Page = null;
-        try self.census(be, identity, &writers_known, &own_live);
-        if (own_live) |p| {
-            log.err("meta volume {s}: appender {d} (term {d}) is LIVE on the directory under this mount point's identity — a previous incarnation's ring is unrecovered; the recovery ladder recovers it before a rejoin may replay it", .{ be.path, p.appender_id, p.term });
-            return error.PredecessorLive;
-        }
+        try census(be, &writers_known);
         holdJoinAppenderIfArmed(be);
         const page0 = (try readAppender0(gpa, be)) orelse {
             log.err("meta volume {s}: appender 0's page is blank — no manager has ever mounted this volume; the D0 ladder is the first writer's", .{be.path});
@@ -524,7 +518,7 @@ pub const JoinedSet = struct {
     fn holdJoinAppenderIfArmed(be: *KvBackend) void {
         const path = knobs.parseStr(be.env.get("SQUEEZEFS_TEST_JOIN_APPENDER_HOLD")) orelse return;
         Io.Dir.cwd().access(be.io, path, .{}) catch return;
-        log.warn("meta volume {s}: SQUEEZEFS_TEST_JOIN_APPENDER_HOLD — the JoinAppender holds (the census read, no page Live under this mount's identity yet) until a writer opens {s}", .{ be.path, path });
+        log.warn("meta volume {s}: SQUEEZEFS_TEST_JOIN_APPENDER_HOLD — the JoinAppender holds (the census read) until a writer opens {s}", .{ be.path, path });
         const f = Io.Dir.cwd().openFile(be.io, path, .{}) catch |e| {
             log.warn("meta volume {s}: the JoinAppender hold could not open {s} ({t}); not holding", .{ be.path, path, e });
             return;
@@ -623,8 +617,7 @@ pub const JoinedSet = struct {
 
     // ---- the census ----
 
-    fn census(self: *JoinedSet, be: *KvBackend, identity: page.Identity, writers_known: *u64, own_live: *?page.Page) OpenError!void {
-        _ = self;
+    fn census(be: *KvBackend, writers_known: *u64) OpenError!void {
         var links: std.ArrayList(dir.Link) = .empty;
         defer links.deinit(be.gpa);
         var reader_ctx: DevicePages = .{ .be = be };
@@ -643,9 +636,7 @@ pub const JoinedSet = struct {
                 const imgs = dir.readPair(reader, l, pair) catch return error.Io;
                 if (imgs.foreign) return error.Corrupt;
                 const p = imgs.newest() orelse continue;
-                if (p.state != .live) continue;
-                writers_known.* += 1;
-                if (p.identity.sameMount(identity)) own_live.* = p;
+                if (p.state == .live) writers_known.* += 1;
             }
         }
         // Appender 0 (the manager) is Live by definition of a joined open;

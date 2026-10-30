@@ -4762,6 +4762,12 @@ const kill_row_b_env = [_][2][]const u8{.{ "SQUEEZEFS_META_FLUSH_INTERVAL_MS", "
 /// `.stats`: `T_owner` (3 s) + the reclaim cadence (5 s) + the recovery
 /// bound (≈ 1.1 s) + the next tick, with headroom for a debug venue.
 const kill_row_wait_ns: u64 = 60 * std.time.ns_per_s;
+/// The same-node successor rows' `T_owner` (decision 0003 §DA): B's page
+/// stays Live — B un-evicted — past the successor's JoinAppender on a
+/// loaded host, and the successor's deferral (`T_owner` + the reclaim
+/// cadence + the recovery bound) stays inside its park bound (`T_OWNER_MS`
+/// + this) and `kill_row_wait_ns`.
+const successor_row_t_owner_ms: u64 = 10_000;
 
 /// Poll a mount's `.stats` (`host` is a `*Rig` or a `*Peer`: both read it
 /// through `stats`) until every `(key, want)` holds or the deadline
@@ -5631,6 +5637,82 @@ test "smoke: THE KILL ROWS (a) SUCCESSOR'S JOIN (charter §5.5 death and recover
     }
     try b.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+test "smoke: THE KILL ROWS (a) OVERLAPPING SUCCESSOR (charter §5.5 death and recovery; decision 0003 §DA) — a second mount S at B's mount point (B's node and mount slot) opens FIRST and parks between its census (no page Live under the pair yet) and its JoinAppender (SQUEEZEFS_TEST_JOIN_APPENDER_HOLD); B mounts there, writes a file (strict: acked after its landing), kill -9 B; released, S's JoinAppender meets B's page still Live (B un-evicted, T_owner 10 s) under another writer id ⇒ Deferred until A evicts B and recovers its region, then S joins on a fresh page (joined_rejoins 0) and reads B's file whole; tripwires 0 on both (red: the join answered `already` with B's page — S stood its ring at B's last cycle head and B's acked file was lost)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{successor_row_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    {
+        const mk = try rig.onMount("mkdir a-dir");
+        gpa.free(mk);
+    }
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/join-appender.fifo", .{rig.work}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    var env_b = try envWith(gpa, &rig.env, &kill_row_b_env);
+    defer env_b.deinit();
+    var env_s = try envWith(gpa, &env_b, &.{.{ "SQUEEZEFS_TEST_JOIN_APPENDER_HOLD", fifo }});
+    defer env_s.deinit();
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    b.env = &env_b;
+    // S at B's mount point: one (node, mount slot) pair, two incarnations.
+    const s = try Peer.init(rig, "s");
+    defer s.deinit();
+    _ = linux.rmdir(s.mp.ptr);
+    gpa.free(s.mp);
+    s.mp = try std.fmt.allocPrintSentinel(gpa, "{s}", .{b.mp}, 0);
+    s.node = kill_peer_node;
+    s.env = &env_s;
+    try s.spawn(&.{});
+    _ = try s.awaitLog("SQUEEZEFS_TEST_JOIN_APPENDER_HOLD — the JoinAppender holds", 0, kill_row_wait_ns);
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const w = try b.onMount("mkdir a-dir/own && echo body > a-dir/own/f && echo ok");
+        gpa.free(w);
+    }
+    try b.kill();
+    const mark_s = try s.logLen();
+    releaseHold(fifo);
+    released = true;
+    _ = try s.awaitLog("ready: ", mark_s, kill_row_wait_ns);
+    {
+        const out = try s.onMount("if f=$(cat a-dir/own/f 2>&1); then echo \"$f\"; else echo \"lost: $f\"; fi");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("body\n", out);
+    }
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try expectMustStayZero(ta);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"appender_recoveries\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dead_members_acted\":"));
+        const ts = try s.stats();
+        defer gpa.free(ts);
+        try expectMustStayZero(ts);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ts, "\"joined_rejoins\":"));
+        const sl = try s.readLog();
+        defer gpa.free(sl);
+        const deferred = std.mem.indexOf(u8, sl[mark_s..], "JoinAppender deferred by the manager") != null;
+        std.debug.print("\nsmoke: kill rows (a) overlapping successor: S's JoinAppender {s} — A: appender_recoveries 1, dead_members_acted 1; S: joined_rejoins 0, B's file whole\n", .{if (deferred) "deferred over B's Live page until its recovery" else "came after B's recovery (no deferral: the window was not met)"});
+    }
+    try s.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try s.waitExit());
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }

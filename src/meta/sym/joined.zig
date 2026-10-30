@@ -420,6 +420,7 @@ pub const JoinedSet = struct {
             log.err("meta volume {s}: appender {d} (term {d}) is LIVE on the directory under this mount point's identity — a previous incarnation's ring is unrecovered; the recovery ladder recovers it before a rejoin may replay it", .{ be.path, p.appender_id, p.term });
             return error.PredecessorLive;
         }
+        holdJoinAppenderIfArmed(be);
         const page0 = (try readAppender0(gpa, be)) orelse {
             log.err("meta volume {s}: appender 0's page is blank — no manager has ever mounted this volume; the D0 ladder is the first writer's", .{be.path});
             return error.ManagerUnreachable;
@@ -515,6 +516,21 @@ pub const JoinedSet = struct {
         sym.stats.appenders_live.add(1);
         log.info("meta volume {s}: JOINED as appender {d} (term {d}, node 0x{x}, mount slot 0x{x}) at {f}: ring {d} B in {d} segment(s), head {d}, grant {d} extent(s), incarnation base {x}; {d} writer(s) known", .{ be.path, jr.appenderId(), jr.core.page.term, identity.node_token, identity.mount_slot, ep, jr.core.ringBytes(), jr.core.table.len, jr.core.core.headPos(), self.granted, jr.seq.load(), writers_known });
         return self;
+    }
+
+    /// `SQUEEZEFS_TEST_JOIN_APPENDER_HOLD`: the open parks between its
+    /// census and its JoinAppender, when the FIFO is present, until a
+    /// writer opens it.
+    fn holdJoinAppenderIfArmed(be: *KvBackend) void {
+        const path = knobs.parseStr(be.env.get("SQUEEZEFS_TEST_JOIN_APPENDER_HOLD")) orelse return;
+        Io.Dir.cwd().access(be.io, path, .{}) catch return;
+        log.warn("meta volume {s}: SQUEEZEFS_TEST_JOIN_APPENDER_HOLD — the JoinAppender holds (the census read, no page Live under this mount's identity yet) until a writer opens {s}", .{ be.path, path });
+        const f = Io.Dir.cwd().openFile(be.io, path, .{}) catch |e| {
+            log.warn("meta volume {s}: the JoinAppender hold could not open {s} ({t}); not holding", .{ be.path, path, e });
+            return;
+        };
+        f.close(be.io);
+        log.warn("meta volume {s}: SQUEEZEFS_TEST_JOIN_APPENDER_HOLD released — the JoinAppender proceeds", .{be.path});
     }
 
     /// What a joiner may rely on from the manager across its incarnations:

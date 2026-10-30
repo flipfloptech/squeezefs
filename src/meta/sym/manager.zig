@@ -2203,6 +2203,37 @@ test "join: allocates the lowest free page, carves + zeroes a ring at the floor,
     try testing.expectEqual(@as(u64, 3), m.appenders_known);
 }
 
+test "join: another incarnation of a pair whose page is Live (the same node and mount slot, another writer id) is Deferred — nothing written, the page untouched; once that page leaves Live (its recovery) the successor joins on a fresh pair (decision 0003 §DA)" {
+    const gpa = testing.allocator;
+    const tv = try TestVolume.init(gpa, 1 << 30, 65_536, 4000);
+    defer tv.deinit();
+    try tv.liveManagerPage();
+    var m = newManager(gpa, tv);
+    defer m.deinit();
+    const j = try m.joinAppender(.{ .identity = ident_a });
+    const bits = tv.allocatedExtents();
+    const entries = tv.control_entries;
+    const before = (try m.readPageOf(j.appender_id)).?;
+    const successor: Identity = .{ .node_token = ident_a.node_token, .mount_slot = ident_a.mount_slot, .writer_id = ident_a.writer_id +% 1 };
+    try testing.expectError(error.Deferred, m.joinAppender(.{ .identity = successor }));
+    try testing.expectEqual(bits, tv.allocatedExtents());
+    try testing.expectEqual(entries, tv.control_entries);
+    const after = (try m.readPageOf(j.appender_id)).?;
+    try testing.expect(after.state == .live and after.identity.eql(ident_a) and after.generation == before.generation);
+    // The recovery takes the page Recovered: the successor's join is a fresh one.
+    var p = after;
+    p.state = .recovered;
+    p.generation += 1;
+    var img: [page.PAGE_LEN]u8 = undefined;
+    try p.encode(&img);
+    @memcpy(tv.at(j.page_addr)[0..page.PAGE_LEN], &img);
+    const j2 = try m.joinAppender(.{ .identity = successor });
+    try testing.expect(!j2.already);
+    try testing.expect(j2.appender_id != j.appender_id);
+    const p2 = (try m.readPageOf(j2.appender_id)).?;
+    try testing.expect(p2.state == .live and p2.identity.eql(successor));
+}
+
 test "join: a join past the ring budget's remainder refuses naming the volume count lever on its own counter (never the refusal tripwire); the chain grows when every pair is taken" {
     const gpa = testing.allocator;
     // 400 extents ⇒ 1.56 MiB budget ⇒ the manager's 1 MiB ring leaves one floor ring.

@@ -168,6 +168,24 @@ fn startTicksFn(_: ?*anyopaque, pid: u32) ?u64 {
 /// The ONE prover (`claim.PidProbe`) over procfs.
 pub const probe: claim.PidProbe = .{ .ctx = null, .startTicksOf = startTicksFn };
 
+/// The live process of this host whose incarnation is `writer_id` at
+/// `slot` — `claim.Identity.writerId` over `local`'s boot id and hostname
+/// and each process's pid and start ticks (a zombie answers none,
+/// `startTicksOf`). One `/proc` walk; null = none alive (or `/proc`
+/// unreadable: no proof).
+pub fn liveWriterPid(io: Io, local: claim.Identity, slot: u16, writer_id: u64) ?linux.pid_t {
+    var proc_dir = Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return null;
+    defer proc_dir.close(io);
+    var it = proc_dir.iterate();
+    while (it.next(io) catch null) |ent| {
+        const pid = std.fmt.parseInt(u32, ent.name, 10) catch continue; // a pid directory, decimal
+        const ticks = startTicksOf(pid) orelse continue;
+        const candidate: claim.Identity = .{ .boot_id = local.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
+        if (candidate.writerId(slot) == writer_id) return @intCast(pid);
+    }
+    return null;
+}
+
 /// This process's identity: boot id, pid, its own start ticks (0 when
 /// `/proc/self/stat` is unreadable — then no later incarnation could ever
 /// match it, which errs towards "alive"), the hostname's hash.
@@ -697,6 +715,26 @@ test "start ticks: field 22 after the last ')' (a comm with spaces and parenthes
     _ = try child.wait(testing.io);
     try testing.expect(startTicksOf(pid) == null);
     try testing.expect(probe.provablyDead(pid, 1));
+}
+
+test "liveWriterPid: an incarnation's writer id names its live process on this host (this process; a running child under its own pid and start ticks), and none once that child is killed and reaped; another slot's id, or a stranger's, names none (decision 0003 §DA)" {
+    const me = localIdentity();
+    try testing.expectEqual(@as(?linux.pid_t, @intCast(me.pid)), liveWriterPid(testing.io, me, 7, me.writerId(7)));
+    try testing.expectEqual(@as(?linux.pid_t, null), liveWriterPid(testing.io, me, 7, me.writerId(8) +% 1));
+    var child = try std.process.spawn(testing.io, .{ .argv = &.{"cat"}, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(child.id.?, .KILL);
+        _ = child.wait(testing.io) catch {};
+    };
+    const pid: u32 = @intCast(child.id.?);
+    const theirs: claim.Identity = .{ .boot_id = me.boot_id, .pid = pid, .start_ticks = startTicksOf(pid).?, .hostname_hash = me.hostname_hash };
+    try testing.expectEqual(@as(?linux.pid_t, @intCast(pid)), liveWriterPid(testing.io, me, 0x0819, theirs.writerId(0x0819)));
+    try testing.expectEqual(@as(?linux.pid_t, null), liveWriterPid(testing.io, me, 0x0819, theirs.writerId(0x081A)));
+    _ = linux.kill(child.id.?, .KILL);
+    _ = try child.wait(testing.io);
+    reaped = true;
+    try testing.expectEqual(@as(?linux.pid_t, null), liveWriterPid(testing.io, me, 0x0819, theirs.writerId(0x0819)));
 }
 
 test "a ZOMBIE holder is dead: a daemon that exited under a supervisor that reaps on its 5 s probe still has /proc/<pid>/stat (state Z, its start ticks) — it holds no fd, writes nothing, and its pid cannot be reused, so the claim it left is reclaimable at once (xfstests' _flakey_drop_and_remount remounts within 50 ms)" {

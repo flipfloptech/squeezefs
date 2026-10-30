@@ -1124,7 +1124,7 @@ pub const KvBackend = struct {
         // the manager's endpoint is awaited, so the slot plane — whose
         // frame seam lives in the cache — arms after it.
         const js = sym.joined.JoinedSet.open(be, jopts.mountpoint, jopts.endpoint, jopts.predecessor, jopts.secret) catch |e| return switch (e) {
-            error.ManagerUnreachable, error.Capacity => error.Busy,
+            error.ManagerUnreachable, error.PredecessorLive, error.Capacity => error.Busy,
             error.Rejected, error.Corrupt => error.Corrupt,
             error.Io => error.Io,
             error.OutOfMemory => error.OutOfMemory,

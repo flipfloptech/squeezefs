@@ -169,10 +169,19 @@ pub const OpenError = error{
     Capacity,
     /// A `Joined` word failed the screen, or the wire schema refused.
     Rejected,
+    /// A page Live under this mount point's (node, mount slot) belongs to
+    /// a process alive on this host: the mount point is served.
+    PredecessorLive,
     Io,
     Corrupt,
     OutOfMemory,
 };
+
+/// One `/proc` walk per second of a Deferred join (every tenth retry,
+/// the first included): a second mount whose census ran before the
+/// served mount's page went Live is refused within a second of its first
+/// deferral, not at its park bound.
+const LIVE_RECHECK_DEFERRALS: u64 = 10;
 
 // ---------------------------------------------------------------------------
 // The shared link: one dialled session, any thread.
@@ -408,12 +417,18 @@ pub const JoinedSet = struct {
         const identity = join.identityFor(local, mount_slot);
         const wire_identity: verbs.WireIdentity = .{ .node_token = identity.node_token, .writer_id = identity.writer_id, .mount_slot = identity.mount_slot, .reserved = 0 };
         // 1. The census: `writers_known`, the manager's identity off
-        // appender 0's page. A previous incarnation's page Live under this
-        // mount slot is the manager's to judge at the JoinAppender — under
-        // its verb lock, where no other join can slip between the look and
-        // the act: Deferred until that page's recovery (decision 0003 §DA).
+        // appender 0's page. A page Live under this mount slot whose
+        // process is alive on this host refuses the mount at once; a
+        // crashed predecessor's is the manager's to judge at the
+        // JoinAppender — under its verb lock, where no other join can slip
+        // between the look and the act: Deferred until that page's
+        // recovery (decision 0003 §DA).
         var writers_known: u64 = 1;
-        try census(be, &writers_known);
+        switch (try census(be, local, identity, &writers_known)) {
+            .none => {},
+            .crashed => |p| log.info("meta volume {s}: appender {d} (term {d}) is Live under this mount point's identity and its process is gone — a crashed predecessor: the manager defers this join until its recovery", .{ be.path, p.appender_id, p.term }),
+            .alive => |a| return refuseLive(be, a),
+        }
         holdJoinAppenderIfArmed(be);
         const page0 = (try readAppender0(gpa, be)) orelse {
             log.err("meta volume {s}: appender 0's page is blank — no manager has ever mounted this volume; the D0 ladder is the first writer's", .{be.path});
@@ -479,6 +494,13 @@ pub const JoinedSet = struct {
                 .ring0_head = be.mounted.journal_tail_seq,
             }) catch |e| {
                 if (e == error.Deferred and clock.monotonicNs() < join_deadline) {
+                    if (join_deferrals % LIVE_RECHECK_DEFERRALS == 0) {
+                        var seen: u64 = 1;
+                        switch (try census(be, local, identity, &seen)) {
+                            .alive => |a| return refuseLive(be, a),
+                            .none, .crashed => {},
+                        }
+                    }
                     if (join_deferrals == 0) log.info("meta volume {s}: JoinAppender deferred by the manager — its ring 0 full, or this mount's predecessor (node 0x{x}, mount slot 0x{x}) not yet recovered; retrying for up to {d} ms", .{ be.path, identity.node_token, identity.mount_slot, self.park_gate.t_park_max_ms });
                     join_deferrals += 1;
                     be.io.sleep(.fromMilliseconds(ENDPOINT_POLL_STEP_MS), .awake) catch {};
@@ -617,7 +639,27 @@ pub const JoinedSet = struct {
 
     // ---- the census ----
 
-    fn census(be: *KvBackend, writers_known: *u64) OpenError!void {
+    /// What the census saw under this mount point's (node, mount slot).
+    const PairVerdict = union(enum) {
+        none,
+        /// Live, its process gone (or not provable): the manager defers.
+        crashed: page.Page,
+        /// Live, its incarnation a live process of this host.
+        alive: Alive,
+    };
+    const Alive = struct { p: page.Page, pid: std.os.linux.pid_t };
+
+    fn refuseLive(be: *KvBackend, a: Alive) OpenError {
+        log.err("meta volume {s}: appender {d} (term {d}) is LIVE on the directory under this mount point's identity and its process, pid {d}, is alive on this host — another mount serves this mount point", .{ be.path, a.p.appender_id, a.p.term, a.pid });
+        return error.PredecessorLive;
+    }
+
+    /// The directory walk: `writers_known`, and the pair's verdict — a
+    /// Live page under the pair is ALIVE when a process of this host is its
+    /// incarnation (`proc.liveWriterPid`: the writer id is the hash of the
+    /// boot id, the hostname, the slot, the pid and its start ticks).
+    fn census(be: *KvBackend, local: claim.Identity, identity: page.Identity, writers_known: *u64) OpenError!PairVerdict {
+        var verdict: PairVerdict = .none;
         var links: std.ArrayList(dir.Link) = .empty;
         defer links.deinit(be.gpa);
         var reader_ctx: DevicePages = .{ .be = be };
@@ -636,12 +678,16 @@ pub const JoinedSet = struct {
                 const imgs = dir.readPair(reader, l, pair) catch return error.Io;
                 if (imgs.foreign) return error.Corrupt;
                 const p = imgs.newest() orelse continue;
-                if (p.state == .live) writers_known.* += 1;
+                if (p.state != .live) continue;
+                writers_known.* += 1;
+                if (verdict == .alive or !p.identity.sameMount(identity)) continue;
+                verdict = if (proc.liveWriterPid(be.io, local, @truncate(identity.mount_slot), p.identity.writer_id)) |pid| .{ .alive = .{ .p = p, .pid = pid } } else .{ .crashed = p };
             }
         }
         // Appender 0 (the manager) is Live by definition of a joined open;
         // the directory holds appenders ≥ 1, so it is counted here.
         writers_known.* += 1;
+        return verdict;
     }
 
     const DevicePages = struct {

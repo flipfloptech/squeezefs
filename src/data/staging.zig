@@ -4520,6 +4520,31 @@ test "linux: the write cache's held copy (decision 0003 §CV) — a dead member'
     try testing.expect(d.dropHeldCopy());
 }
 
+test "linux: a held dir whose path is not a directory (a file in its place: ENOTDIR) holds no write-cache copy — the cache-less probe sees none and the member's bind, the claim free, is fresh" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "staging: Linux only");
+    var uuid: [16]u8 = @splat(0x6D);
+    std.mem.writeInt(u32, uuid[0..4], @intCast(linux.getpid()), .little);
+    std.mem.writeInt(u64, uuid[4..12], @bitCast(clock.monotonicNs()), .little);
+    const ours: Marker = .{ .set_uuid = uuid, .set_epoch = 1, .node_token = 0xC0, .mount_slot = 5, .appender_id = 0, .owner_pid = 3333 };
+    _ = linux.mkdirat(linux.AT.FDCWD, "/build/tmp", 0o755);
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrintSentinel(&root_buf, "/build/tmp/sqz-wcache-notdir-{d}-{x}", .{ linux.getpid(), uuid[4] }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdirat(linux.AT.FDCWD, root, 0o700)));
+    defer std.Io.Dir.cwd().deleteTree(testing.io, root) catch {};
+    // A FILE where the held dir would be (a row's marker file of that name).
+    var dir_buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "{s}/held", .{root}, 0);
+    const frc = linux.open(dir, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o600);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(frc));
+    _ = linux.close(@intCast(frc));
+    try testing.expect(!Ring.Ram.heldCopyExists(ours, dir));
+    var refusal: Ring.BindRefusal = .{};
+    var r = try Ring.Ram.bind(ours, 16 * 4096, dir, &refusal);
+    defer r.release();
+    try testing.expectEqual(BindVerdict.absent, r.verdict);
+    try testing.expect(!r.from_held_copy and r.heldCopy() == null);
+}
+
 test "tie: the write cache's sizing — the table one item per smallest record (2 grains) a shard, at least 16; the index grows on demand to exactly the table at the sealed ring's bound (27 GiB over 32 shards: 110,592 a shard)" {
     const items = writeCacheItems(27 * derive.GiB, 32);
     try testing.expectEqual(@as(usize, 27 * derive.GiB / (2 * RECORD_ALIGN) / 32), items.max);

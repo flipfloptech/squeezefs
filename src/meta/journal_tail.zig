@@ -1772,6 +1772,27 @@ test "linux: the format's sweep of a held copy — the copy of the volume it ove
     try testing.expect(linux_tail.removeHeld(rig.dir, test_identity) == .none);
 }
 
+test "linux: a held dir whose path is not a directory (a file in its place: ENOTDIR) holds no copy — the successor's consumeHeld is `none` (the volume opens), the supervisor's retryHeld `gone`, the format's removeHeld `none`" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the held tail is Linux only");
+    const linux = std.os.linux;
+    const gpa = testing.allocator;
+    var rig: HeldRig = .{};
+    try rig.init("notdir");
+    defer rig.deinit();
+    try rig.outline(test_identity, 0);
+    // A FILE where the held dir would be (a row's marker file of that name).
+    const parent = rig.dir[0 .. rig.dir.len - "/b".len];
+    try linux_tail.makeDirs(parent);
+    const frc = linux.open(rig.dir, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o600);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(frc));
+    _ = linux.close(@intCast(frc));
+    var hb: [PATH_CAP]u8 = undefined;
+    const file = heldPath(&hb, rig.dir, test_identity.volume_uuid).?;
+    try testing.expect(linux_tail.consumeHeld(gpa, file, rig.dev_path, test_identity) == .none);
+    try testing.expect(linux_tail.retryHeld(gpa, file) == .gone);
+    try testing.expect(linux_tail.removeHeld(rig.dir, test_identity) == .none);
+}
+
 /// Four one-entry windows of `death_entry_len` bytes on `HeldRig`'s ring,
 /// written as the lane writes them (`journal.buildEntryWrite` over the
 /// production geometry): window `i`'s entry is one Put on inode `i + 1`.

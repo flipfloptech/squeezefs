@@ -73,3 +73,30 @@ The first name, `SQUEEZEFS_TEST_JOB_HOLD`, strictly prefixed `…_HOLD_SUBMISSIO
 collision law refused it. On `bb8362d`: units (`ops.jobs`, `ops.defrag`, `ops.lifecycle`, `dutyPark`,
 `core.knobs`) 149 + 3 skipped, fmt, rails, the full smoke 169/175 (6 skipped). Rebased onto `90094f4`: the
 units 149/149, fmt, rails 29, the three rows ×3, the full smoke 170/176 (6 skipped).
+
+**5. The no-EAGAIN row's storm meets the old bound on a held barrier (§CO.31–CO.33; branch
+`test/bo-hwm-precondition` off `72f125f`).** A full gate on 2026-10-30 went red on the row's precondition, not
+its law. B's `journal_lane_fsync_waiters_hwm` read 54 against `> 64` (the 64 request cells a barrier took before
+§BO.1), with 0 EAGAIN and 0 failed. Idle runs read 73, 88, 122 or 300. The host's pace defeats the precondition
+in two ways. If the 50 ms cadence barrier lands every create before the fsyncs arrive, each fsync's cover is
+already durable and none is asked. If the fsyncs arrive spread out, each barrier answers one wave. New seam
+`SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS=N`, armed by the mount's first FUSE CREATE before its commit: from then on no
+journal lane starts a coalesced barrier until N fsyncs wait on one lane at once. The first lane to hold N spends
+the seam for good. A stopping lane, a dead ring and the strict group barrier are never held. The creates stay
+un-durable, so every fsyncdir is admitted needing that one barrier. B mounts with N = 65, the row awaits the arm
+line before the fsync gate, and it asserts hwm ≥ 65.
+
+**Red on `72f125f`** (a temporary row change, not committed): 1 s between the creates and the fsync gate gave hwm
+1 and 1, and the shipped assertion failed. A stagger of 2·i ms on thread i's fsyncdir gave 5 (red) and 116. On the
+fix, the same windows gave 300 and 300 (pause) and 257 and 67 (stagger), all green, with the seam spent at 65–66.
+Unit (`journal_lane`): two fsyncs and a landed window's cadence barrier start no barrier, the third fsync
+spends the seam and one barrier answers all three, and a stopping lane is never held. A seam that never holds
+fails that test.
+
+| the row's binary (`f0ed112`) | beside | runs | load | hwm |
+|---|---|---|---|---|
+| the row alone | the full smoke's 16 shards + 16 busy loops | **10/10** | 128–371 | 89–290 |
+| the row alone | nothing of this work's (other worktrees' builds) | **20/20** | 22–183 | 104–300 |
+
+Every run answered 0 to all 1,200 ops (0 EAGAIN). On `f0ed112`: units `journal_lane` 67/67 and `knobs` 57/57,
+fmt, rails 29, the full smoke 183 + 6 skipped of 189.

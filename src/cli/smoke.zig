@@ -200,9 +200,11 @@ const Rig = struct {
         _ = linux.mkdir(self.work.ptr, 0o755);
         // A dead daemon's held custody (a failed replay's journal tail, a
         // write cache no successor took) dies with the work dir, never in
-        // the host's /run (decision 0003 §CV); a row may name its own.
+        // the host's /run (decision 0003 §CV); a row may name its own. Not
+        // `held`: rows make a marker file of that name in the work dir
+        // (ENOTDIR under it is no copy, but the copies would go nowhere).
         var held_buf: [96]u8 = undefined;
-        try self.env.put("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", try std.fmt.bufPrint(&held_buf, "/build/tmp/smoke-{d}/held", .{pid}));
+        try self.env.put("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", try std.fmt.bufPrint(&held_buf, "/build/tmp/smoke-{d}/" ++ rig_held_dir, .{pid}));
         // The data dir's per-run folder (equals `work` unless the seam moved it).
         const data_work = try std.fmt.allocPrintSentinel(gpa, "{s}/smoke-{d}", .{ data_dir, pid }, 0);
         defer gpa.free(data_work);
@@ -10386,7 +10388,7 @@ fn plantHeldRing(io: Io, work: []const u8, set_uuid: [16]u8, path_buf: *[journal
     var nb: [64]u8 = undefined;
     const name = staging.Ring.Ram.claimName(&nb, m.identity(), m.mount_slot, m.member);
     var dir_buf: [256]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&dir_buf, "{s}/held", .{work});
+    const dir = try std.fmt.bufPrint(&dir_buf, "{s}/" ++ rig_held_dir, .{work});
     try Io.Dir.cwd().createDirPath(io, dir);
     const path = try std.fmt.bufPrintSentinel(path_buf, "{s}/{s}" ++ staging.Ring.Ram.HELD_SUFFIX, .{ dir, name }, 0);
     var image: [2 * 4096]u8 = @splat(0);
@@ -10712,7 +10714,7 @@ fn writeCacheMemfdsOf(rig: *Rig, mp: []const u8) !usize {
 /// Held copies (`suffix`) in the rig's held dir.
 fn heldCopies(rig: *Rig, suffix: []const u8) !usize {
     var script: [256]u8 = undefined;
-    const out = try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "ls held 2>/dev/null | grep -c -- '\\{s}$' || true", .{suffix}));
+    const out = try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "ls " ++ rig_held_dir ++ " 2>/dev/null | grep -c -- '\\{s}$' || true", .{suffix}));
     defer rig.gpa.free(out);
     return std.fmt.parseInt(usize, std.mem.trim(u8, out, " \n"), 10);
 }
@@ -11758,6 +11760,8 @@ const overwrite_seed: u64 = 0x5151_4a4a_0404_2026;
 const smoke_loops_knob = "SQUEEZEFS_TEST_SMOKE_STAGE_LOOPS";
 const data_dir_knob = "SQUEEZEFS_TEST_DATA_DIR";
 const rings_knob = "SQUEEZEFS_FUSE_RINGS_PER_QUEUE";
+/// Every rig's held custody, under its work dir (`Rig.init`).
+const rig_held_dir = "held-custody";
 /// One looped pass's wall bound: the overwrite stage runs ~5 s, the storm
 /// ~15 s on the venue; a pass past this is a hang, killed and failed.
 const stage_loop_timeout_s: u32 = 300;

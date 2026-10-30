@@ -242,6 +242,17 @@ pub fn requestVolume(payload: verbs.Request) ?u16 {
     };
 }
 
+/// The ledger volume's half of a JoinAppender (charter §5.5: the join is
+/// the identity's newer incarnation): a standing death record naming the
+/// joining `(node, mount slot)` is retired BEFORE the join writes a page
+/// Live — else the next ledger poll, finding the fresh Live page under the
+/// record's pair while the member's census join (the wire plane's start,
+/// after the open) has not landed, recovers the LIVE joiner's region.
+pub const JoinRetire = struct {
+    ctx: *anyopaque,
+    retire: *const fn (ctx: *anyopaque, identity: Identity) manager.VerbError!void,
+};
+
 pub const ManagerHandlers = struct {
     mgr: *manager.Manager,
     /// The plane's table (the slot verbs' executors).
@@ -249,6 +260,9 @@ pub const ManagerHandlers = struct {
     set_width: u16,
     /// The volume ordinal this face serves (`ManagerSet`'s dispatch key).
     volume: u16 = 0,
+    /// Null until the ledger is up, and on a process that does not manage
+    /// the ledger volume (it retires nothing).
+    join_retire: ?JoinRetire = null,
 
     pub fn register(self: *ManagerHandlers, svc: *service.Service) void {
         svc.register(.join_appender, .{ .ctx = self, .serve = &serveJoin });
@@ -297,6 +311,7 @@ pub const ManagerHandlers = struct {
             .ok => {},
             .rejected => |why| return service.Answer.rejected(@tagName(why)),
         }
+        if (self.join_retire) |jr| jr.retire(jr.ctx, pageIdentity(r.identity)) catch |e| return classifyVerb(e);
         // The kernel's posture before the joiner can write (decision 0003
         // §AB.2).
         if (self.mgr.peer_gate) |g| g.enter(g.ctx);

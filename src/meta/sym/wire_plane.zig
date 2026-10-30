@@ -72,6 +72,7 @@ const backend = @import("../backend.zig");
 const meta_set = @import("../meta_set.zig");
 const claim = @import("../guard/claim.zig");
 const manager = @import("manager.zig");
+const page = @import("appender_page.zig");
 const cr = @import("control_records.zig");
 const membership = @import("membership.zig");
 const shard = membership.shard;
@@ -861,6 +862,7 @@ pub const WirePlane = struct {
         m.owner.bindRows(m.rows.store());
         m.ledger = death_ledger.Ledger.init(gpa, m.ledger_store.store(), @intCast(set.volumes.len), identity, t_owner_ms);
         errdefer m.ledger.deinit();
+        for (m.faces) |*face| face.join_retire = .{ .ctx = self, .retire = &retireJoinerFn };
         m.death_fanout = .{ .plane = self, .ledger = m.ledger.deathSink() };
         m.owner.bindDeathSink(m.death_fanout.sink());
         m.owner_svc = .{ .owner = &m.owner, .now = &nowMsFn, .generation = .{ .ctx = null, .read = &configGenerationFn } };
@@ -1953,6 +1955,16 @@ pub const WirePlane = struct {
         return self.set.volumes[0].sym != null;
     }
 
+    /// `join_ladder.JoinRetire` at the ledger volume: the joining pair's
+    /// standing death record retired before its page goes Live.
+    fn retireJoinerFn(ctx: *anyopaque, identity: page.Identity) manager.VerbError!void {
+        const self: *WirePlane = @ptrCast(@alignCast(ctx));
+        const m = self.mgr orelse return;
+        if (!isVol0ManagerFn(self)) return;
+        const id: death_ledger.WriterIdentity = .{ .node_token = identity.node_token, .mount_slot = identity.mount_slot, .writer_id = identity.writer_id };
+        if (try m.ledger.retireJoiner(id)) log.warn("cluster wire: JoinAppender by node 0x{x} / mount slot {d} RETIRED the identity's standing death record — the join is its newer incarnation (the predecessor's regions are the recovery's)", .{ identity.node_token, identity.mount_slot });
+    }
+
     /// The registrant key of a roster member (a file substrate holds no
     /// PR key: 0).
     fn rosterKey(_: shard.MemberId) u64 {
@@ -2593,7 +2605,6 @@ fn readEnrollSecret(gpa: Allocator, be0: *KvBackend) StartError!wire_auth.Secret
 const testing = std.testing;
 const dlm = @import("../dlm.zig");
 const dialer = @import("../../wire/dialer.zig");
-const page = @import("appender_page.zig");
 const join = @import("join.zig");
 const node_seq = @import("../node_seq.zig");
 const slots_acquire = @import("slots/acquire.zig");

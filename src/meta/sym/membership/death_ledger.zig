@@ -186,6 +186,22 @@ pub const Ledger = struct {
         stats.dead_members_retired_rejoined.inc();
     }
 
+    /// `retire_joiners_death_record` (charter §5.5; the porting spec's
+    /// JoinAppender service edge): a standing record naming the joining
+    /// pair is a PREDECESSOR's — retired, with its `recovered:` rows, before
+    /// the join writes a page Live. Answers whether a record stood; a store
+    /// that refuses the retirement defers the join (the joiner retries). The
+    /// poll that sees the Live page re-reads the record and finds it gone.
+    pub fn retireJoiner(self: *Ledger, identity: WriterIdentity) error{ Deferred, Io }!bool {
+        if ((try self.readDeath(identity)) == null) return false;
+        alloc_lease.retireDeathRecords(self.store.control, self.gpa, identity, self.set_width) catch |e| return switch (e) {
+            error.WindowFull => error.Deferred,
+            error.Io, error.OutOfMemory => error.Io,
+        };
+        stats.dead_members_retired_rejoined.inc();
+        return true;
+    }
+
     pub fn readDeath(self: *Ledger, identity: WriterIdentity) error{Io}!?DeadMember {
         return alloc_lease.readDeath(self.store.control, self.gpa, identity) catch error.Io;
     }
@@ -566,6 +582,28 @@ test "the writer: the home shard's eviction records a death ONCE (a reader's id 
     // The join retires it.
     try l2.retireForJoin(wid(2));
     try testing.expect((try l2.readDeath(wid(2))) == null);
+}
+
+test "a JoinAppender retires the joining pair's standing death record and its recovered rows before the page goes Live (the join is the newer incarnation, whatever its writer id): answers whether one stood; another pair's record stands" {
+    const gpa = testing.allocator;
+    var rs = RamLedgerStore.init(gpa);
+    defer rs.deinit();
+    var l = Ledger.init(gpa, rs.store(), 2, wireOf(wid(0)), 45_000);
+    defer l.deinit();
+    l.recordDeath(wid(1), .{ .epoch = 5, .ts_realtime_ns = 1, .pr_key = 0, .early = false });
+    l.recordDeath(wid(2), .{ .epoch = 6, .ts_realtime_ns = 1, .pr_key = 0, .early = false });
+    try testing.expect(try l.recordRecovered(wid(1), 0, 3, 2));
+    try testing.expect(try l.recordRecovered(wid(1), 1, 3, 2));
+    // A successor of the same pair (another incarnation's writer id).
+    const successor: WriterIdentity = .{ .node_token = wid(1).node_token, .mount_slot = wid(1).mount_slot, .writer_id = 0x77 };
+    const retired0 = stats.dead_members_retired_rejoined.load();
+    try testing.expect(try l.retireJoiner(successor));
+    try testing.expectEqual(retired0 + 1, stats.dead_members_retired_rejoined.load());
+    try testing.expect((try l.readDeath(wid(1))) == null);
+    try testing.expect(!(try l.isRecovered(wid(1), 0)));
+    try testing.expect(!(try l.isRecovered(wid(1), 1)));
+    try testing.expect(!(try l.retireJoiner(successor)));
+    try testing.expect((try l.readDeath(wid(2))) != null);
 }
 
 test "the screen: own identity, a live member, a key the census holds or that contradicts the registered key are rejected before any write; key 0 and the registered key are accepted; a member no census knows is accepted and counted unvalidated" {

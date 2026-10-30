@@ -1216,7 +1216,8 @@ fn announceWriteCache(plane: *plane_mod.DataPlane, env: *const std.process.Envir
     if (knobs.parseStr(env.get("SQUEEZEFS_TEST_WRITE_CACHE_ANNOUNCE_HOLD"))) |path| if (!std.mem.eql(u8, path, "off")) holdBeforeAnnounce(path);
     const claim_frame = (cli.supervisor.TailFrame{ .kind = .write_cache_claim, .index = 0 }).encode();
     const ring_frame = (cli.supervisor.TailFrame{ .kind = .write_cache, .index = 0 }).encode();
-    ipc_rl.sendCtl(sock, &claim_frame, fds.claim) catch |e| {
+    const handover_frame = (cli.supervisor.TailFrame{ .kind = .write_cache_handover, .index = 0 }).encode();
+    if (fds.claim) |claim| ipc_rl.sendCtl(sock, &claim_frame, claim) catch |e| {
         log.err("write cache: cannot hand the claim to the supervisor ({s}) — a crash loses the ring's unsynced residents", .{@errorName(e)});
         return;
     };
@@ -1224,8 +1225,17 @@ fn announceWriteCache(plane: *plane_mod.DataPlane, env: *const std.process.Envir
         log.err("write cache: cannot hand the memfd to the supervisor ({s}) — a crash loses the ring's unsynced residents", .{@errorName(e)});
         return;
     };
-    log.info("write cache: the memfd and its claim handed to the supervisor (a crash of this process keeps every resident for this member's next mount)", .{});
-    plane.writeCacheHandedOver();
+    // After a handover: the previous supervisor keeps the ring until this
+    // one acks holding it on the connection, then lets the claim go for it
+    // (decision 0003 §CV).
+    if (fds.handover) |conn| {
+        ipc_rl.sendCtl(sock, &handover_frame, conn) catch |e| {
+            log.err("write cache: cannot hand the claim connection to the supervisor ({s}) — the previous supervisor keeps the ring until its ack bound, then leaves it to this process alone", .{@errorName(e)});
+            return;
+        };
+        plane.writeCacheAnnounced();
+    }
+    log.info("write cache: the memfd and its {s} handed to the supervisor (a crash of this process keeps every resident for this member's next mount)", .{if (fds.handover != null) "claim connection" else "claim"});
 }
 
 /// `SQUEEZEFS_TEST_WRITE_CACHE_ANNOUNCE_HOLD`: park until a writer opens

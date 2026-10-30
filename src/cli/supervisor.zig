@@ -78,11 +78,13 @@
 //! persistHeldCopy`), which that mount adopts whenever it comes — so no
 //! supervisor outlives its mount holding RAM: a mount the operator or a
 //! harness detached, a successor nothing starts, a dead mount left
-//! attached all end the same way. A set whose every metadata image was
-//! deleted (no name left) can never be mounted again: what is held for it
-//! is discarded, said once. This process never restarts the daemon — the
-//! mount's argv, its identity and whether anyone still wants it are not
-//! its to judge.
+//! attached all end the same way. A ring handed to a successor stays here
+//! until the successor's supervisor acks holding it (`write_cache_held` on
+//! the claim connection); that supervisor then binds the claim. A set
+//! whose every metadata image was deleted (no name left) can never be
+//! mounted again: what is held for it is discarded, said once. This
+//! process never restarts the daemon — the mount's argv, its identity and
+//! whether anyone still wants it are not its to judge.
 
 const std = @import("std");
 const fuzzkit = @import("../core/fuzzkit.zig");
@@ -234,9 +236,13 @@ pub fn probeKind(attached: bool) ProbeKind {
 }
 
 /// One frame on the tail socket: what the fd beside it is. The write
-/// cache's three (charter §6.1 "Staged"): its memfd, its CLAIM socket, and
-/// — no fd — the dismount's word that the ring is drained (discard it).
-pub const TailFrameKind = enum(u8) { tail = 1, guard = 2, write_cache = 3, write_cache_claim = 4, write_cache_drained = 5 };
+/// cache's four (charter §6.1 "Staged"): its memfd, its CLAIM socket, the
+/// claim CONNECTION a handover arrived on (the ack goes on it, decision
+/// 0003 §CV), and — no fd — the dismount's word that the ring is drained
+/// (discard it). On a claim connection: `write_cache` with the memfd (the
+/// holder's handover) and `write_cache_held`, no fd (the successor's
+/// supervisor holds the ring: the ack).
+pub const TailFrameKind = enum(u8) { tail = 1, guard = 2, write_cache = 3, write_cache_claim = 4, write_cache_drained = 5, write_cache_handover = 6, write_cache_held = 7 };
 
 pub const TailFrame = struct {
     kind: TailFrameKind,
@@ -260,6 +266,8 @@ pub const TailFrame = struct {
             3 => .write_cache,
             4 => .write_cache_claim,
             5 => .write_cache_drained,
+            6 => .write_cache_handover,
+            7 => .write_cache_held,
             else => return null,
         };
         return .{ .kind = kind, .index = std.mem.readInt(u16, b[1..3], .little) };
@@ -306,6 +314,26 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         write_cache_claim: ?linux.fd_t = null,
         write_cache_drained: bool = false,
         write_cache_listening: bool = false,
+        /// The claim connection this daemon's bind took the ring over
+        /// (`write_cache_handover`): the ack goes on it once the ring is
+        /// this supervisor's (`takeCustody`).
+        handover: ?linux.fd_t = null,
+        /// The ring is this supervisor's: the member's held copy removed,
+        /// a handover acked (`takeCustody`).
+        custody: bool = false,
+        /// The connection the ring was sent on to a successor, awaiting its
+        /// supervisor's ack: until then the ring and the claim stay here
+        /// (decision 0003 §CV).
+        handing: ?linux.fd_t = null,
+        handing_deadline: u64 = 0,
+        /// How long a successor's supervisor may take to ack from the send:
+        /// the successor's bring-up to `ready` (its supervisor runs from
+        /// there) — a daemon's own silence bound. Past it the ring is the
+        /// successor's alone.
+        ack_ns: u64 = UNRESPONSIVE_NS,
+        /// When the ring moves to its held copy (`holdForSuccessor`'s; a
+        /// handover that ended without an ack starts the grace again).
+        ring_deadline: u64 = 0,
         /// Where the ring goes once no successor took it (the policy's;
         /// empty = the host's runtime dir) and how long it waits on its
         /// claim first (decision 0003 §CV).
@@ -352,10 +380,10 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         }
 
         fn dropWriteCache(self: *Tails) void {
-            if (self.write_cache) |fd| _ = linux.close(fd);
-            if (self.write_cache_claim) |fd| _ = linux.close(fd);
-            self.write_cache = null;
-            self.write_cache_claim = null;
+            inline for (.{ &self.write_cache, &self.write_cache_claim, &self.handover, &self.handing }) |f| {
+                if (f.*) |fd| _ = linux.close(fd);
+                f.* = null;
+            }
         }
 
         /// Park up to `timeout_ns` on the socket: frames are taken as they
@@ -382,8 +410,10 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             }
         }
 
-        /// Take every queued frame (never blocks).
+        /// Take every queued frame (never blocks but for a handover's ack,
+        /// `takeCustody`).
         pub fn drain(self: *Tails) void {
+            defer self.takeCustody();
             const sock = self.sock orelse return;
             var buf: [64]u8 = undefined;
             while (true) {
@@ -425,6 +455,13 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
                         self.write_cache_claim = fd;
                         break :blk true;
                     },
+                    .write_cache_handover => blk: {
+                        if (self.handover) |old| _ = linux.close(old);
+                        self.handover = fd;
+                        break :blk true;
+                    },
+                    // The claim connection's ack, never this socket's.
+                    .write_cache_held => false,
                     .write_cache_drained => unreachable,
                 };
                 if (!kept) _ = linux.close(fd);
@@ -580,6 +617,61 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             self.guards.clearRetainingCapacity();
         }
 
+        /// The waits of a handover's second half (decision 0003 §CV): the
+        /// previous supervisor's close after the ack, then the claim's
+        /// bind retried 10 ms apart while it frees.
+        const RELEASE_WAIT_MS: i32 = 5_000;
+        const CLAIM_BIND_TRIES: u32 = 200;
+
+        /// The ring is this supervisor's (the memfd with its claim, or with
+        /// the claim connection of a handover, drained): the member's held
+        /// copy is older custody — the copy the bind adopted, or one a
+        /// previous supervisor left beside the ring it handed over — and
+        /// goes; after a handover the previous supervisor is acked on the
+        /// connection and, once it let the claim go, this supervisor binds
+        /// it (decision 0003 §CV). Until this instant a death of the daemon
+        /// left the ring with the copy or the previous supervisor.
+        fn takeCustody(self: *Tails) void {
+            if (self.custody) return;
+            const memfd = self.write_cache orelse return;
+            if (self.write_cache_claim == null and self.handover == null) return;
+            self.custody = true;
+            const dir = self.ringDir();
+            if (staging.Ring.Ram.dropHeldCopyOf(dir.slice(), memfd)) log.info("supervisor: this member's held write cache under {s} removed — the ring it held is this supervisor's now", .{dir.slice()});
+            const conn = self.handover orelse return;
+            self.handover = null;
+            defer _ = linux.close(conn);
+            const ack = (TailFrame{ .kind = .write_cache_held, .index = 0 }).encode();
+            if (rendezvous.sendCtl(conn, &ack, null)) {
+                // The previous supervisor lets the ring and the claim go on
+                // the ack, then closes its end.
+                var pfd = [_]linux.pollfd{.{ .fd = conn, .events = linux.POLL.IN, .revents = 0 }};
+                _ = linux.poll(&pfd, 1, RELEASE_WAIT_MS);
+            } else |_| {}
+            self.write_cache_claim = staging.Ring.Ram.bindClaimOf(memfd, CLAIM_BIND_TRIES);
+            if (self.write_cache_claim == null) {
+                log.warn("supervisor: the write cache handed over is held here, but this member's claim is still bound elsewhere (the previous supervisor finishing its handover) — bound at a later tick", .{});
+            } else log.info("supervisor: the write cache handed over is held here (the previous supervisor acked) and this member's claim bound", .{});
+        }
+
+        /// A ring held without its claim (a handover's bind refused, or the
+        /// daemon died before it sent one): the claim the ring's marker
+        /// names, bound once it is free. True when bound now.
+        fn bindWriteCacheClaim(self: *Tails) bool {
+            if (self.write_cache_claim != null) return false;
+            const memfd = self.write_cache orelse return false;
+            self.write_cache_claim = staging.Ring.Ram.bindClaimOf(memfd, 0);
+            if (self.write_cache_claim == null) return false;
+            log.info("supervisor: this member's write-cache claim bound", .{});
+            return true;
+        }
+
+        /// One tick while the daemon lives: a claim still to bind after a
+        /// handover.
+        pub fn retryWriteCacheClaim(self: *Tails) void {
+            if (self.custody) _ = self.bindWriteCacheClaim();
+        }
+
         /// The daemon is dead: hold what it left until it lands or a
         /// successor takes it, then exit. The write cache (residents, not
         /// drained by a dismount): LISTEN on the claim the daemon bound —
@@ -597,7 +689,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             self.prepareWriteCacheHold();
             if (!self.holding()) return;
             if (self.held.items.len != 0 or self.held_memfds.items.len != 0) log.warn("supervisor: holding {d} journal tail(s) that failed to replay (pid {d}) — retried every {d} ms; the volume's next mount replays them before it admits writes", .{ self.held.items.len + self.held_memfds.items.len, linux.getpid(), self.retry_ns / std.time.ns_per_ms });
-            const ring_deadline = clock.monotonicNs() + self.grace_ns;
+            self.ring_deadline = clock.monotonicNs() + self.grace_ns;
             var next_retry = clock.monotonicNs() + self.retry_ns;
             while (self.holding()) {
                 const now = clock.monotonicNs();
@@ -607,19 +699,22 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
                         break;
                     }
                     self.retryHeld();
-                    if (self.write_cache != null and clock.monotonicNs() >= ring_deadline) self.moveRingToHeldCopy();
+                    self.tickWriteCache();
                     next_retry = clock.monotonicNs() + self.retry_ns;
                     continue;
                 }
-                const claim = self.write_cache_claim orelse {
+                // A handover's ack, else the claim's next successor.
+                const fd = self.handing orelse self.write_cache_claim orelse {
                     sleepNs(next_retry - now);
                     continue;
                 };
-                var pfd = [_]linux.pollfd{.{ .fd = claim, .events = linux.POLL.IN, .revents = 0 }};
+                var pfd = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
                 const ms: i32 = @intCast(@min((next_retry - now + std.time.ns_per_ms - 1) / std.time.ns_per_ms, std.math.maxInt(i32)));
                 const rc = linux.poll(&pfd, 1, ms);
                 switch (linux.errno(rc)) {
-                    .SUCCESS => if (rc != 0) self.acceptSuccessor(),
+                    .SUCCESS => if (rc != 0) {
+                        if (self.handing != null) self.handingAnswered() else self.acceptSuccessor();
+                    },
                     .INTR => {},
                     else => sleepNs(next_retry -| clock.monotonicNs()),
                 }
@@ -627,19 +722,19 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             log.info("supervisor: nothing left to hold; done", .{});
         }
 
-        /// The write cache's half of the hold: a drained or empty ring (or
-        /// one the claim cannot serve) discarded, else listened on and said.
+        /// The write cache's half of the hold: a drained or empty ring
+        /// discarded, else listened on and said. A ring without its claim
+        /// (the daemon died between a handover's bind and its supervisor
+        /// binding it) binds the claim its marker names — or, while another
+        /// holds it, at every tick until the grace moves the ring to its
+        /// held copy.
         fn prepareWriteCacheHold(self: *Tails) void {
             const memfd = self.write_cache orelse return;
-            if (self.write_cache_claim == null) {
-                log.err("supervisor: the write cache's memfd arrived without its claim — {d} B of acked unsynced custody cannot be handed over; discarded", .{memfdLen(memfd)});
-                self.dropWriteCache();
-                return;
-            }
             if (self.write_cache_drained or !staging.Ring.Ram.holdsData(memfd)) {
                 self.dropWriteCache();
                 return;
             }
+            if (self.write_cache_claim == null and !self.bindWriteCacheClaim()) log.warn("supervisor: the dead daemon's write cache is held here without its claim (bound elsewhere: a previous supervisor finishing its handover) — bound when it frees", .{});
             self.listenWriteCacheClaim();
             if (self.write_cache == null) return;
             log.warn("supervisor: holding the dead daemon's write cache ({d} MiB of memfd, residents unpromoted) for this member's next mount for {d} s, then in its held copy under {s} — mount the set at this mount point to recover them; kill this process (pid {d}) to discard them before then (every fsync'd byte is on the data volumes)", .{ memfdLen(memfd) >> 20, self.grace_ns / std.time.ns_per_s, self.ringDir().slice(), linux.getpid() });
@@ -649,23 +744,67 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             return if (self.ring_dir.len != 0) self.ring_dir else journal_tail.HeldDir.runtimeOf(.write_cache);
         }
 
+        /// One tick of the ring's hold: a handover unacked past its bound
+        /// leaves the ring to the successor alone; a claim still to bind is
+        /// retried (and listened on once bound); past the grace the ring
+        /// moves to its held copy.
+        fn tickWriteCache(self: *Tails) void {
+            if (self.write_cache == null) return;
+            const now = clock.monotonicNs();
+            if (self.handing != null) {
+                if (now < self.handing_deadline) return;
+                log.warn("supervisor: the successor mount's supervisor did not ack holding the write cache within {d} s of the handover — the ring is that mount's alone from here", .{self.ack_ns / std.time.ns_per_s});
+                self.dropWriteCache();
+                return;
+            }
+            if (self.bindWriteCacheClaim()) self.listenWriteCacheClaim();
+            if (now >= self.ring_deadline) self.moveRingToHeldCopy();
+        }
+
+        /// The handover's connection answered: the ack (the successor's
+        /// supervisor holds the ring) lets the ring and the claim go; a
+        /// close without it (the successor or its supervisor died first)
+        /// keeps them here and starts the grace again.
+        fn handingAnswered(self: *Tails) void {
+            const conn = self.handing orelse return;
+            var buf: [16]u8 = undefined;
+            const acked = blk: {
+                const got = (rendezvous.tryRecvCtl(conn, &buf) catch break :blk false) orelse return;
+                if (got.fd) |fd| _ = linux.close(fd);
+                const f = TailFrame.decode(buf[0..got.len]) orelse break :blk false;
+                break :blk f.kind == .write_cache_held;
+            };
+            if (acked) {
+                log.info("supervisor: the write cache handed to the successor mount — its supervisor holds it", .{});
+                self.dropWriteCache();
+                return;
+            }
+            _ = linux.close(conn);
+            self.handing = null;
+            self.ring_deadline = clock.monotonicNs() + self.grace_ns;
+            log.warn("supervisor: the successor mount ended before its supervisor held the write cache — this process keeps it for the member's next mount ({d} s more, then its held copy)", .{self.grace_ns / std.time.ns_per_s});
+        }
+
         /// No successor took the ring within the grace (decision 0003 §CV):
         /// it moves to its held copy, then the memfd and the claim go. A
         /// successor already queued on the claim is handed the ring instead
-        /// (before the copy) or as well (after it: its bind removes the
-        /// copy the ring supersedes); one that connects as the claim
-        /// closes is told by the close (`HolderGone`) and adopts the copy.
-        /// A copy that cannot be written keeps the ring here, retried at
-        /// the next tick and said at every doubling.
+        /// (before the copy) or as well (after it: its supervisor's custody
+        /// removes the copy the ring supersedes), and the hold goes on to
+        /// its ack; one that connects as the claim closes is told by the
+        /// close (`HolderGone`) and adopts the copy. A copy that cannot be
+        /// written keeps the ring here, retried at the next tick and said
+        /// at every doubling. Never while a handover awaits its ack: a
+        /// copy written under a successor's live ring would be stale.
         fn moveRingToHeldCopy(self: *Tails) void {
             self.acceptPending();
+            if (self.handing != null) return;
             const memfd = self.write_cache orelse return;
-            const claim = self.write_cache_claim orelse return;
             const dir = self.ringDir();
             var nb: [64]u8 = undefined;
             var hp: staging.Ring.Ram.HeldPath = .{};
-            const copied = if (staging.Ring.Ram.claimNameOf(claim, &nb)) |name|
-                staging.Ring.Ram.persistHeldCopy(memfd, dir.slice(), name, &hp)
+            const name = (if (self.write_cache_claim) |claim| staging.Ring.Ram.claimNameOf(claim, &nb) else null) orelse staging.Ring.Ram.claimNameOfRing(memfd, &nb);
+            const copied = if (name) |n|
+                staging.Ring.Ram.persistHeldCopy(memfd, dir.slice(), n, &hp)
             else
                 error.ClaimUnnamed;
             // Refused: the ring stays here, said at every doubling.
@@ -676,6 +815,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             };
             log.warn("supervisor: no successor took the dead daemon's write cache within {d} s — its residents ({d} KiB) moved to {s}: this member's next mount adopts them; the memfd goes", .{ self.grace_ns / std.time.ns_per_s, bytes >> 10, hp.slice() });
             self.acceptPending();
+            if (self.handing != null) return;
             self.dropWriteCache();
         }
 
@@ -737,7 +877,11 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         }
 
         /// A successor connected to the write cache's claim: one frame with
-        /// the memfd; sent, the ring is the successor's.
+        /// the memfd. Sent, the ring and the claim stay here until the
+        /// successor's supervisor acks holding it on the connection
+        /// (`handingAnswered`): a successor that dies before — its bring-up
+        /// failed, or killed — would have taken the ring with it (decision
+        /// 0003 §CV).
         fn acceptSuccessor(self: *Tails) void {
             const memfd = self.write_cache orelse return;
             const claim = self.write_cache_claim orelse return;
@@ -753,12 +897,13 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
             }
             const conn: linux.fd_t = @intCast(rc);
             const frame = (TailFrame{ .kind = .write_cache, .index = 0 }).encode();
-            const sent = if (rendezvous.sendCtl(conn, &frame, memfd)) true else |_| false;
-            _ = linux.close(conn);
-            if (sent) {
-                log.info("supervisor: the write cache handed to the successor mount", .{});
-                self.dropWriteCache();
-            }
+            rendezvous.sendCtl(conn, &frame, memfd) catch {
+                _ = linux.close(conn);
+                return;
+            };
+            self.handing = conn;
+            self.handing_deadline = clock.monotonicNs() + self.ack_ns;
+            log.info("supervisor: the write cache sent to the successor mount — held here until its supervisor acks holding it", .{});
         }
 
         /// `listen` on the claim the moment the daemon is known dead —
@@ -980,6 +1125,9 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         var tails: Tails = .{ .gpa = gpa, .sock = tail_sock, .held_dir = policy.held_dir, .retry_ns = policy.probe_interval_ns, .ring_dir = policy.ring_dir, .grace_ns = policy.successor_grace_ns };
         defer tails.deinit();
         if (tail_sock == null) log.warn("supervisor: no tail socket — a daemon crash has the flush-window exposure (no journal tail replay)", .{});
+        // What the daemon sent before `ready` (its tails, guards, the write
+        // cache) is this process's before it says it watches.
+        tails.drain();
         const conn = connectionId(mountpoint);
         const mount_id = mountIdAt(gpa, io, mountpoint);
         if (conn) |c| log.info("supervisor: watching daemon {d} at {s} (fuse connection {d}, mount id {?d}; probe every {d} ms, escalate after {d} s)", .{ pid, mountpoint, c, mount_id, policy.probe_interval_ns / std.time.ns_per_ms, policy.unresponsive_after_ns / std.time.ns_per_s }) else log.warn("supervisor: stat({s}) failed at start — the connection id is unknown, the abort rung is disabled", .{mountpoint});
@@ -989,6 +1137,7 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         var was_attached = true;
         while (true) {
             tails.waitTick(policy.probe_interval_ns);
+            tails.retryWriteCacheClaim();
             var status: i32 = 0;
             // The daemon's end of the tail socket closed: it is exiting or
             // dead — wait for it (a blocking reap of a process already past
@@ -1164,14 +1313,15 @@ test "fuzz: the supervisor's waiting-count parser is total on arbitrary text" {
     try fuzzkit.fuzz({}, waitingFuzz, .{});
 }
 
-test "tail frame: encode/decode round-trips both kinds; a wrong length or kind is refused" {
-    inline for (.{ TailFrameKind.tail, TailFrameKind.guard, TailFrameKind.write_cache, TailFrameKind.write_cache_claim, TailFrameKind.write_cache_drained }) |k| {
+test "tail frame: encode/decode round-trips every kind; a wrong length or kind is refused" {
+    inline for (std.meta.tags(TailFrameKind)) |k| {
         const f: TailFrame = .{ .kind = k, .index = 513 };
         const d = TailFrame.decode(&f.encode()).?;
         try testing.expectEqual(k, d.kind);
         try testing.expectEqual(@as(u16, 513), d.index);
     }
-    try testing.expectEqual(@as(?TailFrame, null), TailFrame.decode(&.{ 6, 0, 0 }));
+    try testing.expectEqual(@as(?TailFrame, null), TailFrame.decode(&.{ 8, 0, 0 }));
+    try testing.expectEqual(@as(?TailFrame, null), TailFrame.decode(&.{ 0, 0, 0 }));
     try testing.expectEqual(@as(?TailFrame, null), TailFrame.decode(&.{ 1, 0 }));
     try testing.expectEqual(@as(?TailFrame, null), TailFrame.decode(&.{}));
 }
@@ -1231,7 +1381,7 @@ test "linux: a dead daemon's write cache no successor takes moves to its held co
     var tails: linux_loop.Tails = .{ .gpa = testing.allocator, .sock = null, .ring_dir = scratch.heldDir(), .grace_ns = 0, .retry_ns = 10 * std.time.ns_per_ms };
     defer tails.deinit();
     tails.write_cache = @intCast(linux.dup(ring.memfd));
-    tails.write_cache_claim = @intCast(linux.dup(ring.claim));
+    tails.write_cache_claim = @intCast(linux.dup(ring.claim.?));
     ring.release();
     tails.holdForSuccessor();
     try testing.expect(!tails.holding());
@@ -1251,7 +1401,46 @@ test "linux: a dead daemon's write cache no successor takes moves to its held co
     try testing.expectEqual(@as(?staging.Marker, marker), staging.Marker.decode(&m) catch null);
 }
 
-test "linux: the write cache's handover is ACKED (decision 0003 §CV) — the dead daemon's supervisor keeps the memfd and the claim after it sent the ring until the successor's supervisor acks holding it on the claim connection: a successor that dies before the ack (its connection closed without one) leaves the ring held" {
+test "linux: a dead daemon's write cache held WITHOUT its claim (the daemon died between a handover's bind and its supervisor binding the claim) binds the claim its ring's marker names; while another holds the name the ring stays, and past the grace moves to the held copy named by the marker (decision 0003 §CV)" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the supervisor's hold is Linux only");
+    const linux = std.os.linux;
+    var scratch: HoldScratch = .{};
+    try scratch.init("noclaim");
+    defer scratch.deinit();
+    var uuid: [16]u8 = @splat(0x2E);
+    std.mem.writeInt(u32, uuid[0..4], @intCast(linux.getpid()), .little);
+    std.mem.writeInt(u64, uuid[4..12], @bitCast(clock.monotonicNs()), .little);
+    const marker: staging.Marker = .{ .set_uuid = uuid, .set_epoch = 1, .node_token = 0xE0, .mount_slot = 9, .appender_id = 0, .owner_pid = 4444 };
+    var refusal: staging.Ring.BindRefusal = .{};
+    var ring = try staging.Ring.Ram.bind(marker, 16 * 4096, "", &refusal);
+    const payload: [4096]u8 = @splat(0x6C);
+    try testing.expectEqual(@as(usize, payload.len), linux.pwrite(ring.memfd, &payload, payload.len, @intCast(staging.Ring.Ram.HEADER + 4096)));
+    // Free name: bound at the hold, listened on.
+    {
+        var tails: linux_loop.Tails = .{ .gpa = testing.allocator, .sock = null, .ring_dir = scratch.heldDir(), .grace_ns = 60 * std.time.ns_per_s, .retry_ns = 10 * std.time.ns_per_ms };
+        defer tails.deinit();
+        tails.write_cache = @intCast(linux.dup(ring.memfd));
+        const claim = ring.claim.?;
+        ring.claim = null;
+        _ = linux.close(claim);
+        tails.prepareWriteCacheHold();
+        try testing.expect(tails.write_cache_claim != null and tails.write_cache_listening);
+    }
+    // The name held elsewhere: the ring stays here; past the grace its
+    // held copy, named by the marker.
+    ring.claim = staging.Ring.Ram.bindClaimOf(ring.memfd, 0).?;
+    var tails: linux_loop.Tails = .{ .gpa = testing.allocator, .sock = null, .ring_dir = scratch.heldDir(), .grace_ns = 0, .retry_ns = 10 * std.time.ns_per_ms };
+    defer tails.deinit();
+    tails.write_cache = @intCast(linux.dup(ring.memfd));
+    tails.prepareWriteCacheHold();
+    try testing.expect(tails.write_cache != null and tails.write_cache_claim == null);
+    tails.holdForSuccessor();
+    try testing.expect(!tails.holding());
+    try testing.expect(staging.Ring.Ram.heldCopyExists(marker, scratch.dir));
+    ring.release();
+}
+
+test "linux: the write cache's handover is ACKED (decision 0003 §CV) — the dead daemon's supervisor keeps the memfd and the claim after it sent the ring until the successor's supervisor acks holding it on the claim connection: a successor that dies before the ack (its connection closed without one) leaves the ring held; the next successor takes it whole, its supervisor acks, the first supervisor is done and the second binds the member's claim" {
     if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the supervisor's hold is Linux only");
     const linux = std.os.linux;
     const rendezvous = @import("../ipc/rendezvous_linux.zig");
@@ -1268,17 +1457,18 @@ test "linux: the write cache's handover is ACKED (decision 0003 §CV) — the de
     try testing.expectEqual(@as(usize, payload.len), linux.pwrite(ring.memfd, &payload, payload.len, @intCast(staging.Ring.Ram.HEADER + 2 * 4096)));
     var addr: linux.sockaddr.un = undefined;
     var addr_len: linux.socklen_t = @sizeOf(linux.sockaddr.un);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockname(ring.claim, @ptrCast(&addr), &addr_len)));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockname(ring.claim.?, @ptrCast(&addr), &addr_len)));
     // The daemon's death: its supervisor holds the memfd and the claim
     // (no grace runs out here) and listens.
     var tails: linux_loop.Tails = .{ .gpa = testing.allocator, .sock = null, .ring_dir = scratch.heldDir(), .grace_ns = 60 * std.time.ns_per_s, .retry_ns = 10 * std.time.ns_per_ms };
     defer tails.deinit();
     tails.write_cache = @intCast(linux.dup(ring.memfd));
-    tails.write_cache_claim = @intCast(linux.dup(ring.claim));
+    tails.write_cache_claim = @intCast(linux.dup(ring.claim.?));
     ring.release();
     tails.listenWriteCacheClaim();
     const holder = try std.Thread.spawn(.{}, linux_loop.Tails.holdForSuccessor, .{&tails});
-    defer holder.join();
+    var joined = false;
+    defer if (!joined) holder.join();
     // A successor takes the ring over the claim and dies before its
     // supervisor holds it: no ack, its connection closed.
     {
@@ -1293,6 +1483,26 @@ test "linux: the write cache's handover is ACKED (decision 0003 §CV) — the de
         _ = linux.close(got.fd.?);
     }
     // The ring is still held: the claim's name is bound.
+    try testing.expect(try staging.Ring.Ram.claimHeld(marker));
+    // The next successor takes it whole, with no claim of its own; its
+    // supervisor holds the ring and acks — the first supervisor lets the
+    // ring and the claim go and is done, the second binds the claim.
+    var next = try staging.Ring.Ram.bind(marker, 16 * 4096, "", &refusal);
+    defer next.release();
+    try testing.expect(next.claim == null and next.handover != null);
+    var back: [4096]u8 = undefined;
+    try testing.expectEqual(@as(usize, back.len), linux.pread(next.memfd, &back, back.len, @intCast(staging.Ring.Ram.HEADER + 2 * 4096)));
+    try testing.expectEqualSlices(u8, &payload, &back);
+    var successor: linux_loop.Tails = .{ .gpa = testing.allocator, .sock = null, .ring_dir = scratch.heldDir() };
+    defer successor.deinit();
+    successor.write_cache = @intCast(linux.dup(next.memfd));
+    successor.handover = @intCast(linux.dup(next.handover.?));
+    next.closeHandover();
+    successor.takeCustody();
+    holder.join();
+    joined = true;
+    try testing.expect(!tails.holding());
+    try testing.expect(successor.custody and successor.write_cache_claim != null);
     try testing.expect(try staging.Ring.Ram.claimHeld(marker));
 }
 

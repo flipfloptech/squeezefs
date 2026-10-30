@@ -1414,24 +1414,22 @@ pub const DataPlane = struct {
     const WRITE_CACHE_KICK_DIVISOR: u64 = 8;
     const WRITE_CACHE_DRAIN_DIVISOR = staging.WRITE_CACHE_DRAIN_DIVISOR;
 
-    /// The write cache's descriptors for the supervisor (the memfd and the
-    /// claim: `mount` announces them beside the journal tails); null on a
-    /// file-backed ring or with staging off.
-    pub fn writeCacheFds(self: *const DataPlane) ?struct { memfd: linux.fd_t, claim: linux.fd_t } {
+    /// The write cache's descriptors for the supervisor (`mount` announces
+    /// them beside the journal tails): the memfd, and the claim — or, after
+    /// a handover, the connection the previous supervisor awaits the ack
+    /// on (decision 0003 §CV); null with staging off.
+    pub fn writeCacheFds(self: *const DataPlane) ?struct { memfd: linux.fd_t, claim: ?linux.fd_t, handover: ?linux.fd_t } {
         const st = &(self.stage orelse return null);
-        return .{ .memfd = st.ram.memfd, .claim = st.ram.claim };
+        return .{ .memfd = st.ram.memfd, .claim = st.ram.claim, .handover = st.ram.handover };
     }
 
-    /// The write cache's memfd is the supervisor's (`mount` announced it):
-    /// the held copy the bind adopted — or found superseded by the ring the
-    /// claim handed over — goes now, never earlier: until this instant a
-    /// crash of this process would lose the ring the copy still holds
-    /// (decision 0003 §CV).
-    pub fn writeCacheHandedOver(self: *DataPlane) void {
+    /// The handover's connection went to the supervisor (`mount` announced
+    /// it): this end closes, so it lives only in flight and in the
+    /// supervisor — a death of either before the ack closes it, and the
+    /// previous supervisor keeps the ring (decision 0003 §CV).
+    pub fn writeCacheAnnounced(self: *DataPlane) void {
         const st = &(self.stage orelse return);
-        var pbuf: [linux.PATH_MAX]u8 = undefined;
-        const path = std.fmt.bufPrint(&pbuf, "{s}", .{st.ram.heldCopy() orelse return}) catch return;
-        if (st.ram.dropHeldCopy()) log.info("write cache: the held copy {s} removed (the ring it held is this mount's supervisor's now)", .{path}) else log.err("write cache: the held copy {s} could not be removed — it is OLDER than this mount's ring: remove it by hand before this member's next mount, which would adopt it once no supervisor holds the claim", .{path});
+        st.ram.closeHandover();
     }
 
     /// After the dismount pass: the write cache holds no record (every

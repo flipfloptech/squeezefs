@@ -1251,6 +1251,51 @@ test "linux: a dead daemon's write cache no successor takes moves to its held co
     try testing.expectEqual(@as(?staging.Marker, marker), staging.Marker.decode(&m) catch null);
 }
 
+test "linux: the write cache's handover is ACKED (decision 0003 §CV) — the dead daemon's supervisor keeps the memfd and the claim after it sent the ring until the successor's supervisor acks holding it on the claim connection: a successor that dies before the ack (its connection closed without one) leaves the ring held" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the supervisor's hold is Linux only");
+    const linux = std.os.linux;
+    const rendezvous = @import("../ipc/rendezvous_linux.zig");
+    var scratch: HoldScratch = .{};
+    try scratch.init("ack");
+    defer scratch.deinit();
+    var uuid: [16]u8 = @splat(0x4D);
+    std.mem.writeInt(u32, uuid[0..4], @intCast(linux.getpid()), .little);
+    std.mem.writeInt(u64, uuid[4..12], @bitCast(clock.monotonicNs()), .little);
+    const marker: staging.Marker = .{ .set_uuid = uuid, .set_epoch = 1, .node_token = 0xD0, .mount_slot = 6, .appender_id = 0, .owner_pid = 4343 };
+    var refusal: staging.Ring.BindRefusal = .{};
+    var ring = try staging.Ring.Ram.bind(marker, 16 * 4096, "", &refusal);
+    const payload: [4096]u8 = @splat(0x5B);
+    try testing.expectEqual(@as(usize, payload.len), linux.pwrite(ring.memfd, &payload, payload.len, @intCast(staging.Ring.Ram.HEADER + 2 * 4096)));
+    var addr: linux.sockaddr.un = undefined;
+    var addr_len: linux.socklen_t = @sizeOf(linux.sockaddr.un);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockname(ring.claim, @ptrCast(&addr), &addr_len)));
+    // The daemon's death: its supervisor holds the memfd and the claim
+    // (no grace runs out here) and listens.
+    var tails: linux_loop.Tails = .{ .gpa = testing.allocator, .sock = null, .ring_dir = scratch.heldDir(), .grace_ns = 60 * std.time.ns_per_s, .retry_ns = 10 * std.time.ns_per_ms };
+    defer tails.deinit();
+    tails.write_cache = @intCast(linux.dup(ring.memfd));
+    tails.write_cache_claim = @intCast(linux.dup(ring.claim));
+    ring.release();
+    tails.listenWriteCacheClaim();
+    const holder = try std.Thread.spawn(.{}, linux_loop.Tails.holdForSuccessor, .{&tails});
+    defer holder.join();
+    // A successor takes the ring over the claim and dies before its
+    // supervisor holds it: no ack, its connection closed.
+    {
+        const rc = linux.socket(linux.AF.UNIX, linux.SOCK.SEQPACKET | linux.SOCK.CLOEXEC, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        const conn: linux.fd_t = @intCast(rc);
+        defer _ = linux.close(conn);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.connect(conn, @ptrCast(&addr), addr_len)));
+        var buf: [16]u8 = undefined;
+        const got = try rendezvous.recvCtl(conn, &buf);
+        try testing.expectEqual(@as(?TailFrame, .{ .kind = .write_cache, .index = 0 }), TailFrame.decode(buf[0..got.len]));
+        _ = linux.close(got.fd.?);
+    }
+    // The ring is still held: the claim's name is bound.
+    try testing.expect(try staging.Ring.Ram.claimHeld(marker));
+}
+
 test "linux: a set whose every metadata image lost its last name ends every hold at the next tick — the ring discarded, a held journal tail's copy removed; an image with a name left is never judged deleted (decision 0003 §CV)" {
     if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the supervisor's hold is Linux only");
     const linux = std.os.linux;

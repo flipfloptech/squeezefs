@@ -5775,6 +5775,79 @@ test "smoke: THE KILL ROWS (a) EARLY SUCCESSOR (charter §5.5 death and recovery
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+test "smoke: A SECOND MOUNT AT A LIVE JOINER'S MOUNT POINT IS REFUSED AT ONCE (charter §5.5; decision 0003 §DA) — A (the manager), B JOINED and serving; a second `squeezefs mount` S at B's mount point (B's node and mount slot): its joined open proves B's incarnation ALIVE on this host (a live process's pid and start time hash to B's page's writer id) and refuses before any JoinAppender — the census's line, `Busy`, exit 1 — with no join deferred (A's appender_join_live_incarnation_deferrals 0); B keeps serving and unmounts clean (red: S's JoinAppender deferred over B's live page, to wait out its park bound and fail)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const mk = try rig.onMount("mkdir a-dir");
+        gpa.free(mk);
+    }
+    {
+        const w = try b.onMount("mkdir a-dir/own && echo body > a-dir/own/f && echo ok");
+        gpa.free(w);
+    }
+    // S at B's mount point: one (node, mount slot) pair, B's incarnation live.
+    const s = try Peer.init(rig, "s");
+    defer s.deinit();
+    _ = linux.rmdir(s.mp.ptr);
+    gpa.free(s.mp);
+    s.mp = try std.fmt.allocPrintSentinel(gpa, "{s}", .{b.mp}, 0);
+    s.node = kill_peer_node;
+    try s.spawn(&.{});
+    // The first of the two verdicts S's log names: the refusal, or a deferral.
+    const refusal = "is LIVE on the directory under this mount point's identity";
+    const deferral = "JoinAppender deferred by the manager";
+    const deadline = clock.monotonicNs() + kill_row_wait_ns;
+    while (true) {
+        const text = try s.readLog();
+        defer gpa.free(text);
+        const refused = std.mem.indexOf(u8, text, refusal) != null;
+        const deferred = std.mem.indexOf(u8, text, deferral) != null;
+        if (refused or deferred) {
+            if (deferred) std.debug.print("\n--- s: the join DEFERRED over B's live page ---\n{s}\n", .{text});
+            try testing.expect(refused and !deferred);
+            break;
+        }
+        if (!alive(s.pid) or clock.monotonicNs() >= deadline) {
+            std.debug.print("\n--- s: neither verdict ---\n{s}\n", .{text});
+            return error.NoVerdict;
+        }
+        sleepMs(20);
+    }
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, try s.waitExit());
+    {
+        const out = try b.onMount("cat a-dir/own/f && mkdir a-dir/b2 && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("body\nok\n", out);
+    }
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try expectMustStayZero(ta);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"appender_join_live_incarnation_deferrals\":"));
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try expectMustStayZero(tb);
+        std.debug.print("\nsmoke: a second mount at a live joiner's mount point: refused at once (the census's liveness proof), 0 joins deferred; B serves on\n", .{});
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B PARKS-AND-RECLAIMS at T_self (acks held at the pre-admission gate, park expiries 0) → remount A (the D0 ladder: the same-host dead-pid proof, A wins volume 0 again at term 2, the grace window open, the allocation leases taken over from the dead incarnation) → B's reclaim lands in the grace window, its manager link re-points, the held writes drain and every storm file is whole on both" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

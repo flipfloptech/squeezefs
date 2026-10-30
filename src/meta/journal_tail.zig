@@ -1052,7 +1052,8 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         const rc = linux.open(file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
-            .NOENT => return .gone,
+            // A path component that is not a directory names no file.
+            .NOENT, .NOTDIR => return .gone,
             else => return .{ .failed = error.StatFailed },
         }
         const fd: linux.fd_t = @intCast(rc);
@@ -1115,7 +1116,7 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         const rc = linux.open(file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
-            .NOENT => return .none,
+            .NOENT, .NOTDIR => return .none,
             else => return .{ .failed = error.StatFailed },
         }
         const fd: linux.fd_t = @intCast(rc);
@@ -1154,7 +1155,7 @@ pub const linux_tail = if (builtin.os.tag == .linux) struct {
         const rc = linux.open(file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
-            .NOENT => return .none,
+            .NOENT, .NOTDIR => return .none,
             else => return .{ .failed = error.StatFailed },
         }
         const fd: linux.fd_t = @intCast(rc);

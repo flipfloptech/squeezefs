@@ -2712,7 +2712,8 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
             const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
             switch (linux.errno(rc)) {
                 .SUCCESS => {},
-                .NOENT => return null,
+                // A path component that is not a directory names no file.
+                .NOENT, .NOTDIR => return null,
                 else => return error.HeldCopyUnreadable,
             }
             const fd: linux.fd_t = @intCast(rc);

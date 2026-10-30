@@ -493,11 +493,16 @@ ring_segments, grant, already, node_seq_base }` (`M:135-142,483-497`; `B:10263-1
 
 Order of effects at the manager, under `manager_verbs` (one verb at a time, `B:10286`):
 1. `read_directory` (ONE whole-directory walk per verb — `appender_directory_reads`, `A:2294-2305`).
-2. **Durable idempotency** (KD-SYM-7): a `Live` page under this identity IS the join — answer
+2. **Durable idempotency** (KD-SYM-7): a `Live` page under this WHOLE identity (the writer id
+   included, `B:10296-10301`) IS the join — answer
    `already = true` with the page's segments and its UNCLAIMED remainder (the page's `grant` word,
    never the whole record), mint a FRESH incarnation anyway (a rejoin is a new incarnation), and if the
    page is Live with an EMPTY grant and an empty record the first join died before its grant: complete
-   it here (`B:10287-10329`).
+   it here (`B:10287-10329`). **Port law (0003 §DA):** a `Live` page under the identity's `(node,
+   mount slot)` with ANOTHER writer id is another incarnation's ring, whose landed entries only its
+   recovery replays: `Deferred`, nothing written, until that page leaves `Live` (the reference
+   carved a fresh page beside it — two Live pages under one pair for a record keyed by the pair,
+   0002 row 568); the joiner retries to `T_park_max`.
 3. **Capacity refusal**: `live ≥ set.capacity` ⇒ `manager_verb_refusals` + `Busy("{live} appenders are
    live and the ring budget admits {capacity} (appenders_capacity = heap/16 ÷ ring) — the lever is the
    metadata volume COUNT, never a format-time client count")` (`B:10330-10356`; charter "a join past it

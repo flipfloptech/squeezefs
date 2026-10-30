@@ -16442,6 +16442,89 @@ test "smoke: A FALLOCATE'D LAY-DOWN HOLDS ITS SIZE, AND A DELETE'S BLOCKS ARE SU
     _ = try fsckClean(rig, "the clean unmount after the reservation lay-down");
 }
 
+test "smoke: A DELETED FILE'S PARKED BYTES NEVER WAIT FOR THEIR OWN DESTROY (decision 0003 §CW; §CR's upstream supply) — a two-volume set of 2 × 46 usable 4 MiB blocks without a write cache filled to ENOSPC with fsync'd one-block files: the last file's write parks a block no volume can take (write_through_fallbacks) → `rm` of it gathers its corpse, the only supply in sight, and a write to a new file meets the full store and kicks the gather's destroy → the destroy pass settles the corpse's parked block: its mint refuses at once (the corpse's own gather is no supply for its own bytes), the destroy lands (fuse_reclaim_destroys, nothing left gathered) with no park wall crossed (alloc_pressure_park_wall_refusals), the new write answers ENOSPC (the corpse freed nothing) → every file removed, clean unmount, fsck clean; no error line, no tripwire (red on dev: 3 park walls and 3 error lines `StorageFull after parking 1000 ms for visible supply (0 block(s) in sight …) — refusing; the plane is broken, not slow` — the destroy's settle parked the 1 s wall on its own corpse once per candidate volume, the gather pending and the latch inert all the while, and the new file's mint parked behind it)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSetSized(true, &.{}, fallocate_row_data_bytes);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const mark = try rig.logLen();
+    const CorpseCensus = struct { fallbacks: u64, destroys: u64, gathered: u64, walls: u64, kicks: u64 };
+    const census = struct {
+        fn of(r: *Rig) !CorpseCensus {
+            const t = try r.stats();
+            defer r.gpa.free(t);
+            return .{
+                .fallbacks = numberAfter(t, "\"write_through_fallbacks\":") orelse return error.StatMissing,
+                .destroys = numberAfter(t, "\"fuse_reclaim_destroys\":") orelse return error.StatMissing,
+                .gathered = numberAfter(t, "\"fuse_reclaim_gathered\":") orelse return error.StatMissing,
+                .walls = numberAfter(t, "\"alloc_pressure_park_wall_refusals\":") orelse return error.StatMissing,
+                .kicks = numberAfter(t, "\"block_free_upstream_kicks\":") orelse return error.StatMissing,
+            };
+        }
+    }.of;
+    // 1. The fill: one-block files until a write meets the full store; the
+    //    failed file keeps its parked block (custody the daemon holds).
+    const c0 = try census(rig);
+    {
+        const out = try rig.onMountTimed(
+            \\j=0; while [ $j -lt 200 ] && dd if=/dev/zero of=fill$j bs=1M count=4 conv=fsync status=none 2>/dev/null; do j=$((j+1)); done
+            \\echo "filled $j"
+            \\echo $j > last
+        , 600);
+        defer gpa.free(out);
+        std.debug.print("\nsmoke[corpse custody]: {s}", .{out});
+    }
+    const c1 = try census(rig);
+    std.debug.print("smoke[corpse custody]: the fill parked {d} block(s) the store refused\n", .{c1.fallbacks - c0.fallbacks});
+    try testing.expect(c1.fallbacks > c0.fallbacks);
+    try testing.expectEqual(c0.walls, c1.walls);
+    // 2. The delete, then a write that meets the full store: its mint kicks
+    //    the gather's destroy, whose settle lands nothing and never waits.
+    {
+        const out = try rig.onMountTimed(
+            \\rm -f fill$(cat last)
+            \\dd if=/dev/zero of=new bs=1M count=4 conv=fsync status=none 2>&1 | grep -c 'No space left on device'
+        , 120);
+        defer gpa.free(out);
+        std.debug.print("smoke[corpse custody]: the delete, then a new file's write:\n{s}", .{out});
+        try testing.expectEqualStrings("1\n", out);
+    }
+    var c2 = try census(rig);
+    var polls: u32 = 0;
+    while ((c2.destroys < c1.destroys + 1 or c2.gathered != 0) and polls < 3000) : (polls += 1) {
+        try io.sleep(.fromMilliseconds(10), .awake);
+        c2 = try census(rig);
+    }
+    std.debug.print("smoke[corpse custody]: destroyed {d}, gathered {d}, park walls {d}, upstream kicks {d}\n", .{ c2.destroys - c1.destroys, c2.gathered, c2.walls - c1.walls, c2.kicks - c1.kicks });
+    try testing.expectEqual(c1.destroys + 1, c2.destroys);
+    try testing.expectEqual(@as(u64, 0), c2.gathered);
+    try testing.expect(c2.kicks > c1.kicks);
+    try testing.expectEqual(c1.walls, c2.walls);
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"invariant_tripwires\":"));
+    }
+    // 3. Every file removed, the clean unmount lands what is left.
+    rig.gpa.free(try rig.onMountTimed("rm -f fill* new last\n", 120));
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        const errors = std.mem.count(u8, seg, "error(");
+        if (errors != 0) std.debug.print("--- the daemon's alert lines ---\n{s}\n", .{seg});
+        try testing.expectEqual(@as(usize, 0), errors);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, seg, "TRIPWIRE"));
+    }
+    _ = try fsckClean(rig, "the clean unmount after the corpse's custody");
+}
+
 test "smoke: A PUNCH, A ZERO RANGE AND A SAME-SIZE TRUNCATE SURVIVE A POWER CUT (fstests generic/695, 092; charter §6.6) — a set over device-mapper slices of 4 MiB blocks: generic/092's `falloc -k 0 12m` + `pwrite 0 5m` + `truncate 5m` returns the reservation past EOF (`df` 12 → 8 MiB) and `falloc -k 5m 5m` + `truncate 7m` keeps it (12 MiB); generic/695's `truncate 12M` + `pwrite -S 0xab 2M 8M` + sync, then `fpunch 2M 2M` + `fpunch 8M 2M` + fsync (and the same with `fzero`) reads zeros at [2M, 4M) and [8M, 10M) around the 0xab of [4M, 8M) → dm-flakey drops every write (the power cut) → unmount → the working table → fsck --offline --scrub clean → remount: every file byte-exact as fsync'd → clean unmount; no error line, no tripwire (red on dev: `fpunch 8M 2M` and `fzero 8M 2M` — a range starting ON a block boundary and ending inside it — zeroed nothing, read 0xab before and after the cut; the same-size truncate kept the reservation, `df` 12)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

@@ -1,4 +1,4 @@
-# Rung 10 — the journal-full wedge: not reproduced; the watchdog now names the metadata wait (2026-10-29; decision 0003 §CM)
+# Rung 10 — the journal-full wedge: the watchdog names the metadata wait; it named a pass stranded by a lost futex wake (2026-10-29/30; decision 0003 §CM)
 
 The owner's A-B-B-A on `dev` `0778bb4` (run record `/var/lib/sqz-perf/runs/20261029T064343Z`: the dev arm's
 second leg, `mpirun -np 32 mdtest -n 10000 -u -i 1 -w 4096 -e 4096`, a fresh 2 MDT + 2 OST RAM-namespace set,
@@ -76,5 +76,55 @@ A mount reused for several mdtest runs slows run over run, the profile in `kv_fs
 so the round doubled as a reproduction attempt: no wedge in 16 runs, fsck clean in all. Every row within
 ± 6 % of `dev` (plain file removal at -np 64 +9 %), so the census costs nothing measurable. The host was on
 BATTERY for this round (both arms ~20 % below the AC rates, equally); a first round that ran beside two
-agents' rigs outside the venue was discarded. Landed as diagnostics (gate 178 green, 75/75); the wedge stays
-OPEN until a census line names its wait. Sessions: `/build/perf/jw-abba2/`.
+agents' rigs outside the venue was discarded. Landed as diagnostics (gate 178 green, 75/75); the wedge stayed
+open until a census line named its wait (below). Sessions: `/build/perf/jw-abba2/`.
+
+## The cause: a futex wake wrote a fiber's link after the bucket lock (2026-10-29/30; §CM.6–13)
+
+**Reproduced.** `~/tmp/journal-wedge/jwrig-loopseq.sh`: the owner's set shape on 512-B loop devices over sparse files
+under `/build/tmp`, `--supervise`, the owner's budget, `mpirun -np 32 mdtest -n 10000 -u -i 1`, four runs a mount;
+the first watchdog line stops the supervisor and walks the fibers in gdb. `6e9fbdf`: 2 wedges in 119 runs (the
+same rig on RAM namespaces: 82 clean). Both censuses read `pass=recall`, its age growing every tick, committers
+queued (14–16) and parked (16–18), the queue mutex unlocked. The fiber walk: the pass fiber IDLE in
+`Holder.recallAndWait` → `GrantPassGate.passBegin` → the gate lock's interior `Io.Mutex` → `FutexTable.fiberWait`,
+on a word that reads UNLOCKED, the gate lock free: no holder, no cycle — a lost wake.
+
+**The cause.** `FutexTable.wake` unlinked the fibers it took under the bucket lock, threaded them through
+`futex_next`, and read and cleared that link (and flipped their delivery words) after the release. A fiber a stray
+wake had already resumed (a timer pop, a late waker: the futex contract allows both) leaves its wait the moment the
+lock is free and may park again on another word; the waker's late read and clear then cut that list after it, and
+the waiter queued behind it — the pass — is never found by its own release.
+
+**The fix.** The wake collects the fibers it takes into a stack batch under the lock (16 pointers, two cache
+lines; the common wake is one) and wakes each after the release (`state.wake()`, the winner enqueuing): no link is
+touched after the lock and the lock covers no delivery-word RMW. A late wake on a fiber a stray wake resumed is at
+most a spurious wake of its next park: every product park loops on its predicate and `fiberWait`'s resume unlinks
+itself from its new bucket. More matches than a batch: the next pass, from the head, owes only the matches the
+scan counted behind it (a fiber that re-parks behind them is not chased).
+
+**The first shape's cost.** The first fix flipped each taken fiber's delivery word UNDER the lock. The
+orchestrator's A-B-B-A (`mdtest -n 10000 -u`, a fresh RAM mount per run, quiet, Tctl 48–56 °C;
+`/build/perf/wedge-abba`, `wedge-abba2`): plain `-np 32` Directory creation dev 278/277 and 277/296 k ops/s against
+237/247 and 251/251 — −12.7 % and −12.3 %, every other row within noise. A CAS per fiber inside a contended spin
+lock; the batch takes it out (its A-B-B-A is the orchestrator's).
+
+**Model and red.** `futex_table_model.zig` `ChainWalkModel` (two fibers, two wakers, one stray wake, one bucket):
+`.batch` (of two and of one: the overflow pass) and `.cas_under_lock` hold; a probe shows the late wake on the
+re-parked fiber is reached and `LinkedOutsideWait` that its resume leaves the bucket (`.resume_keeps_link` fails it);
+the weakening `.links_after_release` (the pre-fix walk) fails with `TornBucketList`, and with the shape check off
+with `WaiterStranded`. Unit `exec.futex_table` "a wake never touches a link after the bucket lock …" re-parks the
+stray-woken fiber inside the window (the seam `test_after_scan`): red on `6e9fbdf` and with the pre-fix body in the
+batch head, at `expect(!g.futex_linked)`. The overflow unit: 37 waiters woken once each, in queue order, in three
+passes; a fiber parking behind them is not chased.
+
+**Counts** (counters, never rates). The first shape's dist build on the same rig: 61 runs over 16 mounts (load 60–137),
+0 wedges, 0 watchdog lines, 0 tripwires; rw4k ×10 fresh mounts: 0. At dev's rate an unfixed binary goes 61 clean
+with p ≈ 0.36, so the rigs show no regression; the red and the model prove the cause. Units `futex` 54/54, `exec`
+139/139, `sync` 145/145, and again on the head rebased onto `90094f4` with every `_model` check (201/201) and
+`zig build fmt rails` (32/32); the six smoke rows 49/49; xfstests generic/001 013 pass, fsck 0. The batch shape:
+units `futex` 55/55, `exec.` 140/140, `sync.` 145/145, `_model` 201/201, rails 32/32, smoke 49/49; its dist build on
+the rig 20 runs over 5 mounts and rw4k ×5: 0 wedges, 0 watchdog lines, 0 tripwires.
+
+**Seen, not changed.** After four runs a mount the daemon's unmount takes 29–122 s past the detach (dev too); the
+lane's yield path assumes no foreign wake between its `endPollPending` and its requeue, and no product fiber yields:
+§CM.12.

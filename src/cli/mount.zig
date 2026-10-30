@@ -562,6 +562,10 @@ fn mountMain(ctx: *Ctx) u8 {
         .syncfs_keeps_custody = knobs.boolKnob("SQUEEZEFS_TEST_SYNCFS_KEEPS_CUSTODY", env),
         .foreign_claim_hold = claimHoldPath(env),
         .promote_kill_after_commit = knobs.boolKnob("SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT", env),
+        .landing_hold = switch (knobs.intKnob("SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", u64, env)) {
+            0 => null,
+            else => |n| .{ .at_write = n, .fire = &holdLandingFromWrite },
+        },
     }) catch return ctx.failed("out of memory mounting the filesystem", .{});
     defer fs.unmount();
     // The corpse gather is the data plane's upstream supply (decision 0003
@@ -1813,6 +1817,14 @@ const AtimeWatch = struct {
         }
     }
 };
+
+/// The landing-hold seam's trigger (`SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE`):
+/// from this write on, every window stays on the lane un-issued until the
+/// daemon dies — what landed before it stays landed.
+fn holdLandingFromWrite(at_write: u64) void {
+    journal_lane.test_seams.delay_issue.store(1, .release);
+    log.warn("test seam: SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE — journal writes are held un-issued from write {d} on; acked metadata from here lives in the journal tail alone", .{at_write});
+}
 
 /// The `il0` face binder the host calls at arm and unarm.
 fn bindIl0Thunk(ctx: *anyopaque, face: ?handler.kv_fs.Il0Face) void {

@@ -4807,14 +4807,14 @@ fn namesContain(names: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-/// The charter's contract (§1.10 "zero acked loss") over the `tar -x` tree
-/// under `dir` on `host`: every file of the `kill_row_tree_files` tar was
-/// ACKED on — its open and write returned — is present and WHOLE (its
-/// body names it: `t17` holds `t17`); a file tar reported unacked may be
-/// absent, EMPTY (its create landed, its write never did) or whole (the
-/// write landed, the reply did not) — never torn otherwise. Answers the
-/// count of whole files.
-fn expectTreeAcked(host: anytype, dir: []const u8, unacked: []const []const u8) !usize {
+/// The charter's contract (§1.10 "zero acked loss") over the tree under
+/// `dir` on `host` of `files` entries `t0`… a writer walked (`tar -x`, a
+/// script): every file the writer was ACKED on — its open and write
+/// returned — is present and WHOLE (its body names it: `t17` holds
+/// `t17`); a file it reported unacked may be absent, EMPTY (its create
+/// landed, its write never did) or whole (the write landed, the reply did
+/// not) — never torn otherwise. Answers the count of whole files.
+fn expectTreeAcked(host: anytype, dir: []const u8, files: usize, unacked: []const []const u8) !usize {
     const gpa = testing.allocator;
     var script: std.Io.Writer.Allocating = .init(gpa);
     defer script.deinit();
@@ -4845,7 +4845,7 @@ fn expectTreeAcked(host: anytype, dir: []const u8, unacked: []const []const u8) 
     // Every acked name is present (tar walks every entry; a name it did
     // not report unacked was acked).
     var name_buf: [16]u8 = undefined;
-    for (0..kill_row_tree_files) |i| {
+    for (0..files) |i| {
         const name = try std.fmt.bufPrint(&name_buf, "t{d}", .{i});
         if (namesContain(present.items, name) or namesContain(unacked, name)) continue;
         std.debug.print("\n--- {s}/{s}: ACKED by tar, absent on the mount — an acked create lost ---\n", .{ dir, name });
@@ -5394,7 +5394,7 @@ test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒
     }
     // Every file tar was acked on is whole on A (C8/C6: the body names the
     // file); the unacked tail may be absent or empty, never torn.
-    const whole_a = try expectTreeAcked(rig, "a-dir/tree", unacked.items);
+    const whole_a = try expectTreeAcked(rig, "a-dir/tree", kill_row_tree_files, unacked.items);
     std.debug.print("smoke: kill rows (a): A recovered B's region {d} ms after the kill — evictions 1, dead_members recorded 1 / acted 1, appender_recoveries 1, rollbacks 0, orphans 0, unwritten grant returned {d}, page free; {d} files whole on A ({d} seen at the kill)\n", .{ recovered_ms, numberAfter(ta, "\"dead_appender_unwritten_returned\":") orelse 0, whole_a, seen });
     // The same-node successor: B again under the same node name.
     const mark_b = try b.logLen();
@@ -5405,7 +5405,7 @@ test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒
         defer gpa.free(text);
         try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "mounted JOINED as appender 1"));
     }
-    const whole_b = try expectTreeAcked(b, "a-dir/tree", unacked.items);
+    const whole_b = try expectTreeAcked(b, "a-dir/tree", kill_row_tree_files, unacked.items);
     try testing.expectEqual(whole_a, whole_b);
     // B's FIRST cross-owner op after the recovery: a mkdir under A's root.
     {
@@ -5440,6 +5440,88 @@ test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒
     }
     try b.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+/// THE KILL ROWS (a) HELD WRITE: the files B writes whole before the one
+/// whose body meets the landing hold (`t3`, B's 4th write).
+const kill_row_held_file: usize = 3;
+
+test "smoke: THE KILL ROWS (a) HELD WRITE (charter §5.2 the ack point; decision 0003 §CX) — B, THE KILL ROWS (a)'s member, writes t0–t2 into its directory under A's, creates t3 and syncs the filesystem (`sync -f`); its 4th write (t3's body) meets the landing hold (SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE=4: that window and every later one never issued); kill -9 B ⇒ A evicts B and recovers its region: t0–t2 whole, t3 present and EMPTY (the held write never landed), and every write B ACKED is whole on A — B's posture never acks a write its kill can lose" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const h = kill_row_held_file;
+    var env_b = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", std.fmt.comptimePrint("{d}", .{kill_row_held_file + 1}) }});
+    defer env_b.deinit();
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    b.env = &env_b;
+    try b.spawn(&.{});
+    const ready_b = try b.awaitReady();
+    {
+        const mk = try rig.onMount("mkdir a-dir");
+        gpa.free(mk);
+    }
+    // B's writer in a child: `tree` (a cross-owner mkdir), t0–t2 whole,
+    // t3 created and the filesystem synced (`sync -f`: every window before
+    // it landed), then t3's body — the held write.
+    var dest_buf: [160]u8 = undefined;
+    const dest = try std.fmt.bufPrint(&dest_buf, "{s}/a-dir", .{b.mp});
+    var err_buf: [192]u8 = undefined;
+    const err_path = try std.fmt.bufPrint(&err_buf, "{s}/writer.err", .{rig.work});
+    const err_file = try Io.Dir.cwd().createFile(io, err_path, .{ .truncate = true });
+    defer err_file.close(io);
+    var script: std.Io.Writer.Allocating = .init(gpa);
+    defer script.deinit();
+    try script.writer.print("mkdir tree && i=0; while [ $i -lt {d} ]; do printf 't%s\\n' $i > tree/t$i; i=$((i + 1)); done; exec 3> tree/t{d} && sync -f tree/t{d} && printf 't{d}\\n' >&3 && exec 3>&-", .{ h, h, h, h });
+    var writer = try std.process.spawn(io, .{ .argv = &.{ "sh", "-e", "-c", script.written() }, .cwd = .{ .path = dest }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .{ .file = err_file } });
+    // The hold engaged on the held write, before its commit.
+    _ = try b.awaitLog("test seam: SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", ready_b, kill_row_wait_ns);
+    // A mount that acks at the apply says so at its bring-up: the held
+    // write's answer then reaches the writer, which exits 0 with the write
+    // ACKED. A mount that acks at the landing never answers it (its window
+    // never lands): B dies with the write in flight.
+    const acks_early = blk: {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        break :blk std.mem.indexOf(u8, text[0..ready_b], "metadata acks precede the journal landing") != null;
+    };
+    if (acks_early) try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try writer.wait(io));
+    try b.kill();
+    if (!acks_early) {
+        const term = try writer.wait(io);
+        try testing.expect(term != .exited or term.exited != 0);
+    }
+    std.debug.print("\nsmoke: kill rows (a) held write: B acks {s} the landing; kill -9 B with t{d}'s write held un-landed — {s}\n", .{ if (acks_early) "ahead of" else "after", h, if (acks_early) "ACKED" else "never acked" });
+    const ta = try awaitStats(rig, &.{ .{ .key = "\"appender_recoveries\":", .want = 1 }, .{ .key = "\"recovered_regions_released\":", .want = 1 } }, kill_row_wait_ns);
+    defer gpa.free(ta);
+    try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"appender_recoveries\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"appender_recovery_rollbacks\":"));
+    try expectMustStayZero(ta);
+    // The hold's proof: what landed before it stands, the held window is
+    // gone — t3 present (its create synced) and empty.
+    {
+        var cmd_buf: [48]u8 = undefined;
+        const out = try rig.onMount(try std.fmt.bufPrint(&cmd_buf, "stat -c %s a-dir/tree/t{d}", .{h}));
+        defer gpa.free(out);
+        try testing.expectEqualStrings("0\n", out);
+    }
+    var name_buf: [16]u8 = undefined;
+    const held_name: []const u8 = try std.fmt.bufPrint(&name_buf, "t{d}", .{h});
+    const held_list = [_][]const u8{held_name};
+    const unacked: []const []const u8 = if (acks_early) &.{} else &held_list;
+    try testing.expectEqual(h, try expectTreeAcked(rig, "a-dir/tree", h + 1, unacked));
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }

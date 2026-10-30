@@ -519,7 +519,14 @@ pub const Options = struct {
     /// `SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT`: the daemon SIGKILLs
     /// itself between a staged file's promotion commit and its ring release.
     promote_kill_after_commit: bool = false,
+    /// `SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE`: the mount's N-th FUSE write
+    /// fires the hold before its commit (null = no hold).
+    landing_hold: ?LandingHold = null,
 };
+
+/// The landing-hold seam's trigger: `fire` runs once, on the `at_write`-th
+/// write (1-based), before that write's commit.
+pub const LandingHold = struct { at_write: u64, fire: *const fn (at_write: u64) void };
 
 /// A held 4a set travelling with a transaction; it drops at the terminal
 /// outcome (the commit door's per-slot tokens ride the queue entry beside
@@ -727,6 +734,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// `Options.foreign_claim_hold`; `foreign_claim_held` once it held.
         foreign_claim_hold: ?[]const u8 = null,
         foreign_claim_held: std.atomic.Value(bool) = .init(false),
+        /// `Options.landing_hold`; `writes_seen` counts the FUSE writes
+        /// toward it.
+        landing_hold: ?LandingHold = null,
+        writes_seen: std.atomic.Value(u64) = .init(0),
         /// `Options.promote_kill_after_commit` (`promoteToStriped`).
         promote_kill_after_commit: bool,
         /// Test seam: the times drain parks between its claims snapshot and
@@ -867,6 +878,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .syncfs_keeps_custody = opts.syncfs_keeps_custody,
                 .foreign_claim_hold = opts.foreign_claim_hold,
                 .promote_kill_after_commit = opts.promote_kill_after_commit,
+                .landing_hold = opts.landing_hold,
                 .locks = undefined,
                 .uid = opts.uid,
                 .gid = opts.gid,
@@ -4344,6 +4356,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // no OPEN refuses a write-intent open, so the mutation is
             // refused here — EACCES like every other virtual mutation.
             if (virtual_inodes.isVirtualIno(a.ino)) return error.AccessDenied;
+            if (self.landing_hold) |h| if (self.writes_seen.fetchAdd(1, .monotonic) + 1 == h.at_write) h.fire(h.at_write);
             const local = try localOf(a.ino);
             if (c.move) |m| if (m.write_landed) |wl| return self.shipSizeClaim(c, local, wl);
             const len: u64 = if (a.held) |h| h.src.len else a.data.len;

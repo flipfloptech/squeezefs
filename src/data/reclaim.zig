@@ -744,9 +744,9 @@ pub const Reclaimer = struct {
     /// The allocator's "reclaim still owed" conjunct.
     pub fn spacePending(self: *Reclaimer) block_alloc.SpacePending {
         const S = struct {
-            fn pending(ctx: ?*anyopaque) bool {
+            fn pending(ctx: ?*anyopaque, for_ino: ?u64) bool {
                 const r: *Reclaimer = @ptrCast(@alignCast(ctx.?));
-                return r.pending();
+                return r.pendingFor(for_ino);
             }
         };
         return .{ .ctx = self, .pending = &S.pending };
@@ -1132,7 +1132,13 @@ pub const Reclaimer = struct {
 
     /// `!fence_halted ∧ (len > 0 ∨ processing > 0 ∨ held > 0 ∨ upstream)`.
     pub fn pending(self: *Reclaimer) bool {
-        return !self.fenceHalted() and (self.len.load(.acquire) > 0 or self.processing.load(.acquire) > 0 or self.held.load(.acquire) > 0 or self.upstreamPending());
+        return self.pendingFor(null);
+    }
+
+    /// `pending` as a mint FOR `for_ino` sees it: an upstream that owns
+    /// `for_ino` is no supply for it (`Upstream.owns`; decision 0003 §CW).
+    pub fn pendingFor(self: *Reclaimer, for_ino: ?u64) bool {
+        return !self.fenceHalted() and (self.len.load(.acquire) > 0 or self.processing.load(.acquire) > 0 or self.held.load(.acquire) > 0 or self.upstreamPending(for_ino));
     }
 
     /// Frees on their way to this reclaimer that no word here counts yet:
@@ -1145,10 +1151,19 @@ pub const Reclaimer = struct {
     /// matrix's `rm` + lay-down: three of four reservations refused with
     /// the rm's 64 blocks gathered). The kick never waits: the destroy
     /// runs on the filesystem's own fiber, and its frees enter the hold.
+    /// Save to a mint for one of the gather's OWN corpses (`owns`).
     pub const Upstream = struct {
         ctx: *anyopaque,
         pending: *const fn (*anyopaque) bool,
         kick: *const fn (*anyopaque) void,
+        /// `ino`'s corpse is this upstream's — gathered, or inside a destroy
+        /// pass. The pass settles its corpses' write custody BEFORE it
+        /// frees anything (`kv_fs.destroyCorpses` (1)): a mint for one of
+        /// them parked on the upstream waited on itself — the 1 s wall per
+        /// parked block and candidate volume, "the plane is broken", the
+        /// latch inert and every other mint parked behind it meanwhile
+        /// (decision 0003 §CW).
+        owns: *const fn (*anyopaque, ino: u64) bool,
     };
 
     /// Bound once the filesystem is up, unbound before it is torn down
@@ -1157,9 +1172,11 @@ pub const Reclaimer = struct {
         self.upstream.store(u, .release);
     }
 
-    fn upstreamPending(self: *Reclaimer) bool {
+    fn upstreamPending(self: *Reclaimer, for_ino: ?u64) bool {
         const u = self.upstream.load(.acquire) orelse return false;
-        return u.pending(u.ctx);
+        if (!u.pending(u.ctx)) return false;
+        const ino = for_ino orelse return true;
+        return !u.owns(u.ctx, ino);
     }
 
     /// The valve's first act: a gathered upstream's destroy, kicked.
@@ -1791,6 +1808,7 @@ pub const device_binding = if (builtin.os.tag == .linux) struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const enospc_mod = @import("enospc.zig");
 
 test "classify_block_device_discards_never_zero_writes / regular_file_punches / anything_else_skips" {
     try testing.expectEqual(Substrate.bdev_discard, classifySubstrate(linux.S.IFBLK | 0o600));
@@ -2211,17 +2229,27 @@ const FakeGather = struct {
     r: *Reclaimer,
     alloc: *BlockAllocator,
     idx: ?u64,
+    /// The corpse's file.
+    ino: u64 = 7,
     gathered: Atomic(bool) = .init(true),
     kicked: Atomic(bool) = .init(false),
     kicks: Atomic(u32) = .init(0),
+    /// The settle's verdict: the corpse's own `.visible_supply` mint,
+    /// made by `settlingDestroyer` before the free.
+    settled: ?block_alloc.AllocError!block_alloc.Minted = null,
 
     fn upstream(self: *FakeGather) Reclaimer.Upstream {
-        return .{ .ctx = self, .pending = &pending, .kick = &kick };
+        return .{ .ctx = self, .pending = &pending, .kick = &kick, .owns = &owns };
     }
 
     fn pending(ctx: *anyopaque) bool {
         const self: *FakeGather = @ptrCast(@alignCast(ctx));
         return self.gathered.load(.acquire);
+    }
+
+    fn owns(ctx: *anyopaque, ino: u64) bool {
+        const self: *FakeGather = @ptrCast(@alignCast(ctx));
+        return ino == self.ino and self.gathered.load(.acquire);
     }
 
     fn kick(ctx: *anyopaque) void {
@@ -2235,6 +2263,16 @@ const FakeGather = struct {
     /// the count (`kv_fs.drainGather`).
     fn destroyer(self: *FakeGather) void {
         while (!self.kicked.load(.acquire)) std.atomic.spinLoopHint();
+        if (self.idx) |idx| _ = self.r.freeBlock(testing.io, 0, idx, self.alloc.stampOf(idx));
+        self.gathered.store(false, .release);
+    }
+
+    /// `kv_fs.destroyCorpses`' order: the corpse's parked custody settles
+    /// FIRST — its upload's mint, `.visible_supply`, for the corpse's own
+    /// file — and only then the destroy frees.
+    fn settlingDestroyer(self: *FakeGather) void {
+        while (!self.kicked.load(.acquire)) std.atomic.spinLoopHint();
+        self.settled = enospc_mod.allocateBlockGraceBounded(self.alloc, testing.io, enospc_mod.Valve.fromReclaimer(self.r), .visible_supply, null, self.ino);
         if (self.idx) |idx| _ = self.r.freeBlock(testing.io, 0, idx, self.alloc.stampOf(idx));
         self.gathered.store(false, .release);
     }
@@ -2260,7 +2298,7 @@ test "a full store with a delete's corpses gathered UPSTREAM of the hold never a
     try testing.expect(!f.alloc.freshSupplyExhausted()); // inert: supply in sight
     const kicks0 = stats.block_free_upstream_kicks.load();
     const t = try std.Thread.spawn(.{}, FakeGather.destroyer, .{&gather});
-    const m = try enospc.allocateBlockGraceBounded(f.alloc, io, enospc.Valve.fromReclaimer(f.r), .visible_supply, null);
+    const m = try enospc.allocateBlockGraceBounded(f.alloc, io, enospc.Valve.fromReclaimer(f.r), .visible_supply, null, 8);
     t.join();
     try testing.expectEqual(@as(u64, 6), m.idx);
     f.alloc.publishBlock(6);
@@ -2274,12 +2312,44 @@ test "a full store with a delete's corpses gathered UPSTREAM of the hold never a
     empty.kicked.store(true, .release);
     const up2 = empty.upstream();
     f.r.bindUpstream(&up2);
-    try testing.expectError(error.StorageFull, enospc.allocateBlockGraceBounded(f.alloc, io, enospc.Valve.fromReclaimer(f.r), .visible_supply, null));
+    try testing.expectError(error.StorageFull, enospc.allocateBlockGraceBounded(f.alloc, io, enospc.Valve.fromReclaimer(f.r), .visible_supply, null, 8));
     try log.testing.expectAllFired();
     // Nothing upstream: terminal at once.
     f.r.bindUpstream(null);
-    try testing.expectError(error.StorageFull, enospc.allocateBlockGraceBounded(f.alloc, io, enospc.Valve.fromReclaimer(f.r), .visible_supply, null));
+    try testing.expectError(error.StorageFull, enospc.allocateBlockGraceBounded(f.alloc, io, enospc.Valve.fromReclaimer(f.r), .visible_supply, null, 8));
     try testing.expect(f.alloc.freshSupplyExhausted());
+}
+
+test "a gather's own corpse is no supply for its own bytes (decision 0003 §CW): the destroy settles the corpse's parked custody before it frees, so the settle's `.visible_supply` mint FOR the corpse refuses at once — no park, no wall, no loud line — while a live file's mint parks on the same gather and lands the corpse's free; `pendingFor` leaves the owned corpse out, `pending` does not" {
+    const io = testing.io;
+    var f = try Fixture.init(.{ .budget_bytes = test_budget, .batch_ms = 0 }, .bdev_discard, 8);
+    defer f.deinit();
+    var g: FakeGate = .{};
+    f.r.setDurableGate(g.gate());
+    try f.mintPublished(8);
+    try testing.expectError(error.StorageFull, f.alloc.allocateBlock());
+    g.hwm = 3;
+    // Ino 7's corpse holds block 6 and a parked block its destroy settles.
+    var gather: FakeGather = .{ .r = f.r, .alloc = f.alloc, .idx = 6, .ino = 7 };
+    const up = gather.upstream();
+    f.r.bindUpstream(&up);
+    defer f.r.bindUpstream(null);
+    try testing.expect(f.r.pending());
+    try testing.expect(f.r.pendingFor(8));
+    try testing.expect(!f.r.pendingFor(7));
+    try testing.expect(f.alloc.freshSupplyVisibleFor(8));
+    try testing.expect(!f.alloc.freshSupplyVisibleFor(7));
+    const walls0 = enospc_mod.stats.alloc_pressure_park_wall_refusals.load();
+    const t = try std.Thread.spawn(.{}, FakeGather.settlingDestroyer, .{&gather});
+    // The live file (ino 8) parks on the gather; the corpse's settle never
+    // does, so the destroy frees block 6 and the live mint lands it.
+    const m = try enospc_mod.allocateBlockGraceBounded(f.alloc, io, enospc_mod.Valve.fromReclaimer(f.r), .visible_supply, null, 8);
+    t.join();
+    try testing.expectEqual(@as(u64, 6), m.idx);
+    f.alloc.publishBlock(6);
+    try testing.expectError(error.StorageFull, gather.settled.?);
+    try testing.expectEqual(walls0, enospc_mod.stats.alloc_pressure_park_wall_refusals.load());
+    try testing.expect(!f.r.pending());
 }
 
 test "trim_drains_debt_with_counted_commands_and_returns_offsets; stale debt never discards an owned block; a fenced daemon never trims" {

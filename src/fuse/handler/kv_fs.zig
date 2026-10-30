@@ -779,6 +779,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The reclaim gather.
         reclaim_lock: jc.SpinLock = .{},
         reclaim: std.ArrayList(u64) = .empty,
+        /// The destroy passes in flight, each its batch on its drainer's
+        /// stack (`drainGather`), under `reclaim_lock`: with the gather,
+        /// the corpses `corpseUpstream` owns.
+        passes: ?*Pass = null,
         /// The reclaim cadence's wake (it parks on it with its tick as the
         /// deadline): a gather that fills a batch notifies it — the destroy
         /// is never the forgetting thread's (`gatherCorpse`).
@@ -2471,12 +2475,29 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// destroy on the caller's thread (`gatherCorpse`'s law). Bound by
         /// the mount once `self` stands at its address.
         pub fn corpseUpstream(self: *Self) reclaim_mod.Reclaimer.Upstream {
-            return .{ .ctx = self, .pending = &corpsesPendingOf, .kick = &kickCorpses };
+            return .{ .ctx = self, .pending = &corpsesPendingOf, .kick = &kickCorpses, .owns = &corpseOwnsOf };
         }
 
         fn corpsesPendingOf(ctx: *anyopaque) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
             return self.corpses_pending.load(.acquire) != 0;
+        }
+
+        /// `ino`'s corpse is gathered or inside a destroy pass: the pass
+        /// settles its custody before it frees, so the gather is no supply
+        /// for that custody's own mints (decision 0003 §CW). A scan, read
+        /// only on the full-store park path once the reclaimer's cheaper
+        /// conjuncts (queued, processing, held) are all empty.
+        fn corpseOwnsOf(ctx: *anyopaque, ino: u64) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.reclaim_lock.lock();
+            defer self.reclaim_lock.unlock();
+            if (std.mem.indexOfScalar(u64, self.reclaim.items, ino) != null) return true;
+            var p = self.passes;
+            while (p) |pass| : (p = pass.next) {
+                if (std.mem.indexOfScalar(u64, pass.inos, ino) != null) return true;
+            }
+            return false;
         }
 
         fn kickCorpses(ctx: *anyopaque) void {
@@ -2520,19 +2541,23 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn drainGather(self: *Self, c: *Ctx, min_batch: usize, tick: bool) Error!void {
             while (true) {
                 var batch: [RECLAIM_BATCH]u64 = undefined;
-                var n: usize = 0;
+                var pass: Pass = .{ .inos = &.{} };
                 {
                     self.reclaim_lock.lock();
                     defer self.reclaim_lock.unlock();
                     if (self.reclaim.items.len < min_batch) break;
-                    while (n < RECLAIM_BATCH and self.reclaim.items.len > 0) : (n += 1) batch[n] = self.reclaim.pop().?;
+                    var got: usize = 0;
+                    while (got < RECLAIM_BATCH and self.reclaim.items.len > 0) : (got += 1) batch[got] = self.reclaim.pop().?;
+                    if (got == 0) break;
+                    pass = .{ .inos = batch[0..got], .next = self.passes };
+                    self.passes = &pass;
                 }
-                if (n == 0) break;
+                const n = pass.inos.len;
                 var deferred: Deferred = .{};
                 // The pass's frees reached the plane (or it failed): its
                 // corpses leave the pending count after a deferred one
-                // rejoined the gather.
-                defer self.noteCorpsesDone(n);
+                // rejoined the gather, then the pass leaves the owned set.
+                defer self.endPass(&pass);
                 try self.destroyCorpses(c, batch[0..n], &deferred);
                 if (deferred.n != 0) {
                     self.regather(deferred.slice());
@@ -2541,6 +2566,23 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 }
             }
             if (tick and self.space_deferred.swap(false, .acq_rel)) log.info("kv_fs: the deferred corpse destroys landed — the metadata heap took every one", .{});
+        }
+
+        /// A destroy pass in flight: its batch, on its drainer's stack,
+        /// linked into `passes` until the pass returns.
+        const Pass = struct { inos: []const u64, next: ?*Pass = null };
+
+        fn endPass(self: *Self, pass: *Pass) void {
+            self.noteCorpsesDone(pass.inos.len);
+            self.reclaim_lock.lock();
+            defer self.reclaim_lock.unlock();
+            var at = &self.passes;
+            while (at.*) |p| : (at = &p.next) {
+                if (p == pass) {
+                    at.* = p.next;
+                    return;
+                }
+            }
         }
 
         /// The corpses a destroy pass left for a later one: the heap refused
@@ -10889,6 +10931,61 @@ test "the corpse gather is the data plane's upstream supply (decision 0003 §CR)
     try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
     try testing.expect(!up.pending(up.ctx));
     try testing.expectEqual(@as(u64, 0), fuse_reclaim_gathered.load());
+}
+
+test "the corpse gather OWNS its corpses until their destroy pass returns (decision 0003 §CW): a gathered corpse is owned and a live file never is; inside the pass's settle the corpse is owned and the gather still pending — the settle's own mints are not parked on the gather they hold up; once the pass returns nothing is owned, nothing pending" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const up = h.fs.corpseUpstream();
+    const f = try h.create(1, "f", 0o644);
+    const lf = try H.Fs.localOf(f);
+    const live = try h.create(1, "live", 0o644);
+    const llive = try H.Fs.localOf(live);
+    try h.data.publishStriped(lf, 1 << 20, null, Mapping.wholeBlock(0x11, 0, 1));
+    try testing.expect(!up.owns(up.ctx, lf));
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "f" } }, 1).errno());
+    h.release(f);
+    h.forget(f, 1);
+    try testing.expect(up.pending(up.ctx));
+    try testing.expect(up.owns(up.ctx, lf));
+    try testing.expect(!up.owns(up.ctx, llive));
+    // The settle runs inside the pass: the corpse is off the gather list
+    // and on the pass.
+    const AtSettle = struct {
+        var upstream: *const reclaim_mod.Reclaimer.Upstream = undefined;
+        var ino: u64 = 0;
+        var owned: ?bool = null;
+        var pending: ?bool = null;
+        var gathered: usize = 0;
+        var hp: *H = undefined;
+        fn run(_: *anyopaque) void {
+            owned = upstream.owns(upstream.ctx, ino);
+            pending = upstream.pending(upstream.ctx);
+            gathered = hp.fs.reclaim.items.len;
+        }
+    };
+    AtSettle.upstream = &up;
+    AtSettle.ino = lf;
+    AtSettle.hp = &h;
+    h.data.on_flush = .{ .ctx = &h, .call = &AtSettle.run };
+    defer h.data.on_flush = null;
+    var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
+    var win: [16]u8 = undefined;
+    var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
+    try h.fs.reclaimDrain(&c);
+    tr.finish();
+    try testing.expectEqual(@as(u32, 1), h.data.flushes);
+    try testing.expectEqual(@as(usize, 0), AtSettle.gathered);
+    try testing.expectEqual(@as(?bool, true), AtSettle.owned);
+    try testing.expectEqual(@as(?bool, true), AtSettle.pending);
+    try testing.expect(!up.pending(up.ctx));
+    try testing.expect(!up.owns(up.ctx, lf));
+    try testing.expect(h.fs.passes == null);
+    h.release(live);
 }
 
 test "the corpse sweep at mount: an unlinked file whose FORGET died with the daemon (nlink 0, no dentry) is destroyed by the next mount's sweep with its layout; live files are untouched; a clean store sweeps nothing" {

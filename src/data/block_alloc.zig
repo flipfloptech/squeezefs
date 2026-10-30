@@ -424,10 +424,12 @@ pub const UntrackedFreeGate = struct {
 };
 
 /// "Reclaim still owed" — wired by the reclaim module; the valve and the
-/// visibility predicate read it (BA:L245-260, L683-688).
+/// visibility predicate read it (BA:L245-260, L683-688). `for_ino` is the
+/// file a mint is FOR (null: none named): reclaim whose frees wait on that
+/// file's own custody is no supply for it (decision 0003 §CW).
 pub const SpacePending = struct {
     ctx: ?*anyopaque,
-    pending: *const fn (?*anyopaque) bool,
+    pending: *const fn (?*anyopaque, for_ino: ?u64) bool,
 };
 
 // ---------------------------------------------------------------------------
@@ -1852,10 +1854,17 @@ pub const BlockAllocator = struct {
     /// pending` — the conjuncts ARE the mint sources; a source added later
     /// must join them (BA:L683-688).
     pub fn freshSupplyVisible(self: *const BlockAllocator) bool {
+        return self.freshSupplyVisibleFor(null);
+    }
+
+    /// `freshSupplyVisible` as a mint FOR `for_ino` sees it: the reclaim
+    /// conjunct leaves out frees that wait on that file's own custody
+    /// (`SpacePending`; decision 0003 §CW).
+    pub fn freshSupplyVisibleFor(self: *const BlockAllocator, for_ino: ?u64) bool {
         if (self.freeSupplyBlocks() > 0) return true;
         if (self.grace) |g| if (g.vtable.len(g.ctx) > 0) return true;
         if (self.trim_claimed.load(.seq_cst) > 0) return true;
-        if (self.space_pending) |p| if (p.pending(p.ctx)) return true;
+        if (self.space_pending) |p| if (p.pending(p.ctx, for_ino)) return true;
         return false;
     }
 

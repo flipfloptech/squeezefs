@@ -2022,6 +2022,104 @@ test "linux: THE RECOVERY'S CENSUS AGAINST THE MANAGER'S OWN SMO — a dead wire
     try expectAllPresent(live.set, keys.items);
 }
 
+// ---- a same-node successor's join against its predecessor's recovery (decision 0003 §CY) ----
+
+/// The successor's JoinAppender at the manager's service edge (the ledger
+/// volume's half, `join_ladder.JoinRetire`): true = Deferred.
+fn successorJoinDeferred(live: *Live, successor: page.Identity) !bool {
+    const jr = live.plane.mgr.?.faces[0].join_retire.?;
+    jr.retire(jr.ctx, successor) catch |e| switch (e) {
+        error.Deferred => return true,
+        else => return e,
+    };
+    return false;
+}
+
+/// The dead incarnation's pair under a new writer id.
+fn successorOf(dead: WireDead) page.Identity {
+    return .{ .node_token = dead.identity.node_token, .mount_slot = dead.identity.mount_slot, .writer_id = dead.identity.writer_id +% 1 };
+}
+
+test "linux: A SAME-NODE SUCCESSOR'S JOIN BEFORE ITS PREDECESSOR'S RECOVERY (decision 0003 §CY) — a dead wire joiner, its death recorded and not yet acted on; its successor (the same node and mount slot, a new writer id) asks JoinAppender at the manager's service edge: Deferred, the record standing — the next poll recovers the dead region (every acked record readable through tree 0); the join then retires the record, and a poll after it acts on nothing (red: the join retired the record at once, no poll ever recovered the dead region — its page stayed Live, an orphan)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "recover-succ", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try s.env.put("SQUEEZEFS_SYM_MINT_SLOTS", "1");
+    var kill_buf: [160]u8 = undefined;
+    const kill = try std.fmt.bufPrint(&kill_buf, "{s}.kill", .{s.paths[0]});
+    defer unlinkPath(kill);
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer freeKeys(&keys);
+    const dead = try killWireJoiner(s, kill, &keys);
+    var live = try Live.open(s, kill);
+    defer live.close();
+    const be = live.set.volumes[0];
+    try testing.expect(be.sym.?.isUnrecovered(dead.appender_id));
+    live.recordDeath(dead.identity, false);
+    const ledger = live.plane.deathLedger().?;
+    const deferred = try successorJoinDeferred(&live, successorOf(dead));
+    const recoveries0 = recovery.stats.appender_recoveries.load();
+    live.plane.tick();
+    try testing.expectEqual(page.State.recovered, (try be.sym.?.manager.readPageOf(dead.appender_id)).?.state);
+    try testing.expectEqual(recoveries0 + 1, recovery.stats.appender_recoveries.load());
+    try expectAllPresent(live.set, keys.items);
+    try testing.expect(deferred);
+    // Recovered everywhere: the join retires the record and its rows.
+    try testing.expect(!try successorJoinDeferred(&live, successorOf(dead)));
+    try testing.expect((try ledger.readDeath(dead.identity)) == null);
+    try testing.expect(!try ledger.isRecovered(dead.identity, 0));
+    live.plane.tick();
+    try testing.expectEqual(recoveries0 + 1, recovery.stats.appender_recoveries.load());
+}
+
+test "linux: A SAME-NODE SUCCESSOR'S JOIN WHILE ITS PREDECESSOR'S RECOVERY IS IN FLIGHT (decision 0003 §CY) — the recovery parked after its flush (SQUEEZEFS_TEST_RECOVERY_HOLD: the page Recovering, no recovered: row yet); the successor's JoinAppender at the service edge is Deferred, the record standing; released, the recovery completes; the join then retires the record AND its recovered: row — no row outlives its record to open a later death's gate before that death's recovery (red: the join retired the record mid-recovery and the recovery's last step wrote recovered: under no record)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "recover-succ-fly", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try s.env.put("SQUEEZEFS_SYM_MINT_SLOTS", "1");
+    var kill_buf: [160]u8 = undefined;
+    const kill = try std.fmt.bufPrint(&kill_buf, "{s}.kill", .{s.paths[0]});
+    defer unlinkPath(kill);
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer freeKeys(&keys);
+    const dead = try killWireJoiner(s, kill, &keys);
+    try s.env.put("SQUEEZEFS_TEST_RECOVERY_HOLD", "park_after_flush");
+    var live = try Live.open(s, kill);
+    defer live.close();
+    const be = live.set.volumes[0];
+    const binding = live.binding();
+    live.recordDeath(dead.identity, false);
+    const ledger = live.plane.deathLedger().?;
+    const Ticker = struct {
+        fn run(l: *Live) void {
+            l.plane.tick();
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Ticker.run, .{&live});
+    var joined = false;
+    defer if (!joined) {
+        binding.hold.release.set(be.io);
+        th.join();
+    };
+    binding.hold.reached.waitUncancelable(be.io);
+    try testing.expectEqual(page.State.recovering, (try be.sym.?.manager.readPageOf(dead.appender_id)).?.state);
+    const deferred = try successorJoinDeferred(&live, successorOf(dead));
+    binding.hold.release.set(be.io);
+    th.join();
+    joined = true;
+    try testing.expectEqual(page.State.recovered, (try be.sym.?.manager.readPageOf(dead.appender_id)).?.state);
+    try expectAllPresent(live.set, keys.items);
+    // No recovered: row stands without its death record.
+    const standing = (try ledger.readDeath(dead.identity)) != null;
+    try testing.expect(standing or !try ledger.isRecovered(dead.identity, 0));
+    try testing.expect(deferred);
+    try testing.expect(!try successorJoinDeferred(&live, successorOf(dead)));
+    try testing.expect((try ledger.readDeath(dead.identity)) == null);
+    try testing.expect(!try ledger.isRecovered(dead.identity, 0));
+}
+
 // ---- the coherence hold (rung 10 recovery item 2) ----
 
 test "linux: THE COHERENCE HOLD — a write into a recovered slot right after the recovery is refused (SlotBusy, the EAGAIN class) until every live member's census pull has retired the dead holder (the death record's ts + VALIDITY_RENEWALS × renew + 2 × skew_max): before it a joiner may still serve the dead holder's cached token, and the write would contradict it; a death recorded that long ago admits the write at once (red: the successor served the write the instant the slot was Unleased)" {

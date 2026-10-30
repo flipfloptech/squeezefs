@@ -522,7 +522,7 @@ fn mountMain(ctx: *Ctx) u8 {
     // The write cache's memfd and claim to the supervisor (charter §6.1
     // "Staged"): from here a crash of this process keeps every resident
     // for the member's next mount.
-    announceWriteCache(plane);
+    announceWriteCache(plane, env);
     if (ctx.derived_key) |*k| k.zeroize();
     if (ctx.derived_next) |*k| k.zeroize();
     var plane_open = true;
@@ -1208,11 +1208,12 @@ fn announceTail(_: ?*anyopaque, index: u16, fd: std.os.linux.fd_t) bool {
 /// The write cache's memfd and its claim over the supervisor's socket
 /// (two frames, one fd each — the discipline). A mount without a
 /// supervisor binds no write cache (decision 0003 §BR.6).
-fn announceWriteCache(plane: *plane_mod.DataPlane) void {
+fn announceWriteCache(plane: *plane_mod.DataPlane, env: *const std.process.Environ.Map) void {
     const fds = plane.writeCacheFds() orelse return;
     const sock = journal_tail.supervisor_sock.load(.acquire);
     // A write cache is bound only under a supervisor (`run`).
     std.debug.assert(sock >= 0);
+    if (knobs.parseStr(env.get("SQUEEZEFS_TEST_WRITE_CACHE_ANNOUNCE_HOLD"))) |path| if (!std.mem.eql(u8, path, "off")) holdBeforeAnnounce(path);
     const claim_frame = (cli.supervisor.TailFrame{ .kind = .write_cache_claim, .index = 0 }).encode();
     const ring_frame = (cli.supervisor.TailFrame{ .kind = .write_cache, .index = 0 }).encode();
     ipc_rl.sendCtl(sock, &claim_frame, fds.claim) catch |e| {
@@ -1225,6 +1226,20 @@ fn announceWriteCache(plane: *plane_mod.DataPlane) void {
     };
     log.info("write cache: the memfd and its claim handed to the supervisor (a crash of this process keeps every resident for this member's next mount)", .{});
     plane.writeCacheHandedOver();
+}
+
+/// `SQUEEZEFS_TEST_WRITE_CACHE_ANNOUNCE_HOLD`: park until a writer opens
+/// the FIFO, the ring bound and not yet the supervisor's.
+fn holdBeforeAnnounce(path: []const u8) void {
+    log.warn("write cache: SQUEEZEFS_TEST_WRITE_CACHE_ANNOUNCE_HOLD (pid {d}) — the ring is bound and not yet the supervisor's; holding until a writer opens {s}", .{ linux.getpid(), path });
+    var pb: [linux.PATH_MAX]u8 = undefined;
+    const p = std.fmt.bufPrintSentinel(&pb, "{s}", .{path}, 0) catch return;
+    const rc = linux.open(p.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) {
+        log.warn("write cache: the announce hold could not open {s} ({t}); not holding", .{ path, linux.errno(rc) });
+        return;
+    }
+    _ = linux.close(@intCast(rc));
 }
 
 fn announceWriteCacheDrained() void {

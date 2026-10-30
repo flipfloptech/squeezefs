@@ -10879,6 +10879,83 @@ test "smoke: THE ORPHANED SUPERVISOR (h) — acked creates held in the journal t
     try orphanSupervisorRow(.deleted_held_tail);
 }
 
+test "smoke: THE WRITE CACHE'S HANDOVER IS ACKED (decision 0003 §CV) — a supervised mount holds 8 staged files (closed, never synced; the directory fsync'd); kill -9 its daemon: its supervisor holds the ring on the member's claim; the successor mount takes the ring over the claim and is HELD (SQUEEZEFS_TEST_WRITE_CACHE_ANNOUNCE_HOLD) before its own supervisor holds it → kill -9 the successor's daemon there ⇒ the first supervisor still holds the ring (it lets it go only on the ack of a supervisor holding it); the next mount takes it — every file byte-exact, staged_payload_lost_reads 0 — and the first supervisor exits; fsck clean (red: the first supervisor let the memfd go at the send, the ring died with the successor)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    var script: [512]u8 = undefined;
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "i=0; while [ $i -lt {d} ]; do head -c {d} /dev/urandom > src$i; i=$((i + 1)); done; echo ok", .{ orphan_files, orphan_file_bytes })));
+    try rig.spawnSupervised(&.{});
+    const sup = ppidOf(rig.child_pid) orelse return error.NoSupervisor;
+    gpa.free(try rig.onMount(try std.fmt.bufPrint(&script, "i=0; while [ $i -lt {d} ]; do cp \"$1/src$i\" f$i; i=$((i + 1)); done && python3 -c 'import os; fd = os.open(\".\", os.O_RDONLY); os.fsync(fd)' && echo ok", .{orphan_files})));
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(st, "\"data_staging_on\":"));
+    }
+    try rig.kill();
+    // The successor, held between its bind and its own supervisor.
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/announce.fifo", .{rig.work}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    const mark = try rig.logLen();
+    try rig.env.put("SQUEEZEFS_TEST_WRITE_CACHE_ANNOUNCE_HOLD", fifo);
+    var mount_b = try std.process.spawn(io, .{ .argv = &.{ rig.bin, "mount", "--daemon", "--supervise", "--log-file", rig.log_path, rig.meta_uri, rig.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .{ .file = rig.log_file.? }, .stderr = .{ .file = rig.log_file.? } });
+    _ = rig.env.swapRemove("SQUEEZEFS_TEST_WRITE_CACHE_ANNOUNCE_HOLD");
+    var b_done = false;
+    defer if (!b_done) {
+        releaseHold(fifo);
+        _ = mount_b.wait(io) catch {};
+    };
+    const at = try rig.awaitLog("SQUEEZEFS_TEST_WRITE_CACHE_ANNOUNCE_HOLD (pid ", mark, ready_wait_ns);
+    const b_daemon: linux.pid_t = blk: {
+        const t = try rig.readLog();
+        defer gpa.free(t);
+        try testing.expect(std.mem.indexOf(u8, t[mark..at], "handed over by its supervisor") != null);
+        const end = std.mem.indexOfNonePos(u8, t, at, "0123456789") orelse t.len;
+        break :blk try std.fmt.parseInt(linux.pid_t, t[at..end], 10);
+    };
+    _ = linux.kill(b_daemon, .KILL);
+    _ = try mount_b.wait(io);
+    b_done = true;
+    // The first supervisor still holds the ring: the claim connection closed
+    // without an ack.
+    {
+        const memfds = try writeCacheMemfdsOf(rig, rig.mp);
+        std.debug.print("\nsmoke[handover ack]: the successor killed before its supervisor held the ring — the first supervisor {s}, write-cache memfds held by this mount's processes: {d}\n", .{ if (alive(sup)) "holds on" else "EXITED", memfds });
+        try testing.expect(alive(sup));
+        try testing.expectEqual(@as(usize, 1), memfds);
+    }
+    // The next mount takes it; the ack ends the first supervisor's hold.
+    const mark2 = try rig.logLen();
+    try rig.spawnSupervised(&.{});
+    const exact = blk: {
+        const out = try rig.onMount(try std.fmt.bufPrint(&script, "n=0; i=0; while [ $i -lt {d} ]; do if cmp -s \"$1/src$i\" f$i; then n=$((n + 1)); fi; i=$((i + 1)); done; echo $n", .{orphan_files}));
+        defer gpa.free(out);
+        break :blk std.fmt.parseInt(usize, std.mem.trim(u8, out, " \n"), 10) catch 0;
+    };
+    const lost = try stagedLostReads(rig);
+    {
+        const t = try rig.readLog();
+        defer gpa.free(t);
+        std.debug.print("smoke[handover ack]: the next mount {s}; {d} of {d} files byte-exact, staged_payload_lost_reads {d}\n", .{ if (std.mem.indexOf(u8, t[mark2..], "handed over by its supervisor") != null) "took the ring over the claim" else "found no ring", exact, orphan_files, lost });
+    }
+    try testing.expectEqual(orphan_files, exact);
+    try testing.expectEqual(@as(u64, 0), lost);
+    {
+        const deadline = clock.monotonicNs() + exit_wait_ns;
+        while (alive(sup) and clock.monotonicNs() < deadline) sleepMs(20);
+        try testing.expect(!alive(sup));
+    }
+    try testing.expectEqual(@as(usize, 0), try heldCopies(rig, staging.Ring.Ram.HELD_SUFFIX));
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "handover ack");
+}
+
 test "smoke: A FREED BLOCK IS NOT REUSED BEFORE THE RECORD THAT FREED IT IS DURABLE (charter §6.2 block reclaim, §5.2 the ack point; decision 0003 §BT) — a --single-writer set (the flat allocator: a mint takes the free list first) over device-mapper slices, cache-less: three one-block files of 0xa1, 0xa2, 0xa3 written O_DIRECT, fsync'd and synced, eight empty files beside them; the metadata slice slowed 12 s (dm-delay on writes and flushes: every journal window and barrier issued from here is in flight, as one inside the ≤ 50 ms flush span is); `fpunch 0 4m` of the second (answered once its window landed — its barrier still in flight), then `truncate 0` of the first and `rm` of the third (each answered at its RAM apply), then eight O_DIRECT one-block writes of 0xbb; the power cut inside the delay (dm-flakey drop_writes, kill -9 of the foreground daemon: no supervisor, no tail replay), the slices back: the three freed blocks still hold 0xa1, 0xa2, 0xa3 on the device — none was written, nor discarded, before its record was durable; fsck --offline --scrub clean; after the remount the truncate and the unlink were never durable and the two files read their OWN bytes, the landed punch reads its hole (red on 2d44c33: the frees ran right after the answer, the writers' mints took the freed blocks off the free list — the truncated file read 4 MiB of 0xbb, the unlinked one zeros: its block discarded by the debt drainer; fsck found nothing)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

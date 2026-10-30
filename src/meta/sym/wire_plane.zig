@@ -327,6 +327,10 @@ const JoinedHalf = struct {
     /// that the hold began (Release here, its Acquire there).
     follow_hold: ?[]const u8 = null,
     follow_held: std.atomic.Value(bool) = .init(false),
+    /// `SQUEEZEFS_TEST_MEMBERSHIP_JOIN_HOLD`: the FIFO path the start's
+    /// membership join parks on, after the volumes joined (the pages Live),
+    /// when the path is present. Null = no hold.
+    join_hold: ?[]const u8 = null,
 
     /// A tenth of the shipped `T_self` floor (the smoke's `T_owner` of
     /// 3 s derives a 797 ms `T_self`; a tick every 80 ms meets a 265 ms
@@ -467,6 +471,22 @@ const JoinedHalf = struct {
         };
         f.close(self.plane.io);
         log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD released — the beat resumes", .{});
+    }
+
+    /// `SQUEEZEFS_TEST_MEMBERSHIP_JOIN_HOLD`: the start's membership join
+    /// parks, when the FIFO is present, until a writer opens it — the
+    /// mount's pages are Live at the manager and it is no census member
+    /// yet.
+    fn holdJoinIfArmed(self: *JoinedHalf) void {
+        const path = self.join_hold orelse return;
+        Io.Dir.cwd().access(self.plane.io, path, .{}) catch return;
+        log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_JOIN_HOLD — the membership join holds (the pages Live, no census member yet) until a writer opens {s}", .{path});
+        const f = Io.Dir.cwd().openFile(self.plane.io, path, .{}) catch |e| {
+            log.warn("cluster wire: the membership join hold could not open {s} ({t}); not holding", .{ path, e });
+            return;
+        };
+        f.close(self.plane.io);
+        log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_JOIN_HOLD released — the membership join proceeds", .{});
     }
 
     /// `SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD`: the follower parks, once,
@@ -723,6 +743,7 @@ pub const WirePlane = struct {
         if (self.joined) |j| {
             j.beat_hold = knobs.parseStr(env.get("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD"));
             j.follow_hold = knobs.parseStr(env.get("SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD"));
+            j.join_hold = knobs.parseStr(env.get("SQUEEZEFS_TEST_MEMBERSHIP_JOIN_HOLD"));
         }
         // The token holder over this daemon's trees; the pusher over the
         // peers' dialled links.
@@ -951,6 +972,7 @@ pub const WirePlane = struct {
         const j = self.joined.?;
         if (!self.publishToManager()) return error.Io;
         j.member.endpoint = self.advertised;
+        j.holdJoinIfArmed();
         const now = nowMs();
         switch (j.member.join(now, null)) {
             .granted => {},

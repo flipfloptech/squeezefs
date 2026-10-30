@@ -5536,6 +5536,90 @@ test "smoke: THE KILL ROWS (a) HELD WRITE (charter §5.2 the ack point; decision
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+test "smoke: THE KILL ROWS (a) SUCCESSOR'S JOIN (charter §5.5 death and recovery; decision 0003 §CX) — kill -9 B (THE KILL ROWS (a)'s member, a file written) ⇒ A evicts B at T_owner and recovers its region, B's death record standing; B's same-node successor joins — its page Live at A — with its membership join HELD (SQUEEZEFS_TEST_MEMBERSHIP_JOIN_HOLD: no census member yet) across two of A's ledger polls: A never recovers the live successor (appender_recoveries and dead_members_acted stay 1); released, the successor reads B's file, its first cross-owner mkdir lands, it unmounts clean (exit 0); tripwires 0 on both" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // The hold's FIFO is NAMED for both incarnations and CREATED before the
+    // successor's spawn: the first incarnation's join never holds.
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/join.fifo", .{rig.work}, 0);
+    var env_b = try envWith(gpa, &rig.env, &kill_row_b_env);
+    defer env_b.deinit();
+    try env_b.put("SQUEEZEFS_TEST_MEMBERSHIP_JOIN_HOLD", fifo);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    b.env = &env_b;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const mk = try rig.onMount("mkdir a-dir");
+        gpa.free(mk);
+    }
+    {
+        const w = try b.onMount("mkdir a-dir/own && echo body > a-dir/own/f && echo ok");
+        gpa.free(w);
+    }
+    try b.kill();
+    {
+        const ta = try awaitStats(rig, &.{ .{ .key = "\"appender_recoveries\":", .want = 1 }, .{ .key = "\"recovered_regions_released\":", .want = 1 } }, kill_row_wait_ns);
+        defer gpa.free(ta);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"appender_recoveries\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dead_members_acted\":"));
+    }
+    // The successor's pages go Live at A (JoinAppender), then its
+    // membership join holds: two ledger polls run over the window.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    var released = false;
+    defer if (!released) releaseHold(fifo);
+    const mark_b = try b.logLen();
+    try b.spawn(&.{});
+    _ = try b.awaitLog("SQUEEZEFS_TEST_MEMBERSHIP_JOIN_HOLD — the membership join holds", mark_b, kill_row_wait_ns);
+    const polls0 = blk: {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        break :blk numberAfter(t, "\"recovery_ledger_polls\":") orelse return error.StatsKeyMissing;
+    };
+    {
+        const ta = try awaitAtLeast(rig, "\"recovery_ledger_polls\":", polls0 + 2, kill_row_wait_ns);
+        defer gpa.free(ta);
+        try testing.expect((numberAfter(ta, "\"recovery_ledger_polls\":") orelse 0) >= polls0 + 2);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"appender_recoveries\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dead_members_acted\":"));
+        std.debug.print("\nsmoke: kill rows (a) successor's join: {d} ledger polls over the held membership join — appender_recoveries 1, dead_members_acted 1; death records retired at the join {d}\n", .{ (numberAfter(ta, "\"recovery_ledger_polls\":") orelse 0) - polls0, numberAfter(ta, "\"dead_members_retired_rejoined\":") orelse 0 });
+    }
+    releaseHold(fifo);
+    released = true;
+    _ = try b.awaitLog("ready: ", mark_b, ready_wait_ns);
+    {
+        const out = try b.onMount("cat a-dir/own/f && mkdir a-dir/b2 && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("body\nok\n", out);
+    }
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try expectMustStayZero(ta);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"appender_recoveries\":"));
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try expectMustStayZero(tb);
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B PARKS-AND-RECLAIMS at T_self (acks held at the pre-admission gate, park expiries 0) → remount A (the D0 ladder: the same-host dead-pid proof, A wins volume 0 again at term 2, the grace window open, the allocation leases taken over from the dead incarnation) → B's reclaim lands in the grace window, its manager link re-points, the held writes drain and every storm file is whole on both" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

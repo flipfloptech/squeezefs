@@ -5709,7 +5709,7 @@ test "smoke: THE KILL ROWS (a) OVERLAPPING SUCCESSOR (charter §5.5 death and re
         const sl = try s.readLog();
         defer gpa.free(sl);
         const deferred = std.mem.indexOf(u8, sl[mark_s..], "JoinAppender deferred by the manager") != null;
-        std.debug.print("\nsmoke: kill rows (a) overlapping successor: S's JoinAppender {s} — A: appender_recoveries 1, dead_members_acted 1; S: joined_rejoins 0, B's file whole\n", .{if (deferred) "deferred over B's Live page until its recovery" else "came after B's recovery (no deferral: the window was not met)"});
+        std.debug.print("\nsmoke: kill rows (a) overlapping successor: S's JoinAppender {s} (A: appender_join_live_incarnation_deferrals {d}) — A: appender_recoveries 1, dead_members_acted 1; S: joined_rejoins 0, B's file whole\n", .{ if (deferred) "deferred over B's Live page until its recovery" else "came after B's recovery (no deferral: the window was not met)", numberAfter(ta, "\"appender_join_live_incarnation_deferrals\":") orelse 0 });
     }
     try s.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try s.waitExit());

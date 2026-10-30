@@ -96,6 +96,10 @@ pub const stats = struct {
     pub var appender_directory_reads: counters.ShardedCounter = .{};
     pub var appender_directory_links_grown: counters.ShardedCounter = .{};
     pub var appender_join_residue_returned: counters.ShardedCounter = .{};
+    /// A join whose (node, mount slot) has another incarnation's page Live
+    /// (its ring's landed entries are its recovery's): Deferred, nothing
+    /// written (decision 0003 §DA).
+    pub var appender_join_live_incarnation_deferrals: counters.ShardedCounter = .{};
     pub var appender_pending_segments_returned: counters.ShardedCounter = .{};
     pub var appender_grow_ring_short_declines: counters.ShardedCounter = .{};
     pub var appender_ring_grows: counters.ShardedCounter = .{};
@@ -1097,15 +1101,26 @@ pub const Manager = struct {
         const stable: cr.StableIdentity = .{ .node_token = req.identity.node_token, .mount_slot = req.identity.mount_slot };
         const hint = try self.readHint(stable);
 
-        // 2. Durable idempotency: a Live page under this identity IS the join.
+        // 2. Durable idempotency: a Live page under this WHOLE identity IS
+        // the join (one incarnation's retried join: the writer id is per
+        // incarnation). A Live page under the pair with another writer id
+        // is another incarnation's ring, whose landed entries only its
+        // recovery replays: Deferred, nothing written, until that page
+        // leaves Live (decision 0003 §DA).
         var existing: ?struct { p: page.Page, slots: [2]u64 } = null;
+        var other_live = false;
         for (d.links.items) |l| {
             var pair: u32 = 0;
             while (pair < l.header.pairs and existing == null) : (pair += 1) {
                 const imgs = dir.readPair(self.vol.reader(), l, pair) catch return error.Io;
                 const p = imgs.newest() orelse continue;
-                if (p.state == .live and p.identity.sameMount(req.identity)) existing = .{ .p = p, .slots = imgs.offsets };
+                if (p.state != .live or !p.identity.sameMount(req.identity)) continue;
+                if (p.identity.eql(req.identity)) existing = .{ .p = p, .slots = imgs.offsets } else other_live = true;
             }
+        }
+        if (existing == null and other_live) {
+            stats.appender_join_live_incarnation_deferrals.inc();
+            return error.Deferred;
         }
         if (existing) |ex| {
             self.rememberIdentity(req.identity, ex.p.appender_id);
@@ -2192,7 +2207,7 @@ test "join: allocates the lowest free page, carves + zeroes a ring at the floor,
     try testing.expectEqual(@as(u64, 1 + 8 + 12), tv.allocatedExtents());
     try testing.expectEqual(joins_before + 1, stats.appender_joins.load());
     // Idempotent: the Live page under the identity IS the join; a fresh incarnation anyway.
-    const again = try m.joinAppender(.{ .identity = .{ .node_token = 0xAA, .mount_slot = 0x5001, .writer_id = 0x9999 } });
+    const again = try m.joinAppender(.{ .identity = ident_a });
     try testing.expect(again.already);
     try testing.expectEqual(@as(u32, 1), again.appender_id);
     try testing.expectEqual(@as(u64, 0x1000 + 2 * node_seq.INCARNATION_SPACE), again.node_seq_base);
@@ -2215,7 +2230,9 @@ test "join: another incarnation of a pair whose page is Live (the same node and 
     const entries = tv.control_entries;
     const before = (try m.readPageOf(j.appender_id)).?;
     const successor: Identity = .{ .node_token = ident_a.node_token, .mount_slot = ident_a.mount_slot, .writer_id = ident_a.writer_id +% 1 };
+    const deferrals = stats.appender_join_live_incarnation_deferrals.load();
     try testing.expectError(error.Deferred, m.joinAppender(.{ .identity = successor }));
+    try testing.expectEqual(deferrals + 1, stats.appender_join_live_incarnation_deferrals.load());
     try testing.expectEqual(bits, tv.allocatedExtents());
     try testing.expectEqual(entries, tv.control_entries);
     const after = (try m.readPageOf(j.appender_id)).?;

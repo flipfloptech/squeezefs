@@ -566,7 +566,7 @@ pub const ManagerWire = struct {
         var img: [page.PAGE_LEN]u8 = undefined;
         self.pages.read(self.pages.ctx, j.head.page_addr, &img) catch return error.Io;
         const p = page.decode(&img) catch return error.Corrupt;
-        if (p.appender_id != j.head.appender_id or !p.identity.sameMount(req.identity)) {
+        if (p.appender_id != j.head.appender_id or !p.identity.eql(req.identity)) {
             stats.joined_wire_words_rejected.fire("the page at page_addr is not this join's");
             return error.Rejected;
         }
@@ -1190,6 +1190,58 @@ test "a wire word the joiner's screen refuses (an out-of-range slot grant) is th
     try testing.expectEqual(@as(u32, 1), Fake.redials);
     try testing.expectEqual(redials0 + 1, stats.joined_wire_redials.load());
     try testing.expect(!wire.redial_pending);
+}
+
+test "a join by another incarnation of a pair whose page is Live answers Deferred over the wire and installs nothing; the same identity's retried join replays its own page (decision 0003 §DA)" {
+    const gpa = testing.allocator;
+    const d = try TwoDaemons.init(gpa);
+    defer d.deinit();
+    var wire: ManagerWire = .{ .gpa = gpa, .link = d.link(), .volume = 0, .identity = identityOf(1), .pages = d.pages() };
+    var b = Joiner.init(gpa, &wire);
+    defer b.deinit();
+    const in: join.JoinInputs = .{ .identity = pageIdentity(identityOf(1)), .volume_base = d.plane.tv.g.volume_base, .grain = 4096, .ring0_head = d.plane.tv.ring0_head };
+    try b.joinRegion(in);
+    var successor = identityOf(1);
+    successor.writer_id +%= 1;
+    var wire_s: ManagerWire = .{ .gpa = gpa, .link = d.link(), .volume = 0, .identity = successor, .pages = d.pages() };
+    var s = Joiner.init(gpa, &wire_s);
+    defer s.deinit();
+    var in_s = in;
+    in_s.identity = pageIdentity(successor);
+    try testing.expectError(error.Deferred, s.joinRegion(in_s));
+    try testing.expect(s.region == null);
+    var again = Joiner.init(gpa, &wire);
+    defer again.deinit();
+    try again.joinRegion(in);
+    try testing.expect(again.region.?.already);
+    try testing.expectEqual(b.appenderId(), again.appenderId());
+}
+
+test "the joiner's screen refuses a Joined whose page at page_addr names another incarnation of its pair (the must-stay-0 tripwire, nothing installed): a join's page carries the whole identity (decision 0003 §DA)" {
+    const gpa = testing.allocator;
+    const Fake = struct {
+        const segs = [_]verbs.RunWire{.{ .start = 1 << 20, .len = 1 << 19 }};
+        fn call(_: *anyopaque, req: verbs.Request) errors.Error!verbs.Reply {
+            return switch (req) {
+                .join_appender => .{ .join_appender = .{ .head = .{ .appender_id = 1, .already = 1, .n_segments = 1, .n_grant = 0, .reserved = 0, .page_addr = 4096, .node_seq_base = 1 << 38, .ring_bytes = 1 << 19 }, .segments = &segs, .grant = &.{} } },
+                else => error.NotManager,
+            };
+        }
+        fn readPage(_: *anyopaque, _: u64, out: *[page.PAGE_LEN]u8) error{Io}!void {
+            var other = pageIdentity(identityOf(3));
+            other.writer_id +%= 1;
+            const p: page.Page = .{ .appender_id = 1, .generation = 2, .identity = other, .term = 1, .state = .live };
+            p.encode(out) catch return error.Io;
+        }
+    };
+    var marker: u8 = 0;
+    var wire: ManagerWire = .{ .gpa = gpa, .link = .{ .ctx = &marker, .call = &Fake.call }, .volume = 0, .identity = identityOf(3), .pages = .{ .ctx = &marker, .read = &Fake.readPage } };
+    const tw0 = stats.joined_wire_words_rejected.load();
+    stats.joined_wire_words_rejected.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.Rejected, wire.joinAppender(.{ .identity = pageIdentity(identityOf(3)) }));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(tw0 + 1, stats.joined_wire_words_rejected.load());
 }
 
 test "the same-node successor rule: the D0 flock proves dead exactly the predecessor manager page 0 named at the open; a same-node joined appender is never taken over; a foreign node's holder is live; our own identity is never a predecessor" {

@@ -522,11 +522,18 @@ pub const Options = struct {
     /// `SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE`: the mount's N-th FUSE write
     /// fires the hold before its commit (null = no hold).
     landing_hold: ?LandingHold = null,
+    /// `SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS`: the mount's first FUSE create
+    /// fires the hold before its commit (null = no hold).
+    barrier_hold: ?BarrierHold = null,
 };
 
 /// The landing-hold seam's trigger: `fire` runs once, on the `at_write`-th
 /// write (1-based), before that write's commit.
 pub const LandingHold = struct { at_write: u64, fire: *const fn (at_write: u64) void };
+
+/// The fsync-hold seam's trigger: `fire` runs once, on the mount's first
+/// create, before its commit.
+pub const BarrierHold = struct { fsyncs: u32, fire: *const fn (fsyncs: u32) void };
 
 /// A held 4a set travelling with a transaction; it drops at the terminal
 /// outcome (the commit door's per-slot tokens ride the queue entry beside
@@ -738,6 +745,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// toward it.
         landing_hold: ?LandingHold = null,
         writes_seen: std.atomic.Value(u64) = .init(0),
+        /// `Options.barrier_hold`; `barrier_hold_fired` once it fired.
+        barrier_hold: ?BarrierHold = null,
+        barrier_hold_fired: std.atomic.Value(bool) = .init(false),
         /// `Options.promote_kill_after_commit` (`promoteToStriped`).
         promote_kill_after_commit: bool,
         /// Test seam: the times drain parks between its claims snapshot and
@@ -879,6 +889,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .foreign_claim_hold = opts.foreign_claim_hold,
                 .promote_kill_after_commit = opts.promote_kill_after_commit,
                 .landing_hold = opts.landing_hold,
+                .barrier_hold = opts.barrier_hold,
                 .locks = undefined,
                 .uid = opts.uid,
                 .gid = opts.gid,
@@ -3737,6 +3748,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         pub fn create(self: *Self, c: *Ctx, a: filesystem.CreateArgs) Error!filesystem.Created {
+            if (self.barrier_hold) |h| if (!self.barrier_hold_fired.swap(true, .monotonic)) h.fire(h.fsyncs);
             const e = try self.createChild(c, a.parent, a.name, .{ .mode = (a.mode & ~@as(u32, S.IFMT)) | S.IFREG });
             return .{ .entry = e, .fh = self.mintFh(), .open_flags = self.regularOpenFlags() };
         }

@@ -3036,6 +3036,16 @@ const no_eagain_phase_ns: u64 = 120 * std.time.ns_per_s;
 /// crossing is the unit row's to pin, reported here.
 const no_eagain_delay_ms: u32 = 5;
 
+/// THE NO-EAGAIN ROW's fsync hold on B (`SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS`,
+/// decision 0003 §CO.31): one past the 64 request cells a barrier took on
+/// B's floor ring before §BO.1. From B's first create no barrier starts
+/// until this many fsyncs wait on its lane at once — the creates stay
+/// un-durable, so every fsync covers them and waits — and the storm meets
+/// the old bound whatever the host's pace: unheld, a full gate's load
+/// brought 54 inside one barrier, and a cadence barrier that landed every
+/// create before the fsyncs came left 1.
+const no_eagain_fsync_hold: usize = 65;
+
 /// One thread of the no-EAGAIN storm. Its setup: `mkdir s/d<i>` (the VFS
 /// serializes creates in one parent, so the directories come first); at
 /// the first gate its create, `d<i>/f` (O_CREAT|O_EXCL):
@@ -3116,11 +3126,14 @@ test "smoke: 300 CONCURRENT FSYNCS AND 300 CONCURRENT CREATES ON ONE MOUNT NEVER
     }
     try rig.spawnMountOf(dm.meta_uri, &.{});
     _ = try rig.awaitReady(0);
+    var env_b = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS", std.fmt.comptimePrint("{d}", .{no_eagain_fsync_hold}) }});
+    defer env_b.deinit();
     const b = try Peer.init(rig, "b");
     defer b.deinit();
     b.meta_uri = dm.meta_uri;
+    b.env = &env_b;
     try b.spawn(&.{});
-    _ = try b.awaitReady();
+    const ready_b = try b.awaitReady();
     {
         const text = try b.readLog();
         defer gpa.free(text);
@@ -3158,6 +3171,8 @@ test "smoke: 300 CONCURRENT FSYNCS AND 300 CONCURRENT CREATES ON ONE MOUNT NEVER
             spawned += 1;
         }
         for ([_]u32{ 0, 1, 2 }, &phase_ms) |phase, *ms| {
+            // The first create armed the hold before its commit.
+            if (phase == 2) _ = try b.awaitLog("test seam: SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS", ready_b, no_eagain_phase_ns);
             const t0 = clock.monotonicNs();
             gate.store(phase, .release);
             if (!awaitArrived(&arrived, (phase + 1) * no_eagain_width)) {
@@ -3184,8 +3199,8 @@ test "smoke: 300 CONCURRENT FSYNCS AND 300 CONCURRENT CREATES ON ONE MOUNT NEVER
     try testing.expectEqual(@as(usize, 0), again);
     try testing.expectEqual(@as(usize, 0), failed);
     // Past the request cells a barrier once took: the storm met the old
-    // bound and waited through it.
-    try testing.expect(hwm > 64);
+    // bound and waited through it (the hold spends at that count).
+    try testing.expect(hwm >= no_eagain_fsync_hold);
     try expectMustStayZero(tb);
     try b.umount();
     try b.expectCleanExit("B's clean unmount after the storm");

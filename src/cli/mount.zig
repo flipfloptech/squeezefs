@@ -566,6 +566,10 @@ fn mountMain(ctx: *Ctx) u8 {
             0 => null,
             else => |n| .{ .at_write = n, .fire = &holdLandingFromWrite },
         },
+        .barrier_hold = switch (knobs.intKnob("SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS", u32, env)) {
+            0 => null,
+            else => |n| .{ .fsyncs = n, .fire = &holdBarriersFromCreate },
+        },
     }) catch return ctx.failed("out of memory mounting the filesystem", .{});
     defer fs.unmount();
     // The corpse gather is the data plane's upstream supply (decision 0003
@@ -1824,6 +1828,14 @@ const AtimeWatch = struct {
 fn holdLandingFromWrite(at_write: u64) void {
     journal_lane.test_seams.delay_issue.store(1, .release);
     log.warn("test seam: SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE — journal writes are held un-issued from write {d} on; acked metadata from here lives in the journal tail alone", .{at_write});
+}
+
+/// The fsync-hold seam's trigger (`SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS`):
+/// from the first create on, no journal lane starts a coalesced barrier
+/// until `fsyncs` fsyncs wait on one lane at once.
+fn holdBarriersFromCreate(fsyncs: u32) void {
+    journal_lane.test_seams.barrier_hold_fsyncs.store(fsyncs, .release);
+    log.warn("test seam: SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS — from the first create on, no journal barrier starts until {d} fsyncs wait on one lane", .{fsyncs});
 }
 
 /// The `il0` face binder the host calls at arm and unarm.

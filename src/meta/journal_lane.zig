@@ -416,6 +416,14 @@ pub const TestSeams = struct {
     /// barrier stays IN FLIGHT while the fiber admits requests (the join's
     /// window, decision 0003 §CH).
     hold_barrier_fold: std.atomic.Value(u32) = .init(0),
+    /// N > 0 ⇒ no lane starts a COALESCED barrier (the cadence's or one an
+    /// fsync pulled) while fewer than N fsyncs wait on it; the first lane
+    /// holding N at once spends the seam (stores 0) and barriers. A lane
+    /// that is stopping or whose ring is dead is never held, and neither is
+    /// the strict cadence's group barrier (its acks ride it).
+    /// `SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS` arms it at the mount's first
+    /// create (decision 0003 §CO.31).
+    barrier_hold_fsyncs: std.atomic.Value(u32) = .init(0),
 };
 
 pub var test_seams: TestSeams = .{};
@@ -1741,6 +1749,10 @@ pub const JournalLane = struct {
     fn maybeStartCoalescedBarrier(self: *JournalLane, now: u64) void {
         const w = &self.w;
         if (!w.needs_flush or w.barrier_in_flight != null or now < w.flush_due_ns) return;
+        // The fsync-hold seam arms no tick: each fsync's enlist wakes the
+        // fiber to re-check, and so does the stop.
+        w.flush_held_by_seam = self.barrierHeldForFsyncs();
+        if (w.flush_held_by_seam) return;
         // §BB.4: a barrier an fsync pulled starts only once the windows
         // admitted before the request landed — the FSYNC must follow their
         // CQEs (the ring orders nothing between SQEs); the landing's CQE
@@ -1753,6 +1765,18 @@ pub const JournalLane = struct {
         self.startBarrier(.coalesced);
     }
 
+    /// `TestSeams.barrier_hold_fsyncs`: true while it holds this lane's
+    /// coalesced barrier.
+    fn barrierHeldForFsyncs(self: *JournalLane) bool {
+        const n = test_seams.barrier_hold_fsyncs.load(.acquire);
+        if (n == 0) return false;
+        const w = &self.w;
+        if (w.disconnected or w.ring_dead) return false;
+        if (w.fsync_count < n) return true;
+        if (test_seams.barrier_hold_fsyncs.cmpxchgStrong(n, 0, .acq_rel, .monotonic) == null) log.warn("journal lane {d}: test seam: SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS spent — {d} fsyncs wait on one barrier", .{ self.index, w.fsync_count });
+        return false;
+    }
+
     /// ONE `FSYNC|DATASYNC` SQE on the lane's ring. Never `fsync(2)`:
     /// O_DIRECT bypasses the page cache, not the device's volatile write
     /// cache, and a blocking syscall here would stall every CQE behind it.
@@ -1761,6 +1785,7 @@ pub const JournalLane = struct {
         w.barriers_started += 1;
         w.needs_flush = false;
         w.flush_held_for_cover = false;
+        w.flush_held_by_seam = false;
         w.barrier_in_flight = kind;
         w.barrier_landed = false;
         w.barrier_floor = self.landedFloor();
@@ -1876,6 +1901,9 @@ const Worker = struct {
     /// A coalesced barrier an fsync pulled is held for its cover: the
     /// flush-due tick is not armed (the landing's CQE wakes the fiber).
     flush_held_for_cover: bool = false,
+    /// A coalesced barrier the fsync-hold seam holds: the flush-due tick is
+    /// not armed either (`TestSeams.barrier_hold_fsyncs`).
+    flush_held_by_seam: bool = false,
     /// Barrier tickets: a request is satisfied by a barrier STARTED after it.
     barriers_started: u64 = 0,
     barriers_done: u64 = 0,
@@ -1966,7 +1994,7 @@ const Worker = struct {
     /// own park is bounded by its 2 s liveness tick alone).
     fn tickFor(w: *const Worker, now: u64) ?u64 {
         var tick: ?u64 = if (w.owesCompletion()) park_backstop_ns else null;
-        if (w.needs_flush and w.barrier_in_flight == null and !w.flush_held_for_cover) {
+        if (w.needs_flush and w.barrier_in_flight == null and !w.flush_held_for_cover and !w.flush_held_by_seam) {
             const until = w.flush_due_ns -| now;
             tick = if (tick) |t| @min(t, until) else until;
         }
@@ -2549,6 +2577,54 @@ test "THE FSYNC STORM: every request cell's worth of fsyncs and 64 more, each fr
     try testing.expectEqual(@as(usize, 0), refused);
     std.debug.print("\nfsync storm: {d} fsyncs behind {d} windows answered by {d} coalesced barriers\n", .{ n_fsyncs, lane.windowCellCount(), lane.snapshot().barriers_coalesced });
     try testing.expect(lane.snapshot().barriers_coalesced >= 1);
+}
+
+test "the fsync-hold seam (SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS, decision 0003 §CO.31): armed at 3, a landed window's cadence barrier and two fsyncs start no barrier; the third fsync spends the seam and ONE barrier answers all three; re-armed, a stopping lane is never held — its fsync is answered by the trailing barrier" {
+    const h = try Harness.init(testing.allocator, "fsync-hold");
+    defer h.deinit();
+    // A 1 ms cadence: the window's barrier is due at its ack.
+    try h.spawnLane(.{}, "1", 0);
+    const lane = h.lane.?;
+    test_seams.barrier_hold_fsyncs.store(3, .release);
+    defer test_seams.barrier_hold_fsyncs.store(0, .release);
+    stats.fsync_waiters_hwm.set(0);
+    const a = try h.append(1, 400, 0xA1);
+    try a.ticket.wait().result;
+    var f: [3]BarrierWaiter = @splat(.{});
+    try lane.requestBarrier(&f[0]);
+    try lane.requestBarrier(&f[1]);
+    spinUntil(struct {
+        fn ready(_: @This()) bool {
+            return stats.fsync_waiters_hwm.load() >= 2;
+        }
+    }{});
+    // The poll that admitted them made its barrier decision before the
+    // fiber reaches the top of its next one.
+    test_seams.held.store(0, .release);
+    test_seams.hold_before_scan.store(1, .release);
+    defer {
+        test_seams.hold_before_scan.store(0, .release);
+        futex.wakeAll(&test_seams.hold_before_scan);
+    }
+    lane.kick();
+    while (test_seams.held.load(.acquire) == 0) futex.wait(&test_seams.held, 0);
+    try testing.expectEqual(@as(u64, 0), lane.snapshot().barriers_coalesced);
+    try testing.expectEqual(@as(?Outcome, null), f[0].poll());
+    try testing.expectEqual(@as(?Outcome, null), f[1].poll());
+    test_seams.hold_before_scan.store(0, .release);
+    futex.wakeAll(&test_seams.hold_before_scan);
+    test_seams.held.store(0, .release);
+    try lane.requestBarrier(&f[2]);
+    for (&f) |*w| try w.wait().result;
+    try testing.expectEqual(@as(u32, 0), test_seams.barrier_hold_fsyncs.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), lane.snapshot().barriers_coalesced);
+    try testing.expect(lane.durableFloor() >= a.res.paddedEnd());
+    test_seams.barrier_hold_fsyncs.store(3, .release);
+    var last: BarrierWaiter = .{};
+    try lane.requestBarrier(&last);
+    lane.shutdown();
+    try last.wait().result;
+    try testing.expectEqual(@as(u64, 2), lane.snapshot().barriers_coalesced);
 }
 
 /// The DUR-3 faces as a ticket counter: `started` hands out 1, 2, …;

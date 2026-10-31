@@ -33,12 +33,16 @@ id is per process incarnation, so this is one incarnation's retried join. A Live
 with another writer id answers `Deferred`: nothing written, nothing minted, counted
 `appender_join_live_incarnation_deferrals`. The joiner retries every 100 ms up to T_park_max
 (T_OWNER_MS + T_owner). Once the eviction's recovery settles, §CY retires the record and the join
-takes a fresh page. The joiner's page screen checks the whole identity too. The census refusal is
-gone: a remount inside T_owner of a crash now waits for its predecessor's recovery and joins, instead
-of failing `Busy` under the single-writer guard's reason.
+takes a fresh page. The joiner's page screen checks the whole identity too. The census refuses only a
+predecessor proven ALIVE (`e39e692`): a process of this host whose pid and start ticks hash to the
+page's writer id (`proc.liveWriterPid`) ⇒ `PredecessorLive`, Busy at once; otherwise the predecessor
+crashed, and the remount waits for its recovery and joins instead of failing. The proof is re-run
+every tenth deferral. The first cut (`7546096`) dropped the refusal whole, and a second mount at a
+SERVED mount point then waited 90 s and failed (red `a2e014a`, the orchestrator's review).
 
-**Numbers.** OVERLAPPING SUCCESSOR: 141–142 deferrals, then a fresh page; B's file is whole;
-`joined_rejoins` 0; A: recoveries 1, dead members acted 1. EARLY SUCCESSOR: 143 deferrals, the same
-outcome.
+**Numbers.** OVERLAPPING / EARLY SUCCESSOR: 140–144 deferrals, then a fresh page; B's file is whole;
+`joined_rejoins` 0; A: recoveries 1, dead members acted 1. A second mount at a live joiner's mount
+point: refused at once, 0 deferrals; one whose census preceded the served mount's join: refused at its
+first deferral, exactly 1.
 
 **Verified.** Decision 0003 §DA.7.

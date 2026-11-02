@@ -754,6 +754,10 @@ pub const Guard = struct {
                 // Not holding (an open refused after its early registration,
                 // or superseded): nothing to keep but the siblings' ride.
                 var holding = false;
+                // Never registered (a refusal before the arbitration, no
+                // early registration): nothing to take back.
+                const registered = g.pr_active or g.early_fresh != null;
+                if (!registered) last = false;
                 if (last) {
                     var rep = c.report() catch null;
                     if (rep) |*r| {

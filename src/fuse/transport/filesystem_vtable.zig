@@ -396,9 +396,6 @@ const EchoFsImpl = struct {
     lease_waits_parked: std.atomic.Value(u64) = .init(0),
     scratch: [scratch_cap]u8 = @splat(0),
     scratch_len: std.atomic.Value(u64) = .init(0),
-    /// `/scratch`'s mtime (seconds), honoured by SETATTR: the TIME_LIMITS
-    /// clamp is observable here.
-    scratch_mtime: std.atomic.Value(i64) = .init(1_700_000_000),
     /// The fill pool (`SQUEEZEFS_READ_ZC_SERVE` on a zc session): ONE
     /// MAP_SHARED memfd slab holding `/big`, so a READ replies `fd_body`;
     /// the mapping stays for the body views.
@@ -506,13 +503,12 @@ const EchoFsImpl = struct {
         const is_dir = ino == ino_root;
         const len = if (is_dir) 0 else (self.fileLen(ino) orelse return null);
         const mode: u32 = if (is_dir) 0o40755 else if (ino == ino_scratch) 0o100644 else 0o100444;
-        const mtime: i64 = if (ino == ino_scratch) self.scratch_mtime.load(.acquire) else 1_700_000_000;
         return .{
             .ino = ino,
             .size = len,
             .blocks = (len + 511) / 512,
             .atime = 1_700_000_000,
-            .mtime = @bitCast(mtime),
+            .mtime = 1_700_000_000,
             .ctime = 1_700_000_000,
             .atimensec = 0,
             .mtimensec = 0,
@@ -773,9 +769,6 @@ const EchoFsImpl = struct {
             .statfs => h.reply(codec.replyStatfs(&out, u, .{ .blocks = 1024, .bfree = 512, .bavail = 512, .files = 8, .ffree = 2, .bsize = 4096, .namelen = 255, .frsize = 4096 })),
             .access => h.reply(codec.replyOk(u)),
             .setattr => |sa| {
-                // `/scratch` honours an explicit mtime: what the VFS clamped
-                // to our advertised TIME_LIMITS range arrives here.
-                if (ino == ino_scratch and sa.valid & abi.FATTR_MTIME != 0) self.scratch_mtime.store(@bitCast(sa.mtime), .release);
                 if (sa.valid & abi.FATTR_SIZE != 0) {
                     _ = self.size_sets.fetchAdd(1, .monotonic);
                     if (ino == ino_scratch) self.scratch_len.store(@min(sa.size, scratch_cap), .release);
@@ -940,7 +933,7 @@ test "EchoFs: a WRITE to scratch consumes the lease exactly once and lands the b
     try testing.expect(!state.leased());
 }
 
-test "EchoFs: the hold gate is a pure predicate (scratch only, and only when declared); the direct leg is null; a HELD write is extracted lazily through its face and lands; SETATTR stores an explicit mtime" {
+test "EchoFs: the hold gate is a pure predicate (scratch only, and only when declared); the direct leg is null; a HELD write is extracted lazily through its face and lands" {
     var fs: EchoFs = .{};
     fs.io = testing.io;
     const f = fs.filesystem();
@@ -981,12 +974,4 @@ test "EchoFs: the hold gate is a pure predicate (scratch only, and only when dec
     try testing.expectEqual(@as(u64, 1), fs.lazy_extracts.load(.monotonic));
     try testing.expectEqual(@as(u8, 0x5C), fs.scratch[4096]);
     try testing.expectEqual(@as(u64, 8192), fs.scratch_len.load(.acquire));
-    // SETATTR with FATTR_MTIME lands in the attr; without it nothing moves.
-    var sa = abi.zeroed(abi.fuse_setattr_in);
-    sa.valid = abi.FATTR_MTIME;
-    sa.mtime = 1_800_000_000;
-    f.dispatch(requestOf(.{ .setattr = sa }, 32, EchoFs.ino_scratch), .{ .tx = &t, .slot = .classical, .unique = 32, .window = &.{} }, null);
-    try testing.expectEqual(@as(i64, 1_800_000_000), fs.scratch_mtime.load(.acquire));
-    try testing.expectEqual(@as(u64, 1_800_000_000), fs.attrOf(EchoFs.ino_scratch).?.mtime);
-    try testing.expectEqual(@as(u64, 1_700_000_000), fs.attrOf(EchoFs.ino_hello).?.mtime);
 }

@@ -199,9 +199,9 @@ pub const SetAttr = struct {
     }
 };
 
-/// `(time_t bit pattern, nsec)` → the i64-ns word, saturating (the kernel
-/// clamps to the daemon's advertised range under FUSE_TIME_LIMITS; without
-/// it a stamp past ±292 years saturates rather than wraps).
+/// `(time_t bit pattern, nsec)` → the i64-ns word, saturating: a stamp past
+/// ±292 years saturates rather than wraps (no FUSE INIT field tells the
+/// kernel the daemon's range; decision 0003 §DB retired the sqz one).
 pub fn timeNs(sec: u64, nsec: u32) u64 {
     const s: i64 = @bitCast(sec);
     return @bitCast(s *| @as(i64, std.time.ns_per_s) +| @as(i64, nsec));

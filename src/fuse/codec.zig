@@ -924,10 +924,6 @@ pub const InitReply = struct {
         return self.negotiated & bit != 0;
     }
 
-    pub fn timeLimits(self: InitReply) bool {
-        return self.has(abi.FUSE_TIME_LIMITS);
-    }
-
     /// The kernel will send FUSE_SYNCFS on syncfs(2)/sync(2).
     pub fn syncfs(self: InitReply) bool {
         return self.has(abi.FUSE_HAS_SYNCFS);
@@ -976,15 +972,13 @@ pub fn buildInitReply(in: abi.fuse_init_in, p: geometry.Plan, wants: InitWants) 
     std.debug.assert(reply_flags & never_advertised == 0);
 
     // flags2: the ring transport always (no opt-out: the mount fails if it
-    // cannot arm); the time range iff the kernel can apply it; the request
-    // timeout iff offered and asked; syncfs iff offered (the kernel offers
+    // cannot arm); the request timeout iff offered and asked; syncfs iff
+    // offered (the kernel offers
     // it only to a privileged opener) AND beside the request timeout —
     // FUSE_SYNCFS reaches this daemon from EVERY host-wide sync, and only
     // the timeout keeps a frozen daemon from holding them all forever
     // (decision 0003 §Z).
     var flags2: u64 = abi.FUSE_OVER_IO_URING;
-    const time_limits = offered & abi.FUSE_TIME_LIMITS != 0;
-    if (time_limits) flags2 |= abi.FUSE_TIME_LIMITS;
     const request_timeout = offered & abi.FUSE_REQUEST_TIMEOUT != 0 and wants.request_timeout_s != 0;
     if (request_timeout) flags2 |= abi.FUSE_REQUEST_TIMEOUT;
     if (offered & abi.FUSE_HAS_SYNCFS != 0 and request_timeout) flags2 |= abi.FUSE_HAS_SYNCFS;
@@ -1008,8 +1002,6 @@ pub fn buildInitReply(in: abi.fuse_init_in, p: geometry.Plan, wants: InitWants) 
         .max_stack_depth = 0,
         .request_timeout = if (request_timeout) wants.request_timeout_s else 0,
         .unused = @splat(0),
-        .time_min = if (time_limits) abi.TIME_LIMITS_MIN_SEC else 0,
-        .time_max = if (time_limits) abi.TIME_LIMITS_MAX_SEC else 0,
     };
     return .{ .out = out, .negotiated = reply_flags | (if (init_ext) flags2 else 0) };
 }
@@ -1674,7 +1666,7 @@ test "INIT reply: always OVER_IO_URING; INIT_EXT iff offered; minor = min(kernel
     try testing.expectEqual(@as(u16, 0), r.out.map_alignment);
     try testing.expectEqual(@as(u32, 0), r.out.max_stack_depth);
     try testing.expectEqual(@as(u16, 0), r.out.request_timeout);
-    try testing.expectEqual([_]u16{ 0, 0, 0 }, r.out.unused);
+    try testing.expectEqual(@as([11]u16, @splat(0)), r.out.unused);
     const rep = replyInit(&buf, 2, r);
     try testing.expectEqual(@as(u32, INIT_REPLY_LEN), rep.header.len);
     try testing.expectEqual(@as(u32, 80), rep.header.len);
@@ -1702,10 +1694,10 @@ test "INIT reply never advertises POSIX_LOCKS, FLOCK_LOCKS, SPLICE_*, POSIX_ACL 
         try testing.expectEqual(@as(u64, 0), r.out.folded() & never_advertised);
         // Every classical reply bit except INIT_EXT was offered.
         try testing.expectEqual(@as(u64, 0), (@as(u64, r.out.flags) & ~abi.FUSE_INIT_EXT) & ~offered);
-        // flags2 carries only the ring bit and (iff offered) the time, the
-        // request timeout (iff asked) and syncfs (only beside the timeout).
+        // flags2 carries only the ring bit, the request timeout (iff asked)
+        // and syncfs (only beside the timeout).
         const f2 = @as(u64, r.out.flags2) << 32;
-        try testing.expectEqual(@as(u64, 0), f2 & ~(abi.FUSE_OVER_IO_URING | abi.FUSE_TIME_LIMITS | abi.FUSE_REQUEST_TIMEOUT | abi.FUSE_HAS_SYNCFS));
+        try testing.expectEqual(@as(u64, 0), f2 & ~(abi.FUSE_OVER_IO_URING | abi.FUSE_REQUEST_TIMEOUT | abi.FUSE_HAS_SYNCFS));
         const timed = offered & abi.FUSE_REQUEST_TIMEOUT != 0 and timeout_s != 0;
         try testing.expectEqual(timed, f2 & abi.FUSE_REQUEST_TIMEOUT != 0);
         try testing.expectEqual(if (timed) timeout_s else 0, r.out.request_timeout);
@@ -1727,23 +1719,18 @@ test "INIT reply never advertises POSIX_LOCKS, FLOCK_LOCKS, SPLICE_*, POSIX_ACL 
     try testing.expect(all.has(abi.FUSE_PARALLEL_DIROPS));
 }
 
-test "INIT reply echoes the time range iff FUSE_TIME_LIMITS (bit 62) was offered: ±9_223_372_036 s and flags2 bit 30, else zeros" {
-    const with = try buildInitReply(initIn(44, kernel_6_14_offer | abi.FUSE_TIME_LIMITS), test_plan, .{});
-    try testing.expect(with.timeLimits());
-    try testing.expectEqual(abi.TIME_LIMITS_MIN_SEC, with.out.time_min);
-    try testing.expectEqual(abi.TIME_LIMITS_MAX_SEC, with.out.time_max);
-    try testing.expectEqual(abi.flags2Of(abi.FUSE_OVER_IO_URING | abi.FUSE_TIME_LIMITS), with.out.flags2);
-    try testing.expectEqual(@as(u32, (1 << 9) | (1 << 30)), with.out.flags2);
-    const b = abi.encode(with.out);
-    try testing.expectEqual(abi.TIME_LIMITS_MIN_SEC, std.mem.readInt(i64, b[48..56], .little));
-    try testing.expectEqual(abi.TIME_LIMITS_MAX_SEC, std.mem.readInt(i64, b[56..64], .little));
-    const without = try buildInitReply(initIn(44, kernel_6_14_offer), test_plan, .{});
-    try testing.expect(!without.timeLimits());
-    try testing.expectEqual(@as(i64, 0), without.out.time_min);
-    try testing.expectEqual(@as(i64, 0), without.out.time_max);
-    // Offered but without INIT_EXT the kernel cannot apply flags2: not negotiated.
-    const stranded = try buildInitReply(initIn(44, (kernel_6_14_offer | abi.FUSE_TIME_LIMITS) & ~abi.FUSE_INIT_EXT), test_plan, .{});
-    try testing.expect(!stranded.timeLimits());
+test "INIT reply never echoes bit 62 (the retired sqz FUSE_TIME_LIMITS, a bit upstream may assign to anything) nor any flags2 bit it does not implement, and leaves init_out's reserved tail (bytes 42..64) zero — over offers with every unimplemented flags2 bit set" {
+    const bit62: u64 = 1 << 62;
+    const unimplemented2 = ~(abi.FUSE_OVER_IO_URING | abi.FUSE_REQUEST_TIMEOUT | abi.FUSE_HAS_SYNCFS) & ~@as(u64, std.math.maxInt(u32));
+    for ([_]u16{ 0, 135 }) |timeout_s| {
+        const r = try buildInitReply(initIn(46, kernel_6_14_offer | bit62 | unimplemented2 | abi.FUSE_REQUEST_TIMEOUT), test_plan, .{ .request_timeout_s = timeout_s });
+        try testing.expect(!r.has(bit62));
+        try testing.expectEqual(@as(u64, 0), r.out.folded() & bit62);
+        try testing.expectEqual(@as(u64, 0), r.out.folded() & unimplemented2);
+        const b = abi.encode(r.out);
+        try testing.expect(std.mem.allEqual(u8, b[42..64], 0));
+        try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, b[32..36], .little) & (1 << 30));
+    }
 }
 
 test "INIT reply asks for FUSE_SYNCFS (FUSE_HAS_SYNCFS, flags2 bit 12) iff the kernel offered it — offered only to a /dev/fuse opener with CAP_SYS_ADMIN in the initial user namespace — and only beside the request timeout (0003 §Z); without INIT_EXT it is not negotiated" {

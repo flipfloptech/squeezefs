@@ -194,9 +194,6 @@ pub var umount_busy_refusals: counters.ShardedCounter = .{};
 /// `worker.zc_bounce_resident_bytes` (`transport_zc_bounce_bytes`), the
 /// budget component's gauge.
 pub var zc_bounce_slab_bytes: counters.Gauge = .{};
-/// `transport_time_limits`: 1 when FUSE_TIME_LIMITS was echoed with our
-/// i64-ns whole-second range.
-pub var time_limits_gauge: counters.Gauge = .{};
 /// `transport_request_timeout_s`: the request timeout the kernel applies to
 /// this connection (the INIT reply's, capped by `max_request_timeout`,
 /// floored at the check period), seconds; 0 = none negotiated.
@@ -1042,9 +1039,8 @@ pub const Session = struct {
     /// for a parent with a request in flight is written as an `INC_EPOCH`.
     in_flight: std.atomic.Value(?*const watchdog.InFlightProbe) = .init(null),
     arena_component: mem_budget.Component = undefined,
-    /// The pool's zero-copy arm (`probes.zcVerdict`) and FUSE_TIME_LIMITS.
+    /// The pool's zero-copy arm (`probes.zcVerdict`).
     zc: probes.Verdict = .absent,
-    time_limits: probes.Verdict = .absent,
     /// Rings (groups, `sqz-fuse-ur<qid>` workers) registered on each queue:
     /// `nqueues × rings_per_queue` groups, a queue's rings at consecutive
     /// indices from `qid_group[qid]`.
@@ -1439,9 +1435,7 @@ pub const Session = struct {
             return error.InitUnsupported;
         };
         geometry.gauges.publish(self.plan, init_in.max_readahead);
-        self.time_limits = probes.timeLimitsVerdict(init_in.folded());
         self.entry_flags = if (init_in.folded() & abi.FUSE_HAS_EXPIRE_ONLY != 0) abi.FUSE_EXPIRE_ONLY else 0;
-        time_limits_gauge.set(@intFromBool(self.init_reply.timeLimits()));
         self.request_timeout_s = if (self.init_reply.requestTimeoutS() != 0) geometry.kernelRequestTimeoutS(self.init_reply.requestTimeoutS(), geometry.readMaxRequestTimeout(self.io)) else 0;
         request_timeout_gauge.set(self.request_timeout_s);
         if (asked_timeout_s != 0) self.warnRequestTimeout(asked_timeout_s, init_in.folded());
@@ -1459,14 +1453,14 @@ pub const Session = struct {
             try self.sideband.writeOnce(&frame);
         }
         self.resolveRingsPerQueue(env);
-        probes.publish(self.zc, self.time_limits, probes.driver.capSysAdmin(self.io, env));
+        probes.publish(self.zc, probes.driver.capSysAdmin(self.io, env));
         geometry.gauges.publishRingsPerQueue(self.rings_per_queue);
         fs.init(.{ .negotiated = self.init_reply.negotiated, .minor = self.init_reply.minor(), .plan = self.plan, .io = self.io, .read_zc_serve = read_zc_serve, .zc_open = self.zc_open, .zc_create_only = self.zc_create_only });
         errdefer {
             self.failStartup();
             self.destroyOnce();
         }
-        log.info("transport: INIT 7.{d} → 7.{d}: flags 0x{x} (over_io_uring={}, time_limits={}, request_timeout {d} s), max_write {d}, max_pages {d}, max_background {d}, queues {d} × depth {d}, payload {d} B, {d} ring(s) per queue, bufpool present, zero-copy {}", .{ init_in.minor, self.init_reply.minor(), self.init_reply.negotiated, self.init_reply.has(abi.FUSE_OVER_IO_URING), self.init_reply.timeLimits(), self.request_timeout_s, self.plan.max_write, self.plan.max_pages, self.plan.max_background, self.plan.nqueues, self.plan.depth, self.plan.payload_sz, self.rings_per_queue, self.zeroCopyArmed() });
+        log.info("transport: INIT 7.{d} → 7.{d}: flags 0x{x} (over_io_uring={}, request_timeout {d} s), max_write {d}, max_pages {d}, max_background {d}, queues {d} × depth {d}, payload {d} B, {d} ring(s) per queue, bufpool present, zero-copy {}", .{ init_in.minor, self.init_reply.minor(), self.init_reply.negotiated, self.init_reply.has(abi.FUSE_OVER_IO_URING), self.request_timeout_s, self.plan.max_write, self.plan.max_pages, self.plan.max_background, self.plan.nqueues, self.plan.depth, self.plan.payload_sz, self.rings_per_queue, self.zeroCopyArmed() });
         if (knobs.boolKnob("SQUEEZEFS_TEST_FUSE_FAIL_AFTER_INIT_REPLY", env)) {
             log.err("transport: SQUEEZEFS_TEST_FUSE_FAIL_AFTER_INIT_REPLY — the bring-up fails after the INIT reply, before any queue registers", .{});
             return error.InjectedStartupFailure;
@@ -1640,7 +1634,7 @@ pub const Session = struct {
     /// bit 43 — absent, the mount fails loud by name, the refusal carrying
     /// the running release (the probe is the only degrade point, and there
     /// is nothing to degrade to); then the pool's zero-copy arm by `CapEff`
-    /// + the sparse table, and FUSE_TIME_LIMITS by its bit.
+    /// + the sparse table.
     fn resolveProbes(self: *Session, env: *const std.process.Environ.Map, offered: u64, refusal: ?*Refusal) MountError!void {
         const bufpool = if (knobs.boolKnob("SQUEEZEFS_TEST_FUSE_BUFPOOL_ABSENT", env)) .absent else probes.bufpoolVerdict(offered);
         if (bufpool == .absent) {
@@ -2239,9 +2233,7 @@ pub const Session = struct {
         try field(w, "transport_arena_bytes", arena_bytes.load());
         try field(w, "transport_probe_zc", probes.zc_gauge.load());
         try field(w, "fuse_uring_rings_per_queue", g.rings_per_queue.load());
-        try field(w, "transport_probe_time_limits", probes.time_limits_gauge.load());
         try field(w, "transport_probe_cap_sys_admin", probes.cap_gauge.load());
-        try field(w, "transport_time_limits", time_limits_gauge.load());
         try field(w, "transport_request_timeout_s", request_timeout_gauge.load());
         try field(w, "transport_kernel_max_background", kernel_max_background.load());
         try field(w, "transport_pool_queues_added", worker.pool_queues_added.load());
@@ -4526,30 +4518,6 @@ test "e2e zc bridges: a bridge that never completes (the stall seam) is cancelle
     try expectLaws(before, after);
     try testing.expectEqual(@as(u64, 1), after.bridge_cancels - before.bridge_cancels);
     std.debug.print("\nbridge stall: cancelled after {d} ms (deadline 300), reader EIO, then served\n", .{waited / std.time.ns_per_ms});
-}
-
-test "e2e TIME_LIMITS: a utimensat with a time outside our advertised range is clamped by the VFS to the bound before it reaches the daemon" {
-    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
-    const rig = try Rig.init(testing.allocator, 30, &.{});
-    defer rig.deinit();
-    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
-    // The init-flag bit IS the probe (porting spec §2.4): the kernel's INIT offer.
-    var tb: [192]u8 = undefined;
-    if (s.time_limits == .absent) return testkit.skipWhy(@src(), testkit.venue.kernelFeatureAbsent(&tb, "FUSE_TIME_LIMITS in the INIT offer"));
-    try testing.expect(s.init_reply.timeLimits());
-    var pb: [256]u8 = undefined;
-    const path = rig.child(&pb, "scratch");
-    // Far past our ceiling: the VFS clamps to s_time_max = our TIME_LIMITS_MAX_SEC.
-    const times = [2]linux.timespec{ linux.UTIME.OMIT, .{ .sec = std.math.maxInt(i64) / 2, .nsec = 0 } };
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.utimensat(linux.AT.FDCWD, path, &times, 0)));
-    try testing.expectEqual(abi.TIME_LIMITS_MAX_SEC, rig.fs.scratch_mtime.load(.acquire));
-    var st: linux.Statx = undefined;
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, path, 0, linux.STATX.BASIC_STATS, &st)));
-    try testing.expectEqual(abi.TIME_LIMITS_MAX_SEC, st.mtime.sec);
-    // And the floor.
-    const low = [2]linux.timespec{ linux.UTIME.OMIT, .{ .sec = std.math.minInt(i64) / 2, .nsec = 0 } };
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.utimensat(linux.AT.FDCWD, path, &low, 0)));
-    try testing.expectEqual(abi.TIME_LIMITS_MIN_SEC, rig.fs.scratch_mtime.load(.acquire));
 }
 
 test "e2e fused poll: SQUEEZEFS_FUSE_READ_FUSION=1 on a zero-copy session — a probe that declines its first poll is served by the fused re-poll (fusions ≥ 8, no late demotion); on a copying session (the CAP_SYS_ADMIN seam) the lever is inert" {

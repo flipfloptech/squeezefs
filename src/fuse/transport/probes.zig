@@ -11,8 +11,7 @@
 //! by name (`bufpoolVerdict`); nothing degrades. The zero-copy arm of the
 //! pool is the second verdict: `CapEff` bit 21 (the kernel's EPERM gate on
 //! a zero-copy ADD_QUEUE) ∧ a sparse fixed-buffer table on a scratch ring;
-//! without it the pool's queues are created copying. `FUSE_TIME_LIMITS` is
-//! read off the same offer.
+//! without it the pool's queues are created copying.
 //!
 //! What differs from the reference (0002 ledger rows): the zc capability is
 //! `CapEff` bit 21 from `/proc/self/status`, not `euid == 0` (a root daemon
@@ -45,8 +44,6 @@ pub const CAP_SYS_ADMIN_BIT: u6 = 21;
 /// `transport_probe_zc`: 1 when the pool's queues are created zero-copy
 /// (bufpool ∧ cap ∧ sparse).
 pub var zc_gauge: counters.Gauge = .{};
-/// `transport_probe_time_limits`: 1 when the kernel offered bit 62.
-pub var time_limits_gauge: counters.Gauge = .{};
 /// `transport_probe_cap_sys_admin`: 1 when CapEff bit 21 is set.
 pub var cap_gauge: counters.Gauge = .{};
 
@@ -97,18 +94,9 @@ pub fn capSysAdminFromStatus(text: []const u8) ?bool {
     return null;
 }
 
-// ---------------------------------------------------------------------------
-// 3. FUSE_TIME_LIMITS — the init-flag bit IS the probe (porting spec §2.4)
-// ---------------------------------------------------------------------------
-
-pub fn timeLimitsVerdict(offered_flags: u64) Verdict {
-    return if (offered_flags & abi.FUSE_TIME_LIMITS != 0) .present else .absent;
-}
-
 /// Publish every verdict (after the gate passed).
-pub fn publish(zc: Verdict, time_limits: Verdict, cap: bool) void {
+pub fn publish(zc: Verdict, cap: bool) void {
     zc_gauge.set(zc.gauge());
-    time_limits_gauge.set(time_limits.gauge());
     cap_gauge.set(@intFromBool(cap));
 }
 
@@ -144,7 +132,7 @@ test "the buffer-pool gate: INIT bit 43 is the probe — present beside FUSE_OVE
     try testing.expectEqual(Verdict.present, bufpoolVerdict(abi.FUSE_OVER_IO_URING | abi.FUSE_HAS_IO_URING_BUFPOOL));
     try testing.expectEqual(Verdict.present, bufpoolVerdict(abi.FUSE_HAS_IO_URING_BUFPOOL));
     try testing.expectEqual(Verdict.absent, bufpoolVerdict(abi.FUSE_OVER_IO_URING));
-    try testing.expectEqual(Verdict.absent, bufpoolVerdict(abi.FUSE_HAS_SYNCFS | abi.FUSE_TIME_LIMITS));
+    try testing.expectEqual(Verdict.absent, bufpoolVerdict(abi.FUSE_HAS_SYNCFS | abi.FUSE_REQUEST_TIMEOUT));
     try testing.expectEqual(Verdict.absent, bufpoolVerdict(0));
     try testing.expectEqual(@as(u64, 1), Verdict.present.gauge());
     try testing.expectEqual(@as(u64, 0), Verdict.absent.gauge());
@@ -160,15 +148,9 @@ test "the zero-copy arm is a conjunction of CapEff bit 21 and the sparse table; 
     try testing.expectEqual(@as(?bool, true), capSysAdminFromStatus("CapEff: 0000000000200000"));
     try testing.expectEqual(@as(?bool, null), capSysAdminFromStatus("CapPrm:\t00000000a82465fb\n"));
     try testing.expectEqual(@as(?bool, null), capSysAdminFromStatus("CapEff:\tzz\n"));
-    publish(.present, .present, true);
+    publish(.present, true);
     try testing.expectEqual(@as(u64, 1), zc_gauge.load());
-    try testing.expectEqual(@as(u64, 1), time_limits_gauge.load());
     try testing.expectEqual(@as(u64, 1), cap_gauge.load());
-}
-
-test "FUSE_TIME_LIMITS: bit 62 offered is the probe" {
-    try testing.expectEqual(Verdict.present, timeLimitsVerdict(abi.FUSE_TIME_LIMITS | abi.FUSE_OVER_IO_URING));
-    try testing.expectEqual(Verdict.absent, timeLimitsVerdict(abi.FUSE_OVER_IO_URING));
 }
 
 test "linux: the drivers live on this kernel — the sparse table registers, CapEff reads this process's capability, the seam forces it absent" {

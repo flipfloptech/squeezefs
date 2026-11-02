@@ -130,19 +130,17 @@ pub const FUSE_REQUEST_TIMEOUT: u64 = 1 << 42;
 /// kernel gate: a mount whose INIT does not offer it is refused by name
 /// (fuse_mainline_pools.md §0).
 pub const FUSE_HAS_IO_URING_BUFPOOL: u64 = 1 << 43;
-/// uapi 7.47 (flags2 bit 12; `scripts/kernel/patches-mainline/0006-fuse-
-/// allow-FUSE_SYNCFS-…` backports it to the venue's 7.3 at upstream's bit): the server asks for syncfs(2)/sync(2) as
-/// FUSE_SYNCFS. The kernel OFFERS it only to a `/dev/fuse` opener with
-/// CAP_SYS_ADMIN in the initial user namespace (an untrusted server could
-/// stall `sync`) and honors the echo only there; without it a plain
-/// `fuse` mount never sees a syncfs (only virtiofs and fuseblk set
-/// `fc->sync_fs`). Echoed iff offered — the daemon's write custody makes
+/// uapi 7.47 (flags2 bit 12; upstream from Linux 7.4, `fuse/for-next`
+/// `989db66818a4`): the server asks for syncfs(2)/sync(2) as FUSE_SYNCFS.
+/// The kernel OFFERS it only to a `/dev/fuse` opener with CAP_SYS_ADMIN in
+/// the initial user namespace (an untrusted server could stall `sync`) and
+/// honors the echo only there; without it a plain `fuse` mount never sees
+/// a syncfs (only virtiofs and fuseblk set `fc->sync_fs`) — stock 7.3
+/// neither offers it nor ever sends one. Echoed iff offered; whether a
+/// syncfs reaches the daemon is judged at ready by the bring-up probe
+/// (`fuse_syncfs_reaches`, charter §3) — the daemon's write custody makes
 /// `sync -f` a durability point only through it.
 pub const FUSE_HAS_SYNCFS: u64 = 1 << 44;
-/// sqz patch `patches-mainline/0005` (flags2 bit 30): the daemon advertises its i64-ns
-/// timestamp range in `fuse_init_out.time_min/time_max` so the VFS clamps
-/// where the daemon does. The bit IS the probe (fuse_kmbuf_zc.md §2.4).
-pub const FUSE_TIME_LIMITS: u64 = 1 << 62;
 
 /// The flags2 half of a folded capability word.
 pub inline fn flags2Of(folded: u64) u32 {
@@ -155,13 +153,6 @@ pub inline fn flagsOf(folded: u64) u32 {
 pub inline fn fold(flags: u32, flags2: u32) u64 {
     return @as(u64, flags) | (@as(u64, flags2) << 32);
 }
-
-/// `FUSE_TIME_LIMITS` range the daemon advertises: the whole-second interior
-/// of the i64-nanosecond word, conservative by one second on the floor
-/// (exact floor −9_223_372_037 s + 145_224_192 ns) so every kernel-clamped
-/// `(sec, nsec = 0)` round-trips exactly (fuse_kmbuf_zc.md §8.1).
-pub const TIME_LIMITS_MIN_SEC: i64 = -9_223_372_036;
-pub const TIME_LIMITS_MAX_SEC: i64 = 9_223_372_036;
 
 // ---------------------------------------------------------------------------
 // Per-op flag bits
@@ -449,8 +440,8 @@ pub const fuse_init_in = extern struct {
     }
 };
 
-/// 64 bytes. `time_min/time_max` are the sqz carve-out of upstream's
-/// `unused[11]` → `unused[3] u16 ‖ i64 ‖ i64`, naturally aligned at 48/56.
+/// 64 bytes, upstream's layout: `unused[11]` is reserved and written zero
+/// (a stock kernel reads none of it; no bit of ours claims it).
 pub const fuse_init_out = extern struct {
     major: u32,
     minor: u32,
@@ -465,9 +456,7 @@ pub const fuse_init_out = extern struct {
     flags2: u32,
     max_stack_depth: u32,
     request_timeout: u16,
-    unused: [3]u16,
-    time_min: i64,
-    time_max: i64,
+    unused: [11]u16,
 
     pub fn folded(self: fuse_init_out) u64 {
         return fold(self.flags, self.flags2);
@@ -723,7 +712,7 @@ comptime {
     assertLayout(fuse_statfs_out, 80, .{.{ "st", 0 }});
     assertLayout(fuse_file_lock, 24, .{ .{ "start", 0 }, .{ "end", 8 }, .{ "type", 16 }, .{ "pid", 20 } });
     assertLayout(fuse_init_in, 64, .{ .{ "major", 0 }, .{ "minor", 4 }, .{ "max_readahead", 8 }, .{ "flags", 12 }, .{ "flags2", 16 }, .{ "unused", 20 } });
-    assertLayout(fuse_init_out, 64, .{ .{ "major", 0 }, .{ "minor", 4 }, .{ "max_readahead", 8 }, .{ "flags", 12 }, .{ "max_background", 16 }, .{ "congestion_threshold", 18 }, .{ "max_write", 20 }, .{ "time_gran", 24 }, .{ "max_pages", 28 }, .{ "map_alignment", 30 }, .{ "flags2", 32 }, .{ "max_stack_depth", 36 }, .{ "request_timeout", 40 }, .{ "unused", 42 }, .{ "time_min", 48 }, .{ "time_max", 56 } });
+    assertLayout(fuse_init_out, 64, .{ .{ "major", 0 }, .{ "minor", 4 }, .{ "max_readahead", 8 }, .{ "flags", 12 }, .{ "max_background", 16 }, .{ "congestion_threshold", 18 }, .{ "max_write", 20 }, .{ "time_gran", 24 }, .{ "max_pages", 28 }, .{ "map_alignment", 30 }, .{ "flags2", 32 }, .{ "max_stack_depth", 36 }, .{ "request_timeout", 40 }, .{ "unused", 42 } });
 
     assertLayout(fuse_forget_in, 8, .{.{ "nlookup", 0 }});
     assertLayout(fuse_forget_one, 16, .{ .{ "nodeid", 0 }, .{ "nlookup", 8 } });
@@ -791,7 +780,6 @@ comptime {
     std.debug.assert(@sizeOf(fuse_init_in) <= FUSE_URING_OP_IN_OUT_SZ);
     // The folded bits sit where the spec says.
     std.debug.assert(FUSE_OVER_IO_URING == @as(u64, 1 << 9) << 32);
-    std.debug.assert(FUSE_TIME_LIMITS == @as(u64, 1 << 30) << 32);
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +848,7 @@ test "the wire is little-endian native: a u32 at offset 0 lands low byte first" 
     try testing.expectEqualSlices(u8, &.{ 8, 7, 6, 5, 4, 3, 2, 1 }, b[8..16]);
 }
 
-test "spec table pins: in_header 40 (total_extlen@36), out_header 16, attr 88 (flags@84), entry_out 128, attr_out 104, init_out 64 (time_min@48, time_max@56), open_in open_flags@4" {
+test "spec table pins: in_header 40 (total_extlen@36), out_header 16, attr 88 (flags@84), entry_out 128, attr_out 104, init_out 64 (request_timeout@40, unused[11]@42), open_in open_flags@4" {
     // The comptime block is the law; this restates the rows the specs pin by name.
     try testing.expectEqual(@as(usize, 40), @sizeOf(fuse_in_header));
     try testing.expectEqual(@as(usize, 36), @offsetOf(fuse_in_header, "total_extlen"));
@@ -870,8 +858,8 @@ test "spec table pins: in_header 40 (total_extlen@36), out_header 16, attr 88 (f
     try testing.expectEqual(@as(usize, 128), @sizeOf(fuse_entry_out));
     try testing.expectEqual(@as(usize, 104), @sizeOf(fuse_attr_out));
     try testing.expectEqual(@as(usize, 64), @sizeOf(fuse_init_out));
-    try testing.expectEqual(@as(usize, 48), @offsetOf(fuse_init_out, "time_min"));
-    try testing.expectEqual(@as(usize, 56), @offsetOf(fuse_init_out, "time_max"));
+    try testing.expectEqual(@as(usize, 40), @offsetOf(fuse_init_out, "request_timeout"));
+    try testing.expectEqual(@as(usize, 42), @offsetOf(fuse_init_out, "unused"));
     try testing.expectEqual(@as(usize, 4), @offsetOf(fuse_open_in, "open_flags"));
     try testing.expectEqual(@as(usize, 12), @offsetOf(fuse_create_in, "open_flags"));
     try testing.expectEqual(@as(usize, 12), @offsetOf(fuse_open_out, "backing_id"));
@@ -908,11 +896,9 @@ test "uring ABI pins (uapi 7.46): req header 288 (op_in@128, ring_ent@256), ent_
     try testing.expectEqual(@as(u32, 1), IORING_URING_CMD_FIXED);
 }
 
-test "capability bits: OVER_IO_URING = 1<<41 = flags2 bit 9; TIME_LIMITS = 1<<62 = flags2 bit 30; INIT_EXT 1<<30; KILLPRIV_V2 1<<28; fold/split round-trip" {
+test "capability bits: OVER_IO_URING = 1<<41 = flags2 bit 9; INIT_EXT 1<<30; KILLPRIV_V2 1<<28; fold/split round-trip" {
     try testing.expectEqual(@as(u64, 1) << 41, FUSE_OVER_IO_URING);
     try testing.expectEqual(@as(u32, 1 << 9), flags2Of(FUSE_OVER_IO_URING));
-    try testing.expectEqual(@as(u64, 1) << 62, FUSE_TIME_LIMITS);
-    try testing.expectEqual(@as(u32, 1 << 30), flags2Of(FUSE_TIME_LIMITS));
     try testing.expectEqual(@as(u64, 1 << 30), FUSE_INIT_EXT);
     try testing.expectEqual(@as(u64, 1 << 28), FUSE_HANDLE_KILLPRIV_V2);
     try testing.expectEqual(@as(u64, 1 << 19), FUSE_HANDLE_KILLPRIV);
@@ -953,16 +939,6 @@ test "opcodes are named through uapi 7.45; an unknown decodes without error and 
     try testing.expectEqual(@as(u32, 42), @backingInt(Opcode.batch_forget));
     try testing.expectEqual(@as(u32, 2), @backingInt(NotifyCode.inval_inode));
     try testing.expectEqual(@as(u32, 9), @backingInt(NotifyCode.prune));
-}
-
-test "time limits: the whole-second interior of the i64-ns word, conservative by one second on the floor" {
-    const ns_per_s: i128 = std.time.ns_per_s;
-    try testing.expect(@as(i128, TIME_LIMITS_MAX_SEC) * ns_per_s <= std.math.maxInt(i64));
-    try testing.expect((@as(i128, TIME_LIMITS_MAX_SEC) + 1) * ns_per_s > std.math.maxInt(i64));
-    try testing.expect(@as(i128, TIME_LIMITS_MIN_SEC) * ns_per_s >= std.math.minInt(i64));
-    // The exact floor is −9_223_372_037 s + 145_224_192 ns; we stop one whole second above it.
-    try testing.expect((@as(i128, TIME_LIMITS_MIN_SEC) - 1) * ns_per_s < std.math.minInt(i64));
-    try testing.expectEqual(-TIME_LIMITS_MAX_SEC, TIME_LIMITS_MIN_SEC);
 }
 
 test "dirent record length law: (24 + namelen + 7) & ~7; direntplus 152 + name" {

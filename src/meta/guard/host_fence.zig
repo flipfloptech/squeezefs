@@ -505,6 +505,29 @@ pub fn admitBeforeRegister(ctx: RuleContext, reg: *const Registry, c: *pr.Client
     return true;
 }
 
+/// Under the registry's lock: the rule (when the register admits the host
+/// afresh), then the register itself. True = fresh.
+pub fn registerUnderRule(ctx: RuleContext, reg: *const Registry, c: *pr.Client, pages: PageSource, register: Register) (RegistryError || error{ SiblingLive, OutOfMemory, PagesUnreadable, RegisterFailed })!bool {
+    const fresh = try admitBeforeRegister(ctx, reg, c, pages);
+    register.run(register.ctx, c) catch return error.RegisterFailed;
+    return fresh;
+}
+
+/// The register a caller runs under the rule (the gate's ladder, a
+/// joiner's `fencing.joinAsRegistrant`).
+pub const Register = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque, c: *pr.Client) anyerror!void,
+};
+
+/// A joiner's clean departure: does it take the host's registration with
+/// it?
+pub fn departUnregisters(reg: *const Registry, gpa: Allocator, c: *pr.Client, pid: u32) bool {
+    _ = c;
+    const others = reg.othersAlive(gpa, pid) catch 1;
+    return others == 0;
+}
+
 /// The host identity's hostid (the explicit pair → `/etc/nvme` → the
 /// machine-id derivation, `initiator.resolveHostIdentity`); null = no
 /// source (the mount's per-incarnation key, the rule off — logged).
@@ -648,8 +671,7 @@ pub const Joiner = struct {
             defer self.reg.unlock();
             const pid = proc.localIdentity().pid;
             self.reg.remove(pid);
-            const others = self.reg.othersAlive(self.gpa, pid) catch 1;
-            if (others == 0) self.client.unregister(self.client.key) catch {};
+            if (departUnregisters(&self.reg, self.gpa, self.client, pid)) self.client.unregister(self.client.key) catch {};
         } else |_| {}
         self.client.deinit();
         self.gpa.destroy(self.client);
@@ -664,6 +686,7 @@ pub const Joiner = struct {
 
 const testing = std.testing;
 const fuzzkit = @import("../../core/fuzzkit.zig");
+const fake = @import("fake_nvme.zig");
 
 fn entryFuzz(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
@@ -742,4 +765,100 @@ test "the registry: entries append and parse; a dead process's entry is pruned b
     const none = try reg.entries(testing.allocator);
     defer testing.allocator.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "B1 (review): a re-joined-in-place member's retired mark covers ONLY its retired incarnation's page — the successor incarnation (the same writer id) evicted later, its page Recovering, is STALE; while its page is Live it is current; the retired page alone is spared" {
+    const node: u64 = 0xA;
+    var e = Entry.parse(42, "77\nj 9 00000000000000b1\nr 00000000000000b1 3\n").?;
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{ pg(3, .recovered, node, 0xb1), pg(5, .recovering, node, 0xb1) }, node, 0, false));
+    try testing.expectEqual(Verdict.current, judge(&e, &.{ pg(3, .recovered, node, 0xb1), pg(5, .live, node, 0xb1) }, node, 0, false));
+    try testing.expectEqual(Verdict.retired, judge(&e, &.{pg(3, .recovered, node, 0xb1)}, node, 0, false));
+}
+
+test "B3 (review): a joiner's departure never unregisters the host key while the reservation holder's key is ours — the manager re-mounting on this host holds it before it enrols" {
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-b3-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var reg = Registry.at(base, .set, 0xb3);
+    reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer reg.unlock();
+    var ns = fake.Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var h: fake.Host = .{ .ns = &ns, .host_id = "this-host-id-001".* };
+    var c = try pr.Client.init(testing.allocator, h.face(), 1, 0x7777);
+    defer c.deinit();
+    try fencing.acquireWero(&c);
+    try testing.expect(!departUnregisters(&reg, testing.allocator, &c, proc.localIdentity().pid));
+}
+
+/// The B2 rig's page source: the sibling's page Live at the first read,
+/// Recovering at every later one (a remote recovery's step 2 between the
+/// judgement and the register).
+const RacingPages = struct {
+    node: u64,
+    writer_id: u64,
+    reads: u32 = 0,
+
+    fn read(ctx: *anyopaque, gpa: Allocator) error{ Io, Corrupt, OutOfMemory }![]page.Page {
+        const self: *RacingPages = @ptrCast(@alignCast(ctx));
+        self.reads += 1;
+        const out = try gpa.alloc(page.Page, 1);
+        out[0] = pg(4, if (self.reads == 1) .live else .recovering, self.node, self.writer_id);
+        return out;
+    }
+};
+
+fn registerLadderFn(_: *anyopaque, c: *pr.Client) anyerror!void {
+    _ = try c.registerLadder();
+}
+
+test "B2 (review): the rule re-judges AFTER the register, under the lock — a sibling whose page went Recovering between the judgement and the register (a remote recovery racing it) is killed, never left re-admitted" {
+    const gpa = testing.allocator;
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-b2-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var reg = Registry.at(base, .set, 0xb2);
+    reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer reg.unlock();
+    // The sibling: a live process of this host enrolled under a writer id
+    // its start ticks recompute.
+    var child = try std.process.spawn(testing.io, .{ .argv = &.{"cat"}, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(child.id.?, .KILL);
+        _ = child.wait(testing.io) catch {};
+    };
+    const sib_pid: u32 = @intCast(child.id.?);
+    const local = proc.localIdentity();
+    const ticks = proc.startTicksOf(sib_pid) orelse return error.SkipZigTest;
+    const sib: claim.Identity = .{ .boot_id = local.boot_id, .pid = sib_pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
+    var lb: [64]u8 = undefined;
+    try reg.append(sib_pid, ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = sib.writerId(9) }));
+    // The device: another host holds WERO; this host was fenced (absent).
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var mh: fake.Host = .{ .ns = &ns, .host_id = "other-host-id-01".* };
+    var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer m.deinit();
+    try fencing.acquireWero(&m);
+    var h: fake.Host = .{ .ns = &ns, .host_id = "this-host-id-001".* };
+    var c = try pr.Client.init(gpa, h.face(), 1, 0x2222);
+    defer c.deinit();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var pages: RacingPages = .{ .node = 0xA, .writer_id = sib.writerId(9) };
+    const ctx: RuleContext = .{ .gpa = gpa, .env = &env, .path = "b2", .local = local, .node_token = 0xA, .vol_index = 0, .taking_manager = false };
+    const fresh = registerUnderRule(ctx, &reg, &c, .{ .ctx = &pages, .read = &RacingPages.read }, .{ .ctx = undefined, .run = &registerLadderFn }) catch |e| switch (e) {
+        // A refused registration takes its own key back with it.
+        error.SiblingLive => {
+            try testing.expect(!(try hostRegistered(&c)));
+            return;
+        },
+        else => return e,
+    };
+    try testing.expect(fresh);
+    // The sibling stale at the re-judge: killed before the lock is let go.
+    try testing.expect(!proc.isWriterIncarnation(local, sib_pid, 9, sib.writerId(9)));
+    _ = try child.wait(testing.io);
+    reaped = true;
 }

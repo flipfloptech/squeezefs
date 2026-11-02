@@ -1167,6 +1167,9 @@ const RamVolume = struct {
     handover_notifies: u32 = 0,
     /// Seam: the pointer's seq lies (the install must refuse).
     stale_pointer: bool = false,
+    /// Seam: runs when a page write turns a page Recovering (a register
+    /// of the dead member's host racing the recovery's step 2).
+    on_recovering: ?struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) void } = null,
     /// Seam: the volume's own SMO on a recovered tree during the flush
     /// cycles (the checkpoint task's maintenance, the D4 arm): `old`'s
     /// image replaced by `new` (claimed from the volume's pool), `old`
@@ -1310,6 +1313,7 @@ const RamVolume = struct {
         const self = self_(ctx);
         self.pages.put(self.gpa, p.appender_id, p.*) catch return error.OutOfMemory;
         self.page_writes += 1;
+        if (p.state == .recovering) if (self.on_recovering) |hook| hook.run(hook.ctx);
     }
     fn readRingFn(ctx: *anyopaque, gpa: Allocator, p: *const page.Page, out: *std.ArrayList(WindowRecord)) Error!RingRead {
         const self = self_(ctx);
@@ -1571,6 +1575,10 @@ const Fixture = struct {
     driver: Driver,
 
     fn init(gpa: Allocator, early: bool) !*Fixture {
+        return initKeyed(gpa, early, 0);
+    }
+
+    fn initKeyed(gpa: Allocator, early: bool, pr_key: u64) !*Fixture {
         const f = try gpa.create(Fixture);
         errdefer gpa.destroy(f);
         f.gpa = gpa;
@@ -1578,7 +1586,7 @@ const Fixture = struct {
         try f.rv.seedDeadAppender(DEAD);
         f.ledger_store = death_ledger.RamLedgerStore.init(gpa);
         f.ledger = death_ledger.Ledger.init(gpa, f.ledger_store.store(), 2, death_ledger.wireOf(ME), 45_000);
-        f.ledger.recordDeath(DEAD, .{ .epoch = 9, .ts_realtime_ns = 1_000 * std.time.ns_per_ms, .pr_key = 0, .early = early });
+        f.ledger.recordDeath(DEAD, .{ .epoch = 9, .ts_realtime_ns = 1_000 * std.time.ns_per_ms, .pr_key = pr_key, .early = early });
         f.screen = .{ .gpa = gpa, .table = f.rv.table, .pr_fenced = false };
         f.stamps = fencing.FrameStamps.init(gpa, 0);
         // The recoverer (the manager, appender 0) stamps the dead slots at
@@ -2017,4 +2025,30 @@ test "appender clear: the seven refusals in order (live mount, a fresh claim on 
     var w: std.Io.Writer = .fixed(&buf);
     try writeClearRefusal(&w, .appender_zero, 0);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "ids ≥ 1") != null);
+}
+
+test "B2 (review): recovery re-reads the report once the page is Recovering — a registration of the dead member's host that raced the preempt (the preempt found the key absent: an earlier death had fenced the host) is preempted again before the ring is read" {
+    const gpa = testing.allocator;
+    const fake_nvme = @import("../../guard/fake_nvme.zig");
+    const f = try Fixture.initKeyed(gpa, false, 0x2222);
+    defer f.deinit();
+    var ns = fake_nvme.Namespace.init(gpa);
+    defer ns.deinit();
+    var mh: fake_nvme.Host = .{ .ns = &ns, .host_id = "manager-host-id1".* };
+    var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer m.deinit();
+    try fencing.acquireWero(&m);
+    var rh: fake_nvme.Host = .{ .ns = &ns, .host_id = "remote-host-id-2".* };
+    var r = try pr.Client.init(gpa, rh.face(), 1, 0x2222);
+    defer r.deinit();
+    f.driver.mount.meta_pr = &m;
+    const Race = struct {
+        fn run(ctx: *anyopaque) void {
+            const c: *pr.Client = @ptrCast(@alignCast(ctx));
+            _ = fencing.joinAsRegistrant(c, null) catch {};
+        }
+    };
+    f.rv.on_recovering = .{ .ctx = &r, .run = &Race.run };
+    try testing.expectEqual(Outcome.acted, f.driver.recoverDead(f.death()));
+    try testing.expect(!ns.writeAllowed("remote-host-id-2".*));
 }

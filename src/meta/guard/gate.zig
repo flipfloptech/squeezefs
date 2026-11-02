@@ -25,6 +25,7 @@ const Io = std.Io;
 
 const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
+const knobs = @import("../../core/knobs.zig");
 const derive = @import("../../core/derive.zig");
 const errors = @import("../../core/errors.zig");
 const uring_fs = @import("../../io/uring_fs.zig");
@@ -249,8 +250,24 @@ pub const Guard = struct {
         if (g.prClient()) |c| {
             try g.arbitrate(c, g.evidence);
             g.pr_active = true;
+            g.holdArbitratedIfArmed();
         }
         return g;
+    }
+
+    /// `SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD`: the gate parks after its PR
+    /// arbitration and before the claim's commit until a writer opens the
+    /// FIFO — a second successor arbitrates in that window.
+    fn holdArbitratedIfArmed(g: *Guard) void {
+        const path = knobs.parseStr(g.be.env.get("SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD")) orelse return;
+        Io.Dir.cwd().access(g.io, path, .{}) catch return;
+        log.warn("meta volume {s}: SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD — the gate holds (arbitrated, the claim not yet committed) until a writer opens {s}", .{ g.be.path, path });
+        const f = Io.Dir.cwd().openFile(g.io, path, .{}) catch |e| {
+            log.warn("meta volume {s}: the arbitrated hold could not open {s} ({t}); not holding", .{ g.be.path, path, e });
+            return;
+        };
+        f.close(g.io);
+        log.warn("meta volume {s}: SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD released — the claim commits", .{g.be.path});
     }
 
     /// The second phase: the claim tx through the conveyor and its

@@ -1610,31 +1610,44 @@ test "nvmet fidelity: co-located mounts — ONE host identity for every mount of
     try expectNoResidue(rig, set.data_nqn);
 }
 
-/// The stale-sibling legs' membership `T_owner` (the smoke rows' value).
-const sibling_t_owner_ms: u64 = 3000;
+/// Open a FIFO for write: a daemon parked opening it for read proceeds.
+fn releaseFifo(path: [:0]const u8) void {
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) == .SUCCESS) _ = linux.close(@intCast(rc));
+}
 
-test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmetric set whose manager M runs under a second identity (another host); B then A mount on this host under the one identity (B registers the host, A adopts); B frozen (SIGSTOP) is evicted and M's recovery preempts the HOST's key — A, the live sibling, is fenced with it (its fsync refused); a fresh mount on this host whose kill of B is refused (SQUEEZEFS_TEST_SIBLING_KILL_REFUSED) refuses its registration loud by name and exits, B alive, the host unregistered; a fresh mount A2 on this host must re-register the host, and B, alive and stale, is killed before it does (pr_stale_sibling_kills 1, B dead); A2's writes land and M reads them; B never writes again" {
+/// Wait until daemon `d` either logged `ready: ` or exited; true = ready.
+fn readyOrDead(rig: *Rig, d: usize) !bool {
+    const deadline = clock.monotonicNs() + ready_wait_ns;
+    while (clock.monotonicNs() < deadline) {
+        const text = try rig.readLog(d);
+        defer rig.gpa.free(text);
+        if (std.mem.indexOf(u8, text, "ready: ") != null) return true;
+        if (!alive(rig.daemons.items[d].pid)) return false;
+        sleepMs(50);
+    }
+    return error.DaemonNeitherReadyNorDead;
+}
+
+const ident_c: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0", .hostid = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0" };
+
+test "nvmet fidelity: stale sibling — one manager per volume and per-host fencing's safety rule on a three-host set: B (host A's manager) and A (a joiner on host A) under host A's one identity (B registers the host, A adopts); B frozen (SIGSTOP) past the claim's TTL; two successors on hosts B and C race for the role — P1 arbitrates and parks before its claim (SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD), P2 arbitrates meanwhile: the device keeps ONE holder (WERO), so P2's acquire conflicts and preempts P1's host, P2 binds and P1, released, never does (review round 3 N1: under rtype 5 both bound); host A was fenced by the takeover — A's fsync refused; a fresh mount on host A whose kill of B is refused (SQUEEZEFS_TEST_SIBLING_KILL_REFUSED) refuses its registration loud by name and exits, B alive; A2 kills the superseded manager B before it registers host A (pr_stale_sibling_kills 1), joins P2 and writes; P2 reads it" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
     const transport: configfs.Trtype = .loop;
     const set = try symmetricSet(rig, "ss", transport, try rig.servicePorts(transport));
     const cm = set.cm;
-    var tb: [16]u8 = undefined;
-    const t_owner = try std.fmt.bufPrint(&tb, "{d}", .{sibling_t_owner_ms});
     const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    const cm_c = try rig.connect(set.meta_nqn, transport, 0, ident_c, &.{});
     var mu_b: [64]u8 = undefined;
     const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
-    var env_m = try rig.envWith(ident_b);
-    defer env_m.deinit();
-    try env_m.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
-    var env_h = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
-    defer env_h.deinit();
-    const m = try rig.spawnMountEnv("ss-m", meta_uri_b, &env_m, &.{});
-    try rig.awaitLog(m, "ready: ", ready_wait_ns);
-    const b = try rig.spawnMountEnv("ss-b", set.metaUri(), &env_h, &.{});
+    var mu_c: [64]u8 = undefined;
+    const meta_uri_c = try std.fmt.bufPrint(&mu_c, "sqmeta://{s}", .{cm_c.dev()});
+    // Host A: the manager B, then the joiner A.
+    const b = try rig.spawnMount("ss-b", set.metaUri(), null, &.{});
     try rig.awaitLog(b, "ready: ", ready_wait_ns);
-    const a = try rig.spawnMountEnv("ss-a", set.metaUri(), &env_h, &.{});
+    const a = try rig.spawnMount("ss-a", set.metaUri(), null, &.{});
     try rig.awaitLog(a, "ready: ", ready_wait_ns);
     {
         const sb = try rig.stats(b);
@@ -1645,66 +1658,48 @@ test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmet
         try testing.expectEqual(@as(u64, 1), try statNumber(sa, "pr_host_adoptions"));
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
-        try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
     }
+    try testing.expect(try scriptSucceeds(rig, a, "mkdir da && echo a > da/a && sync -d da/a"));
     const before = try rig.onMount(b, "echo before > f && sync -d f && cat f");
     defer gpa.free(before);
     try testing.expectEqualStrings("before\n", before);
-    // A's own directory: its creates land through A's own ring (a create
-    // in the root is the manager's slot's, applied by M over the wire).
-    try testing.expect(try scriptSucceeds(rig, a, "mkdir da && echo a > da/a && sync -d da/a"));
-    // B frozen: evicted past T_owner, its region recovered by M, whose
-    // recovery's preempt removes this HOST's registration.
+    // B frozen: its claim ages past the TTL (its beats stop).
     const pid_b = rig.daemons.items[b].pid;
-    const rr_before = try rig.resvReportJson(cm.dev());
-    defer gpa.free(rr_before);
     _ = linux.kill(pid_b, .STOP);
-    const sm = try rig.awaitStat(m, "appender_recoveries", 1, ready_wait_ns);
-    defer gpa.free(sm);
-    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
-    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recovery_preempts"));
+    sleepMs(lease_clock.T_OWNER_MS + 5_000);
+    // Two successors race for the manager role.
+    var fb: [128]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/p1-arbitrated.fifo", .{rig.root}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    var env_p1 = try rig.envWith(ident_b);
+    defer env_p1.deinit();
+    try env_p1.put("SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD", fifo);
+    const p1 = try rig.spawnMountEnv("ss-p1", meta_uri_b, &env_p1, &.{});
+    try rig.awaitLog(p1, "SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD — the gate holds", ready_wait_ns);
+    const p2 = try rig.spawnMount("ss-p2", meta_uri_c, ident_c, &.{});
+    const p2_ready = try readyOrDead(rig, p2);
+    releaseFifo(fifo);
+    const p1_ready = try readyOrDead(rig, p1);
+    // ONE manager: the later arbiter (P2) preempted P1's host; P1 never binds.
+    try testing.expect(p2_ready);
+    try testing.expect(!p1_ready);
+    // Host A was fenced by the takeover (B's key, host A's, preempted).
+    try testing.expect(!try scriptSucceeds(rig, a, "echo x > da/z && sync -d da/z"));
     {
-        // The preempt removed this host's registration: M's alone stands.
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        if (json_scan.number(rr, "regctl") != 1) {
-            std.debug.print("\nstale sibling: before B's stop the report read {s}\nafter M's recovery it reads {s}\n", .{ rr_before, rr });
-            for ([_]usize{ m, a }) |d| {
-                const st = try rig.stats(d);
-                defer gpa.free(st);
-                const at = std.mem.indexOf(u8, st, "\"pr_key\"") orelse 0;
-                std.debug.print("  {s} pr: {s}\n", .{ rig.daemons.items[d].mp, st[at..@min(st.len, at + 420)] });
-            }
-            for ([_]usize{ m, a }) |d| {
-                const text = try rig.readLog(d);
-                defer gpa.free(text);
-                var it = std.mem.splitScalar(u8, text, '\n');
-                while (it.next()) |line| if (std.mem.indexOf(u8, line, "slot leases") == null) std.debug.print("  [{s}] {s}\n", .{ rig.daemons.items[d].mp, line });
-            }
-        }
         try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
     }
-    // A is fenced with its host: its fsync is refused at the device.
-    const fenced_write = try scriptSucceeds(rig, a, "echo x > da/z && sync -d da/z");
-    if (fenced_write) {
-        const sa = try rig.stats(a);
-        defer gpa.free(sa);
-        std.debug.print("\nstale sibling: A's fsync after the host's fence SUCCEEDED; A's .stats: {s}\n", .{sa});
-    }
-    try testing.expect(!fenced_write);
-    // A stale sibling that can be neither proven dead nor killed refuses
-    // the registration loud by name: the mount exits, B lives on, the host
-    // stays unregistered (M's registration alone).
+    // A stale sibling that can be neither proven dead nor killed refuses the
+    // registration loud by name: the mount exits, B lives on, host A stays
+    // unregistered.
     {
-        var env_r = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+        var env_r = try rig.envWithKnob("SQUEEZEFS_TEST_SIBLING_KILL_REFUSED", "1");
         defer env_r.deinit();
-        try env_r.put("SQUEEZEFS_TEST_SIBLING_KILL_REFUSED", "1");
         const r = try rig.spawnMountEnv("ss-refused", set.metaUri(), &env_r, &.{});
+        try testing.expect(!try readyOrDead(rig, r));
         const dm = &rig.daemons.items[r];
-        const deadline = clock.monotonicNs() + ready_wait_ns;
-        while (alive(dm.pid) and clock.monotonicNs() < deadline) sleepMs(20);
-        try testing.expect(!alive(dm.pid));
         const term = try dm.child.wait(rig.io);
         dm.reaped = true;
         try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
@@ -1717,8 +1712,8 @@ test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmet
         defer gpa.free(rr);
         try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
     }
-    // A2 re-registers the host — never while the stale B lives.
-    const a2 = try rig.spawnMountEnv("ss-a2", set.metaUri(), &env_h, &.{});
+    // A2 re-registers host A — never while the superseded B lives.
+    const a2 = try rig.spawnMount("ss-a2", set.metaUri(), null, &.{});
     try rig.awaitLog(a2, "ready: ", ready_wait_ns);
     try testing.expect(!alive(pid_b));
     {
@@ -1731,14 +1726,18 @@ test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmet
     const after = try rig.onMount(a2, "mkdir d2 && echo after > d2/g && sync -d d2/g && cat f d2/g");
     defer gpa.free(after);
     try testing.expectEqualStrings("before\nafter\n", after);
-    const seen_m = try rig.onMount(m, "cat d2/g");
-    defer gpa.free(seen_m);
-    try testing.expectEqualStrings("after\n", seen_m);
+    const seen = try rig.onMount(p2, "cat d2/g");
+    defer gpa.free(seen);
+    try testing.expectEqualStrings("after\n", seen);
     try rig.kill9(b);
     try rig.kill9(a);
+    try rig.kill9(p1);
     try rig.umount(a2);
-    try rig.umount(m);
+    try rig.umount(p2);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    try rig.disconnect(&cm_c);
     try rig.disconnect(&cm_b);
     try rig.disconnect(&cm);
     try rig.unshare(set.data_nqn);

@@ -11,8 +11,9 @@
 #
 # Two package families: Debian/Ubuntu (apt, dpkg; a distro or kernel.org Linux >= 7.3) and
 # Arch and its derivatives such as Omarchy (pacman; scripts/kernel/build-host-kernel builds
-# kernel.org's release, unpatched, with the venue's config fragment, with makepkg). No kernel
-# patch is ever required (owner ruling 2026-11-02, decision 0003 §DB).
+# the venue's two kernels with its config fragment, with makepkg: the default Omarchy-flavoured
+# kernel.org release, decision 0003 §DD, and the release unpatched). No kernel patch of ours is
+# ever required (owner ruling 2026-11-02, decision 0003 §DB).
 #
 # Never done here: a kernel install, a reboot, a filesystem, LV or sudoers change — those
 # print as commands to run.
@@ -74,14 +75,15 @@ kr=$(uname -r)
 kmaj=${kr%%.*}; kmin=${kr#*.}; kmin=${kmin%%[!0-9]*}
 if [ "$kmaj" -gt "$KMIN_MAJOR" ] || { [ "$kmaj" = "$KMIN_MAJOR" ] && [ "${kmin:-0}" -ge "$KMIN_MINOR" ]; }; then
   case $kr in
-    *sqz*) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR, a build-host-kernel package)" ;;
+    *-omarchy-mainline) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR, the venue's default Omarchy-flavoured kernel.org build)" ;;
+    *sqz*) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR, the venue's unpatched kernel.org build)" ;;
     *) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR)" ;;
   esac
   note "FUSE_SYNCFS (upstream from 7.4): each mount probes whether syncfs(2) reaches its daemon and says so (.stats fuse_syncfs_reaches); without it sync/syncfs make no staged byte durable — fsync does"
 elif [ "$FAMILY" = arch ]; then
   miss "Linux >= $KMIN_MAJOR.$KMIN_MINOR (running $kr): FUSE-over-io_uring buffer pools — the daemon refuses an older kernel" \
-    "scripts/kernel/build-host-kernel --local   # kernel.org's release, unpatched, + scripts/kernel/config-fragment, makepkg, pacman -U; the Limine hooks make the UKI and entry (never reboots)" \
-    "(after a release bump: build-host-kernel --local --prepare-only first — the tarball, its signature and the config checklist in minutes)" "then REBOOT into it"
+    "scripts/kernel/build-host-kernel --local   # the Omarchy-flavoured kernel.org release (the default entry) and the release unpatched (the second), + scripts/kernel/config-fragment, makepkg, pacman -U; the Limine hooks make the UKIs and entries (never reboots)" \
+    "(after a release or Omarchy bump: build-host-kernel --local --prepare-only first — the tarball, its signature, the omarchy series at --fuzz=0 and the config checklist in minutes)" "then REBOOT into it"
 else
   miss "Linux >= $KMIN_MAJOR.$KMIN_MINOR (running $kr): FUSE-over-io_uring buffer pools — the daemon refuses an older kernel" \
     "install a distro or kernel.org $KMIN_MAJOR.$KMIN_MINOR+ kernel with CONFIG_FUSE_IO_URING=y (scripts/kernel/config-fragment lists the rest), then REBOOT into it"

@@ -250,9 +250,10 @@ pub const Identity = struct {
     }
 };
 
-/// The PR key: `hash64(writer_id ‖ NUL ‖ boot_id)` from the two words the
-/// claim carries, so a report's holder cross-checks against the record
-/// (B:846-850).
+/// The INCARNATION's PR key, `hash64(writer_id ‖ NUL ‖ boot_id)`: the
+/// per-mount seam's (`SQUEEZEFS_TEST_PER_MOUNT_IDENTITY`), a fixture's, and a
+/// namespace without a wire host id. A product mount registers its HOST's
+/// key (`host_fence.hostKey`, decision 0003 §DF), which the V2 claim names.
 pub fn prKey(writer_id: u64, boot_id: [16]u8) u64 {
     var h: checksum.Hasher = .init();
     h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, writer_id)));

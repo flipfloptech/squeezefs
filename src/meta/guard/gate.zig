@@ -118,7 +118,7 @@ pub const Guard = struct {
     /// The char node behind an active posture (owned).
     device: ?*pr_linux.Device = null,
     /// The host's registry of this set's mounts (per-host fencing, decision
-    /// 0003 §DE): null without a device fence, under the per-mount seam,
+    /// 0003 §DF): null without a device fence, under the per-mount seam,
     /// or with no host identity source.
     fence_reg: ?host_fence.Registry = null,
     /// The configured host identity recorded at the gate (§1.4).

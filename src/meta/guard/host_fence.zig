@@ -1,4 +1,4 @@
-//! Per-host fencing (owner ruling 2026-11-02, option C; decision 0003 §DE;
+//! Per-host fencing (owner ruling 2026-11-02, option C; decision 0003 §DF;
 //! charter §5.5 "Fencing"): every mount of a set on one host presents ONE
 //! NVMe host identity and ONE registration key, so the device fences the
 //! HOST (the GPFS node model) — a preempt of the key fences every mount of

@@ -31,11 +31,12 @@ with Zig 0.17.0 and the repo at the same absolute path, and runs commands as roo
   commands run through `sudo` in this tree, no sync, no VM. Set it up once with
   `scripts/dev/provision-local-venue` (checks the distro — Debian/Ubuntu with apt, or Arch
   and its derivatives such as Omarchy with pacman —, zig on root's PATH, a ≥ 7.3 kernel
-  and `fuse.enable_uring`, the nvmet/brd/null_blk modules, the packages, the build root,
-  passwordless sudo; prints each fix and notes what the host's kernel lacks (FUSE_SYNCFS
-  before 7.4, the nvmet rows `nvme_core.multipath` decides); `--apply` does the packages,
-  modules, IOR/mdtest and directories — never a kernel install, a boot parameter or a
-  reboot; with ≥ 64 GiB of RAM, `/build/tmp` and the tree's `.zig-cache/tmp` live in RAM:
+  and `fuse.enable_uring`, `nvme_core.multipath=N` live and persisted (the venue's
+  single-host rows stand two hosts up under two identities; decision 0003 §DF), the
+  nvmet/brd/null_blk modules, the packages, the build root, passwordless sudo; prints each
+  fix and notes what the host's kernel lacks (FUSE_SYNCFS before 7.4); `--apply` does the
+  packages, modules, the `nvme_core.multipath=N` drop-in (GRUB or Limine), IOR/mdtest and
+  directories — never a kernel install or a reboot; with ≥ 64 GiB of RAM, `/build/tmp` and the tree's `.zig-cache/tmp` live in RAM:
   ext4 on a zram device via zram-generator, so every test image stays off the disk). The kernel:
   `scripts/kernel/build-host-kernel --local` (Arch/Omarchy) — `linux-mainline-sqz`: kernel.org
   7.3.1, UNPATCHED, configured with `scripts/kernel/config-fragment` over Omarchy's CURRENT

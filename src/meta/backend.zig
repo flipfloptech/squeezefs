@@ -905,7 +905,7 @@ pub const KvBackend = struct {
             };
         }
         // The role is durable: this process enters the host's registry of
-        // the set (the stale-sibling rule's candidates, decision 0003 §DE).
+        // the set (the stale-sibling rule's candidates, decision 0003 §DF).
         be.guard.?.enrollManager();
         be.test_ckpt_error_logs = opts.test_ckpt_error_logs;
         be.ckpt_thread = std.Thread.spawn(.{}, ckptMain, .{be}) catch return error.ThreadSpawnFailed;

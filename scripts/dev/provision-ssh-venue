@@ -30,7 +30,7 @@ want=$(printf '%s\n' "# squeezefs venue (scripts/dev/provision-ssh-venue)" "${MO
 if [ ! -f "$conf" ] || [ "$(cat "$conf")" != "$want" ]; then printf '%s\n' "$want" >"$conf"; fi
 mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
 
-# The venue boots nvme_core.multipath=N (owner ruling 2026-11-02, decision 0003 §DE): the
+# The venue boots nvme_core.multipath=N (owner ruling 2026-11-02, decision 0003 §DF): the
 # product presents ONE host identity per host, but the venue's single-host rows stand two
 # hosts up on one under two identities (explicit pairs, SQUEEZEFS_TEST_PER_MOUNT_IDENTITY),
 # and a stock kernel groups a host-side subsystem by its NQN alone — under native multipath

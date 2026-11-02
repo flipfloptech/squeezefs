@@ -6,7 +6,7 @@
 //! mount, before discovery opens any data device, the daemon resolves the
 //! HOST's identity (the explicit pair → `/etc/nvme` both → the machine-id
 //! derivation: ONE identity for every mount of the set on this host, owner
-//! ruling 2026-11-02, decision 0003 §DE — the test seam
+//! ruling 2026-11-02, decision 0003 §DF — the test seam
 //! `SQUEEZEFS_TEST_PER_MOUNT_IDENTITY` salts the derived one by the mount
 //! point), reuses a controller already riding that identity for the
 //! record's subsystem (a sibling mount's, or a crashed predecessor's) or

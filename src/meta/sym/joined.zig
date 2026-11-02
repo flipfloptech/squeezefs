@@ -438,7 +438,7 @@ pub const JoinedSet = struct {
             .crashed => |p| log.info("meta volume {s}: appender {d} (term {d}) is Live under this mount point's identity and its process is gone — a crashed predecessor: the manager defers this join until its recovery", .{ be.path, p.appender_id, p.term }),
             .alive => |a| return refuseLive(be, a),
         }
-        // The host's registration (per-host fencing, decision 0003 §DE):
+        // The host's registration (per-host fencing, decision 0003 §DF):
         // adopted when the host is registered under the set's key, else
         // registered after the stale-sibling rule — before the JoinAppender,
         // so this incarnation never writes unregistered.

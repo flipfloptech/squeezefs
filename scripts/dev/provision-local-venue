@@ -101,7 +101,7 @@ done
   || miss "modules:$lack (the nvmet, NVMe-oF, kTLS and RAM-namespace rows)" "a kernel config that has them (scripts/kernel/config-fragment lists them)"
 [ -f /etc/modules-load.d/sqz.conf ] && ok "nvmet modules persisted (/etc/modules-load.d/sqz.conf)" \
   || miss "the nvmet modules loaded at boot" "scripts/dev/provision-local-venue --apply"
-# The venue boots nvme_core.multipath=N (owner ruling 2026-11-02, decision 0003 §DE): the
+# The venue boots nvme_core.multipath=N (owner ruling 2026-11-02, decision 0003 §DF): the
 # product presents one host identity per host, but the venue's single-host rows stand two
 # hosts up on one under two identities, and a stock kernel groups a host-side NVMe subsystem
 # by its NQN alone — under native multipath two identities on one subsystem merge under one

@@ -23,7 +23,7 @@
 //! namespaces; PR armed for real; a second identity refused; `kill -9` →
 //! remount adopts the host's standing registration; `umount` → zero
 //! registrants), `co-located mounts` and `stale sibling` (one host
-//! identity per host, decision 0003 §DE), `sigstop-preempt` (a stopped holder is preempted past
+//! identity per host, decision 0003 §DF), `sigstop-preempt` (a stopped holder is preempted past
 //! `T_owner`; resumed, its next beat reads the usurpation and its barrier
 //! answers the device's `-EBADE` — FAILED), `g2-restore-tcp` (the PTPL
 //! lapse: the subsystem wiped by hand under a live mount, `restore`
@@ -977,7 +977,7 @@ fn mountLeg(transport: configfs.Trtype) !void {
     }
     try rig.disconnect(&cm_b);
     // kill -9 → remount under the same identity: the SAME host key (one per
-    // host identity and set, decision 0003 §DE) — the host is still
+    // host identity and set, decision 0003 §DF) — the host is still
     // registered, so the remount adopts it (an idempotent register, no
     // own-stale recovery) and takes the reservation over. The data
     // association the killed daemon left (its pair, its subsystem) is

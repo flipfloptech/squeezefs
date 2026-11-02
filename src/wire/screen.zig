@@ -332,7 +332,7 @@ pub fn bitmapRefs(refs: []align(1) const verbs.BitmapRefWire, blocks: u64, heaps
 /// contradicting the registered key (0 and the registered key are
 /// accepted; an unregistered member's word is accepted and the handler
 /// counts it as unvalidated). A key a live member also holds is the
-/// dead member's HOST's (per-host fencing, decision 0003 §DE: every mount
+/// dead member's HOST's (per-host fencing, decision 0003 §DF: every mount
 /// of a set on a host registers one key) — its preempt fences the host's
 /// live siblings too, the ruling's accepted cost — never a contradiction.
 pub fn recordDeath(req: verbs.RecordDeathReq, b: *const DeathBounds) Verdict {

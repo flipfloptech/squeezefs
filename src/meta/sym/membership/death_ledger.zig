@@ -8,7 +8,7 @@
 //! before anything is written (own identity, a member the installed owner
 //! lists live, a key contradicting the registered one — rejected; key 0 or
 //! the registered key — accepted, a key live siblings share included: it
-//! is their host's, decision 0003 §DE; an unknown census — kept with the
+//! is their host's, decision 0003 §DF; an unknown census — kept with the
 //! word and COUNTED, quirk Q-R2). A write that fails is PARKED in RAM
 //! (dedup by identity) and the next poll drains it. The join RETIRES the
 //! identity's standing record before any page goes Live under it.

@@ -17344,7 +17344,7 @@ test "smoke: A FALLOCATE'D LAY-DOWN HOLDS ITS SIZE, AND A DELETE'S BLOCKS ARE SU
     _ = try fsckClean(rig, "the clean unmount after the reservation lay-down");
 }
 
-test "smoke: A DELETED FILE'S PARKED BYTES NEVER WAIT FOR THEIR OWN DESTROY (decision 0003 §CW; §CR's upstream supply) — a two-volume set of 2 × 46 usable 4 MiB blocks without a write cache filled to ENOSPC with fsync'd one-block files: the last file's write parks a block no volume can take (write_through_fallbacks) → `rm` of it gathers its corpse, the only supply in sight, and a write to a new file meets the full store and kicks the gather's destroy → the destroy pass settles the corpse's parked block: its mint refuses at once (the corpse's own gather is no supply for its own bytes), the destroy lands (fuse_reclaim_destroys, nothing left gathered) with no park wall crossed (alloc_pressure_park_wall_refusals), the new write answers ENOSPC (the corpse freed nothing) → every file removed, clean unmount, fsck clean; no error line, no tripwire (red on dev: 3 park walls and 3 error lines `StorageFull after parking 1000 ms for visible supply (0 block(s) in sight …) — refusing; the plane is broken, not slow` — the destroy's settle parked the 1 s wall on its own corpse once per candidate volume, the gather pending and the latch inert all the while, and the new file's mint parked behind it)" {
+test "smoke: A DELETED FILE'S PARKED BYTES NEVER WAIT FOR THEIR OWN DESTROY (decision 0003 §CW; §CR's upstream supply) — a two-volume set of 2 × 46 usable 4 MiB blocks without a write cache filled to ENOSPC with fsync'd one-block files: the last file's write parks a block no volume can take (write_through_fallbacks) → `rm` of it gathers its corpse, the only supply in sight, and a write to a new file meets the full store and kicks the gather's destroy → the corpse's parked block was discarded at its delete (decision 0003 §DC: discard_at_delete_blocks), so the destroy pass mints nothing for it and never waits on itself: the destroy lands (fuse_reclaim_destroys, nothing left gathered) with no park wall crossed (alloc_pressure_park_wall_refusals), the new write answers ENOSPC (the corpse freed nothing) → every file removed, clean unmount, fsck clean; no error line, no tripwire (red on dev: 3 park walls and 3 error lines `StorageFull after parking 1000 ms for visible supply (0 block(s) in sight …) — refusing; the plane is broken, not slow` — the destroy's settle parked the 1 s wall on its own corpse once per candidate volume, the gather pending and the latch inert all the while, and the new file's mint parked behind it)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -17354,7 +17354,7 @@ test "smoke: A DELETED FILE'S PARKED BYTES NEVER WAIT FOR THEIR OWN DESTROY (dec
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
     const mark = try rig.logLen();
-    const CorpseCensus = struct { fallbacks: u64, destroys: u64, gathered: u64, walls: u64, kicks: u64 };
+    const CorpseCensus = struct { fallbacks: u64, destroys: u64, gathered: u64, walls: u64, kicks: u64, discards: u64 };
     const census = struct {
         fn of(r: *Rig) !CorpseCensus {
             const t = try r.stats();
@@ -17365,6 +17365,7 @@ test "smoke: A DELETED FILE'S PARKED BYTES NEVER WAIT FOR THEIR OWN DESTROY (dec
                 .gathered = numberAfter(t, "\"fuse_reclaim_gathered\":") orelse return error.StatMissing,
                 .walls = numberAfter(t, "\"alloc_pressure_park_wall_refusals\":") orelse return error.StatMissing,
                 .kicks = numberAfter(t, "\"block_free_upstream_kicks\":") orelse return error.StatMissing,
+                .discards = numberAfter(t, "\"discard_at_delete_blocks\":") orelse return error.StatMissing,
             };
         }
     }.of;
@@ -17401,11 +17402,14 @@ test "smoke: A DELETED FILE'S PARKED BYTES NEVER WAIT FOR THEIR OWN DESTROY (dec
         try io.sleep(.fromMilliseconds(10), .awake);
         c2 = try census(rig);
     }
-    std.debug.print("smoke[corpse custody]: destroyed {d}, gathered {d}, park walls {d}, upstream kicks {d}\n", .{ c2.destroys - c1.destroys, c2.gathered, c2.walls - c1.walls, c2.kicks - c1.kicks });
+    std.debug.print("smoke[corpse custody]: destroyed {d}, gathered {d}, park walls {d}, upstream kicks {d}, parked blocks discarded at the delete {d}\n", .{ c2.destroys - c1.destroys, c2.gathered, c2.walls - c1.walls, c2.kicks - c1.kicks, c2.discards - c1.discards });
     try testing.expectEqual(c1.destroys + 1, c2.destroys);
     try testing.expectEqual(@as(u64, 0), c2.gathered);
     try testing.expect(c2.kicks > c1.kicks);
     try testing.expectEqual(c1.walls, c2.walls);
+    // The corpse's block left at its delete; the one parked buffer left is
+    // the new file's, refused by the full store.
+    try testing.expect(c2.discards > c1.discards);
     {
         const t = try rig.stats();
         defer gpa.free(t);
@@ -17479,6 +17483,16 @@ test "smoke: A DELETED FILE'S PARKED BYTES ARE DISCARDED AT ITS DELETE, NEVER UP
     std.debug.print("smoke[dead file's parked bytes]: after the delete's destroy: destroyed {d}, gathered {d}, parked buffers {d}\n", .{ c2.destroys - c1.destroys, c2.gathered, c2.parked });
     try testing.expectEqual(c1.destroys + 1, c2.destroys);
     try testing.expectEqual(@as(u64, 0), c2.gathered);
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        const blocks = numberAfter(t, "\"discard_at_delete_blocks\":") orelse return error.StatMissing;
+        const bytes = numberAfter(t, "\"discard_at_delete_bytes\":") orelse return error.StatMissing;
+        std.debug.print("smoke[dead file's parked bytes]: discarded at the delete: {d} block(s), {d} B; marks left {d}\n", .{ blocks, bytes, numberAfter(t, "\"discard_at_delete_marks\":") orelse 0 });
+        try testing.expect(blocks >= c1.parked);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"discard_at_delete_marks\":"));
+    }
+    try testing.expectEqual(@as(u64, 0), c2.parked);
     // 3. Supply returns: every other file removed, their destroys landed
     //    and their frees back in the allocator; the parked set empties.
     rig.gpa.free(try rig.onMountTimed("rm -f fill* last\n", 120));
@@ -17602,8 +17616,13 @@ test "smoke: A DELETED FILE'S WRITE-CACHE RESIDENT LEAVES WITH ITS CLAIM, NEVER 
     try testing.expect(c3.evictions > c1.evictions);
     try testing.expectEqual(c2.freed, c4.freed);
     {
+        // The probe's resident left at its destroy, `r`'s at its eviction
+        // or its destroy: one each, never promoted.
         const t = try rig.stats();
         defer gpa.free(t);
+        try testing.expectEqual(@as(?u64, 2), numberAfter(t, "\"discard_at_delete_residents\":"));
+        try testing.expectEqual(@as(?u64, 2 * 65536), numberAfter(t, "\"discard_at_delete_resident_bytes\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"discard_at_delete_marks\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"invariant_tripwires\":"));
     }
     try rig.umount();
@@ -17619,6 +17638,83 @@ test "smoke: A DELETED FILE'S WRITE-CACHE RESIDENT LEAVES WITH ITS CLAIM, NEVER 
         try testing.expectEqual(@as(u64, 0), (try dismountLineOf(seg)).failed);
     }
     _ = try fsckClean(rig, "the orderly unmount after the dead file's resident");
+}
+
+test "smoke: AN UNLINKED FILE STILL OPEN READS AND WRITES ITS BYTES UNTIL ITS CLOSE (the owner's ruling 2026-11-02: the delete is the final FORGET, never the unlink) — a supervised two-volume set, the write cache ON: one shell opens `b` and `s` read-write, writes 5,300,000 B to `b` (a whole block and a parked tail) and 20,000 B to `s` (a write-cache resident), `rm b s` with both still open, appends 4 KiB to each through the open descriptors, and reads both back through /proc/self/fd — byte-exact, sizes whole, nothing discarded while open (discard_at_delete_*) — then closes them → both FORGETs are deletes: their destroys land (fuse_reclaim_destroys, nothing gathered, no mark left) → orderly unmount (the dismount pass promotes nothing), fsck clean; no error line, no tripwire" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSetSized(true, &.{}, fallocate_row_data_bytes);
+    try rig.mountAsSet(&.{});
+    _ = try rig.awaitReady(0);
+    const mark = try rig.logLen();
+    const destroys0 = blk: {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        break :blk numberAfter(t, "\"fuse_reclaim_destroys\":") orelse return error.StatMissing;
+    };
+    {
+        const out = try rig.onMountTimed(
+            \\head -c 5300000 /dev/urandom > "$1/big"
+            \\head -c 20000 /dev/urandom > "$1/small"
+            \\head -c 4096 /dev/urandom > "$1/more"
+            \\cat "$1/big" "$1/more" > "$1/b.want"
+            \\cat "$1/small" "$1/more" > "$1/s.want"
+            \\exec 3<>b 4<>s
+            \\cat "$1/big" >&3
+            \\cat "$1/small" >&4
+            \\rm b s
+            \\cat "$1/more" >&3
+            \\cat "$1/more" >&4
+            \\echo "b $(stat -L -c %s /proc/$$/fd/3) s $(stat -L -c %s /proc/$$/fd/4)"
+            \\cmp -s /proc/$$/fd/3 "$1/b.want" && echo "b whole" || echo "b differs"
+            \\cmp -s /proc/$$/fd/4 "$1/s.want" && echo "s whole" || echo "s differs"
+            \\grep -o '"discard_at_delete_blocks":[0-9]*,"discard_at_delete_bytes":[0-9]*' .stats
+            \\grep -o '"discard_at_delete_residents":[0-9]*' .stats
+            \\exec 3>&- 4>&-
+            \\echo closed
+        , 120);
+        defer gpa.free(out);
+        std.debug.print("\nsmoke[unlinked, still open]:\n{s}", .{out});
+        try testing.expect(std.mem.indexOf(u8, out, "b 5304096 s 24096\n") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "b whole\ns whole\n") != null);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(out, "\"discard_at_delete_blocks\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(out, "\"discard_at_delete_residents\":"));
+        try testing.expect(std.mem.endsWith(u8, out, "closed\n"));
+    }
+    // The closes: both FORGETs are deletes; their destroys land.
+    var polls: u32 = 0;
+    while (polls < 3000) : (polls += 1) {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        const destroys = numberAfter(t, "\"fuse_reclaim_destroys\":") orelse return error.StatMissing;
+        const gathered = numberAfter(t, "\"fuse_reclaim_gathered\":") orelse return error.StatMissing;
+        if (destroys >= destroys0 + 2 and gathered == 0) {
+            std.debug.print("smoke[unlinked, still open]: after the closes: destroyed {d}, marks left {d}, staged {d} B, parked {d}\n", .{ destroys - destroys0, numberAfter(t, "\"discard_at_delete_marks\":") orelse 0, numberAfter(t, "\"current_staged_write_bytes\":") orelse 0, numberAfter(t, "\"parked_buffers\":") orelse 0 });
+            try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"discard_at_delete_marks\":"));
+            try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"current_staged_write_bytes\":"));
+            try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"invariant_tripwires\":"));
+            break;
+        }
+        try io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.DestroysNeverLanded;
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        const errors = std.mem.count(u8, seg, "error(");
+        if (errors != 0) std.debug.print("--- the daemon's alert lines ---\n{s}\n", .{seg});
+        try testing.expectEqual(@as(usize, 0), errors);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, seg, "TRIPWIRE"));
+        const d = try dismountLineOf(seg);
+        try testing.expectEqual(@as(u64, 0), d.promoted);
+        try testing.expectEqual(@as(u64, 0), d.failed);
+    }
+    _ = try fsckClean(rig, "the orderly unmount after the unlinked open files");
 }
 
 /// The store's free blocks off the mount's `.stats` (Σ capacity − used over

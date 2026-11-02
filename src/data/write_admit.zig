@@ -508,6 +508,9 @@ pub const WritePath = struct {
     governor: pipeline.Governor,
     overlay: device_overlay.Overlay,
     table: accumulate.Table,
+    /// The deleted inos (decision 0003 §DC): every landing point discards
+    /// their parked blocks, the plane's promotion their residents.
+    deleted: accumulate.Deleted = .{},
     touched: fsync_mod.TouchedTable,
     last_write_end: LastWriteEnd,
     view: write_side_view.Composite,
@@ -669,6 +672,7 @@ pub const WritePath = struct {
         }
         self.last_write_end.deinit(self.gpa);
         self.touched.deinit(self.gpa);
+        self.deleted.deinit(self.gpa);
         self.table.deinit();
         self.governor.deinit();
         self.locks.deinit(self.gpa);
@@ -691,7 +695,7 @@ pub const WritePath = struct {
     }
 
     pub fn uploadDeps(self: *WritePath) accumulate.UploadDeps {
-        return .{ .device = self.device, .map = self.map, .free = self.free, .purge = self.purge, .vols = self.vols, .picker = self.picker.picker(), .valve = self.valve, .epochs = &self.epochs, .stripes = self.stripes, .locks = &self.locks, .transform = self.transform, .scratch = self.scratch, .touched = &touchedStamp, .touched_ctx = self, .image = self.image, .custody = .{ .ctx = self, .ram_custody = &epochCustody, .overlay_open = &overlayOpen }, .fence = self.fence };
+        return .{ .device = self.device, .map = self.map, .free = self.free, .purge = self.purge, .vols = self.vols, .picker = self.picker.picker(), .valve = self.valve, .epochs = &self.epochs, .stripes = self.stripes, .locks = &self.locks, .transform = self.transform, .scratch = self.scratch, .touched = &touchedStamp, .touched_ctx = self, .image = self.image, .custody = .{ .ctx = self, .ram_custody = &epochCustody, .overlay_open = &overlayOpen }, .fence = self.fence, .deleted = &self.deleted };
     }
 
     fn touchedStamp(ctx: ?*anyopaque, ino: u64, ordinal: u32) void {
@@ -1918,11 +1922,82 @@ pub const WritePath = struct {
         for (holders) |ino| self.flushIno(io, ino);
     }
 
-    /// The pre-clip settle (a truncate, an O_TRUNC open, the corpse
-    /// destroy): the ino's write-side custody lands or drops before its
-    /// layout is read and clipped — exactly `flushIno` (a parked block's
-    /// upload in flight is JOINED to its exit, tail included; the overlay
-    /// drains; the epoch closes) and nothing process-wide. The old form
+    // ---- the delete's discard (the owner's ruling 2026-11-02, decision 0003 §DC) ----
+
+    /// How `discardParked` takes a block's guard: `.try_only` on the FUSE
+    /// drain worker's FORGET (a park there parks its lane and its ring),
+    /// `.blocking` on the destroy's fiber.
+    pub const DiscardGuard = enum { try_only, blocking };
+
+    /// THE DELETE — the final FORGET of `ino` at nlink 0 (`kv_fs.forget`):
+    /// marked (`accumulate.Deleted`), then every parked block whose guard is
+    /// free discarded at once. A block whose guard is held (an upload's
+    /// publish section, a drain) keeps the mark: the next landing point
+    /// that meets it, or the destroy, discards it. Spin locks and try-locks
+    /// only — never a park.
+    pub fn noteDeleted(self: *WritePath, io: Io, ino: u64) void {
+        _ = self.deleted.mark(self.gpa, ino);
+        self.discardParked(io, ino, .try_only);
+    }
+
+    pub fn markDeleted(self: *WritePath, ino: u64) void {
+        _ = self.deleted.mark(self.gpa, ino);
+    }
+
+    /// The destroy is done with `ino`, or found it no corpse.
+    pub fn unmarkDeleted(self: *WritePath, ino: u64) void {
+        self.deleted.unmark(ino);
+    }
+
+    pub fn isDeleted(self: *WritePath, ino: u64) bool {
+        return self.deleted.has(ino);
+    }
+
+    /// THE DESTROY'S SETTLE of a deleted striped file (`kv_fs.destroyCorpses`
+    /// (1), before its plan reads the layout): the parked blocks DISCARDED
+    /// under each block's guard — an upload in flight is never joined: its
+    /// publish runs under the same guard, so it published first (the plan
+    /// names its block, the destroy frees it) or finds the entry gone and
+    /// returns its mint —; the overlay records and the rewrite epoch, whose
+    /// bytes the device already holds, land as at a truncate's settle so
+    /// the plan names every block they wrote. Nothing here mints.
+    pub fn settleDeleted(self: *WritePath, io: Io, ino: u64) void {
+        _ = self.overlay.drainForIno(io, &self.locks, ino, std.math.maxInt(u64), false, self.closeSeams());
+        self.discardParked(io, ino, .blocking);
+        _ = self.epochs.close(io, ino, self.closeSeams());
+    }
+
+    /// Every parked block of `ino` discarded (`accumulate.discardEntry`), a
+    /// page of the table's census at a time; under `.try_only` a block whose
+    /// guard is held stays (marked).
+    pub fn discardParked(self: *WritePath, io: Io, ino: u64, how: DiscardGuard) void {
+        if (!self.table.mayHoldIno(ino)) return;
+        var blocks: [64]u32 = undefined;
+        var any = false;
+        while (true) {
+            const page = self.table.blocksOf(ino, &blocks);
+            var dropped = false;
+            for (page) |b| {
+                const g = switch (how) {
+                    .blocking => self.locks.acquire(io, ino, b, .settle),
+                    .try_only => self.locks.tryAcquire(io, ino, b) orelse continue,
+                };
+                defer g.release(io);
+                const e = self.table.get(ino, b) orelse continue;
+                accumulate.discardEntry(&self.table, e);
+                dropped = true;
+            }
+            any = any or dropped;
+            if (page.len < blocks.len or !dropped) break;
+        }
+        if (any) self.table.capacity.notifyWaiters(io);
+    }
+
+    /// The pre-clip settle (a truncate, an O_TRUNC open): the ino's
+    /// write-side custody lands or drops before its layout is read and
+    /// clipped — exactly `flushIno` (a parked block's upload in flight is
+    /// JOINED to its exit, tail included; the overlay drains; the epoch
+    /// closes) and nothing process-wide. The old form
     /// added `quiesce`, a wait for EVERY ino's detached uploads through the
     /// one task set's single-awaiter group join: two truncates settling at
     /// once lost one wake for good (fstests generic/074 and 464 — ONE
@@ -3597,6 +3672,67 @@ test "the write-back timer's drain (decision 0003 §AJ): `drainAged` flushes exa
     try testing.expect(!w.wp.holdsCustody(41));
     try testing.expect(!w.wp.overlay.anyOpenFast());
     try testing.expectEqual(@as(usize, 0), w.wp.epochs.openCount());
+}
+
+test "THE DELETE'S DISCARD (the owner's ruling 2026-11-02, decision 0003 §DC): a deleted ino's parked blocks leave without landing — nothing minted, no device byte, each counted with the bytes written into it: at the delete every block whose guard is free (a W2 extent over a published block), and a block whose guard the delete found held keeps the mark and is dropped by the next landing point it meets — the upload, the D3 fold, the write-back timer's drain (which lands nothing); the destroy's settle finds nothing left and the mark leaves; a live ino's custody lands as ever" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, true);
+    defer w.deinit(testing.allocator);
+    // Ino 60: a fresh partial block 2 and a W2 extent over its published
+    // block 0 (an unaligned page); ino 61, live: a fresh partial block.
+    _ = try w.f.publishBlock(60, 0, 0xAA);
+    var tail: [1000]u8 = @splat(0x60);
+    _ = try w.wp.write(io, .{ .ino = 60, .offset = 2 * wt.BS, .payload = .{ .bytes = &tail }, .class = .entire_op, .file = World.striped(wt.BS) });
+    var page: [PAGE]u8 = @splat(0x61);
+    const file60 = World.striped(2 * wt.BS + tail.len);
+    try testing.expectEqual(@as(u32, 1), (try w.wp.write(io, .{ .ino = 60, .offset = 3 * PAGE + 100, .payload = .{ .bytes = &page }, .class = .shared, .file = file60 })).count(.extent));
+    try w.f.map.create(61, .striped, 0);
+    _ = try w.wp.write(io, .{ .ino = 61, .offset = 0, .payload = .{ .bytes = &tail }, .class = .entire_op, .file = World.striped(0) });
+    try testing.expect(w.wp.table.has(60, 0) and w.wp.table.has(60, 2) and w.wp.table.has(61, 0));
+    const mints0 = block_alloc.stats.alloc_fresh_mints.load() + block_alloc.stats.alloc_from_freelist.load();
+    const written0 = w.f.dev.writeBytesTotal();
+    const blocks0 = accumulate.stats.discard_at_delete_blocks.load();
+    const bytes0 = accumulate.stats.discard_at_delete_bytes.load();
+    // The delete with block 2's guard held (an upload's publish section):
+    // the extent leaves at once, block 2 stays, marked. (The two blocks'
+    // guards are distinct stripes.)
+    try testing.expect(w.wp.locks.stripeOf(60, 0) != w.wp.locks.stripeOf(60, 2));
+    {
+        const held = w.wp.locks.acquire(io, 60, 2, .settle);
+        defer held.release(io);
+        w.wp.noteDeleted(io, 60);
+    }
+    try testing.expect(w.wp.isDeleted(60) and !w.wp.isDeleted(61));
+    try testing.expect(!w.wp.table.has(60, 0) and w.wp.table.has(60, 2));
+    try testing.expectEqual(blocks0 + 1, accumulate.stats.discard_at_delete_blocks.load());
+    try testing.expectEqual(bytes0 + PAGE, accumulate.stats.discard_at_delete_bytes.load());
+    // The upload meets it before any mint.
+    var prof = pipeline.Prof.start();
+    try testing.expectEqual(accumulate.Disposition.discarded, accumulate.uploadParkedBlock(&w.wp.table, w.wp.uploadDeps(), io, 60, 2, 0, &prof));
+    prof.finish();
+    try testing.expect(!w.wp.table.has(60, 2));
+    try testing.expectEqual(bytes0 + PAGE + tail.len, accumulate.stats.discard_at_delete_bytes.load());
+    // Custody parked under the mark (the unit's own writes: a deleted file
+    // writes nothing) meets the fold and the timer's drain: dropped.
+    try testing.expectEqual(@as(u32, 1), (try w.wp.write(io, .{ .ino = 60, .offset = 3 * PAGE + 100, .payload = .{ .bytes = &page }, .class = .shared, .file = file60 })).count(.extent));
+    accumulate.foldExtentBlock(&w.wp.table, w.wp.uploadDeps(), io, 60, 0);
+    try testing.expect(!w.wp.table.has(60, 0));
+    _ = try w.wp.write(io, .{ .ino = 60, .offset = 3 * wt.BS, .payload = .{ .bytes = &tail }, .class = .entire_op, .file = file60 });
+    try testing.expectEqual(WritePath.AgedDrain{ .landed = false, .kept_born_ns = null }, w.wp.drainAged(io, 60, std.math.maxInt(u64)));
+    try testing.expect(!w.wp.table.has(60, 3));
+    try testing.expectEqual(blocks0 + 4, accumulate.stats.discard_at_delete_blocks.load());
+    try testing.expectEqual(mints0, block_alloc.stats.alloc_fresh_mints.load() + block_alloc.stats.alloc_from_freelist.load());
+    try testing.expectEqual(written0, w.f.dev.writeBytesTotal());
+    // The destroy's settle: nothing left; the mark leaves.
+    w.wp.settleDeleted(io, 60);
+    w.wp.unmarkDeleted(60);
+    try testing.expect(!w.wp.isDeleted(60));
+    try testing.expect(!w.wp.holdsCustody(60));
+    // The live ino's custody lands as ever.
+    w.wp.flushIno(io, 61);
+    try testing.expect(!w.wp.table.has(61, 0));
+    try testing.expect(w.f.map.seam().lookup(61, 0) != null);
+    try testing.expectEqual(blocks0 + 4, accumulate.stats.discard_at_delete_blocks.load());
 }
 
 test "the lost overwrite (2026-10-07, the smoke's dd-per-overwrite shape): a write landing on a block the OPEN epoch shadows takes the accumulation arm with the epoch's B as its base, never the map's stale A; after the save, the next flush seeds from B and its save displaces exactly what it parked — every acked byte readable, drift 0, nothing freed twice" {

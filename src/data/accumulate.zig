@@ -46,6 +46,7 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 const counters = @import("../core/counters.zig");
+const u64_map = @import("../core/u64_map.zig");
 const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
 const derive = @import("../core/derive.zig");
@@ -207,14 +208,24 @@ pub const stats = struct {
     /// `lowestBlockOf`): only after the ino's presence stripe read non-zero.
     /// The read row's probes never scan (`docs/evidence/rung-10-read-cost.md`).
     pub var parked_ino_scans: counters.ShardedCounter = .{};
+    /// THE DELETE'S DISCARD (`Deleted`): the parked blocks of a deleted
+    /// file dropped instead of landed, and the bytes written into them (a
+    /// full buffer's covered bytes, a W2 extent's merged ones).
+    pub var discard_at_delete_blocks: counters.ShardedCounter = .{};
+    pub var discard_at_delete_bytes: counters.ShardedCounter = .{};
+    /// Inos marked deleted whose destroy has not run yet (0 at quiescence).
+    pub var discard_at_delete_marks: counters.Gauge = .{};
+    /// A mark the set could not grow for (out of memory): the destroy's
+    /// discard still drops the custody; until it runs, an upload may land.
+    pub var discard_at_delete_mark_refusals: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_seed_read_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks", "parked_ino_scans", "reserved_landings", "reserved_landing_declines", "upload_join_overlong", "upload_join_refusals_taken" }) |name| {
+    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides", "drain_inplace_drains", "drain_inplace_pages", "drain_inplace_dmas", "drain_inplace_write_bytes", "drain_inplace_seed_bytes", "drain_inplace_declines", "drain_inplace_dma_errors", "drain_inplace_seed_read_errors", "drain_inplace_dirty_drains", "extent_cap_fallbacks", "parked_ino_scans", "reserved_landings", "reserved_landing_declines", "upload_join_overlong", "upload_join_refusals_taken", "discard_at_delete_blocks", "discard_at_delete_bytes", "discard_at_delete_mark_refusals" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load() });
+    try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},\"discard_at_delete_marks\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load(), stats.discard_at_delete_marks.load() });
     inline for (.{ "coverage_complete_buffer_not_content_valid", "complete_union_with_extra_runs", "zero_complete_on_deferred_seed", "active_block_table_full" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, counters.tripwireCount(name) });
@@ -1167,6 +1178,87 @@ pub const Table = struct {
 };
 
 // ---------------------------------------------------------------------------
+// The delete's discard (the owner's ruling 2026-11-02, decision 0003 §DC).
+// ---------------------------------------------------------------------------
+
+/// THE DELETE'S MARK: the inos whose last name is gone and whose last kernel
+/// reference returned (the final FORGET of an inode at nlink 0 — no fd, no
+/// mmap, no lookup reaches its bytes again), from that FORGET until their
+/// destroy's discard. A parked block of a marked ino is DISCARDED at every
+/// landing point instead of landed (`discardEntry`): nothing is minted, no
+/// byte is DMA'd for a file nobody can read. A deleted file writes nothing,
+/// so no custody is born after the mark; an upload already past its
+/// snapshot finishes (its publish finds the entry gone and returns its mint,
+/// or published first and the destroy frees the block). `count` is read
+/// with no lock: 0 ⇒ nothing marked, one load on every landing point.
+pub const Deleted = struct {
+    lock: jc.SpinLock = .{},
+    set: u64_map.U64Map(void) = .empty,
+    count: Atomic(usize) = .init(0),
+
+    pub fn deinit(self: *Deleted, gpa: Allocator) void {
+        stats.discard_at_delete_marks.sub(self.set.count());
+        self.set.deinit(gpa);
+        self.* = undefined;
+    }
+
+    /// `ino` is deleted. False: the set could not grow (counted) — the
+    /// destroy's discard still drops the custody.
+    pub fn mark(self: *Deleted, gpa: Allocator, ino: u64) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const gop = self.set.getOrPut(gpa, ino) catch {
+            stats.discard_at_delete_mark_refusals.inc();
+            return false;
+        };
+        if (!gop.found_existing) {
+            // Release: a landing point that loads the count non-zero takes
+            // the lock, which orders the insert before its lookup.
+            _ = self.count.fetchAdd(1, .release);
+            stats.discard_at_delete_marks.add(1);
+        }
+        return true;
+    }
+
+    pub fn has(self: *Deleted, ino: u64) bool {
+        if (self.count.load(.acquire) == 0) return false;
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.set.contains(ino);
+    }
+
+    /// The destroy discarded `ino`'s custody (or found it no corpse).
+    pub fn unmark(self: *Deleted, ino: u64) void {
+        if (self.count.load(.acquire) == 0) return;
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (!self.set.remove(ino)) return;
+        _ = self.count.fetchSub(1, .release);
+        stats.discard_at_delete_marks.sub(1);
+    }
+};
+
+/// A deleted file's parked entry leaves without landing — counted, its cell
+/// or pages returned. Under the caller's (3).
+pub fn discardEntry(table: *Table, e: *Entry) void {
+    stats.discard_at_delete_blocks.inc();
+    stats.discard_at_delete_bytes.add(switch (e.repr) {
+        .full => e.coverage.coveredBytes(),
+        .extent => |*x| x.bytes,
+    });
+    table.retire(e);
+}
+
+/// The landing points' check (under the caller's (3), the entry in hand):
+/// a deleted ino's entry is discarded, never landed.
+fn discardedAsDeleted(table: *Table, deps: UploadDeps, e: *Entry) bool {
+    const d = deps.deleted orelse return false;
+    if (!d.has(e.key.ino)) return false;
+    discardEntry(table, e);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // §5.3 Write-through: the pipeline upload.
 // ---------------------------------------------------------------------------
 
@@ -1220,6 +1312,9 @@ pub const UploadDeps = struct {
     /// The volume's FAILED/fenced probe an upload's fence drop is
     /// classified on (`pipeline.countDisposition`); null = healthy.
     fence: ?seams.FenceProbe = null,
+    /// The deleted inos (`Deleted`): their parked entries are discarded at
+    /// every landing point; null = none marked (the tests' default).
+    deleted: ?*Deleted = null,
 };
 
 /// The whole plaintext image of `b` into `out` (`image` when bound, else
@@ -1386,6 +1481,14 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                     settle.cancel(io);
                     return if (joined) .joined else .discarded;
                 };
+                // A deleted file's block is dropped before any mint; an
+                // upload of it in flight elsewhere finds the entry gone at
+                // its publish and returns its mint.
+                if (discardedAsDeleted(table, deps, e)) {
+                    settle.cancel(io);
+                    retired_by_us = true;
+                    return .discarded;
+                }
                 // The upload this task waited on left the block parked: its
                 // refusal IS the verdict (no second device wait).
                 if (joined_seq) |js| if (e.refused_seq == js) {
@@ -1705,6 +1808,11 @@ pub fn flushParkedBlockBy(table: *Table, deps: UploadDeps, io: Io, ino: u64, blo
         const g = deps.locks.acquire(io, ino, block, .writeback_flush);
         defer g.release(io);
         const e = table.get(ino, block) orelse return .discarded;
+        // A deleted file's block lands nowhere, in place or fresh.
+        if (discardedAsDeleted(table, deps, e)) {
+            table.capacity.notifyWaiters(io);
+            return .discarded;
+        }
         if (e.repr == .extent) {
             if (foldInPlaceLocked(table, deps, e)) |d| {
                 if (d == .published) table.capacity.notifyWaiters(io);
@@ -1771,6 +1879,10 @@ pub fn foldExtentBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block:
     const g = deps.locks.acquire(io, ino, block, .fold);
     defer g.release(io);
     const e = table.get(ino, block) orelse return;
+    if (discardedAsDeleted(table, deps, e)) {
+        table.capacity.notifyWaiters(io);
+        return;
+    }
     if (e.repr != .extent) return;
     if (foldInPlaceLocked(table, deps, e)) |d| {
         if (d == .published) table.capacity.notifyWaiters(io);

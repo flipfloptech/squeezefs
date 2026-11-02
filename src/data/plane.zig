@@ -2089,11 +2089,59 @@ pub const DataPlane = struct {
         self.releaseHolds().drop(bindings);
     }
 
-    /// A truncate or destroy begins: every write-side custody of `ino`
-    /// lands or drops, every detached upload of the mount lands — so the
-    /// layout the caller clips is the whole truth.
+    /// A truncate begins: every write-side custody of `ino` lands or drops
+    /// — so the layout the caller clips is the whole truth.
     pub fn flushCustody(self: *DataPlane, io: Io, ino: u64) void {
         self.wp.settleCustody(io, ino);
+    }
+
+    /// THE DELETE (the owner's ruling 2026-11-02, decision 0003 §DC): the
+    /// final FORGET of `ino` at nlink 0 (`kv_fs.forget`, on the FUSE drain
+    /// worker — never a park). No fd, mmap or lookup reaches its bytes
+    /// again, so they are discarded, never landed: marked, its parked
+    /// blocks dropped where their guard is free (`WritePath.noteDeleted`),
+    /// and every landing point and promotion drops what it meets of it
+    /// until its destroy.
+    pub fn discardAtDelete(self: *DataPlane, ino: u64) void {
+        // Nothing parked and no write cache: nothing to discard or decline.
+        if (self.stage == null and !self.wp.table.mayHoldIno(ino)) return;
+        self.wp.noteDeleted(self.io, ino);
+    }
+
+    /// The destroy's settle of a deleted file (`kv_fs.destroyCorpses` (1),
+    /// before its plan): the striped custody (`WritePath.settleDeleted`)
+    /// and the write cache's resident `staged` names — released with its
+    /// claim on the store, never promoted — then the mark leaves.
+    pub fn discardAtDestroy(self: *DataPlane, io: Io, ino: u64, striped: bool, staged: ?staging.StagingKey) void {
+        defer self.wp.unmarkDeleted(ino);
+        if (!striped and staged == null) {
+            self.wp.discardParked(io, ino, .blocking);
+            return;
+        }
+        // Marked across the settle: a promotion or a landing that meets the
+        // ino meanwhile drops it too (a deferred judgement marked nothing).
+        self.wp.markDeleted(ino);
+        if (striped) self.wp.settleDeleted(io, ino) else self.wp.discardParked(io, ino, .blocking);
+        if (staged) |k| self.discardResident(k);
+    }
+
+    /// The destroy found `ino` no corpse to settle (no record, or a link
+    /// raised its count): the delete's mark leaves.
+    pub fn clearDeleted(self: *DataPlane, ino: u64) void {
+        self.wp.unmarkDeleted(ino);
+    }
+
+    /// A deleted file's resident leaves the ring with its claim — whatever
+    /// generation is resident: nothing writes a deleted file.
+    fn discardResident(self: *DataPlane, k: staging.StagingKey) void {
+        const st = &(self.stage orelse return);
+        const lease = st.seg.get(k) orelse return;
+        const generation = lease.generation();
+        const len = lease.bytes().len;
+        lease.release();
+        if (!staging.releaseStaged(&st.pool, &st.seg, st.cache, k, generation)) return;
+        staging.stats.discard_at_delete_residents.inc();
+        staging.stats.discard_at_delete_resident_bytes.add(len);
     }
 
     /// RELEASE (the no-open posture: a FLUSH that found custody, or the
@@ -2599,20 +2647,30 @@ pub const DataPlane = struct {
         defer lease.release();
         const generation = lease.generation();
         const image = lease.bytes();
-        const dismount_corpse = pass == .dismount and self.inoIsCorpse(ino);
-        const out: Promoted = if (dismount_corpse) .{ .ok = false } else self.promoteLocked(io, ino, k, generation, image);
+        // A deleted file's resident (decision 0003 §DC) is never promoted:
+        // read under the locks, so a promotion the delete's mark missed
+        // finished before the destroy's plan takes them.
+        const deleted = self.wp.isDeleted(ino);
+        const dismount_corpse = !deleted and pass == .dismount and self.inoIsCorpse(ino);
+        const out: Promoted = if (deleted or dismount_corpse) .{ .ok = false } else self.promoteLocked(io, ino, k, generation, image);
         // A spilled block (`writeback.blockKey`) is custody no layout names
         // by design: judged by its ino alone, never unnamed.
         const unnamed = out.unnamed and writeback.blockOfKey(k) == null;
         // A live point's FAILED promotion of a corpse's resident (the
         // record read only then: a landing never pays it) owes nothing
         // (`LiveVerdict.corpse`); the dismount pass destroys it.
-        const corpse = dismount_corpse or (!out.ok and !unnamed and self.inoIsCorpse(ino));
+        const corpse = deleted or dismount_corpse or (!out.ok and !unnamed and self.inoIsCorpse(ino));
         const verdict: Under = if (out.ok) .promoted else if (corpse) .corpse else if (unnamed) .unnamed else if (out.no_space) .no_space else .kept;
-        // The dismount pass destroys what nothing names; a live point leaves
-        // an unnamed record to the release already on its way (the
-        // committed publish's `afterCommit`) or to the open file's FORGET.
-        if (pass == .dismount and (verdict == .corpse or verdict == .unnamed)) {
+        // The dismount pass destroys what nothing names, and every pass a
+        // deleted file's resident; a live point leaves an unnamed record to
+        // the release already on its way (the committed publish's
+        // `afterCommit`) or to the open file's FORGET.
+        if (deleted) {
+            if (staging.releaseStaged(&st.pool, &st.seg, st.cache, k, generation)) {
+                staging.stats.discard_at_delete_residents.inc();
+                staging.stats.discard_at_delete_resident_bytes.add(image.len);
+            }
+        } else if (pass == .dismount and (verdict == .corpse or verdict == .unnamed)) {
             log.debug("dismount promotion ino {d}: {s} record destroyed ({d} B)", .{ ino, @tagName(verdict), image.len });
             _ = staging.releaseStaged(&st.pool, &st.seg, st.cache, k, generation);
         }

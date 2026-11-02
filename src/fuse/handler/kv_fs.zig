@@ -823,10 +823,6 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The reclaim gather.
         reclaim_lock: jc.SpinLock = .{},
         reclaim: std.ArrayList(u64) = .empty,
-        /// The destroy passes in flight, each its batch on its drainer's
-        /// stack (`drainGather`), under `reclaim_lock`: with the gather,
-        /// the corpses `corpseUpstream` owns.
-        passes: ?*Pass = null,
         /// The reclaim cadence's wake (it parks on it with its tick as the
         /// deadline): a gather that fills a batch notifies it — the destroy
         /// is never the forgetting thread's (`gatherCorpse`).
@@ -2115,9 +2111,21 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         /// The write-side custody of a regular file lands or drops before a
-        /// layout is clipped (truncate, O_TRUNC, destroy of a striped corpse).
+        /// layout is clipped (truncate, O_TRUNC).
         fn settleCustody(self: *Self, ino: u64, kind: layout.Kind) void {
             if (kind == .striped and self.data.hasVolumes()) self.data.flushCustody(self.io, ino);
+        }
+
+        /// A corpse's write-side custody at its destroy (the owner's ruling
+        /// 2026-11-02, decision 0003 §DC): DISCARDED, never landed — its
+        /// parked blocks and its write cache's resident with its claim; the
+        /// overlay records and the epoch, whose bytes the device already
+        /// holds, land so the plan names their blocks.
+        fn discardCustody(self: *Self, ino: u64, rec: ?LayoutRec) void {
+            if (!self.data.hasVolumes()) return;
+            const kind = kindOf(rec);
+            const staged: ?staging.StagingKey = if (kind == .staged) stagingKeyOf(ino, rec.?.layout) else null;
+            self.data.discardAtDestroy(self.io, ino, kind == .striped, staged);
         }
 
         // ---- truncate ----
@@ -2470,7 +2478,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             };
             switch (judged) {
                 .live => {},
-                .corpse => self.gatherCorpse(c, local),
+                .corpse => {
+                    // THE DELETE (decision 0003 §DC): the last name is gone
+                    // and the kernel returned its last reference — no fd,
+                    // mmap or lookup reaches these bytes again. A deferred
+                    // judgement proves nothing: its destroy's re-read does.
+                    if (self.data.hasVolumes()) self.data.discardAtDelete(local);
+                    self.gatherCorpse(c, local);
+                },
                 .deferred => {
                     fuse_forget_judgements_deferred.inc();
                     self.gatherCorpse(c, local);
@@ -2521,29 +2536,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// destroy on the caller's thread (`gatherCorpse`'s law). Bound by
         /// the mount once `self` stands at its address.
         pub fn corpseUpstream(self: *Self) reclaim_mod.Reclaimer.Upstream {
-            return .{ .ctx = self, .pending = &corpsesPendingOf, .kick = &kickCorpses, .owns = &corpseOwnsOf };
+            return .{ .ctx = self, .pending = &corpsesPendingOf, .kick = &kickCorpses };
         }
 
         fn corpsesPendingOf(ctx: *anyopaque) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
             return self.corpses_pending.load(.acquire) != 0;
-        }
-
-        /// `ino`'s corpse is gathered or inside a destroy pass: the pass
-        /// settles its custody before it frees, so the gather is no supply
-        /// for that custody's own mints (decision 0003 §CW). A scan, read
-        /// only on the full-store park path once the reclaimer's cheaper
-        /// conjuncts (queued, processing, held) are all empty.
-        fn corpseOwnsOf(ctx: *anyopaque, ino: u64) bool {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            self.reclaim_lock.lock();
-            defer self.reclaim_lock.unlock();
-            if (std.mem.indexOfScalar(u64, self.reclaim.items, ino) != null) return true;
-            var p = self.passes;
-            while (p) |pass| : (p = pass.next) {
-                if (std.mem.indexOfScalar(u64, pass.inos, ino) != null) return true;
-            }
-            return false;
         }
 
         fn kickCorpses(ctx: *anyopaque) void {
@@ -2587,23 +2585,19 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn drainGather(self: *Self, c: *Ctx, min_batch: usize, tick: bool) Error!void {
             while (true) {
                 var batch: [RECLAIM_BATCH]u64 = undefined;
-                var pass: Pass = .{ .inos = &.{} };
+                var n: usize = 0;
                 {
                     self.reclaim_lock.lock();
                     defer self.reclaim_lock.unlock();
                     if (self.reclaim.items.len < min_batch) break;
-                    var got: usize = 0;
-                    while (got < RECLAIM_BATCH and self.reclaim.items.len > 0) : (got += 1) batch[got] = self.reclaim.pop().?;
-                    if (got == 0) break;
-                    pass = .{ .inos = batch[0..got], .next = self.passes };
-                    self.passes = &pass;
+                    while (n < RECLAIM_BATCH and self.reclaim.items.len > 0) : (n += 1) batch[n] = self.reclaim.pop().?;
                 }
-                const n = pass.inos.len;
+                if (n == 0) break;
                 var deferred: Deferred = .{};
                 // The pass's frees reached the plane (or it failed): its
                 // corpses leave the pending count after a deferred one
-                // rejoined the gather, then the pass leaves the owned set.
-                defer self.endPass(&pass);
+                // rejoined the gather.
+                defer self.noteCorpsesDone(n);
                 try self.destroyCorpses(c, batch[0..n], &deferred);
                 if (deferred.n != 0) {
                     self.regather(deferred.slice());
@@ -2612,23 +2606,6 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 }
             }
             if (tick and self.space_deferred.swap(false, .acq_rel)) log.info("kv_fs: the deferred corpse destroys landed — the metadata heap took every one", .{});
-        }
-
-        /// A destroy pass in flight: its batch, on its drainer's stack,
-        /// linked into `passes` until the pass returns.
-        const Pass = struct { inos: []const u64, next: ?*Pass = null };
-
-        fn endPass(self: *Self, pass: *Pass) void {
-            self.noteCorpsesDone(pass.inos.len);
-            self.reclaim_lock.lock();
-            defer self.reclaim_lock.unlock();
-            var at = &self.passes;
-            while (at.*) |p| : (at = &p.next) {
-                if (p == pass) {
-                    at.* = p.next;
-                    return;
-                }
-            }
         }
 
         /// The corpses a destroy pass left for a later one: the heap refused
@@ -2751,13 +2728,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// greedily under the whole-entry cap; the blocks go to the
         /// reclaimer AFTER the commit (RES-1).
         ///
-        /// The order is the contract. (1) A striped corpse's write-side
-        /// custody SETTLES first, with no lock held: the flush's own merge
-        /// republishes the layout onto the blocks it uploaded and frees the
-        /// ones it displaced. (2) THEN every corpse's (3.7) layout lock,
-        /// held across the plan read AND the destroy commit, so the plan
-        /// names exactly the bindings the record carries at the commit
-        /// (the plane's promotion of a staged corpse takes the same lock).
+        /// The order is the contract. (1) A corpse's write-side custody
+        /// SETTLES first, with no lock held (`discardCustody`: its parked
+        /// bytes and its resident discarded, decision 0003 §DC): the
+        /// overlay's and the epoch's own merges republish the layout onto
+        /// the blocks they wrote and free the ones they displaced. (2) THEN
+        /// every corpse's (3.7) layout lock, held across the plan read AND
+        /// the destroy commit, so the plan names exactly the bindings the
+        /// record carries at the commit (the plane's promotion of a staged
+        /// corpse takes the same lock).
         /// A plan read BEFORE the settle named the displaced block — freed
         /// twice — and never the fresh one: its `+ref` stayed durable
         /// forever (fstests generic/013: fsstress write+truncate+unlink,
@@ -2781,12 +2760,17 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var live: [RECLAIM_BATCH]u64 = undefined;
             var n_live: usize = 0;
             for (corpses) |ino| {
-                const v = (try self.readInodeOpt(ino)) orelse continue;
-                if (v.nlink != 0) continue;
+                const v = (try self.readInodeOpt(ino)) orelse {
+                    self.data.clearDeleted(ino);
+                    continue;
+                };
+                if (v.nlink != 0) {
+                    self.data.clearDeleted(ino);
+                    continue;
+                }
                 const rec = try self.readLayout(ino);
-                const kind = kindOf(rec);
-                self.freeLayout(rec);
-                self.settleCustody(ino, kind);
+                defer self.freeLayout(rec);
+                self.discardCustody(ino, rec);
                 live[n_live] = ino;
                 n_live += 1;
             }
@@ -6111,6 +6095,9 @@ pub const NoData = struct {
     pub fn dropReleases(_: *NoData, _: []const layout.MapEntry) void {}
     pub fn freeBindings(_: *NoData, _: Io, _: []const Mapping) void {}
     pub fn flushCustody(_: *NoData, _: Io, _: u64) void {}
+    pub fn discardAtDelete(_: *NoData, _: u64) void {}
+    pub fn discardAtDestroy(_: *NoData, _: Io, _: u64, _: bool, _: ?staging.StagingKey) void {}
+    pub fn clearDeleted(_: *NoData, _: u64) void {}
     pub fn flushAllCustody(_: *NoData, _: Io) void {}
     pub fn releaseIno(_: *NoData, _: Io, _: u64) void {}
     pub fn drainAged(_: *NoData, _: Io, _: u64, _: u64) open_table.Drained {
@@ -6953,6 +6940,12 @@ const SettlingData = struct {
     /// `from` → `to`.
     merge: ?struct { ino: u64, size: u64, from: Mapping, to: Mapping } = null,
     flushes: u32 = 0,
+    /// The deletes (`discardAtDelete`), the destroy's discards with what
+    /// the destroy named (`discardAtDestroy`), and the marks it cleared
+    /// for inos it found no corpse (`clearDeleted`).
+    deletes: std.ArrayList(u64) = .empty,
+    destroy_discards: std.ArrayList(struct { ino: u64, striped: bool, staged: ?staging.StagingKey }) = .empty,
+    cleared: std.ArrayList(u64) = .empty,
     /// The last extension law asked of the plane (`zeroExtension`) and
     /// the custody flushes that had run before it.
     extension: ?struct { old_size: u64, new_size: u64, flushes_before: u32 } = null,
@@ -6971,7 +6964,8 @@ const SettlingData = struct {
     data_barriers: u32 = 0,
     barrier_inos: usize = 0,
     in_release: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) void } = null,
-    /// Runs inside `flushCustody` (the settle): the times drain racing it.
+    /// Runs inside the settle (`flushCustody`, `discardAtDestroy`): the
+    /// times drain racing it.
     on_flush: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) void } = null,
     write_back_drains: u32 = 0,
     /// The (3.7) balance observed inside the flush: a held lock there is
@@ -7096,6 +7090,9 @@ const SettlingData = struct {
         self.releases.deinit(testing.allocator);
         self.held.deinit(testing.allocator);
         self.writes.deinit(testing.allocator);
+        self.deletes.deinit(testing.allocator);
+        self.destroy_discards.deinit(testing.allocator);
+        self.cleared.deinit(testing.allocator);
     }
 
     fn commitsNow(self: *const SettlingData) u64 {
@@ -7237,6 +7234,24 @@ const SettlingData = struct {
     /// The custody lands: the plane's merge under its own (3.5)+(3.7).
     pub fn flushCustody(self: *SettlingData, io: Io, ino: u64) void {
         self.flushes += 1;
+        self.settle(io, ino);
+    }
+    /// The delete: the ino's custody discarded, never landed.
+    pub fn discardAtDelete(self: *SettlingData, ino: u64) void {
+        self.deletes.append(testing.allocator, ino) catch unreachable;
+        if (self.custody_of == ino) self.custody_of = null;
+    }
+    /// The destroy's settle: the parked custody discarded, the custody whose
+    /// bytes the device holds (the armed merge: an epoch's save) landed.
+    pub fn discardAtDestroy(self: *SettlingData, io: Io, ino: u64, striped: bool, staged: ?staging.StagingKey) void {
+        self.destroy_discards.append(testing.allocator, .{ .ino = ino, .striped = striped, .staged = staged }) catch unreachable;
+        if (self.custody_of == ino) self.custody_of = null;
+        self.settle(io, ino);
+    }
+    pub fn clearDeleted(self: *SettlingData, ino: u64) void {
+        self.cleared.append(testing.allocator, ino) catch unreachable;
+    }
+    fn settle(self: *SettlingData, io: Io, ino: u64) void {
         self.locks_held_at_flush = self.base.layout_lock_held;
         self.locks_taken_at_flush = self.base.layout_locks_taken;
         if (self.on_flush) |h| h.call(h.ctx);
@@ -7463,7 +7478,8 @@ test "the corpse destroy settles the write-side custody BEFORE it reads the layo
     const from = Mapping.wholeBlock(0x11, 0, 1);
     const to = Mapping.wholeBlock(0x11, layout.DEFAULT_CHUNK, 2);
     // The own-block shape: striped over `from`; the write side holds
-    // custody of block 0 that lands as `to` when the destroy settles it.
+    // custody of block 0 whose bytes the device already holds (an epoch's
+    // save) that lands as `to` when the destroy settles it.
     try h.data.publishStriped(lf, size, null, from);
     h.data.merge = .{ .ino = lf, .size = size, .from = from, .to = to };
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "f" } }, 1).errno());
@@ -7488,9 +7504,11 @@ test "the corpse destroy settles the write-side custody BEFORE it reads the layo
     try testing.expectEqual(from.blockIdx(layout.DEFAULT_CHUNK), h.data.releases.items[0].block_idx);
     try testing.expectEqual(@as(usize, 0), h.store.countKind(key.TREE_BLOCK_REFS));
     try testing.expectEqual(@as(usize, 0), h.store.countKind(key.TREE_XATTRS));
-    // The custody settled exactly once, with no (3.7) held (the plane's
+    // The custody settled exactly once, through the destroy's discard
+    // (never the truncate's landing), with no (3.7) held (the plane's
     // merge takes it) and before the destroy's own acquisition.
-    try testing.expectEqual(@as(u32, 1), h.data.flushes);
+    try testing.expectEqual(@as(usize, 1), h.data.destroy_discards.items.len);
+    try testing.expectEqual(@as(u32, 0), h.data.flushes);
     try testing.expectEqual(@as(u32, 0), h.data.locks_held_at_flush);
     try testing.expectEqual(@as(u32, 0), h.data.locks_taken_at_flush);
     try testing.expectEqual(@as(u32, 1), h.data.base.layout_locks_taken);
@@ -11019,59 +11037,65 @@ test "the corpse gather is the data plane's upstream supply (decision 0003 §CR)
     try testing.expectEqual(@as(u64, 0), fuse_reclaim_gathered.load());
 }
 
-test "the corpse gather OWNS its corpses until their destroy pass returns (decision 0003 §CW): a gathered corpse is owned and a live file never is; inside the pass's settle the corpse is owned and the gather still pending — the settle's own mints are not parked on the gather they hold up; once the pass returns nothing is owned, nothing pending" {
+test "THE DELETE discards a corpse's custody and never lands it (the owner's ruling 2026-11-02, decision 0003 §DC): the FORGET that proves a corpse — nlink 0, the kernel's last reference returned — hands it to the data plane's discard at once; a live file's forget and a deferred judgement (the try-only read refused) discard nothing there; the destroy re-judges every gathered ino, discards each corpse's custody before its plan — the striped kind named, a staged corpse's resident named by its key, nothing landed through the truncate's settle — and clears the delete's mark of an ino it finds live" {
     const H = HarnessOf(SettlingData);
     var h: H = undefined;
     try h.init();
     defer h.deinit();
     defer h.data.deinit();
     h.data.store = &h.store;
-    const up = h.fs.corpseUpstream();
     const f = try h.create(1, "f", 0o644);
     const lf = try H.Fs.localOf(f);
-    const live = try h.create(1, "live", 0o644);
-    const llive = try H.Fs.localOf(live);
+    const d = try h.create(1, "d", 0o644);
+    const ld = try H.Fs.localOf(d);
+    const g = try h.create(1, "g", 0o644);
+    const e = try h.create(1, "e", 0o644);
+    const le = try H.Fs.localOf(e);
     try h.data.publishStriped(lf, 1 << 20, null, Mapping.wholeBlock(0x11, 0, 1));
-    try testing.expect(!up.owns(up.ctx, lf));
+    const fid: layout.FileId = @splat(9);
+    try fiemapPublish(&h, ld, Layout.staged(100, fid, null), &.{});
+    h.data.custody_of = lf;
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "f" } }, 1).errno());
-    h.release(f);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "d" } }, 1).errno());
+    for ([_]u64{ f, d, g, e }) |x| h.release(x);
+    // A live file's last forget: nothing discarded, nothing gathered.
+    h.forget(g, 1);
+    try testing.expectEqual(@as(usize, 0), h.data.deletes.items.len);
+    try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
+    // f's FORGET proves its corpse: its custody discarded at once.
     h.forget(f, 1);
-    try testing.expect(up.pending(up.ctx));
-    try testing.expect(up.owns(up.ctx, lf));
-    try testing.expect(!up.owns(up.ctx, llive));
-    // The settle runs inside the pass: the corpse is off the gather list
-    // and on the pass.
-    const AtSettle = struct {
-        var upstream: *const reclaim_mod.Reclaimer.Upstream = undefined;
-        var ino: u64 = 0;
-        var owned: ?bool = null;
-        var pending: ?bool = null;
-        var gathered: usize = 0;
-        var hp: *H = undefined;
-        fn run(_: *anyopaque) void {
-            owned = upstream.owns(upstream.ctx, ino);
-            pending = upstream.pending(upstream.ctx);
-            gathered = hp.fs.reclaim.items.len;
-        }
-    };
-    AtSettle.upstream = &up;
-    AtSettle.ino = lf;
-    AtSettle.hp = &h;
-    h.data.on_flush = .{ .ctx = &h, .call = &AtSettle.run };
-    defer h.data.on_flush = null;
+    try testing.expectEqualSlices(u64, &.{lf}, h.data.deletes.items);
+    try testing.expectEqual(@as(?u64, null), h.data.custody_of);
+    // d's and e's reads refused: gathered unjudged, nothing discarded.
+    h.store.try_only_refusals = 1;
+    h.forget(d, 1);
+    h.store.try_only_refusals = 1;
+    h.forget(e, 1);
+    try testing.expectEqualSlices(u64, &.{lf}, h.data.deletes.items);
+    try testing.expectEqual(@as(usize, 3), h.fs.reclaim.items.len);
     var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
     var win: [16]u8 = undefined;
     var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
     try h.fs.reclaimDrain(&c);
     tr.finish();
-    try testing.expectEqual(@as(u32, 1), h.data.flushes);
-    try testing.expectEqual(@as(usize, 0), AtSettle.gathered);
-    try testing.expectEqual(@as(?bool, true), AtSettle.owned);
-    try testing.expectEqual(@as(?bool, true), AtSettle.pending);
-    try testing.expect(!up.pending(up.ctx));
-    try testing.expect(!up.owns(up.ctx, lf));
-    try testing.expect(h.fs.passes == null);
-    h.release(live);
+    // The two corpses discarded (f striped; d staged, its resident named),
+    // the live e's mark cleared, nothing landed.
+    try testing.expectEqual(@as(usize, 2), h.data.destroy_discards.items.len);
+    for (h.data.destroy_discards.items) |x| {
+        if (x.ino == lf) {
+            try testing.expect(x.striped);
+            try testing.expectEqual(@as(?staging.StagingKey, null), x.staged);
+        } else {
+            try testing.expectEqual(ld, x.ino);
+            try testing.expect(!x.striped);
+            try testing.expect(x.staged.?.eql(staging.StagingKey.init(fid, ld)));
+        }
+    }
+    try testing.expectEqualSlices(u64, &.{le}, h.data.cleared.items);
+    try testing.expectEqual(@as(u32, 0), h.data.flushes);
+    try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+    try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, d).errno().?);
+    try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
 }
 
 test "the corpse sweep at mount: an unlinked file whose FORGET died with the daemon (nlink 0, no dentry) is destroyed by the next mount's sweep with its layout; live files are untouched; a clean store sweeps nothing" {

@@ -846,7 +846,7 @@ fn prMatrixLeg(transport: configfs.Trtype) !void {
     try expectNoResidue(rig, nqn);
 }
 
-test "nvmet fidelity: pr-matrix-loop — the real reservation legs (RESCAP, EDS-first, idempotent register, the spec-strict own-stale ladder, the two-identity WE fence as -EBADE, All Registrants rtype 5 with the fencing binding, the holder's preempt of a registrant's key, preempt-and-abort, zero residue, shared identity) on nvmet-loop" {
+test "nvmet fidelity: pr-matrix-loop — the real reservation legs (RESCAP, EDS-first, idempotent register, the spec-strict own-stale ladder, the two-identity WE fence as -EBADE, WERO rtype 3 with the fencing binding, the holder's preempt of a registrant's key (a no-op on nvmet 7.3 under WERO, spec under rtype 5), preempt-and-abort, zero residue, shared identity) on nvmet-loop" {
     try prMatrixLeg(.loop);
 }
 
@@ -1547,7 +1547,7 @@ fn statNumber(text: []const u8, key: []const u8) !u64 {
     };
 }
 
-test "nvmet fidelity: co-located mounts — ONE host identity for every mount of a set on a host (owner ruling 2026-11-02, option C): a symmetric set on nvmet-loop, the manager A and a joiner B on this host under the one identity; ONE controller of the data subsystem serves both; ONE registration of the host (regctl 1) under the manager's All Registrants hold (rtype 5), A registered it, B adopted it (the same key, no device mutation); both read each other's files; B's umount leaves the shared association and the registration standing (A reads B's file and writes on), A's umount releases both (no controller, regctl 0)" {
+test "nvmet fidelity: co-located mounts — ONE host identity for every mount of a set on a host (owner ruling 2026-11-02, option C): a symmetric set on nvmet-loop, the manager A and a joiner B on this host under the one identity; ONE controller of the data subsystem serves both; ONE registration of the host (regctl 1) under the manager's WERO hold, A registered it, B adopted it (the same key, no device mutation); both read each other's files; B's umount leaves the shared association and the registration standing (A reads B's file and writes on), A's umount releases both (no controller, regctl 0)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -1563,7 +1563,7 @@ test "nvmet fidelity: co-located mounts — ONE host identity for every mount of
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
         try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
-        try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
+        try testing.expectEqual(@as(?u64, nvme.RTYPE_WERO), json_scan.number(rr, "rtype"));
         const sa = try rig.stats(a);
         defer gpa.free(sa);
         const sb = try rig.stats(b);
@@ -1631,7 +1631,7 @@ fn readyOrDead(rig: *Rig, d: usize) !bool {
 
 const ident_c: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0", .hostid = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0" };
 
-test "nvmet fidelity: stale sibling — one manager per volume and per-host fencing's safety rule on a three-host set: B (host A's manager) and A (a joiner on host A) under host A's one identity (B registers the host, A adopts); B frozen (SIGSTOP) past the claim's TTL; two successors on hosts B and C race for the role — P1 arbitrates and parks before its claim (SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD), P2 arbitrates meanwhile: the device keeps ONE holder (WERO), so P2's acquire conflicts and preempts P1's host, P2 binds and P1, released, never does (review round 3 N1: under rtype 5 both bound); host A was fenced by the takeover — A's fsync refused; a fresh mount on host A whose kill of B is refused (SQUEEZEFS_TEST_SIBLING_KILL_REFUSED) refuses its registration loud by name and exits, B alive; A2 kills the superseded manager B before it registers host A (pr_stale_sibling_kills 1), joins P2 and writes; P2 reads it" {
+test "nvmet fidelity: stale sibling — one manager per volume and per-host fencing's safety rule on a three-host set: B (host A's manager) and A (a joiner on host A) under host A's one identity (B registers the host, A adopts); B frozen (SIGSTOP) past the claim's TTL; two successors on hosts B and C race for the role — P1 arbitrates and parks before its claim (SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD), P2 arbitrates meanwhile: the device keeps ONE holder (WERO), so P2's acquire conflicts and preempts P1's host, P2 binds and P1, released, never does (review round 3 N1: under rtype 5 both bound); host A was fenced by the takeover — A's fsync refused; a fresh mount on host A whose kill of B is refused (SQUEEZEFS_TEST_SIBLING_KILL_REFUSED) refuses its registration loud by name and exits, B alive; A2 kills the superseded manager B (and A, if evicted meanwhile) before it registers host A, joins P2 and writes; P2 reads it" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -1684,8 +1684,10 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
     // ONE manager: the later arbiter (P2) preempted P1's host; P1 never binds.
     try testing.expect(p2_ready);
     try testing.expect(!p1_ready);
-    // Host A was fenced by the takeover (B's key, host A's, preempted).
-    try testing.expect(!try scriptSucceeds(rig, a, "echo x > da/z && sync -d da/z"));
+    // Host A was fenced by the takeover (B's key, host A's, preempted): A's
+    // fsync is refused at the device (or A, parked past its bound, is gone).
+    const a_wrote = scriptSucceeds(rig, a, "echo x > da/z && sync -d da/z") catch false;
+    try testing.expect(!a_wrote);
     {
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
@@ -1705,8 +1707,11 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
         try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
         const text = try rig.readLog(r);
         defer gpa.free(text);
-        var nb: [64]u8 = undefined;
-        try testing.expect(std.mem.indexOf(u8, text, try std.fmt.bufPrint(&nb, "REFUSING to register this host: the stale sibling pid {d}", .{pid_b})) != null);
+        // B, or A (evicted while its manager was gone, its region recovered by
+        // P2) — whichever stale sibling the rule meets first is named.
+        const named = std.mem.indexOf(u8, text, "REFUSING to register this host: the stale sibling pid ") != null;
+        if (!named) std.debug.print("\n--- the refused mount's log ---\n{s}\n", .{text});
+        try testing.expect(named);
         try testing.expect(alive(pid_b));
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
@@ -1719,7 +1724,7 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
     {
         const s2 = try rig.stats(a2);
         defer gpa.free(s2);
-        try testing.expectEqual(@as(u64, 1), try statNumber(s2, "pr_stale_sibling_kills"));
+        try testing.expect(try statNumber(s2, "pr_stale_sibling_kills") >= 1);
         try testing.expectEqual(@as(u64, 1), try statNumber(s2, "pr_host_registrations"));
         try testing.expectEqual(@as(u64, 0), try statNumber(s2, "pr_stale_sibling_refusals"));
     }

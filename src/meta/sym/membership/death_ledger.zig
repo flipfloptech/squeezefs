@@ -280,7 +280,13 @@ pub const Ledger = struct {
             const id = shard.writerMemberId(req.member);
             listed_live = o.memberIsLive(id, now_ms);
             registered = o.registeredKey(id);
-            if (o.holdsKeyElsewhere(req.pr_key, req.member.node_token)) n_held = 1;
+            // The held-key check answers only for a member the census does
+            // not know (review round 3, major 5): a known member's key is
+            // checked against its registration — a host's key outlives its
+            // reboot (its node token does not), so a pre-reboot member's
+            // death is never refused because the rebooted host's new mount
+            // holds the same key.
+            if (registered == null and o.holdsKeyElsewhere(req.pr_key, req.member.node_token)) n_held = 1;
         }
         const b: screen.DeathBounds = .{ .own = self.own, .listed_live = listed_live, .registered_key = registered, .held_keys = held[0..n_held] };
         const v = screen.recordDeath(req, &b);
@@ -661,6 +667,12 @@ test "the screen: own identity, a live member, a key the census holds on another
     // key member 3 holds: its host's key (decision 0003 §DF) — accepted.
     const sibling: WriterIdentity = .{ .node_token = wid(3).node_token, .mount_slot = 77, .writer_id = 0xB077 };
     try testing.expect(l.screenDeath(req.of(wireOf(sibling), 0x33), &o, 0).isOk());
+    // A member the census knows under 0x55, past its deadline, while the
+    // rebooted host's new mount (another node token) holds 0x55 live: its
+    // death matches its registration — accepted (round 3, major 5).
+    _ = o.join(.{ .id = shard.writerMemberId(wireOf(wid(5))), .role = .writer, .endpoint = .none, .pid = 1, .boot = @splat(0), .prior_epoch = null, .pr_key = 0x55, .mount = "/m5", .row = null }, 0).granted;
+    _ = o.join(.{ .id = shard.writerMemberId(wireOf(wid(6))), .role = .writer, .endpoint = .none, .pid = 1, .boot = @splat(0), .prior_epoch = null, .pr_key = 0x55, .mount = "/m6", .row = null }, 46_000).granted;
+    try testing.expect(l.screenDeath(req.of(wireOf(wid(5)), 0x55), &o, 46_000).isOk());
     // Past T_owner the member is evicted: its key stays HELD (departed,
     // 2 × T_owner) so a word naming it for anyone is a contradiction; a
     // word naming an unknown key for the now-unregistered member is kept

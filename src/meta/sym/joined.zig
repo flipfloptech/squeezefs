@@ -80,6 +80,8 @@ comptime {
 }
 
 const KvBackend = backend.KvBackend;
+const device_loader = @import("../device_loader.zig");
+const superblock = @import("../superblock.zig");
 
 pub const stats = struct {
     /// Volumes this process holds as a JOINED appender.
@@ -1107,7 +1109,7 @@ pub const JoinedSet = struct {
         be.smo_lock.lockUncancelable(be.io);
         _ = be.lane.latch.failStop();
         be.smo_lock.unlock(be.io);
-        if (self.fence) |f| f.declareRetired(self.appenderId());
+        if (self.fence) |f| f.declareRetired(self.appenderId(), self.core().page.term);
         self.gate.open();
         return .{ .drained = drained, .head = be.core.headPos(), .open = be.reg.openCount() };
     }
@@ -1130,53 +1132,58 @@ pub const JoinedSet = struct {
         };
         const loc = dir.locate(self.appenderId(), dir.pairCount(be.sb.node_size));
         if (loc.chain_index >= links.items.len) return null;
-        return pageAtPair(&reader_ctx, links.items[loc.chain_index].extent, loc.pair);
+        return pageAtPair(reader, links.items[loc.chain_index].extent, loc.pair);
     }
 
     /// The newest valid image of one directory pair's appender over its
     /// FOUR slots: the pair and — once a directory image names a first
     /// segment — the two ring-side slots a recovery writes through.
-    fn pageAtPair(reader_ctx: *DevicePages, extent: dir.Extent, pair: u32) OpenError!?page.Page {
+    fn pageAtPair(reader: dir.PageReader, extent: dir.Extent, pair: u32) OpenError!?page.Page {
         const dir_slots = dir.pairOffsets(extent, pair);
         var bufs: [page.PAGE_SLOTS][page.PAGE_LEN]u8 = undefined;
         var imgs: [page.PAGE_SLOTS]?[]const u8 = .{ null, null, null, null };
         for (dir_slots, 0..) |off, i| {
-            DevicePages.read(reader_ctx, off, &bufs[i]) catch return error.Io;
+            reader.read(reader.ctx, off, &bufs[i]) catch return error.Io;
             imgs[i] = &bufs[i];
         }
         const dir_best = page.newestValid(.{ imgs[0], imgs[1], null, null }) catch return error.Corrupt;
         if (dir_best) |p| if (p.segments.len > 0) {
             for (page.ringSideOffsets(p.segments.items[0]), 2..) |off, i| {
-                DevicePages.read(reader_ctx, off, &bufs[i]) catch return error.Io;
+                reader.read(reader.ctx, off, &bufs[i]) catch return error.Io;
                 imgs[i] = &bufs[i];
             }
         };
         return page.newestValid(imgs) catch error.Corrupt;
     }
 
-    /// Every appender page of `be`'s volume as the device holds it NOW
-    /// (appender 0 + the directory, each over its four slots): the
+    /// Every appender page of a volume as the device holds it NOW (appender
+    /// 0 + the directory, each over its four slots), off the loader and the
+    /// superblock alone — a mount reads it before its first write: the
     /// stale-sibling rule's input (`guard/host_fence.zig`). Empty on a
     /// volume without the symmetric plane.
-    pub fn devicePages(gpa: Allocator, be: *KvBackend) error{ Io, Corrupt, OutOfMemory }![]page.Page {
+    pub fn devicePagesOn(gpa: Allocator, dev: *device_loader.DeviceLoader, sb: superblock.Superblock) error{ Io, Corrupt, OutOfMemory }![]page.Page {
         var out: std.ArrayList(page.Page) = .empty;
         errdefer out.deinit(gpa);
-        if (!be.sb.symmetricPlaneStamped()) return out.toOwnedSlice(gpa);
-        const p0 = readAppender0(gpa, be) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Corrupt => error.Corrupt,
-            else => error.Io,
-        };
-        if (p0) |p| try out.append(gpa, p);
+        if (!sb.symmetricPlaneStamped()) return out.toOwnedSlice(gpa);
+        var reader_ctx: LoaderPages = .{ .dev = dev, .gpa = gpa };
+        const reader: dir.PageReader = .{ .ctx = &reader_ctx, .read = &LoaderPages.read };
+        {
+            const offs = page.appender0PageOffsets(sb.journal.start);
+            var bufs: [4][page.PAGE_LEN]u8 = undefined;
+            var imgs: [4]?[]const u8 = .{ null, null, null, null };
+            for (offs, 0..) |off, i| {
+                try LoaderPages.read(&reader_ctx, off, &bufs[i]);
+                imgs[i] = &bufs[i];
+            }
+            if (page.newestValid(imgs) catch return error.Corrupt) |p0| try out.append(gpa, p0);
+        }
         var links: std.ArrayList(dir.Link) = .empty;
         defer links.deinit(gpa);
-        var reader_ctx: DevicePages = .{ .be = be };
-        const reader: dir.PageReader = .{ .ctx = &reader_ctx, .read = &DevicePages.read };
-        try dir.walkChain(gpa, reader, .{ .start = be.sb.appender_dir.start, .len = be.sb.appender_dir.len }, be.sb.node_size, .{ .start = be.sb.heap.start, .len = be.sb.heap.len }, be.sb.totalExtents(), &links);
+        try dir.walkChain(gpa, reader, .{ .start = sb.appender_dir.start, .len = sb.appender_dir.len }, sb.node_size, .{ .start = sb.heap.start, .len = sb.heap.len }, sb.totalExtents(), &links);
         for (links.items) |l| {
             var pair: u32 = 0;
             while (pair < l.header.pairs) : (pair += 1) {
-                const maybe = pageAtPair(&reader_ctx, l.extent, pair) catch |e| return switch (e) {
+                const maybe = pageAtPair(reader, l.extent, pair) catch |e| return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
                     error.Corrupt => error.Corrupt,
                     else => error.Io,
@@ -1187,9 +1194,26 @@ pub const JoinedSet = struct {
         return out.toOwnedSlice(gpa);
     }
 
+    /// `devicePagesOn` over a mounted volume.
+    pub fn devicePages(gpa: Allocator, be: *KvBackend) error{ Io, Corrupt, OutOfMemory }![]page.Page {
+        return devicePagesOn(gpa, &be.dev, be.sb);
+    }
+
     fn devicePagesFn(ctx: *anyopaque, gpa: Allocator) error{ Io, Corrupt, OutOfMemory }![]page.Page {
         return devicePages(gpa, @ptrCast(@alignCast(ctx)));
     }
+
+    const LoaderPages = struct {
+        dev: *device_loader.DeviceLoader,
+        gpa: Allocator,
+
+        fn read(ctx: *anyopaque, offset: u64, out: *[page.PAGE_LEN]u8) error{Io}!void {
+            const self: *LoaderPages = @ptrCast(@alignCast(ctx));
+            const img = self.dev.readRange(self.gpa, offset, page.PAGE_LEN) catch return error.Io;
+            defer self.gpa.free(img);
+            @memcpy(out, img[0..page.PAGE_LEN]);
+        }
+    };
 
     /// The successor's recovery of this (retired) region as the device
     /// shows it: the page `Recovered` under this identity, and the head

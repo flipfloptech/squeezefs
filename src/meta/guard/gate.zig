@@ -81,6 +81,9 @@ pub const Options = struct {
     /// Skip layer A (the flock): the "another host" simulation — two
     /// writers of one volume in one process, so the claim alone refuses.
     test_skip_flock: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    /// The posture and the host's registration the backend made before its
+    /// first write (`host_fence.registerBeforeWrites`; adopted, freed here).
+    early: ?*host_fence.Early = null,
 };
 
 /// The gate's own conveyor traffic at a writer open: ONE claim tx and
@@ -122,6 +125,9 @@ pub const Guard = struct {
     /// 0003 §DF): null without a device fence, under the per-mount seam,
     /// or with no host identity source.
     fence_reg: ?host_fence.Registry = null,
+    /// The host registered before the first write (`Options.early`): its
+    /// freshness; null = the gate registers.
+    early_fresh: ?bool = null,
     /// The configured host identity recorded at the gate (§1.4).
     identity_opts: pr.IdentityOptions,
     identity_stamp: pr.IdentityStamp,
@@ -152,9 +158,6 @@ pub const Guard = struct {
     pub fn ourClaim(self: *const Guard) claim.Claim {
         var c = self.identity.claim(self.be.index, clock.realtimeCoarseNs());
         c.heartbeat_seq = self.heartbeat_seq;
-        // The holder's registration key: a D0 successor fences exactly this
-        // host (decision 0003 §DF).
-        if (self.prClient()) |pc| c.pr_key = pc.key;
         return c;
     }
 
@@ -315,6 +318,14 @@ pub const Guard = struct {
     /// The PR substrate: the test namespace, else the block node's char
     /// twin; RESCAP decides the posture. Never fails the mount.
     fn resolvePr(g: *Guard, gpa: Allocator, opts: Options) backend.OpenError!void {
+        if (opts.early) |e| {
+            g.device = e.device;
+            g.posture = e.posture;
+            g.fence_reg = e.reg;
+            g.early_fresh = e.fresh;
+            gpa.destroy(e);
+            return;
+        }
         const incarnation_key = claim.prKey(g.identity.writerId(g.be.index), g.identity.boot_id);
         // The fake namespace keeps the incarnation's key: no host registry
         // behind a fixture.
@@ -345,6 +356,7 @@ pub const Guard = struct {
                     // every mount of the set on this host rides one
                     // registration.
                     const fp = host_fence.plan(g.be.env, c, g.be.sb.set_uuid, incarnation_key, g.be.path);
+                    if (fp.refused) return error.Busy;
                     c.key = fp.key;
                     g.fence_reg = fp.reg;
                 }
@@ -379,7 +391,7 @@ pub const Guard = struct {
         });
         return host_fence.registerUnderRule(g.ruleContext(taking_manager), reg, c, .{ .ctx = g.be, .read = &pagesFn }, .{ .ctx = g, .run = &ladderFn }) catch |e| switch (e) {
             error.OutOfMemory => error.OutOfMemory,
-            error.SiblingLive, error.NamespaceBlind => error.Busy,
+            error.SiblingLive => error.Busy,
             error.RegisterFailed => g.prErrorLog(c, "register", error.DeviceStatus),
             error.RegistryUnavailable, error.PagesUnreadable => {
                 log.err("meta volume {s}: the stale-sibling rule could not read its inputs ({s}; registry {s}) — refusing to register this host", .{ g.be.path, @errorName(e), reg.dir() });
@@ -437,20 +449,22 @@ pub const Guard = struct {
     }
 
     fn arbitrateBlocking(g: *Guard, c: *pr.Client, evidence: claim.Evidence) backend.OpenError!void {
-        // A symmetric set's manager holds Write Exclusive – All Registrants:
-        // every member's host is a registrant that may write, and any
-        // registrant's preempt unregisters a dead host's key with the
-        // reservation kept (charter §5.5, decision 0003 §DF); a flat
-        // volume's single writer holds Write Exclusive.
-        const symmetric = g.be.sb.symmetricPlaneStamped();
-        c.rtype = if (symmetric) nvme.RTYPE_WEAR else nvme.RTYPE_WRITE_EXCLUSIVE;
+        // A symmetric set's manager holds WERO: every member's host is a
+        // registrant that may write and the device keeps ONE holder — a
+        // successor's acquire conflicts and preempts it, which unregisters
+        // the superseded manager's host (charter §5.5, decision 0003 §DF); a
+        // flat volume's single writer holds Write Exclusive.
+        c.rtype = if (g.be.sb.symmetricPlaneStamped()) nvme.RTYPE_WERO else nvme.RTYPE_WRITE_EXCLUSIVE;
         const locked = try g.lockRegistry();
         defer if (locked) g.fence_reg.?.unlock();
-        const fresh = try g.registerHost(c, true);
-        // Enrolled under the register's lock, judged "joining" until the
-        // role is durable: a co-located departure sees this process (B3).
-        if (g.fence_reg) |*reg| try g.enrolLocked(reg, .pending);
-        if (symmetric) try g.holdAllRegistrants(c, evidence) else try g.holdWriteExclusive(c, evidence);
+        const fresh = if (g.early_fresh) |f| f else blk: {
+            const f = try g.registerHost(c, true);
+            // Enrolled under the register's lock: a co-located departure
+            // sees this process (B3).
+            if (g.fence_reg) |*reg| try g.enrolLocked(reg, .pending);
+            break :blk f;
+        };
+        try g.hold(c, evidence);
         if (locked) {
             if (fresh) guard.stats.pr_host_registrations.inc() else guard.stats.pr_host_adoptions.inc();
         }
@@ -458,49 +472,10 @@ pub const Guard = struct {
         if (c.identityShared() catch false) log.warn("{s}: another registration shares this mount's wire host id — fencing between the two is PROCESS-LOCAL (co-located mounts on one registrant)", .{g.be.path});
     }
 
-    /// The symmetric hold. nvmet answers a registrant's acquire of a WEAR
-    /// reservation another registrant acquired with a conflict (the spec
-    /// says it already holds): registered under rtype 5 IS holding. A
-    /// superseded holder's host — the stale claim names its key — is
-    /// preempted: its frozen manager's writes are refused from here (under
-    /// All Registrants every registrant reads as a holder in the report, so
-    /// the claim, not the report, names it).
-    fn holdAllRegistrants(g: *Guard, c: *pr.Client, evidence: claim.Evidence) backend.OpenError!void {
-        c.acquire() catch |e| switch (e) {
-            error.ReservationConflict => {
-                var rep = c.report() catch |re| return g.prErrorLog(c, "report", re);
-                defer rep.deinit(c.gpa);
-                if (!(nvme.allRegistrants(rep.rtype) and rep.registered(c.key))) {
-                    // Another type stands (a flat writer's, or a WERO an
-                    // earlier binary held): its one holder preempted.
-                    const victim = rep.holder() orelse {
-                        log.err("{s}: reservation acquire conflicted but the report names no holder — refusing to arbitrate blind (single-writer guard)", .{g.be.path});
-                        return error.Busy;
-                    };
-                    if (victim != c.key) {
-                        c.preempt(victim) catch |pe| return g.prErrorLog(c, "preempt", pe);
-                        guard.stats.preempts.inc();
-                        log.warn("{s}: preempted stale reservation holder key {x:0>16} (device-fenced takeover; writer_claim evidence was {s})", .{ g.be.path, victim, @tagName(evidence.standing()) });
-                    }
-                }
-            },
-            else => return g.prErrorLog(c, "acquire", e),
-        };
-        const stale = switch (evidence) {
-            .stale_foreign => |maybe| maybe orelse return,
-            else => return,
-        };
-        if (stale.pr_key == 0 or stale.pr_key == c.key) return;
-        var rep = c.report() catch |e| return g.prErrorLog(c, "report", e);
-        defer rep.deinit(c.gpa);
-        if (!rep.registered(stale.pr_key)) return;
-        c.preempt(stale.pr_key) catch |e| return g.prErrorLog(c, "preempt", e);
-        guard.stats.preempts.inc();
-        log.warn("{s}: preempted the superseded manager's host key {x:0>16} (device-fenced takeover under All Registrants; writer_claim evidence was stale)", .{ g.be.path, stale.pr_key });
-    }
-
-    /// The flat hold: Write Exclusive, a stale holder preempted.
-    fn holdWriteExclusive(g: *Guard, c: *pr.Client, evidence: claim.Evidence) backend.OpenError!void {
+    /// The hold (WERO or Write Exclusive under `c.rtype`): acquired, or the
+    /// report's ONE holder preempted — the superseded writer's host
+    /// unregistered, its writes refused from here.
+    fn hold(g: *Guard, c: *pr.Client, evidence: claim.Evidence) backend.OpenError!void {
         c.acquire() catch |e| switch (e) {
             error.ReservationConflict => {
                 const victim = (c.holder() catch |re| return g.prErrorLog(c, "report", re)) orelse {
@@ -760,12 +735,13 @@ pub const Guard = struct {
     pub fn releasePr(g: *Guard) void {
         switch (g.posture) {
             .active => |c| {
-                // The host's registration is every sibling's: the last
-                // process of the set on this host takes it with it. Under
-                // All Registrants the reservation stands while any member
-                // host stays registered, so the manager's leave releases
-                // nothing then (a release would unreserve every host's
-                // writes until the next manager acquires).
+                // The hold stays while anyone relies on it (review round 3,
+                // major 4): a sibling of the set on this host rides our
+                // host's registration, and another host's registrant writes
+                // only while a reservation keeps fenced hosts out — the last
+                // registration stays the hold, a successor preempts it. Only
+                // the namespace's last registrant with no sibling releases
+                // and unregisters (zero residue).
                 var last = true;
                 if (g.fence_reg) |*reg| {
                     if (reg.lock()) |_| {
@@ -774,14 +750,22 @@ pub const Guard = struct {
                         last = (reg.othersAlive(g.gpa, g.identity.pid) catch 1) == 0;
                     } else |_| last = false;
                 }
-                const all_regs = nvme.allRegistrants(c.rtype);
-                if (g.pr_active and all_regs and last) c.unregister(c.key) catch |e| {
-                    var buf: [128]u8 = undefined;
-                    var w: Io.Writer = .fixed(&buf);
-                    c.writeError(&w, e) catch {};
-                    log.warn("meta volume {s}: unregister failed ({s}) — a stale registration may remain (the next mount's ladder recovers it)", .{ g.be.path, w.buffered() });
-                };
-                if (g.pr_active and !all_regs and last) c.release() catch |e| {
+                // Holding: the hold stays while another registrant stands.
+                // Not holding (an open refused after its early registration,
+                // or superseded): nothing to keep but the siblings' ride.
+                var holding = false;
+                if (last) {
+                    var rep = c.report() catch null;
+                    if (rep) |*r| {
+                        defer r.deinit(c.gpa);
+                        holding = r.heldBy(c.key);
+                        if (holding) for (r.registrants) |reg| if (reg.rkey != c.key) {
+                            last = false;
+                        };
+                    } else last = false;
+                }
+                if (last and !holding) c.unregister(c.key) catch {};
+                if (last and holding) c.release() catch |e| {
                     var buf: [128]u8 = undefined;
                     var w: Io.Writer = .fixed(&buf);
                     c.writeError(&w, e) catch {};
@@ -1303,7 +1287,7 @@ test "a heartbeat rewrites ts and heartbeat_seq through the conveyor (coalesced 
     try testing.expectEqual(c1.heartbeat_seq + 2, (try v.probe()).?.heartbeat_seq);
 }
 
-test "B1 on a PR substrate (the fake): the symmetric volume's manager holds Write Exclusive – All Registrants at mount under our derived key (every member host a registrant may write; an unregistered host may not), its clean unmount leaves zero residue; writer_guard_mode is flock+pr; RESCAP 0 degrades to flock+claim" {
+test "B1 on a PR substrate (the fake): the symmetric volume's manager holds WERO at mount under our derived key (the device keeps ONE holder) (every member host a registrant may write; an unregistered host may not), its clean unmount leaves zero residue; writer_guard_mode is flock+pr; RESCAP 0 degrades to flock+claim" {
     const gpa = testing.allocator;
     const v = try Vol.create(gpa, "pr", null);
     defer v.destroy();
@@ -1316,7 +1300,7 @@ test "B1 on a PR substrate (the fake): the symmetric volume's manager holds Writ
         try testing.expectEqualStrings("flock+pr", be.guard.?.modeName());
         try testing.expectEqual(@as(?u64, claim.prKey(me.writerId(0), boot_a)), ns.holder);
         try testing.expect(be.sb.symmetricPlaneStamped());
-        try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
+        try testing.expectEqual(nvme.RTYPE_WERO, ns.rtype);
         try testing.expect(ns.writeAllowed(host_a_id));
         try testing.expect(!ns.writeAllowed(host_b_id));
         var buf: [2048]u8 = undefined;

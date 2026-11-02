@@ -9,12 +9,12 @@
 //! "unregister only OWN stale keys" arm fire for real (a different key
 //! under the same host identity — nvmet's `pr.c` conflicts), the
 //! two-identity Write Exclusive fence as a DEVICE REJECTION (`-EBADE` on
-//! the write CQE), Write Exclusive – All Registrants (rtype 5) with a
-//! registrant writing and an unregistered one refused (the `fencing.zig`
-//! binding: `acquireManagerHold` + `joinAsRegistrant` on two real
-//! associations), the HOLDER's preempt of a registrant's key (a no-op under
-//! WERO on nvmet 7.3, the victim unregistered with the hold kept under
-//! rtype 5 — decision 0003 §DF), `preempt_and_abort` as a plain preempt,
+//! the write CQE), WERO (rtype 3) with a registrant writing and an
+//! unregistered one refused (the `fencing.zig` binding:
+//! `acquireManagerHold` + `joinAsRegistrant` on two real associations), the
+//! HOLDER's preempt of a registrant's key (a no-op under WERO on nvmet 7.3,
+//! the victim unregistered with the hold kept under rtype 5 — decision 0003
+//! §DF), `preempt_and_abort` as a plain preempt,
 //! release + unregister = zero residue, and the shared-identity probe. The verb
 //! `nvmeof resv-report <dev> [--json] [--pr-matrix --peer <dev> [--force]]`
 //! runs them so the fidelity tier needs no nvme-cli (quirk Q14).
@@ -129,7 +129,7 @@ pub const Leg = enum {
     register_idempotent,
     spec_strict_ladder,
     two_identity_we_fence,
-    all_registrants_rtype5,
+    wero_rtype3,
     holder_preempt,
     preempt_and_abort,
     release_zero_residue,
@@ -316,20 +316,19 @@ pub fn legTwoIdentityWeFence(p: *Pair, r: *LegResult) void {
 }
 
 /// The `fencing.zig` binding on two real associations: the manager holds
-/// Write Exclusive – All Registrants (`acquireManagerHold`), the joiner
-/// registers through `joinAsRegistrant` and WRITES; an unregistered
-/// association is refused.
-pub fn legAllRegistrantsRtype5(p: *Pair, r: *LegResult) void {
+/// WERO (`acquireManagerHold`), the joiner registers through
+/// `joinAsRegistrant` and WRITES; an unregistered association is refused.
+pub fn legWeroRtype3(p: *Pair, r: *LegResult) void {
     fencing.acquireManagerHold(p.a) catch |e| return set(r, false, "acquireManagerHold failed: {s}", .{errName(e)});
     const before_join = if (p.write(p.b_block)) false else |e| e == error.ReservationConflict;
     const joined = fencing.joinAsRegistrant(p.b, fencing.declaredRegistrantCap(p.env)) catch |e| return set(r, false, "joinAsRegistrant failed: {s}", .{errName(e)});
-    p.write(p.b_block) catch |e| return set(r, false, "the registrant's write under All Registrants failed: {s}", .{errName(e)});
+    p.write(p.b_block) catch |e| return set(r, false, "the registrant's write under WERO failed: {s}", .{errName(e)});
     var rep = p.a.report() catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
     defer rep.deinit(p.gpa);
     // B leaves: its writes are refused again.
     p.b.unregister(key_b1) catch |e| return set(r, false, "b unregister failed: {s}", .{errName(e)});
     const after_leave = if (p.write(p.b_block)) false else |e| e == error.ReservationConflict;
-    set(r, rep.rtype == nvme.RTYPE_WEAR and joined.regctl == 2 and joined.cap_in_force == 0 and !joined.shared and before_join and after_leave, "rtype {d} (Write Exclusive – All Registrants); the registrant joined (regctl {d}, cap {d}) and wrote; unregistered writes refused before the join and after leaving", .{ rep.rtype, joined.regctl, joined.cap_in_force });
+    set(r, rep.rtype == nvme.RTYPE_WERO and joined.regctl == 2 and joined.cap_in_force == 0 and !joined.shared and before_join and after_leave, "rtype {d} (WERO); the registrant joined (regctl {d}, cap {d}) and wrote; unregistered writes refused before the join and after leaving", .{ rep.rtype, joined.regctl, joined.cap_in_force });
 }
 
 /// The HOLDER preempts a registrant's key (decision 0003 §DF, the death
@@ -348,8 +347,10 @@ pub fn legHolderPreempt(p: *Pair, r: *LegResult) void {
     const wero_kept = wero.registered(key_b1);
     wero.deinit(p.gpa);
     p.reset();
-    fencing.acquireManagerHold(p.a) catch |e| return set(r, false, "acquireManagerHold failed: {s}", .{errName(e)});
-    _ = fencing.joinAsRegistrant(p.b, null) catch |e| return set(r, false, "joinAsRegistrant failed: {s}", .{errName(e)});
+    p.a.rtype = nvme.RTYPE_WEAR;
+    _ = p.a.registerLadder() catch |e| return set(r, false, "a register failed: {s}", .{errName(e)});
+    p.a.acquire() catch |e| return set(r, false, "a rtype-5 acquire failed: {s}", .{errName(e)});
+    _ = p.b.registerLadder() catch |e| return set(r, false, "b register failed: {s}", .{errName(e)});
     p.a.preemptAndAbort(key_b1) catch |e| return set(r, false, "the All Registrants holder's preempt failed: {s}", .{errName(e)});
     var rep = p.a.report() catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
     defer rep.deinit(p.gpa);
@@ -424,7 +425,7 @@ pub fn runMatrix(p: *Pair) MatrixReport {
         .{ .leg = .register_idempotent, .run = legRegisterIdempotent },
         .{ .leg = .spec_strict_ladder, .run = legSpecStrictLadder },
         .{ .leg = .two_identity_we_fence, .run = legTwoIdentityWeFence },
-        .{ .leg = .all_registrants_rtype5, .run = legAllRegistrantsRtype5 },
+        .{ .leg = .wero_rtype3, .run = legWeroRtype3 },
         .{ .leg = .holder_preempt, .run = legHolderPreempt },
         .{ .leg = .preempt_and_abort, .run = legPreemptAndAbort },
         .{ .leg = .release_zero_residue, .run = legReleaseZeroResidue },

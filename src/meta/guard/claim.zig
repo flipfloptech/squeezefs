@@ -54,12 +54,7 @@ pub const SKEW_BOUND_S: u64 = 1;
 // ---------------------------------------------------------------------------
 
 pub const MAGIC: [4]u8 = "WCLM".*;
-/// The V1 shape: the membership rows' (`sym/membership/shard.zig`) and a
-/// writer claim an earlier binary left (decoded with no key).
 pub const VERSION: u8 = 1;
-/// The writer claim's shape since decision 0003 §DF: V1 + the holder's
-/// registration key.
-pub const VERSION_WRITER: u8 = 2;
 /// `kind` 0 = the writer claim; 1 = a membership row on the same shape
 /// (`sym/membership/shard.zig`, decision 0003 §E).
 pub const KIND_WRITER: u8 = 0;
@@ -73,8 +68,9 @@ pub const WriterClaimV1 = extern struct {
     reserved0: [2]u8,
     /// `hash64(boot_id ‖ hostname ‖ mount_slot ‖ pid ‖ start_ticks)`: one
     /// value per INCARNATION (the §DA writer-id proof's word). The
-    /// registration key is the HOST's (decision 0003 §DF), carried by the
-    /// V2 writer claim beside it.
+    /// registration key is the HOST's (decision 0003 §DF): a kill -9 remount
+    /// adopts the standing registration; the ladder's own-stale arm serves a
+    /// different key under the same wire host id.
     writer_id_le: [8]u8,
     /// The heartbeat, realtime ns (the one cross-host comparable clock).
     ts_ns_le: [8]u8,
@@ -93,19 +89,6 @@ pub const WriterClaimV1 = extern struct {
 
 pub const CLAIM_LEN: usize = @sizeOf(WriterClaimV1);
 
-/// The writer claim (V2): V1's words + the holder's registration key, so
-/// a D0 successor fences exactly the superseded holder's host — under
-/// Write Exclusive – All Registrants every registrant reads as a holder in
-/// the report (decision 0003 §DF).
-pub const WriterClaimV2 = extern struct {
-    v1: WriterClaimV1,
-    /// 0 = no device fence (no PR posture, or the per-mount seam's
-    /// incarnation key is not the host's).
-    pr_key_le: [8]u8,
-};
-
-pub const WRITER_CLAIM_LEN: usize = @sizeOf(WriterClaimV2);
-
 comptime {
     std.debug.assert(CLAIM_LEN == 88);
     std.debug.assert(@offsetOf(WriterClaimV1, "writer_id_le") == 8);
@@ -117,8 +100,6 @@ comptime {
     std.debug.assert(@offsetOf(WriterClaimV1, "heartbeat_seq_le") == 64);
     std.debug.assert(@offsetOf(WriterClaimV1, "term_le") == 72);
     std.debug.assert(@offsetOf(WriterClaimV1, "csum_le") == 80);
-    std.debug.assert(WRITER_CLAIM_LEN == 96);
-    std.debug.assert(@offsetOf(WriterClaimV2, "pr_key_le") == 88);
 }
 
 /// The RAM form.
@@ -131,16 +112,11 @@ pub const Claim = struct {
     hostname_hash: u64,
     heartbeat_seq: u64,
     term: u64 = 0,
-    /// The holder's registration key (0 = none, or a V1 record).
-    pr_key: u64 = 0,
 
-    /// The V2 record; the checksum covers the whole image (V1's word at
-    /// its V1 offset, over all 96 bytes).
-    pub fn encode(self: Claim) [WRITER_CLAIM_LEN]u8 {
-        var v: WriterClaimV2 = undefined;
-        const w = &v.v1;
+    pub fn encode(self: Claim) [CLAIM_LEN]u8 {
+        var w: WriterClaimV1 = undefined;
         w.magic = MAGIC;
-        w.version = VERSION_WRITER;
+        w.version = VERSION;
         w.kind = KIND_WRITER;
         w.reserved0 = @splat(0);
         std.mem.writeInt(u64, &w.writer_id_le, self.writer_id, .little);
@@ -153,8 +129,7 @@ pub const Claim = struct {
         std.mem.writeInt(u64, &w.heartbeat_seq_le, self.heartbeat_seq, .little);
         std.mem.writeInt(u64, &w.term_le, self.term, .little);
         w.csum_le = @splat(0);
-        std.mem.writeInt(u64, &v.pr_key_le, self.pr_key, .little);
-        var bytes = std.mem.toBytes(v);
+        var bytes = std.mem.toBytes(w);
         checksum.stamp(&bytes, @offsetOf(WriterClaimV1, "csum_le"));
         return bytes;
     }
@@ -164,15 +139,10 @@ pub const Claim = struct {
     /// which the gate treats as an UNDECODABLE claim (stale foreign, never
     /// auto-taken).
     pub fn decode(bytes: []const u8) error{Corrupt}!Claim {
-        const version: u8 = switch (bytes.len) {
-            WRITER_CLAIM_LEN => VERSION_WRITER,
-            CLAIM_LEN => VERSION,
-            else => return error.Corrupt,
-        };
+        if (bytes.len != CLAIM_LEN) return error.Corrupt;
         if (!checksum.verify(bytes, @offsetOf(WriterClaimV1, "csum_le"))) return error.Corrupt;
         const w = std.mem.bytesToValue(WriterClaimV1, bytes[0..CLAIM_LEN]);
-        if (!std.mem.eql(u8, &w.magic, &MAGIC) or w.version != version or w.kind != KIND_WRITER) return error.Corrupt;
-        const pr_key: u64 = if (version == VERSION_WRITER) std.mem.readInt(u64, bytes[CLAIM_LEN..][0..8], .little) else 0;
+        if (!std.mem.eql(u8, &w.magic, &MAGIC) or w.version != VERSION or w.kind != KIND_WRITER) return error.Corrupt;
         if (!std.mem.allEqual(u8, &w.reserved0, 0) or !std.mem.allEqual(u8, &w.reserved1, 0)) return error.Corrupt;
         return .{
             .writer_id = std.mem.readInt(u64, &w.writer_id_le, .little),
@@ -183,7 +153,6 @@ pub const Claim = struct {
             .hostname_hash = std.mem.readInt(u64, &w.hostname_hash_le, .little),
             .heartbeat_seq = std.mem.readInt(u64, &w.heartbeat_seq_le, .little),
             .term = std.mem.readInt(u64, &w.term_le, .little),
-            .pr_key = pr_key,
         };
     }
 
@@ -253,7 +222,7 @@ pub const Identity = struct {
 /// The INCARNATION's PR key, `hash64(writer_id ‖ NUL ‖ boot_id)`: the
 /// per-mount seam's (`SQUEEZEFS_TEST_PER_MOUNT_IDENTITY`), a fixture's, and a
 /// namespace without a wire host id. A product mount registers its HOST's
-/// key (`host_fence.hostKey`, decision 0003 §DF), which the V2 claim names.
+/// key (`host_fence.hostKey`, decision 0003 §DF).
 pub fn prKey(writer_id: u64, boot_id: [16]u8) u64 {
     var h: checksum.Hasher = .init();
     h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, writer_id)));
@@ -484,27 +453,18 @@ fn claimOf(boot: [16]u8, pid: u32, start: u64, age_s: i64) Claim {
 }
 
 test "the record round-trips byte-exactly; decode is total (length, magic, version, kind, reserved, checksum each refuse)" {
-    var c = claimOf(boot_a, 42, 99, 5);
-    c.pr_key = 0x5eed;
+    const c = claimOf(boot_a, 42, 99, 5);
     const bytes = c.encode();
-    try testing.expectEqual(WRITER_CLAIM_LEN, bytes.len);
+    try testing.expectEqual(CLAIM_LEN, bytes.len);
     try testing.expectEqualSlices(u8, &MAGIC, bytes[0..4]);
-    try testing.expectEqual(VERSION_WRITER, bytes[4]);
     const back = try Claim.decode(&bytes);
     try testing.expectEqual(c, back);
-    try testing.expectError(error.Corrupt, Claim.decode(bytes[0 .. WRITER_CLAIM_LEN - 1]));
-    var longer: [WRITER_CLAIM_LEN + 1]u8 = undefined;
-    @memcpy(longer[0..WRITER_CLAIM_LEN], &bytes);
-    longer[WRITER_CLAIM_LEN] = 0;
+    try testing.expectError(error.Corrupt, Claim.decode(bytes[0 .. CLAIM_LEN - 1]));
+    var longer: [CLAIM_LEN + 1]u8 = undefined;
+    @memcpy(longer[0..CLAIM_LEN], &bytes);
+    longer[CLAIM_LEN] = 0;
     try testing.expectError(error.Corrupt, Claim.decode(&longer));
-    // A V1 writer claim an earlier binary left decodes with no key.
-    var v1: [CLAIM_LEN]u8 = bytes[0..CLAIM_LEN].*;
-    v1[4] = VERSION;
-    checksum.stamp(&v1, @offsetOf(WriterClaimV1, "csum_le"));
-    const old = try Claim.decode(&v1);
-    try testing.expectEqual(@as(u64, 0), old.pr_key);
-    try testing.expectEqual(c.writer_id, old.writer_id);
-    inline for (.{ 0, 4, 5, 6, 28, 40, 81, 90 }) |off| {
+    inline for (.{ 0, 4, 5, 6, 28, 40, 81 }) |off| {
         var bad = bytes;
         bad[off] ^= 0x01;
         try testing.expectError(error.Corrupt, Claim.decode(&bad));
@@ -631,11 +591,11 @@ test "refusal texts name the holder and the remedy" {
 }
 
 fn claimFuzz(_: void, smith: *std.testing.Smith) !void {
-    var buf: [WRITER_CLAIM_LEN + 8]u8 = undefined;
+    var buf: [CLAIM_LEN + 8]u8 = undefined;
     const len = smith.slice(&buf);
     _ = Claim.decode(buf[0..len]) catch {};
-    if (len >= WRITER_CLAIM_LEN) {
-        const img = buf[0..WRITER_CLAIM_LEN];
+    if (len >= CLAIM_LEN) {
+        const img = buf[0..CLAIM_LEN];
         checksum.stamp(img, @offsetOf(WriterClaimV1, "csum_le"));
         if (Claim.decode(img)) |c| try std.testing.expectEqualSlices(u8, img, &c.encode()) else |_| {}
     }

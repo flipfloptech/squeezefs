@@ -578,6 +578,21 @@ pub const KvBackend = struct {
         const classified = try readSuperblock(gpa, &dev, path, opts.env, volume_len);
         const sb = classified.sb;
 
+        // 3b. The host registered BEFORE the first write (decision 0003
+        //     §DF): the held tail, the replay's fold and the bring-up cover
+        //     write through the namespace, and a host the reservation does not
+        //     admit is refused at the device. The gate adopts it.
+        var early: ?*guard.host_fence.Early = null;
+        errdefer if (early) |e| e.discard(gpa);
+        if (opts.guard.mode != .claim_clear and !testNamespaceArmed(opts)) {
+            const local = if (builtin.is_test) (opts.guard.test_identity orelse guard.proc.localIdentity()) else guard.proc.localIdentity();
+            var src: EarlyPages = .{ .dev = &dev, .sb = sb };
+            early = guard.host_fence.registerBeforeWrites(gpa, opts.env, path, sb.set_uuid, opts.index, local, sym.join.nodeToken(local), .{ .ctx = &src, .read = &EarlyPages.read }) catch |e| return switch (e) {
+                error.Busy => error.Busy,
+                error.OutOfMemory => error.OutOfMemory,
+            };
+        }
+
         // 4. The ledger.
         var mounted = try readNewestLedger(gpa, &dev, path, sb);
         errdefer mounted.deinit(gpa);
@@ -862,7 +877,10 @@ pub const KvBackend = struct {
         // heartbeat. A gate refusal unwinds the `errdefer`s above and
         // closes the flock fd LAST.
         const t_gate = clock.monotonicNs();
-        be.guard = try guard.gate.Guard.prepare(gpa, io, be, opts.guard);
+        var gate_opts = opts.guard;
+        gate_opts.early = early;
+        early = null;
+        be.guard = try guard.gate.Guard.prepare(gpa, io, be, gate_opts);
         errdefer {
             be.guard.?.deinit();
             be.guard = null;
@@ -1809,6 +1827,23 @@ pub const KvBackend = struct {
         }
         return @intCast(rc);
     }
+
+    fn testNamespaceArmed(opts: OpenOptions) bool {
+        if (builtin.is_test) return opts.guard.test_namespace != null;
+        return false;
+    }
+
+    /// The early registration's page source: the loader and the superblock
+    /// (the backend is not built yet).
+    const EarlyPages = struct {
+        dev: *device_loader.DeviceLoader,
+        sb: superblock.Superblock,
+
+        fn read(ctx: *anyopaque, gpa: Allocator) error{ Io, Corrupt, OutOfMemory }![]@import("sym/appender_page.zig").Page {
+            const self: *EarlyPages = @ptrCast(@alignCast(ctx));
+            return sym.joined.JoinedSet.devicePagesOn(gpa, self.dev, self.sb);
+        }
+    };
 
     /// Layer A of the D0 guard: `flock(LOCK_EX | LOCK_NB)` on the dedicated
     /// fd, an exiting holder of this binary waited out (`guard.proc`'s wait

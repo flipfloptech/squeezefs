@@ -47,6 +47,10 @@ with Zig 0.17.0 and the repo at the same absolute path, and runs commands as roo
   and the 7.3 sqz series (`patches-mainline/` 0001–0007, deleted 2026-11-02) live in git
   history only. Build slots: one per 4 threads and per 8 GiB
   (`SQZ_VENUE_SLOTS` overrides; every controller of one build root must agree).
+  Two boot entries (decision 0003 §DD): `linux-omarchy-mainline` (`7.3.1-1-omarchy-mainline`, the
+  default: 7.3.1 + Omarchy's applying patches, BORE, Omarchy's display fixes ported — the series in
+  `scripts/kernel/omarchy-7.3/`) first, `linux-mainline-sqz` second; `build-host-kernel --local`
+  builds both, `--flavour omarchy|stock` one.
 - `vm` (the default on the Mac): the macOS `container` `sqz-zig` — aarch64, Ubuntu 24.04,
   this repo mounted rw at the same path. Its kernel was the 7.2-sqz container build; it needs
   a ≥ 7.3 arm64 kernel (no recipe exists yet) before it is a venue again.

@@ -563,13 +563,17 @@ pub const Joiner = struct {
     /// device fence here (a file, a loop device, no char node, RESCAP 0,
     /// the seam, no identity source): the join is the detection grade's.
     pub fn admit(ctx: RuleContext, set_uuid: [16]u8, opts: pr.IdentityOptions, slot: u32, writer_id: u64, pages: PageSource) error{ HostAdmissionRefused, OutOfMemory }!?*Joiner {
-        const p = plan(ctx.env, opts, set_uuid, 0, ctx.path);
-        var reg = p.reg orelse return null;
+        if (perMountIdentity(ctx.env)) return null;
         const dev = switch (pr_linux.resolve(ctx.gpa, ctx.path)) {
             .none => return null,
             .device => |d| d,
         };
         errdefer dev.deinit();
+        const p = plan(ctx.env, opts, set_uuid, 0, ctx.path);
+        var reg = p.reg orelse {
+            dev.deinit();
+            return null;
+        };
         const c = try ctx.gpa.create(pr.Client);
         errdefer ctx.gpa.destroy(c);
         c.* = try pr.Client.init(ctx.gpa, dev.face(), dev.nsid, p.key);

@@ -21,8 +21,9 @@
 //! registration-survives-disconnect row (tcp), `fidelity-mount` (THE row
 //! charter §8 names: the metadata and data volumes ARE connected
 //! namespaces; PR armed for real; a second identity refused; `kill -9` →
-//! remount recovers through the own-stale ladder; `umount` → zero
-//! registrants), `sigstop-preempt` (a stopped holder is preempted past
+//! remount adopts the host's standing registration; `umount` → zero
+//! registrants), `co-located mounts` and `stale sibling` (one host
+//! identity per host, decision 0003 §DE), `sigstop-preempt` (a stopped holder is preempted past
 //! `T_owner`; resumed, its next beat reads the usurpation and its barrier
 //! answers the device's `-EBADE` — FAILED), `g2-restore-tcp` (the PTPL
 //! lapse: the subsystem wiped by hand under a live mount, `restore`
@@ -917,9 +918,9 @@ fn daemonSetFormat(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, po
 /// THE row (charter §8): meta + data shares → connect both → format on
 /// the connected namespaces → the data volume's endpoint record → mount
 /// (the daemon connects the data volume itself) → PR armed → a second
-/// identity refused → kill -9 → remount through the own-stale ladder
-/// (the data association REUSED) → umount → regctl 0, the association
-/// released.
+/// identity refused → kill -9 → remount under the same host key, the
+/// host's registration adopted (the data association REUSED) → umount →
+/// regctl 0, the association released.
 fn mountLeg(transport: configfs.Trtype) !void {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
@@ -975,17 +976,21 @@ fn mountLeg(transport: configfs.Trtype) !void {
         try testing.expect(std.mem.indexOf(u8, text, "single-writer guard") != null);
     }
     try rig.disconnect(&cm_b);
-    // kill -9 → remount under the same identity: a DIFFERENT per-incarnation
-    // key under the SAME host id — nvmet conflicts, the ladder unregisters
-    // exactly the stale one. The data association the killed daemon left
-    // (its pair, its subsystem) is REUSED, never a second connect.
+    // kill -9 → remount under the same identity: the SAME host key (one per
+    // host identity and set, decision 0003 §DE) — the host is still
+    // registered, so the remount adopts it (an idempotent register, no
+    // own-stale recovery) and takes the reservation over. The data
+    // association the killed daemon left (its pair, its subsystem) is
+    // REUSED, never a second connect.
     try rig.kill9(a);
     try testing.expectEqual(@as(u32, 1), try rig.controllersOf(data_nqn, ident_a));
     const a2 = try rig.spawnMount("a2", meta_uri, null, &.{});
     try rig.awaitLog(a2, "ready: ", ready_wait_ns);
     const st2 = try rig.stats(a2);
     defer gpa.free(st2);
-    try testing.expectEqual(@as(?u64, 1), json_scan.number(st2, "pr_own_stale_recoveries"));
+    try testing.expectEqual(@as(?u64, 0), json_scan.number(st2, "pr_own_stale_recoveries"));
+    try testing.expectEqual(@as(?u64, 1), json_scan.number(st2, "pr_host_adoptions"));
+    try testing.expectEqualStrings(pr_key, json_scan.string(st2, "pr_key").?);
     try testing.expectEqual(@as(?u64, 1), json_scan.number(st2, "pr_registrants_per_namespace"));
     try testing.expectEqual(@as(?u64, 0), json_scan.number(st2, "writer_guard_fenced"));
     try testing.expectEqual(@as(?u64, 0), json_scan.number(st2, "fabric_daemon_connects"));
@@ -1390,7 +1395,7 @@ test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with
     try expectNoResidue(rig, data_nqn);
 }
 
-test "nvmet fidelity: fidelity-mount (loop) — THE row: the metadata and data volumes ARE connected namespaces (the data volume the daemon's own connect from its endpoint record); format → mount → PR armed for real (holder == pr_key, regctl 1) → a second identity refused → kill -9 → remount recovers via the own-stale ladder (pr_own_stale_recoveries 1, payload intact) and REUSES the data association → umount → regctl 0, the association released → disconnect → unshare" {
+test "nvmet fidelity: fidelity-mount (loop) — THE row: the metadata and data volumes ARE connected namespaces (the data volume the daemon's own connect from its endpoint record); format → mount → PR armed for real (holder == pr_key, regctl 1) → a second identity refused → kill -9 → remount adopts the host's standing registration under the same host key (pr_host_adoptions 1, pr_own_stale_recoveries 0, payload intact) and REUSES the data association → umount → regctl 0, the association released → disconnect → unshare" {
     try mountLeg(.loop);
 }
 

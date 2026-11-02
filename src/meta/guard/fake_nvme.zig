@@ -43,6 +43,13 @@ pub const Namespace = struct {
     wire_host_id_override: ?[16]u8 = null,
     /// An injected transport failure on the next command (a dead node).
     fail_next: ?errors.Error = null,
+    /// nvmet 7.3's preempt: the HOLDER's preempt only re-types its own hold
+    /// (`nvmet_pr_preempt` answers `holder == reg` before it compares the
+    /// key) and succeeds, the victim left registered; with no holder a
+    /// preempt unregisters by key and takes no hold.
+    holder_preempt_retypes: bool = false,
+    /// The last Reservation Acquire (the byte-exact proof of its RACQA).
+    last_acquire: nvme.UringCmd = nvme.UringCmd.zeroed(),
     /// A vendor registrant cap: a register that would make the table
     /// larger answers `CAP_STATUS` (a command-specific status, the learn
     /// rule's class) — the emulated capped array (spec §8 D:1047).
@@ -188,6 +195,7 @@ pub const Namespace = struct {
         const rtype: u8 = @intCast((cmd.cdw10 >> 8) & 0xff);
         const mine = self.find(host_id) orelse return nvme.SC_RESERVATION_CONFLICT;
         if (mine.key != crkey) return nvme.SC_RESERVATION_CONFLICT;
+        self.last_acquire = cmd.*;
         switch (racqa) {
             nvme.RACQA_ACQUIRE => {
                 if (self.holder) |h| {
@@ -200,6 +208,19 @@ pub const Namespace = struct {
                 return nvme.STATUS_SUCCESS;
             },
             nvme.RACQA_PREEMPT, nvme.RACQA_PREEMPT_AND_ABORT => {
+                if (self.holder_preempt_retypes) {
+                    if (self.holder) |h| if (h == crkey) {
+                        self.rtype = rtype;
+                        return nvme.STATUS_SUCCESS;
+                    };
+                    if (self.holder == null) {
+                        if (!self.isRegistered(prkey)) return nvme.SC_RESERVATION_CONFLICT;
+                        self.remove(prkey);
+                        self.preempts += 1;
+                        self.generation += 1;
+                        return nvme.STATUS_SUCCESS;
+                    }
+                }
                 if (!self.isRegistered(prkey)) return nvme.SC_INVALID_FIELD;
                 self.remove(prkey);
                 self.holder = crkey;

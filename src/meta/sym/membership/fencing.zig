@@ -645,7 +645,7 @@ test "the death preempt: a usurper's key is preempted-and-aborted (fenced; the v
     try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, 0x2222));
     try testing.expectEqual(preempts0 + 1, stats.appender_recovery_preempts.load());
     try testing.expect(!ns.writeAllowed(host_r));
-    try testing.expectEqual(nvme.RACQA_PREEMPT_AND_ABORT, ns.last.cdw10 & 0x7);
+    try testing.expectEqual(nvme.RACQA_PREEMPT_AND_ABORT, ns.last_acquire.cdw10 & 0x7);
     try testing.expectEqual(@as(?u64, 0x1111), ns.holder);
     const guards0 = stats.appender_recovery_own_key_guards.load();
     try testing.expectEqual(PreemptOutcome.own_key_guard, preemptDeadRegistrant(&m, 0x1111));
@@ -654,6 +654,28 @@ test "the death preempt: a usurper's key is preempted-and-aborted (fenced; the v
     try testing.expectEqual(PreemptOutcome.no_device, preemptDeadRegistrant(null, 0x5));
     // An unknown victim: the device answers Invalid Field — failed, logged.
     try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, 0x4444));
+}
+
+test "the death preempt on a target whose holder's preempt only re-types its hold (nvmet 7.3): the victim still registered after it is preempted with the reservation released, then the hold re-acquired — fenced, one cycle counted" {
+    const gpa = testing.allocator;
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    ns.holder_preempt_retypes = true;
+    var mh: fake.Host = .{ .ns = &ns, .host_id = host_m };
+    var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer m.deinit();
+    try acquireWero(&m);
+    var rh: fake.Host = .{ .ns = &ns, .host_id = host_r };
+    var r = try pr.Client.init(gpa, rh.face(), 1, 0x2222);
+    defer r.deinit();
+    _ = try joinAsRegistrant(&r, null);
+    const cycles0 = stats.appender_recovery_holder_preempt_cycles.load();
+    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, 0x2222));
+    try testing.expectEqual(cycles0 + 1, stats.appender_recovery_holder_preempt_cycles.load());
+    try testing.expect(!ns.writeAllowed(host_r));
+    try testing.expect(ns.writeAllowed(host_m));
+    try testing.expectEqual(@as(?u64, 0x1111), ns.holder);
+    try testing.expectEqual(nvme.RTYPE_WERO, ns.rtype);
 }
 
 const RamTerm = struct {

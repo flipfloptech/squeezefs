@@ -159,8 +159,6 @@ pub const DeathBounds = struct {
     /// The key the census REGISTERED for the member (null = unvalidated:
     /// "the tail scan is the fence", the word is kept and counted).
     registered_key: ?u64,
-    /// Keys this process or a live member holds.
-    held_keys: []const u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -330,16 +328,18 @@ pub fn bitmapRefs(refs: []align(1) const verbs.BitmapRefWire, blocks: u64, heaps
 }
 
 /// `screen_record_death` (REC:581-634): never this mount's own identity,
-/// never a member the installed owner lists LIVE, never a key this
-/// process or a live member holds or one contradicting the registered key
-/// (0 and the registered key are accepted; an unregistered member's word
-/// is accepted and the handler counts it as unvalidated).
+/// never a member the installed owner lists LIVE, never a key
+/// contradicting the registered key (0 and the registered key are
+/// accepted; an unregistered member's word is accepted and the handler
+/// counts it as unvalidated). A key a live member also holds is the
+/// dead member's HOST's (per-host fencing, decision 0003 §DE: every mount
+/// of a set on a host registers one key) — its preempt fences the host's
+/// live siblings too, the ruling's accepted cost — never a contradiction.
 pub fn recordDeath(req: verbs.RecordDeathReq, b: *const DeathBounds) Verdict {
     if (req.member.isZero()) return reject(.identity_zero);
     if (req.member.sameMember(b.own)) return reject(.death_own_identity);
     if (b.listed_live) return reject(.death_member_live);
     if (req.pr_key != 0) {
-        for (b.held_keys) |k| if (k == req.pr_key) return reject(.death_key_contradicts);
         if (b.registered_key) |rk| if (rk != req.pr_key) return reject(.death_key_contradicts);
     }
     return .ok;
@@ -608,9 +608,8 @@ test "bitmap refs: volume, heap, alignment, emptiness, overflow, the region sum'
     try testing.expectEqual(@as(u64, 1), bitmapRegionLen(1));
 }
 
-test "RecordDeath's key screen: own identity, a live member, a held or contradicting key refuse; 0 and the registered key pass; an unregistered member's word passes" {
-    const held = [_]u64{ 0xAAAA, 0xBBBB };
-    var b: DeathBounds = .{ .own = me, .listed_live = false, .registered_key = 0x1234, .held_keys = &held };
+test "RecordDeath's key screen: own identity, a live member, a contradicting key refuse; 0 and the registered key pass; an unregistered member's word passes, a key a live sibling shares included (per-host keys)" {
+    var b: DeathBounds = .{ .own = me, .listed_live = false, .registered_key = 0x1234 };
     const req: verbs.RecordDeathReq = .{ .volume = 0, .reserved = 0, .reserved2 = 0, .member = other, .epoch = 1, .pr_key = 0x1234 };
     try testing.expect(recordDeath(req, &b).isOk());
     var r0 = req;
@@ -623,8 +622,6 @@ test "RecordDeath's key screen: own identity, a live member, a held or contradic
     try expectRejected(.death_member_live, recordDeath(req, &b));
     b.listed_live = false;
     var r2 = req;
-    r2.pr_key = 0xAAAA;
-    try expectRejected(.death_key_contradicts, recordDeath(r2, &b));
     r2.pr_key = 0x9999;
     try expectRejected(.death_key_contradicts, recordDeath(r2, &b));
     b.registered_key = null;
@@ -732,7 +729,7 @@ fn screenFuzz(_: void, smith: *std.testing.Smith) !void {
     const dvs = [_]DataVolumeBounds{.{ .vol_tag = smith.value(u64), .blocks = smith.value(u64) }};
     const heaps = [_]HeapBounds{.{ .start = smith.value(u64), .end = smith.value(u64), .node_size = @max(1, smith.value(u32)) }};
     const sb: SlotWordBounds = .{ .granted_floor = smith.value(u64), .release_seq_floor_bound = smith.value(u64), .recorded_cursor = smith.value(u64), .recorded_root = .{ .addr = smith.value(u64), .seq = smith.value(u64) }, .total_extents = smith.value(u64), .heap = heaps[0] };
-    const db: DeathBounds = .{ .own = me, .listed_live = smith.value(bool), .registered_key = smith.value(u64), .held_keys = &.{smith.value(u64)} };
+    const db: DeathBounds = .{ .own = me, .listed_live = smith.value(bool), .registered_key = smith.value(u64) };
     if (verbs.decodeRequest(.release_slot, bytes)) |r| _ = releaseWords(r.release_slot.head.words, r.release_slot.items, &sb) else |_| {}
     if (verbs.decodeRequest(.publish_roots, bytes)) |r| {
         for (r.publish_roots.items) |root| _ = publishRoot(root, &sb);

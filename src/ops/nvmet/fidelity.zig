@@ -1571,18 +1571,18 @@ test "nvmet fidelity: co-located mounts — ONE host identity for every mount of
         try testing.expectEqualStrings(key_a, key_b);
         try testing.expectEqualStrings(key_a, json_scan.string(rr, "holder_key") orelse return error.StatMissing);
     }
-    const sum_a = try rig.onMount(a, "head -c 1048576 /dev/urandom > fa && sync fa && cksum fa | cut -d' ' -f1");
+    const sum_a = try rig.onMount(a, "head -c 1048576 /dev/urandom > fa && sync -d fa && cksum fa | cut -d' ' -f1");
     defer gpa.free(sum_a);
     const seen_b = try rig.onMount(b, "cksum fa | cut -d' ' -f1");
     defer gpa.free(seen_b);
     try testing.expectEqualStrings(sum_a, seen_b);
-    const sum_b = try rig.onMount(b, "head -c 1048576 /dev/urandom > fb && sync fb && cksum fb | cut -d' ' -f1");
+    const sum_b = try rig.onMount(b, "head -c 1048576 /dev/urandom > fb && sync -d fb && cksum fb | cut -d' ' -f1");
     defer gpa.free(sum_b);
     // B leaves: the association and the registration are the host's, and
     // A still mounts on them.
     try rig.umount(b);
     try testing.expectEqual(@as(u32, 1), try rig.controllersOf(set.data_nqn, ident_a));
-    try testing.expect(try scriptSucceeds(rig, a, "cksum fb > /dev/null && head -c 1048576 /dev/urandom > fc && sync fc"));
+    try testing.expect(try scriptSucceeds(rig, a, "cksum fb > /dev/null && head -c 1048576 /dev/urandom > fc && sync -d fc"));
     const seen_a = try rig.onMount(a, "cksum fb | cut -d' ' -f1");
     defer gpa.free(seen_a);
     try testing.expectEqualStrings(sum_b, seen_a);
@@ -1608,7 +1608,7 @@ test "nvmet fidelity: co-located mounts — ONE host identity for every mount of
 /// The stale-sibling legs' membership `T_owner` (the smoke rows' value).
 const sibling_t_owner_ms: u64 = 3000;
 
-test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmetric set whose manager M runs under a second identity (another host); B then A mount on this host under the one identity (B registers the host, A adopts); B frozen (SIGSTOP) is evicted and M's recovery preempts the HOST's key — A, the live sibling, is fenced with it (its fsync refused); a fresh mount A2 on this host must re-register the host, and B, alive and stale, is killed before it does (pr_stale_sibling_kills 1, B dead); A2's writes land and M reads them; B never writes again" {
+test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmetric set whose manager M runs under a second identity (another host); B then A mount on this host under the one identity (B registers the host, A adopts); B frozen (SIGSTOP) is evicted and M's recovery preempts the HOST's key — A, the live sibling, is fenced with it (its fsync refused); a fresh mount on this host whose kill of B is refused (SQUEEZEFS_TEST_SIBLING_KILL_REFUSED) refuses its registration loud by name and exits, B alive, the host unregistered; a fresh mount A2 on this host must re-register the host, and B, alive and stale, is killed before it does (pr_stale_sibling_kills 1, B dead); A2's writes land and M reads them; B never writes again" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -1643,7 +1643,7 @@ test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmet
         try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
         try testing.expectEqual(@as(?u64, nvme.RTYPE_WERO), json_scan.number(rr, "rtype"));
     }
-    const before = try rig.onMount(b, "echo before > f && sync f && cat f");
+    const before = try rig.onMount(b, "echo before > f && sync -d f && cat f");
     defer gpa.free(before);
     try testing.expectEqualStrings("before\n", before);
     // B frozen: evicted past T_owner, its region recovered by M, whose
@@ -1655,7 +1655,31 @@ test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmet
     try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
     try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recovery_preempts"));
     // A is fenced with its host: its fsync is refused at the device.
-    try testing.expect(!try scriptSucceeds(rig, a, "echo x > z && sync z"));
+    try testing.expect(!try scriptSucceeds(rig, a, "echo x > z && sync -d z"));
+    // A stale sibling that can be neither proven dead nor killed refuses
+    // the registration loud by name: the mount exits, B lives on, the host
+    // stays unregistered (M's registration alone).
+    {
+        var env_r = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+        defer env_r.deinit();
+        try env_r.put("SQUEEZEFS_TEST_SIBLING_KILL_REFUSED", "1");
+        const r = try rig.spawnMountEnv("ss-refused", set.metaUri(), &env_r, &.{});
+        const dm = &rig.daemons.items[r];
+        const deadline = clock.monotonicNs() + ready_wait_ns;
+        while (alive(dm.pid) and clock.monotonicNs() < deadline) sleepMs(20);
+        try testing.expect(!alive(dm.pid));
+        const term = try dm.child.wait(rig.io);
+        dm.reaped = true;
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+        const text = try rig.readLog(r);
+        defer gpa.free(text);
+        var nb: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, text, try std.fmt.bufPrint(&nb, "REFUSING to register this host: the stale sibling pid {d}", .{pid_b})) != null);
+        try testing.expect(alive(pid_b));
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+    }
     // A2 re-registers the host — never while the stale B lives.
     const a2 = try rig.spawnMountEnv("ss-a2", set.metaUri(), &env_h, &.{});
     try rig.awaitLog(a2, "ready: ", ready_wait_ns);
@@ -1667,7 +1691,7 @@ test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmet
         try testing.expectEqual(@as(u64, 1), try statNumber(s2, "pr_host_registrations"));
         try testing.expectEqual(@as(u64, 0), try statNumber(s2, "pr_stale_sibling_refusals"));
     }
-    const after = try rig.onMount(a2, "echo after > g && sync g && cat f g");
+    const after = try rig.onMount(a2, "echo after > g && sync -d g && cat f g");
     defer gpa.free(after);
     try testing.expectEqualStrings("before\nafter\n", after);
     const seen_m = try rig.onMount(m, "cat g");

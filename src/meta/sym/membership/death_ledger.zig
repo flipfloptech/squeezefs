@@ -6,8 +6,9 @@
 //! (through the shard's `DeathSink`; a reader's id holds no region and is
 //! ignored); the wire form `RecordDeath` is a PEER manager's, SCREENED
 //! before anything is written (own identity, a member the installed owner
-//! lists live, a key this process or a live member holds — rejected; key
-//! 0 or the registered key — accepted; an unknown census — kept with the
+//! lists live, a key contradicting the registered one — rejected; key 0 or
+//! the registered key — accepted, a key live siblings share included: it
+//! is their host's, decision 0003 §DE; an unknown census — kept with the
 //! word and COUNTED, quirk Q-R2). A write that fails is PARKED in RAM
 //! (dedup by identity) and the next poll drains it. The join RETIRES the
 //! identity's standing record before any page goes Live under it.
@@ -268,19 +269,14 @@ pub const Ledger = struct {
     /// `census` supplies the owner's view (null = this node owns no shard
     /// the member could be in: the word is unvalidated).
     pub fn screenDeath(self: *Ledger, req: verbs.RecordDeathReq, census: ?*const shard.Owner, now_ms: u64) screen.Verdict {
-        // The one key the screen asks about, held or not: no allocation, so
-        // the screen never fails open.
-        const held = [1]u64{req.pr_key};
-        var n_held: usize = 0;
         var listed_live = false;
         var registered: ?u64 = null;
         if (census) |o| {
             const id = shard.writerMemberId(req.member);
             listed_live = o.memberIsLive(id, now_ms);
             registered = o.registeredKey(id);
-            if (o.holdsKey(req.pr_key)) n_held = 1;
         }
-        const b: screen.DeathBounds = .{ .own = self.own, .listed_live = listed_live, .registered_key = registered, .held_keys = held[0..n_held] };
+        const b: screen.DeathBounds = .{ .own = self.own, .listed_live = listed_live, .registered_key = registered };
         const v = screen.recordDeath(req, &b);
         if (v.isOk() and req.pr_key != 0 and registered == null) stats.dead_member_keys_unvalidated.inc();
         return v;
@@ -636,7 +632,7 @@ test "a JoinAppender retires the joining pair's standing death record and its re
     try testing.expect((try l.readDeath(wid(2))) != null);
 }
 
-test "the screen: own identity, a live member, a key the census holds or that contradicts the registered key are rejected before any write; key 0 and the registered key are accepted; a member no census knows is accepted and counted unvalidated" {
+test "the screen: own identity, a live member, a key that contradicts the registered key are rejected before any write; key 0 and the registered key are accepted, a key a live sibling shares included (per-host keys); a member no census knows is accepted and counted unvalidated" {
     const gpa = testing.allocator;
     var rs = RamLedgerStore.init(gpa);
     defer rs.deinit();
@@ -653,38 +649,20 @@ test "the screen: own identity, a live member, a key the census holds or that co
     };
     try testing.expect(!l.screenDeath(req.of(wireOf(wid(0)), 0), &o, 0).isOk());
     try testing.expect(!l.screenDeath(req.of(wireOf(wid(3)), 0), &o, 0).isOk());
-    try testing.expect(!l.screenDeath(req.of(wireOf(wid(4)), 0x33), &o, 0).isOk());
     try testing.expect(l.screenDeath(req.of(wireOf(wid(4)), 0), &o, 0).isOk());
-    // Past T_owner the member is evicted: its key stays HELD (departed,
-    // 2 × T_owner) so a word naming it for anyone is a contradiction; a
-    // word naming an unknown key for the now-unregistered member is kept
-    // and counted unvalidated.
-    _ = o.expireDue(50_000);
-    try testing.expect(!l.screenDeath(req.of(wireOf(wid(4)), 0x33), &o, 50_000).isOk());
+    // Member 4, unregistered, dead under the key live member 3 holds: its
+    // host's key (a sibling's) — accepted, counted unvalidated.
     const unval0 = stats.dead_member_keys_unvalidated.load();
+    try testing.expect(l.screenDeath(req.of(wireOf(wid(4)), 0x33), &o, 0).isOk());
+    try testing.expectEqual(unval0 + 1, stats.dead_member_keys_unvalidated.load());
+    // Past T_owner member 3 is evicted: a word naming an unknown key for the
+    // now-unregistered member is kept and counted unvalidated.
+    _ = o.expireDue(50_000);
     try testing.expect(l.screenDeath(req.of(wireOf(wid(3)), 0x44), &o, 50_000).isOk());
     try testing.expect(l.screenDeath(req.of(wireOf(wid(9)), 0x99), &o, 50_000).isOk());
-    try testing.expectEqual(unval0 + 2, stats.dead_member_keys_unvalidated.load());
+    try testing.expectEqual(unval0 + 3, stats.dead_member_keys_unvalidated.load());
     try testing.expect(l.screenDeath(req.of(wireOf(wid(9)), 0), null, 50_000).isOk());
-    try testing.expectEqual(unval0 + 2, stats.dead_member_keys_unvalidated.load());
-}
-
-test "an evicted member's key stays held through an allocation failure: the departure keeps it and the screen still rejects a death naming it (the screen never fails open)" {
-    const gpa = testing.allocator;
-    var rs = RamLedgerStore.init(gpa);
-    defer rs.deinit();
-    var failing = std.testing.FailingAllocator.init(gpa, .{});
-    var l = Ledger.init(failing.allocator(), rs.store(), 2, wireOf(wid(0)), 45_000);
-    defer l.deinit();
-    const clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
-    var o = try shard.Owner.arm(failing.allocator(), clocks, 0, 1, 0, &.{}, 0);
-    defer o.deinit();
-    _ = o.join(.{ .id = shard.writerMemberId(wireOf(wid(3))), .role = .writer, .endpoint = .none, .pid = 1, .boot = @splat(0), .prior_epoch = null, .pr_key = 0x33, .mount = "/m", .row = null }, 0).granted;
-    failing.fail_index = failing.alloc_index;
-    failing.resize_fail_index = failing.resize_index;
-    try testing.expectEqual(@as(u32, 1), o.expireDue(50_000));
-    const req: verbs.RecordDeathReq = .{ .volume = 0, .reserved = 0, .reserved2 = 0, .member = wireOf(wid(4)), .epoch = 1, .pr_key = 0x33 };
-    try testing.expect(!l.screenDeath(req, &o, 50_000).isOk());
+    try testing.expectEqual(unval0 + 3, stats.dead_member_keys_unvalidated.load());
 }
 
 test "the poll: release-recovered first, then every death on every volume (acted per region; propagation = max lag), the retirement at 2 × T_owner only when no page stands and no lease names it, the roll-forward iff anything was recovered; the vol-0 rule releases the role after T_owner unreachable, once" {

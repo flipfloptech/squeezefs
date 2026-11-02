@@ -49,6 +49,9 @@ const pr = @import("pr.zig");
 const pr_linux = @import("pr_linux.zig");
 const proc = @import("proc.zig");
 const nvme = @import("nvme_cmd.zig");
+const host_fence = @import("host_fence.zig");
+const join = @import("../sym/join.zig");
+const joined = @import("../sym/joined.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("guard/gate is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -114,6 +117,10 @@ pub const Guard = struct {
     pr_active: bool = false,
     /// The char node behind an active posture (owned).
     device: ?*pr_linux.Device = null,
+    /// The host's registry of this set's mounts (per-host fencing, decision
+    /// 0003 §DE): null without a device fence, under the per-mount seam,
+    /// or with no host identity source.
+    fence_reg: ?host_fence.Registry = null,
     /// The configured host identity recorded at the gate (§1.4).
     identity_opts: pr.IdentityOptions,
     identity_stamp: pr.IdentityStamp,
@@ -288,8 +295,11 @@ pub const Guard = struct {
     /// The PR substrate: the test namespace, else the block node's char
     /// twin; RESCAP decides the posture. Never fails the mount.
     fn resolvePr(g: *Guard, gpa: Allocator, opts: Options) backend.OpenError!void {
-        const pr_key = claim.prKey(g.identity.writerId(g.be.index), g.identity.boot_id);
+        const incarnation_key = claim.prKey(g.identity.writerId(g.be.index), g.identity.boot_id);
+        // The fake namespace keeps the incarnation's key: no host registry
+        // behind a fixture.
         if (builtin.is_test) if (opts.test_namespace) |ns| {
+            const pr_key = incarnation_key;
             const c = try gpa.create(pr.Client);
             errdefer gpa.destroy(c);
             c.* = try pr.Client.init(gpa, ns, 1, pr_key);
@@ -303,16 +313,61 @@ pub const Guard = struct {
             },
             .device => |dev| {
                 g.device = dev;
+                // One key and one registry per (host identity, set): every
+                // mount of the set on this host rides one registration.
+                const fp = host_fence.plan(g.be.env, opts.identity, g.be.sb.set_uuid, incarnation_key, g.be.path);
                 const c = try gpa.create(pr.Client);
                 errdefer gpa.destroy(c);
-                c.* = try pr.Client.init(gpa, dev.face(), dev.nsid, pr_key);
+                c.* = try pr.Client.init(gpa, dev.face(), dev.nsid, fp.key);
                 g.posture = pr.resolvePosture(gpa, c, g.be.path);
                 if (g.posture == .none) {
                     dev.deinit();
                     g.device = null;
-                }
+                } else g.fence_reg = fp.reg;
             },
         }
+    }
+
+    fn ruleContext(g: *const Guard, taking_manager: bool) host_fence.RuleContext {
+        return .{ .gpa = g.gpa, .env = g.be.env, .path = g.be.path, .local = g.identity, .node_token = join.nodeToken(g.identity), .vol_index = g.be.index, .taking_manager = taking_manager };
+    }
+
+    fn pagesFn(ctx: *anyopaque, gpa: Allocator) error{ Io, Corrupt, OutOfMemory }![]@import("../sym/appender_page.zig").Page {
+        return joined.JoinedSet.devicePages(gpa, @ptrCast(@alignCast(ctx)));
+    }
+
+    /// Under the registry's lock, before a register: the stale-sibling
+    /// rule when the register would admit the host afresh. True = fresh.
+    fn admitHost(g: *Guard, c: *pr.Client, taking_manager: bool) backend.OpenError!bool {
+        const reg = &(g.fence_reg orelse return true);
+        return host_fence.admitBeforeRegister(g.ruleContext(taking_manager), reg, c, .{ .ctx = g.be, .read = &pagesFn }) catch |e| switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.SiblingLive => error.Busy,
+            error.RegistryUnavailable, error.PagesUnreadable => {
+                log.err("meta volume {s}: the stale-sibling rule could not read its inputs ({s}; registry {s}) — refusing to register this host", .{ g.be.path, @errorName(e), reg.dir() });
+                return error.Busy;
+            },
+        };
+    }
+
+    fn lockRegistry(g: *Guard) backend.OpenError!bool {
+        const reg = &(g.fence_reg orelse return false);
+        reg.lock() catch {
+            log.err("meta volume {s}: the host's registry of this set ({s}) cannot be opened — refusing to register this host (the stale-sibling rule cannot run)", .{ g.be.path, reg.dir() });
+            return error.Busy;
+        };
+        return true;
+    }
+
+    /// This process enters the host's registry of the set as the volume's
+    /// manager (after its role is durable: appender 0's page Live under it
+    /// on a symmetric volume, the claim on a flat one).
+    pub fn enrollManager(g: *Guard) void {
+        const reg = &(g.fence_reg orelse return);
+        reg.lock() catch return;
+        defer reg.unlock();
+        var lb: [64]u8 = undefined;
+        reg.append(g.identity.pid, g.identity.start_ticks, host_fence.regionLine(&lb, .{ .role = .manager, .slot = g.be.index, .writer_id = g.identity.writerId(g.be.index) })) catch |e| log.warn("meta volume {s}: this mount could not enter the host's registry of the set ({s}: {s}) — a sibling's registration cannot judge it", .{ g.be.path, reg.dir(), @errorName(e) });
     }
 
     fn prErrorLog(g: *Guard, c: *pr.Client, what: []const u8, e: pr.Error) backend.OpenError {
@@ -332,6 +387,13 @@ pub const Guard = struct {
     }
 
     fn arbitrateBlocking(g: *Guard, c: *pr.Client, evidence: claim.Evidence) backend.OpenError!void {
+        // A symmetric set's manager holds WERO: every member's host is a
+        // registrant that may write (charter §5.5); a flat volume's single
+        // writer holds Write Exclusive.
+        if (g.be.sb.symmetricPlaneStamped()) c.rtype = nvme.RTYPE_WERO;
+        const locked = try g.lockRegistry();
+        defer if (locked) g.fence_reg.?.unlock();
+        const fresh = try g.admitHost(c, true);
         switch (c.registerLadder() catch |e| return g.prErrorLog(c, "register", e)) {
             .registered => {},
             .recovered_own_stale => |n| log.warn("{s}: the register ladder unregistered {d} stale registration(s) of this host (a crashed incarnation's residue on a spec-strict target) before registering key {x:0>16}", .{ g.be.path, n, c.key }),
@@ -349,6 +411,9 @@ pub const Guard = struct {
             },
             else => return g.prErrorLog(c, "acquire", e),
         };
+        if (locked) {
+            if (fresh) guard.stats.pr_host_registrations.inc() else guard.stats.pr_host_adoptions.inc();
+        }
         // Rung 6's shared-identity probe: another rkey under our wire id.
         if (c.identityShared() catch false) log.warn("{s}: another registration shares this mount's wire host id — fencing between the two is PROCESS-LOCAL (co-located mounts on one registrant)", .{g.be.path});
     }
@@ -538,8 +603,12 @@ pub const Guard = struct {
             return .report_failed;
         };
         if (holder) |k| return if (k == c.key) .ours else .{ .usurped = k };
+        const locked = g.lockRegistry() catch return .reacquire_failed;
+        defer if (locked) g.fence_reg.?.unlock();
+        const fresh = g.admitHost(c, false) catch return .reacquire_failed;
         _ = c.registerLadder() catch return .reacquire_failed;
         c.acquire() catch return .reacquire_failed;
+        if (locked and fresh) guard.stats.pr_host_registrations.inc();
         return .reacquired;
     }
 
@@ -585,7 +654,22 @@ pub const Guard = struct {
     pub fn releasePr(g: *Guard) void {
         switch (g.posture) {
             .active => |c| {
-                if (g.pr_active) c.release() catch |e| {
+                // The host's registration is every sibling's: the last
+                // process of the set on this host takes it with it, any
+                // other releases only the reservation.
+                var last = true;
+                if (g.fence_reg) |*reg| if (reg.lock()) |_| {
+                    defer reg.unlock();
+                    reg.remove(g.identity.pid);
+                    last = (reg.othersAlive(g.gpa, g.identity.pid) catch 1) == 0;
+                } else |_| {};
+                if (g.pr_active and !last) c.releaseReservation() catch |e| {
+                    var buf: [128]u8 = undefined;
+                    var w: Io.Writer = .fixed(&buf);
+                    c.writeError(&w, e) catch {};
+                    log.warn("meta volume {s}: reservation release failed ({s}) — the next manager's acquire preempts it", .{ g.be.path, w.buffered() });
+                };
+                if (g.pr_active and last) c.release() catch |e| {
                     var buf: [128]u8 = undefined;
                     var w: Io.Writer = .fixed(&buf);
                     c.writeError(&w, e) catch {};
@@ -1107,7 +1191,7 @@ test "a heartbeat rewrites ts and heartbeat_seq through the conveyor (coalesced 
     try testing.expectEqual(c1.heartbeat_seq + 2, (try v.probe()).?.heartbeat_seq);
 }
 
-test "B1 on a PR substrate (the fake): acquired WE at mount with our derived key, released at a clean unmount with zero residue; writer_guard_mode is flock+pr; RESCAP 0 degrades to flock+claim" {
+test "B1 on a PR substrate (the fake): the symmetric volume's manager acquires WERO at mount with our derived key (every member host a registrant may write; an unregistered host may not), released at a clean unmount with zero residue; writer_guard_mode is flock+pr; RESCAP 0 degrades to flock+claim" {
     const gpa = testing.allocator;
     const v = try Vol.create(gpa, "pr", null);
     defer v.destroy();
@@ -1119,7 +1203,8 @@ test "B1 on a PR substrate (the fake): acquired WE at mount with our derived key
         const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
         try testing.expectEqualStrings("flock+pr", be.guard.?.modeName());
         try testing.expectEqual(@as(?u64, claim.prKey(me.writerId(0), boot_a)), ns.holder);
-        try testing.expectEqual(nvme.RTYPE_WRITE_EXCLUSIVE, ns.rtype);
+        try testing.expect(be.sb.symmetricPlaneStamped());
+        try testing.expectEqual(nvme.RTYPE_WERO, ns.rtype);
         try testing.expect(ns.writeAllowed(host_a_id));
         try testing.expect(!ns.writeAllowed(host_b_id));
         var buf: [2048]u8 = undefined;

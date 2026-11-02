@@ -6,8 +6,8 @@
 #   scripts/dev/provision-local-venue           # check only; exit 1 when something is missing
 #   scripts/dev/provision-local-venue --apply   # also fix what is safe to fix, then re-check:
 #       install the missing packages (apt or pacman), then scripts/dev/provision-ssh-venue
-#       (the nvmet modules loaded and persisted, IOR/mdtest into /opt/sqz-tools, root-MPI
-#       env, the build root's directories)
+#       (the nvmet modules loaded and persisted, nvme_core.multipath=N in GRUB or Limine,
+#       IOR/mdtest into /opt/sqz-tools, root-MPI env, the build root's directories)
 #
 # Two package families: Debian/Ubuntu (apt, dpkg; a distro or kernel.org Linux >= 7.3) and
 # Arch and its derivatives such as Omarchy (pacman; scripts/kernel/build-host-kernel builds
@@ -101,13 +101,30 @@ done
   || miss "modules:$lack (the nvmet, NVMe-oF, kTLS and RAM-namespace rows)" "a kernel config that has them (scripts/kernel/config-fragment lists them)"
 [ -f /etc/modules-load.d/sqz.conf ] && ok "nvmet modules persisted (/etc/modules-load.d/sqz.conf)" \
   || miss "the nvmet modules loaded at boot" "scripts/dev/provision-local-venue --apply"
-# A stock kernel groups a host-side NVMe subsystem by its NQN alone (decision 0003 §DB): which
-# nvmet rows can run follows nvme_core.multipath, the venue's boot choice (an owner call, §DB.4).
+# The venue boots nvme_core.multipath=N (owner ruling 2026-11-02, decision 0003 §DE): the
+# product presents one host identity per host, but the venue's single-host rows stand two
+# hosts up on one under two identities, and a stock kernel groups a host-side NVMe subsystem
+# by its NQN alone — under native multipath two identities on one subsystem merge under one
+# head, which the product refuses. Persisted where provision-ssh-venue writes it: Debian's
+# GRUB drop-ins, or limine-entry-tool's (Omarchy); anything else is by hand.
+if [ -d /etc/default/grub.d ]; then mp_dropin=/etc/default/grub.d/sqz-venue.cfg; mp_fix="scripts/dev/provision-local-venue --apply (persists it in GRUB: $mp_dropin), then reboot"
+elif [ -d /etc/limine-entry-tool.d ] && command -v limine-mkinitcpio >/dev/null; then mp_dropin=/etc/limine-entry-tool.d/sqz-venue.conf; mp_fix="scripts/dev/provision-local-venue --apply (persists it in Limine: $mp_dropin, then limine-mkinitcpio rebuilds the boot image), then reboot"
+elif [ -f /etc/default/grub ]; then mp_dropin=""; mp_fix="append nvme_core.multipath=N to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub && sudo grub-mkconfig -o /boot/grub/grub.cfg, then reboot"
+else mp_dropin=""; mp_fix="append nvme_core.multipath=N to the kernel command line in your bootloader's config (neither GRUB drop-ins nor limine-entry-tool here), then reboot"; fi
 case $(cat /sys/module/nvme_core/parameters/multipath 2>/dev/null || echo absent) in
-  Y) note "nvme_core.multipath=Y: two host identities on one subsystem merge under one head, which the product refuses — the nvmet two-identity rows (PR matrix, registrants, sigstop-preempt) cannot connect; nvme_core.multipath=N on the kernel command line runs them and skips multipath-tcp" ;;
-  N) note "nvme_core.multipath=N: each host identity gets its own namespace node (the nvmet two-identity rows run); the multipath-tcp row skips (no native multipath head)" ;;
-  *) note "no native NVMe multipath (CONFIG_NVME_MULTIPATH unset): each host identity gets its own namespace node; the multipath-tcp row skips" ;;
+  N) ok "nvme_core.multipath=N (each host identity its own namespace node: the nvmet two-identity rows run; multipath-tcp skips by name)" ;;
+  Y) miss "nvme_core.multipath=N (running Y: two host identities on one subsystem merge under one head, which the product refuses — the nvmet two-identity rows cannot connect)" "$mp_fix" ;;
+  *) ok "no native NVMe multipath (CONFIG_NVME_MULTIPATH unset): each host identity its own namespace node; multipath-tcp skips by name" ;;
 esac
+if [ -n "$mp_dropin" ]; then
+  if [ -f "$mp_dropin" ] && grep -qF nvme_core.fabrics_host_scoped_subsystems "$mp_dropin"; then
+    miss "$mp_dropin without the retired sqz-only nvme_core.fabrics_host_scoped_subsystems (decision 0003 §DB)" "$mp_fix"
+  elif [ -f "$mp_dropin" ] && grep -qF nvme_core.multipath=N "$mp_dropin"; then
+    ok "nvme_core.multipath=N persisted ($mp_dropin)"
+  else
+    miss "nvme_core.multipath=N persisted for the next boot ($mp_dropin)" "$mp_fix"
+  fi
+fi
 # A desktop host runs udisks (and an automounter over it: Omarchy's udiskie): it probes and
 # auto-mounts every loop device the suites format (LTP's .all_filesystems tests, xfstests'
 # TEST_DEV/SCRATCH_DEV) — the next mkfs sees "is mounted", the loop never detaches, and the

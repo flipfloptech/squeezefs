@@ -53,6 +53,8 @@ const smo = @import("../smo.zig");
 const checkpoint_cycle = @import("../checkpoint_cycle.zig");
 const claim = @import("../guard/claim.zig");
 const proc = @import("../guard/proc.zig");
+const pr = @import("../guard/pr.zig");
+const host_fence = @import("../guard/host_fence.zig");
 const sym = @import("../sym.zig");
 const page = @import("appender_page.zig");
 const dir = @import("appender_dir.zig");
@@ -172,6 +174,10 @@ pub const OpenError = error{
     /// A page Live under this mount point's (node, mount slot) belongs to
     /// a process alive on this host: the mount point is served.
     PredecessorLive,
+    /// The host's registration on the PR-capable namespace was refused (a
+    /// stale sibling could be neither proven dead nor killed, or the rule's
+    /// inputs were unreadable — logged by name).
+    HostAdmissionRefused,
     Io,
     Corrupt,
     OutOfMemory,
@@ -403,12 +409,15 @@ pub const JoinedSet = struct {
     /// CYCLE (the reference's cadence — a stall's park-kicked cycle lands
     /// first, then the growth), never per 50 ms tick.
     grow_judged_at_seq: u64 = 0,
+    /// The host's registration on a PR-capable metadata namespace (null =
+    /// no device fence: a file, a loop device, RESCAP 0, the seam).
+    fence: ?*host_fence.Joiner = null,
 
     /// The joined door (module doc): the census, the endpoint and the
     /// secret off the projection, the dial, `JoinAppender`. The region's
     /// words are read through `standing()`; the slots through
     /// `acquireRotor`. Nothing of the backend's ring exists yet.
-    pub fn open(be: *KvBackend, mountpoint: []const u8, explicit_ep: ?endpoint.EndpointWire, predecessor: ?u32, set_secret: ?wire_auth.Secret) OpenError!*JoinedSet {
+    pub fn open(be: *KvBackend, mountpoint: []const u8, explicit_ep: ?endpoint.EndpointWire, predecessor: ?u32, set_secret: ?wire_auth.Secret, identity_opts: pr.IdentityOptions) OpenError!*JoinedSet {
         const gpa = be.gpa;
         const self = try gpa.create(JoinedSet);
         errdefer gpa.destroy(self);
@@ -429,6 +438,15 @@ pub const JoinedSet = struct {
             .crashed => |p| log.info("meta volume {s}: appender {d} (term {d}) is Live under this mount point's identity and its process is gone — a crashed predecessor: the manager defers this join until its recovery", .{ be.path, p.appender_id, p.term }),
             .alive => |a| return refuseLive(be, a),
         }
+        // The host's registration (per-host fencing, decision 0003 §DE):
+        // adopted when the host is registered under the set's key, else
+        // registered after the stale-sibling rule — before the JoinAppender,
+        // so this incarnation never writes unregistered.
+        const fence = host_fence.Joiner.admit(.{ .gpa = gpa, .env = be.env, .path = be.path, .local = local, .node_token = identity.node_token, .vol_index = be.index, .taking_manager = false }, be.sb.set_uuid, identity_opts, identity.mount_slot, identity.writer_id, .{ .ctx = be, .read = &devicePagesFn }) catch |e| return switch (e) {
+            error.HostAdmissionRefused => error.HostAdmissionRefused,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+        errdefer if (fence) |f| f.deinit();
         holdJoinAppenderIfArmed(be);
         const page0 = (try readAppender0(gpa, be)) orelse {
             log.err("meta volume {s}: appender 0's page is blank — no manager has ever mounted this volume; the D0 ladder is the first writer's", .{be.path});
@@ -465,6 +483,7 @@ pub const JoinedSet = struct {
             .granted_bits = .{},
             .park_gate = park.ParkGate.arm(be.io, be.stamp.member_position, park.tParkMaxMs(grant.failoverBoundMs(0, 0), park.graceMs(shard.tOwnerMsFromEnv(be.env)))),
             .gate = ring_growth.Gate.init(be.io),
+            .fence = fence,
         };
         errdefer self.link.deinit();
         // `--join` names a listener the record may not yet carry: the
@@ -583,6 +602,7 @@ pub const JoinedSet = struct {
     }
 
     pub fn deinit(self: *JoinedSet) void {
+        if (self.fence) |f| f.deinit();
         self.refill.cancel(self.be.io);
         if (self.pool_armed) self.be.alloc.uninstallLowWater();
         self.joiner.deinit();
@@ -596,6 +616,13 @@ pub const JoinedSet = struct {
 
     pub fn appenderId(self: *const JoinedSet) u32 {
         return self.joiner.region.?.appenderId();
+    }
+
+    /// The host's registration key this member rides (0 = no device fence:
+    /// the death preempt's word, `fencing.preemptDeadRegistrant`).
+    pub fn prKey(self: *const JoinedSet) u64 {
+        const f = self.fence orelse return 0;
+        return f.client.key;
     }
 
     pub fn core(self: *JoinedSet) *region.RegionCore {
@@ -1081,6 +1108,7 @@ pub const JoinedSet = struct {
         be.smo_lock.lockUncancelable(be.io);
         _ = be.lane.latch.failStop();
         be.smo_lock.unlock(be.io);
+        if (self.fence) |f| f.declareRetired();
         self.gate.open();
         return .{ .drained = drained, .head = be.core.headPos(), .open = be.reg.openCount() };
     }
@@ -1103,21 +1131,65 @@ pub const JoinedSet = struct {
         };
         const loc = dir.locate(self.appenderId(), dir.pairCount(be.sb.node_size));
         if (loc.chain_index >= links.items.len) return null;
-        const dir_slots = dir.pairOffsets(links.items[loc.chain_index].extent, loc.pair);
+        return pageAtPair(&reader_ctx, links.items[loc.chain_index].extent, loc.pair);
+    }
+
+    /// The newest valid image of one directory pair's appender over its
+    /// FOUR slots: the pair and — once a directory image names a first
+    /// segment — the two ring-side slots a recovery writes through.
+    fn pageAtPair(reader_ctx: *DevicePages, extent: dir.Extent, pair: u32) OpenError!?page.Page {
+        const dir_slots = dir.pairOffsets(extent, pair);
         var bufs: [page.PAGE_SLOTS][page.PAGE_LEN]u8 = undefined;
         var imgs: [page.PAGE_SLOTS]?[]const u8 = .{ null, null, null, null };
         for (dir_slots, 0..) |off, i| {
-            DevicePages.read(&reader_ctx, off, &bufs[i]) catch return error.Io;
+            DevicePages.read(reader_ctx, off, &bufs[i]) catch return error.Io;
             imgs[i] = &bufs[i];
         }
         const dir_best = page.newestValid(.{ imgs[0], imgs[1], null, null }) catch return error.Corrupt;
         if (dir_best) |p| if (p.segments.len > 0) {
             for (page.ringSideOffsets(p.segments.items[0]), 2..) |off, i| {
-                DevicePages.read(&reader_ctx, off, &bufs[i]) catch return error.Io;
+                DevicePages.read(reader_ctx, off, &bufs[i]) catch return error.Io;
                 imgs[i] = &bufs[i];
             }
         };
         return page.newestValid(imgs) catch error.Corrupt;
+    }
+
+    /// Every appender page of `be`'s volume as the device holds it NOW
+    /// (appender 0 + the directory, each over its four slots): the
+    /// stale-sibling rule's input (`guard/host_fence.zig`). Empty on a
+    /// volume without the symmetric plane.
+    pub fn devicePages(gpa: Allocator, be: *KvBackend) error{ Io, Corrupt, OutOfMemory }![]page.Page {
+        var out: std.ArrayList(page.Page) = .empty;
+        errdefer out.deinit(gpa);
+        if (!be.sb.symmetricPlaneStamped()) return out.toOwnedSlice(gpa);
+        const p0 = readAppender0(gpa, be) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Corrupt => error.Corrupt,
+            else => error.Io,
+        };
+        if (p0) |p| try out.append(gpa, p);
+        var links: std.ArrayList(dir.Link) = .empty;
+        defer links.deinit(gpa);
+        var reader_ctx: DevicePages = .{ .be = be };
+        const reader: dir.PageReader = .{ .ctx = &reader_ctx, .read = &DevicePages.read };
+        try dir.walkChain(gpa, reader, .{ .start = be.sb.appender_dir.start, .len = be.sb.appender_dir.len }, be.sb.node_size, .{ .start = be.sb.heap.start, .len = be.sb.heap.len }, be.sb.totalExtents(), &links);
+        for (links.items) |l| {
+            var pair: u32 = 0;
+            while (pair < l.header.pairs) : (pair += 1) {
+                const maybe = pageAtPair(&reader_ctx, l.extent, pair) catch |e| return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.Corrupt => error.Corrupt,
+                    else => error.Io,
+                };
+                if (maybe) |p| try out.append(gpa, p);
+            }
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    fn devicePagesFn(ctx: *anyopaque, gpa: Allocator) error{ Io, Corrupt, OutOfMemory }![]page.Page {
+        return devicePages(gpa, @ptrCast(@alignCast(ctx)));
     }
 
     /// The successor's recovery of this (retired) region as the device
@@ -1348,6 +1420,7 @@ pub const JoinedSet = struct {
         if (self.left) return;
         self.left = true;
         const be = self.be;
+        if (self.fence) |f| f.depart();
         // A FENCED member's dismount is the CRASH shape (charter §5.5: a
         // park's expiry is the terminal poison; `leaveAllowed`'s law): its
         // home shard evicted it, or will, and the manager recovers its
@@ -1425,6 +1498,10 @@ pub const JoinedSet = struct {
         const unclaimed = self.unclaimedCount();
         try w.print("{{\"manager_lease\":\"joined\",\"appenders_live\":1,\"appenders_known\":{d},\"appenders_capacity\":0,\"appender_ring_budget_remaining_bytes\":0,\"appender_live_pages_at_mount\":0,\"appender_unrecovered\":0,\"manager_endpoint\":\"{f}\",\"manager_repoints\":{d},\"regions\":[{{\"appender_id\":{d},\"term\":{d},\"ring_bytes\":{d},\"ring_segments\":{d},\"seq_offset\":{d},\"grant_unclaimed\":{d},\"grant_held\":{d},\"grant_granted\":{d},\"grant_returned\":{d},\"entries\":{d}}}],\"slots\":", .{ self.writers_known, self.managerEndpoint(), self.manager_resolver.repoints.load(.monotonic), self.appenderId(), r.page.term, r.ringBytes(), r.table.len, self.be.reg.seqOffset(), unclaimed, self.granted_bits.count() - unclaimed, self.granted, self.returned, self.entries });
         try self.be.slots.writeStatsJson(w);
+        if (self.fence) |f| {
+            try w.writeAll(",\"pr\":");
+            try f.client.writeStatsJson(w);
+        }
         try w.writeByte('}');
     }
 };

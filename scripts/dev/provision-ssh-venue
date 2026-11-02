@@ -5,7 +5,9 @@
 #
 #   1. the kernel modules the nvmet / NVMe-oF / kTLS rows need, loaded now and
 #      persisted in /etc/modules-load.d/sqz.conf (a stock distro kernel ships
-#      them as modules; a kernel built with them =y modprobes as a no-op);
+#      them as modules; a kernel built with them =y modprobes as a no-op), and
+#      nvme_core.multipath=N persisted on the kernel command line (GRUB drop-ins,
+#      or Limine's);
 #   2. IOR/mdtest at io500's pinned hash into /opt/sqz-tools, exactly as
 #      scripts/dev/Containerfile builds them, and root runs allowed for OpenMPI;
 #   3. the facts a gate log is read against (kernel, openssl, fusermount3).
@@ -28,12 +30,36 @@ want=$(printf '%s\n' "# squeezefs venue (scripts/dev/provision-ssh-venue)" "${MO
 if [ ! -f "$conf" ] || [ "$(cat "$conf")" != "$want" ]; then printf '%s\n' "$want" >"$conf"; fi
 mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
 
-# NVMe fabric identities: the venue kernel carries no patch (decision 0003 §DB), and a
-# stock kernel groups a host-side subsystem by its NQN alone — under native multipath
-# (nvme_core.multipath=Y) two host identities on one subsystem MERGE under one head, which
-# the product refuses (the nvmet two-identity rows cannot connect); with
-# nvme_core.multipath=N each identity gets its own node and the multipath-tcp row skips.
-# Which one the venue boots is an owner call (§DB.4): reported below, never set here.
+# The venue boots nvme_core.multipath=N (owner ruling 2026-11-02, decision 0003 §DE): the
+# product presents ONE host identity per host, but the venue's single-host rows stand two
+# hosts up on one under two identities (explicit pairs, SQUEEZEFS_TEST_PER_MOUNT_IDENTITY),
+# and a stock kernel groups a host-side subsystem by its NQN alone — under native multipath
+# two identities on one subsystem MERGE under one head, which the product refuses. With
+# multipath=N each identity gets its own node (the multipath-tcp row skips by name).
+# nvme_core loads from the initramfs, so only the command line sets it: persisted here, live
+# after the next reboot — in Debian's GRUB drop-ins, or in limine-entry-tool's (Omarchy),
+# where the parameter is baked into the UKI, so the boot image is rebuilt the way Omarchy's
+# own migrations do it (limine-mkinitcpio). A drop-in that already carries the parameter
+# (and not the retired sqz-only nvme_core.fabrics_host_scoped_subsystems) is left as it is.
+mp_cmdline=nvme_core.multipath=N
+stale_cmdline=nvme_core.fabrics_host_scoped_subsystems
+dropin_ok() { [ -f "$1" ] && grep -qF "$mp_cmdline" "$1" && ! grep -qF "$stale_cmdline" "$1"; }
+if [ -d /etc/default/grub.d ]; then
+  grub_cfg=/etc/default/grub.d/sqz-venue.cfg
+  if ! dropin_ok "$grub_cfg"; then
+    printf '%s\n' "# squeezefs venue (scripts/dev/provision-ssh-venue)" "GRUB_CMDLINE_LINUX_DEFAULT=\"\$GRUB_CMDLINE_LINUX_DEFAULT $mp_cmdline\"" >"$grub_cfg"
+    update-grub >/dev/null 2>&1
+  fi
+elif [ -d /etc/limine-entry-tool.d ] && command -v limine-mkinitcpio >/dev/null; then
+  limine_conf=/etc/limine-entry-tool.d/sqz-venue.conf
+  if ! dropin_ok "$limine_conf"; then
+    printf '%s\n' "# squeezefs venue (scripts/dev/provision-ssh-venue)" "KERNEL_CMDLINE[default]+=\" $mp_cmdline\"" >"$limine_conf"
+    echo "provision: $limine_conf written; rebuilding the boot image (limine-mkinitcpio) …"
+    limine-mkinitcpio
+  fi
+else
+  grep -qF "$mp_cmdline" /proc/cmdline || echo "provision: no GRUB drop-in dir and no limine-entry-tool here — put $mp_cmdline on the kernel command line yourself" >&2
+fi
 
 # The hash io500 sc26 pins (docs/gates/brackets.md); the same as the image's.
 # Spelled out in full: the commit is reachable today only from a pull-request
@@ -71,6 +97,6 @@ chmod 1777 "$root/tmp"
 echo "kernel:   $(uname -r) ($(uname -m)), $(nproc) cpus, $(free -g | awk 'NR==2{print $2}') GiB"
 echo "modules:  $(for m in "${MODULES[@]}"; do [ -d "/sys/module/${m//-/_}" ] && printf '%s ' "$m"; done)"
 echo "openssl:  $(openssl version)"
-echo "nvme:     multipath=$(cat /sys/module/nvme_core/parameters/multipath 2>/dev/null || echo absent) (Y: two host identities on one subsystem merge — refused; N: each its own node)"
+echo "nvme:     multipath=$(cat /sys/module/nvme_core/parameters/multipath 2>/dev/null || echo absent) (the venue boots N: each host identity its own node)$(grep -qF "$mp_cmdline" /proc/cmdline || echo " ($mp_cmdline persisted for the next boot: REBOOT to apply)")"
 echo "fuse:     $(fusermount3 --version 2>&1 | head -1); enable_uring=$(cat /sys/module/fuse/parameters/enable_uring 2>/dev/null || echo absent)"
 echo "tools:    $(PATH=$PREFIX/bin:$PATH command -v ior mdtest | tr '\n' ' ')fio $(fio --version)"

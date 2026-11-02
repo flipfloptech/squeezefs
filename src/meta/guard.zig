@@ -30,6 +30,7 @@ pub const pr = @import("guard/pr.zig");
 pub const proc = if (is_linux) @import("guard/proc.zig") else struct {};
 pub const pr_linux = if (is_linux) @import("guard/pr_linux.zig") else struct {};
 pub const gate = if (is_linux) @import("guard/gate.zig") else struct {};
+pub const host_fence = if (is_linux) @import("guard/host_fence.zig") else struct {};
 pub const smoke = if (is_linux) @import("guard/smoke.zig") else struct {};
 
 /// Process-wide guard counters (charter §10; spec §4.2). Per-volume detail
@@ -64,12 +65,27 @@ pub const Stats = struct {
     /// A changed hostnqn/hostid under a live mount cannot happen on a
     /// correctly provisioned host.
     identity_mismatch: counters.Tripwire = .init("writer_guard_identity_mismatch"),
+    /// `pr_host_registrations`: registrations that admitted this host
+    /// afresh on a namespace (after the stale-sibling rule).
+    pr_host_registrations: counters.ShardedCounter = .{},
+    /// `pr_host_adoptions`: mounts that found their host registered under
+    /// the set's key — no device mutation, nobody re-admitted.
+    pr_host_adoptions: counters.ShardedCounter = .{},
+    /// `pr_stale_sibling_kills`: stale siblings killed before a
+    /// registration admitted their host.
+    pr_stale_sibling_kills: counters.ShardedCounter = .{},
+    /// `pr_siblings_proven_dead`: registry entries the writer-id proof
+    /// found dead.
+    pr_siblings_proven_dead: counters.ShardedCounter = .{},
+    /// `pr_stale_sibling_refusals`: registrations refused because a stale
+    /// sibling could be neither proven dead nor killed.
+    pr_stale_sibling_refusals: counters.ShardedCounter = .{},
 };
 
 pub var stats: Stats = .{};
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"writer_guard_fenced\":{d},\"volume_fenced\":{d},\"writer_guard_pr_reacquires\":{d},\"writer_guard_claims_committed\":{d},\"writer_guard_heartbeats\":{d},\"writer_guard_heartbeat_failures\":{d},\"writer_guard_reclaims_dead_pid\":{d},\"writer_guard_preempts\":{d},\"writer_guard_pr_unavailable\":{d},\"writer_guard_claim_refusals\":{d},\"writer_guard_clear_cleared\":{d},\"writer_guard_clear_refusals\":{d},\"clients_registered\":{d},\"writer_guard_identity_mismatch\":{d},\"writer_guard_heartbeat_interval_s\":{d},\"writer_guard_stale_ttl_s\":{d}}}", .{
+    try w.print("{{\"writer_guard_fenced\":{d},\"volume_fenced\":{d},\"writer_guard_pr_reacquires\":{d},\"writer_guard_claims_committed\":{d},\"writer_guard_heartbeats\":{d},\"writer_guard_heartbeat_failures\":{d},\"writer_guard_reclaims_dead_pid\":{d},\"writer_guard_preempts\":{d},\"writer_guard_pr_unavailable\":{d},\"writer_guard_claim_refusals\":{d},\"writer_guard_clear_cleared\":{d},\"writer_guard_clear_refusals\":{d},\"clients_registered\":{d},\"writer_guard_identity_mismatch\":{d},\"pr_host_registrations\":{d},\"pr_host_adoptions\":{d},\"pr_stale_sibling_kills\":{d},\"pr_siblings_proven_dead\":{d},\"pr_stale_sibling_refusals\":{d},\"writer_guard_heartbeat_interval_s\":{d},\"writer_guard_stale_ttl_s\":{d}}}", .{
         stats.fenced.load(),
         stats.volume_fenced.load(),
         stats.pr_reacquires.load(),
@@ -84,6 +100,11 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.clear_refusals.load(),
         stats.clients_registered.load(),
         stats.identity_mismatch.load(),
+        stats.pr_host_registrations.load(),
+        stats.pr_host_adoptions.load(),
+        stats.pr_stale_sibling_kills.load(),
+        stats.pr_siblings_proven_dead.load(),
+        stats.pr_stale_sibling_refusals.load(),
         claim.HEARTBEAT_INTERVAL_S,
         claim.STALE_TTL_S,
     });
@@ -100,6 +121,7 @@ test {
         _ = proc;
         _ = pr_linux;
         _ = gate;
+        _ = host_fence;
         _ = smoke;
     }
 }
@@ -108,7 +130,7 @@ test "the stats JSON names every writer_guard_* family and the two constants" {
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
-    inline for (.{ "writer_guard_fenced", "volume_fenced", "writer_guard_pr_reacquires", "writer_guard_claims_committed", "writer_guard_heartbeats", "writer_guard_reclaims_dead_pid", "writer_guard_preempts", "writer_guard_pr_unavailable", "clients_registered", "writer_guard_identity_mismatch" }) |k| {
+    inline for (.{ "writer_guard_fenced", "volume_fenced", "writer_guard_pr_reacquires", "writer_guard_claims_committed", "writer_guard_heartbeats", "writer_guard_reclaims_dead_pid", "writer_guard_preempts", "writer_guard_pr_unavailable", "clients_registered", "writer_guard_identity_mismatch", "pr_host_registrations", "pr_host_adoptions", "pr_stale_sibling_kills", "pr_siblings_proven_dead", "pr_stale_sibling_refusals" }) |k| {
         try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"" ++ k ++ "\":") != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"writer_guard_stale_ttl_s\":45") != null);

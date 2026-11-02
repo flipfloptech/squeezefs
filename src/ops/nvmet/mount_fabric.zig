@@ -3,14 +3,15 @@
 //! ops_nvmet_keys.md` §3.7 KD-MW-15; the rung-8a3 owed row). The set
 //! config's `FabricEndpoint` record per data volume is the operator's
 //! declaration that THIS daemon owns the volume's fabric association: at
-//! mount, before discovery opens any data device, the daemon resolves its
-//! own host identity (the explicit pair → `/etc/nvme` both → the
-//! machine-id derivation SALTED BY THE MOUNTPOINT, so co-located mounts
-//! never share a controller and a remount at the same mountpoint presents
-//! the same identity — the reservation's identity stamp never reads a
-//! change), reuses a controller already riding that identity for the
-//! record's subsystem (a crashed predecessor's association) or connects
-//! one (`initiator.connect`: the uevent-driven readiness wait), probes the
+//! mount, before discovery opens any data device, the daemon resolves the
+//! HOST's identity (the explicit pair → `/etc/nvme` both → the machine-id
+//! derivation: ONE identity for every mount of the set on this host, owner
+//! ruling 2026-11-02, decision 0003 §DE — the test seam
+//! `SQUEEZEFS_TEST_PER_MOUNT_IDENTITY` salts the derived one by the mount
+//! point), reuses a controller already riding that identity for the
+//! record's subsystem (a sibling mount's, or a crashed predecessor's) or
+//! connects one (`initiator.connect`: the uevent-driven readiness wait),
+//! probes the
 //! node's DMA grain (`align_probe`) and hands discovery the LIVE node path
 //! — the data superblock read right after is the identity law (`vol_tag`,
 //! `device_uuid`, `set_uuid`): a wrong namespace refuses by name and the
@@ -26,12 +27,14 @@
 //! operator's intent, and opening the recorded path "as-is" would bind a
 //! renumbered node.
 //!
-//! Ownership = identity (the reference's `--identity-only` law): at the
-//! teardown, after every device fd closed, the daemon deletes exactly the
-//! controllers of its records' subsystems that carry ITS pair — a
-//! co-located mount's (another pair) or the operator's (the host default)
-//! association is never touched, and `/sys/class/nvme` reads as the mount
-//! found it.
+//! Ownership = identity (the reference's `--identity-only` law), SHARED by
+//! the host's mounts: each association counts its users in the host's
+//! registry (`guard/host_fence.zig`, one entry per process, judged live by
+//! its start ticks, every mutation under the registry's flock). At the
+//! teardown, after every device fd closed, the LAST user deletes the
+//! controllers of its records' subsystems that carry the host's pair; any
+//! other leaves them to the siblings riding them. Another pair's
+//! association is never touched.
 //!
 //! MULTIPATH (`multipath.zig`): a record names one subsystem over SEVERAL
 //! paths (several Ethernet links). The daemon connects EVERY path under
@@ -62,6 +65,7 @@ const proc = @import("../../meta/guard/proc.zig");
 const set_config = @import("../../data/set_config.zig");
 const dir_place = @import("../../meta/routing/dir_place.zig");
 const staging = @import("../../data/staging.zig");
+const host_fence = @import("../../meta/guard/host_fence.zig");
 const initiator = @import("initiator.zig");
 const multipath = @import("multipath.zig");
 const configfs = @import("configfs.zig");
@@ -98,6 +102,8 @@ pub const Bound = struct {
     /// The iopolicy read back after the write; empty when none applied.
     iopolicy_buf: [32]u8 = undefined,
     iopolicy_len: usize = 0,
+    /// The host's users of this association (the release's count).
+    users: host_fence.Registry = .{},
 
     pub fn subnqn(self: *const Bound) []const u8 {
         return self.subnqn_buf[0..self.subnqn_len];
@@ -133,6 +139,8 @@ pub const Refusal = union(enum) {
     head: struct { vol_tag: u64, subnqn: []const u8, verdict: multipath.HeadVerdict },
     /// The connected node's DMA grain is past what the planes admit.
     grain: struct { vol_tag: u64, path: []const u8, grain: u64 },
+    /// The host's registry of the association's users cannot be opened.
+    users: struct { vol_tag: u64, dir: []const u8 },
     out_of_memory,
 
     pub fn write(self: Refusal, w: *Io.Writer) Io.Writer.Error!void {
@@ -154,6 +162,7 @@ pub const Refusal = union(enum) {
                 try h.verdict.write(w);
             },
             .grain => |g| try w.print("data volume vol-{x:0>16}: the connected namespace {s} reports a DMA grain of {d} bytes, past the {d} the data plane admits", .{ g.vol_tag, g.path, g.grain, align_probe.max_grain }),
+            .users => |u| try w.print("data volume vol-{x:0>16}: the host's registry of the association's users ({s}) cannot be opened — a shared association cannot be counted", .{ u.vol_tag, u.dir }),
             .out_of_memory => try w.writeAll("out of memory binding the fabric endpoints"),
         }
     }
@@ -306,9 +315,24 @@ pub const Plan = struct {
         const id = &self.identity.?;
         const pair_: initiator.HostPair = .{ .hostnqn = id.hostnqn(), .hostid = id.hostid() };
         const timeouts = multipath.resolveConnectTimeouts(env);
-        var b: Bound = .{ .vol_tag = d.vol_tag };
+        var b: Bound = .{ .vol_tag = d.vol_tag, .users = host_fence.Registry.runtime(.fabric, host_fence.fabricRegistryKey(f.subnqn, id.hostnqn(), id.hostid())) };
         @memcpy(b.subnqn_buf[0..f.subnqn.len], f.subnqn);
         b.subnqn_len = f.subnqn.len;
+        // The reuse-or-connect and this mount's entry as ONE step under the
+        // users' lock: a sibling's release never deletes a controller this
+        // mount is about to ride.
+        b.users.lock() catch {
+            diag.* = .{ .users = .{ .vol_tag = d.vol_tag, .dir = b.users.dir() } };
+            return error.Refused;
+        };
+        defer b.users.unlock();
+        {
+            const me = proc.localIdentity();
+            b.users.append(me.pid, me.start_ticks, "u\n") catch {
+                diag.* = .{ .users = .{ .vol_tag = d.vol_tag, .dir = b.users.dir() } };
+                return error.Refused;
+            };
+        }
         // Several paths need the kernel's native multipath to merge them
         // into one head: refused BEFORE any connect, naming the parameter.
         if (f.paths.len > 1 and multipath.readMultipathParam() != .on) {
@@ -331,7 +355,7 @@ pub const Plan = struct {
                 bp.reused = true;
                 dev = ours.ns.blockPath(&dev_path);
                 stats.fabric_daemon_reuses.inc();
-                log.warn("mount: data volume vol-{x:0>16}: reusing controller nvme{d} ({s}) already riding this mount's identity for {s} at {s}:{d} — a previous incarnation's association; it is released with this mount", .{ d.vol_tag, ours.instance, dev, f.subnqn, spec.traddr, spec.trsvcid });
+                log.info("mount: data volume vol-{x:0>16}: reusing controller nvme{d} ({s}) already riding this host's identity for {s} at {s}:{d} — a sibling mount's or a previous incarnation's association; the host's last user releases it", .{ d.vol_tag, ours.instance, dev, f.subnqn, spec.traddr, spec.trsvcid });
             } else {
                 const c = initiator.connect(self.gpa, spec, null) catch |e| {
                     stats.fabric_daemon_connect_failures.inc();
@@ -353,6 +377,7 @@ pub const Plan = struct {
             b.n_paths += 1;
         }
         if (b.n_paths == 0) {
+            b.users.remove(proc.localIdentity().pid);
             diag.* = .{ .connect = .{ .vol_tag = d.vol_tag, .subnqn = f.subnqn, .err = last_err.?, .spec = last_spec, .paths = f.paths.len } };
             return error.Refused;
         }
@@ -361,12 +386,17 @@ pub const Plan = struct {
         // The connects are owned from here: a refusal below releases them
         // with the plan.
         self.bound.append(self.gpa, b) catch {
-            var ib: [set_config.MAX_FABRIC_PATHS]u32 = undefined;
-            for (b.instances(&ib)) |inst| initiator.deleteController(inst) catch {};
+            b.users.remove(proc.localIdentity().pid);
+            if ((b.users.othersAlive(self.gpa, proc.localIdentity().pid) catch 1) == 0) {
+                var ib: [set_config.MAX_FABRIC_PATHS]u32 = undefined;
+                for (b.instances(&ib)) |inst| initiator.deleteController(inst) catch {};
+            }
             diag.* = .out_of_memory;
             return error.Refused;
         };
         const bound = &self.bound.items[self.bound.items.len - 1];
+        // The lock is this frame's copy's: the list's copy holds none.
+        bound.users.lock_fd = -1;
         if (bound.paths_failed != 0) {
             stats.fabric_paths_degraded.add(bound.paths_failed);
             log.warn("mount: data volume vol-{x:0>16}: DEGRADED — {d} of {d} path(s) of {s} did not come up; serving on {d} (`squeezefs nvmeof status` lists the paths; a path that comes back later needs a remount to be used)", .{ d.vol_tag, bound.paths_failed, f.paths.len, f.subnqn, bound.n_paths });
@@ -518,12 +548,25 @@ pub const Plan = struct {
         return null;
     }
 
-    /// The teardown: every controller of a bound subsystem under our pair
-    /// (`--identity-only`, every path), each awaited gone. After the
-    /// device fds closed.
+    /// The teardown: out of every association's users; the LAST user of
+    /// one deletes every controller of its subsystem under the host's pair
+    /// (`--identity-only`, every path), each awaited gone; any other leaves
+    /// it to the siblings riding it. After the device fds closed.
     pub fn release(self: *Plan) void {
         const p = self.pair() orelse return;
+        const me = proc.localIdentity().pid;
         for (self.bound.items) |*b| {
+            b.users.lock() catch {
+                log.err("umount: data volume vol-{x:0>16}: the host's registry of {s}'s users ({s}) cannot be opened — its association is left standing (`squeezefs nvmeof disconnect --identity-only {s}` once no mount rides it)", .{ b.vol_tag, b.subnqn(), b.users.dir(), b.subnqn() });
+                continue;
+            };
+            defer b.users.unlock();
+            b.users.remove(me);
+            const others = b.users.othersAlive(self.gpa, me) catch 1;
+            if (others != 0) {
+                log.info("umount: data volume vol-{x:0>16}: the association with {s} stays — {d} other mount(s) of this host ride it", .{ b.vol_tag, b.subnqn(), others });
+                continue;
+            }
             const n = initiator.disconnect(self.gpa, .{ .subsysnqn = b.subnqn(), .identity = .{ .hostnqn = p.hostnqn, .hostid = p.hostid } }) catch |e| {
                 log.err("umount: data volume vol-{x:0>16}: the disconnect of {s} failed ({s}) — `squeezefs nvmeof disconnect --identity-only {s}`", .{ b.vol_tag, b.subnqn(), @errorName(e), b.subnqn() });
                 continue;
@@ -571,25 +614,31 @@ pub const Plan = struct {
     }
 };
 
-/// The data-plane connect identity: the explicit pair → `/etc/nvme` both
-/// → the machine-id derivation salted by the mountpoint (stable per mount
-/// slot: a remount at the same mountpoint presents the same pair; two
-/// mountpoints on one host never share a controller).
+/// The data-plane connect identity: the HOST's (the explicit pair →
+/// `/etc/nvme` both → the machine-id derivation) — every mount of a set on
+/// this host connects under it and shares its associations (owner ruling
+/// 2026-11-02). The seam `SQUEEZEFS_TEST_PER_MOUNT_IDENTITY` salts the
+/// derived one by the mount point (over `/etc/nvme`'s hostid or the
+/// machine id; an explicit pair still wins): per-mount identities for the
+/// rows that stand two hosts up on one.
 pub fn resolveMountIdentity(env: *const std.process.Environ.Map, mountpoint: []const u8) initiator.Resolved {
     const etc = proc.EtcNvme.read();
     var mb: [128]u8 = undefined;
     const mid = proc.readSmall(initiator.MACHINE_ID_PATH, &mb);
-    const r = resolveMountIdentityWith(env, &etc, mid, mountpoint);
+    const r = resolveMountIdentityWith(env, &etc, mid, mountpoint, host_fence.perMountIdentity(env));
     if (r == .identity) stats.fabric_host_identity_source.set(@backingInt(r.identity.source));
     return r;
 }
 
 /// Pure over the sources (the fixture tests).
-pub fn resolveMountIdentityWith(env: *const std.process.Environ.Map, etc: *const proc.EtcNvme, machine_id: ?[]const u8, mountpoint: []const u8) initiator.Resolved {
-    const mid = std.mem.trim(u8, machine_id orelse "", " \t\r\n");
+pub fn resolveMountIdentityWith(env: *const std.process.Environ.Map, etc: *const proc.EtcNvme, machine_id: ?[]const u8, mountpoint: []const u8, per_mount: bool) initiator.Resolved {
+    if (!per_mount or pr.resolveExplicitIdentity(env, .{}) != .none) return initiator.resolveIdentity(env, .{}, etc, machine_id);
+    const base = if (etc.hostnqn().len != 0 and etc.hostid().len != 0) etc.hostid() else std.mem.trim(u8, machine_id orelse "", " \t\r\n");
+    if (base.len == 0) return initiator.resolveIdentity(env, .{}, etc, machine_id);
     var salted: [128 + linux.PATH_MAX]u8 = undefined;
-    const salted_id: ?[]const u8 = if (mid.len == 0) null else std.fmt.bufPrint(&salted, "{s}\x00{s}", .{ mid, mountpoint }) catch null;
-    return initiator.resolveIdentity(env, .{}, etc, salted_id);
+    const salted_id = std.fmt.bufPrint(&salted, "{s}\x00{s}", .{ base, mountpoint }) catch return initiator.resolveIdentity(env, .{}, etc, machine_id);
+    const none: proc.EtcNvme = .{};
+    return initiator.resolveIdentity(env, .{}, &none, salted_id);
 }
 
 /// The ladder's shape for a device path: on a multipath kernel the node
@@ -665,31 +714,39 @@ pub fn controllerOfNode(root: []const u8, path: []const u8) ?initiator.Controlle
 const testing = std.testing;
 const testkit = @import("../../core/testkit.zig");
 
-test "the mount identity: the explicit pair wins; the derived default is salted by the mountpoint (two mountpoints differ, a remount at one agrees, the unsalted verb identity differs from both); no source refuses" {
+test "the mount identity: the HOST's — every mount point and the verbs present one identity (owner ruling 2026-11-02); under the per-mount seam the derived one is salted by the mount point over the machine id or /etc/nvme's hostid (two mount points differ, a remount at one agrees); the explicit pair wins either way; no source refuses" {
     const gpa = testing.allocator;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     var etc: proc.EtcNvme = .{};
-    const a1 = resolveMountIdentityWith(&env, &etc, "0123456789abcdef0123456789abcdef\n", "/mnt/a");
-    const a2 = resolveMountIdentityWith(&env, &etc, "0123456789abcdef0123456789abcdef", "/mnt/a");
-    const b = resolveMountIdentityWith(&env, &etc, "0123456789abcdef0123456789abcdef", "/mnt/b");
+    const mid = "0123456789abcdef0123456789abcdef";
+    const h_a = resolveMountIdentityWith(&env, &etc, mid ++ "\n", "/mnt/a", false);
+    const h_b = resolveMountIdentityWith(&env, &etc, mid, "/mnt/b", false);
+    const verb0 = initiator.resolveIdentity(&env, .{}, &etc, mid);
+    try testing.expectEqualStrings(h_a.identity.hostid(), h_b.identity.hostid());
+    try testing.expectEqualStrings(verb0.identity.hostid(), h_a.identity.hostid());
+    const a1 = resolveMountIdentityWith(&env, &etc, mid ++ "\n", "/mnt/a", true);
+    const a2 = resolveMountIdentityWith(&env, &etc, mid, "/mnt/a", true);
+    const b = resolveMountIdentityWith(&env, &etc, mid, "/mnt/b", true);
     try testing.expect(a1 == .identity and a2 == .identity and b == .identity);
     try testing.expectEqual(initiator.IdentitySource.machine_id, a1.identity.source);
     try testing.expectEqualStrings(a1.identity.hostid(), a2.identity.hostid());
     try testing.expect(!std.mem.eql(u8, a1.identity.hostid(), b.identity.hostid()));
-    const verb = initiator.resolveIdentity(&env, .{}, &etc, "0123456789abcdef0123456789abcdef");
+    const verb = initiator.resolveIdentity(&env, .{}, &etc, mid);
     try testing.expect(!std.mem.eql(u8, verb.identity.hostid(), a1.identity.hostid()));
     try testing.expect(std.mem.startsWith(u8, a1.identity.hostnqn(), initiator.HOSTNQN_UUID_PREFIX));
-    try testing.expect(resolveMountIdentityWith(&env, &etc, null, "/mnt/a").refusal == .no_source);
+    try testing.expect(resolveMountIdentityWith(&env, &etc, null, "/mnt/a", false).refusal == .no_source);
+    try testing.expect(resolveMountIdentityWith(&env, &etc, null, "/mnt/a", true).refusal == .no_source);
     try env.put("SQUEEZEFS_HOSTNQN", "nqn.2014-08.org.nvmexpress:uuid:2c2c2c2c-2c2c-4c2c-8c2c-2c2c2c2c2c2c");
     try env.put("SQUEEZEFS_HOSTID", "2c2c2c2c-2c2c-4c2c-8c2c-2c2c2c2c2c2c");
-    const e = resolveMountIdentityWith(&env, &etc, null, "/mnt/a");
+    try testing.expectEqualStrings("2c2c2c2c-2c2c-4c2c-8c2c-2c2c2c2c2c2c", resolveMountIdentityWith(&env, &etc, null, "/mnt/b", true).identity.hostid());
+    const e = resolveMountIdentityWith(&env, &etc, null, "/mnt/a", false);
     try testing.expectEqual(initiator.IdentitySource.explicit, e.identity.source);
     try testing.expectEqualStrings("2c2c2c2c-2c2c-4c2c-8c2c-2c2c2c2c2c2c", e.identity.hostid());
     // The write cache's member scope follows the identity (0003 §BG): a
     // plan with none is the local device's one member (0); two mount
-    // points' derived identities are two members; the explicit pair is
-    // one member wherever it mounts.
+    // points' seam-derived identities are two members; the host's identity
+    // is one member wherever it mounts (the mount slot tells them apart).
     var none = Plan.init(gpa);
     defer none.deinit();
     try testing.expectEqual(@as(u64, 0), none.memberIdentity());

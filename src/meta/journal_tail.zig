@@ -561,11 +561,15 @@ pub const HeldDir = struct {
     pub const Kind = enum {
         journal_tails,
         write_cache,
+        /// The host's registries of a set's mounts and of its shared
+        /// fabric associations (`guard/host_fence.zig`).
+        hosts,
 
         fn leaf(self: Kind) []const u8 {
             return switch (self) {
                 .journal_tails => "journal-tails",
                 .write_cache => "write-cache",
+                .hosts => "hosts",
             };
         }
     };

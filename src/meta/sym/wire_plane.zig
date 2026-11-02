@@ -954,7 +954,9 @@ pub const WirePlane = struct {
             .pid = @intCast(linux.getpid()),
             .boot = local.boot_id,
             .endpoint = .none,
-            .pr_key = 0,
+            // The host's registration key (0 without a device fence): the
+            // death preempt's victim word.
+            .pr_key = js.prKey(),
             .mount = js.mountpoint,
             .gate = &js.park_gate,
             .poison = j.poison.sink(),

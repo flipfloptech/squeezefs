@@ -179,11 +179,20 @@ pub fn liveWriterPid(io: Io, local: claim.Identity, slot: u16, writer_id: u64) ?
     var it = proc_dir.iterate();
     while (it.next(io) catch null) |ent| {
         const pid = std.fmt.parseInt(u32, ent.name, 10) catch continue; // a pid directory, decimal
-        const ticks = startTicksOf(pid) orelse continue;
-        const candidate: claim.Identity = .{ .boot_id = local.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
-        if (candidate.writerId(slot) == writer_id) return @intCast(pid);
+        if (isWriterIncarnation(local, pid, slot, writer_id)) return @intCast(pid);
     }
     return null;
+}
+
+/// The proof for ONE pid: the live (non-zombie) process `pid` of this host
+/// IS the incarnation `writer_id` at `slot` — its start ticks and this
+/// host's boot id and hostname recompute the writer id. `liveWriterPid`
+/// runs it over every pid; a registry that names the pid runs it alone
+/// (`host_fence.zig`).
+pub fn isWriterIncarnation(local: claim.Identity, pid: u32, slot: u16, writer_id: u64) bool {
+    const ticks = startTicksOf(pid) orelse return false;
+    const candidate: claim.Identity = .{ .boot_id = local.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
+    return candidate.writerId(slot) == writer_id;
 }
 
 /// This process's identity: boot id, pid, its own start ticks (0 when

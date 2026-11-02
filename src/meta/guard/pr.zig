@@ -282,6 +282,14 @@ pub const Client = struct {
         return self.issue(.io, &nvme.reservationAcquire(self.nsid, nvme.RACQA_PREEMPT_AND_ABORT, self.rtype, self.key, victim, &payload));
     }
 
+    /// Release under the HELD rtype and keep the registration: the host's
+    /// registration is its siblings' too (per-host fencing).
+    pub fn releaseReservation(self: *Client) Error!void {
+        var payload: [8]u8 = undefined;
+        self.stats.releases += 1;
+        return self.issue(.io, &nvme.reservationRelease(self.nsid, self.rtype, self.key, &payload));
+    }
+
     /// Release under the HELD rtype, then unregister: NVMe release does not
     /// unregister, and a stale registration makes the next fresh-key
     /// register conflict (R:1004-1022). Best-effort: the first failure is

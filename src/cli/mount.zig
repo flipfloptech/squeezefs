@@ -1027,6 +1027,8 @@ fn mountMain(ctx: *Ctx) u8 {
     // The session's posture, not the knob's: a mainline zero-copy session
     // serves opens (decision 0003 §BE) and has nothing to latch.
     if (session.noOpen()) latchNoOpen(ctx.mountpoint);
+    // Whether syncfs(2) reaches this daemon, observed (charter §3).
+    probeSyncfs(&binding.d, ctx.mountpoint, ctx.opts.read_only);
     // The classes the law serves now, and its posture (decision 0003 §AB.2).
     const ttls_now = coherence.law.current();
     log.info("ready: {s} mounted at {s} (pid {d}; {d} queue(s) × depth {d}; budget {d} MiB; TTLs attr {d} ms entry {d} ms dir_entry {d} ms negative {d} ms, {s})", .{ ctx.meta_uri, ctx.mountpoint, linux.getpid(), session.plan.nqueues, session.plan.depth, ctx.budget_bytes >> 20, ttls_now.attr_ns / std.time.ns_per_ms, ttls_now.entry_ns / std.time.ns_per_ms, ttls_now.dir_entry_ns / std.time.ns_per_ms, ttls_now.negative_ns / std.time.ns_per_ms, if (coherence.law.peered.load(.acquire)) "peered" else "isolated" });
@@ -1886,6 +1888,35 @@ fn latchNoOpen(mountpoint: [:0]const u8) void {
         return;
     }
     _ = linux.close(@intCast(rc));
+}
+
+/// THE FUSE_SYNCFS PROBE (charter §3: a kernel capability is observed,
+/// never inferred from a version): one syncfs(2) on the mount, judged by
+/// whether a FUSE_SYNCFS reached the dispatcher while it was armed — stock
+/// 7.3 sends none to a `/dev/fuse` server (upstream from 7.4). Served whole
+/// when it arrives (a host-wide sync beside it loses nothing). A read-only
+/// mount is not probed: the kernel skips a read-only superblock's sync, and
+/// there is nothing for syncfs to make durable.
+fn probeSyncfs(d: *handler.ring.RingDispatcher, mountpoint: [:0]const u8, read_only: bool) void {
+    if (read_only) return;
+    d.armSyncfsProbe();
+    const rc = linux.open(mountpoint, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) {
+        _ = d.endSyncfsProbe();
+        handler.kv_fs.publishSyncfsProbe(false);
+        log.warn("mount: {s} could not be opened for the FUSE_SYNCFS probe ({t}): syncfs/sync are not shown to make staged data durable; fsync does", .{ mountpoint, linux.errno(rc) });
+        return;
+    }
+    // Its errno is the drain's (a FAILED member's EIO); arrival is the verdict.
+    _ = linux.syncfs(@intCast(rc));
+    _ = linux.close(@intCast(rc));
+    const arrived = d.endSyncfsProbe();
+    handler.kv_fs.publishSyncfsProbe(arrived);
+    if (arrived) {
+        log.info("mount: FUSE_SYNCFS reaches this daemon: syncfs/sync make staged data durable", .{});
+    } else {
+        log.warn("this kernel does not send FUSE_SYNCFS (upstream from 7.4): syncfs/sync do not make staged data durable; fsync does", .{});
+    }
 }
 
 fn mountDevice(mountpoint: [:0]const u8) ?u64 {

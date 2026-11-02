@@ -280,7 +280,9 @@ pub const FlushArgs = struct { ino: u64, fh: u64, lock_owner: u64, drain: bool =
 pub const ReleaseArgs = struct { ino: u64, fh: u64, flags: u32, lock_owner: u64, flush: bool };
 pub const FsyncArgs = struct { ino: u64, fh: u64, datasync: bool };
 /// `ino` = the request's nodeid (the root's): the op names the mount.
-pub const SyncfsArgs = struct { ino: u64 };
+/// `probe`: the bring-up's FUSE_SYNCFS probe (charter §3) — served whole
+/// like any syncfs, counted apart from the application's.
+pub const SyncfsArgs = struct { ino: u64, probe: bool = false };
 /// `flags`: the directory description's open flags (`fuse_read_in.flags`).
 pub const ReaddirArgs = struct { ino: u64, fh: u64, offset: u64, size: u32, flags: u32 };
 pub const StatfsArgs = struct { ino: u64 };

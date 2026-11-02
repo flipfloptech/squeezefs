@@ -218,7 +218,7 @@ src/fuse/mount_options.zig:334 | 10 | ff259fadfdc9b746 | OWED: derive it or docu
 src/fuse/transport/filesystem_vtable.zig:489 | 0o100444 | 7135406c144801b7 | a file mode (POSIX permission bits)
 src/fuse/transport/filesystem_vtable.zig:489 | 0o100644 | 7135406c144801b7 | a file mode (POSIX permission bits)
 src/fuse/transport/filesystem_vtable.zig:489 | 0o40755 | 7135406c144801b7 | a file mode (POSIX permission bits)
-src/fuse/transport/filesystem_vtable.zig:490 | 1_700_000_000 | fd4ea96464581e64 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/filesystem_vtable.zig:511 | 1_700_000_000 | 1b17ec2b5b590213 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/filesystem_vtable.zig:494 | 511 | 5d2c01608fb7c4d8 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/filesystem_vtable.zig:494 | 512 | 5d2c01608fb7c4d8 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/filesystem_vtable.zig:495 | 1_700_000_000 | 0ab306935ccb433f | OWED: derive it or document it on the line (charter §1.5)

@@ -1016,15 +1016,14 @@ exec.timer_thread.test.dropped_sleep_cancels_cleanly: a cancelled hour-long arm 
 exec.timer_thread.test.sleep_fires: a raw sleep returns at or after its deadline; many sleeps from many threads all fire in order	11700	2656
 exec.wake_core_model.test.the coalescer pair holds in drain → disarm → scan order; disarming after the scan loses a push	342	326
 exec.wake_core_model.test.wake core model: exhaustive within the explorer's default limits	233	233
-fuse.abi.test.capability bits: OVER_IO_URING = 1<<41 = flags2 bit 9; TIME_LIMITS = 1<<62 = flags2 bit 30; INIT_EXT 1<<30; KILLPRIV_V2 1<<28; fold/split round-trip	10	10
+fuse.abi.test.capability bits: OVER_IO_URING = 1<<41 = flags2 bit 9; INIT_EXT 1<<30; KILLPRIV_V2 1<<28; fold/split round-trip	10	10
 fuse.abi.test.codec: exact decode admits only @sizeOf(T); prefix decode admits ≥; encode∘decode = id; unaligned sources never trap	262	263
 fuse.abi.test.dirent record length law: (24 + namelen + 7) & ~7; direntplus 152 + name	10	10
 fuse.abi.test.fuzz: every decoder is total on arbitrary bytes	95	96
 fuse.abi.test.killpriv v2 bits pinned together: FATTR_KILL_SUIDGID 1<<11, WRITE_KILL_SUIDGID 1<<2, OPEN_KILL_SUIDGID 1<<0; FOPEN bits; release/getattr/read/lk bits	6	7
 fuse.abi.test.opcodes are named through uapi 7.45; an unknown decodes without error and says so; notify codes	20	20
-fuse.abi.test.spec table pins: in_header 40 (total_extlen@36), out_header 16, attr 88 (flags@84), entry_out 128, attr_out 104, init_out 64 (time_min@48, time_max@56), open_in open_flags@4	11	11
+fuse.abi.test.spec table pins: in_header 40 (total_extlen@36), out_header 16, attr 88 (flags@84), entry_out 128, attr_out 104, init_out 64 (request_timeout@40, unused[11]@42), open_in open_flags@4	11	11
 fuse.abi.test.the wire is little-endian native: a u32 at offset 0 lands low byte first	20	20
-fuse.abi.test.time limits: the whole-second interior of the i64-ns word, conservative by one second on the floor	8	9
 fuse.abi.test.totality: every decoder returns or null on every length 0..300 (deterministic)	515	511
 fuse.abi.test.uring ABI pins (uapi 7.46): req header 288 (op_in@128, ring_ent@256), ent_in_out 32 (offset@20), cmd_req 40 (padding[6]@18, union@24: bufpool uaddr@24 len@32 reserved@36 | ent_zero_copy_buf_index u16@24), ADD_QUEUE 3 / ADD_BUFPOOL 4, HAS_IO_URING_BUFPOOL = flags2 bit 11, FOPEN_IO_URING_ZERO_COPY = 1<<8	12	12
 fuse.atime.test.Live: one byte, the default is the kernel's relatime; set reports a change and the next load sees it	7	7
@@ -1037,9 +1036,9 @@ fuse.codec.test.INIT decode: the 16-byte prefix suffices; flags2 is read iff INI
 fuse.codec.test.INIT reply asks for FUSE_SYNCFS (FUSE_HAS_SYNCFS, flags2 bit 12) iff the kernel offered it — offered only to a /dev/fuse opener with CAP_SYS_ADMIN in the initial user namespace — and only beside the request timeout (0003 §Z); without INIT_EXT it is not negotiated	17	18
 fuse.codec.test.INIT reply carries FUSE_ATOMIC_O_TRUNC iff offered and wanted: a no-open session (decision 0003 §AF) drops it — with it the kernel's `fuse_setattr` skips the ATTR_OPEN truncate ("done by OPEN") and no OPEN is sent, so an O_TRUNC open would truncate nothing	7	7
 fuse.codec.test.INIT reply carries the request timeout (FUSE_REQUEST_TIMEOUT, bit 42 = flags2 bit 10; `request_timeout` at byte 40) iff the kernel offered it and the session asked one; else 0 and the bit clear	9	9
-fuse.codec.test.INIT reply echoes the time range iff FUSE_TIME_LIMITS (bit 62) was offered: ±9_223_372_036 s and flags2 bit 30, else zeros	11	12
 fuse.codec.test.INIT reply minor law over the whole shape space: min(kernel, 36); INIT_EXT needs offered ∧ minor ≥ 36; an unknown major or a pre-7.23 minor refuses	20	20
 fuse.codec.test.INIT reply never advertises POSIX_LOCKS, FLOCK_LOCKS, SPLICE_*, POSIX_ACL or any unimplemented bit — over the whole offer space	1930	1924
+fuse.codec.test.INIT reply never echoes bit 62 (the retired sqz FUSE_TIME_LIMITS, a bit upstream may assign to anything) nor any flags2 bit it does not implement, and leaves init_out's reserved tail (bytes 42..64) zero — over offers with every unimplemented flags2 bit set	11	12
 fuse.codec.test.INIT reply option gates: KILLPRIV_V2 iff offered ∧ wanted (v1 never rides along unless asked); writeback/dont_mask/no_open/no_opendir/export iff wanted; force_readdirplus drops READDIRPLUS_AUTO	10	11
 fuse.codec.test.INIT reply: always OVER_IO_URING; INIT_EXT iff offered; minor = min(kernel, 36); max_readahead verbatim; geometry fields; time_gran 1; len 80	9	10
 fuse.codec.test.TTL split is nanosecond-exact (Q2): 1.5 s → (1, 500_000_000); 0.25 s → (0, 250_000_000); attr stamps floor below the epoch	17	17
@@ -1273,15 +1272,13 @@ fuse.transport.commit_queue.test.the bound is per slot: a second message for a c
 fuse.transport.commit_queue.test.the wake coalesces: 8 publications between two worker passes pay ONE eventfd write (7 elided); after the worker disarms the next publication pays again	78	79
 fuse.transport.filesystem_vtable.test.EchoFs: a WRITE to scratch consumes the lease exactly once and lands the bytes; a WRITE elsewhere is EROFS and still releases	20	20
 fuse.transport.filesystem_vtable.test.EchoFs: lookup/getattr/read on the fixed tree answer exactly once each; a miss is a negative entry; the probe serves hello and big into the window and declines park; forget returns lookups	24	26
-fuse.transport.filesystem_vtable.test.EchoFs: the hold gate is a pure predicate (scratch only, and only when declared); the direct leg is null; a HELD write is extracted lazily through its face and lands; SETATTR stores an explicit mtime	38	39
+fuse.transport.filesystem_vtable.test.EchoFs: the hold gate is a pure predicate (scratch only, and only when declared); the direct leg is null; a HELD write is extracted lazily through its face and lands	38	39
 fuse.transport.filesystem_vtable.test.the handle routes each reply kind through the Tx face; failWith maps a typed error through the ONE table (EAGAIN for backpressure, EIO for a dead ring)	13	13
 fuse.transport.pass_stamps.test.the stalest pass stamp names the held worker: the oldest stamp of a worker INSIDE a pass wins, a parked worker is no holder however old its stamp, a cleared worker is no holder, an empty table names none; the phase rides the stamp's low bit on its own line	141	142
-fuse.transport.probes.test.FUSE_TIME_LIMITS: bit 62 offered is the probe	2	2
 fuse.transport.probes.test.linux: the drivers live on this kernel — the sparse table registers, CapEff reads this process's capability, the seam forces it absent	245	247
 fuse.transport.probes.test.the buffer-pool gate: INIT bit 43 is the probe — present beside FUSE_OVER_IO_URING (Linux ≥ 7.3), absent on an offer without it (a pre-7.3 kernel, or enable_uring reading N when the INIT was sent)	3	4
 fuse.transport.probes.test.the zero-copy arm is a conjunction of CapEff bit 21 and the sparse table; CapEff parses from /proc/self/status text; the gauges publish	13	14
 fuse.transport.session.test.a sideband cell given back while another taker sits between its dequeue CAS and its sequence store is retried, never asserted (decision 0003 §AI.4): the free list holds the pool's whole population, so the refused push is a taker mid-pop — not a full ring; the give-back counts one respin and lands once that taker stores	189	218
-fuse.transport.session.test.e2e TIME_LIMITS: a utimensat with a time outside our advertised range is clamped by the VFS to the bound before it reaches the daemon	99110	108390
 fuse.transport.session.test.e2e buffer pools (Linux ≥ 7.3): every queue ADD_QUEUE'd and pooled (pool_queues_added ≡ queues), rings per queue the derived 3, the arena gauge is the pool; reads of /big and writes to /scratch serve byte-exact through the pool (pool_deliveries move, the offsets stay on the payload grid: off_boundary 0, breach 0) and the laws close; with zero-copy armed (CAP_SYS_ADMIN) an opened file's READ and WRITE are flagged ENT_ZERO_COPY (pool_zc_deliveries move) and a 1 MiB aligned write is HELD and stored straight from the slot; a copied WRITE is held in its pool buffer and stored straight from it	278891	273988
 fuse.transport.session.test.e2e buffer pools without zero-copy (the CAP_SYS_ADMIN seam): the queues are created copying — no bounce slab, no zc grant, opens keep the mount's posture; reads of /big and writes to /scratch serve byte-exact through the pool buffer (no delivery flagged ENT_ZERO_COPY, the payload in the ring's window) and the laws close	165183	134375
 fuse.transport.session.test.e2e fused poll: SQUEEZEFS_FUSE_READ_FUSION=1 on a zero-copy session — a probe that declines its first poll is served by the fused re-poll (fusions ≥ 8, no late demotion); on a copying session (the CAP_SYS_ADMIN seam) the lever is inert	250635	274266
@@ -2968,11 +2965,11 @@ ops.nvmet.fidelity.test.nvmet fidelity: pr-registrants — 64 loop connects (nr_
 ops.nvmet.fidelity.test.nvmet fidelity: roundtrip-loop — share → list managed+live → connect → the namespace carries the ledger's uuid → 64 MiB O_DIRECT round trip → resv-report → disconnect → unshare → zero residue	25	26
 ops.nvmet.fidelity.test.nvmet fidelity: roundtrip-tcp — the same on nvmet-tcp over 127.0.0.1	33	33
 ops.nvmet.fidelity.test.nvmet fidelity: sigstop-preempt — a SIGSTOPped holder is preempted by a second identity past T_owner; resumed, its next beat reads the usurpation (writer_guard_fenced 1, the latch FAILED by the fence class) while the second mount's writes land and its own answer EIO	13	13
+ops.nvmet.initiator.test.admin_timeout reads on the venue; absent elsewhere it is the kernel's default	87	85
 ops.nvmet.initiator.test.connect string: the tcp base shape; each option singly and combined; the loop shape with and without traddr; an all-absent set is byte-identical to the base; the read-back parses and refuses garbage	39	41
 ops.nvmet.initiator.test.discovery on a multipath kernel: the controller holds only its hidden path node; the namespace is the head of the subsystem dir listing it, with its uuid and char twin — and never while another identity serves that subsystem	2161	2156
 ops.nvmet.initiator.test.discovery over fixture trees: the plain per-controller node with its nsid, uuid and char twin; a path node and a partition never match; a missing controller is an honest null; a controller's attrs read; the merged shape is detected only with a head and > 1 hostnqn	2701	2632
 ops.nvmet.initiator.test.fuzz: the nvmf_dev_read read-back parser is total on arbitrary text	23	24
-ops.nvmet.initiator.test.host-scoped parameter and admin_timeout read on the venue; absent elsewhere	87	85
 ops.nvmet.initiator.test.identity resolution: the explicit pair; one env half refuses; one /etc/nvme file refuses; both files serve; the machine-id derivation is deterministic, RFC 4122-shaped and named by the nvmexpress uuid prefix; no source refuses; a non-uuid hostid refuses	388	243
 ops.nvmet.initiator.test.the fabric sampler: pcie skipped; unknown state not live; a missing sysfs is a zero sample; a reconnect is an observed not-live → live; renumbering of a not-live identity is tracked once; src_addr churn is one identity; the same NQN on two addresses is two	223	223
 ops.nvmet.initiator.test.the ladder verdict: every (plane, record, actual, merged) cell under no identity and under a pair	35	31

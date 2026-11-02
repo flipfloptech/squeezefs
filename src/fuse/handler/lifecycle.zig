@@ -214,6 +214,14 @@ pub fn Dispatcher(comptime Transport: type) type {
         /// bit every regular-file open reply carries on such a session, 0
         /// elsewhere. Set at `initFilesystem` from the session's caps.
         zc_open_flag: u32 = 0,
+        /// The bring-up's FUSE_SYNCFS probe (charter §3: whether syncfs(2)
+        /// reaches this daemon is observed, never inferred from a version):
+        /// `armSyncfsProbe` arms it, the first FUSE_SYNCFS to arrive while
+        /// armed marks it seen and is served as the probe's,
+        /// `endSyncfsProbe` reads and disarms it.
+        syncfs_probe: std.atomic.Value(SyncfsProbe) = .init(.idle),
+
+        pub const SyncfsProbe = enum(u8) { idle, armed, seen };
 
         /// FUSE-2: exactly one reply per delivered request. The value owes
         /// a reply from construction; `reply`/`fail` consume it; `deinit`
@@ -266,6 +274,20 @@ pub fn Dispatcher(comptime Transport: type) type {
                 .drain_coalesce_ns = opts.drain_coalesce_ns,
                 .writeback = opts.writeback,
             };
+        }
+
+        /// Before the prober's syncfs(2) on the mount.
+        pub fn armSyncfsProbe(self: *Self) void {
+            // Release: pairs with the handler's acquire CAS below.
+            self.syncfs_probe.store(.armed, .release);
+        }
+
+        /// After the prober's syncfs(2) returned: whether a FUSE_SYNCFS
+        /// arrived while armed (the kernel answers syncfs(2) only after
+        /// its FUSE_SYNCFS was replied, so a sent one is seen by now).
+        pub fn endSyncfsProbe(self: *Self) bool {
+            // Acquire: pairs with the handler's release CAS.
+            return self.syncfs_probe.swap(.idle, .acquire) == .seen;
         }
 
         /// A no-open FLUSH that found custody: coalesce it when a FLUSH
@@ -687,7 +709,10 @@ pub fn Dispatcher(comptime Transport: type) type {
                     return codec.replyOk(u);
                 },
                 .syncfs => {
-                    try fs.vtable.syncfs(fs.impl, c, .{ .ino = ino });
+                    // Acq_rel: pairs with `armSyncfsProbe`'s release store
+                    // and `endSyncfsProbe`'s acquire swap.
+                    const probe = self.syncfs_probe.cmpxchgStrong(.armed, .seen, .acq_rel, .acquire) == null;
+                    try fs.vtable.syncfs(fs.impl, c, .{ .ino = ino, .probe = probe });
                     return codec.replyOk(u);
                 },
                 .readdir => |r| {
@@ -812,6 +837,8 @@ const Scripted = struct {
     short_read: ?usize = null,
     syncfs_calls: u32 = 0,
     syncfs_inos: [2]u64 = @splat(0),
+    /// The SYNCFS calls that carried the bring-up probe's mark.
+    syncfs_probes: u32 = 0,
     open_calls: u32 = 0,
     /// FLUSHes that carried the no-open drain.
     flush_drains: u32 = 0,
@@ -891,6 +918,7 @@ const Scripted = struct {
         try self.verdict;
         self.syncfs_inos[self.syncfs_calls % self.syncfs_inos.len] = a.ino;
         self.syncfs_calls += 1;
+        if (a.probe) self.syncfs_probes += 1;
     }
     pub fn forget(self: *Scripted, _: *Ctx, a: filesystem.ForgetArgs) void {
         self.forgets += 1;
@@ -1011,6 +1039,37 @@ test "FUSE_SYNCFS (opcode 50) decodes and reaches the filesystem's syncfs once w
     try testing.expectEqual(linux.E.NOSYS, rig.lb.captured(s).?.errno().?);
     try testing.expectEqual(@as(u32, 3), rig.lb.replyCount(s));
     try testing.expectEqual(@as(u32, 0), rig.reg.inFlight());
+}
+
+test "the bring-up's FUSE_SYNCFS probe (charter §3): armed, the FIRST FUSE_SYNCFS to arrive is the probe's — served whole by the filesystem with `probe` set, replied OK, and `endSyncfsProbe` reads it arrived; one that arrives unarmed (an application's syncfs) carries no mark; an armed probe that no FUSE_SYNCFS reached reads absent (a kernel that never sends it); each end disarms" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const s = Loopback.slot(2);
+    var buf: [64]u8 = undefined;
+    // No FUSE_SYNCFS while armed: absent, and the probe is spent.
+    rig.d.armSyncfsProbe();
+    try testing.expect(!rig.d.endSyncfsProbe());
+    rig.d.dispatch(try syncfsRequest(&buf, 2), Rig.meta(2, abi.FUSE_ROOT_ID), s, null);
+    try testing.expectEqual(@as(u32, 1), rig.fsi.syncfs_calls);
+    try testing.expectEqual(@as(u32, 0), rig.fsi.syncfs_probes);
+    // Armed: the next FUSE_SYNCFS is the probe's, served whole.
+    rig.d.armSyncfsProbe();
+    rig.d.dispatch(try syncfsRequest(&buf, 4), Rig.meta(4, abi.FUSE_ROOT_ID), s, null);
+    try testing.expectEqual(@as(?linux.E, null), rig.lb.captured(s).?.errno());
+    try testing.expectEqual(@as(u32, 2), rig.fsi.syncfs_calls);
+    try testing.expectEqual(@as(u32, 1), rig.fsi.syncfs_probes);
+    // A second one inside the same window (a host-wide sync beside it) is
+    // an application's: one probe mark per arming.
+    rig.d.dispatch(try syncfsRequest(&buf, 6), Rig.meta(6, abi.FUSE_ROOT_ID), s, null);
+    try testing.expectEqual(@as(u32, 3), rig.fsi.syncfs_calls);
+    try testing.expectEqual(@as(u32, 1), rig.fsi.syncfs_probes);
+    try testing.expect(rig.d.endSyncfsProbe());
+    // Disarmed: later ones carry no mark and a fresh end reads absent.
+    rig.d.dispatch(try syncfsRequest(&buf, 8), Rig.meta(8, abi.FUSE_ROOT_ID), s, null);
+    try testing.expectEqual(@as(u32, 1), rig.fsi.syncfs_probes);
+    try testing.expect(!rig.d.endSyncfsProbe());
+    try testing.expectEqual(@as(u32, 4), rig.lb.replyCount(s));
 }
 
 test "FORGET and BATCH_FORGET never reply; the filesystem's forget runs once per entry with the table's verdict; INTERRUPT is counted and ignored; NOTIFY_REPLY is silent" {

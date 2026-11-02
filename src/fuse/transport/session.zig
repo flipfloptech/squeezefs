@@ -1427,9 +1427,15 @@ pub const Session = struct {
         self.resolveOpenPosture(env, cfg.no_open);
 
         // 4. The reply word; the filesystem's init hook sees the negotiation.
+        //    The syncfs seam reads the offer as stock 7.3 sends it.
+        var offer_in = init_in;
+        if (knobs.boolKnob("SQUEEZEFS_TEST_FUSE_SYNCFS_UNOFFERED", env)) {
+            offer_in.flags2 &= ~abi.flags2Of(abi.FUSE_HAS_SYNCFS);
+            log.warn("transport: SQUEEZEFS_TEST_FUSE_SYNCFS_UNOFFERED — the INIT offer is read without FUSE_HAS_SYNCFS (stock 7.3's): the kernel never sends FUSE_SYNCFS", .{});
+        }
         const asked_timeout_s = geometry.resolveRequestTimeoutS(geometry.requestTimeoutOverride(env), cfg.request_timeout_s);
         const wants: codec.InitWants = .{ .writeback_cache = cfg.opts.write_back and !cfg.opts.read_only, .request_timeout_s = asked_timeout_s, .atomic_o_trunc = !self.no_open, .export_support = fs.export_support };
-        self.init_reply = codec.buildInitReply(init_in, self.plan, wants) catch {
+        self.init_reply = codec.buildInitReply(offer_in, self.plan, wants) catch {
             log.err("transport: unsupported FUSE protocol {d}.{d} (need 7.{d}+)", .{ init_in.major, init_in.minor, codec.MIN_SUPPORTED_MINOR });
             self.sideband.replyInline(codec.replyError(self.init_unique, .INVAL));
             return error.InitUnsupported;
@@ -1438,7 +1444,7 @@ pub const Session = struct {
         self.entry_flags = if (init_in.folded() & abi.FUSE_HAS_EXPIRE_ONLY != 0) abi.FUSE_EXPIRE_ONLY else 0;
         self.request_timeout_s = if (self.init_reply.requestTimeoutS() != 0) geometry.kernelRequestTimeoutS(self.init_reply.requestTimeoutS(), geometry.readMaxRequestTimeout(self.io)) else 0;
         request_timeout_gauge.set(self.request_timeout_s);
-        if (asked_timeout_s != 0) self.warnRequestTimeout(asked_timeout_s, init_in.folded());
+        if (asked_timeout_s != 0) self.warnRequestTimeout(asked_timeout_s, offer_in.folded());
         const read_zc_serve = knobs.boolKnob("SQUEEZEFS_READ_ZC_SERVE", env) and self.zeroCopyArmed();
         self.read_zc_serve = read_zc_serve;
 

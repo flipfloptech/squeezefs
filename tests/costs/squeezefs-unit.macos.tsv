@@ -605,24 +605,23 @@ exec.timer_heap.test.cancel: an indexed removal from the middle keeps the heap o
 exec.timer_heap.test.order: popDue yields deadlines in order and only those due; peekDeadline is the park bound	79	80
 exec.wake_core_model.test.the coalescer pair holds in drain → disarm → scan order; disarming after the scan loses a push	784	778
 exec.wake_core_model.test.wake core model: exhaustive within the explorer's default limits	408	408
-fuse.abi.test.capability bits: OVER_IO_URING = 1<<41 = flags2 bit 9; TIME_LIMITS = 1<<62 = flags2 bit 30; INIT_EXT 1<<30; KILLPRIV_V2 1<<28; fold/split round-trip	4	5
+fuse.abi.test.capability bits: OVER_IO_URING = 1<<41 = flags2 bit 9; INIT_EXT 1<<30; KILLPRIV_V2 1<<28; fold/split round-trip	4	5
 fuse.abi.test.codec: exact decode admits only @sizeOf(T); prefix decode admits ≥; encode∘decode = id; unaligned sources never trap	207	208
 fuse.abi.test.dirent record length law: (24 + namelen + 7) & ~7; direntplus 152 + name	9	9
 fuse.abi.test.fuzz: every decoder is total on arbitrary bytes	114	115
 fuse.abi.test.killpriv v2 bits pinned together: FATTR_KILL_SUIDGID 1<<11, WRITE_KILL_SUIDGID 1<<2, OPEN_KILL_SUIDGID 1<<0; FOPEN bits; release/getattr/read/lk bits	16	15
 fuse.abi.test.opcodes are named through uapi 7.45; an unknown decodes without error and says so; notify codes	15	16
-fuse.abi.test.spec table pins: in_header 40 (total_extlen@36), out_header 16, attr 88 (flags@84), entry_out 128, attr_out 104, init_out 64 (time_min@48, time_max@56), open_in open_flags@4	14	15
+fuse.abi.test.spec table pins: in_header 40 (total_extlen@36), out_header 16, attr 88 (flags@84), entry_out 128, attr_out 104, init_out 64 (request_timeout@40, unused[11]@42), open_in open_flags@4	14	15
 fuse.abi.test.the wire is little-endian native: a u32 at offset 0 lands low byte first	6	6
-fuse.abi.test.time limits: the whole-second interior of the i64-ns word, conservative by one second on the floor	1	2
 fuse.abi.test.totality: every decoder returns or null on every length 0..300 (deterministic)	296	296
 fuse.abi.test.uring ABI pins (uapi 7.46): req header 288 (op_in@128, ring_ent@256), ent_in_out 32 (offset@20), cmd_req 40 (padding[6]@18, union@24: bufpool uaddr@24 len@32 reserved@36 | ent_zero_copy_buf_index u16@24), ADD_QUEUE 3 / ADD_BUFPOOL 4, HAS_IO_URING_BUFPOOL = flags2 bit 11, FOPEN_IO_URING_ZERO_COPY = 1<<8	18	19
 fuse.abi.test.uring command and init-flag constants: REGISTER 1, COMMIT_AND_FETCH 2, RELEASE_PAYLOAD 3; BUF_RING/ZERO_COPY/RETENTION 1/2/4; COMMIT_RETAIN 1; kmbuf opcode pairs 37/38 and 38/39; mmap offset law	1	2
 fuse.codec.test.INIT decode: the 16-byte prefix suffices; flags2 is read iff INIT_EXT ∧ len ≥ 20, else 0; the 64-byte form decodes whole; < 16 is refused	7	8
 fuse.codec.test.INIT reply asks for FUSE_SYNCFS (FUSE_HAS_SYNCFS, flags2 bit 12) iff the kernel offered it — offered only to a /dev/fuse opener with CAP_SYS_ADMIN in the initial user namespace — and only beside the request timeout (0003 §Z); without INIT_EXT it is not negotiated	2	2
 fuse.codec.test.INIT reply carries the request timeout (FUSE_REQUEST_TIMEOUT, bit 42 = flags2 bit 10; `request_timeout` at byte 40) iff the kernel offered it and the session asked one; else 0 and the bit clear	4	3
-fuse.codec.test.INIT reply echoes the time range iff FUSE_TIME_LIMITS (bit 62) was offered: ±9_223_372_036 s and flags2 bit 30, else zeros	4	5
 fuse.codec.test.INIT reply minor law over the whole shape space: min(kernel, 36); INIT_EXT needs offered ∧ minor ≥ 36; an unknown major or a pre-7.23 minor refuses	6	6
 fuse.codec.test.INIT reply never advertises POSIX_LOCKS, FLOCK_LOCKS, SPLICE_*, POSIX_ACL or any unimplemented bit — over the whole offer space	749	750
+fuse.codec.test.INIT reply never echoes bit 62 (the retired sqz FUSE_TIME_LIMITS, a bit upstream may assign to anything) nor any flags2 bit it does not implement, and leaves init_out's reserved tail (bytes 42..64) zero — over offers with every unimplemented flags2 bit set	4	5
 fuse.codec.test.INIT reply option gates: KILLPRIV_V2 iff offered ∧ wanted (v1 never rides along unless asked); writeback/dont_mask/no_open/no_opendir/export iff wanted; force_readdirplus drops READDIRPLUS_AUTO	11	12
 fuse.codec.test.INIT reply: always OVER_IO_URING; INIT_EXT iff offered; minor = min(kernel, 36); max_readahead verbatim; geometry fields; time_gran 1; len 80	53	53
 fuse.codec.test.TTL split is nanosecond-exact (Q2): 1.5 s → (1, 500_000_000); 0.25 s → (0, 250_000_000); attr stamps floor below the epoch	2	3
@@ -765,9 +764,8 @@ fuse.transport.commit_queue.test.the bound is per slot: a second message for a c
 fuse.transport.commit_queue.test.the wake coalesces: 8 publications between two worker passes pay ONE eventfd write (7 elided); after the worker disarms the next publication pays again	154	155
 fuse.transport.filesystem_vtable.test.EchoFs: a WRITE to scratch consumes the lease exactly once and lands the bytes; a WRITE elsewhere is EROFS and still releases	6	7
 fuse.transport.filesystem_vtable.test.EchoFs: lookup/getattr/read on the fixed tree answer exactly once each; a miss is a negative entry; the probe serves hello and big into the window and declines park; forget returns lookups	40	40
-fuse.transport.filesystem_vtable.test.EchoFs: the hold gate is a pure predicate (scratch only, and only when declared); the direct leg is null; a HELD write is extracted lazily through its face and lands; SETATTR stores an explicit mtime	19	20
+fuse.transport.filesystem_vtable.test.EchoFs: the hold gate is a pure predicate (scratch only, and only when declared); the direct leg is null; a HELD write is extracted lazily through its face and lands	19	20
 fuse.transport.filesystem_vtable.test.the handle routes each reply kind through the Tx face; failWith maps a typed error through the ONE table (EAGAIN for backpressure, EIO for a dead ring)	2	2
-fuse.transport.probes.test.FUSE_TIME_LIMITS: bit 62 offered is the probe	1	1
 fuse.transport.probes.test.linux: the drivers live on this kernel — the sparse table registers, CapEff reads this process's capability, the seam forces it absent	5	5
 fuse.transport.probes.test.the zc surface is a conjunction of kmbuf, CapEff bit 21 and the sparse table; CapEff parses from /proc/self/status text	9	10
 fuse.transport.slot.test.REGISTER failures back off 1, 2, 4 … 64 ms (monotone, ≥ base, ≤ max) then retire on the 8th; success resets; the nearest deadline bounds the park and is consumed once due	96	96

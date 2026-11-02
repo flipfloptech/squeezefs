@@ -3656,9 +3656,10 @@ test "smoke: TWO MOUNTS OF ONE SET ON ONE HOST — each member holds its OWN wri
     const a_staged = blk: {
         const sa = try rig.stats();
         defer gpa.free(sa);
-        // The outside syncfs reached A (FUSE_HAS_SYNCFS negotiated): the
-        // seam's hold, not a missed sync, is what keeps the residents.
-        try testing.expect((numberAfter(sa, "\"fuse_syncfs\":") orelse 0) >= 1);
+        // The outside syncfs reached A exactly when syncfs reaches a daemon
+        // on this kernel (the mount's probe): then the seam's hold, not a
+        // missed sync, is what keeps the residents.
+        try testing.expectEqual(syncfsAbsent(sa) == null, (numberAfter(sa, "\"fuse_syncfs\":") orelse 0) >= 1);
         break :blk numberAfter(sa, "\"current_staged_write_bytes\":") orelse 0;
     };
     try testing.expect(a_staged >= scope_a_files * 64 * 1024);
@@ -14622,6 +14623,56 @@ const syncfs_base_bytes: u64 = 4 << 20;
 /// (its mtime is a parked stamp under the coalesced cadence, §L.6).
 const syncfs_patch_bytes: u64 = 8192;
 
+/// The FUSE_SYNCFS probe's verdict on a ready mount (`fuse_syncfs_reaches`,
+/// charter §3): null when syncfs(2) reaches the daemon, else the named
+/// reason a row whose law is syncfs's durability skips with.
+fn syncfsAbsent(st: []const u8) ?[]const u8 {
+    if (numberAfter(st, "\"fuse_syncfs_reaches\":") == 1) return null;
+    return "this kernel does not send FUSE_SYNCFS (fuse_syncfs_reaches 0; upstream from 7.4): syncfs(2)/sync never reach the daemon, so they make no staged byte durable";
+}
+
+const syncfs_absent_line = "this kernel does not send FUSE_SYNCFS (upstream from 7.4): syncfs/sync do not make staged data durable; fsync does";
+
+test "smoke: THE FUSE_SYNCFS PROBE AT MOUNT (charter §3, decision 0003 §DB) — the bring-up's syncfs(2) on the mount is judged by whether a FUSE_SYNCFS arrived: `fuse_syncfs_reaches` equals INIT's negotiation (`fuse_syncfs_armed`), the probe's syncfs counted apart (`fuse_syncfs_probes` = reaches, `fuse_syncfs` 0 at ready) and named in the log — the loud line when absent; an application's `sync -f` then counts in `fuse_syncfs` iff it reaches; under SQUEEZEFS_TEST_FUSE_SYNCFS_UNOFFERED (the INIT offer as stock 7.3 sends it) the probe reads absent, the loud line once, and `sync -f` reaches no daemon code" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(false);
+    for ([_]bool{ false, true }) |unoffered| {
+        try rig.env.put("SQUEEZEFS_TEST_FUSE_SYNCFS_UNOFFERED", if (unoffered) "1" else "0");
+        // The first mount creates the log.
+        const from = if (unoffered) try rig.logLen() else 0;
+        try rig.spawnMount(&.{});
+        _ = try rig.awaitReady(from);
+        const st = try rig.stats();
+        defer gpa.free(st);
+        const armed = numberAfter(st, "\"fuse_syncfs_armed\":") orelse return error.StatsKeyMissing;
+        const reaches = numberAfter(st, "\"fuse_syncfs_reaches\":") orelse return error.StatsKeyMissing;
+        std.debug.print("\nsmoke[syncfs probe{s}]: armed {d}, reaches {d}, probes {d}, fuse_syncfs {d}\n", .{ if (unoffered) ", stock-7.3 offer" else "", armed, reaches, numberAfter(st, "\"fuse_syncfs_probes\":") orelse 0, numberAfter(st, "\"fuse_syncfs\":") orelse 0 });
+        try testing.expectEqual(armed, reaches);
+        if (unoffered) try testing.expectEqual(@as(u64, 0), reaches);
+        try testing.expectEqual(@as(?u64, reaches), numberAfter(st, "\"fuse_syncfs_probes\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"fuse_syncfs\":"));
+        {
+            const text = try rig.readLog();
+            defer gpa.free(text);
+            const mine = text[from..];
+            const loud = std.mem.count(u8, mine, syncfs_absent_line);
+            try testing.expectEqual(@as(usize, if (reaches == 1) 0 else 1), loud);
+            try testing.expectEqual(reaches == 1, std.mem.indexOf(u8, mine, "FUSE_SYNCFS reaches this daemon") != null);
+        }
+        gpa.free(try rig.onMount("echo x > f && sync -f ."));
+        const after = try rig.stats();
+        defer gpa.free(after);
+        try testing.expectEqual(@as(?u64, reaches), numberAfter(after, "\"fuse_syncfs\":"));
+        try testing.expectEqual(@as(?u64, reaches), numberAfter(after, "\"fuse_syncfs_probes\":"));
+        try rig.umount();
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    }
+}
+
 test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — format (no write cache: every write beyond inline striped) → mount → the test process holds `f` and `g` OPEN and closes neither (no RELEASE, no FLUSH drains them; it spawns nothing while it holds them): 1 MiB + 1000 B into the fresh `f` (a partial block parked in RAM), 8 KiB over the head of the fsync'd `g` (a size-neutral write: its mtime parked) → syncfs(2) on the mount returns → kill -9 the daemon → fsck --offline clean → remount → `f` is the image byte for byte, `g` carries the overwrite and the mtime the holder saw" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
@@ -14637,20 +14688,17 @@ test "smoke: `sync -f` IS A DURABILITY POINT FOR THE DAEMON'S WRITE CUSTODY — 
     try rig.env.put("SQUEEZEFS_TEST_FUSE_OWED_IDLE_MS", "600000");
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
-    // The kernel forwards syncfs to a plain /dev/fuse server only once INIT
-    // negotiated FUSE_HAS_SYNCFS (upstream 7.47; the venue's 7.3 through
-    // scripts/kernel/patches-mainline/0006): without it `sync -f` never
-    // reaches the daemon and the row has nothing to judge.
+    // The kernel forwards syncfs to a plain /dev/fuse server only from 7.4
+    // (FUSE_HAS_SYNCFS); the mount's probe says whether it does here —
+    // without it `sync -f` never reaches the daemon and the row has nothing
+    // to judge.
     {
         const st = try rig.stats();
         defer gpa.free(st);
-        if (numberAfter(st, "\"fuse_syncfs_armed\":") != 1) {
-            const rel = try rig.shOk(rig.work, "uname -r");
-            defer gpa.free(rel);
+        if (syncfsAbsent(st)) |why| {
             try rig.umount();
             _ = try rig.waitChild();
-            var detail: [192]u8 = undefined;
-            return testkit.skip(@src(), .no_kernel_feature, std.fmt.bufPrint(&detail, "kernel {s}: FUSE_HAS_SYNCFS not offered — syncfs(2) never reaches a plain /dev/fuse server", .{std.mem.trimEnd(u8, rel, "\n")}) catch "a kernel without FUSE_HAS_SYNCFS");
+            return testkit.skip(@src(), .no_kernel_feature, why);
         }
     }
     {
@@ -15409,11 +15457,11 @@ test "smoke: UNDER THE WRITE-BACK TIMER fsync, fdatasync AND syncfs ARE STILL DU
     var pb: [256]u8 = undefined;
     const body = try gpa.alloc(u8, wb_file_bytes);
     defer gpa.free(body);
-    var syncfs_armed = true;
+    var syncfs_reaches = true;
     {
         const st = try statsDirect(rig);
         defer gpa.free(st);
-        syncfs_armed = numberAfter(st, "\"fuse_syncfs_armed\":") == 1;
+        syncfs_reaches = syncfsAbsent(st) == null;
     }
     for (1..5) |k| {
         for (body, 0..) |*b, i| b.* = wbByte(300 + k, i);
@@ -15430,11 +15478,11 @@ test "smoke: UNDER THE WRITE-BACK TIMER fsync, fdatasync AND syncfs ARE STILL DU
     {
         const st = try statsDirect(rig);
         defer gpa.free(st);
-        std.debug.print("\nsmoke[write-back timer, syncs]: before the kill: timer drains {d}, owed {d}, parked buffers {d}, syncfs {d} (armed {})\n", .{ numberAfter(st, "\"writeback_timer_drains\":") orelse 0, numberAfter(st, "\"fuse_owed_drain_inos\":") orelse 0, numberAfter(st, "\"parked_buffers\":") orelse 0, numberAfter(st, "\"fuse_syncfs\":") orelse 0, syncfs_armed });
+        std.debug.print("\nsmoke[write-back timer, syncs]: before the kill: timer drains {d}, owed {d}, parked buffers {d}, syncfs {d} (reaches {})\n", .{ numberAfter(st, "\"writeback_timer_drains\":") orelse 0, numberAfter(st, "\"fuse_owed_drain_inos\":") orelse 0, numberAfter(st, "\"parked_buffers\":") orelse 0, numberAfter(st, "\"fuse_syncfs\":") orelse 0, syncfs_reaches });
         // The timer is held away: only the syncs drained, `s4` still parked
         // (and `s3` when the kernel never forwards syncfs).
         try testing.expectEqual(@as(?u64, 0), numberAfter(st, "\"writeback_timer_drains\":"));
-        try testing.expectEqual(@as(?u64, if (syncfs_armed) 1 else 2), numberAfter(st, "\"parked_buffers\":"));
+        try testing.expectEqual(@as(?u64, if (syncfs_reaches) 1 else 2), numberAfter(st, "\"parked_buffers\":"));
     }
     try rig.kill();
     const recovered = try fsckClean(rig, "the kill after the syncs");
@@ -15443,7 +15491,7 @@ test "smoke: UNDER THE WRITE-BACK TIMER fsync, fdatasync AND syncfs ARE STILL DU
         const j = try wbJudge(gpa, try std.fmt.bufPrintSentinel(&pb, "{s}/s{d}", .{ rig.mp, k }, 0), 300 + k);
         // Without FUSE_HAS_SYNCFS the kernel never forwards syncfs(2): `s3`
         // is then an unsynced file like `s4` (judged at write grain only).
-        if (k != 3 or syncfs_armed) try testing.expect(j.whole());
+        if (k != 3 or syncfs_reaches) try testing.expect(j.whole());
     }
     // `s4`'s tail was parked (the timer held away): zeros at its acked
     // size. Its 1 MiB head is whichever its arm made it — the device
@@ -16347,13 +16395,10 @@ test "smoke: [venue-exclusive] A FROZEN DAEMON NEVER HANGS THE HOST'S `sync` (00
     const negotiated_s = blk: {
         const st = try rig.stats();
         defer gpa.free(st);
-        if (numberAfter(st, "\"fuse_syncfs_armed\":") != 1) {
-            const rel = try rig.shOk(rig.work, "uname -r");
-            defer gpa.free(rel);
+        if (syncfsAbsent(st)) |why| {
             try rig.umount();
             _ = try rig.waitChild();
-            var detail: [192]u8 = undefined;
-            return testkit.skip(@src(), .no_kernel_feature, std.fmt.bufPrint(&detail, "kernel {s}: FUSE_HAS_SYNCFS not offered — the host's sync never reaches a plain /dev/fuse server", .{std.mem.trimEnd(u8, rel, "\n")}) catch "a kernel without FUSE_HAS_SYNCFS");
+            return testkit.skip(@src(), .no_kernel_feature, why);
         }
         break :blk numberAfter(st, "\"transport_request_timeout_s\":");
     };
@@ -16659,10 +16704,10 @@ test "smoke: A SYNCFS THAT MEETS A RE-STAGE OF ONE OF ITS RESIDENTS LANDS THE CU
     {
         const st = try rig.stats();
         defer gpa.free(st);
-        if (numberAfter(st, "\"fuse_syncfs_armed\":") != 1) {
+        if (syncfsAbsent(st)) |why| {
             try rig.umount();
             _ = try rig.waitChild();
-            return testkit.skip(@src(), .no_kernel_feature, "FUSE_HAS_SYNCFS not offered — syncfs(2) never reaches a plain /dev/fuse server");
+            return testkit.skip(@src(), .no_kernel_feature, why);
         }
     }
     var released = false;
@@ -16731,10 +16776,10 @@ test "smoke: A SYNCFS THAT MEETS A RESIDENT ITS LAYOUT NO LONGER NAMES OWES IT N
     {
         const st = try rig.stats();
         defer gpa.free(st);
-        if (numberAfter(st, "\"fuse_syncfs_armed\":") != 1) {
+        if (syncfsAbsent(st)) |why| {
             try rig.umount();
             _ = try rig.waitChild();
-            return testkit.skip(@src(), .no_kernel_feature, "FUSE_HAS_SYNCFS not offered — syncfs(2) never reaches a plain /dev/fuse server");
+            return testkit.skip(@src(), .no_kernel_feature, why);
         }
     }
     var released = false;
@@ -16825,10 +16870,10 @@ test "smoke: A FULL DATA STORE ANSWERS ENOSPC — NEVER EIO — AT write(2) AND 
     {
         const st = try rig.stats();
         defer gpa.free(st);
-        if (numberAfter(st, "\"fuse_syncfs_armed\":") != 1) {
+        if (syncfsAbsent(st)) |why| {
             try rig.umount();
             _ = try rig.waitChild();
-            return testkit.skip(@src(), .no_kernel_feature, "FUSE_HAS_SYNCFS not offered — syncfs(2) never reaches a plain /dev/fuse server");
+            return testkit.skip(@src(), .no_kernel_feature, why);
         }
     }
     // 1. The fill: 100 KiB files, never synced, until write(2) refuses.

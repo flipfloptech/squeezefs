@@ -1,4 +1,4 @@
-//! The fabrics initiator (charter §3 "NVMe fabric identities", §8; `docs/
+//! The fabrics initiator (charter §3 "Per-identity NVMe fabric subsystems", §8; `docs/
 //! porting/ops_nvmet_keys.md` §3; decision 0003 §G): the connect string
 //! written DIRECTLY to `/dev/nvme-fabrics` (no nvme-cli — the venue has
 //! none and the product owns its wire), the kernel's `instance=N,cntlid=M`

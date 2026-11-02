@@ -379,10 +379,33 @@ pub var fuse_killpriv_negotiated: counters.Gauge = .{};
 /// fsync/fdatasync/fsyncdir are the only durability points of its write
 /// custody.
 pub var fuse_syncfs_armed: counters.Gauge = .{};
-/// `fuse_syncfs`: FUSE_SYNCFS served; `fuse_syncfs_phase_ns`: its legs,
+/// `fuse_syncfs`: FUSE_SYNCFS served (the application's; the bring-up
+/// probe's count apart); `fuse_syncfs_phase_ns`: every one's legs,
 /// exact-sum (`fsync.SyncfsPhase`).
 pub var fuse_syncfs: counters.ShardedCounter = .{};
 pub var fuse_syncfs_phase_ns: fsync_mod.SyncfsPhaseNs = .{};
+/// `fuse_syncfs_reaches`: 1 when the bring-up's probe — a syncfs(2) on the
+/// mount, judged by whether a FUSE_SYNCFS arrived (charter §3) — reached
+/// this daemon; 0 = syncfs(2)/sync never reach it (stock 7.3: upstream
+/// sends FUSE_SYNCFS to a `/dev/fuse` server from 7.4), so they make no
+/// write custody durable — fsync/fdatasync/fsyncdir do. A row whose law is
+/// syncfs's durability skips by it, naming why.
+pub var fuse_syncfs_reaches: counters.Gauge = .{};
+/// `fuse_syncfs_probes`: the probe's FUSE_SYNCFS, served whole.
+pub var fuse_syncfs_probes: counters.ShardedCounter = .{};
+
+/// The bring-up probe's verdict (`arrived`: its syncfs(2) delivered a
+/// FUSE_SYNCFS), published beside the INIT negotiation it must agree with.
+pub fn publishSyncfsProbe(arrived: bool) void {
+    fuse_syncfs_reaches.set(@intFromBool(arrived));
+    const negotiated = fuse_syncfs_armed.load() == 1;
+    if (arrived == negotiated) return;
+    if (arrived) {
+        log.warn("kv_fs: a FUSE_SYNCFS reached this daemon though INIT never echoed FUSE_HAS_SYNCFS — the kernel forwards syncfs on its own; syncfs/sync are durability points", .{});
+    } else {
+        log.err("kv_fs: INIT echoed FUSE_HAS_SYNCFS but the probe's syncfs(2) delivered no FUSE_SYNCFS — syncfs/sync make no staged data durable on this mount; fsync does", .{});
+    }
+}
 /// `fuse_reclaim_destroys`: corpses destroyed; `fuse_reclaim_drains`:
 /// destroy entries committed (the batched-destroy economy's two words);
 /// `fuse_reclaim_blocks_freed`: bindings the destroy riders released.
@@ -5478,8 +5501,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// namespace, the epochs' saves, then the store-wide meta barrier
         /// (every member's coalesced barrier; the strict cadence's per
         /// commit). Custody born after it began is a later write's.
-        pub fn syncfs(self: *Self, c: *Ctx, _: filesystem.SyncfsArgs) Error!void {
-            fuse_syncfs.inc();
+        pub fn syncfs(self: *Self, c: *Ctx, a: filesystem.SyncfsArgs) Error!void {
+            if (a.probe) fuse_syncfs_probes.inc() else fuse_syncfs.inc();
             var prof = fsync_mod.SyncfsProf.start();
             defer prof.finish(&fuse_syncfs_phase_ns);
             _ = try self.drainPendingTimes(c);
@@ -9129,6 +9152,44 @@ test "FUSE_SYNCFS is a per-file fsync for the whole mount: every parked stamp jo
     try testing.expectEqual(@as(?linux.E, null), m.call(.syncfs, 1).errno());
     try testing.expectEqual(mfsyncs0 + 1, m.store.fsyncs);
     m.release(mf);
+}
+
+test "the bring-up probe's FUSE_SYNCFS is a whole syncfs counted apart: fuse_syncfs_probes +1 and fuse_syncfs unchanged, the plane's drain and the store's barrier ran; the verdict publishes fuse_syncfs_reaches, and one that contradicts INIT's FUSE_HAS_SYNCFS negotiation is loud (a promised syncfs that never arrived is an error)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const calls0 = fuse_syncfs.load();
+    const probes0 = fuse_syncfs_probes.load();
+    const fsyncs0 = h.store.fsyncs;
+    h.d.armSyncfsProbe();
+    try testing.expectEqual(@as(?linux.E, null), h.call(.syncfs, 1).errno());
+    try testing.expect(h.d.endSyncfsProbe());
+    try testing.expectEqual(calls0, fuse_syncfs.load());
+    try testing.expectEqual(probes0 + 1, fuse_syncfs_probes.load());
+    try testing.expectEqual(@as(u32, 1), h.data.syncfs_calls);
+    try testing.expectEqual(fsyncs0 + 1, h.store.fsyncs);
+    // An application's syncfs after the probe ended is counted as one.
+    try testing.expectEqual(@as(?linux.E, null), h.call(.syncfs, 1).errno());
+    try testing.expectEqual(calls0 + 1, fuse_syncfs.load());
+    try testing.expectEqual(probes0 + 1, fuse_syncfs_probes.load());
+    // The verdict beside the negotiation: agreement is silent either way.
+    const armed0 = fuse_syncfs_armed.load();
+    defer fuse_syncfs_armed.set(armed0);
+    fuse_syncfs_armed.set(1);
+    publishSyncfsProbe(true);
+    try testing.expectEqual(@as(u64, 1), fuse_syncfs_reaches.load());
+    fuse_syncfs_armed.set(0);
+    publishSyncfsProbe(false);
+    try testing.expectEqual(@as(u64, 0), fuse_syncfs_reaches.load());
+    // Negotiated, never arrived: the kernel broke its INIT contract.
+    fuse_syncfs_armed.set(1);
+    log.testing.expectErrorLogs(1);
+    publishSyncfsProbe(false);
+    try log.testing.expectAllFired();
+    try testing.expectEqual(@as(u64, 0), fuse_syncfs_reaches.load());
 }
 
 test "the handover's step 0 (rung 10 item 4): drainPendingTimesOfSlot commits the parked stamps of ONE routing slot in one Δ entry — the stored records of that slot carry their served mtimes, another slot's stamp stays parked for the cadence, a slot with nothing to refine commits nothing; the binding is the plane's TimesDrain seam" {

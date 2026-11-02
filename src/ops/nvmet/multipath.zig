@@ -1,5 +1,5 @@
 //! The kernel's native NVMe multipath under the daemon's data-plane
-//! associations (charter §3 "NVMe fabric identities", §8;
+//! associations (charter §3 "Per-identity NVMe fabric subsystems", §8;
 //! `docs/porting/ops_nvmet_keys.md` §3.7): a data volume's
 //! `fabric_endpoint` record names ONE subsystem over SEVERAL paths (one
 //! per target listener — several Ethernet links); the daemon connects

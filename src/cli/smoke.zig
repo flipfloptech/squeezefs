@@ -17427,6 +17427,96 @@ test "smoke: A DELETED FILE'S PARKED BYTES NEVER WAIT FOR THEIR OWN DESTROY (dec
     _ = try fsckClean(rig, "the clean unmount after the corpse's custody");
 }
 
+test "smoke: A DELETED FILE'S PARKED BYTES ARE DISCARDED AT ITS DELETE, NEVER UPLOADED AFTER IT (the owner's ruling 2026-11-02; decision 0003 §CW.5 (a)) — a two-volume set of 2 × 46 usable 4 MiB blocks without a write cache filled to ENOSPC with fsync'd one-block files: the last file's write parks a block no volume can take (write_through_fallbacks) → `rm` of it: its FORGET is the delete (nlink 0, the kernel's last reference gone) and its destroy lands at the reclaim tick (fuse_reclaim_destroys, nothing left gathered) → every other file removed, so the store has supply again → from the delete on nothing is minted (alloc_fresh_mints + alloc_from_freelist unchanged), no upload meets the dead file's merge NotFound (write_pipeline_discards unchanged) and no parked buffer is left → clean unmount, fsck clean; no error line, no tripwire (red on dev: the write-back timer retried the corpse's parked block every pass and, once the frees came back, minted a block, DMA'd the dead bytes and dropped them at the merge's NotFound)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSetSized(true, &.{}, fallocate_row_data_bytes);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const mark = try rig.logLen();
+    const DeadCensus = struct { fallbacks: u64, destroys: u64, gathered: u64, mints: u64, discards: u64, parked: u64 };
+    const census = struct {
+        fn of(r: *Rig) !DeadCensus {
+            const t = try r.stats();
+            defer r.gpa.free(t);
+            return .{
+                .fallbacks = numberAfter(t, "\"write_through_fallbacks\":") orelse return error.StatMissing,
+                .destroys = numberAfter(t, "\"fuse_reclaim_destroys\":") orelse return error.StatMissing,
+                .gathered = numberAfter(t, "\"fuse_reclaim_gathered\":") orelse return error.StatMissing,
+                .mints = (numberAfter(t, "\"alloc_fresh_mints\":") orelse return error.StatMissing) + (numberAfter(t, "\"alloc_from_freelist\":") orelse return error.StatMissing),
+                .discards = numberAfter(t, "\"write_pipeline_discards\":") orelse return error.StatMissing,
+                .parked = numberAfter(t, "\"parked_buffers\":") orelse return error.StatMissing,
+            };
+        }
+    }.of;
+    // 1. The fill: one-block files until a write meets the full store; the
+    //    failed file keeps its parked block.
+    const c0 = try census(rig);
+    {
+        const out = try rig.onMountTimed(
+            \\j=0; while [ $j -lt 200 ] && dd if=/dev/zero of=fill$j bs=1M count=4 conv=fsync status=none 2>/dev/null; do j=$((j+1)); done
+            \\echo "filled $j"
+            \\echo $j > last
+        , 600);
+        defer gpa.free(out);
+        std.debug.print("\nsmoke[dead file's parked bytes]: {s}", .{out});
+    }
+    const c1 = try census(rig);
+    std.debug.print("smoke[dead file's parked bytes]: the fill parked {d} block(s) the store refused, {d} parked buffer(s)\n", .{ c1.fallbacks - c0.fallbacks, c1.parked });
+    try testing.expect(c1.fallbacks > c0.fallbacks);
+    try testing.expect(c1.parked >= 1);
+    // 2. The delete; its destroy lands at the reclaim tick.
+    rig.gpa.free(try rig.onMountTimed("rm -f fill$(cat last)\n", 60));
+    var c2 = try census(rig);
+    var polls: u32 = 0;
+    while ((c2.destroys < c1.destroys + 1 or c2.gathered != 0) and polls < 3000) : (polls += 1) {
+        try io.sleep(.fromMilliseconds(10), .awake);
+        c2 = try census(rig);
+    }
+    std.debug.print("smoke[dead file's parked bytes]: after the delete's destroy: destroyed {d}, gathered {d}, parked buffers {d}\n", .{ c2.destroys - c1.destroys, c2.gathered, c2.parked });
+    try testing.expectEqual(c1.destroys + 1, c2.destroys);
+    try testing.expectEqual(@as(u64, 0), c2.gathered);
+    // 3. Supply returns: every other file removed, their destroys landed
+    //    and their frees back in the allocator; the parked set empties.
+    rig.gpa.free(try rig.onMountTimed("rm -f fill* last\n", 120));
+    var c3 = try census(rig);
+    var free: u64 = 0;
+    polls = 0;
+    while (polls < 600) : (polls += 1) {
+        const out = try rig.onMountTimed(store_free_blocks_sh, 30);
+        defer gpa.free(out);
+        free = numberAfter(out, "free ") orelse return error.StatMissing;
+        c3 = try census(rig);
+        if (free != 0 and c3.gathered == 0 and c3.parked == 0) break;
+        try io.sleep(.fromMilliseconds(100), .awake);
+    }
+    std.debug.print("smoke[dead file's parked bytes]: supply back ({d} free block(s)): since the delete {d} block(s) minted, {d} upload(s) dropped at the merge's NotFound, {d} parked buffer(s)\n", .{ free, c3.mints - c1.mints, c3.discards - c1.discards, c3.parked });
+    try testing.expect(free != 0);
+    try testing.expectEqual(@as(u64, 0), c3.parked);
+    try testing.expectEqual(c1.mints, c3.mints);
+    try testing.expectEqual(c1.discards, c3.discards);
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"invariant_tripwires\":"));
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        const errors = std.mem.count(u8, seg, "error(");
+        if (errors != 0) std.debug.print("--- the daemon's alert lines ---\n{s}\n", .{seg});
+        try testing.expectEqual(@as(usize, 0), errors);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, seg, "TRIPWIRE"));
+    }
+    _ = try fsckClean(rig, "the clean unmount after the dead file's parked bytes");
+}
+
 /// The store's free blocks off the mount's `.stats` (Σ capacity − used over
 /// the data plane's `volumes` rows), one line `free N`.
 const store_free_blocks_sh =

@@ -43,3 +43,7 @@ this note's pure stock kernel.org 7.3.1 + `scripts/kernel/config-fragment`
 
 Not run (venue-exclusive or the full gate's): the frozen-daemon and bring-up-failure host-sync rows;
 the full gate (the orchestrator's).
+
+## On the venue's 7.3.1-1-omarchy-mainline under `nvme_core.multipath=N` (decision 0003 §DE)
+
+The first gate there (dev baf1fcc) had five nvmet-smoke rows red: daemon-connect-{loop,tcp} and sigstop-preempt refused by the head verdict (stock 7.3.1 links both identities' controllers into one headless `nvme-subsys` dir — a dir without a head now answers no head), fidelity-mount (loop) and guard-tcp read an empty payload after kill -9 (`sync -f` reaches no daemon — the rows sync by the file). At code head 2dc8ad5: nvmet-smoke 54 pass, 1 skip (multipath-tcp, by name) ×3; units `nvmet` 85 pass, 15 skip (the tier's own step); `zig fmt --check`, `zig build rails` clean.

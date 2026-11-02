@@ -1054,7 +1054,7 @@ test "B2 (review): the rule re-judges AFTER the register, under the lock — a s
     };
     const sib_pid: u32 = @intCast(child.id.?);
     const local = proc.localIdentity();
-    const ticks = proc.startTicksOf(sib_pid) orelse return error.SkipZigTest;
+    const ticks = proc.startTicksOf(sib_pid) orelse return @import("../../core/testkit.zig").skip(@src(), .no_device, "/proc does not show the spawned sibling's start ticks");
     const sib: claim.Identity = .{ .boot_id = local.boot_id, .pid = sib_pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
     var lb: [64]u8 = undefined;
     try reg.append(sib_pid, ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = sib.writerId(9) }));

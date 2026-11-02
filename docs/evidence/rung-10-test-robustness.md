@@ -100,3 +100,43 @@ fails that test.
 
 Every run answered 0 to all 1,200 ops (0 EAGAIN). On `f0ed112`: units `journal_lane` 67/67 and `knobs` 57/57,
 fmt, rails 29, the full smoke 183 + 6 skipped of 189.
+
+**6. The no-open close row reads its FLUSHes, not the times drain's tick (§CO.34–CO.36; branch
+`test/noopen-close-drain` off `4767b45`, Linux 7.3.1-omarchy).** §DC.9 (e): A NO-OPEN CLOSE IS THE WRITE-BACK
+DRAIN failed inside a 29-row group on the patched 7.3 kernel: 5 of 5 runs on one branch, 1 of 4 on dev, 0 of 3 on
+a copy with one extra print. Each failure was `expected 0, found 1` on `meta_kv_times_echo_pending`, read the moment
+the last close returned. That gauge counts every parked refinement, and `> g` and `> f` park the root's stamp (§AV)
+until the times drain's next tick (≤ one 50 ms flush interval). Each close's drain journals only its own file's
+claim, so the gauge read 1 or 0 by the script's phase against that tick. The cause is the row's, not the product's.
+Shown on `4767b45` with a temporary harness that moves the cadence's tick an hour away (the barrier cadence
+unchanged; not committed):
+
+| shape | verdict | pending | parent parks | drain commits |
+|---|---|---|---|---|
+| tick an hour away | `expected 0, found 1` | 1 | 2 | 2 (the FLUSHes of `f`, `g`) |
+| … then fsync `f`, fsync `g` | — | 1, 1 | | 2, 2 |
+| … then fsync of the root directory | — | 0 | | 3 |
+| cadence free | 3/3 green | 0 | 2 | 3 (the third: the cadence's root drain) |
+
+The race also hid the defect the row names. With a temporary product weakening (the close drain journals no claim),
+the old row passed 2 of 3 runs, because the cadence journaled the claims before the read and the files read whole
+after the kill. It caught the defect once (`expected 0, found 3`).
+
+New seam `SQUEEZEFS_TEST_TIMES_DRAIN_HOLD` (`cli/mount.zig`): the cadence's ticks drain nothing; every durability
+point drains as before (FLUSH, RELEASE, fsync, fsyncdir, syncfs, a grant's landing, the handover's step 0, the
+dismount). The no-open arm holds it and asserts `pending` = min(1, `fuse_parent_times_parked`), the root's stamp
+(0 under the strict cadence). With the cadence held, only the FLUSHes can have journaled the claims, so the row now
+fails the weakened product 2/2 (`expected 1, found 3`, commits 0). On the fix, the hour-away tick and a 1 ms tick
+both read 1 parked and 2 commits. Unit (mount): 100 held ticks commit nothing, the filesystem's own drain journals,
+a released tick drains. A hold that never holds fails that test.
+
+| the row's binary (`ddfa698`) | beside | runs | load (32 threads) |
+|---|---|---|---|
+| the row alone | the full smoke's 16 shards + 16 busy loops (20 s and 120 s warm-ups) | **30/30** | 20–32 |
+| the row alone | nothing of this work's (another agent's unit build) | **10/10** | 12–13 |
+
+Every run read FLUSH drains 2, 1 parked (the root's stamp) and 2 commits, and both files were whole after the kill.
+Also on `ddfa698`: the units (the seam's, the cadence's, `core.knobs`) 57/57, fmt, rails 29, the eight §AF rows ×2,
+and the full smoke at 185 + 13 skipped of 198. Seen, not changed: under `SQUEEZEFS_META_FLUSH_INTERVAL_MS=0` the row
+fails `drains >= 2`, on `4767b45` too. The strict cadence turns off the shared-size write path, so nothing is parked
+at the close.

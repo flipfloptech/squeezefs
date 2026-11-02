@@ -741,6 +741,44 @@ test "over a sysfs fixture of a multipath kernel: the subsystem dir of each path
     try testing.expect(std.mem.indexOf(u8, out.written(), "  nvme4:  : gone") != null);
 }
 
+test "over a sysfs fixture of a stock kernel under nvme_core.multipath=N: the kernel links every controller of one subsysnqn into ONE nvme-subsys dir whatever its identity but makes no head — each controller serves its own nvme<N>n<Y>, so nothing is shared: the verdict is no head (the dir unnamed), never foreign — beside another identity's live controller, a mid-teardown one, a gone link; the same dir WITH a head (multipath=Y) is foreign" {
+    const gpa = testing.allocator;
+    var fx = initiator.Fixture.init(gpa, testing.io, "mpathN") catch return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer fx.deinit();
+    const ours: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:a0a0a0a0-a0a0-4a0a-8a0a-a0a0a0a0a0a0", .hostid = "a0a0a0a0-a0a0-4a0a-8a0a-a0a0a0a0a0a0" };
+    // 7.3.1 under multipath=N, daemon-connect's second mount: identity B's
+    // operator connect nvme2 and the mount's own nvme3, both linked in
+    // nvme-subsys2 (the kernel matches the subsysnqn alone), each holding
+    // its plain node; the dir lists no nvme<K>n<Y>.
+    try fx.controller(2, "loop", "live", "nqn.sub", "nqn.2014-08.org.nvmexpress:uuid:b0b0b0b0-b0b0-4b0b-8b0b-b0b0b0b0b0b0", "b0b0b0b0-b0b0-4b0b-8b0b-b0b0b0b0b0b0", "");
+    try fx.namespace(2, 1, "11111111-2222-3333-4444-555555555555\n", true);
+    try fx.controller(3, "loop", "live", "nqn.sub", ours.hostnqn, ours.hostid, "");
+    try fx.namespace(3, 1, "11111111-2222-3333-4444-555555555555\n", true);
+    try fx.file("class/nvme-subsystem/nvme-subsys2/subsysnqn", .{}, "nqn.sub\n");
+    try fx.file("class/nvme-subsystem/nvme-subsys2/iopolicy", .{}, "numa\n");
+    try fx.dir("class/nvme-subsystem/nvme-subsys2/nvme2", .{});
+    try fx.dir("class/nvme-subsystem/nvme-subsys2/nvme3", .{});
+    var sb: [32]u8 = undefined;
+    try testing.expectEqualStrings("nvme-subsys2", (try subsystemOf(gpa, fx.root, 3, &sb)).?);
+    var hb: [32]u8 = undefined;
+    try testing.expect((try headOf(gpa, fx.root, "nvme-subsys2", &hb)) == null);
+    const h = try headVerdict(gpa, fx.root, &.{3}, ours, &sb);
+    try testing.expectEqual(HeadVerdict.no_head, h.verdict);
+    try testing.expectEqual(@as(usize, 0), h.subsys_len);
+    // The other identity's controller mid-teardown, and a link whose
+    // controller dir is gone: still no head, still nothing shared.
+    try fx.file("class/nvme/nvme2/state", .{}, "deleting\n");
+    try fx.dir("class/nvme-subsystem/nvme-subsys2/nvme5", .{});
+    try testing.expectEqual(HeadVerdict.no_head, (try headVerdict(gpa, fx.root, &.{3}, ours, &sb)).verdict);
+    // The same dir with a head (multipath=Y): the serving set is judged,
+    // the other identity refused.
+    try fx.file("class/nvme/nvme2/state", .{}, "live\n");
+    try fx.dir("class/nvme-subsystem/nvme-subsys2/nvme2n1", .{});
+    const y = try headVerdict(gpa, fx.root, &.{3}, ours, &sb);
+    try testing.expectEqual(HeadVerdict{ .foreign = 2 }, y.verdict);
+    try testing.expectEqualStrings("nvme-subsys2", sb[0..y.subsys_len]);
+}
+
 fn sysfsTextFuzz(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
     const len = smith.slice(&buf);

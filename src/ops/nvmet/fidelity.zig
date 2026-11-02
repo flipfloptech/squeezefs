@@ -1657,6 +1657,8 @@ test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmet
     // B frozen: evicted past T_owner, its region recovered by M, whose
     // recovery's preempt removes this HOST's registration.
     const pid_b = rig.daemons.items[b].pid;
+    const rr_before = try rig.resvReportJson(cm.dev());
+    defer gpa.free(rr_before);
     _ = linux.kill(pid_b, .STOP);
     const sm = try rig.awaitStat(m, "appender_recoveries", 1, ready_wait_ns);
     defer gpa.free(sm);
@@ -1666,7 +1668,21 @@ test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmet
         // The preempt removed this host's registration: M's alone stands.
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        std.debug.print("\nstale sibling: after M's recovery the report reads {s}\n", .{rr});
+        if (json_scan.number(rr, "regctl") != 1) {
+            std.debug.print("\nstale sibling: before B's stop the report read {s}\nafter M's recovery it reads {s}\n", .{ rr_before, rr });
+            for ([_]usize{ m, a }) |d| {
+                const st = try rig.stats(d);
+                defer gpa.free(st);
+                const at = std.mem.indexOf(u8, st, "\"pr_key\"") orelse 0;
+                std.debug.print("  {s} pr: {s}\n", .{ rig.daemons.items[d].mp, st[at..@min(st.len, at + 420)] });
+            }
+            for ([_]usize{ m, a }) |d| {
+                const text = try rig.readLog(d);
+                defer gpa.free(text);
+                var it = std.mem.splitScalar(u8, text, '\n');
+                while (it.next()) |line| if (std.mem.indexOf(u8, line, "slot leases") == null) std.debug.print("  [{s}] {s}\n", .{ rig.daemons.items[d].mp, line });
+            }
+        }
         try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
     }
     // A is fenced with its host: its fsync is refused at the device.

@@ -266,7 +266,7 @@ pub const Guard = struct {
         try g.barrier();
         guard.stats.claims_committed.inc();
         guard.stats.clients_registered.add(1);
-        log.info("meta volume {s}: writer claim committed and barriered (id {x:0>16}, pid {d}, mode {s}, pr key {x:0>16})", .{ g.be.path, g.identity.writerId(g.be.index), g.identity.pid, g.modeName(), claim.prKey(g.identity.writerId(g.be.index), g.identity.boot_id) });
+        log.info("meta volume {s}: writer claim committed and barriered (id {x:0>16}, pid {d}, mode {s}, pr key {x:0>16})", .{ g.be.path, g.identity.writerId(g.be.index), g.identity.pid, g.modeName(), if (g.prClient()) |c| c.key else 0 });
     }
 
     /// Both phases back to back (the tests' door; the backend interleaves

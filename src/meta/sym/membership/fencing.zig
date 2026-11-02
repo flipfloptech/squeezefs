@@ -69,6 +69,10 @@ pub const stats = struct {
     pub var appender_recovery_preempts: counters.ShardedCounter = .{};
     /// A preempt withheld because the dead key is THIS host's registrant.
     pub var appender_recovery_own_key_guards: counters.ShardedCounter = .{};
+    /// The holder's preempt left the victim registered (nvmet: a holder's
+    /// preempt only re-types its own hold) — released, preempted with no
+    /// holder standing, re-acquired.
+    pub var appender_recovery_holder_preempt_cycles: counters.ShardedCounter = .{};
     /// The per-volume era in force.
     pub var writer_term: counters.Gauge = .{};
     /// Slots whose lessee's page is `Recovering` (rule 4 suspended).
@@ -220,15 +224,45 @@ pub fn preemptDeadRegistrant(client: ?*pr.Client, victim_key: u64) PreemptOutcom
         stats.appender_recovery_own_key_guards.inc();
         return .own_key_guard;
     }
-    c.preemptAndAbort(victim_key) catch |e| {
-        var buf: [128]u8 = undefined;
-        var w: std.Io.Writer = .fixed(&buf);
-        c.writeError(&w, e) catch {};
-        log.warn("recovery preempt: preempt-and-abort of key 0x{x} did not land ({s}) — the full tail scan is the fence", .{ victim_key, w.buffered() });
-        return .failed;
-    };
+    c.preemptAndAbort(victim_key) catch |e| return preemptFailed(c, victim_key, e);
+    // A target where the HOLDER's preempt only re-types its own hold
+    // (nvmet 7.3's `nvmet_pr_preempt` answers `holder == reg` before it
+    // compares the key) leaves the victim registered: the reservation is
+    // released, the victim preempted with no holder standing (that arm
+    // unregisters by key), the hold re-acquired. The window between the
+    // release and the acquire admits every host's writes — the frame
+    // screen's, as before any fence.
+    if (keyRegistered(c, victim_key) catch true) {
+        stats.appender_recovery_holder_preempt_cycles.inc();
+        c.releaseReservation() catch |e| return preemptFailed(c, victim_key, e);
+        const preempted = c.preemptAndAbort(victim_key);
+        c.acquire() catch |e| {
+            var buf: [128]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            c.writeError(&w, e) catch {};
+            log.err("recovery preempt: the reservation released to preempt key 0x{x} could not be re-acquired ({s}) — the namespace stands unreserved until the heartbeat's re-check", .{ victim_key, w.buffered() });
+        };
+        preempted catch |e| return preemptFailed(c, victim_key, e);
+        if (keyRegistered(c, victim_key) catch true) return preemptFailed(c, victim_key, error.DeviceStatus);
+    }
     stats.appender_recovery_preempts.inc();
     return .fenced;
+}
+
+fn preemptFailed(c: *pr.Client, victim_key: u64, e: pr.Error) PreemptOutcome {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    c.writeError(&w, e) catch {};
+    log.warn("recovery preempt: preempt-and-abort of key 0x{x} did not land ({s}) — the full tail scan is the fence", .{ victim_key, w.buffered() });
+    return .failed;
+}
+
+/// Does a registrant hold `key` on the namespace (the report)?
+fn keyRegistered(c: *pr.Client, rkey: u64) pr.Error!bool {
+    var rep = try c.report();
+    defer rep.deinit(c.gpa);
+    for (rep.registrants) |r| if (r.rkey == rkey) return true;
+    return false;
 }
 
 // ---------------------------------------------------------------------------

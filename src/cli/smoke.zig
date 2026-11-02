@@ -17517,6 +17517,110 @@ test "smoke: A DELETED FILE'S PARKED BYTES ARE DISCARDED AT ITS DELETE, NEVER UP
     _ = try fsckClean(rig, "the clean unmount after the dead file's parked bytes");
 }
 
+test "smoke: A DELETED FILE'S WRITE-CACHE RESIDENT LEAVES WITH ITS CLAIM, NEVER PROMOTED (the owner's ruling 2026-11-02) — a supervised set whose write cache is the 64 MiB floor (SQUEEZEFS_WRITE_CACHE_PCT=1 of a SQUEEZEFS_MEM_BUDGET_MB=4480 budget: four 16 MiB shards): a 64 KiB file `r` written first and never synced — the oldest resident of its shard —, a probe file, then 60 % of the bound in younger 64 KiB residents with nothing evicted → the probe's delete lands at a reclaim tick (the next is a cadence away) → `rm r`, its FORGET processed (the delete) → at once 60 % of the bound more: every shard's LRU drain evicts its oldest residents, `r`'s first → `r`'s destroy at the next tick frees nothing (fuse_reclaim_blocks_freed unchanged: `r` was never promoted) → orderly unmount, fsck clean; no error line, no tripwire (red on dev: the LRU drain promoted the corpse's resident into a packed slot — minted and DMA'd for a file nobody can read — and its destroy freed that slot; the first form of this row promoted it by a syncfs, which reaches no daemon code on Linux 7.3, decision 0003 §DB)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MEM_BUDGET_MB", "4480");
+    try rig.env.put("SQUEEZEFS_WRITE_CACHE_PCT", "1");
+    try rig.formatSet(true);
+    try rig.mountAsSet(&.{});
+    _ = try rig.awaitReady(0);
+    const mark = try rig.logLen();
+    const ResidentCensus = struct { staged: u64, bound: u64, evictions: u64, sheds: u64, forgets: u64, destroys: u64, gathered: u64, freed: u64 };
+    const census = struct {
+        fn of(r: *Rig) !ResidentCensus {
+            const t = try r.stats();
+            defer r.gpa.free(t);
+            return .{
+                .staged = numberAfter(t, "\"current_staged_write_bytes\":") orelse return error.StatMissing,
+                .bound = numberAfter(t, "\"write_cache_bound_bytes\":") orelse return error.StatMissing,
+                .evictions = numberAfter(t, "\"write_cache_evict_promotions\":") orelse return error.StatMissing,
+                .sheds = numberAfter(t, "\"write_cache_budget_sheds\":") orelse return error.StatMissing,
+                .forgets = numberAfter(t, "\"fuse_forget_evictions\":") orelse return error.StatMissing,
+                .destroys = numberAfter(t, "\"fuse_reclaim_destroys\":") orelse return error.StatMissing,
+                .gathered = numberAfter(t, "\"fuse_reclaim_gathered\":") orelse return error.StatMissing,
+                .freed = numberAfter(t, "\"fuse_reclaim_blocks_freed\":") orelse return error.StatMissing,
+            };
+        }
+        fn awaitDestroys(r: *Rig, want: u64) !ResidentCensus {
+            var c = try of(r);
+            var polls: u32 = 0;
+            while ((c.destroys < want or c.gathered != 0) and polls < 3000) : (polls += 1) {
+                try r.io.sleep(.fromMilliseconds(10), .awake);
+                c = try of(r);
+            }
+            try testing.expectEqual(want, c.destroys);
+            return c;
+        }
+    };
+    // 1. `r` first, the probe `p`, then 60 % of the bound in younger
+    //    residents (the second 60 % prepared off the mount for step 3).
+    rig.gpa.free(try rig.onMountTimed(
+        \\head -c 65536 /dev/urandom > "$1/val"
+        \\dd if="$1/val" of=r bs=64k status=none
+        \\dd if="$1/val" of=p bs=64k status=none
+    , 60));
+    const c0 = try census.of(rig);
+    const cost = c0.staged / 2;
+    const batch = (c0.bound * 6 / 10) / cost;
+    std.debug.print("\nsmoke[dead file's resident]: the write cache's bound {d} MiB, {d} B a resident; two batches of {d}\n", .{ c0.bound >> 20, cost, batch });
+    try testing.expect(cost >= 65536 and batch >= 64);
+    {
+        var script: [512]u8 = undefined;
+        rig.gpa.free(try rig.onMountTimed(try std.fmt.bufPrint(&script,
+            \\head -c {d} /dev/urandom > "$1/pre"
+            \\head -c {d} /dev/urandom > "$1/over"
+            \\split -b 64k -a 5 "$1/pre" pre.
+        , .{ batch * 65536, batch * 65536 }), 120));
+    }
+    const c1 = try census.of(rig);
+    std.debug.print("smoke[dead file's resident]: {d} B staged, {d} evicted, {d} shed\n", .{ c1.staged, c1.evictions - c0.evictions, c1.sheds - c0.sheds });
+    try testing.expectEqual(c0.evictions, c1.evictions);
+    try testing.expectEqual(c0.sheds, c1.sheds);
+    // 2. The probe's delete lands at a reclaim tick.
+    rig.gpa.free(try rig.onMountTimed("rm p\n", 60));
+    const c2 = try census.awaitDestroys(rig, c0.destroys + 1);
+    // 3. The delete, then at once a second batch: every shard overflows.
+    rig.gpa.free(try rig.onMountTimed("rm r\n", 60));
+    {
+        var c = try census.of(rig);
+        var polls: u32 = 0;
+        while (c.forgets < c2.forgets + 1 and polls < 3000) : (polls += 1) {
+            try io.sleep(.fromMilliseconds(5), .awake);
+            c = try census.of(rig);
+        }
+        try testing.expect(c.forgets >= c2.forgets + 1);
+    }
+    rig.gpa.free(try rig.onMountTimed("split -b 64k -a 5 \"$1/over\" ov.\n", 120));
+    const c3 = try census.of(rig);
+    // 4. `r`'s destroy at the next tick frees nothing: never promoted.
+    const c4 = try census.awaitDestroys(rig, c0.destroys + 2);
+    std.debug.print("smoke[dead file's resident]: the second batch: {d} evicted (before `r`'s destroy {d}), {d} shed; `r`'s destroy freed {d} binding(s)\n", .{ c4.evictions - c1.evictions, c3.evictions - c1.evictions, c4.sheds - c1.sheds, c4.freed - c2.freed });
+    try testing.expect(c3.evictions > c1.evictions);
+    try testing.expectEqual(c2.freed, c4.freed);
+    {
+        const t = try rig.stats();
+        defer gpa.free(t);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"invariant_tripwires\":"));
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        const errors = std.mem.count(u8, seg, "error(");
+        if (errors != 0) std.debug.print("--- the daemon's alert lines ---\n{s}\n", .{seg});
+        try testing.expectEqual(@as(usize, 0), errors);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, seg, "TRIPWIRE"));
+        try testing.expectEqual(@as(u64, 0), (try dismountLineOf(seg)).failed);
+    }
+    _ = try fsckClean(rig, "the orderly unmount after the dead file's resident");
+}
+
 /// The store's free blocks off the mount's `.stats` (Σ capacity − used over
 /// the data plane's `volumes` rows), one line `free N`.
 const store_free_blocks_sh =

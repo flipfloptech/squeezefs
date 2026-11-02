@@ -1,4 +1,4 @@
-//! The fabrics initiator (charter §3 host-scoped subsystems, §8; `docs/
+//! The fabrics initiator (charter §3 "NVMe fabric identities", §8; `docs/
 //! porting/ops_nvmet_keys.md` §3; decision 0003 §G): the connect string
 //! written DIRECTLY to `/dev/nvme-fabrics` (no nvme-cli — the venue has
 //! none and the product owns its wire), the kernel's `instance=N,cntlid=M`
@@ -15,24 +15,24 @@
 //! `nvmf_default_host` is a RANDOM uuid per module load, so an un-named
 //! connect would register under a different host identity every boot and
 //! the guard's identity-stability stamp would read a change at every
-//! reboot's first beat), `nvme_core.fabrics_host_scoped_subsystems` read
-//! once and announced, the sysfs discovery over an injectable root (the
+//! reboot's first beat), the sysfs discovery over an injectable root (the
 //! strict `^nvme\d+n\d+$` shape; a merged multipath head is never handed
 //! out), disconnect by `delete_controller` (every controller of the NQN,
 //! or `--identity-only` ours), the `fabric_*` sampler (a SAMPLED-transition
 //! reconnect counter that undercounts flaps faster than its cadence — by
 //! design) and the §5.2 refusal ladder as a pure verdict.
 //!
-//! On the VM's kernel `CONFIG_NVME_MULTIPATH` is unset: two identities on
-//! one subsystem yield two controllers with their own `nvme<N>n1` nodes (the
-//! kernel warns "multipathing not supported" and proceeds) — the merged
-//! shape cannot arise and `fabrics_host_scoped_subsystems=N` is inert; on
-//! a multipath kernel (a stock distro's, kamrui's) the controller holds only
-//! a hidden path node and the namespace is its subsystem's head, handed out
-//! only while every serving controller is ours (`controllerNamespace`); with
-//! `N` two per-mount identities would merge under one head whose round-robin
-//! voids per-mount fencing, which is what the announcement at the first
-//! connect says.
+//! Without native multipath (`CONFIG_NVME_MULTIPATH` unset, or
+//! `nvme_core.multipath=N`) two identities on one subsystem yield two
+//! controllers with their own `nvme<N>n1` nodes — the merged shape cannot
+//! arise; on a multipath kernel (`nvme_core.multipath=Y`, a stock distro's
+//! default) the controller holds only a hidden path node and the namespace
+//! is its subsystem's head, handed out only while every serving controller
+//! is ours (`controllerNamespace`): a stock kernel groups subsystems by
+//! `subsysnqn` alone, so two per-mount identities on one subsystem MERGE
+//! under one head whose round-robin voids per-mount fencing — refused,
+//! never served (decision 0003 §DB; the announcement at the first connect
+//! says which posture the host runs).
 
 const std = @import("std");
 const fuzzkit = @import("../../core/fuzzkit.zig");
@@ -58,7 +58,6 @@ comptime {
 pub const FABRICS_DEV = "/dev/nvme-fabrics";
 pub const SYSFS_ROOT = "/sys";
 pub const MACHINE_ID_PATH = "/etc/machine-id";
-pub const HOST_SCOPED_PARAM = "/sys/module/nvme_core/parameters/fabrics_host_scoped_subsystems";
 pub const ADMIN_TIMEOUT_PARAM = "/sys/module/nvme_core/parameters/admin_timeout";
 /// The kernel's own default when the parameter is unreadable.
 pub const ADMIN_TIMEOUT_DEFAULT_S: u64 = 60;
@@ -341,37 +340,6 @@ pub fn resolveHostIdentity(env: *const std.process.Environ.Map, opts: pr.Identit
     const r = resolveIdentity(env, opts, &etc, mid);
     if (r == .identity) stats.fabric_host_identity_source.set(@backingInt(r.identity.source));
     return r;
-}
-
-// ---------------------------------------------------------------------------
-// §3.3 `nvme_core.fabrics_host_scoped_subsystems`.
-// ---------------------------------------------------------------------------
-
-pub const HostScoped = enum(u8) {
-    off = 0,
-    on = 1,
-    /// A stock kernel without the sqz patch.
-    absent = 2,
-
-    pub fn announce(self: HostScoped) []const u8 {
-        return switch (self) {
-            .on => "host-scoped fabric subsystems: ON (co-located per-mount identities on this host get their own subsystem heads)",
-            .off => "host-scoped fabric subsystems: OFF (nvme_core.fabrics_host_scoped_subsystems=N — on a multipath kernel two per-mount identities on one subsystem would MERGE under one head whose round-robin voids per-mount fencing; this kernel has no multipath, so each identity gets its own nvme<N>n<Y> and the merge cannot arise)",
-            .absent => "host-scoped fabric subsystems: stock kernel (no nvme_core.fabrics_host_scoped_subsystems) — co-located per-mount identities merge under one multipath head unless nvme_core.multipath=N",
-        };
-    }
-};
-
-/// Published on `fabric_host_scoped` on every path — a stock kernel's
-/// `absent` too, never left reading the gauge's zero (`off`).
-pub fn readHostScoped() HostScoped {
-    var buf: [16]u8 = undefined;
-    const hs: HostScoped = if (proc.readSmall(HOST_SCOPED_PARAM, &buf)) |t|
-        (if (std.mem.eql(u8, std.mem.trim(u8, t, " \t\r\n"), "Y")) .on else .off)
-    else
-        .absent;
-    stats.fabric_host_scoped.set(@backingInt(hs));
-    return hs;
 }
 
 pub fn adminTimeoutS() u64 {
@@ -1120,7 +1088,7 @@ pub const Verdict = union(enum) {
             .accept => try w.writeAll("accepted"),
             .accept_unverified => try w.writeAll("accepted UNVERIFIED: a metadata volume served by no fabric controller carries no identity to check (the operator's bootstrap connect)"),
             .daemon_connect => try w.writeAll("the daemon connects this data volume itself under the mount's identity pair"),
-            .refuse_merged => try w.writeAll("refused: two host identities are MERGED under one multipath head for this subsystem (its round-robin voids per-mount fencing) — boot the sqz kernel with nvme_core.fabrics_host_scoped_subsystems=Y, or a stock kernel with nvme_core.multipath=N"),
+            .refuse_merged => try w.writeAll("refused: two host identities are MERGED under one multipath head for this subsystem (its round-robin voids per-mount fencing; the kernel groups a subsystem by its NQN alone) — serve this subsystem under one host identity on this host, or boot with nvme_core.multipath=N"),
             .refuse_identity => try w.writeAll("refused: a controller already serves this device under ANOTHER host identity than the mount's pair — an explicit per-mount identity is never inert; disconnect it or drop the pair"),
             .refuse_no_record => try w.writeAll("refused: a data volume under an explicit identity needs a fabric_endpoint record (`squeezefs config set-fabric-endpoints`) — a pre-connected controller is refused even when its identity matches"),
         }
@@ -1543,14 +1511,11 @@ test "the ladder verdict: every (plane, record, actual, merged) cell under no id
     var w: Io.Writer = .fixed(&buf);
     const rm: Verdict = .refuse_merged;
     try rm.write(&w);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "fabrics_host_scoped_subsystems=Y") != null and std.mem.indexOf(u8, w.buffered(), "nvme_core.multipath=N") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "one host identity") != null and std.mem.indexOf(u8, w.buffered(), "nvme_core.multipath=N") != null);
 }
 
-test "host-scoped parameter and admin_timeout read on the venue; absent elsewhere" {
-    const hs = readHostScoped();
-    _ = hs.announce();
+test "admin_timeout reads on the venue; absent elsewhere it is the kernel's default" {
     try testing.expect(adminTimeoutS() >= 1);
-    try testing.expectEqual(@as(u64, @backingInt(hs)), stats.fabric_host_scoped.load());
 }
 
 fn readBackFuzz(_: void, smith: *std.testing.Smith) !void {

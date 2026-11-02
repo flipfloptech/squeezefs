@@ -96,7 +96,7 @@ pub fn run(p: cli.Process, v: args.Nvmeof) u8 {
 }
 
 /// `nvmeof connect`: the identity (explicit pair > /etc/nvme > machine
-/// id), the host-scoped announcement, the write + read-back + the
+/// id), the multipath announcement, the write + read-back + the
 /// uevent-driven discovery; prints the block node, the char node, nsid,
 /// uuid, instance, cntlid.
 fn connect(p: cli.Process, c: args.NvmeofConnect) u8 {
@@ -134,8 +134,7 @@ fn connect(p: cli.Process, c: args.NvmeofConnect) u8 {
         // path-loss clocks as the daemon's own.
         .timeouts = multipath.resolveConnectTimeouts(p.env),
     };
-    const hs = initiator.readHostScoped();
-    log.info("nvmeof connect: identity {s} / {s} ({s}); {s}", .{ id.hostnqn(), id.hostid(), @tagName(id.source), hs.announce() });
+    log.info("nvmeof connect: identity {s} / {s} ({s}); {s}", .{ id.hostnqn(), id.hostid(), @tagName(id.source), multipath.readMultipathParam().announce() });
     const got = initiator.connect(p.gpa, spec, c.ns_uuid) catch |e| {
         var buf: [1024]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);

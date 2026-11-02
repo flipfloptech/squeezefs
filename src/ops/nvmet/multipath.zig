@@ -1,11 +1,11 @@
 //! The kernel's native NVMe multipath under the daemon's data-plane
-//! associations (charter §3 "Host-scoped NVMe fabric subsystems", §8;
+//! associations (charter §3 "NVMe fabric identities", §8;
 //! `docs/porting/ops_nvmet_keys.md` §3.7): a data volume's
 //! `fabric_endpoint` record names ONE subsystem over SEVERAL paths (one
 //! per target listener — several Ethernet links); the daemon connects
 //! every path under ONE host identity and the kernel (`CONFIG_NVME_
-//! MULTIPATH=y`, `nvme_core.multipath=Y`; patch 0025 keeps same-identity
-//! merging) merges the controllers into one namespace head `nvme<K>n<Y>`
+//! MULTIPATH=y`, `nvme_core.multipath=Y`) merges the controllers into one
+//! namespace head `nvme<K>n<Y>`
 //! in the `nvme-subsys<K>` dir that links them. This module is the sysfs
 //! side of that: which subsystem dir lists a controller, its serving set
 //! judged EXACTLY OURS as a pure verdict (every path ours, no foreign
@@ -48,6 +48,16 @@ pub const MultipathParam = enum {
             .on => "Y",
             .off => "N",
             .absent => "absent (CONFIG_NVME_MULTIPATH unset)",
+        };
+    }
+
+    /// The host's identity posture, announced at the first connect: a
+    /// stock kernel groups a subsystem by its NQN alone (decision 0003 §DB).
+    pub fn announce(self: MultipathParam) []const u8 {
+        return switch (self) {
+            .on => "native NVMe multipath ON (nvme_core.multipath=Y): every host identity of one subsystem merges under one head — a head another identity serves is refused, never handed out (co-located per-mount identities on one subsystem need nvme_core.multipath=N)",
+            .off => "native NVMe multipath OFF (nvme_core.multipath=N): each host identity gets its own nvme<N>n<Y>; a record with several paths is refused",
+            .absent => "no native NVMe multipath (CONFIG_NVME_MULTIPATH unset): each host identity gets its own nvme<N>n<Y>; a record with several paths is refused",
         };
     }
 };
@@ -187,7 +197,7 @@ pub const HeadVerdict = union(enum) {
     pub fn write(self: HeadVerdict, w: *Io.Writer) Io.Writer.Error!void {
         switch (self) {
             .exactly_ours => try w.writeAll("every serving controller of the head is this mount's"),
-            .foreign => |n| try w.print("controller nvme{d} serves the same head under ANOTHER host identity (or is gone): a shared head round-robins across a per-mount fence — boot the sqz kernel with nvme_core.fabrics_host_scoped_subsystems=Y, or disconnect it", .{n}),
+            .foreign => |n| try w.print("controller nvme{d} serves the same head under ANOTHER host identity (or is gone): a shared head round-robins across a per-mount fence (the kernel groups a subsystem by its NQN alone) — disconnect it, serve this subsystem under one host identity on this host, or boot with nvme_core.multipath=N", .{n}),
             .missing => |n| try w.print("controller nvme{d} (one of this mount's paths) is not a serving controller of the head's subsystem: the kernel did not merge the paths", .{n}),
             .no_head => try w.writeAll("no multipath head: this kernel has no native NVMe multipath (CONFIG_NVME_MULTIPATH / nvme_core.multipath=Y), so several paths would be several disks"),
         }
@@ -597,7 +607,7 @@ test "the exactly-ours verdict (pure): every serving controller ours and every p
     var buf: [512]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     try (HeadVerdict{ .foreign = 3 }).write(&w);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "nvme3") != null and std.mem.indexOf(u8, w.buffered(), "fabrics_host_scoped_subsystems=Y") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "nvme3") != null and std.mem.indexOf(u8, w.buffered(), "nvme_core.multipath=N") != null);
 }
 
 test "name grammars: a controller link, a hidden path node (nvme1c2n1 → head 1, ctrl 2, ns 1) and the strict head shape never match each other; the address attribute splits into traddr/trsvcid (src_addr dropped, loop empty); a block stat parses its 4 counters and refuses a short line" {

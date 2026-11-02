@@ -6,12 +6,13 @@
 #   scripts/dev/provision-local-venue           # check only; exit 1 when something is missing
 #   scripts/dev/provision-local-venue --apply   # also fix what is safe to fix, then re-check:
 #       install the missing packages (apt or pacman), then scripts/dev/provision-ssh-venue
-#       (the nvmet modules loaded and persisted, the nvme_core boot parameter in GRUB or
-#       Limine, IOR/mdtest into /opt/sqz-tools, root-MPI env, the build root's directories)
+#       (the nvmet modules loaded and persisted, IOR/mdtest into /opt/sqz-tools, root-MPI
+#       env, the build root's directories)
 #
 # Two package families: Debian/Ubuntu (apt, dpkg; a distro or kernel.org Linux >= 7.3) and
 # Arch and its derivatives such as Omarchy (pacman; scripts/kernel/build-host-kernel builds
-# mainline + scripts/kernel/patches-mainline with makepkg).
+# kernel.org's release, unpatched, with the venue's config fragment, with makepkg). No kernel
+# patch is ever required (owner ruling 2026-11-02, decision 0003 §DB).
 #
 # Never done here: a kernel install, a reboot, a filesystem, LV or sudoers change — those
 # print as commands to run.
@@ -73,14 +74,14 @@ kr=$(uname -r)
 kmaj=${kr%%.*}; kmin=${kr#*.}; kmin=${kmin%%[!0-9]*}
 if [ "$kmaj" -gt "$KMIN_MAJOR" ] || { [ "$kmaj" = "$KMIN_MAJOR" ] && [ "${kmin:-0}" -ge "$KMIN_MINOR" ]; }; then
   case $kr in
-    *sqz*) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR, the sqz mainline series)" ;;
-    *) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR)"
-       note "no sqz tag: scripts/kernel/patches-mainline is absent (FUSE_TIME_LIMITS, FUSE_SYNCFS before 7.4, host-scoped NVMe-oF subsystems)" ;;
+    *sqz*) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR, the venue's unpatched kernel.org build)" ;;
+    *) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR)" ;;
   esac
+  note "FUSE_SYNCFS (upstream from 7.4): each mount probes whether syncfs(2) reaches its daemon and says so (.stats fuse_syncfs_reaches); without it sync/syncfs make no staged byte durable — fsync does"
 elif [ "$FAMILY" = arch ]; then
   miss "Linux >= $KMIN_MAJOR.$KMIN_MINOR (running $kr): FUSE-over-io_uring buffer pools — the daemon refuses an older kernel" \
-    "scripts/kernel/build-host-kernel --local   # mainline $KMIN_MAJOR.$KMIN_MINOR + scripts/kernel/patches-mainline, makepkg, pacman -U; the Limine hooks make the UKI and entry (never reboots)" \
-    "(after a base bump: build-host-kernel --local --prepare-only first — every patch at --fuzz=0 in minutes)" "then REBOOT into it"
+    "scripts/kernel/build-host-kernel --local   # kernel.org's release, unpatched, + scripts/kernel/config-fragment, makepkg, pacman -U; the Limine hooks make the UKI and entry (never reboots)" \
+    "(after a release bump: build-host-kernel --local --prepare-only first — the tarball, its signature and the config checklist in minutes)" "then REBOOT into it"
 else
   miss "Linux >= $KMIN_MAJOR.$KMIN_MINOR (running $kr): FUSE-over-io_uring buffer pools — the daemon refuses an older kernel" \
     "install a distro or kernel.org $KMIN_MAJOR.$KMIN_MINOR+ kernel with CONFIG_FUSE_IO_URING=y (scripts/kernel/config-fragment lists the rest), then REBOOT into it"
@@ -98,14 +99,13 @@ done
   || miss "modules:$lack (the nvmet, NVMe-oF, kTLS and RAM-namespace rows)" "a kernel config that has them (scripts/kernel/config-fragment lists them)"
 [ -f /etc/modules-load.d/sqz.conf ] && ok "nvmet modules persisted (/etc/modules-load.d/sqz.conf)" \
   || miss "the nvmet modules loaded at boot" "scripts/dev/provision-local-venue --apply"
-# Where provision-ssh-venue persists a kernel parameter: Debian's GRUB drop-ins, or
-# limine-entry-tool's drop-ins (Omarchy); anything else is by hand.
-if [ -d /etc/default/grub.d ]; then cmdline_fix="scripts/dev/provision-local-venue --apply (persists it in GRUB: /etc/default/grub.d/sqz-venue.cfg), then reboot"
-elif [ -d /etc/limine-entry-tool.d ] && command -v limine-mkinitcpio >/dev/null; then cmdline_fix="scripts/dev/provision-local-venue --apply (persists it in Limine: /etc/limine-entry-tool.d/sqz-venue.conf, then limine-mkinitcpio rebuilds the boot image), then reboot"
-elif [ -f /etc/default/grub ]; then cmdline_fix="append it to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub && sudo grub-mkconfig -o /boot/grub/grub.cfg, then reboot"
-else cmdline_fix="append it to the kernel command line in your bootloader's config (neither GRUB drop-ins nor limine-entry-tool here), then reboot"; fi
-grep -q 'nvme_core.fabrics_host_scoped_subsystems=Y' /proc/cmdline && ok "nvme_core.fabrics_host_scoped_subsystems=Y (the nvmet two-identity rows)" \
-  || miss "nvme_core.fabrics_host_scoped_subsystems=Y on the kernel command line (the nvmet two-identity rows)" "$cmdline_fix"
+# A stock kernel groups a host-side NVMe subsystem by its NQN alone (decision 0003 §DB): which
+# nvmet rows can run follows nvme_core.multipath, the venue's boot choice (an owner call, §DB.4).
+case $(cat /sys/module/nvme_core/parameters/multipath 2>/dev/null || echo absent) in
+  Y) note "nvme_core.multipath=Y: two host identities on one subsystem merge under one head, which the product refuses — the nvmet two-identity rows (PR matrix, registrants, sigstop-preempt) cannot connect; nvme_core.multipath=N on the kernel command line runs them and skips multipath-tcp" ;;
+  N) note "nvme_core.multipath=N: each host identity gets its own namespace node (the nvmet two-identity rows run); the multipath-tcp row skips (no native multipath head)" ;;
+  *) note "no native NVMe multipath (CONFIG_NVME_MULTIPATH unset): each host identity gets its own namespace node; the multipath-tcp row skips" ;;
+esac
 # A desktop host runs udisks (and an automounter over it: Omarchy's udiskie): it probes and
 # auto-mounts every loop device the suites format (LTP's .all_filesystems tests, xfstests'
 # TEST_DEV/SCRATCH_DEV) — the next mkfs sees "is mounted", the loop never detaches, and the
@@ -148,8 +148,8 @@ if PATH=/opt/sqz-tools/bin:$PATH command -v ior >/dev/null && PATH=/opt/sqz-tool
 else
   miss "ior/mdtest at io500's pinned hash" "scripts/dev/provision-local-venue --apply (builds them into /opt/sqz-tools)"
 fi
-# (The kernel series lives in scripts/kernel/patches-mainline; the reference is porting
-# evidence only.)
+# (The venue kernel is kernel.org's, unpatched — scripts/kernel/build-host-kernel; the
+# reference is porting evidence only.)
 git -C "$REF" rev-parse --is-inside-work-tree >/dev/null 2>&1 && ok "the Rust reference at $REF (read-only porting evidence)" \
   || miss "the Rust reference at $REF (read-only porting evidence; the vm venue mounts it)" "git clone git@github.com:flipfloptech/squeezefs.git $REF   # or set SQZ_REFERENCE"
 

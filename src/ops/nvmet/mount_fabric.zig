@@ -249,7 +249,7 @@ pub const Plan = struct {
                 },
             }
             const id = &self.identity.?;
-            log.info("mount: fabric host identity hostnqn={s} hostid={s} ({s}); {s}", .{ id.hostnqn(), id.hostid(), @tagName(id.source), initiator.readHostScoped().announce() });
+            log.info("mount: fabric host identity hostnqn={s} hostid={s} ({s}); {s}", .{ id.hostnqn(), id.hostid(), @tagName(id.source), multipath.readMultipathParam().announce() });
         }
         const policy = multipath.iopolicyKnob(env);
         // The META plane: the operator's connects. A fabric multipath head

@@ -37,8 +37,6 @@ pub var fabric_ctrl_not_live: counters.Gauge = .{};
 /// Observed not-live → live transitions per identity: a SAMPLED
 /// counter that UNDERCOUNTS flaps faster than the cadence (F:294-303).
 pub var fabric_ctrl_reconnects: counters.ShardedCounter = .{};
-/// `nvme_core.fabrics_host_scoped_subsystems`: 0 N, 1 Y, 2 absent (stock).
-pub var fabric_host_scoped: counters.Gauge = .{};
 /// How the connect identity resolved: 0 explicit, 1 /etc/nvme, 2 machine id.
 pub var fabric_host_identity_source: counters.Gauge = .{};
 pub var fabric_connects: counters.ShardedCounter = .{};
@@ -74,7 +72,7 @@ test "the family names every nvmet_* and fabric_* instrument" {
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
-    inline for (.{ "nvmet_shares_applied", "nvmet_configfs_write_failures", "nvmet_ledger_generation", "fabric_controllers", "fabric_ctrl_not_live", "fabric_ctrl_reconnects", "fabric_host_scoped", "fabric_host_identity_source", "fabric_connects", "fabric_daemon_connects", "fabric_daemon_reuses", "fabric_daemon_disconnects", "fabric_ladder_refusals", "fabric_paths_degraded", "fabric_paths_live", "fabric_iopolicy_sets", "fabric_iopolicy_failures" }) |k| {
+    inline for (.{ "nvmet_shares_applied", "nvmet_configfs_write_failures", "nvmet_ledger_generation", "fabric_controllers", "fabric_ctrl_not_live", "fabric_ctrl_reconnects", "fabric_host_identity_source", "fabric_connects", "fabric_daemon_connects", "fabric_daemon_reuses", "fabric_daemon_disconnects", "fabric_ladder_refusals", "fabric_paths_degraded", "fabric_paths_live", "fabric_iopolicy_sets", "fabric_iopolicy_failures" }) |k| {
         try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"" ++ k ++ "\":") != null);
     }
 }

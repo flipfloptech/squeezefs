@@ -190,8 +190,10 @@ pub const HeadVerdict = union(enum) {
     /// One of our connected paths is not a serving controller of the
     /// dir: the kernel grouped it elsewhere (two heads, no merge).
     missing: u32,
-    /// No subsystem dir lists our first controller: a kernel without
-    /// native multipath (each path is its own `nvme<N>n<Y>`).
+    /// No head serves our first controller: no subsystem dir lists it, or
+    /// its dir holds no `nvme<K>n<Y>` (`nvme_core.multipath=N`: the kernel
+    /// still links every controller of the NQN there, whatever its
+    /// identity, but each path is its own `nvme<N>n<Y>` — nothing shared).
     no_head,
 
     pub fn write(self: HeadVerdict, w: *Io.Writer) Io.Writer.Error!void {
@@ -357,9 +359,13 @@ pub fn countLiveServing(root: []const u8, subsys: []const u8, pair: ?initiator.H
 pub const Head = struct { verdict: HeadVerdict, subsys_len: usize };
 
 /// The head verdict for the paths this mount connected: the subsystem
-/// dir of the first (named into `subsys_out`), its serving set, judged.
+/// dir of the first (named into `subsys_out`), its serving set, judged —
+/// only where the dir holds a head (the merged shape's own condition,
+/// as `initiator.multipathMergedShape` reads it).
 pub fn headVerdict(gpa: Allocator, root: []const u8, ours: []const u32, pair: initiator.HostPair, subsys_out: *[32]u8) !Head {
     const sub = (try subsystemOf(gpa, root, ours[0], subsys_out)) orelse return .{ .verdict = .no_head, .subsys_len = 0 };
+    var hb: [32]u8 = undefined;
+    if ((try headOf(gpa, root, sub, &hb)) == null) return .{ .verdict = .no_head, .subsys_len = 0 };
     const serving = try servingControllers(gpa, root, sub);
     defer gpa.free(serving);
     return .{ .verdict = judgeServing(serving, ours, pair), .subsys_len = sub.len };

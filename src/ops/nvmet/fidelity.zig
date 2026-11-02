@@ -1651,6 +1651,9 @@ test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmet
     const before = try rig.onMount(b, "echo before > f && sync -d f && cat f");
     defer gpa.free(before);
     try testing.expectEqualStrings("before\n", before);
+    // A's own directory: its creates land through A's own ring (a create
+    // in the root is the manager's slot's, applied by M over the wire).
+    try testing.expect(try scriptSucceeds(rig, a, "mkdir da && echo a > da/a && sync -d da/a"));
     // B frozen: evicted past T_owner, its region recovered by M, whose
     // recovery's preempt removes this HOST's registration.
     const pid_b = rig.daemons.items[b].pid;
@@ -1659,8 +1662,21 @@ test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmet
     defer gpa.free(sm);
     try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
     try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recovery_preempts"));
+    {
+        // The preempt removed this host's registration: M's alone stands.
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        std.debug.print("\nstale sibling: after M's recovery the report reads {s}\n", .{rr});
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+    }
     // A is fenced with its host: its fsync is refused at the device.
-    try testing.expect(!try scriptSucceeds(rig, a, "echo x > z && sync -d z"));
+    const fenced_write = try scriptSucceeds(rig, a, "echo x > da/z && sync -d da/z");
+    if (fenced_write) {
+        const sa = try rig.stats(a);
+        defer gpa.free(sa);
+        std.debug.print("\nstale sibling: A's fsync after the host's fence SUCCEEDED; A's .stats: {s}\n", .{sa});
+    }
+    try testing.expect(!fenced_write);
     // A stale sibling that can be neither proven dead nor killed refuses
     // the registration loud by name: the mount exits, B lives on, the host
     // stays unregistered (M's registration alone).
@@ -1696,10 +1712,10 @@ test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmet
         try testing.expectEqual(@as(u64, 1), try statNumber(s2, "pr_host_registrations"));
         try testing.expectEqual(@as(u64, 0), try statNumber(s2, "pr_stale_sibling_refusals"));
     }
-    const after = try rig.onMount(a2, "echo after > g && sync -d g && cat f g");
+    const after = try rig.onMount(a2, "mkdir d2 && echo after > d2/g && sync -d d2/g && cat f d2/g");
     defer gpa.free(after);
     try testing.expectEqualStrings("before\nafter\n", after);
-    const seen_m = try rig.onMount(m, "cat g");
+    const seen_m = try rig.onMount(m, "cat d2/g");
     defer gpa.free(seen_m);
     try testing.expectEqualStrings("after\n", seen_m);
     try rig.kill9(b);

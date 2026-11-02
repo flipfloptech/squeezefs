@@ -871,6 +871,16 @@ const DaemonSet = struct {
 };
 
 fn daemonSet(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [2]u16, format_extra: []const []const u8) !DaemonSet {
+    return daemonSetFormat(rig, prefix, transport, ports, &.{"--single-writer"}, format_extra);
+}
+
+/// The same set, formatted SYMMETRIC (the default format): every later
+/// mount of it joins the manager.
+fn symmetricSet(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [2]u16) !DaemonSet {
+    return daemonSetFormat(rig, prefix, transport, ports, &.{}, &.{});
+}
+
+fn daemonSetFormat(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [2]u16, mode: []const []const u8, format_extra: []const []const u8) !DaemonSet {
     var mb: [64]u8 = undefined;
     var db: [64]u8 = undefined;
     const meta_nqn = try rig.share(try std.fmt.bufPrint(&mb, "{s}meta", .{prefix}), meta_len, transport, ports[0]);
@@ -884,8 +894,11 @@ fn daemonSet(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [
     var argv: [12][]const u8 = undefined;
     var n: usize = 0;
     argv[n] = "format";
-    argv[n + 1] = "--single-writer";
-    n += 2;
+    n += 1;
+    for (mode) |e| {
+        argv[n] = e;
+        n += 1;
+    }
     for (format_extra) |e| {
         argv[n] = e;
         n += 1;
@@ -1510,6 +1523,167 @@ test "nvmet fidelity: g2-restore-tcp — the PTPL lapse: the subsystem wiped by 
     try rig.unshare(meta_nqn);
     try expectNoResidue(rig, meta_nqn);
     try expectNoResidue(rig, data_nqn);
+}
+
+/// `sh -c script` on a daemon's mount: whether it exited 0 (a refused
+/// write is the expected answer of a fenced mount).
+fn scriptSucceeds(rig: *Rig, d: usize, script: []const u8) !bool {
+    const r = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "sh", "-c", script }, .cwd = .{ .path = rig.daemons.items[d].mp }, .environ_map = &rig.env });
+    defer rig.freeRun(r);
+    return r.term.success();
+}
+
+/// A stats number that must be present (a missing key is the red's answer,
+/// never a panic in the runner).
+fn statNumber(text: []const u8, key: []const u8) !u64 {
+    return json_scan.number(text, key) orelse {
+        std.debug.print("\n--- .stats carries no \"{s}\" ---\n", .{key});
+        return error.StatMissing;
+    };
+}
+
+test "nvmet fidelity: co-located mounts — ONE host identity for every mount of a set on a host (owner ruling 2026-11-02, option C): a symmetric set on nvmet-loop, the manager A and a joiner B on this host under the one identity; ONE controller of the data subsystem serves both; ONE registration of the host (regctl 1) under the manager's WERO hold, A registered it, B adopted it (the same key, no device mutation); both read each other's files; B's umount leaves the shared association and the registration standing (A reads B's file and writes on), A's umount releases both (no controller, regctl 0)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "co", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    const a = try rig.spawnMount("co-a", set.metaUri(), null, &.{});
+    try rig.awaitLog(a, "ready: ", ready_wait_ns);
+    const b = try rig.spawnMount("co-b", set.metaUri(), null, &.{});
+    try rig.awaitLog(b, "ready: ", ready_wait_ns);
+    try testing.expectEqual(@as(u32, 1), try rig.controllersOf(set.data_nqn, ident_a));
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, nvme.RTYPE_WERO), json_scan.number(rr, "rtype"));
+        const sa = try rig.stats(a);
+        defer gpa.free(sa);
+        const sb = try rig.stats(b);
+        defer gpa.free(sb);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sa, "pr_host_registrations"));
+        try testing.expectEqual(@as(u64, 0), try statNumber(sb, "pr_host_registrations"));
+        try testing.expectEqual(@as(u64, 1), try statNumber(sb, "pr_host_adoptions"));
+        const key_a = json_scan.string(sa, "pr_key") orelse return error.StatMissing;
+        const key_b = json_scan.string(sb, "pr_key") orelse return error.StatMissing;
+        try testing.expectEqualStrings(key_a, key_b);
+        try testing.expectEqualStrings(key_a, json_scan.string(rr, "holder_key") orelse return error.StatMissing);
+    }
+    const sum_a = try rig.onMount(a, "head -c 1048576 /dev/urandom > fa && sync fa && cksum fa | cut -d' ' -f1");
+    defer gpa.free(sum_a);
+    const seen_b = try rig.onMount(b, "cksum fa | cut -d' ' -f1");
+    defer gpa.free(seen_b);
+    try testing.expectEqualStrings(sum_a, seen_b);
+    const sum_b = try rig.onMount(b, "head -c 1048576 /dev/urandom > fb && sync fb && cksum fb | cut -d' ' -f1");
+    defer gpa.free(sum_b);
+    // B leaves: the association and the registration are the host's, and
+    // A still mounts on them.
+    try rig.umount(b);
+    try testing.expectEqual(@as(u32, 1), try rig.controllersOf(set.data_nqn, ident_a));
+    try testing.expect(try scriptSucceeds(rig, a, "cksum fb > /dev/null && head -c 1048576 /dev/urandom > fc && sync fc"));
+    const seen_a = try rig.onMount(a, "cksum fb | cut -d' ' -f1");
+    defer gpa.free(seen_a);
+    try testing.expectEqualStrings(sum_b, seen_a);
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+    }
+    try rig.umount(a);
+    try testing.expectEqual(@as(u32, 0), try rig.controllersOf(set.data_nqn, null));
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, 0), json_scan.number(rr, "regctl"));
+    }
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+/// The stale-sibling legs' membership `T_owner` (the smoke rows' value).
+const sibling_t_owner_ms: u64 = 3000;
+
+test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmetric set whose manager M runs under a second identity (another host); B then A mount on this host under the one identity (B registers the host, A adopts); B frozen (SIGSTOP) is evicted and M's recovery preempts the HOST's key — A, the live sibling, is fenced with it (its fsync refused); a fresh mount A2 on this host must re-register the host, and B, alive and stale, is killed before it does (pr_stale_sibling_kills 1, B dead); A2's writes land and M reads them; B never writes again" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "ss", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    var tb: [16]u8 = undefined;
+    const t_owner = try std.fmt.bufPrint(&tb, "{d}", .{sibling_t_owner_ms});
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var env_m = try rig.envWith(ident_b);
+    defer env_m.deinit();
+    try env_m.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    var env_h = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    defer env_h.deinit();
+    const m = try rig.spawnMountEnv("ss-m", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const b = try rig.spawnMountEnv("ss-b", set.metaUri(), &env_h, &.{});
+    try rig.awaitLog(b, "ready: ", ready_wait_ns);
+    const a = try rig.spawnMountEnv("ss-a", set.metaUri(), &env_h, &.{});
+    try rig.awaitLog(a, "ready: ", ready_wait_ns);
+    {
+        const sb = try rig.stats(b);
+        defer gpa.free(sb);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sb, "pr_host_registrations"));
+        const sa = try rig.stats(a);
+        defer gpa.free(sa);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sa, "pr_host_adoptions"));
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, nvme.RTYPE_WERO), json_scan.number(rr, "rtype"));
+    }
+    const before = try rig.onMount(b, "echo before > f && sync f && cat f");
+    defer gpa.free(before);
+    try testing.expectEqualStrings("before\n", before);
+    // B frozen: evicted past T_owner, its region recovered by M, whose
+    // recovery's preempt removes this HOST's registration.
+    const pid_b = rig.daemons.items[b].pid;
+    _ = linux.kill(pid_b, .STOP);
+    const sm = try rig.awaitStat(m, "appender_recoveries", 1, ready_wait_ns);
+    defer gpa.free(sm);
+    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
+    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recovery_preempts"));
+    // A is fenced with its host: its fsync is refused at the device.
+    try testing.expect(!try scriptSucceeds(rig, a, "echo x > z && sync z"));
+    // A2 re-registers the host — never while the stale B lives.
+    const a2 = try rig.spawnMountEnv("ss-a2", set.metaUri(), &env_h, &.{});
+    try rig.awaitLog(a2, "ready: ", ready_wait_ns);
+    try testing.expect(!alive(pid_b));
+    {
+        const s2 = try rig.stats(a2);
+        defer gpa.free(s2);
+        try testing.expectEqual(@as(u64, 1), try statNumber(s2, "pr_stale_sibling_kills"));
+        try testing.expectEqual(@as(u64, 1), try statNumber(s2, "pr_host_registrations"));
+        try testing.expectEqual(@as(u64, 0), try statNumber(s2, "pr_stale_sibling_refusals"));
+    }
+    const after = try rig.onMount(a2, "echo after > g && sync g && cat f g");
+    defer gpa.free(after);
+    try testing.expectEqualStrings("before\nafter\n", after);
+    const seen_m = try rig.onMount(m, "cat g");
+    defer gpa.free(seen_m);
+    try testing.expectEqualStrings("after\n", seen_m);
+    try rig.kill9(b);
+    try rig.kill9(a);
+    try rig.umount(a2);
+    try rig.umount(m);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
 }
 
 test "nvmet fidelity: crash-window — W-N1: a share with a TEST-NET-1 listener fails at its second port link (EADDRNOTAVAIL) leaving a PENDING record claiming both ids; a second share of the backing refuses mid-window; restore finalizes; unshare removes both ports. W-N2: a never-linkable share → pending → the subsystem wiped by hand → restore garbage-collects it and sweeps the port shell" {

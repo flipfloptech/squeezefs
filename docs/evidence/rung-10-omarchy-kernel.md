@@ -34,7 +34,11 @@ against the stock flavour's final `.config` it differs only by the patches' own 
 (`CC_OPTIMIZE_FOR_PERFORMANCE_O3`, `SCHED_BORE`, `MIN_BASE_SLICE_NS=2000000`, `MQ_IOSCHED_ADIOS=m`);
 `CONFIG_HZ=1000`. A verification tree rebuilt from the series file with `patch --fuzz=0` equals the
 `--prepare-only` tree (`PREPARE-OK`, 91 patches); every configured object the series touches (107)
-compiles, and W=1 on the ported, BORE and sched objects shows 0 warnings. The full build: see §DD.6.
+compiles, and W=1 on the ported, BORE and sched objects shows 0 warnings. The full `--no-install` build
+(10:07–10:26, 32 jobs): `BUILD-OK`, `/build/kernel/omarchy-mainline/linux-omarchy-mainline-7.3.1-1-x86_64.pkg.tar.zst`
+and `…-headers-7.3.1-1-x86_64.pkg.tar.zst` (6,495 modules; vermagic `7.3.1-1-omarchy-mainline SMP preempt`;
+`SCHED_BORE=y`, `FUSE_IO_URING=y`; the ported strings are in `amdgpu.ko` and `vmlinux`); 2 compiler warnings,
+both `-Wstringop-overread` in the 3ware SCSI drivers under Omarchy's `-O3` (the stock flavour, `-O2`, has none).
 
 **Owed after the reboot (owner):** boot; `sysctl kernel.sched_bore` = 1; s2idle suspend/resume; the
 display fixes on an external HDMI 2.1 (VRR/ALLM) and an OLED/DisplayID panel; the gate train on the new

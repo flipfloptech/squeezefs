@@ -14877,6 +14877,11 @@ fn closeDrainRow(no_open: bool) !void {
     try rig.formatSet(false);
     try rig.createImage();
     if (no_open) try pinNoOpen(rig) else try rig.env.put("SQUEEZEFS_FUSE_NO_OPEN", "0");
+    // The no-open arm reads what its FLUSHes journaled at once: with the
+    // times drain's cadence held nothing else journals a claim, and the
+    // root's stamp the creates parked (§AV) stays parked (decision 0003
+    // §CO.34).
+    if (no_open) try rig.env.put("SQUEEZEFS_TEST_TIMES_DRAIN_HOLD", "1");
     // The close posture: the A/B control arm of the write-back timer
     // (decision 0003 §AJ), kept tested.
     try rig.env.put("SQUEEZEFS_WRITEBACK_POSTURE", "close");
@@ -14902,7 +14907,11 @@ fn closeDrainRow(no_open: bool) !void {
     {
         const sp = if (no_open) try rig.stats() else try awaitExactly(rig, "\"meta_kv_times_echo_pending\":", 0, 20 * std.time.ns_per_s);
         defer gpa.free(sp);
-        try testing.expectEqual(@as(?u64, 0), numberAfter(sp, "\"meta_kv_times_echo_pending\":"));
+        // The one refinement no close covers: the root's parked stamp
+        // (none on the strict cadence, which parks nothing).
+        const root_parked: u64 = if (no_open) @min(1, numberAfter(sp, "\"fuse_parent_times_parked\":") orelse 0) else 0;
+        std.debug.print("smoke[close drain, no_open={}]: refinements parked {d} (the root's stamp {d}), drain commits {d}\n", .{ no_open, numberAfter(sp, "\"meta_kv_times_echo_pending\":") orelse 0, root_parked, numberAfter(sp, "\"meta_kv_times_echo_drain_commits\":") orelse 0 });
+        try testing.expectEqual(@as(?u64, root_parked), numberAfter(sp, "\"meta_kv_times_echo_pending\":"));
     }
     if (no_open) {
         // The latch: the daemon's own open at ready — `cat g` sent none,
@@ -14917,6 +14926,7 @@ fn closeDrainRow(no_open: bool) !void {
         try testing.expectEqual(@as(u64, 0), drains);
     }
     try rig.kill();
+    _ = rig.env.swapRemove("SQUEEZEFS_TEST_TIMES_DRAIN_HOLD");
     const recovered = try fsckClean(rig, "the kill after the close");
     _ = try remountAfterKill(rig, recovered, .foreground);
     const out = try rig.onMount(try std.fmt.bufPrint(&script, close_drain_check, .{ syncfs_fresh_bytes, syncfs_fresh_bytes }));

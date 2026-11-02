@@ -956,7 +956,8 @@ fn mountMain(ctx: *Ctx) u8 {
     // The times drain (decision 0003 §L.6): the parked write stamps and
     // SETATTR echoes journaled once per flush interval; strict mode parks
     // nothing and runs no cadence.
-    var times_drain: TimesDrainCadence = .{ .fs = &fs, .io = io, .interval_ns = flush_interval_ms * std.time.ns_per_ms, .meta_uri = ctx.meta_uri };
+    var times_drain: TimesDrainCadence = .{ .fs = &fs, .io = io, .interval_ns = flush_interval_ms * std.time.ns_per_ms, .meta_uri = ctx.meta_uri, .hold = knobs.boolKnob("SQUEEZEFS_TEST_TIMES_DRAIN_HOLD", env) };
+    if (times_drain.hold and flush_interval_ms != 0) log.warn("test seam: SQUEEZEFS_TEST_TIMES_DRAIN_HOLD — the times drain cadence drains nothing for this mount's life; the durability points journal what they cover", .{});
     var times_drain_fut: ?@TypeOf(reclaim_fut) = if (flush_interval_ms == 0) null else ctx.sqz.spawnMeta(TimesDrainCadence.run, .{&times_drain}) catch {
         wd.requestStop();
         wd_fut.cancel(io);
@@ -1674,6 +1675,8 @@ fn TimesDrainCadenceOf(comptime Fs: type) type {
         stop: std.atomic.Value(bool) = .init(false),
         /// The FAILED line was logged (the cadence fiber's own word).
         failed_named: bool = false,
+        /// `SQUEEZEFS_TEST_TIMES_DRAIN_HOLD`: every tick drains nothing.
+        hold: bool = false,
 
         fn requestStop(self: *Self) void {
             self.stop.store(true, .release);
@@ -1696,7 +1699,7 @@ fn TimesDrainCadenceOf(comptime Fs: type) type {
 
         /// One tick: the drain of whatever is parked.
         fn tick(self: *Self) void {
-            if (self.fs.pending.len() == 0) return;
+            if (self.hold or self.fs.pending.len() == 0) return;
             if (self.fs.store.isFailed()) return self.failedTick();
             var trace = op_trace.OpTrace.begin(0, .other);
             defer trace.finish();
@@ -2397,4 +2400,33 @@ test "the times drain cadence commits as this mount's kernel's own op — acked 
     try testing.expectEqual(commits0 + 1, store.commits);
     try testing.expectEqual(@as(u64, 0), fs.pending.len());
     try testing.expect(store.last_kernel_origin);
+}
+
+test "SQUEEZEFS_TEST_TIMES_DRAIN_HOLD: a held cadence's ticks drain nothing — the root's parked stamp stands across 100 ticks — while a durability point's own drain journals it; released, a tick drains as before" {
+    const kv_fs = handler.kv_fs;
+    var store = try kv_fs.MemStore.init(testing.allocator);
+    defer store.deinit();
+    var nodata: kv_fs.NoData = .{};
+    var fs = try kv_fs.MemFs.mount(testing.allocator, testing.io, &store, &nodata, .{ .dlm_stripes = 64 });
+    defer fs.unmount();
+    var cadence: TimesDrainCadenceOf(kv_fs.MemFs) = .{ .fs = &fs, .io = testing.io, .interval_ns = 0, .meta_uri = "sqmeta:///dev/null", .hold = true };
+    const root = try kv_fs.MemFs.localOf(1);
+    const stamp: u64 = @bitCast(clock.realtimeCoarseNs());
+    _ = try fs.pending.park(root, stamp, stamp);
+    const commits0 = store.commits;
+    for (0..100) |_| cadence.tick();
+    try testing.expectEqual(commits0, store.commits);
+    try testing.expectEqual(@as(u64, 1), fs.pending.len());
+    // fsyncdir's / syncfs's drain: the hold is the cadence's alone.
+    var trace = op_trace.OpTrace.begin(0, .other);
+    defer trace.finish();
+    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{}, .kernel = true };
+    try testing.expectEqual(@as(u64, 1), try fs.drainPendingTimes(&ctx));
+    try testing.expectEqual(commits0 + 1, store.commits);
+    try testing.expectEqual(@as(u64, 0), fs.pending.len());
+    _ = try fs.pending.park(root, stamp + 1, stamp + 1);
+    cadence.hold = false;
+    cadence.tick();
+    try testing.expectEqual(commits0 + 2, store.commits);
+    try testing.expectEqual(@as(u64, 0), fs.pending.len());
 }

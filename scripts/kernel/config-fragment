@@ -10,7 +10,7 @@
 CONFIG_IO_URING=y
 CONFIG_IO_URING_ZCRX=y
 # FUSE + fuse-over-io_uring: the buffer-pool transport (uapi 7.46,
-# Linux >= 7.3) rides these; the series adds NO Kconfig symbols.
+# Linux >= 7.3) rides these.
 CONFIG_FUSE_FS=m
 CONFIG_FUSE_IO_URING=y
 # devmem-TCP cell: host-RAM dma-buf source (frontier census found it

@@ -43,10 +43,12 @@ pub const Namespace = struct {
     wire_host_id_override: ?[16]u8 = null,
     /// An injected transport failure on the next command (a dead node).
     fail_next: ?errors.Error = null,
-    /// nvmet 7.3's preempt: the HOLDER's preempt only re-types its own hold
-    /// (`nvmet_pr_preempt` answers `holder == reg` before it compares the
-    /// key) and succeeds, the victim left registered; with no holder a
-    /// preempt unregisters by key and takes no hold.
+    /// nvmet 7.3's preempt under a single-holder type: the HOLDER's preempt
+    /// only re-types its own hold (`nvmet_pr_preempt` answers `holder ==
+    /// reg` before it compares the key) and succeeds, the victim left
+    /// registered; with no holder a preempt unregisters by key and takes no
+    /// hold. (Under an All Registrants type the target and the spec agree:
+    /// the key's registrants go, the reservation stays.)
     holder_preempt_retypes: bool = false,
     /// The last Reservation Acquire (the byte-exact proof of its RACQA).
     last_acquire: nvme.UringCmd = nvme.UringCmd.zeroed(),
@@ -94,7 +96,7 @@ pub const Namespace = struct {
         const holder = self.holder orelse return true;
         return switch (self.rtype) {
             nvme.RTYPE_WRITE_EXCLUSIVE => if (self.find(host_id)) |r| r.key == holder else false,
-            nvme.RTYPE_WERO => self.find(host_id) != null,
+            nvme.RTYPE_WERO, nvme.RTYPE_WEAR => self.find(host_id) != null,
             else => false,
         };
     }
@@ -168,8 +170,14 @@ pub const Namespace = struct {
                 self.removeHost(host_id);
                 self.unregisters += 1;
                 if (self.holder == m.key) {
-                    self.holder = null;
-                    self.rtype = 0;
+                    // Under All Registrants the reservation passes to a
+                    // remaining registrant (nvmet's `nvmet_pr_unregister_one`).
+                    if (nvme.allRegistrants(self.rtype) and self.registered.items.len != 0) {
+                        self.holder = self.registered.items[0].key;
+                    } else {
+                        self.holder = null;
+                        self.rtype = 0;
+                    }
                 }
                 self.generation += 1;
                 return nvme.STATUS_SUCCESS;
@@ -208,6 +216,19 @@ pub const Namespace = struct {
                 return nvme.STATUS_SUCCESS;
             },
             nvme.RACQA_PREEMPT, nvme.RACQA_PREEMPT_AND_ABORT => {
+                if (self.holder != null and nvme.allRegistrants(self.rtype) and prkey != 0) {
+                    if (!self.isRegistered(prkey)) return nvme.SC_RESERVATION_CONFLICT;
+                    self.remove(prkey);
+                    if (self.holder.? == prkey) {
+                        if (self.registered.items.len == 0) {
+                            self.holder = null;
+                            self.rtype = 0;
+                        } else self.holder = self.registered.items[0].key;
+                    }
+                    self.preempts += 1;
+                    self.generation += 1;
+                    return nvme.STATUS_SUCCESS;
+                }
                 if (self.holder_preempt_retypes) {
                     if (self.holder) |h| if (h == crkey) {
                         self.rtype = rtype;
@@ -257,7 +278,7 @@ pub const Namespace = struct {
         std.debug.assert(out.len == (@as(usize, cmd.cdw10) + 1) * 4);
         const regs = try self.gpa.alloc(nvme.Registrant, self.registered.items.len);
         defer self.gpa.free(regs);
-        for (self.registered.items, regs) |r, *o| o.* = .{ .cntlid = 1, .holds = self.holder != null and self.holder.? == r.key, .rkey = r.key, .host_id = r.host_id };
+        for (self.registered.items, regs) |r, *o| o.* = .{ .cntlid = 1, .holds = self.holder != null and (self.holder.? == r.key or nvme.allRegistrants(self.rtype)), .rkey = r.key, .host_id = r.host_id };
         nvme.encodeReport(out, extended, self.generation, self.rtype, 0, regs);
         return nvme.STATUS_SUCCESS;
     }

@@ -532,6 +532,13 @@ pub const Driver = struct {
             p.generation += 1;
             try self.vol.vt.writePage(self.vol.ctx, &p);
         }
+        // ---- 2b. the fence re-read (review B2): the dead member's host
+        //      registered again while step 1 ran (its preempt found the key
+        //      absent) is preempted again before the ring is read ----
+        var fenced = pr_fenced;
+        if (meta != .own_key_guard) if (fencing.refenceAfterRecovering(self.mount.meta_pr, standing.pr_key)) |again| {
+            fenced = again == .fenced;
+        };
         try self.mount.screen.suspendLessee(p.appender_id);
         defer self.mount.screen.resumeLessee(p.appender_id);
         try self.fail(.page_recovering);
@@ -667,7 +674,7 @@ pub const Driver = struct {
         for (plans.items) |pl| {
             var tails: std.ArrayList(cr.TailEntry) = .empty;
             errdefer tails.deinit(gpa);
-            const bytes = try self.vol.vt.leafTails(self.vol.ctx, gpa, pl.slot, pr_fenced, &tails);
+            const bytes = try self.vol.vt.leafTails(self.vol.ctx, gpa, pl.slot, fenced, &tails);
             stats.recovery_full_tail_scan_bytes.add(bytes);
             try tails_per_slot.append(gpa, tails);
         }
@@ -2037,7 +2044,7 @@ test "B2 (review): recovery re-reads the report once the page is Recovering — 
     var mh: fake_nvme.Host = .{ .ns = &ns, .host_id = "manager-host-id1".* };
     var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
     defer m.deinit();
-    try fencing.acquireWero(&m);
+    try fencing.acquireManagerHold(&m);
     var rh: fake_nvme.Host = .{ .ns = &ns, .host_id = "remote-host-id-2".* };
     var r = try pr.Client.init(gpa, rh.face(), 1, 0x2222);
     defer r.deinit();

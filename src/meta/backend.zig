@@ -906,7 +906,7 @@ pub const KvBackend = struct {
         }
         // The role is durable: this process enters the host's registry of
         // the set (the stale-sibling rule's candidates, decision 0003 §DF).
-        be.guard.?.enrollManager();
+        try be.guard.?.enrollManager();
         be.test_ckpt_error_logs = opts.test_ckpt_error_logs;
         be.ckpt_thread = std.Thread.spawn(.{}, ckptMain, .{be}) catch return error.ThreadSpawnFailed;
         try be.guard.?.startHeartbeat();
@@ -1126,7 +1126,7 @@ pub const KvBackend = struct {
         // The projection may be re-read (and the cache re-created) while
         // the manager's endpoint is awaited, so the slot plane — whose
         // frame seam lives in the cache — arms after it.
-        const js = sym.joined.JoinedSet.open(be, jopts.mountpoint, jopts.endpoint, jopts.predecessor, jopts.secret, opts.guard.identity) catch |e| return switch (e) {
+        const js = sym.joined.JoinedSet.open(be, jopts.mountpoint, jopts.endpoint, jopts.predecessor, jopts.secret) catch |e| return switch (e) {
             error.ManagerUnreachable, error.PredecessorLive, error.Capacity, error.HostAdmissionRefused => error.Busy,
             error.Rejected, error.Corrupt => error.Corrupt,
             error.Io => error.Io,

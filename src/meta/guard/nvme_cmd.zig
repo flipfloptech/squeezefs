@@ -127,6 +127,17 @@ pub const HOSTID_SHORT_LEN: usize = 8;
 /// registrant's READS on nvmet 2026-08-15 — never used.
 pub const RTYPE_WRITE_EXCLUSIVE: u8 = 1;
 pub const RTYPE_WERO: u8 = 3;
+/// Write Exclusive – All Registrants: the symmetric plane's hold (decision
+/// 0003 §DF) — every registered member host may write and every registrant
+/// holds, so any registrant's preempt unregisters the victim's key with the
+/// reservation kept (nvmet 7.3 runs it before its `holder == reg` early
+/// return, which makes a WERO holder's preempt of another key a no-op).
+pub const RTYPE_WEAR: u8 = 5;
+
+/// The All Registrants types (5, 6): every registrant holds.
+pub fn allRegistrants(rtype: u8) bool {
+    return rtype == RTYPE_WEAR or rtype == RTYPE_WEAR + 1;
+}
 
 /// Register CDW10: RREGA bits 2:0, IEKEY bit 3, CPTPL bits 31:30.
 pub const RREGA_REGISTER: u32 = 0;
@@ -302,10 +313,27 @@ pub const Report = struct {
     /// than fit decodes the ones that fit — total).
     registrants: []Registrant,
 
+    /// The holder's key under a single-holder type (null = no reservation).
+    /// Under an All Registrants type every registrant reads as a holder:
+    /// this answers the first — ask `heldBy` instead.
     pub fn holder(self: Report) ?u64 {
         if (self.rtype == 0) return null;
         for (self.registrants) |r| if (r.holds) return r.rkey;
         return null;
+    }
+
+    /// Does `key` hold the reservation (any registrant of it under an All
+    /// Registrants type; the one holder otherwise)?
+    pub fn heldBy(self: Report, key: u64) bool {
+        if (self.rtype == 0) return false;
+        for (self.registrants) |r| if (r.rkey == key and (r.holds or allRegistrants(self.rtype))) return true;
+        return false;
+    }
+
+    /// Is `key` a registrant's?
+    pub fn registered(self: Report, key: u64) bool {
+        for (self.registrants) |r| if (r.rkey == key) return true;
+        return false;
     }
 
     pub fn deinit(self: *Report, gpa: std.mem.Allocator) void {

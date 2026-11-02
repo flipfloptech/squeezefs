@@ -387,6 +387,16 @@ const Grace = struct {
     }
 };
 
+/// A departed member's key, its node with it: a key is its HOST's
+/// (decision 0003 §DF), so only another node's hold of it contradicts.
+const DepartedKey = struct { key: u64, until_ms: u64, node_token: u64 };
+
+/// The node a member id names (0 for a reader's id).
+fn nodeOf(id: MemberId) u64 {
+    const w = memberIdentity(id) orelse return 0;
+    return w.node_token;
+}
+
 /// A pending OFFER the holder pushes to a wire requester: rides the
 /// requester's next renewal `Grant` (the RecallForOffer push over a
 /// dial-only wire — the renewal carriage is the belt).
@@ -405,6 +415,7 @@ pub const Owner = struct {
     grace: ?Grace = null,
     /// A departure's registrant key kept `2 × T_owner` (the age a death
     /// record can stand) for the `RecordDeath` screen.
+    departed_keys: std.ArrayList(DepartedKey) = .empty,
     death_sink: ?DeathSink = null,
     rows: ?RowStore = null,
     offers: std.ArrayList(PendingOffer) = .empty,
@@ -432,6 +443,7 @@ pub const Owner = struct {
     pub fn deinit(self: *Owner) void {
         self.members.deinit(self.gpa);
         if (self.grace) |*g| g.deinit(self.gpa);
+        self.departed_keys.deinit(self.gpa);
         self.offers.deinit(self.gpa);
         self.releases.deinit(self.gpa);
         stats.membership_shards.sub(1);
@@ -595,6 +607,9 @@ pub const Owner = struct {
         if (existing) |i| {
             self.members.items[i] = m;
         } else {
+            // Room for every member's departure: `rememberDepartedKey`
+            // never allocates.
+            self.departed_keys.ensureUnusedCapacity(self.gpa, self.members.items.len + 1) catch return .io;
             self.members.append(self.gpa, m) catch return .io;
         }
         self.writeRow(&m) catch return .io;
@@ -626,19 +641,26 @@ pub const Owner = struct {
         return .{ .granted = .{ .epoch = epoch, .ack_prior_epoch = 0 } };
     }
 
-    /// The clean departure: out of the census, the row deleted; never a
-    /// death.
-    pub fn leave(self: *Owner, id: MemberId) bool {
+    /// The clean departure: out of the census, its key remembered, the
+    /// row deleted; never a death.
+    pub fn leave(self: *Owner, id: MemberId, now_ms: u64) bool {
         const i = self.indexOf(id) orelse return false;
         const m = self.members.items[i];
+        self.rememberDepartedKey(m.pr_key, now_ms, nodeOf(m.id));
         self.deleteRow(&m);
         _ = self.members.swapRemove(i);
         self.publishCounts();
         return true;
     }
 
-    fn evict(self: *Owner, i: usize, epoch_word: u64) void {
+    fn rememberDepartedKey(self: *Owner, key: u64, now_ms: u64, node_token: u64) void {
+        if (key == 0) return;
+        self.departed_keys.appendAssumeCapacity(.{ .key = key, .until_ms = now_ms + DEPARTED_KEY_TTLS * self.clocks.t_owner_ms, .node_token = node_token });
+    }
+
+    fn evict(self: *Owner, i: usize, now_ms: u64, epoch_word: u64) void {
         const m = self.members.items[i];
+        self.rememberDepartedKey(m.pr_key, now_ms, nodeOf(m.id));
         self.deleteRow(&m);
         _ = self.members.swapRemove(i);
         stats.membership_evictions.inc();
@@ -654,12 +676,22 @@ pub const Owner = struct {
         var i: usize = 0;
         while (i < self.members.items.len) {
             if (now_ms >= self.members.items[i].deadline_ms) {
-                self.evict(i, self.members.items[i].epoch);
+                self.evict(i, now_ms, self.members.items[i].epoch);
                 n += 1;
             } else i += 1;
         }
+        self.pruneDepartedKeys(now_ms);
         if (n != 0) self.publishCounts();
         return n;
+    }
+
+    fn pruneDepartedKeys(self: *Owner, now_ms: u64) void {
+        var i: usize = 0;
+        while (i < self.departed_keys.items.len) {
+            if (now_ms >= self.departed_keys.items[i].until_ms) {
+                _ = self.departed_keys.swapRemove(i);
+            } else i += 1;
+        }
     }
 
     /// `reap_grace_deadline`: at the deadline the EXPECTED members that
@@ -699,6 +731,17 @@ pub const Owner = struct {
     pub fn registeredKey(self: *const Owner, id: MemberId) ?u64 {
         const m = self.find(id) orelse return null;
         return m.pr_key;
+    }
+
+    /// Is `key` held — a live member's or a departure's inside its TTL?
+    /// Is `key` held — a live member's or a departure's inside its TTL — on
+    /// a node OTHER than `node_token`? Every mount of a set on one host
+    /// registers the host's key (decision 0003 §DF): the dead member's own
+    /// node holding it is its siblings' share, never a contradiction.
+    pub fn holdsKeyElsewhere(self: *const Owner, key: u64, node_token: u64) bool {
+        for (self.members.items) |m| if (m.pr_key != 0 and m.pr_key == key and nodeOf(m.id) != node_token) return true;
+        for (self.departed_keys.items) |d| if (d.key == key and d.node_token != node_token) return true;
+        return false;
     }
 
     pub fn endpointOf(self: *const Owner, id: MemberId) ?EndpointWire {
@@ -775,6 +818,10 @@ pub const Owner = struct {
         return .{ .owner = self, .local = local, .probe = probe, .now = now, .now_ctx = now_ctx };
     }
 };
+
+/// A departure's key stands as long as its death record can: `2 ×
+/// T_owner` (one TTL for every manager to act, one for the grace).
+pub const DEPARTED_KEY_TTLS: u64 = 2;
 
 /// The `clients` seam: every member of this shard as a registration row
 /// (writers through their row's dead-pid proof; readers as live rows).
@@ -942,7 +989,7 @@ pub const OwnerService = struct {
 
     fn serveLeave(ctx: *anyopaque, req: *const service.Request, _: []u8) service.Answer {
         const self: *OwnerService = @ptrCast(@alignCast(ctx));
-        const left = self.owner.leave(req.payload.leave.id);
+        const left = self.owner.leave(req.payload.leave.id, self.now(self.now_ctx));
         return .{ .ok = .{ .leave = if (left) verbs.Ack.fresh else verbs.Ack.replay } };
     }
 
@@ -1310,10 +1357,15 @@ test "the owner: arm refuses a stale term; a join writes ONE row and grants an e
     try testing.expectEqual(@as(u32, 1), rows.deletes);
     try testing.expectEqual(Liveness.dead, o.liveness(id1, t + 45_000));
     try testing.expect(o.renew(id1, 1, 0, t + 45_001) == .unknown_lease);
+    try testing.expect(o.holdsKeyElsewhere(0x1001, testIdentity(9).node_token));
+    // Its own node's word: the host's key, shared by its siblings.
+    try testing.expect(!o.holdsKeyElsewhere(0x1001, testIdentity(1).node_token));
+    _ = o.expireDue(t + 45_000 + 2 * 45_000);
+    try testing.expect(!o.holdsKeyElsewhere(0x1001, testIdentity(9).node_token));
     // A leave: departed, no death.
     _ = o.join(joinReqOf(2, null, "/mnt/b"), t);
-    try testing.expect(o.leave(writerMemberId(testIdentity(2))));
-    try testing.expect(!o.leave(writerMemberId(testIdentity(2))));
+    try testing.expect(o.leave(writerMemberId(testIdentity(2)), t));
+    try testing.expect(!o.leave(writerMemberId(testIdentity(2)), t));
     try testing.expectEqual(@as(usize, 1), deaths.list.items.len);
     try testing.expectEqual(@as(u64, 0), stats.membership_members.load());
 }
@@ -1411,7 +1463,7 @@ test "a predecessor-roster member that re-asserted, then left or was evicted, jo
     try testing.expect(g2.epoch > g1.epoch);
     try testing.expectEqual(@as(u64, 0), g2.ack_prior_epoch);
     // A clean leave inside the window, then a fresh join: granted too.
-    _ = o.leave(a);
+    _ = o.leave(a, 300 + clocks.t_owner_ms);
     try testing.expect(o.join(joinReqOf(1, null, "/m1"), 400 + clocks.t_owner_ms) == .granted);
     // An expected member that never re-asserted joins past the deadline: fresh.
     const b = writerMemberId(testIdentity(2));
@@ -1612,7 +1664,7 @@ test "UnknownLease before T_self fences terminally and never parks; a leave over
     var m: Member = .{ .gpa = gpa, .id = writerMemberId(me), .role = .writer, .link = dl.link(), .pid = 7, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0, .mount = "/mnt/m", .gate = &gate, .poison = p.sink() };
     try testing.expectEqual(Member.JoinOutcome.granted, m.join(0, null));
     // The owner forgets the lease (a leave from elsewhere): the beat answers UnknownLease.
-    _ = o.leave(m.id);
+    _ = o.leave(m.id, 0);
     manual_now_ms = 10_000;
     try testing.expectEqual(TickVerdict.fenced, m.tick(10_000, 0));
     try testing.expect(!gate.isParked());
@@ -1637,7 +1689,7 @@ test "THE RE-JOIN IN PLACE's verdict (decision 0003 §BS): a member armed to re-
     var gate = park.ParkGate.arm(testing.io, 0, 1 << 40);
     var m: Member = .{ .gpa = gpa, .id = writerMemberId(testIdentity(5)), .role = .writer, .link = dl.link(), .pid = 7, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0, .mount = "/mnt/m", .gate = &gate, .poison = p.sink(), .rejoin_armed = true };
     try testing.expectEqual(Member.JoinOutcome.granted, m.join(0, null));
-    _ = o.leave(m.id);
+    _ = o.leave(m.id, 0);
     manual_now_ms = 10_000;
     try testing.expectEqual(TickVerdict.evicted, m.tick(10_000, 0));
     try testing.expect(gate.word() == .running and !m.words.fenced.load(.acquire));
@@ -1649,7 +1701,7 @@ test "THE RE-JOIN IN PLACE's verdict (decision 0003 §BS): a member armed to re-
     var m2: Member = .{ .gpa = gpa, .id = writerMemberId(testIdentity(6)), .role = .writer, .link = dl2.link(), .pid = 7, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0, .mount = "/mnt/n", .gate = &gate2, .poison = p.sink(), .rejoin_armed = true };
     manual_now_ms = 10_000;
     try testing.expectEqual(Member.JoinOutcome.granted, m2.join(10_000, null));
-    _ = o.leave(m2.id);
+    _ = o.leave(m2.id, 10_000);
     _ = gate2.park(1);
     try testing.expectEqual(TickVerdict.evicted, m2.tick(10_001, 2));
     try testing.expect(gate2.isParked() and !m2.words.fenced.load(.acquire));
@@ -1660,7 +1712,7 @@ test "THE RE-JOIN IN PLACE's verdict (decision 0003 §BS): a member armed to re-
     osvc.register(&dl3.svc);
     var m3: Member = .{ .gpa = gpa, .id = writerMemberId(testIdentity(7)), .role = .writer, .link = dl3.link(), .pid = 7, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0, .mount = "/mnt/o", .gate = &gate3, .poison = p.sink(), .rejoin_armed = true };
     try testing.expectEqual(Member.JoinOutcome.granted, m3.join(10_000, null));
-    _ = o.leave(m3.id);
+    _ = o.leave(m3.id, 10_000);
     _ = gate3.park(1);
     park.stats.appender_park_expiries.resetLogBudgetForTest();
     log.testing.expectErrorLogs(1);

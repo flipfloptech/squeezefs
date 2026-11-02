@@ -1,13 +1,13 @@
 //! Fencing under the symmetric plane (charter §5.5 "Fencing"; `docs/
-//! porting/sym_wire_membership_recovery.md` §4): the metadata namespace
-//! holds WERO (rtype 3) by the MANAGER with every appender a REGISTRANT
-//! under ONE key per namespace class — the ledger's preempt of that key
-//! fences the member everywhere. A joiner NEVER acquires: a co-located
-//! mount (the manager's D0 flock or claim boot is this host's — one head,
-//! one association, the device sees ONE host) ADOPTS with ZERO device
-//! mutation, the standing holder cross-checked against the enrolled keys
-//! (a register here destroyed the fence in the rung-9 finding: `rtype 0,
-//! regctl 0`); a remote one registers and walks the CAP GATE — the report
+//! porting/sym_wire_membership_recovery.md` §4; decision 0003 §DF): the
+//! metadata namespace is held Write Exclusive – All Registrants (rtype 5)
+//! by the MANAGER with every member HOST a REGISTRANT under its host's key —
+//! the ledger's preempt of that key fences the host's members everywhere
+//! (on nvmet 7.3 a WERO holder's preempt of another key is a no-op; the All
+//! Registrants arm unregisters it with the reservation kept). A joiner NEVER
+//! acquires: one whose host is registered under the key ADOPTS with ZERO
+//! device mutation (a register here destroyed the fence in the rung-9
+//! finding: `rtype 0, regctl 0`); another registers and walks the CAP GATE — the report
 //! read in two steps sized by REGCTL, the cap in force = declared else
 //! LEARNED else unbounded, learned ONLY from the REPEAT of a device-
 //! answered command-/vendor-specific status at the same regctl, unlearned
@@ -62,17 +62,16 @@ pub const stats = struct {
     pub var pr_registrant_cap_refusals: counters.ShardedCounter = .{};
     /// Another rkey under OUR wire host id (two mounts on one registrant).
     pub var pr_registrant_shared: counters.Gauge = .{};
-    pub var pr_wero_acquires: counters.ShardedCounter = .{};
+    pub var pr_manager_holds: counters.ShardedCounter = .{};
     pub var pr_registrant_joins: counters.ShardedCounter = .{};
     pub var pr_colocated_adoptions: counters.ShardedCounter = .{};
     /// The death preempt landed (meta + data namespaces).
     pub var appender_recovery_preempts: counters.ShardedCounter = .{};
     /// A preempt withheld because the dead key is THIS host's registrant.
     pub var appender_recovery_own_key_guards: counters.ShardedCounter = .{};
-    /// The holder's preempt left the victim registered (nvmet: a holder's
-    /// preempt only re-types its own hold) — released, preempted with no
-    /// holder standing, re-acquired.
-    pub var appender_recovery_holder_preempt_cycles: counters.ShardedCounter = .{};
+    /// The dead key found registered again after the page went Recovering
+    /// (review B2): preempted again.
+    pub var appender_recovery_refences: counters.ShardedCounter = .{};
     /// The per-volume era in force.
     pub var writer_term: counters.Gauge = .{};
     /// Slots whose lessee's page is `Recovering` (rule 4 suspended).
@@ -83,7 +82,7 @@ pub const stats = struct {
 };
 
 // ---------------------------------------------------------------------------
-// The WERO duty split.
+// The manager's hold and the members' registrations.
 // ---------------------------------------------------------------------------
 
 pub const JoinError = error{
@@ -94,17 +93,19 @@ pub const JoinError = error{
     /// A co-located join found no reservation at all (the manager holds
     /// none: the fence is down).
     NoHolder,
-    /// The manager holds rtype 1 (Write Exclusive): a flat mount's hold.
-    NotWero,
+    /// The standing hold is not the symmetric plane's (Write Exclusive –
+    /// All Registrants): a flat mount's Write Exclusive refuses the join.
+    NotAllRegistrants,
     Device,
 };
 
-/// The manager's hold: WERO under our key after the register ladder.
-pub fn acquireWero(client: *pr.Client) pr.Error!void {
-    client.rtype = nvme.RTYPE_WERO;
+/// The manager's hold: Write Exclusive – All Registrants under our key
+/// after the register ladder (decision 0003 §DF).
+pub fn acquireManagerHold(client: *pr.Client) pr.Error!void {
+    client.rtype = nvme.RTYPE_WEAR;
     _ = try client.registerLadder();
     try client.acquire();
-    stats.pr_wero_acquires.inc();
+    stats.pr_manager_holds.inc();
     // The gauges read the namespace at every gate: the report after the hold.
     var rep = try client.report();
     rep.deinit(client.gpa);
@@ -142,11 +143,12 @@ pub const Registered = struct {
     shared: bool,
 };
 
-/// A REMOTE joiner: register under ONE key, read the report, feed the
+/// A joiner host: register under ONE key, read the report, feed the
 /// learner, run the gate against the cap in force. The manager's hold must
-/// be WERO (a flat mount's rtype 1 refuses the join).
+/// be Write Exclusive – All Registrants (a flat mount's rtype 1 refuses the
+/// join).
 pub fn joinAsRegistrant(client: *pr.Client, declared_cap: ?u16) JoinError!Registered {
-    client.rtype = nvme.RTYPE_WERO;
+    client.rtype = nvme.RTYPE_WEAR;
     const outcome = client.registerLadder() catch |e| switch (e) {
         error.DeviceStatus => {
             // The ladder fed the learner from this status; the gate reads
@@ -166,7 +168,10 @@ pub fn joinAsRegistrant(client: *pr.Client, declared_cap: ?u16) JoinError!Regist
     var rep = client.report() catch return error.Device;
     defer rep.deinit(client.gpa);
     noteReport(client);
-    if (rep.rtype != 0 and rep.rtype != nvme.RTYPE_WERO) return error.NotWero;
+    if (rep.rtype != 0 and rep.rtype != nvme.RTYPE_WEAR) {
+        client.unregister(client.key) catch {};
+        return error.NotAllRegistrants;
+    }
     const cap = client.cap.effective(declared_cap);
     stats.pr_registrant_cap.set(cap);
     registrantCapGate(rep.regctl, cap) catch |e| {
@@ -180,19 +185,18 @@ pub fn joinAsRegistrant(client: *pr.Client, declared_cap: ?u16) JoinError!Regist
     return .{ .regctl = rep.regctl, .cap_in_force = cap, .shared = shared };
 }
 
-/// A CO-LOCATED joiner: ZERO device mutation — the standing holder read
-/// and cross-checked against the enrolled keys (the manager's claim-
-/// derived key on the metadata namespace; the roster's writer keys on a
-/// data namespace). Answers the holder's key.
+/// A CO-LOCATED joiner: ZERO device mutation — the standing hold read and
+/// one of the enrolled keys (the host's) found holding under it. Answers
+/// that key.
 pub fn adoptColocated(client: *pr.Client, enrolled: []const u64) JoinError!u64 {
     var rep = client.report() catch return error.Device;
     defer rep.deinit(client.gpa);
     noteReport(client);
-    const holder = rep.holder() orelse return error.NoHolder;
-    if (rep.rtype != nvme.RTYPE_WERO) return error.NotWero;
-    for (enrolled) |k| if (k == holder) {
+    if (rep.rtype == 0) return error.NoHolder;
+    if (rep.rtype != nvme.RTYPE_WEAR) return error.NotAllRegistrants;
+    for (enrolled) |k| if (rep.heldBy(k)) {
         stats.pr_colocated_adoptions.inc();
-        return holder;
+        return k;
     };
     return error.HolderNotEnrolled;
 }
@@ -225,28 +229,35 @@ pub fn preemptDeadRegistrant(client: ?*pr.Client, victim_key: u64) PreemptOutcom
         return .own_key_guard;
     }
     c.preemptAndAbort(victim_key) catch |e| return preemptFailed(c, victim_key, e);
-    // A target where the HOLDER's preempt only re-types its own hold
-    // (nvmet 7.3's `nvmet_pr_preempt` answers `holder == reg` before it
-    // compares the key) leaves the victim registered: the reservation is
-    // released, the victim preempted with no holder standing (that arm
-    // unregisters by key), the hold re-acquired. The window between the
-    // release and the acquire admits every host's writes — the frame
-    // screen's, as before any fence.
-    if (keyRegistered(c, victim_key) catch true) {
-        stats.appender_recovery_holder_preempt_cycles.inc();
-        c.releaseReservation() catch |e| return preemptFailed(c, victim_key, e);
-        const preempted = c.preemptAndAbort(victim_key);
-        c.acquire() catch |e| {
-            var buf: [128]u8 = undefined;
-            var w: std.Io.Writer = .fixed(&buf);
-            c.writeError(&w, e) catch {};
-            log.err("recovery preempt: the reservation released to preempt key 0x{x} could not be re-acquired ({s}) — the namespace stands unreserved until the heartbeat's re-check", .{ victim_key, w.buffered() });
-        };
-        preempted catch |e| return preemptFailed(c, victim_key, e);
-        if (keyRegistered(c, victim_key) catch true) return preemptFailed(c, victim_key, error.DeviceStatus);
+    // The report proves it: a target that answered success yet kept the
+    // key (nvmet 7.3 under a single-holder type: its HOLDER's preempt only
+    // re-types its own hold) fenced nothing — the full tail scan, never a
+    // release (that would leave the namespace unreserved). Under the
+    // symmetric hold (All Registrants) the preempt unregisters the key with
+    // the reservation kept. A report that fails trusts the device's answer.
+    const kept = keyRegistered(c, victim_key) catch false;
+    if (kept) {
+        log.warn("recovery preempt: the target answered the preempt of key 0x{x} yet keeps it registered (a single-holder type's holder preempt on nvmet) — the full tail scan is the fence", .{victim_key});
+        return .failed;
     }
     stats.appender_recovery_preempts.inc();
     return .fenced;
+}
+
+/// Review B2's recovery side: once the page is Recovering (step 2), the
+/// report read again — a registration of the dead member's host that raced
+/// step 1 (its preempt found the key absent: an earlier death had fenced the
+/// host, and a sibling's rule registered it meanwhile) is preempted again
+/// before the ring is read. Null = the key stands absent (or no device, or
+/// no key); a report that fails is the full tail scan's.
+pub fn refenceAfterRecovering(client: ?*pr.Client, victim_key: u64) ?PreemptOutcome {
+    const c = client orelse return null;
+    if (victim_key == 0 or victim_key == c.key) return null;
+    const back = keyRegistered(c, victim_key) catch return .failed;
+    if (!back) return null;
+    stats.appender_recovery_refences.inc();
+    log.warn("recovery preempt: key 0x{x} is registered again once the page is Recovering (the dead member's host registered meanwhile) — preempted again", .{victim_key});
+    return preemptDeadRegistrant(c, victim_key);
 }
 
 fn preemptFailed(c: *pr.Client, victim_key: u64, e: pr.Error) PreemptOutcome {
@@ -527,7 +538,7 @@ const host_m: [16]u8 = "manager-host-id1".*;
 const host_r: [16]u8 = "remote-host-id-2".*;
 const host_s: [16]u8 = "remote-host-id-3".*;
 
-test "WERO by the manager (rtype 3 on the wire), a remote joiner registers under ONE key and reads the report sized by REGCTL; a co-located joiner adopts with zero device mutation and cross-checks the holder against the enrolled keys; a flat (rtype 1) holder refuses the join" {
+test "the manager's hold is Write Exclusive – All Registrants (rtype 5 on the wire); a joiner host registers under ONE key and reads the report sized by REGCTL; a co-located joiner adopts with zero device mutation, one of its enrolled keys found holding; a flat (rtype 1) holder refuses the join" {
     const gpa = testing.allocator;
     var ns = fake.Namespace.init(gpa);
     defer ns.deinit();
@@ -535,8 +546,8 @@ test "WERO by the manager (rtype 3 on the wire), a remote joiner registers under
     var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
     defer m.deinit();
     _ = try m.probeRescap();
-    try acquireWero(&m);
-    try testing.expectEqual(nvme.RTYPE_WERO, ns.rtype);
+    try acquireManagerHold(&m);
+    try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
     try testing.expectEqual(@as(?u64, 0x1111), ns.holder);
     try testing.expectEqual(nvme.OP_RESV_REPORT, ns.last.opcode);
     try testing.expectEqual(@as(u64, 1), stats.pr_registrants_per_namespace.load());
@@ -569,7 +580,7 @@ test "WERO by the manager (rtype 3 on the wire), a remote joiner registers under
     var fh: fake.Host = .{ .ns = &flat, .host_id = host_r };
     var f = try pr.Client.init(gpa, fh.face(), 1, 0x2222);
     defer f.deinit();
-    try testing.expectError(error.NotWero, joinAsRegistrant(&f, null));
+    try testing.expectError(error.NotAllRegistrants, joinAsRegistrant(&f, null));
     // No reservation at all: a co-located adopt finds no holder.
     var empty = fake.Namespace.init(gpa);
     defer empty.deinit();
@@ -586,7 +597,7 @@ test "the cap gate: a declared cap refuses the join at or past it loud (naming t
     var mh: fake.Host = .{ .ns = &ns, .host_id = host_m };
     var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
     defer m.deinit();
-    try acquireWero(&m);
+    try acquireManagerHold(&m);
     var rh: fake.Host = .{ .ns = &ns, .host_id = host_r };
     var r = try pr.Client.init(gpa, rh.face(), 1, 0x2222);
     defer r.deinit();
@@ -635,7 +646,7 @@ test "the death preempt: a usurper's key is preempted-and-aborted (fenced; the v
     var mh: fake.Host = .{ .ns = &ns, .host_id = host_m };
     var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
     defer m.deinit();
-    try acquireWero(&m);
+    try acquireManagerHold(&m);
     var rh: fake.Host = .{ .ns = &ns, .host_id = host_r };
     var r = try pr.Client.init(gpa, rh.face(), 1, 0x2222);
     defer r.deinit();
@@ -656,7 +667,7 @@ test "the death preempt: a usurper's key is preempted-and-aborted (fenced; the v
     try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, 0x4444));
 }
 
-test "the death preempt on a target whose holder's preempt only re-types its hold (nvmet 7.3): the victim still registered after it is preempted with the reservation released, then the hold re-acquired — fenced, one cycle counted" {
+test "the death preempt on nvmet 7.3's semantics: under a single-holder type (WERO) the holder's preempt answers success yet keeps the victim registered — .failed (the full tail scan), never a release that would leave the namespace unreserved; under All Registrants (the manager's hold) it unregisters the victim's key with the reservation kept — .fenced" {
     const gpa = testing.allocator;
     var ns = fake.Namespace.init(gpa);
     defer ns.deinit();
@@ -664,18 +675,41 @@ test "the death preempt on a target whose holder's preempt only re-types its hol
     var mh: fake.Host = .{ .ns = &ns, .host_id = host_m };
     var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
     defer m.deinit();
-    try acquireWero(&m);
+    m.rtype = nvme.RTYPE_WERO;
+    _ = try m.registerLadder();
+    try m.acquire();
     var rh: fake.Host = .{ .ns = &ns, .host_id = host_r };
     var r = try pr.Client.init(gpa, rh.face(), 1, 0x2222);
     defer r.deinit();
-    _ = try joinAsRegistrant(&r, null);
-    const cycles0 = stats.appender_recovery_holder_preempt_cycles.load();
-    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, 0x2222));
-    try testing.expectEqual(cycles0 + 1, stats.appender_recovery_holder_preempt_cycles.load());
-    try testing.expect(!ns.writeAllowed(host_r));
-    try testing.expect(ns.writeAllowed(host_m));
+    _ = try r.registerLadder();
+    try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, 0x2222));
+    try testing.expect(ns.writeAllowed(host_r));
     try testing.expectEqual(@as(?u64, 0x1111), ns.holder);
     try testing.expectEqual(nvme.RTYPE_WERO, ns.rtype);
+    // The symmetric hold: the same preempt fences the victim, the hold kept.
+    var ns5 = fake.Namespace.init(gpa);
+    defer ns5.deinit();
+    ns5.holder_preempt_retypes = true;
+    var mh5: fake.Host = .{ .ns = &ns5, .host_id = host_m };
+    var m5 = try pr.Client.init(gpa, mh5.face(), 1, 0x1111);
+    defer m5.deinit();
+    try acquireManagerHold(&m5);
+    var rh5: fake.Host = .{ .ns = &ns5, .host_id = host_r };
+    var r5 = try pr.Client.init(gpa, rh5.face(), 1, 0x2222);
+    defer r5.deinit();
+    _ = try joinAsRegistrant(&r5, null);
+    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m5, 0x2222));
+    try testing.expect(!ns5.writeAllowed(host_r));
+    try testing.expect(ns5.writeAllowed(host_m));
+    try testing.expectEqual(@as(?u64, 0x1111), ns5.holder);
+    try testing.expectEqual(nvme.RTYPE_WEAR, ns5.rtype);
+    // The re-fence (review B2): the key registered again is preempted again.
+    _ = try joinAsRegistrant(&r5, null);
+    try testing.expectEqual(@as(?PreemptOutcome, .fenced), refenceAfterRecovering(&m5, 0x2222));
+    try testing.expect(!ns5.writeAllowed(host_r));
+    try testing.expectEqual(@as(?PreemptOutcome, null), refenceAfterRecovering(&m5, 0x2222));
+    try testing.expectEqual(@as(?PreemptOutcome, null), refenceAfterRecovering(&m5, 0x1111));
+    try testing.expectEqual(@as(?PreemptOutcome, null), refenceAfterRecovering(null, 0x2222));
 }
 
 const RamTerm = struct {

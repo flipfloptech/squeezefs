@@ -53,7 +53,6 @@ const smo = @import("../smo.zig");
 const checkpoint_cycle = @import("../checkpoint_cycle.zig");
 const claim = @import("../guard/claim.zig");
 const proc = @import("../guard/proc.zig");
-const pr = @import("../guard/pr.zig");
 const host_fence = @import("../guard/host_fence.zig");
 const sym = @import("../sym.zig");
 const page = @import("appender_page.zig");
@@ -417,7 +416,7 @@ pub const JoinedSet = struct {
     /// secret off the projection, the dial, `JoinAppender`. The region's
     /// words are read through `standing()`; the slots through
     /// `acquireRotor`. Nothing of the backend's ring exists yet.
-    pub fn open(be: *KvBackend, mountpoint: []const u8, explicit_ep: ?endpoint.EndpointWire, predecessor: ?u32, set_secret: ?wire_auth.Secret, identity_opts: pr.IdentityOptions) OpenError!*JoinedSet {
+    pub fn open(be: *KvBackend, mountpoint: []const u8, explicit_ep: ?endpoint.EndpointWire, predecessor: ?u32, set_secret: ?wire_auth.Secret) OpenError!*JoinedSet {
         const gpa = be.gpa;
         const self = try gpa.create(JoinedSet);
         errdefer gpa.destroy(self);
@@ -442,7 +441,7 @@ pub const JoinedSet = struct {
         // adopted when the host is registered under the set's key, else
         // registered after the stale-sibling rule — before the JoinAppender,
         // so this incarnation never writes unregistered.
-        const fence = host_fence.Joiner.admit(.{ .gpa = gpa, .env = be.env, .path = be.path, .local = local, .node_token = identity.node_token, .vol_index = be.index, .taking_manager = false }, be.sb.set_uuid, identity_opts, identity.mount_slot, identity.writer_id, .{ .ctx = be, .read = &devicePagesFn }) catch |e| return switch (e) {
+        const fence = host_fence.Joiner.admit(.{ .gpa = gpa, .env = be.env, .path = be.path, .local = local, .node_token = identity.node_token, .vol_index = be.index, .taking_manager = false }, be.sb.set_uuid, identity.mount_slot, identity.writer_id, .{ .ctx = be, .read = &devicePagesFn }) catch |e| return switch (e) {
             error.HostAdmissionRefused => error.HostAdmissionRefused,
             error.OutOfMemory => error.OutOfMemory,
         };
@@ -1108,7 +1107,7 @@ pub const JoinedSet = struct {
         be.smo_lock.lockUncancelable(be.io);
         _ = be.lane.latch.failStop();
         be.smo_lock.unlock(be.io);
-        if (self.fence) |f| f.declareRetired();
+        if (self.fence) |f| f.declareRetired(self.appenderId());
         self.gate.open();
         return .{ .drained = drained, .head = be.core.headPos(), .open = be.reg.openCount() };
     }

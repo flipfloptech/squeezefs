@@ -846,7 +846,7 @@ fn prMatrixLeg(transport: configfs.Trtype) !void {
     try expectNoResidue(rig, nqn);
 }
 
-test "nvmet fidelity: pr-matrix-loop — the real reservation legs (RESCAP, EDS-first, idempotent register, the spec-strict own-stale ladder, the two-identity WE fence as -EBADE, WERO rtype 3 with the fencing binding, preempt-and-abort, zero residue, shared identity) on nvmet-loop" {
+test "nvmet fidelity: pr-matrix-loop — the real reservation legs (RESCAP, EDS-first, idempotent register, the spec-strict own-stale ladder, the two-identity WE fence as -EBADE, All Registrants rtype 5 with the fencing binding, the holder's preempt of a registrant's key, preempt-and-abort, zero residue, shared identity) on nvmet-loop" {
     try prMatrixLeg(.loop);
 }
 
@@ -1547,7 +1547,7 @@ fn statNumber(text: []const u8, key: []const u8) !u64 {
     };
 }
 
-test "nvmet fidelity: co-located mounts — ONE host identity for every mount of a set on a host (owner ruling 2026-11-02, option C): a symmetric set on nvmet-loop, the manager A and a joiner B on this host under the one identity; ONE controller of the data subsystem serves both; ONE registration of the host (regctl 1) under the manager's WERO hold, A registered it, B adopted it (the same key, no device mutation); both read each other's files; B's umount leaves the shared association and the registration standing (A reads B's file and writes on), A's umount releases both (no controller, regctl 0)" {
+test "nvmet fidelity: co-located mounts — ONE host identity for every mount of a set on a host (owner ruling 2026-11-02, option C): a symmetric set on nvmet-loop, the manager A and a joiner B on this host under the one identity; ONE controller of the data subsystem serves both; ONE registration of the host (regctl 1) under the manager's All Registrants hold (rtype 5), A registered it, B adopted it (the same key, no device mutation); both read each other's files; B's umount leaves the shared association and the registration standing (A reads B's file and writes on), A's umount releases both (no controller, regctl 0)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -1563,7 +1563,7 @@ test "nvmet fidelity: co-located mounts — ONE host identity for every mount of
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
         try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
-        try testing.expectEqual(@as(?u64, nvme.RTYPE_WERO), json_scan.number(rr, "rtype"));
+        try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
         const sa = try rig.stats(a);
         defer gpa.free(sa);
         const sb = try rig.stats(b);
@@ -1646,7 +1646,7 @@ test "nvmet fidelity: stale sibling — per-host fencing's safety rule: a symmet
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
         try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
-        try testing.expectEqual(@as(?u64, nvme.RTYPE_WERO), json_scan.number(rr, "rtype"));
+        try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
     }
     const before = try rig.onMount(b, "echo before > f && sync -d f && cat f");
     defer gpa.free(before);

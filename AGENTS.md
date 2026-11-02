@@ -20,29 +20,32 @@ take the better design and add a row to the ledger in decision 0002 before diver
 
 ## Venue
 
-Linux ≥ 7.3 only (charter §1.2, §3; owner ruling 2026-10-29). Every Linux venue is reached
-through `scripts/venue`, runs **Linux ≥ 7.3 with FUSE-over-io_uring buffer pools**
-(`CONFIG_FUSE_IO_URING=y`, `fuse.enable_uring`; the venue kernel is mainline +
-`scripts/kernel/patches-mainline/` + `scripts/kernel/config-fragment`, `uname -r` ending
-`mainline-sqz`) with Zig 0.17.0 and the repo at the same absolute path, and runs commands as
-root:
+Stock Linux ≥ 7.3 only (charter §1.2, §3; owner rulings 2026-10-29 and 2026-11-02 "no kernel
+patches", decision 0003 §DB): the product's floor is a stock kernel.org ≥ 7.3 kernel and the repo
+carries no kernel patch. Every Linux venue is reached through `scripts/venue`, runs **Linux ≥ 7.3
+with FUSE-over-io_uring buffer pools** (`CONFIG_FUSE_IO_URING=y`, `fuse.enable_uring`; the local
+venue boots the default Omarchy-flavoured 7.3.1, with pure stock kernel.org 7.3.1 +
+`scripts/kernel/config-fragment` — `uname -r` `7.3.1-1-mainline-sqz` — as the second boot entry)
+with Zig 0.17.0 and the repo at the same absolute path, and runs commands as root:
 - `local` (`SQZ_VENUE=local`; the default when the controller is Linux): THIS host —
   commands run through `sudo` in this tree, no sync, no VM. Set it up once with
   `scripts/dev/provision-local-venue` (checks the distro — Debian/Ubuntu with apt, or Arch
   and its derivatives such as Omarchy with pacman —, zig on root's PATH, a ≥ 7.3 kernel
   and `fuse.enable_uring`, the nvmet/brd/null_blk modules, the packages, the build root,
-  passwordless sudo; prints each fix; `--apply` does the packages, modules, the boot
-  parameter in GRUB or Limine, IOR/mdtest and directories — never a kernel install or a
+  passwordless sudo; prints each fix and notes what the host's kernel lacks (FUSE_SYNCFS
+  before 7.4, the nvmet rows `nvme_core.multipath` decides); `--apply` does the packages,
+  modules, IOR/mdtest and directories — never a kernel install, a boot parameter or a
   reboot; with ≥ 64 GiB of RAM, `/build/tmp` and the tree's `.zig-cache/tmp` live in RAM:
   ext4 on a zram device via zram-generator, so every test image stays off the disk). The kernel:
-  `scripts/kernel/build-host-kernel --local` (Arch/Omarchy) — `linux-mainline-sqz`: mainline
-  7.3 + `scripts/kernel/patches-mainline/` with Omarchy's CURRENT config as the seed and its
-  PKGBUILD's build/package functions, built with makepkg, installed with pacman, FIRST in
-  Limine's boot order (`7.3.0-1.N-mainline-sqz`; `docs/evidence/rung-10-kernel-mainline.md` has
-  the tables). `--prepare-only` applies every patch at `--fuzz=0` and checks the config in
-  minutes. A Debian/Ubuntu host runs a distro or kernel.org ≥ 7.3 kernel. Reboot into it
-  yourself. The 7.2 series and its build paths were deleted 2026-10-29
-  (`docs/evidence/rung-10-drop-7.2.md`). Build slots: one per 4 threads and per 8 GiB
+  `scripts/kernel/build-host-kernel --local` (Arch/Omarchy) — `linux-mainline-sqz`: kernel.org
+  7.3.1, UNPATCHED, configured with `scripts/kernel/config-fragment` over Omarchy's CURRENT
+  config as the seed, its PKGBUILD's build/package functions, built with makepkg, installed
+  with pacman (`7.3.1-1-mainline-sqz`; `docs/evidence/rung-10-stock-kernel.md`); `--no-install`
+  stops at the packages, `--prepare-only` checks the tarball's signature and the config
+  checklist in minutes. A Debian/Ubuntu host runs a distro or kernel.org ≥ 7.3 kernel. Reboot
+  into it yourself. The 7.2 series (deleted 2026-10-29, `docs/evidence/rung-10-drop-7.2.md`)
+  and the 7.3 sqz series (`patches-mainline/` 0001–0007, deleted 2026-11-02) live in git
+  history only. Build slots: one per 4 threads and per 8 GiB
   (`SQZ_VENUE_SLOTS` overrides; every controller of one build root must agree).
 - `vm` (the default on the Mac): the macOS `container` `sqz-zig` — aarch64, Ubuntu 24.04,
   this repo mounted rw at the same path. Its kernel was the 7.2-sqz container build; it needs

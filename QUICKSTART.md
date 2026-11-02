@@ -47,7 +47,10 @@ size (derived from the volume size), the block size (4 MiB) and `dir spread dept
 `--supervise` matters. A supervised mount keeps a **write cache** in RAM (a kernel-held memory file
 the supervisor hands to the next daemon after a crash) and a journal tail the supervisor replays, so
 a `kill -9` of the daemon loses nothing that was acknowledged. A mount without a supervisor runs
-without the write cache: small writes go straight to the data volumes.
+without the write cache: small writes go straight to the data volumes. On Linux 7.3 `sync` and
+`syncfs(2)` never reach the daemon (the kernel forwards them to a FUSE server from 7.4), so they do
+not make cached writes durable — `fsync` does; the mount's log says which kernel you have
+("this kernel does not send FUSE_SYNCFS …") and `.stats` reports `fuse_syncfs_reaches`.
 
 ## 2. On real devices
 
@@ -91,7 +94,8 @@ handy for a first look at its log.
 The daemon keeps two caches, each sized as a percentage of system RAM and each defaulting to 25 %:
 
 - `SQUEEZEFS_WRITE_CACHE_PCT` — the write cache (supervised mounts only). Small writes land here and
-  are promoted to the data volumes at `fsync`, when the cache fills, or on the flush cadence.
+  are promoted to the data volumes at `fsync`, when the cache fills, or on the flush cadence — and
+  at `syncfs`/`sync` where the kernel forwards them (Linux ≥ 7.4).
 - `SQUEEZEFS_READ_CACHE_PCT` — the read cache of device blocks, kept coherent by a per-file epoch.
 
 Set either to `0` to turn it off. Both are environment variables of the `mount` command, like every

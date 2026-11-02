@@ -237,7 +237,7 @@ desired_max_write, max_pages_limit, page, buffer_cap, mb_override, ct_override)`
 
 ### 2.1a The INIT reply word (session.rs:1780–1830, :6412–6640)
 - `flags2` ALWAYS carries `FUSE_OVER_IO_URING_FLAGS2 = 1 << 9` ("required: no opt-out", session.rs:1792–1797);
-  plus `FUSE_TIME_LIMITS >> 32` iff the kernel offered folded bit 62, with `time_min/time_max =
+  plus (the reference; retired in the Zig port, decision 0003 §DB) `FUSE_TIME_LIMITS >> 32` iff the kernel offered folded bit 62, with `time_min/time_max =
   ±9_223_372_036 s` (session.rs:1810–1818, :6362–6386 — the whole-second interior of the i64-ns word,
   conservative by one second on the floor).
 - `FUSE_INIT_EXT` rides the reply iff the kernel offered it ∧ `flags2 != 0` ∧ `reply_minor ≥ 36`

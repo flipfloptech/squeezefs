@@ -85,7 +85,9 @@ NO_OPENDIR_SUPPORT 1<<24, EXPLICIT_INVAL_DATA 1<<25, MAP_ALIGNMENT 1<<26, **HAND
 Folded 64-bit word = `flags | flags2 << 32` (`KernelInit::new`, session.rs:345–351):
 **FUSE_OVER_IO_URING = 1<<41 = flags2 bit 9** (`FUSE_OVER_IO_URING_FLAGS2 = 1<<9`, fuse_over_uring.rs:109;
 Linux ≥ 6.14), **FUSE_TIME_LIMITS = 1<<62 = flags2 bit 30** (sqz patch 0027; abi.rs:191–201; pinned
-session.rs:7071–7084).
+session.rs:7071–7084). **Zig: RETIRED** (decision 0003 §DB, 2026-11-02 — no kernel patch is carried, so
+no kernel offers bit 62 and upstream may assign it): the reply never echoes bit 62 and `fuse_init_out`
+is upstream's (`request_timeout u16@40, unused[11] u16@42`, written zero).
 
 ### 1.4 Per-op request structs (`op_in`)
 | struct | size | fields | cite |
@@ -220,7 +222,8 @@ log line; still answer `-ENOSYS` (the kernel latches `fc->no_<op>` on ENOSYS for
    `error = EINVAL` and fails (:1751–1769). `flags2 = data[16..20]` iff `flags & FUSE_INIT_EXT` and
    `data.len() ≥ 20`, else 0 (:1780–1784). Publish `KernelInit{major, minor, flags|flags2<<32}` into a
    process-global `OnceLock` BEFORE `fs.init` (:1785–1790; `kernel_init_info()`, :360–362).
-3. **flags2**: ALWAYS `FUSE_OVER_IO_URING_FLAGS2` (1<<9) — "No opt-out" (:1792–1797). Add
+3. **flags2**: ALWAYS `FUSE_OVER_IO_URING_FLAGS2` (1<<9) — "No opt-out" (:1792–1797). [Zig: the
+   time-limits leg is retired, §DB; the rest of this step is the reference's.] Add
    `(FUSE_TIME_LIMITS >> 32)` = 1<<30 iff the kernel's folded word has bit 62 (`negotiate_time_limits`,
    :6380–6386); then `(time_min, time_max) = (−9_223_372_036, +9_223_372_036)` s, else `(0, 0)`
    (:1810–1818; constants :6372–6374 — the whole-second interior of the i64-ns word, floor conservative

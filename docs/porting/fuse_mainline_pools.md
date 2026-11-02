@@ -131,8 +131,8 @@ byte offset into the slot, `buf_index` = `1 + ent`. Unregistered at `fuse_uring_
 
 **`args->zero_copy`** is `ff->open_flags & FOPEN_IO_URING_ZERO_COPY` (`file.c:608, 1157`),
 set only by an OPEN/CREATE reply (`fuse_file_open`: a `no_open` open gets `FOPEN_KEEP_CACHE`
-alone). Hence decision 0003 §BE.3 (serve opens) and the RFC (`scripts/kernel/upstream/
-fuse-zc-no-open/`).
+alone). Hence decision 0003 §BE.3 (serve opens) and the RFC drafted 2026-10-21 (`scripts/kernel/upstream/
+fuse-zc-no-open/`, in git history since §DB deleted the postings 2026-11-02).
 
 ---
 

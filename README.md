@@ -22,8 +22,9 @@ shared-disk model.
   three levels round-robin; everything below follows its parent), so a single project tree uses every
   metadata volume. The depth is one set-level setting.
 - **Durable the way you expect.** A metadata operation is acknowledged once applied and durable at the
-  next commit (50 ms); `fsync`, `fdatasync` and `syncfs` are durable on return, including small writes
-  that live in the write cache. On a supervised mount a `kill -9` of the daemon loses nothing synced
+  next commit (50 ms); `fsync` and `fdatasync` are durable on return, including small writes that
+  live in the write cache — and `syncfs`/`sync` too on a kernel that forwards them to the daemon
+  (Linux ≥ 7.4; on 7.3 they never reach it, and every mount says which it is). On a supervised mount a `kill -9` of the daemon loses nothing synced
   or acknowledged: the supervisor keeps the journal tail and the write cache across the crash and the
   next daemon replays them. A power cut can lose only the unsynced work of the last commit interval.
 - **Operable.** Online `fsck`, `scrub` and `defrag`; `status`, `df`, `clients`, `config show`; volume
@@ -50,14 +51,15 @@ removes/s, 284 k mkdir/s, 283 k rmdir/s. The measurement notes behind every numb
 
 ## Requirements
 
-- **Linux ≥ 7.3** with FUSE-over-io_uring buffer pools (`CONFIG_FUSE_IO_URING`; the daemon
+- **Linux ≥ 7.3, stock** with FUSE-over-io_uring buffer pools (`CONFIG_FUSE_IO_URING`; the daemon
   switches `fuse.enable_uring` on itself). A kernel without them refuses the mount, naming what is
-  missing. Linux 7.3 runs the filesystem unpatched. `scripts/kernel/patches-mainline/` carries a
-  few optional kernel patches — two fixes, `syncfs(2)` forwarded to the daemon,
-  `FUSE_TIME_LIMITS`, host-scoped NVMe-oF subsystems for two fenced identities on one host — and
-  `scripts/kernel/build-host-kernel` builds a kernel with them.
-  Every kernel feature is probed at runtime; a missing one is reported by name, never worked around
-  silently.
+  missing. No kernel patch is needed or carried; `scripts/kernel/build-host-kernel` builds
+  kernel.org's release unpatched with the config the development venue uses. What 7.3 lacks is
+  stated, never worked around silently: `syncfs(2)`/`sync` reach the daemon only from Linux 7.4
+  (`fsync` is the durability point before that; each mount probes it and says so), and under
+  native NVMe multipath two host identities on one NVMe-oF subsystem would share one path set, so
+  a second identity on a subsystem the host already serves is refused (`nvme_core.multipath=N`
+  lifts it). Every kernel feature is probed at runtime and a missing one is reported by name.
 - **Root.** The daemon mounts with FUSE-over-io_uring and opens devices `O_DIRECT`.
 - **Block devices** for anything you measure. Image files work for trying it out (see QUICKSTART),
   but then you are measuring the host filesystem.

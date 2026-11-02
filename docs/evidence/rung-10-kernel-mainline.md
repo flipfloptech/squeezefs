@@ -1,5 +1,10 @@
 # Rung 10 — the sqz kernel series against mainline (2026-10-21)
 
+> **Superseded 2026-11-02** (`rung-10-stock-kernel.md`, decision 0003 §DB, the owner's ruling "no
+> kernel patches"): the series below and `scripts/kernel/upstream/` are deleted (git history keeps
+> them); the venue kernel is kernel.org's, unpatched. This note stays as the record of what was
+> measured and why each patch existed.
+
 The owner's direction: know which kernel patches the daemon REQUIRES and which are performance;
 the performance patches that are ours get MAINLINED; find out how much of the zero-copy base is
 already upstream. Venue: the workstation (`local`, `7.2.8-9.33-omarchy-sqz`); mainline cloned to

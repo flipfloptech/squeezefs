@@ -74,7 +74,7 @@ kr=$(uname -r)
 kmaj=${kr%%.*}; kmin=${kr#*.}; kmin=${kmin%%[!0-9]*}
 if [ "$kmaj" -gt "$KMIN_MAJOR" ] || { [ "$kmaj" = "$KMIN_MAJOR" ] && [ "${kmin:-0}" -ge "$KMIN_MINOR" ]; }; then
   case $kr in
-    *sqz*) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR, the venue's unpatched kernel.org build)" ;;
+    *sqz*) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR, a build-host-kernel package)" ;;
     *) ok "kernel $kr (Linux >= $KMIN_MAJOR.$KMIN_MINOR)" ;;
   esac
   note "FUSE_SYNCFS (upstream from 7.4): each mount probes whether syncfs(2) reaches its daemon and says so (.stats fuse_syncfs_reaches); without it sync/syncfs make no staged byte durable — fsync does"

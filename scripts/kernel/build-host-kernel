@@ -260,19 +260,22 @@ echo "$image"; echo "$headers"
 if [ "$(uname -r)" = "$ver" ]; then
   echo "== NOTE: this host runs $ver now: installing replaces the running kernel's /usr/lib/modules — install and reboot together"
 fi
+# Limine's BOOT_ORDER, written before pacman -U so the hook's limine-update applies it at once:
+# the omarchy flavour, the stock one, then Omarchy's own order (its kernels are the fallbacks).
+# The drop-in sorts after a sqz-kernel.conf a 7.2-era install left (the last BOOT_ORDER wins).
+dropin=/etc/limine-entry-tool.d/sqz-mainline-kernel.conf
+order='BOOT_ORDER="linux-omarchy-mainline, linux-mainline-sqz, linux-t2, linux-omarchy, linux-omarchy-*, *, *fallback, Snapshots"'
 if [ "${INSTALL:-1}" = 0 ]; then
-  echo "== not installed (--no-install); install, then reboot: sudo pacman -U $image $headers"
+  echo "== not installed (--no-install); install, then reboot:"
+  [ -d "${dropin%/*}" ] && echo "   echo '$order' | sudo tee $dropin"
+  echo "   sudo pacman -U $image $headers"
   echo "BUILD-OK"
   exit 0
 fi
 echo "== install"
-# Limine's BOOT_ORDER, written before pacman -U so the hook's limine-update applies it at once:
-# the omarchy flavour, the stock one, then Omarchy's own order (its kernels are the fallbacks).
-# The drop-in sorts after a sqz-kernel.conf a 7.2-era install left (the last BOOT_ORDER wins).
-if [ -d /etc/limine-entry-tool.d ]; then
+if [ -d "${dropin%/*}" ]; then
   printf '%s\n' "# squeezefs venue kernels (scripts/kernel/build-host-kernel): the omarchy flavour boots by default, the stock one is the second entry" \
-    "BOOT_ORDER=\"linux-omarchy-mainline, linux-mainline-sqz, linux-t2, linux-omarchy, linux-omarchy-*, *, *fallback, Snapshots\"" \
-    | sudo tee /etc/limine-entry-tool.d/sqz-mainline-kernel.conf >/dev/null
+    "$order" | sudo tee "$dropin" >/dev/null
 fi
 sudo pacman -U --noconfirm "$image" "$headers"
 if sudo test -f /boot/limine.conf; then

@@ -1,66 +1,95 @@
 #!/usr/bin/env bash
-# build-host-kernel — build the squeezefs venue kernel natively on a Linux HOST — one reached
-# over ssh, or this one (--local) — as the host's distro packages, and install it.
+# build-host-kernel — build the squeezefs venue kernels natively on a Linux HOST — one reached
+# over ssh, or this one (--local) — as the host's distro packages, and install them.
 #
-#   scripts/kernel/build-host-kernel <ssh-host>                # build + install (no reboot)
-#   scripts/kernel/build-host-kernel <ssh-host> --no-install   # build the packages only
-#   scripts/kernel/build-host-kernel <ssh-host> --status       # tail the remote build log
-#   scripts/kernel/build-host-kernel --local [--no-install | --status | --prepare-only]
+#   scripts/kernel/build-host-kernel <ssh-host> [--flavour F] [--no-install | --status | --prepare-only]
+#   scripts/kernel/build-host-kernel --local    [--flavour F] [--no-install | --status | --prepare-only]
+#
+#   F: omarchy | stock | both (the default: omarchy, then stock, one after the other)
 #
 # The product needs Linux >= 7.3 with FUSE-over-io_uring buffer pools (owner ruling 2026-10-29)
-# and the venue carries NO kernel patch (owner ruling 2026-11-02: no kernel patches, no fork;
-# decision 0003 §DB, docs/evidence/rung-10-stock-kernel.md); any such kernel serves, and this
-# script builds the venue's own: kernel.org linux $KVER, UNPATCHED (the tarball, checked by its
-# signature), configured with scripts/kernel/config-fragment, asserted as a checklist (fail
-# loud). A config is not a patch: the fragment only enables in-tree options.
+# and the venue carries none of OUR kernel patches (owner ruling 2026-11-02: no kernel patches of
+# ours, no fork; decision 0003 §DB, docs/evidence/rung-10-stock-kernel.md); any such kernel
+# serves. This script builds the venue's two, both kernel.org linux $KVER (the tarball, checked by
+# its signature) configured with scripts/kernel/config-fragment, asserted as a checklist (fail
+# loud; a config is not a patch: the fragment only enables in-tree options):
 #
-# The build runs in the background under nohup in $SQZ_BUILD_ROOT/kernel/mainline (default
-# /build/kernel/mainline) on the target; its log is build.log there. Nothing here reboots:
-# the new kernel runs after the reboot whoever owns the host schedules.
+#   omarchy — pkgbase linux-omarchy-mainline, the venue's DEFAULT boot entry (owner ruling
+#     2026-11-02; decision 0003 §DD, docs/evidence/rung-10-omarchy-kernel.md): Omarchy's kernel
+#     recipe at the commit pinned in scripts/kernel/omarchy-7.3/series — its config.x86_64 as the
+#     seed, its build/package functions, the patches of its series that apply to $KVER (fetched
+#     from that commit by name, each checked by its b2sum) — plus BORE's own $KVER patch and
+#     Omarchy's AMD/VESA display fixes ported to $KVER (vendored in that directory, whose README
+#     has the table and the refresh steps). uname -r: $KVER-1-omarchy-mainline.
+#   stock — pkgbase linux-mainline-sqz, the SECOND boot entry: $KVER UNPATCHED, Omarchy's CURRENT
+#     config.x86_64 as the seed, none of its patches (they are for its own base), its PKGBUILD's
+#     build/package functions verbatim. uname -r: $KVER-1-mainline-sqz.
 #
-# --no-install stops after the packages: the log ends with their absolute paths and the
-# line that installs them, for whoever coordinates the host's reboot (a package manager
-# replaces the running kernel's /lib/modules/<ver> when the version string is the same,
-# so install and reboot together).
+# Arch and derivatives (Omarchy) only: makepkg builds, pacman -U installs, which fires the
+# mkinitcpio/Limine hooks (the UKI, the boot entry). pkgrel 1; bump it when a rebuild of the
+# same $KVER must be told from the running one. A limine-entry-tool drop-in orders BOOT_ORDER:
+# the omarchy flavour, then the stock one, then Omarchy's own entries and their fallbacks (the
+# daemon refuses a kernel without buffer pools). A Debian/Ubuntu host runs a distro or kernel.org
+# >= 7.3 kernel (scripts/dev/provision-local-venue checks it).
 #
-# Arch and derivatives (Omarchy) only: pkgbase linux-mainline-sqz (the name the Limine
-#   BOOT_ORDER drop-in and scripts/dev/provision-local-venue know), Omarchy's CURRENT
-#   config.x86_64 (fetched from omacom/omarchy-pkgs at build time) as the seed (`make
-#   olddefconfig`, then the fragment and its checklist), none of Omarchy's patches (they are
-#   for its own base), its PKGBUILD's build/package functions verbatim; built with makepkg and
-#   installed with pacman -U, which fires the mkinitcpio/Limine hooks (the UKI, the boot entry).
-#   pkgrel 1 (uname -r: $KVER-1-mainline-sqz); bump it when a rebuild of the same $KVER must
-#   be told from the running one. A limine-entry-tool drop-in puts it FIRST in BOOT_ORDER; the
-#   distro kernel stays the fallback entry (the daemon refuses a kernel without buffer pools).
-#   --prepare-only runs makepkg -o in the foreground — download, signature, the config and its
-#   checklist, no compile — to see a config gap in minutes rather than after a build. A
-#   Debian/Ubuntu host runs a distro or kernel.org >= 7.3 kernel (scripts/dev/provision-local-venue
-#   checks it).
+# Each flavour builds in its own directory on the target — $SQZ_BUILD_ROOT/kernel/omarchy-mainline
+# and $SQZ_BUILD_ROOT/kernel/mainline (default root /build) — under nohup, the selected flavours
+# one after the other; each directory's log is build.log there. Nothing here reboots: the new
+# kernels run after the reboot whoever owns the host schedules.
+#
+# --no-install stops after the packages: each log ends with their absolute paths and the line
+# that installs them, for whoever coordinates the host's reboot (a package manager replaces the
+# running kernel's /lib/modules/<ver> when the version string is the same, so install and
+# reboot together). --prepare-only runs makepkg -o in the foreground — download, signature, the
+# patches at --fuzz=0, the config and its checklist, no compile — to see a patch or config gap
+# in minutes rather than after a build.
 set -euo pipefail
 
-HOST=${1:?usage: build-host-kernel <ssh-host> | --local [--no-install | --status | --prepare-only]}
+HOST=${1:?usage: build-host-kernel <ssh-host> | --local [--flavour omarchy|stock|both] [--no-install | --status | --prepare-only]}
 [ "$HOST" = --local ] && HOST=
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SSH=(ssh -o BatchMode=yes -o LogLevel=ERROR)
 ROOT=${SQZ_BUILD_ROOT:-/build}
-RDIR=$ROOT/kernel/mainline
-# The kernel.org release the venue runs (the latest stable; a bump is this line and a rebuild).
+# The kernel.org release the venue runs (the latest stable; a bump is this line, a refreshed
+# scripts/kernel/omarchy-7.3/series and a rebuild).
 KVER=7.3.1
+SERIES=$REPO/scripts/kernel/omarchy-7.3
 # A shell command on the target: over ssh, or here.
 on() { if [ -n "$HOST" ]; then "${SSH[@]}" "$HOST" "$1"; else bash -c "$1"; fi; }
 at() { echo "${HOST:+$HOST:}$1"; }
 WHERE=${HOST:-this host}
+# A flavour's build directory on the target.
+fdir() { case "$1" in omarchy) echo "$ROOT/kernel/omarchy-mainline" ;; stock) echo "$ROOT/kernel/mainline" ;; esac; }
 
 INSTALL=1
 STAGE=build
+FLAVOURS="omarchy stock"
 shift
-case "${1:-}" in
-  --status) on "tail -5 $RDIR/build.log; ls $RDIR/*.pkg.tar.zst 2>/dev/null"; exit ;;
-  --no-install) INSTALL=0 ;;
-  --prepare-only) STAGE=prepare ;;
-  '') ;;
-  *) echo "build-host-kernel: unknown option '$1' (--no-install | --status | --prepare-only)" >&2; exit 2 ;;
-esac
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --flavour)
+      case "${2:-}" in
+        omarchy | stock) FLAVOURS=$2 ;;
+        both) FLAVOURS="omarchy stock" ;;
+        *) echo "build-host-kernel: --flavour takes omarchy | stock | both, not '${2:-}'" >&2; exit 2 ;;
+      esac
+      shift ;;
+    --status) STAGE=status ;;
+    --no-install) INSTALL=0 ;;
+    --prepare-only) STAGE=prepare ;;
+    *) echo "build-host-kernel: unknown option '$1' (--flavour omarchy|stock|both | --no-install | --status | --prepare-only)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [ "$STAGE" = status ]; then
+  for f in $FLAVOURS; do
+    d=$(fdir "$f")
+    echo "== $f ($d)"
+    on "tail -5 $d/build.log 2>/dev/null; ls $d/*.pkg.tar.zst 2>/dev/null" || true
+  done
+  exit
+fi
 
 # The target's package family (Omarchy says ID=omarchy ID_LIKE=arch).
 case " $(on '. /etc/os-release; echo "$ID ${ID_LIKE:-}"') " in
@@ -68,13 +97,14 @@ case " $(on '. /etc/os-release; echo "$ID ${ID_LIKE:-}"') " in
   *) echo "build-host-kernel: $WHERE is not Arch-family: the venue kernel packages for Arch/Omarchy only — run a distro or kernel.org Linux >= 7.3 there" >&2; exit 2 ;;
 esac
 
-echo "kernel.org linux $KVER, no patch; fragment: $(grep -c '^CONFIG_' "$REPO/scripts/kernel/config-fragment") entries; target: $WHERE"
+# The omarchy flavour's series is made for one kernel release: refuse another.
+case " $FLAVOURS " in *" omarchy "*)
+  skver=$(awk '$1 == "kernel" { print $2 }' "$SERIES/series")
+  [ "$skver" = "$KVER" ] || { echo "build-host-kernel: $SERIES/series is for linux '$skver', this script builds $KVER — refresh the series (README.md there)" >&2; exit 2; }
+esac
 
-on "sudo mkdir -p $RDIR && sudo chown \$(id -un) $RDIR && rm -rf $RDIR/patches"
-rsync -a -e "${SSH[*]}" "$REPO/scripts/kernel/config-fragment" "$(at "$RDIR/fragment")"
-
-# The target's half (runs under nohup; its log is $RDIR/build.log).
-on "cat > $RDIR/build.sh" <<'REMOTE'
+# The target's half: one flavour, in its directory (runs under nohup; its log is build.log there).
+IFS= read -r -d '' BUILD_SH <<'REMOTE' || true
 #!/usr/bin/env bash
 set -euo pipefail
 # A failed step says so in the log (set -e alone exits silently).
@@ -83,33 +113,62 @@ cd "$(dirname "$0")"
 # The distro's toolchain only: a version manager's rustc or gcc on the caller's PATH
 # (mise shims) would be picked over the makedepends makepkg installs.
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
-# Omarchy's kernel recipe: the seed config and the build/package functions.
+# Omarchy's kernel recipe: the seed config and the build/package functions (and, for the
+# omarchy flavour, the patches its series names).
 UPSTREAM=linux-omarchy
+KVER=${KVER:?}
+case "${FLAVOUR:?}" in
+  omarchy)
+    PKGBASE=linux-omarchy-mainline
+    rev=$(awk '$1 == "omarchy-pkgs" { print $2 }' series/series)
+    [ -n "$rev" ] || { echo "series/series names no omarchy-pkgs commit"; exit 1; }
+    desc="Linux (kernel.org) with Omarchy patches, BORE and the squeezefs venue config fragment (sqz)" ;;
+  stock)
+    PKGBASE=linux-mainline-sqz
+    rev=HEAD
+    desc="Linux (kernel.org, unpatched) with the squeezefs venue config fragment (sqz)" ;;
+esac
 # makepkg caches the kernel tarball here across rebuilds and drops the packages beside the log.
 export SRCDEST=$PWD/sources PKGDEST=$PWD
 mkdir -p "$SRCDEST"
-echo "== the current recipe: omacom/omarchy-pkgs pkgbuilds/$UPSTREAM"
+echo "== the recipe: omacom/omarchy-pkgs pkgbuilds/$UPSTREAM at $rev"
 rm -rf omarchy-pkgs
-git clone -q --depth 1 --filter=blob:none --sparse https://github.com/omacom/omarchy-pkgs.git omarchy-pkgs
+git init -q omarchy-pkgs
+git -C omarchy-pkgs remote add origin https://github.com/omacom/omarchy-pkgs.git
 git -C omarchy-pkgs sparse-checkout set "pkgbuilds/$UPSTREAM" >/dev/null
+git -C omarchy-pkgs fetch -q --depth 1 --filter=blob:none origin "$rev"
+git -C omarchy-pkgs checkout -q FETCH_HEAD
 up=$PWD/omarchy-pkgs/pkgbuilds/$UPSTREAM
 omarchy_rev=$(git -C omarchy-pkgs rev-parse --short HEAD)
 echo "  omarchy-pkgs $omarchy_rev ($(git -C omarchy-pkgs log -1 --format=%cs)): $(grep -m1 '^pkgver=' "$up/PKGBUILD") $(grep -m1 '^pkgrel=' "$up/PKGBUILD"), $(ls "$up"/*.patch | wc -l) Omarchy patches"
 grep -q '^prepare()' "$up/PKGBUILD" || { echo "PKGBUILD has no prepare() — the recipe changed shape; read it"; exit 1; }
-PKGBASE=linux-mainline-sqz
-KVER=${KVER:?}
-echo "== the derived package: $PKGBASE = kernel.org linux $KVER, unpatched, + the venue's config fragment; Omarchy's config as the seed, its build/package functions, none of its patches"
 rm -rf "$PKGBASE" && mkdir "$PKGBASE" && cd "$PKGBASE"
 cp -a "$up/keys" . && cp "$up/config.x86_64" .
 cp ../fragment sqz-config-fragment
+# The series, in its order: an Omarchy patch from the pinned recipe, or a vendored one; makepkg
+# checks each against the series' b2sum (the b2sums array below is the series', not the file's).
+patches=() sums=()
+if [ "$FLAVOUR" = omarchy ]; then
+  while read -r src file sum; do
+    case "$src" in
+      omarchy) cp "$up/$file" . ;;
+      vendored) cp "../series/$file" . ;;
+      *) continue ;;
+    esac
+    patches+=("$file") sums+=("'$sum'")
+  done < ../series/series
+  echo "== the derived package: $PKGBASE = kernel.org linux $KVER + $(grep -c '^omarchy ' ../series/series) Omarchy patches (omarchy-pkgs $omarchy_rev) + $(grep -c '^vendored ' ../series/series) vendored (BORE, the display ports) + the venue's config fragment; Omarchy's config as the seed, its build/package functions"
+else
+  echo "== the derived package: $PKGBASE = kernel.org linux $KVER, unpatched, + the venue's config fragment; Omarchy's config as the seed, its build/package functions, none of its patches"
+fi
 {
-  echo "# linux-mainline-sqz (scripts/kernel/build-host-kernel): kernel.org linux $KVER, no patch,"
-  echo "# configured with the venue's fragment (scripts/kernel/config-fragment); Omarchy's PKGBUILD"
-  echo "# ($omarchy_rev) lends its config as the seed and its build/package functions."
+  echo "# $PKGBASE (scripts/kernel/build-host-kernel --flavour $FLAVOUR): kernel.org linux $KVER,"
+  echo "# ${#patches[@]} patches, configured with the venue's fragment (scripts/kernel/config-fragment);"
+  echo "# Omarchy's PKGBUILD ($omarchy_rev) lends its config as the seed and its build/package functions."
   echo "pkgbase=$PKGBASE"
   echo "pkgver=$KVER"
   echo "pkgrel=1"
-  echo "pkgdesc='Linux (kernel.org, unpatched) with the squeezefs venue config fragment (sqz)'"
+  echo "pkgdesc='$desc'"
   echo "url='https://kernel.org'"
   echo "arch=(x86_64)"
   echo "license=(GPL-2.0-only)"
@@ -119,15 +178,17 @@ cp ../fragment sqz-config-fragment
   echo '_srcname=linux-$pkgver'
   echo "source=("
   echo '  https://cdn.kernel.org/pub/linux/kernel/v${_major}.x/${_srcname}.tar.{xz,sign}'
+  for p in "${patches[@]}"; do echo "  $p"; done
   echo "  sqz-config-fragment"
   echo ")"
   echo "source_x86_64=(config.x86_64)"
   sed -n '/^validpgpkeys=(/,/^)/p' "$up/PKGBUILD"
   # The tarball is checked by its signature (the keys above); the files beside the PKGBUILD by hash.
-  echo "b2sums=('SKIP' 'SKIP' '$(b2sum sqz-config-fragment | cut -d' ' -f1)')"
+  echo "b2sums=('SKIP' 'SKIP' ${sums[*]} '$(b2sum sqz-config-fragment | cut -d' ' -f1)')"
   echo "b2sums_x86_64=('$(b2sum config.x86_64 | cut -d' ' -f1)')"
   echo
-  # Omarchy's exports, prepare(), build(), _package(), _package-headers() and the pkgname loop.
+  # Omarchy's exports, prepare() (it applies every *.patch of source=() in order at --fuzz=0),
+  # build(), _package(), _package-headers() and the pkgname loop.
   sed -n '/^export KBUILD_BUILD_HOST/,$p' "$up/PKGBUILD" | sed 's/^export KBUILD_BUILD_HOST=.*/export KBUILD_BUILD_HOST=sqz/'
 } > PKGBUILD
 grep -q '^prepare()' PKGBUILD && grep -q '^_package-headers()' PKGBUILD || { echo "the derived PKGBUILD lacks prepare()/_package-headers(); read Omarchy's"; exit 1; }
@@ -138,7 +199,7 @@ grep -q '^prepare()' PKGBUILD && grep -q '^_package-headers()' PKGBUILD || { ech
 prepare() {
   _omarchy_prepare
   cd "$srcdir/$_srcname"
-  # The sqz tag comes from the pkgbase (localversion.20-pkgname → -mainline-sqz).
+  # The flavour's tag comes from the pkgbase (localversion.20-pkgname → -omarchy-mainline / -mainline-sqz).
   echo "Applying the sqz config fragment..."
   local line opt val
   while IFS= read -r line; do
@@ -170,7 +231,7 @@ PREPARE
 # The signing keys the recipe ships (Torvalds, Kroah-Hartman, Omarchy's kernel maintainer).
 gpg --quiet --import keys/pgp/*.asc 2>/dev/null || true
 if [ "${STAGE:-build}" = prepare ]; then
-  echo "== prepare only: the tarball, its signature, the config and its checklist $(date)"
+  echo "== prepare only: the tarball, its signature, the patches, the config and its checklist $(date)"
   # -s here too: olddefconfig keeps CONFIG_RUST only with rustc present, so the dry pass
   # configures what the build will.
   makepkg -o -s --noconfirm
@@ -206,11 +267,11 @@ if [ "${INSTALL:-1}" = 0 ]; then
 fi
 echo "== install"
 # Limine's BOOT_ORDER, written before pacman -U so the hook's limine-update applies it at once:
-# the venue kernel first, Omarchy's own order after it (the distro kernel is the fallback). The
-# drop-in sorts after a sqz-kernel.conf a 7.2-era install left (the last BOOT_ORDER wins).
+# the omarchy flavour, the stock one, then Omarchy's own order (its kernels are the fallbacks).
+# The drop-in sorts after a sqz-kernel.conf a 7.2-era install left (the last BOOT_ORDER wins).
 if [ -d /etc/limine-entry-tool.d ]; then
-  printf '%s\n' "# squeezefs venue kernel (scripts/kernel/build-host-kernel): boots by default" \
-    "BOOT_ORDER=\"$PKGBASE, linux-t2, linux-omarchy, linux-omarchy-*, *, *fallback, Snapshots\"" \
+  printf '%s\n' "# squeezefs venue kernels (scripts/kernel/build-host-kernel): the omarchy flavour boots by default, the stock one is the second entry" \
+    "BOOT_ORDER=\"linux-omarchy-mainline, linux-mainline-sqz, linux-t2, linux-omarchy, linux-omarchy-*, *, *fallback, Snapshots\"" \
     | sudo tee /etc/limine-entry-tool.d/sqz-mainline-kernel.conf >/dev/null
 fi
 sudo pacman -U --noconfirm "$image" "$headers"
@@ -221,11 +282,31 @@ echo "== installed; REBOOT this host into $ver to run it (nothing here reboots),
 echo "BUILD-AND-INSTALL-OK"
 REMOTE
 
+echo "kernel.org linux $KVER; flavours: $FLAVOURS; fragment: $(grep -c '^CONFIG_' "$REPO/scripts/kernel/config-fragment") entries; target: $WHERE"
+for f in $FLAVOURS; do
+  d=$(fdir "$f")
+  on "sudo mkdir -p $d && sudo chown \$(id -un) $d && rm -rf $d/patches"
+  rsync -a -e "${SSH[*]}" "$REPO/scripts/kernel/config-fragment" "$(at "$d/fragment")"
+  [ "$f" = omarchy ] && rsync -a --delete -e "${SSH[*]}" "$SERIES/" "$(at "$d/series/")"
+  on "cat > $d/build.sh && chmod +x $d/build.sh" <<< "$BUILD_SH"
+done
+
 if [ "$STAGE" = prepare ]; then
-  on "set -o pipefail; chmod +x $RDIR/build.sh && cd $RDIR && STAGE=prepare KVER=$KVER SQZ_BUILD_ROOT=$ROOT ./build.sh 2>&1 | tee prepare.log"
+  for f in $FLAVOURS; do
+    d=$(fdir "$f")
+    echo "== $f: prepare in $d"
+    on "set -o pipefail; cd $d && STAGE=prepare FLAVOUR=$f KVER=$KVER SQZ_BUILD_ROOT=$ROOT ./build.sh 2>&1 | tee prepare.log"
+  done
   exit
 fi
-# Background the build alone: a backgrounded and-list is a subshell holding ssh's
-# streams, and ssh waited out the whole build.
-on "chmod +x $RDIR/build.sh && cd $RDIR && { INSTALL=$INSTALL KVER=$KVER SQZ_BUILD_ROOT=$ROOT nohup ./build.sh > build.log 2>&1 < /dev/null & } && echo started"
-echo "build started on $WHERE — follow with: scripts/kernel/build-host-kernel ${HOST:---local} --status (log $RDIR/build.log; the host needs a reboot after the install)"
+# One background chain builds the flavours in order and stops at the first failure; each
+# waits in its log until its turn. Background the chain alone: a backgrounded and-list is a
+# subshell holding ssh's streams, and ssh waited out the whole build.
+chain=
+for f in $FLAVOURS; do
+  d=$(fdir "$f")
+  on "echo '== queued $(date)' > $d/build.log"
+  chain+="cd $d && INSTALL=$INSTALL FLAVOUR=$f KVER=$KVER SQZ_BUILD_ROOT=$ROOT ./build.sh > build.log 2>&1 < /dev/null || exit 1; "
+done
+on "{ nohup bash -c '$chain' > /dev/null 2>&1 < /dev/null & } && echo started"
+echo "build started on $WHERE ($FLAVOURS) — follow with: scripts/kernel/build-host-kernel ${HOST:---local} --status (logs $(for f in $FLAVOURS; do printf '%s ' "$(fdir "$f")/build.log"; done)— the host needs a reboot after the install)"

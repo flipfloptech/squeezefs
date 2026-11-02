@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: squeezefs venue <venue@sqz.invalid>
+Date: Mon, 2 Nov 2026 09:55:50 -0500
+Subject: [PATCH] drm/amd/display: send the VTEM on HDMI TMDS links too
+
+Omarchy 0451-amd-vtem-tmds-links.patch (omacom/omarchy-pkgs 99aa5aa,
+pkgbuilds/linux-omarchy): HDMI 2.1 Gaming-VRR signals through the VTEM on TMDS
+links as well as on FRL ones; build it for a TMDS sink that advertises HDMI VRR
+(display_info.hdmi.vrr_cap.supported, from 0450).
+
+ported to 7.3.1: the hunk is unchanged; it moves from amdgpu_dm.c's
+update_freesync_state_on_stream() to amdgpu_dm_freesync.c's
+amdgpu_dm_update_freesync_state_on_stream() (7.3 split amdgpu_dm.c upstream).
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_freesync.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_freesync.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_freesync.c
+index 89479348d..ffea05c41 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_freesync.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_freesync.c
+@@ -237,7 +237,10 @@ void amdgpu_dm_update_freesync_state_on_stream(
+ 		&vrr_infopacket,
+ 		pack_sdp_v1_3);
+ 
+-	if (new_stream->sink->sink_signal == SIGNAL_TYPE_HDMI_FRL)
++	/* Per HDMI 2.1, VTEM is valid on TMDS as well as FRL */
++	if (new_stream->sink->sink_signal == SIGNAL_TYPE_HDMI_FRL ||
++	    (new_stream->sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A &&
++	     aconn && aconn->base.display_info.hdmi.vrr_cap.supported))
+ 		mod_build_infopacket_vtem(new_stream, &vrr_params, 0, &vrr_infopacket);
+ 
+ 	new_crtc_state->freesync_vrr_info_changed |=

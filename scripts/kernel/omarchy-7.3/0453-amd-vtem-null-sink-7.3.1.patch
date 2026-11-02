@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: squeezefs venue <venue@sqz.invalid>
+Date: Mon, 2 Nov 2026 09:55:51 -0500
+Subject: [PATCH] drm/amd/display: test the stream's signal, not its sink's,
+ for the VTEM
+
+Omarchy 0453-amd-vtem-null-sink.patch (omacom/omarchy-pkgs 99aa5aa,
+pkgbuilds/linux-omarchy): the VTEM test read new_stream->sink->sink_signal; a
+stream can have no sink, so test new_stream->signal instead.
+
+ported to 7.3.1: the hunk is unchanged; it moves to amdgpu_dm_freesync.c's
+amdgpu_dm_update_freesync_state_on_stream() (7.3 split amdgpu_dm.c upstream).
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_freesync.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_freesync.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_freesync.c
+index ffea05c41..bed7c4144 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_freesync.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_freesync.c
+@@ -238,8 +238,8 @@ void amdgpu_dm_update_freesync_state_on_stream(
+ 		pack_sdp_v1_3);
+ 
+ 	/* Per HDMI 2.1, VTEM is valid on TMDS as well as FRL */
+-	if (new_stream->sink->sink_signal == SIGNAL_TYPE_HDMI_FRL ||
+-	    (new_stream->sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A &&
++	if (new_stream->signal == SIGNAL_TYPE_HDMI_FRL ||
++	    (new_stream->signal == SIGNAL_TYPE_HDMI_TYPE_A &&
+ 	     aconn && aconn->base.display_info.hdmi.vrr_cap.supported))
+ 		mod_build_infopacket_vtem(new_stream, &vrr_params, 0, &vrr_infopacket);
+ 

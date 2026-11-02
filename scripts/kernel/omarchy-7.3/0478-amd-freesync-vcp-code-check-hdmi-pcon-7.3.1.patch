@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: squeezefs venue <venue@sqz.invalid>
+Date: Mon, 2 Nov 2026 09:57:36 -0500
+Subject: [PATCH] drm/amd/display: Restore FreeSync VCP code check for
+ HDMI/PCON sinks
+
+Omarchy 0478-amd-freesync-vcp-code-check-hdmi-pcon.patch (omacom/omarchy-pkgs
+99aa5aa, pkgbuilds/linux-omarchy); upstream submission: amd-gfx, September 2026,
+"[PATCH 52/64] drm/amd/display: Restore FreeSync VCP code check for HDMI/PCON
+sinks" (Fixes: "drm/amd/display: Consult MCCS FreeSync cap only if requested &
+supported"). An HDMI or whitelisted-PCON sink without an EDID FreeSync VCP code
+is not FreeSync-capable; that check was lost when the MCCS handling moved under
+do_mccs, so it is restored outside it.
+
+ported to 7.3.1: the hunk is unchanged; it moves from amdgpu_dm.c to
+amdgpu_dm_update_freesync_caps() in amdgpu_dm_connector.c (7.3 split amdgpu_dm.c
+upstream). 7.3.1 does not carry the fix (its only VCP test is inside do_mccs).
+The submission's KUnit test updates are not part of Omarchy's patch; 7.3.1 has
+no such tests. As in Omarchy, this runs after 0450's HF-VSDB fallback, so an
+HDMI TMDS sink without an AMD VSDB stays not FreeSync-capable.
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
+index 67fcc288a..2b34890db 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
+@@ -4051,6 +4051,12 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
+ 		}
+ 	}
+ 
++	/* HDMI/PCON without an EDID FreeSync VCP code is not FreeSync-capable. */
++	if ((sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A ||
++	     as_type == FREESYNC_TYPE_PCON_IN_WHITELIST) &&
++	    !sink->edid_caps.freesync_vcp_code)
++		freesync_capable = false;
++
+ 	/* Handle MCCS */
+ 	if (do_mccs) {
+ 		dm_helpers_read_mccs_caps(adev->dm.dc->ctx, amdgpu_dm_connector->dc_link, sink);

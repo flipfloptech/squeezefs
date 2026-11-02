@@ -194,7 +194,10 @@ const Rig = struct {
         // The applier venue's A/B lever and the flush cadence reach the
         // daemons the same way (`SQUEEZEFS_META_APPLIERS=0 zig build smoke …`
         // gates the inline arm; a short cadence pins a drain inside a row).
-        for ([_][]const u8{ "SQUEEZEFS_META_APPLIERS", "SQUEEZEFS_META_FLUSH_INTERVAL_MS", "SQUEEZEFS_META_PASS_VENUE", "SQUEEZEFS_META_WINDOW_HOLD", "SQUEEZEFS_META_ACK_POINT", "SQUEEZEFS_META_APPLY", "SQUEEZEFS_READ_CACHE_PCT", "SQUEEZEFS_READ_CACHE_FILL" }) |k| {
+        // So does stock 7.3's INIT offer (`SQUEEZEFS_TEST_FUSE_SYNCFS_UNOFFERED=1
+        // zig build smoke …`: no daemon sees a syncfs, as on 7.3, on a kernel
+        // that forwards it — decision 0003 §DB).
+        for ([_][]const u8{ "SQUEEZEFS_META_APPLIERS", "SQUEEZEFS_META_FLUSH_INTERVAL_MS", "SQUEEZEFS_META_PASS_VENUE", "SQUEEZEFS_META_WINDOW_HOLD", "SQUEEZEFS_META_ACK_POINT", "SQUEEZEFS_META_APPLY", "SQUEEZEFS_READ_CACHE_PCT", "SQUEEZEFS_READ_CACHE_FILL", "SQUEEZEFS_TEST_FUSE_SYNCFS_UNOFFERED" }) |k| {
             if (knobs.present(proc_env.get(k))) |v| try self.env.put(k, v);
         }
         _ = linux.mkdir(self.work.ptr, 0o755);
@@ -1384,9 +1387,17 @@ test "smoke: a TWO-MEMBER metadata set through the binary — format sqmeta://a,
     // write into every directory (homes on both members) parks its stamp
     // and size claim; the syncfs drains them, one entry per member — never
     // an entry the facade refuses (`routing_split_refused`, EIO, every
-    // refinement parked forever).
+    // refinement parked forever). Where syncfs reaches no daemon (the
+    // mount's probe, charter §3) each file's fsync lands its custody and
+    // claim, and the fsync of the root drains the rest by the same drain.
     {
-        const out = try rig.onMount("for d in $(seq 0 7); do dd if=/dev/zero of=r$d/big bs=32k count=1 status=none && dd if=/dev/zero of=r$d/big bs=512 count=1 conv=notrunc status=none; done; sync -f . && echo synced");
+        const reaches = blk: {
+            const st0 = try rig.stats();
+            defer gpa.free(st0);
+            break :blk syncfsAbsent(st0) == null;
+        };
+        var drain_script: [512]u8 = undefined;
+        const out = try rig.onMount(try std.fmt.bufPrint(&drain_script, "for d in $(seq 0 7); do dd if=/dev/zero of=r$d/big bs=32k count=1 status=none && dd if=/dev/zero of=r$d/big bs=512 count=1 conv={s} status=none; done; {s} && echo synced", .{ if (reaches) "notrunc" else "notrunc,fsync", if (reaches) "sync -f ." else fsyncdir_script ++ " ." }));
         defer gpa.free(out);
         try testing.expectEqualStrings("synced\n", out);
         const st = try rig.stats();
@@ -6572,11 +6583,12 @@ test "smoke: THE HANDOVER DRAINS PARKED STAMPS (rung 10 item 4) — A (the manag
     var pair: [2][]const u8 = undefined;
     {
         var script_buf: [256]u8 = undefined;
-        // `sync -f`: the syncfs lands the files' custody and journals their
-        // size claims (the ordered law, decision 0003 §AL.5) — an fsync of
-        // `d` journals only what already landed, and the flush cadence is
-        // held a minute away, so their claims would stay parked at A.
-        const out = try rig.onMount(try std.fmt.bufPrint(&script_buf, "mkdir d && i=0; while [ $i -lt {d} ]; do dd if=/dev/zero of=d/f$i bs=32k count=1 status=none; i=$((i+1)); done; sync -f d; stat -c '%n %i' d/f*", .{handover_row_files}));
+        // Each file's fsync lands its custody and journals its size claim
+        // (the ordered law, decision 0003 §AL.5), then the fsync of `d`
+        // journals every stamp still parked — the flush cadence is held a
+        // minute away, so they would stay parked at A. (Not `sync -f`: on
+        // a kernel that never forwards syncfs it reaches no daemon, §3.)
+        const out = try rig.onMount(try std.fmt.bufPrint(&script_buf, "mkdir d && i=0; while [ $i -lt {d} ]; do dd if=/dev/zero of=d/f$i bs=32k count=1 conv=fsync status=none; i=$((i+1)); done; " ++ fsyncdir_script ++ " d; stat -c '%n %i' d/f*", .{handover_row_files}));
         defer gpa.free(out);
         var inos_of: [handover_row_files]u64 = undefined;
         var names_of: [handover_row_files][]const u8 = undefined;
@@ -7241,7 +7253,10 @@ fn expectCustodyKeptThroughSync(b: *Peer) !void {
     gpa.free(sy);
     const after = try b.stats();
     defer gpa.free(after);
-    try testing.expect(numberAfter(after, "\"fuse_syncfs\":").? > numberAfter(before, "\"fuse_syncfs\":").?);
+    // The sync reached B exactly when syncfs reaches a daemon on this
+    // kernel (B's probe, charter §3); custody stays parked either way.
+    const reached = numberAfter(after, "\"fuse_syncfs\":").? > numberAfter(before, "\"fuse_syncfs\":").?;
+    try testing.expectEqual(syncfsAbsent(after) == null, reached);
     try testing.expectEqual(numberAfter(before, "\"syncfs_custody_inos\":"), numberAfter(after, "\"syncfs_custody_inos\":"));
 }
 
@@ -13576,7 +13591,7 @@ test "smoke: THE READ VIEW — a 16 MiB striped file (no write cache), its custo
     _ = try rig.awaitReady(0);
     const file_len: u64 = 16 << 20;
     var script: [512]u8 = undefined;
-    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "head -c {d} /dev/urandom > pattern && cp pattern {s}/f && sync -f {s}", .{ file_len, rig.mp, rig.mp })));
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "head -c {d} /dev/urandom > pattern && dd if=pattern of={s}/f bs=1M conv=fsync status=none", .{ file_len, rig.mp })));
     var fb: [192]u8 = undefined;
     const f = try std.fmt.bufPrintSentinel(&fb, "{s}/f", .{rig.mp}, 0);
     var pb: [linux.PATH_MAX]u8 = undefined;
@@ -13645,7 +13660,7 @@ test "smoke: THE READ VIEW — a 16 MiB striped file (no write cache), its custo
     try testing.expect(numberAfter(t2, "\"read_view_stale\":").? > numberAfter(t1, "\"read_view_stale\":").?);
     // An overwrite of page 5 (its publish lands a new binding): the view
     // stales again and the new bytes read back.
-    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "head -c 4096 /dev/urandom > page && dd if=page of={s}/f bs=4096 seek=5 conv=notrunc status=none && dd if=page of=pattern bs=4096 seek=5 conv=notrunc status=none && sync -f {s}", .{ rig.mp, rig.mp })));
+    gpa.free(try rig.shOk(rig.work, try std.fmt.bufPrint(&script, "head -c 4096 /dev/urandom > page && dd if=page of={s}/f bs=4096 seek=5 conv=notrunc,fsync status=none && dd if=page of=pattern bs=4096 seek=5 conv=notrunc status=none", .{rig.mp})));
     try aioRandomReads(f, pattern, 6 * 4096, 32, 4, 4);
     const t3 = try rig.stats();
     defer gpa.free(t3);
@@ -14632,6 +14647,10 @@ fn syncfsAbsent(st: []const u8) ?[]const u8 {
 }
 
 const syncfs_absent_line = "this kernel does not send FUSE_SYNCFS (upstream from 7.4): syncfs/sync do not make staged data durable; fsync does";
+
+/// fsync(2) of the directory its one argument names (FUSE_FSYNCDIR: every
+/// parked stamp journaled). Not `sync DIR`: uutils' is a host-wide sync(2).
+const fsyncdir_script = "python3 -c 'import os, sys; os.fsync(os.open(sys.argv[1], os.O_RDONLY))'";
 
 test "smoke: THE FUSE_SYNCFS PROBE AT MOUNT (charter §3, decision 0003 §DB) — the bring-up's syncfs(2) on the mount is judged by whether a FUSE_SYNCFS arrived: `fuse_syncfs_reaches` equals INIT's negotiation (`fuse_syncfs_armed`), the probe's syncfs counted apart (`fuse_syncfs_probes` = reaches, `fuse_syncfs` 0 at ready) and named in the log — the loud line when absent; an application's `sync -f` then counts in `fuse_syncfs` iff it reaches; under SQUEEZEFS_TEST_FUSE_SYNCFS_UNOFFERED (the INIT offer as stock 7.3 sends it) the probe reads absent, the loud line once, and `sync -f` reaches no daemon code" {
     const io = testing.io;
@@ -16646,6 +16665,17 @@ test "smoke: THE STAGED READ'S IDENTITY WINDOW — a 256 KiB staged file; an O_D
     try rig.formatSet(true);
     try rig.mountAsSet(&.{});
     _ = try rig.awaitReady(0);
+    // The promotion the window meets is a syncfs's: it exists only where
+    // syncfs reaches the daemon (the mount's probe, charter §3).
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        if (syncfsAbsent(st)) |why| {
+            try rig.umount();
+            _ = try rig.waitChild();
+            return testkit.skip(@src(), .no_kernel_feature, why);
+        }
+    }
     var released = false;
     defer if (!released) releaseHold(fifo);
     var script: [512]u8 = undefined;

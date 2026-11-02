@@ -938,8 +938,10 @@ fn mountLeg(transport: configfs.Trtype) !void {
     defer gpa.free(rr);
     try testing.expectEqualStrings(pr_key, json_scan.string(rr, "holder_key").?);
     try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
-    // 8 MiB written and synced; its checksum.
-    const sum = try rig.onMount(a, "head -c 8388608 /dev/urandom > payload && sync -f . && cksum payload | cut -d' ' -f1");
+    // 8 MiB written and synced by the file (`sync -d`: the kill below needs
+    // a durability point, and syncfs reaches no daemon on a stock 7.3 —
+    // decision 0003 §DB.3); its checksum.
+    const sum = try rig.onMount(a, "head -c 8388608 /dev/urandom > payload && sync -d payload && cksum payload | cut -d' ' -f1");
     defer gpa.free(sum);
     // A second mount under a SECOND identity pair (its own connect of the
     // meta share): refused — the claim is fresh (the ladder's first rung).
@@ -1284,7 +1286,7 @@ test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with
         try testing.expect(std.mem.indexOf(u8, stx, try std.fmt.bufPrint(&needle, "{s} {s}\n  iopolicy round-robin; head {s}; 2 path(s)\n", .{ sub0, data_nqn, head })) != null);
     }
     // The write workload: four 64 MiB files in parallel, synced.
-    const sums = try rig.onMount(a, "for i in 1 2 3 4; do head -c 67108864 /dev/urandom > p$i & done; wait; sync -f . && cksum p1 p2 p3 p4 | cut -d' ' -f1");
+    const sums = try rig.onMount(a, "for i in 1 2 3 4; do head -c 67108864 /dev/urandom > p$i & done; wait; sync -d p1 p2 p3 p4 && cksum p1 p2 p3 p4 | cut -d' ' -f1");
     defer gpa.free(sums);
     var after_write: [16]multipath.BlockStat = undefined;
     try pathStats(rig, insts, &nodes, &after_write);
@@ -1395,7 +1397,8 @@ test "nvmet fidelity: sigstop-preempt — a SIGSTOPped holder is preempted by a 
     const meta_uri = set.metaUri();
     const a = try rig.spawnMount("sa", meta_uri, null, &.{});
     try rig.awaitLog(a, "ready: ", ready_wait_ns);
-    const w0 = try rig.onMount(a, "echo before > f && sync -f .");
+    // Synced by the file, so A's write has landed before the STOP (§DB.3).
+    const w0 = try rig.onMount(a, "echo before > f && sync -d f");
     gpa.free(w0);
     // Stop A: its claim ages past T_owner (45 s) and its beats stop.
     _ = linux.kill(rig.daemons.items[a].pid, .STOP);

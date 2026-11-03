@@ -35,6 +35,11 @@
 //!         then departs (B3: it never unregisters a hold that is ours).
 //!   5 L   a PTPL-less target power cycle: every registration and the hold
 //!         forgotten.
+//!   6 R0  M0's recovery thread finishing a death it ran when frozen: the
+//!         report (does host A — our key under our host id — hold?) then its
+//!         fencer's preempt of a host-B member's key; the two under the
+//!         fencer's lock, which the heartbeat's re-register and check take
+//!         too (review M1 of decision 0003 §DG).
 //!
 //! `Member` — the manager MG on host A holds, its fencing registrant F_A (a
 //! write-free second identity of host A under host A's key, a NON-holder)
@@ -154,8 +159,21 @@ pub const ElectionConfig = struct {
     p2: bool = true,
     fencer_key: FencerKey = .host,
     /// M0, resumed, finishes a recovery it ran when frozen: its fencer's
-    /// death preempt of a host-B member's key.
+    /// death preempt of a host-B member's key (thread R0).
     m0_fences: bool = true,
+    /// Review M1: a fencer preempts only after a report shows its host
+    /// holding, and a re-registered fencer is taken back when the host does
+    /// not hold (false: neither check).
+    fencer_hold_check: bool = true,
+    /// The fencer's lock: the recovery's check and preempt, the heartbeat's
+    /// re-register and check, each one critical section (false: separate
+    /// steps nothing orders).
+    fencer_lock: bool = true,
+    /// The lapse's claim read and its re-acquire as separate steps (true:
+    /// the code's order — the claim probe, then the register and acquire —
+    /// with a successor's bind between them; shown reachable, an accepted
+    /// instant of the lapse class, §DF.13(k), §DG.13(h)).
+    lapse_acquire_split: bool = false,
 };
 
 const Line = enum(u8) { none, p, m, pm };
@@ -200,18 +218,28 @@ fn successorOrder(cfg: ElectionConfig, t: usize) Order {
 pub fn Election(comptime cfg: ElectionConfig) type {
     return extern struct {
         const Self = @This();
-        pub const thread_count: usize = 6;
+        pub const thread_count: usize = 7;
         const order = [3]Order{ .{}, successorOrder(cfg, 1), successorOrder(cfg, 2) };
         const HOST = [3]u8{ A, B, C };
         const SA_END = 3;
         const JB_DEPART = 3;
         const JB_END = 4;
-        const M0_STEPS: u8 = 3 + @as(u8, @intFromBool(cfg.m0_fences));
+        /// Write, the beat (report; after a lapse the host's register), the
+        /// acquire, the fencer's re-register, the check, write.
+        const M0_STEPS: u8 = 6;
+        const R0 = 6;
 
         reg: [3]bool = .{ true, false, false },
         /// Each host's fencing registrant registered (M0 stood host A's at
         /// its hold).
         reg_f: [3]bool = .{ true, false, false },
+        /// M0's beat found the lapse and registered host A (the re-acquire's
+        /// remaining steps run).
+        m0_lapsed: bool = false,
+        /// The fencer's lock (FREE, M0 or R0).
+        flock: u8 = FREE,
+        /// R0's report showed host A holding.
+        r0_ok: bool = false,
         /// The holder's host (NONE: unreserved).
         holder: u8 = A,
         /// The holder is that host's FENCER, not the host (nvmet's preempt of
@@ -223,7 +251,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         claim: u8 = 0,
         /// Appender 0's Live page names this manager (NONE: Free).
         page0: u8 = 0,
-        pc: [6]u8 = @splat(0),
+        pc: [7]u8 = @splat(0),
         alive: [3]bool = @splat(true),
         bound: [3]bool = .{ true, false, false },
         failed: [3]bool = @splat(false),
@@ -254,6 +282,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         overwrote_acked: bool = false,
         preempted_live: bool = false,
         fencer_held: bool = false,
+        fencer_preempt_unheld: bool = false,
         hit_lapse: bool = false,
         hit_register: bool = false,
 
@@ -320,6 +349,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
                 3 => self.pc[3] >= SA_END,
                 4 => self.pc[4] >= JB_END,
                 5 => self.pc[5] >= 1,
+                R0 => !cfg.m0_fences or self.pc[R0] >= 2 or !self.alive[0],
                 else => unreachable,
             };
         }
@@ -327,13 +357,33 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         pub fn step(self: *Self, t: usize) void {
             switch (t) {
                 0 => {
-                    const k = self.pc[0];
-                    if (cfg.m0_fences and k == 0) {
-                        self.m0FencerPreempt();
-                    } else if (k - @intFromBool(cfg.m0_fences) == 1) {
-                        if (!self.m0Beat()) return;
-                    } else self.m0Write();
+                    switch (self.pc[0]) {
+                        0, 5 => self.m0Write(),
+                        1 => if (!self.m0Beat()) return,
+                        2 => self.m0Acquire(),
+                        3 => if (!self.m0FencerRegister()) return,
+                        4 => self.m0FencerCheck(),
+                        else => unreachable,
+                    }
                     self.pc[0] += 1;
+                },
+                R0 => {
+                    if (self.pc[R0] == 0) {
+                        if (cfg.fencer_lock) {
+                            if (self.flock != FREE) return;
+                            self.flock = R0;
+                        }
+                        self.r0_ok = !cfg.fencer_hold_check or self.holds(A);
+                        if (!self.r0_ok) {
+                            if (self.flock == R0) self.flock = FREE;
+                            self.pc[R0] = 2;
+                            return;
+                        }
+                    } else {
+                        self.m0FencerPreempt();
+                        if (self.flock == R0) self.flock = FREE;
+                    }
+                    self.pc[R0] += 1;
                 },
                 1, 2 => self.successor(@intCast(t)),
                 3 => self.ruleRunner(3, A, SA_END),
@@ -380,7 +430,8 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         /// The heartbeat's PR re-check (`gate.prRecheck`). False = waiting
         /// for host A's registry lock (the re-register).
         fn m0Beat(self: *Self) bool {
-            if (self.keyHolds(A)) return true;
+            // The report: held by host A (our key under our host id).
+            if (self.holds(A)) return true;
             if (self.holder != NONE) {
                 self.failed[0] = true; // usurped
                 return true;
@@ -391,11 +442,42 @@ pub fn Election(comptime cfg: ElectionConfig) type {
             }
             if (self.busy(A, 0)) return false;
             self.reg[A] = true;
-            // The re-acquire re-registers the fencer the lapse forgot.
-            self.reg_f[A] = true;
-            self.holder = A;
-            self.m0_reacquired = true;
+            self.m0_lapsed = true;
+            if (!cfg.lapse_acquire_split) self.m0Acquire();
             return true;
+        }
+
+        /// The re-acquire's hold: an acquire on an unreserved namespace; a
+        /// reservation standing (a successor's, since the register) or our
+        /// registration gone conflicts — `reacquire_failed`, fail-stop.
+        fn m0Acquire(self: *Self) void {
+            if (!self.m0_lapsed or self.m0_reacquired or self.failed[0]) return;
+            if (self.holder == NONE and self.reg[A]) {
+                self.holder = A;
+                self.m0_reacquired = true;
+            } else if (!self.holds(A)) self.failed[0] = true;
+        }
+
+        /// The fencer's re-register (the lapse forgot it), under its lock.
+        /// False = waiting for the lock.
+        fn m0FencerRegister(self: *Self) bool {
+            if (!self.m0_lapsed) return true;
+            if (cfg.fencer_lock) {
+                if (self.flock != FREE and self.flock != 0) return false;
+                self.flock = 0;
+            }
+            self.reg_f[A] = true;
+            return true;
+        }
+
+        /// Review M1: the host must still hold, else the fencer is taken back
+        /// and the volume usurped; the lock released.
+        fn m0FencerCheck(self: *Self) void {
+            if (self.m0_lapsed and cfg.fencer_hold_check and !self.holds(A)) {
+                self.reg_f[A] = false;
+                self.failed[0] = true;
+            }
+            if (self.flock == 0) self.flock = FREE;
         }
 
         /// M0's fencer preempts a host-B member's key. Its registration gone,
@@ -406,6 +488,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         /// else every registrant of the key goes, the reservation kept.
         fn m0FencerPreempt(self: *Self) void {
             if (!self.reg_f[A]) return;
+            if (!self.holds(A)) self.fencer_preempt_unheld = true;
             if (self.keyHolds(B)) {
                 self.holder = A;
                 self.holder_fencer = true;
@@ -652,6 +735,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
             if (self.wrote_unheld) return error.WroteUnheld;
             if (self.overwrote_acked) return error.OverwroteAcked;
             if (self.fenced_wrote) return error.FencedWrote;
+            if (self.fencer_preempt_unheld) return error.FencerPreemptUnheld;
             if (self.fencer_held) return error.FencerHeld;
             if (cfg.structural and (!self.lapse_happened or cfg.strict.lapse)) {
                 var managers: u8 = 0;
@@ -1033,7 +1117,7 @@ fn firstError(comptime M: type) ?anyerror {
     return null;
 }
 
-test "model: the election as built (WERO, the claim probed before the registration, again right before the hold and again under it — a writer this open's preempt fenced taken over —, the rule judging a manager by the report then appender 0's page with `p` retired at enrolment, the re-judge, the lapse's claim check, a hold taken by a preempt kept at the last clean unmount, the departure that keeps our hold; every manager's fencing registrant under its host's key, the superseded manager's resumed fencer preempt) holds — no current manager killed or preempted live, no write over a live claim, outside its own hold or from a view a later manager's acked metadata superseded, no fenced write, no fencer holding, one manager, never unreserved under the current manager" {
+test "model: the election as built (WERO, the claim probed before the registration, again right before the hold and again under it — a writer this open's preempt fenced taken over —, the rule judging a manager by the report then appender 0's page with `p` retired at enrolment, the re-judge, the lapse's claim check, a hold taken by a preempt kept at the last clean unmount, the departure that keeps our hold; every manager's fencing registrant under its host's key, the superseded manager's resumed fencer preempt under the fencer's lock after a report shows its host holding, the lapse's re-acquire as separate commands with the fencer taken back when its host does not hold) holds — no current manager killed or preempted live, no write over a live claim, outside its own hold or from a view a later manager's acked metadata superseded, no fenced write, no fencer preempt while its host does not hold, no fencer holding, one manager, never unreserved under the current manager" {
     try explorer.expectHolds(Election(.{}), limits);
     const r = try statesOf(Election(.{}));
     std.debug.print("\nhost fence model (election): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
@@ -1061,7 +1145,17 @@ test "model weakening (§DG.2): a fencer under a key of its own outlives its hos
     try explorer.expectFails(Member(.{ .semantics = .nvmet, .fencer_key = .distinct }), limits, error.InvariantViolated);
     try explorer.expectFails(Member(.{ .semantics = .nvmet, .fencer_key = .distinct, .merged_path = true }), limits, error.InvariantViolated);
     try explorer.expectFails(Election(.{ .fencer_key = .distinct }), limits, error.InvariantViolated);
-    try testing.expectEqual(@as(?anyerror, error.FencerHeld), firstError(Election(.{ .fencer_key = .distinct })));
+}
+
+test "model, an accepted instant (§DG.13(h)): the lapse's claim probe and its re-acquire are separate commands — a successor binding between them leaves the resumed manager re-acquiring on a stale view (OverwroteAcked); the claim's TTL and the lapse class bound it" {
+    try explorer.expectFails(Election(.{ .lapse_acquire_split = true }), limits, error.InvariantViolated);
+}
+
+test "model weakening (review M1 of §DG): without the hold checks a fencer re-registered after a successor preempted its host's key (the lapse's re-acquire, the fencer's re-register as separate commands) preempts while its host does not hold — and takes the successor's reservation; without the fencer's lock the recovery's check and preempt straddle the takeover and the re-register" {
+    try explorer.expectFails(Election(.{ .fencer_hold_check = false }), limits, error.InvariantViolated);
+    try testing.expectEqual(@as(?anyerror, error.FencerPreemptUnheld), firstError(Election(.{ .fencer_hold_check = false })));
+    try explorer.expectFails(Election(.{ .fencer_lock = false }), limits, error.InvariantViolated);
+    try testing.expectEqual(@as(?anyerror, error.FencerPreemptUnheld), firstError(Election(.{ .fencer_lock = false })));
 }
 
 test "model: under multipath=Y a fencer under its host's key is fenced with the host — a write routed through its path is refused (an availability cost, never a breach)" {
@@ -1193,7 +1287,9 @@ test "model: which invariant each weakening breaks" {
     try expectBreaks("nvmet 7.3 without the fencer (§DF.11)", firstError(Member(.{ .semantics = .nvmet, .fencer = false })), &.{error.FencedMemberWrote});
     try expectBreaks("a fencer key of its own (§DG.2)", firstError(Member(.{ .semantics = .nvmet, .fencer_key = .distinct })), &.{error.FencedHostRegistered});
     try expectBreaks("a fencer key of its own under multipath=Y (§DG.2)", firstError(Member(.{ .semantics = .nvmet, .fencer_key = .distinct, .merged_path = true })), &.{ error.FencerWrote, error.FencedHostRegistered, error.FencedMemberWrote });
-    try expectBreaks("a fencer key of its own: the superseded manager's fencer (§DG.2)", firstError(Election(.{ .fencer_key = .distinct })), &.{error.FencerHeld});
+    try expectBreaks("a fencer key of its own: the superseded manager's fencer (§DG.2)", firstError(Election(.{ .fencer_key = .distinct })), &.{ error.FencerPreemptUnheld, error.FencerHeld });
+    try expectBreaks("no hold checks around the fencer (review M1)", firstError(Election(.{ .fencer_hold_check = false })), &.{error.FencerPreemptUnheld});
+    try expectBreaks("no fencer lock (review M1)", firstError(Election(.{ .fencer_lock = false })), &.{error.FencerPreemptUnheld});
     try expectBreaks("no own-key guard (§DG.4)", firstError(Member(.{ .semantics = .nvmet, .own_key_guard = false })), &.{ error.FencerFenced, error.ManagerUnreserved });
     try expectBreaks("the fencer's preempts not keeping the hold (§DG.5)", firstError(Member(.{ .semantics = .nvmet, .fencer_preempts_keep_hold = false })), &.{error.FencedMemberWrote});
     try expectBreaks("no re-fence under nvmet + fencer", firstError(Member(.{ .semantics = .nvmet, .refence = false })), &.{error.FencedMemberWrote});

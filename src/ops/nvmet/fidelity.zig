@@ -2304,6 +2304,78 @@ test "nvmet fidelity: a frozen member fenced through the manager's fencing regis
     try expectNoResidue(rig, set.data_nqn);
 }
 
+/// The manager's fencing registrant's controller of `nqn`: the one whose
+/// identity none of the rig's connects carries.
+fn fencerController(rig: *Rig, nqn: []const u8) !?initiator.Controller {
+    const ctrls = try initiator.listControllers(rig.gpa, initiator.SYSFS_ROOT);
+    defer rig.gpa.free(ctrls);
+    for (ctrls) |c| {
+        if (!std.mem.eql(u8, c.subsysnqnOf(), nqn)) continue;
+        var ours = false;
+        for ([_]initiator.HostPair{ ident_a, ident_b, ident_c }) |i| ours = ours or c.hasIdentity(i.hostnqn, i.hostid);
+        if (!ours) return c;
+    }
+    return null;
+}
+
+test "nvmet fidelity: a metadata mount pointed at the fencing registrant's namespace node is refused by name (review M3 of decision 0003 §DG) — M (host B) manages a symmetric set and stood its fencer; a mount with no explicit pair on the fencer's block node (a by-id link that picked it, a hand-typed path) never registers there: it exits naming the fencer, and the fencer's registration under M's key stands (no own-stale ladder unregistered it)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "fz", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    const m = try rig.spawnMount("fz-m", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const key_m = try statString(rig, m, "pr_key");
+    defer gpa.free(key_m);
+    const fc = (try fencerController(rig, set.meta_nqn)) orelse return error.NoFencerController;
+    const ns = (try initiator.controllerNamespace(gpa, initiator.SYSFS_ROOT, fc.instance)) orelse return error.NoFencerNamespace;
+    var nb: [40]u8 = undefined;
+    var ub: [64]u8 = undefined;
+    const meta_uri_f = try std.fmt.bufPrint(&ub, "sqmeta://{s}", .{ns.blockPath(&nb)});
+    var env_z = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", "3000");
+    defer env_z.deinit();
+    _ = env_z.swapRemove(hostnqn_knob);
+    _ = env_z.swapRemove(hostid_knob);
+    const z = try rig.spawnMountEnv("fz-z", meta_uri_f, &env_z, &.{});
+    try testing.expect(!(try readyOrDead(rig, z)));
+    {
+        const text = try rig.readLog(z);
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "fencing registrant") != null);
+    }
+    {
+        // The fencer still registered under M's key beside M's host.
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(usize, 3), std.mem.count(u8, rr, key_m));
+        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
+    }
+    try rig.umount(m);
+    // Whatever the refused mount connected on the data subsystem is the rig's
+    // to sweep (its identity is the host's derived one).
+    for ([_][]const u8{ set.data_nqn, set.meta_nqn }) |nqn| {
+        const ctrls = try initiator.listControllers(gpa, initiator.SYSFS_ROOT);
+        defer gpa.free(ctrls);
+        for (ctrls) |c| if (std.mem.eql(u8, c.subsysnqnOf(), nqn) and !c.hasIdentity(ident_a.hostnqn, ident_a.hostid) and !c.hasIdentity(ident_b.hostnqn, ident_b.hostid)) {
+            initiator.deleteController(c.instance) catch {};
+            _ = initiator.awaitControllerGone(c.instance);
+        };
+    }
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
 /// A stats string that must be present, owned by the caller.
 fn statString(rig: *Rig, d: usize, key: []const u8) ![]u8 {
     const st = try rig.stats(d);

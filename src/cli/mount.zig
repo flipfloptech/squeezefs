@@ -564,7 +564,10 @@ fn mountMain(ctx: *Ctx) u8 {
         .promote_kill_after_commit = knobs.boolKnob("SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT", env),
         .landing_hold = switch (knobs.intKnob("SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", u64, env)) {
             0 => null,
-            else => |n| .{ .at_write = n, .fire = &holdLandingFromWrite },
+            else => |n| blk: {
+                armLandingRelease(env);
+                break :blk .{ .at_write = n, .fire = &holdLandingFromWrite };
+            },
         },
         .barrier_hold = switch (knobs.intKnob("SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS", u32, env)) {
             0 => null,
@@ -1829,10 +1832,63 @@ const AtimeWatch = struct {
 
 /// The landing-hold seam's trigger (`SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE`):
 /// from this write on, every window stays on the lane un-issued until the
-/// daemon dies — what landed before it stays landed.
+/// daemon dies — what landed before it stays landed — or until the release
+/// FIFO is opened (`SQUEEZEFS_TEST_LANDING_HOLD_RELEASE`).
 fn holdLandingFromWrite(at_write: u64) void {
     journal_lane.test_seams.delay_issue.store(1, .release);
     log.warn("test seam: SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE — journal writes are held un-issued from write {d} on; acked metadata from here lives in the journal tail alone", .{at_write});
+    if (landing_release_len == 0) return;
+    const t = std.Thread.spawn(.{}, landingReleaseMain, .{}) catch |e| {
+        log.warn("test seam: SQUEEZEFS_TEST_LANDING_HOLD_RELEASE — its waiter could not start ({s}); the hold stays for the daemon's life", .{@errorName(e)});
+        return;
+    };
+    t.detach();
+}
+
+/// `SQUEEZEFS_TEST_LANDING_HOLD_RELEASE`'s FIFO path (empty: off), read once
+/// at the mount's setup.
+var landing_release_buf: [linux.PATH_MAX]u8 = undefined;
+var landing_release_len: usize = 0;
+
+fn armLandingRelease(env: *const std.process.Environ.Map) void {
+    const p = knobs.parseStr(env.get("SQUEEZEFS_TEST_LANDING_HOLD_RELEASE")) orelse return;
+    if (std.mem.eql(u8, p, "off") or p.len >= landing_release_buf.len) return;
+    @memcpy(landing_release_buf[0..p.len], p);
+    landing_release_buf[p.len] = 0;
+    landing_release_len = p.len;
+}
+
+/// The release's waiter: the FIFO's read end open (non-blocking, so a
+/// writer's open never waits on this thread being scheduled), then a writer's
+/// open-and-close (the read end's hang-up) clears the hold, and the lane
+/// issues every window it kept at its next poll (a frozen member's acked
+/// windows landing after its resume).
+fn landingReleaseMain() void {
+    var nb: thread_name.CommBuf = undefined;
+    _ = thread_name.nameCurrentThread(&nb, "sqz-seam");
+    const path = landing_release_buf[0..landing_release_len :0];
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) {
+        log.warn("test seam: SQUEEZEFS_TEST_LANDING_HOLD_RELEASE — {s} could not be opened ({t}); the hold stays", .{ path, linux.errno(rc) });
+        return;
+    }
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    log.warn("test seam: SQUEEZEFS_TEST_LANDING_HOLD_RELEASE — the release waits on {s}", .{path});
+    var pfd = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    while (true) {
+        const pr = linux.poll(&pfd, 1, -1);
+        switch (linux.errno(pr)) {
+            .SUCCESS => if (pr > 0) break,
+            .INTR => {},
+            else => |e| {
+                log.warn("test seam: SQUEEZEFS_TEST_LANDING_HOLD_RELEASE — the wait on {s} failed ({t}); the hold stays", .{ path, e });
+                return;
+            },
+        }
+    }
+    journal_lane.test_seams.delay_issue.store(0, .release);
+    log.warn("test seam: SQUEEZEFS_TEST_LANDING_HOLD_RELEASE released — the held journal writes are issued from here", .{});
 }
 
 /// The fsync-hold seam's trigger (`SQUEEZEFS_TEST_BARRIER_HOLD_FSYNCS`):

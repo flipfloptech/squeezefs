@@ -1569,14 +1569,17 @@ pub const JournalLane = struct {
             if (c.first_err) |e| {
                 stats.write_failures.inc();
                 if (self.latch.admitsLine(.window_write)) log.warn("journal lane {d}: window [{d}, {d}) write failed: {s} — rolling back {d} entries", .{ self.index, c.window.start, c.window.end(), @errorName(e), c.entries });
+                // The fence rung FIRST — before the rollback hook, whose
+                // ACKED-window arm fail-stops the volume (a fence classified
+                // after it found the latch set and was never counted: the
+                // gate's sigstop-preempt row under load). A reservation
+                // conflict on an entry-write CQE latches FAILED at once; the
+                // generic 3-count below is then a no-op on a latched volume.
+                if (self.latch.classifyFence(e, "an entry-write CQE") == .latched) stats.volumes_failed.inc();
                 if (self.hooks.rollback) |f| {
                     f(self.hooks.ctx, SeqSpan.stamped(c.seq_base, c.window.len), c.window);
                     stats.rollbacks.inc();
                 }
-                // The fence rung FIRST: a reservation conflict on an
-                // entry-write CQE latches FAILED at once; the generic
-                // 3-count below is then a no-op on a latched volume.
-                if (self.latch.classifyFence(e, "an entry-write CQE") == .latched) stats.volumes_failed.inc();
                 self.noteJournalFailure();
                 // The reserved range is a PERMANENT hole (same-page successors
                 // of a dead chain are undiscoverable): checkpoint past it.

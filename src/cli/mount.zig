@@ -561,6 +561,7 @@ fn mountMain(ctx: *Ctx) u8 {
         .write_postlude_hold = knobs.boolKnob("SQUEEZEFS_TEST_WRITE_POSTLUDE_HOLD", env),
         .syncfs_keeps_custody = knobs.boolKnob("SQUEEZEFS_TEST_SYNCFS_KEEPS_CUSTODY", env),
         .foreign_claim_hold = claimHoldPath(env),
+        .corpse_destroy_hold = corpseDestroyHoldPath(env),
         .promote_kill_after_commit = knobs.boolKnob("SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT", env),
         .landing_hold = switch (knobs.intKnob("SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", u64, env)) {
             0 => null,
@@ -1290,6 +1291,12 @@ fn grantSizeEpoch(ctx: *anyopaque, object: u64) u64 {
 /// `SQUEEZEFS_TEST_FOREIGN_CLAIM_HOLD` (a FIFO path; unset or `off` = none).
 fn claimHoldPath(env: *const std.process.Environ.Map) ?[]const u8 {
     const raw = knobs.parseStr(env.get("SQUEEZEFS_TEST_FOREIGN_CLAIM_HOLD")) orelse return null;
+    return if (std.mem.eql(u8, raw, "off")) null else raw;
+}
+
+/// `SQUEEZEFS_TEST_CORPSE_DESTROY_HOLD` (a path; unset or `off` = none).
+fn corpseDestroyHoldPath(env: *const std.process.Environ.Map) ?[]const u8 {
+    const raw = knobs.parseStr(env.get("SQUEEZEFS_TEST_CORPSE_DESTROY_HOLD")) orelse return null;
     return if (std.mem.eql(u8, raw, "off")) null else raw;
 }
 

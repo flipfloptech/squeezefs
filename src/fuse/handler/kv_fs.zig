@@ -539,6 +539,9 @@ pub const Options = struct {
     /// write parks between its publish and its claim until a writer opens
     /// this FIFO (null = no hold).
     foreign_claim_hold: ?[]const u8 = null,
+    /// `SQUEEZEFS_TEST_CORPSE_DESTROY_HOLD`: no gathered corpse is
+    /// destroyed until a file exists at this path (null = no hold).
+    corpse_destroy_hold: ?[]const u8 = null,
     /// `SQUEEZEFS_TEST_PROMOTE_KILL_AFTER_COMMIT`: the daemon SIGKILLs
     /// itself between a staged file's promotion commit and its ring release.
     promote_kill_after_commit: bool = false,
@@ -764,6 +767,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// `Options.foreign_claim_hold`; `foreign_claim_held` once it held.
         foreign_claim_hold: ?[]const u8 = null,
         foreign_claim_held: std.atomic.Value(bool) = .init(false),
+        /// `Options.corpse_destroy_hold`; `corpse_destroy_released` once the
+        /// release file was found, `corpse_destroy_said` once the hold logged.
+        corpse_destroy_hold: ?[]const u8 = null,
+        corpse_destroy_released: std.atomic.Value(bool) = .init(false),
+        corpse_destroy_said: std.atomic.Value(bool) = .init(false),
         /// `Options.landing_hold`; `writes_seen` counts the FUSE writes
         /// toward it.
         landing_hold: ?LandingHold = null,
@@ -906,6 +914,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .write_hold = opts.write_postlude_hold,
                 .syncfs_keeps_custody = opts.syncfs_keeps_custody,
                 .foreign_claim_hold = opts.foreign_claim_hold,
+                .corpse_destroy_hold = opts.corpse_destroy_hold,
                 .promote_kill_after_commit = opts.promote_kill_after_commit,
                 .landing_hold = opts.landing_hold,
                 .barrier_hold = opts.barrier_hold,
@@ -2583,6 +2592,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// stops there: the next tick retries it (charter §5.3 "Space": a
         /// full heap is a posture, never terminal — deletes return room).
         fn drainGather(self: *Self, c: *Ctx, min_batch: usize, tick: bool) Error!void {
+            if (self.destroysHeld()) return;
             while (true) {
                 var batch: [RECLAIM_BATCH]u64 = undefined;
                 var n: usize = 0;
@@ -2606,6 +2616,21 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 }
             }
             if (tick and self.space_deferred.swap(false, .acq_rel)) log.info("kv_fs: the deferred corpse destroys landed — the metadata heap took every one", .{});
+        }
+
+        /// `SQUEEZEFS_TEST_CORPSE_DESTROY_HOLD`: true while no file exists at
+        /// the seam's path (the corpses stay gathered; the cadence never
+        /// parks on it). Said once; released for good at the first find.
+        fn destroysHeld(self: *Self) bool {
+            const path = self.corpse_destroy_hold orelse return false;
+            if (self.corpse_destroy_released.load(.acquire)) return false;
+            Io.Dir.cwd().access(self.io, path, .{}) catch {
+                if (!self.corpse_destroy_said.swap(true, .acq_rel)) log.info("kv_fs: SQUEEZEFS_TEST_CORPSE_DESTROY_HOLD — no corpse is destroyed until {s} exists ({d} gathered)", .{ path, self.corpses_pending.load(.acquire) });
+                return true;
+            };
+            self.corpse_destroy_released.store(true, .release);
+            log.info("kv_fs: SQUEEZEFS_TEST_CORPSE_DESTROY_HOLD released — the gathered corpses are destroyed", .{});
+            return false;
         }
 
         /// The corpses a destroy pass left for a later one: the heap refused

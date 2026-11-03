@@ -17727,6 +17727,396 @@ test "smoke: AN UNLINKED FILE STILL OPEN READS AND WRITES ITS BYTES UNTIL ITS CL
     _ = try fsckClean(rig, "the orderly unmount after the unlinked open files");
 }
 
+/// THE DESCRIPTOR HOLDER (the cross-member delete row): a python3 process
+/// holding descriptors on one mount across another member's ops, driven a
+/// line at a time over pipes — every answer ends `END`. `open NAME`
+/// (O_RDWR; answers the ino), `read NAME LEN` (pread at 0: the length, a
+/// sha256 prefix and whether every byte is zero), `fstat NAME`, `write NAME
+/// OFF LEN HEXBYTE`, `fsync NAME`, `ftruncate NAME LEN`, `mmap NAME LEN`
+/// (MAP_SHARED, read whole in a forked child: a SIGBUS is answered, never
+/// fatal), `close NAME`; a failed call answers its errno's name.
+const fd_holder_py =
+    \\import errno, hashlib, mmap, os, signal, sys
+    \\fds = {}
+    \\def say(s):
+    \\    sys.stdout.write(s + "\n")
+    \\def ename(e):
+    \\    return errno.errorcode.get(e.errno, str(e.errno))
+    \\def digest(b):
+    \\    return "len=%d sha=%s zeros=%d" % (len(b), hashlib.sha256(b).hexdigest()[:16], 1 if b.count(0) == len(b) else 0)
+    \\def mapped(fd, n):
+    \\    r, w = os.pipe()
+    \\    pid = os.fork()
+    \\    if pid == 0:
+    \\        os.close(r)
+    \\        try:
+    \\            out = "ok " + digest(mmap.mmap(fd, n, mmap.MAP_SHARED, mmap.PROT_READ)[:])
+    \\        except OSError as e:
+    \\            out = "err=" + ename(e)
+    \\        os.write(w, out.encode())
+    \\        os._exit(0)
+    \\    os.close(w)
+    \\    out = b""
+    \\    while True:
+    \\        c = os.read(r, 4096)
+    \\        if not c:
+    \\            break
+    \\        out += c
+    \\    os.close(r)
+    \\    _, st = os.waitpid(pid, 0)
+    \\    if os.WIFSIGNALED(st):
+    \\        return "sig=" + signal.Signals(os.WTERMSIG(st)).name
+    \\    return out.decode()
+    \\for line in sys.stdin:
+    \\    w = line.split()
+    \\    if not w:
+    \\        continue
+    \\    op, name = w[0], w[1]
+    \\    try:
+    \\        if op == "open":
+    \\            fds[name] = os.open(name, os.O_RDWR)
+    \\            say("open %s ok ino=%d" % (name, os.fstat(fds[name]).st_ino))
+    \\        elif op == "read":
+    \\            say("read %s ok %s" % (name, digest(os.pread(fds[name], int(w[2]), 0))))
+    \\        elif op == "fstat":
+    \\            st = os.fstat(fds[name])
+    \\            say("fstat %s ok size=%d nlink=%d" % (name, st.st_size, st.st_nlink))
+    \\        elif op == "write":
+    \\            say("write %s ok n=%d" % (name, os.pwrite(fds[name], bytes([int(w[4], 16)]) * int(w[3]), int(w[2]))))
+    \\        elif op == "fsync":
+    \\            os.fsync(fds[name])
+    \\            say("fsync %s ok" % name)
+    \\        elif op == "ftruncate":
+    \\            os.ftruncate(fds[name], int(w[2]))
+    \\            say("ftruncate %s ok" % name)
+    \\        elif op == "mmap":
+    \\            say("mmap %s %s" % (name, mapped(fds[name], int(w[2]))))
+    \\        elif op == "close":
+    \\            os.close(fds.pop(name))
+    \\            say("close %s ok" % name)
+    \\    except OSError as e:
+    \\        say("%s %s err=%s" % (op, name, ename(e)))
+    \\    say("END")
+    \\    sys.stdout.flush()
+;
+
+/// How long one holder command may take before the row fails naming it.
+const fd_holder_wait_ns: u64 = 120 * std.time.ns_per_s;
+
+const FdHolder = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    name: []const u8,
+    child: std.process.Child,
+    done: bool = false,
+
+    /// The holder with `cwd` (a mount point) as its working directory.
+    fn start(rig: *Rig, name: []const u8, cwd: []const u8) !FdHolder {
+        const child = try std.process.spawn(rig.io, .{ .argv = &.{ "python3", "-u", "-c", fd_holder_py }, .cwd = .{ .path = cwd }, .environ_map = &rig.env, .stdin = .pipe, .stdout = .pipe });
+        return .{ .gpa = rig.gpa, .io = rig.io, .name = name, .child = child };
+    }
+
+    /// One command; its answer (owned, the `END` line dropped).
+    fn ask(self: *FdHolder, cmd: []const u8) ![]u8 {
+        try self.child.stdin.?.writeStreamingAll(self.io, cmd);
+        try self.child.stdin.?.writeStreamingAll(self.io, "\n");
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.gpa);
+        const fd = self.child.stdout.?.handle;
+        const deadline = clock.monotonicNs() + fd_holder_wait_ns;
+        while (!std.mem.endsWith(u8, out.items, "END\n")) {
+            const now = clock.monotonicNs();
+            if (now >= deadline) {
+                std.debug.print("\n--- holder {s}: `{s}` did not answer within {d} s; so far: {s} ---\n", .{ self.name, cmd, fd_holder_wait_ns / std.time.ns_per_s, out.items });
+                return error.Timeout;
+            }
+            var pfd = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+            const rc = linux.poll(&pfd, 1, @intCast(@min((deadline - now) / std.time.ns_per_ms + 1, 1000)));
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => |e| {
+                    std.debug.print("\n--- holder {s}: poll failed ({t}) ---\n", .{ self.name, e });
+                    return error.HolderPipe;
+                },
+            }
+            if (rc == 0) continue;
+            var buf: [4096]u8 = undefined;
+            const n = linux.read(fd, &buf, buf.len);
+            if (linux.errno(n) != .SUCCESS or n == 0) {
+                std.debug.print("\n--- holder {s}: its pipe closed during `{s}`; so far: {s} ---\n", .{ self.name, cmd, out.items });
+                return error.HolderExited;
+            }
+            try out.appendSlice(self.gpa, buf[0..n]);
+        }
+        out.shrinkRetainingCapacity(out.items.len - "END\n".len);
+        return out.toOwnedSlice(self.gpa);
+    }
+
+    /// End of input: the holder closes what it still holds and exits.
+    fn finish(self: *FdHolder) !std.process.Child.Term {
+        self.done = true;
+        self.child.stdin.?.close(self.io);
+        self.child.stdin = null;
+        return self.child.wait(self.io);
+    }
+
+    fn deinit(self: *FdHolder) void {
+        if (!self.done) self.child.kill(self.io);
+    }
+};
+
+/// The value after `key ` on the line of `text` naming `label` (the setup's
+/// `label value…` lines).
+fn wordAfter(text: []const u8, label: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, label) or line.len <= label.len or line[label.len] != ' ') continue;
+        const rest = line[label.len + 1 ..];
+        return rest[0 .. std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len];
+    }
+    return null;
+}
+
+/// The cross-member delete row's verdict book: every answer is printed and
+/// every mismatch named before the row fails, so one run maps every op at
+/// every timing.
+const DeleteBook = struct {
+    misses: u32 = 0,
+
+    fn expect(self: *DeleteBook, phase: []const u8, answer: []const u8, needle: []const u8) void {
+        std.debug.print("smoke[cross-member delete] {s}: {s}", .{ phase, answer });
+        if (std.mem.indexOf(u8, answer, needle) != null) return;
+        self.misses += 1;
+        std.debug.print("smoke[cross-member delete] {s}: MISMATCH — wanted `{s}`\n", .{ phase, needle });
+    }
+
+    fn never(self: *DeleteBook, phase: []const u8, answer: []const u8, needle: []const u8) void {
+        if (std.mem.indexOf(u8, answer, needle) == null) return;
+        self.misses += 1;
+        std.debug.print("smoke[cross-member delete] {s}: MISMATCH — `{s}` answered `{s}`\n", .{ phase, answer, needle });
+    }
+};
+
+/// A's corpse census: the corpses gathered and the destroys landed.
+fn corpseCensus(rig: *Rig) !struct { gathered: u64, destroys: u64 } {
+    const t = try rig.stats();
+    defer rig.gpa.free(t);
+    return .{
+        .gathered = numberAfter(t, "\"fuse_reclaim_gathered\":") orelse return error.StatMissing,
+        .destroys = numberAfter(t, "\"fuse_reclaim_destroys\":") orelse return error.StatMissing,
+    };
+}
+
+test "smoke: A FILE ANOTHER MEMBER DELETED ANSWERS ESTALE ON A JOINED MEMBER'S OPEN DESCRIPTORS — NEVER ZEROS, NEVER SUCCESS, NEVER ANOTHER FILE'S BYTES (the owner's ruling 2026-11-03) — A (the manager) and B JOINED, both supervised (the write cache ON): A writes `d/s` (20,000 B, a resident of its write cache) and `d/g` (4 MiB + 4 KiB, fsync'd: striped, landed); a process on A and one on B open both read-write and B reads both byte-exact → A `rm`s them, still open on A: B reads both byte-exact and writes 4 KiB into `g`, which A's descriptor reads back (the file lives while its holder's kernel holds it) → A writes through its descriptors (`s` re-staged, `g` fsync'd) and closes them: its FORGETs are the delete, the destroy held (SQUEEZEFS_TEST_CORPSE_DESTROY_HOLD) → every op of B's descriptors — a read past the cached size, fstat, write, fsync, ftruncate — answers ESTALE, a buffered read inside the cached size EIO (the kernel's page-cache read path), an mmap'd read SIGBUS → the destroy lands → the same again → A creates 64 files in `d`: none takes a deleted ino and B's descriptors still answer so, never another file's bytes nor their own refused writes' → B closes both → no tripwire, no error line, no lost staged read; umount both, fsck clean (red on dev: after the delete B read `s` as 20,000 zero bytes — the discarded resident, staged_payload_lost_reads — and `g`'s bytes, and its write, fsync and ftruncate succeeded into the corpse; after the destroy fstat and write answered ENOENT, fsync succeeded, ftruncate answered EIO and fired A's record_refusals tripwire, and a read returned B's own refused write's page)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    var rb: [linux.PATH_MAX]u8 = undefined;
+    const release = try std.fmt.bufPrint(&rb, "{s}/destroy.release", .{rig.work});
+    try rig.env.put("SQUEEZEFS_TEST_CORPSE_DESTROY_HOLD", release);
+    try rig.formatSet(true);
+    try rig.mountAsSet(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawnAsSet(&.{});
+    _ = try b.awaitReady();
+    const mark_a = try rig.logLen();
+    const mark_b = try b.logLen();
+    var book: DeleteBook = .{};
+    // 1. A's two files and every image the row compares against.
+    const want = try rig.onMountTimed(
+        \\mkdir d
+        \\head -c 20000 /dev/urandom > "$1/s0"
+        \\head -c 4198400 /dev/urandom > "$1/g0"
+        \\cat "$1/s0" > d/s
+        \\cat "$1/g0" > d/g
+        \\sync -d d/g
+        \\python3 - "$1" <<'EOF'
+        \\import sys
+        \\w = sys.argv[1]
+        \\s = bytearray(open(w + "/s0", "rb").read()); s[4096:8192] = b"A" * 4096; open(w + "/s1", "wb").write(s)
+        \\g = bytearray(open(w + "/g0", "rb").read()); g[0:4096] = b"B" * 4096; g[8192:12288] = b"A" * 4096; open(w + "/g1", "wb").write(g)
+        \\open(w + "/b4k", "wb").write(b"B" * 4096)
+        \\EOF
+        \\for f in s0 s1 g0 g1 b4k; do echo "$f $(sha256sum < "$1/$f" | cut -c1-16)"; done
+        \\echo "ino_s $(stat -c %i d/s)"
+        \\echo "ino_g $(stat -c %i d/g)"
+    , 120);
+    defer gpa.free(want);
+    std.debug.print("\nsmoke[cross-member delete] the images:\n{s}", .{want});
+    const sha_s0 = wordAfter(want, "s0") orelse return error.NoImage;
+    const sha_g0 = wordAfter(want, "g0") orelse return error.NoImage;
+    const sha_b4k = wordAfter(want, "b4k") orelse return error.NoImage;
+    const ino_s = wordAfter(want, "ino_s") orelse return error.NoImage;
+    const ino_g = wordAfter(want, "ino_g") orelse return error.NoImage;
+    var ha = try FdHolder.start(rig, "A", rig.mp);
+    defer ha.deinit();
+    var hb = try FdHolder.start(rig, "B", b.mp);
+    defer hb.deinit();
+    var nb: [96]u8 = undefined;
+    // 2. Both members hold both files open; B reads them byte-exact.
+    for ([_]*FdHolder{ &ha, &hb }) |h| for ([_][]const u8{ "open d/s", "open d/g" }) |cmd| {
+        const a = try h.ask(cmd);
+        defer gpa.free(a);
+        book.expect("open", a, " ok ino=");
+    };
+    {
+        const a = try hb.ask("read d/s 20000");
+        defer gpa.free(a);
+        book.expect("B before the unlink", a, try std.fmt.bufPrint(&nb, "sha={s} ", .{sha_s0}));
+        const g = try hb.ask("read d/g 4198400");
+        defer gpa.free(g);
+        book.expect("B before the unlink", g, try std.fmt.bufPrint(&nb, "sha={s} ", .{sha_g0}));
+    }
+    // 3. Unlinked, still open on A: the file lives — B reads both, writes
+    //    `g`, and A's descriptor reads B's bytes back.
+    gpa.free(try rig.onMount("rm d/s d/g"));
+    {
+        const a = try hb.ask("read d/s 20000");
+        defer gpa.free(a);
+        book.expect("B unlinked, open on A", a, try std.fmt.bufPrint(&nb, "sha={s} ", .{sha_s0}));
+        const g = try hb.ask("read d/g 4198400");
+        defer gpa.free(g);
+        book.expect("B unlinked, open on A", g, try std.fmt.bufPrint(&nb, "sha={s} ", .{sha_g0}));
+        const st = try hb.ask("fstat d/s");
+        defer gpa.free(st);
+        book.expect("B unlinked, open on A", st, "ok size=20000 nlink=0");
+        const w = try hb.ask("write d/g 0 4096 42");
+        defer gpa.free(w);
+        book.expect("B unlinked, open on A", w, "ok n=4096");
+        const back = try ha.ask("read d/g 4096");
+        defer gpa.free(back);
+        book.expect("A reads B's write", back, try std.fmt.bufPrint(&nb, "sha={s} ", .{sha_b4k}));
+    }
+    // 4. A writes through its descriptors (each write's commit recalls B)
+    //    and closes them: its FORGETs at nlink 0 are the delete.
+    const c0 = try corpseCensus(rig);
+    for ([_][]const u8{ "write d/s 4096 4096 41", "write d/g 8192 4096 41", "fsync d/g", "close d/s", "close d/g" }) |cmd| {
+        const a = try ha.ask(cmd);
+        defer gpa.free(a);
+        book.expect("A's last writes and closes", a, " ok");
+    }
+    {
+        var c = try corpseCensus(rig);
+        const deadline = clock.monotonicNs() + kill_row_wait_ns;
+        while (c.gathered < c0.gathered + 2) : (c = try corpseCensus(rig)) {
+            if (clock.monotonicNs() >= deadline) return error.DeleteNeverGathered;
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+        try testing.expectEqual(c0.destroys, c.destroys);
+    }
+    // 5. Deleted, the destroy held; then destroyed; then the inos A mints
+    //    after it: every op of B's descriptors answers ESTALE — but a
+    //    buffered read inside the size the kernel caches, which its
+    //    page-cache read path reports as EIO whatever the daemon answered
+    //    (7.3's `filemap_read_folio`: a folio the read left not uptodate),
+    //    and an mmap'd read, SIGBUS. A read past that size asks GETATTR
+    //    first and carries the daemon's ESTALE.
+    const ops = [_]struct { cmd: []const u8, want: []const u8 }{
+        .{ .cmd = "read d/s 65536", .want = "err=ESTALE" },
+        .{ .cmd = "read d/g 8388608", .want = "err=ESTALE" },
+        .{ .cmd = "read d/s 20000", .want = "err=EIO" },
+        .{ .cmd = "read d/g 4198400", .want = "err=EIO" },
+        .{ .cmd = "fstat d/s", .want = "err=ESTALE" },
+        .{ .cmd = "fstat d/g", .want = "err=ESTALE" },
+        .{ .cmd = "mmap d/s 20000", .want = "sig=SIGBUS" },
+        .{ .cmd = "mmap d/g 4198400", .want = "sig=SIGBUS" },
+        .{ .cmd = "write d/s 0 4096 43", .want = "err=ESTALE" },
+        .{ .cmd = "write d/g 0 4096 43", .want = "err=ESTALE" },
+        .{ .cmd = "fsync d/s", .want = "err=ESTALE" },
+        .{ .cmd = "fsync d/g", .want = "err=ESTALE" },
+        .{ .cmd = "ftruncate d/s 20000", .want = "err=ESTALE" },
+        .{ .cmd = "ftruncate d/g 4198400", .want = "err=ESTALE" },
+    };
+    for (ops) |op| {
+        const a = try hb.ask(op.cmd);
+        defer gpa.free(a);
+        book.expect("B deleted, the destroy held", a, op.want);
+    }
+    {
+        const f = try Io.Dir.cwd().createFile(io, release, .{});
+        f.close(io);
+        const c1 = try corpseCensus(rig);
+        var c = c1;
+        const deadline = clock.monotonicNs() + kill_row_wait_ns;
+        while (c.destroys < c0.destroys + 2 or c.gathered != 0) : (c = try corpseCensus(rig)) {
+            if (clock.monotonicNs() >= deadline) return error.DestroysNeverLanded;
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+    }
+    for (ops) |op| {
+        const a = try hb.ask(op.cmd);
+        defer gpa.free(a);
+        book.expect("B destroyed", a, op.want);
+    }
+    // 6. A mints 64 files in `d`: never a deleted ino, and B's descriptors
+    //    never read their bytes.
+    const fresh = try rig.onMountTimed(
+        \\for i in $(seq 0 63); do head -c 8192 /dev/urandom > d/n$i; done
+        \\for i in $(seq 0 63); do echo "n ino=$(stat -c %i d/n$i) sha=$(sha256sum < d/n$i | cut -c1-16)"; done
+    , 120);
+    defer gpa.free(fresh);
+    {
+        var ib: [48]u8 = undefined;
+        book.never("A's fresh inos", fresh, try std.fmt.bufPrint(&ib, "ino={s} ", .{ino_s}));
+        book.never("A's fresh inos", fresh, try std.fmt.bufPrint(&ib, "ino={s} ", .{ino_g}));
+    }
+    for (ops) |op| {
+        const a = try hb.ask(op.cmd);
+        defer gpa.free(a);
+        book.expect("B after A's fresh files", a, op.want);
+        var it = std.mem.splitScalar(u8, fresh, '\n');
+        while (it.next()) |line| {
+            const sha = std.mem.indexOf(u8, line, "sha=") orelse continue;
+            book.never("B after A's fresh files", a, line[sha..]);
+        }
+    }
+    // 7. B closes: a close is never an error.
+    for ([_][]const u8{ "close d/s", "close d/g" }) |cmd| {
+        const a = try hb.ask(cmd);
+        defer gpa.free(a);
+        book.expect("B's closes", a, " ok");
+    }
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try hb.finish());
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try ha.finish());
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        std.debug.print("smoke[cross-member delete] B: staged_payload_lost_reads {d}, fuse_estale_record_gone {?d}, fuse_estale_ship_gone {?d}, fuse_estale_data_gone {?d}; A: dlm_token_grants_deleted {?d}, record_ships_gone {?d}, fuse_delete_kicks {?d}\n", .{ numberAfter(tb, "\"staged_payload_lost_reads\":") orelse 0, numberAfter(tb, "\"fuse_estale_record_gone\":"), numberAfter(tb, "\"fuse_estale_ship_gone\":"), numberAfter(tb, "\"fuse_estale_data_gone\":"), numberAfter(ta, "\"dlm_token_grants_deleted\":"), numberAfter(ta, "\"record_ships_gone\":"), numberAfter(ta, "\"fuse_delete_kicks\":") });
+        for ([_]struct { what: []const u8, got: ?u64 }{
+            .{ .what = "B's staged_payload_lost_reads", .got = numberAfter(tb, "\"staged_payload_lost_reads\":") },
+            .{ .what = "A's invariant_tripwires", .got = numberAfter(ta, "\"invariant_tripwires\":") },
+            .{ .what = "B's invariant_tripwires", .got = numberAfter(tb, "\"invariant_tripwires\":") },
+        }) |c| if (c.got != @as(?u64, 0)) {
+            std.debug.print("smoke[cross-member delete]: MISMATCH — {s} {?d}, wanted 0\n", .{ c.what, c.got });
+            book.misses += 1;
+        };
+    }
+    for ([_]struct { name: []const u8, text: []u8, mark: usize }{ .{ .name = "A", .text = try rig.readLog(), .mark = mark_a }, .{ .name = "B", .text = try b.readLog(), .mark = mark_b } }) |l| {
+        defer gpa.free(l.text);
+        const errs = std.mem.count(u8, l.text[l.mark..], "error(");
+        if (errs != 0) {
+            std.debug.print("--- daemon {s}'s alert lines ---\n{s}\n", .{ l.name, l.text[l.mark..] });
+            book.misses += 1;
+        }
+    }
+    try testing.expectEqual(@as(u32, 0), book.misses);
+    try b.umount();
+    try b.expectCleanExit("B's unmount");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the cross-member delete");
+}
+
 /// The store's free blocks off the mount's `.stats` (Σ capacity − used over
 /// the data plane's `volumes` rows), one line `free N`.
 const store_free_blocks_sh =

@@ -40,25 +40,27 @@ Not changed (§DH.13): a full heap delays the kicked destroy; a non-holder's own
 ESTALE once the holder forgets it; a served unlink of a file the holder's kernel never held waits for the next
 mount's sweep; a wired mount pays the registry at every delete (removal rows flat in the A-B-B-A below).
 
-**The creates' regression** (§DH.14). The orchestrator's A-B-B-A (dev `10f6182` vs `e4c0193`, mdtest -n 10000 -u,
-fresh RAM perf mount per run): File creation −2.6 to −4.3 % in all four shapes, plain np64 Directory creation
-−5.5 %, removal flat. The perf mount's own stats: `dlm_token_grants_served` 0 in both arms (one member, wire up), so
-the registry's lock never ran on a create; `fuse_delete_registry` 1,145,729 at exit (the gather's backlog — dev's
-§DC marks 1,148,865). Cause: the new `KvFs` fields re-ordered the auto layout, putting `next_fh` (a RMW per create)
-at 848 beside `xv` 840 and `io` 856 (read per op) and the `..` memo's header (written per mkdir) at 872.
-**Fix** (`8fde307`): `next_fh`, the memos, the destroy tally and the gather's count in `OwnLine` (own cache lines,
-pinned by a unit); the registry a 4,096-cell counting filter over 64 own-line shards — a clear cell answers a
-grant or shipped verb in one SeqCst load; the delete raises its cell THEN reads the holder's watch, the grant's
-registration raises the watch THEN reads the cell (both SeqCst). **Model** `tokens/delete_watch_model.zig`:
-holds over 2,704 states (4,576 with another deleted ino in the cell); the delete's raise un-fenced fails after
-17 states, the grant's after 1,773. **Counters** (a joined pair, temporary row): empty registry — B's 10,000
-stats of A's files: A's grants +10,016–10,021, `fuse_delete_registry_looks` +0; B's 10,000 creates in A's
-directory: grants +12,286–15,092, looks +0. 256 deletes registered: A's own 10,000 creates 0 grants, 0 looks;
-B's 10,000 stats of fresh files +10,010–10,012 grants, +512 looks (5.1 %); B's creates in A's directory +14,383
-grants, +0 looks. The old check locked once per grant. Seen on dev too, not changed (§DH.13 (h)): after B filled
-A's directory, A's unlink there answered EIO (B's `cluster_wire_service_refusals` tripwire), and one dev run's
-fsck found 169 live inodes named by no dentry.
+**The creates' regression** (§DH.14). A-B-B-A (dev `10f6182` vs `e4c0193`, mdtest -n 10000 -u): File creation
+−2.6 to −4.3 %, plain np64 Directory creation −5.5 %. The perf mount serves no grant (`dlm_token_grants_served` 0
+in both arms), so the registry's lock never ran on a create; the cause was the layout — `next_fh` (a RMW per
+create) moved beside `xv` and `io` (read per op), the `..` memo's header beside them. **Fix** `8fde307`: those
+fields in `OwnLine`; the registry a 4,096-cell counting filter over 64 own-line shards, a Dekker pair with the
+grant's registration (both raises SeqCst). **Model** `tokens/delete_watch_model.zig`: holds over 2,704 / 4,576
+states; the delete's raise not SeqCst fails after 17 states, the grant's after 1,773. **Counters** (a joined
+pair): 10,000 grants of live files take 0 registry locks with an empty registry, 512 (5.1 %) with 256 deletes
+registered. Checks on `8fde307`: red ×3, §DH units ×3 (49/49), 27 rows ×1 (68/68), full units, fmt, rails 32/32.
+Seen on dev too (§DH.13 (h)): after B filled A's directory, A's unlink there answered EIO; one dev run's fsck
+found 169 live inodes named by no dentry.
 
-**Checks** (`8fde307`): the red ×3 (3/3), the §DH units ×3 (49/49 each), the 27 related rows ×1 (68/68), the full
-unit step 3,248 pass / 185 skip / 0 fail (one earlier run lost stats' eight-thread render test to load: 7/7
-alone), `zig fmt --check`, rails 32/32.
+**The mkdirs' regression** (§DH.16). Four order-balanced rounds: File creation fixed, Directory creation −7 % at
+plain np32 and real at rw4k np64. A mkdir takes the memo's spin lock four times; `8fde307`'s `Memo` put the
+`parents` header at +8, on the lock word's line, where every waiter spins. perf c2c (IBS, `mdtest -D -C` np32,
+RAM perf mount; cache-line counts only): memo HITMs per run old head 28/20/35, dev 14/11/18/14, the old head's
+header HITMs on the lock's line (7/6/15). Fix `38ecaac`: the word and both headers each in a block of their own —
+19/12/24, the lock's line lock-only, the headers' HITMs on their own lines; the unit `THE MEMO'S LAYOUT` (red on
+`054d5a9`). **The row's flake** (§DH.17, 1 run in ~170): B's relatime drain serves a token after shipping an
+access stamp; that background grant, landing between A's last recall and A's delete, is never recalled while the
+seam holds the destroy, and B answered from its cache. The row mounts B noatime and asserts no stamp shipped.
+
+**Checks** (`6b39633`): the red ×13 (13/13), the §DH units ×3 (50/50 each), the full unit step 3,249 pass /
+185 skip / 0 fail, `zig fmt --check`, rails 32/32.

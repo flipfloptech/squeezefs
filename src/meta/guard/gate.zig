@@ -145,6 +145,9 @@ pub const Guard = struct {
     fencer: ?*fencer.Fencer = null,
     fencer_absent: ?fencer.Absent = null,
     test_fencer: if (builtin.is_test) ?nvme.Namespace else void = if (builtin.is_test) null else {},
+    /// Test seam: fired in a lapse's re-acquire between the hold and the
+    /// fencer's re-register (a successor's hold landing in that window).
+    test_after_reacquire: if (builtin.is_test) ?TestHook else void = if (builtin.is_test) null else {},
     /// Test seam: every claim probe after a lapse fails (checkpoint churn).
     test_probe_unreadable: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// The configured host identity recorded at the gate (§1.4).
@@ -158,6 +161,8 @@ pub const Guard = struct {
     found_raw: ?[]u8 = null,
     evidence: claim.Evidence = .{ .reclaimable = .absent },
     gate_now: i64 = 0,
+
+    pub const TestHook = struct { ctx: *anyopaque, fire: *const fn (ctx: *anyopaque) void };
 
     /// `writer_guard_mode` (§2.8).
     pub fn modeName(self: *const Guard) []const u8 {
@@ -823,6 +828,7 @@ pub const Guard = struct {
         const fresh = g.registerHost(c, false) catch return .reacquire_failed;
         c.acquire() catch return .reacquire_failed;
         if (locked and fresh) guard.stats.pr_host_registrations.inc();
+        if (builtin.is_test) if (g.test_after_reacquire) |h| h.fire(h.ctx);
         // The lapse forgot the fencer too.
         if (g.fencer) |f| f.reregister();
         return .reacquired;
@@ -1536,6 +1542,52 @@ test "the fencing registrant on a PR substrate (the fake, decision 0003 §DG): t
     }
     try testing.expectEqual(@as(?u64, null), ns.holder);
     try testing.expectEqual(@as(usize, 0), ns.registered.items.len);
+}
+
+/// A successor on host B taking the hold by preempting `victim` (the
+/// manager's key) — the M1 window's other side.
+const Takeover = struct {
+    s: *pr.Client,
+    victim: u64,
+
+    fn run(ctx: *anyopaque) void {
+        const t: *Takeover = @ptrCast(@alignCast(ctx));
+        _ = t.s.registerLadder() catch return;
+        t.s.preempt(t.victim) catch return;
+    }
+};
+
+test "review M1 (decision 0003 §DG): a fencer re-registered after its host was preempted never preempts — a lapse; the manager's beat re-acquires; a successor's hold preempts the manager's key before the fencer's re-register (the seam); the fencer re-registers under the superseded key; the manager, finishing a recovery, preempts the successor's host key through it: REFUSED — the successor keeps its reservation (nvmet's holder-key arm would have made the fencer the holder) and the fencer is not left registered" {
+    const gpa = testing.allocator;
+    const v = try Vol.create(gpa, "m1", "600000");
+    defer v.destroy();
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    ns.holder_preempt_retypes = true;
+    var host: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
+    var fhost: fake.Host = .{ .ns = &ns, .host_id = host_f_id };
+    var shost: fake.Host = .{ .ns = &ns, .host_id = host_b_id };
+    const me = ident(boot_a, 4000, 777);
+    const pr_key = claim.prKey(me.writerId(0), boot_a);
+    const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_fencer = fhost.face(), .test_pid_probe = PidTable.probe }, 0);
+    defer be.close();
+    const g = be.guard.?;
+    var s = try pr.Client.init(gpa, shost.face(), 1, 0x5a5a);
+    defer s.deinit();
+    s.rtype = nvme.RTYPE_WERO;
+    var takeover: Takeover = .{ .s = &s, .victim = pr_key };
+    g.test_after_reacquire = .{ .ctx = &takeover, .fire = Takeover.run };
+    log.testing.expectErrorLogs(2);
+    ns.powerCycle();
+    g.beat();
+    try testing.expect(ns.isHolder(host_b_id));
+    const out = fencing.preemptDeadRegistrant(g.prClient(), g.fencerClient(), 0x5a5a);
+    try testing.expect(out != .fenced);
+    try testing.expect(ns.isHolder(host_b_id));
+    try testing.expect(ns.find(host_f_id) == null);
+    // The beat read the successor's hold after its re-acquire: usurped.
+    try testing.expect(be.isFailed());
+    try log.testing.expectAllFired();
 }
 
 test "the recovery ladder step 2 on PR: a TTL-stale foreign claim with a foreign reservation holder is PREEMPTED (one preempt, holder transferred); a FRESH foreign claim is refused BEFORE any PR arbitration; a conflict with no holder in the report refuses blind" {

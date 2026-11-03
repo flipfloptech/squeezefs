@@ -883,12 +883,12 @@ pub const Early = struct {
     fresh: bool,
     /// This volume's writer id (its `p` line's word).
     writer_id: u64,
-    /// The hold was taken by preempting another key.
-    preempted: bool = false,
+    /// The hold stays at this incarnation's end (`HoldOutcome.kept`).
+    keep_hold: bool = false,
 
     /// An open that failed before its gate adopted this: the `p` line out,
     /// the registration given back as `leaveRegistration` says (a hold
-    /// taken by a preempt stays).
+    /// taken by a preempt, or inherited, stays).
     pub fn discard(self: *Early, gpa: Allocator) void {
         const c = self.posture.active;
         if (self.reg) |*reg| {
@@ -896,9 +896,9 @@ pub const Early = struct {
                 defer reg.unlock();
                 const me = proc.localIdentity();
                 reg.removeRegion(me.pid, "p", self.writer_id, .any);
-                if ((reg.othersAlive(gpa, me.pid) catch 1) == 0) leaveRegistration(c, self.preempted) catch {};
+                if ((reg.othersAlive(gpa, me.pid) catch 1) == 0) leaveRegistration(c, self.keep_hold) catch {};
             } else |_| {}
-        } else leaveRegistration(c, self.preempted) catch {};
+        } else leaveRegistration(c, self.keep_hold) catch {};
         c.deinit();
         gpa.destroy(c);
         self.device.deinit();
@@ -987,10 +987,11 @@ pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map,
     keep_dev = true;
     keep_client = true;
     c.rtype = if (symmetric) nvme.RTYPE_WERO else nvme.RTYPE_WRITE_EXCLUSIVE;
-    e.preempted = holdReservation(c, path) catch {
+    const outcome = holdReservation(c, path) catch {
         e.discard(gpa);
         return error.Busy;
     };
+    e.keep_hold = outcome.kept();
     return e;
 }
 
@@ -998,9 +999,12 @@ pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map,
 /// release, an open refused after its early registration), called when no
 /// other process of the set on this host rides it. A non-holder
 /// unregisters. A holder keeps the hold while another registrant stands (a
-/// successor preempts it) or when it took the hold by preempting
-/// (`keep_hold`: a release would re-admit the host it fenced); the
-/// namespace's last registrant releases (zero residue).
+/// successor preempts it) or when `keep_hold` (it took the hold by a
+/// preempt, inherited it, or preempted a member since: a release would
+/// re-admit every host a preempt fenced — a superseded manager's checkpoint,
+/// an open paused across the takeover, would land over acked metadata;
+/// review 4 blocker 2); else the namespace's last registrant releases (zero
+/// residue).
 pub fn leaveRegistration(c: *pr.Client, keep_hold: bool) pr.Error!void {
     var rep = try c.report();
     defer rep.deinit(c.gpa);
@@ -1010,10 +1014,30 @@ pub fn leaveRegistration(c: *pr.Client, keep_hold: bool) pr.Error!void {
     return c.release();
 }
 
-/// The hold under `c.rtype`: acquired, or the report's ONE holder preempted
-/// (the superseded writer's host unregistered, its writes refused from
-/// here). True = taken by a preempt.
-pub fn holdReservation(c: *pr.Client, path: []const u8) error{Refused}!bool {
+pub const HoldOutcome = enum {
+    /// Acquired on an unreserved namespace.
+    acquired,
+    /// Held under this key already: a predecessor's of this host, which may
+    /// have taken it by a preempt.
+    inherited,
+    /// The holder's key preempted: its host fenced.
+    preempted,
+
+    /// The hold stays at this incarnation's last clean unmount.
+    pub fn kept(o: HoldOutcome) bool {
+        return o != .acquired;
+    }
+};
+
+/// The hold under `c.rtype`: inherited (the report names our key), acquired,
+/// or the report's ONE holder preempted (the superseded writer's host
+/// unregistered, its writes refused from here).
+pub fn holdReservation(c: *pr.Client, path: []const u8) error{Refused}!HoldOutcome {
+    const before = c.holder() catch {
+        log.err("{s}: the reservation report failed before the hold — refusing to arbitrate blind", .{path});
+        return error.Refused;
+    };
+    if (before) |k| if (k == c.key) return .inherited;
     c.acquire() catch |e| switch (e) {
         error.ReservationConflict => {
             const victim = (c.holder() catch {
@@ -1023,21 +1047,21 @@ pub fn holdReservation(c: *pr.Client, path: []const u8) error{Refused}!bool {
                 log.err("{s}: reservation acquire conflicted but the report names no holder — refusing to arbitrate blind (single-writer guard)", .{path});
                 return error.Refused;
             };
-            if (victim == c.key) return false;
+            if (victim == c.key) return .inherited;
             c.preempt(victim) catch {
                 log.err("{s}: the preempt of the stale reservation holder key {x:0>16} failed — refusing the mount", .{ path, victim });
                 return error.Refused;
             };
             guard.stats.preempts.inc();
             log.warn("{s}: preempted stale reservation holder key {x:0>16} (device-fenced takeover)", .{ path, victim });
-            return true;
+            return .preempted;
         },
         else => {
             log.err("{s}: reservation acquire failed on the PR-capable namespace — refusing the mount", .{path});
             return error.Refused;
         },
     };
-    return false;
+    return .acquired;
 }
 
 fn joinRegisterFn(ctx: *anyopaque, c: *pr.Client) anyerror!void {

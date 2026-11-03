@@ -128,9 +128,9 @@ pub const Guard = struct {
     /// The host registered before the first write (`Options.early`): its
     /// freshness; null = the gate registers.
     early_fresh: ?bool = null,
-    /// The early registration's hold was taken by a preempt (cleared once
-    /// the claim commits).
-    early_preempted: bool = false,
+    /// The hold stays at this incarnation's end: taken by a preempt or
+    /// inherited (review 4 blocker 2, `host_fence.HoldOutcome.kept`).
+    keep_hold: bool = false,
     /// Test seam: every claim probe after a lapse fails (checkpoint churn).
     test_probe_unreadable: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// The configured host identity recorded at the gate (§1.4).
@@ -350,7 +350,7 @@ pub const Guard = struct {
             g.posture = e.posture;
             g.fence_reg = e.reg;
             g.early_fresh = e.fresh;
-            g.early_preempted = e.preempted;
+            g.keep_hold = e.keep_hold;
             gpa.destroy(e);
             return;
         }
@@ -518,6 +518,7 @@ pub const Guard = struct {
                     log.err("{s}: reservation acquire conflicted but the report names no holder — refusing to arbitrate blind (single-writer guard)", .{g.be.path});
                     return error.Busy;
                 };
+                g.keep_hold = true;
                 if (victim == c.key) return;
                 c.preempt(victim) catch |pe| return g.prErrorLog(c, "preempt", pe);
                 guard.stats.preempts.inc();
@@ -561,8 +562,6 @@ pub const Guard = struct {
         // Release pairs with `close`'s acquire: the deletion runs iff the
         // claim landed.
         g.claimed.store(true, .release);
-        // Bound: its release follows the standard policy from here.
-        g.early_preempted = false;
     }
 
     fn barrier(g: *Guard) backend.OpenError!void {
@@ -833,9 +832,9 @@ pub const Guard = struct {
                 // early registration): nothing to take back.
                 const registered = g.pr_active or g.early_fresh != null;
                 if (!registered) last = false;
-                // An open refused before its claim keeps a hold its early
-                // registration took by a preempt.
-                if (last) host_fence.leaveRegistration(c, g.early_preempted) catch |e| {
+                // A hold taken by a preempt or inherited — or one under which
+                // this client preempted a member — stays (review 4 blocker 2).
+                if (last) host_fence.leaveRegistration(c, g.keep_hold or c.stats.preempts > 0) catch |e| {
                     var buf: [128]u8 = undefined;
                     var w: Io.Writer = .fixed(&buf);
                     c.writeError(&w, e) catch {};

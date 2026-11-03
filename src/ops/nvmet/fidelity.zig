@@ -920,7 +920,7 @@ fn daemonSetFormat(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, po
 /// (the daemon connects the data volume itself) → PR armed → a second
 /// identity refused → kill -9 → remount under the same host key, the
 /// host's registration adopted (the data association REUSED) → umount →
-/// regctl 0, the association released.
+/// the inherited hold stays (regctl 1), the association released.
 fn mountLeg(transport: configfs.Trtype) !void {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
@@ -999,13 +999,17 @@ fn mountLeg(transport: configfs.Trtype) !void {
     const sum2 = try rig.onMount(a2, "cksum payload | cut -d' ' -f1");
     defer gpa.free(sum2);
     try testing.expectEqualStrings(sum, sum2);
-    // umount: release + unregister = zero registrants; the daemon's data
+    // umount: the hold a2 INHERITED from the killed incarnation stays (one
+    // registration, Write Exclusive): a hold this incarnation did not
+    // acquire on an unreserved namespace may carry a predecessor's fence —
+    // released, it would re-admit every host that preempt fenced (review 4
+    // blocker 2); the next mount adopts or preempts it. The daemon's data
     // association released with it.
     try rig.umount(a2);
     const rr2 = try rig.resvReportJson(cm.dev());
     defer gpa.free(rr2);
-    try testing.expectEqual(@as(?u64, 0), json_scan.number(rr2, "regctl"));
-    try testing.expectEqual(@as(?u64, 0), json_scan.number(rr2, "rtype"));
+    try testing.expectEqual(@as(?u64, 1), json_scan.number(rr2, "regctl"));
+    try testing.expectEqual(@as(?u64, nvme.RTYPE_WRITE_EXCLUSIVE), json_scan.number(rr2, "rtype"));
     try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, null));
     const log2 = try rig.readLog(a2);
     defer gpa.free(log2);
@@ -1395,7 +1399,7 @@ test "nvmet fidelity: multipath-tcp — RAM-backed metadata and data shares with
     try expectNoResidue(rig, data_nqn);
 }
 
-test "nvmet fidelity: fidelity-mount (loop) — THE row: the metadata and data volumes ARE connected namespaces (the data volume the daemon's own connect from its endpoint record); format → mount → PR armed for real (holder == pr_key, regctl 1) → a second identity refused → kill -9 → remount adopts the host's standing registration under the same host key (pr_host_adoptions 1, pr_own_stale_recoveries 0, payload intact) and REUSES the data association → umount → regctl 0, the association released → disconnect → unshare" {
+test "nvmet fidelity: fidelity-mount (loop) — THE row: the metadata and data volumes ARE connected namespaces (the data volume the daemon's own connect from its endpoint record); format → mount → PR armed for real (holder == pr_key, regctl 1) → a second identity refused → kill -9 → remount adopts the host's standing registration under the same host key (pr_host_adoptions 1, pr_own_stale_recoveries 0, payload intact) and REUSES the data association → umount → the inherited hold stays (regctl 1, rtype 1: review 4 blocker 2), the association released → disconnect → unshare" {
     try mountLeg(.loop);
 }
 

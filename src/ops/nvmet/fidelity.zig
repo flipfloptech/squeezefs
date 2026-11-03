@@ -811,6 +811,89 @@ test "nvmet fidelity: roundtrip-tcp — the same on nvmet-tcp over 127.0.0.1" {
     try roundtripLeg(.tcp);
 }
 
+/// A loop port built by hand the way an operator builds one: `addr_trtype
+/// = loop`, no address, a subsystem of its own linked (so it is enabled),
+/// on the run's own small id below both ranges. Removed by `deinit`
+/// whatever state a failed row left it in.
+const ForeignLoopPort = struct {
+    nqn_buf: [64]u8 = undefined,
+    nqn_len: usize = 0,
+    id: u16,
+
+    fn nqn(self: *const ForeignLoopPort) []const u8 {
+        return self.nqn_buf[0..self.nqn_len];
+    }
+
+    fn stand(rig: *Rig) !ForeignLoopPort {
+        const fs = configfs.RealFs.face();
+        var self: ForeignLoopPort = .{ .id = try smallPortId(fs, rig.pid) };
+        self.nqn_len = (try std.fmt.bufPrint(&self.nqn_buf, "nqn.2026-10.example:loopfg-{d}", .{rig.pid})).len;
+        errdefer self.deinit();
+        var pb: [512]u8 = undefined;
+        var tb: [128]u8 = undefined;
+        try fs.mkdir(try std.fmt.bufPrint(&pb, "subsystems/{s}", .{self.nqn()}));
+        try fs.mkdir(try std.fmt.bufPrint(&pb, "ports/{d}", .{self.id}));
+        try fs.writeAttr(try std.fmt.bufPrint(&pb, "ports/{d}/addr_trtype", .{self.id}), "loop");
+        try fs.symlink(try std.fmt.bufPrint(&tb, "subsystems/{s}", .{self.nqn()}), try std.fmt.bufPrint(&pb, "ports/{d}/subsystems/{s}", .{ self.id, self.nqn() }));
+        return self;
+    }
+
+    /// The port's links as the walk read them (sorted).
+    fn links(self: *const ForeignLoopPort, walk: *const configfs.Walk) ![]const []u8 {
+        const p = walk.ports.find(self.id) orelse return error.ForeignPortGone;
+        return p.links;
+    }
+
+    fn deinit(self: *const ForeignLoopPort) void {
+        const fs = configfs.RealFs.face();
+        var pb: [512]u8 = undefined;
+        fs.unlink(std.fmt.bufPrint(&pb, "ports/{d}/subsystems/{s}", .{ self.id, self.nqn() }) catch unreachable) catch {};
+        fs.rmdir(std.fmt.bufPrint(&pb, "subsystems/{s}", .{self.nqn()}) catch unreachable) catch {};
+        // A share that joined the port still links it: its own teardown
+        // removes the port last-out.
+        fs.rmdir(std.fmt.bufPrint(&pb, "ports/{d}", .{self.id}) catch unreachable) catch {};
+    }
+};
+
+test "nvmet fidelity: roundtrip-loop beside a foreign loop port — an operator's enabled loop port (no address, a subsystem of its own, an id below both ranges) stands before the share; the share takes a harness port of its own, never one that existed before it; the connect reaches it and the namespace carries the ledger's uuid; unshare leaves the foreign port and its one link as they were" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const fs = configfs.RealFs.face();
+    const foreign = try ForeignLoopPort.stand(rig);
+    defer foreign.deinit();
+    var before = try configfs.snapshotPorts(fs, gpa);
+    defer before.deinit(gpa);
+    const nqn = try rig.share("lf", meta_len, .loop, 0);
+    var rec = (try rig.ledgerRecord(nqn)).?;
+    defer rec.deinit(gpa);
+    const port_id = rec.listeners[0].port_id;
+    try testing.expect(configfs.isHarnessPortId(port_id));
+    try testing.expect(before.find(port_id) == null);
+    {
+        var walk = try configfs.walkLive(fs, gpa);
+        defer walk.deinit(gpa);
+        const fl = try foreign.links(&walk);
+        try testing.expectEqual(@as(usize, 1), fl.len);
+        try testing.expectEqualStrings(foreign.nqn(), fl[0]);
+    }
+    const c = try rig.connect(nqn, .loop, 0, null, &.{});
+    const ns = (try initiator.controllerNamespace(gpa, initiator.SYSFS_ROOT, c.instance)).?;
+    try testing.expectEqual(rec.ns_uuid, ns.uuid.?);
+    try rig.disconnect(&c);
+    try rig.unshare(nqn);
+    try expectNoResidue(rig, nqn);
+    try expectPortLastOut(rig, port_id);
+    var walk = try configfs.walkLive(fs, gpa);
+    defer walk.deinit(gpa);
+    const fl = try foreign.links(&walk);
+    try testing.expectEqual(@as(usize, 1), fl.len);
+    try testing.expectEqualStrings(foreign.nqn(), fl[0]);
+    var b: [64]u8 = undefined;
+    var pb: [64]u8 = undefined;
+    try testing.expectEqualStrings("", try fs.readAttr(try std.fmt.bufPrint(&pb, "ports/{d}/addr_traddr", .{foreign.id}), &b));
+}
+
 fn prMatrixLeg(transport: configfs.Trtype) !void {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);

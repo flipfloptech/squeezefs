@@ -1489,6 +1489,27 @@ test "port ids: frozen hash64 first-candidate vectors inside the 900 slots; a re
     try testing.expectEqual(@as(u32, 65535), @as(u32, PORT_ID_BASE_MAX) + PORT_ID_RANGE - 1);
 }
 
+test "port ids: a loop port the product did not make is never joined — an operator's (no address; linked or link-free) below the range, another ledger's on the candidate; ours on the candidate is reused; an address-less one on the candidate is not ours to join" {
+    const c3 = firstCandidate(PORT_ID_BASE_DEFAULT, "loop");
+    var foreign_name = "nqn.2026-10.example:operator".*;
+    var foreign_links = [_][]u8{&foreign_name};
+    var no_links = [_][]u8{};
+    // An operator's enabled loop port (its own link) and a link-free one: skipped, the candidate.
+    var operator = [_]PortEntry{.{ .id = 7, .trtype = .loop, .adrfam = "", .traddr = "", .trsvcid = "", .links = &foreign_links }};
+    try testing.expectEqual(c3, try allocatePortId(PORT_ID_BASE_DEFAULT, Listener.loop, .{ .entries = &operator }, none_ledgered));
+    var operator_idle = [_]PortEntry{.{ .id = 7, .trtype = .loop, .adrfam = "", .traddr = "", .trsvcid = "", .links = &no_links }};
+    try testing.expectEqual(c3, try allocatePortId(PORT_ID_BASE_DEFAULT, Listener.loop, .{ .entries = &operator_idle }, none_ledgered));
+    // A product-shaped loop port on the candidate: another ledger's ⇒ skipped; ours ⇒ reused.
+    var tb: [32]u8 = undefined;
+    const shaped = try std.fmt.bufPrint(&tb, "squeezefs-port-{d}", .{c3});
+    var other_ledger = [_]PortEntry{.{ .id = c3, .trtype = .loop, .adrfam = "", .traddr = shaped, .trsvcid = "", .links = &foreign_links }};
+    try testing.expectEqual(c3 + 1, try allocatePortId(PORT_ID_BASE_DEFAULT, Listener.loop, .{ .entries = &other_ledger }, none_ledgered));
+    try testing.expectEqual(c3, try allocatePortId(PORT_ID_BASE_DEFAULT, Listener.loop, .{ .entries = &other_ledger }, all_ledgered));
+    // An address-less loop port on the candidate is unaddressable beside another: skipped.
+    var addressless = [_]PortEntry{.{ .id = c3, .trtype = .loop, .adrfam = "", .traddr = "", .trsvcid = "", .links = &no_links }};
+    try testing.expectEqual(c3 + 1, try allocatePortId(PORT_ID_BASE_DEFAULT, Listener.loop, .{ .entries = &addressless }, all_ledgered));
+}
+
 test "NQN grammar: a path component ≤ 223 bytes starting with nqn.; '..', '/', whitespace and a leading dot refuse; harness markers classify" {
     try validateNqn("nqn.2026-10.io.squeezefs:share-abc");
     try testing.expectError(error.Empty, validateNqn(""));

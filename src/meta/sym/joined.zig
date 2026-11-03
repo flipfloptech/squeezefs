@@ -1512,6 +1512,8 @@ pub const JoinedSet = struct {
             log.err("meta volume {s}: appender {d} could not leave cleanly ({s}) — its page stays Live for the next open's recovery", .{ be.path, self.appenderId(), @errorName(e) });
             return;
         };
+        // The leave's last write landed: the `l` line goes.
+        if (self.fence) |f| f.departed();
         log.info("meta volume {s}: appender {d} left ({s}); {d} extent run(s) returned with the page, {d} ahead of it", .{ be.path, self.appenderId(), if (left.already) "already" else "page Free", runs.items.len, returned_ahead });
     }
 

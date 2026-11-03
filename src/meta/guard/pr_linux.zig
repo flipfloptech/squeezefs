@@ -191,6 +191,13 @@ fn openVerifiedChar(node: [:0]const u8, want: DevNum) ?linux.fd_t {
     return fd;
 }
 
+/// `path` is an NVMe namespace's block node (no open, no char twin).
+pub fn isNvmeNamespace(path: []const u8) bool {
+    const st = (align_probe.statPath(path) catch return false) orelse return false;
+    if (!st.is_bdev) return false;
+    return sysfsNsid(st.rdev_major, st.rdev_minor) != null;
+}
+
 /// Classify `path` and open its char twin. Never fails the mount: every
 /// refusal is a `NoPrReason` the posture logs.
 pub fn resolve(gpa: Allocator, path: []const u8) Resolved {

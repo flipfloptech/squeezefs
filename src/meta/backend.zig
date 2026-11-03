@@ -578,19 +578,31 @@ pub const KvBackend = struct {
         const classified = try readSuperblock(gpa, &dev, path, opts.env, volume_len);
         const sb = classified.sb;
 
-        // 3b. The host registered BEFORE the first write (decision 0003
-        //     §DF): the held tail, the replay's fold and the bring-up cover
-        //     write through the namespace, and a host the reservation does not
-        //     admit is refused at the device. The gate adopts it.
+        // 3b. On an NVMe namespace, BEFORE the first write (decision 0003
+        //     §DF): the claim judged off a private replay, then the host
+        //     registered and the reservation held — the held tail, the
+        //     replay's fold and the bring-up cover write through the
+        //     namespace, and a host the reservation does not admit is
+        //     refused at the device. The gate adopts it.
         var early: ?*guard.host_fence.Early = null;
         errdefer if (early) |e| e.discard(gpa);
-        if (opts.guard.mode != .claim_clear and !testNamespaceArmed(opts)) {
+        if (opts.guard.mode != .claim_clear and !testNamespaceArmed(opts) and guard.pr_linux.isNvmeNamespace(path)) {
             const local = if (builtin.is_test) (opts.guard.test_identity orelse guard.proc.localIdentity()) else guard.proc.localIdentity();
+            // The claim FIRST, off a private replay that writes nothing
+            // (review round 3, major 2): over a live writer's fresh claim
+            // this open registers nothing and writes nothing — no held tail,
+            // no fold, no cover land in the live writer's volume.
+            const probe = if (builtin.is_test) (opts.guard.test_pid_probe orelse guard.proc.probe) else guard.proc.probe;
+            try guard.gate.Guard.refuseFreshEarly(gpa, io, opts.env, pool, path, local, probe);
             var src: EarlyPages = .{ .dev = &dev, .sb = sb };
-            early = guard.host_fence.registerBeforeWrites(gpa, opts.env, path, sb.set_uuid, opts.index, local, sym.join.nodeToken(local), .{ .ctx = &src, .read = &EarlyPages.read }) catch |e| return switch (e) {
+            early = guard.host_fence.registerBeforeWrites(gpa, opts.env, path, sb.set_uuid, opts.index, local, sym.join.nodeToken(local), .{ .ctx = &src, .read = &EarlyPages.read }, sb.symmetricPlaneStamped()) catch |e| return switch (e) {
                 error.Busy => error.Busy,
                 error.OutOfMemory => error.OutOfMemory,
             };
+            // Once more under the hold: a writer that committed its claim
+            // between the probe and this hold (the hold's preempt fenced it)
+            // is never written over — the open refuses, the hold kept.
+            if (early != null) try guard.gate.Guard.refuseFreshEarly(gpa, io, opts.env, pool, path, local, probe);
         }
 
         // 4. The ledger.

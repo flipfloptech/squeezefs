@@ -128,6 +128,9 @@ pub const Guard = struct {
     /// The host registered before the first write (`Options.early`): its
     /// freshness; null = the gate registers.
     early_fresh: ?bool = null,
+    /// The early registration's hold was taken by a preempt (cleared once
+    /// the claim commits).
+    early_preempted: bool = false,
     /// The configured host identity recorded at the gate (§1.4).
     identity_opts: pr.IdentityOptions,
     identity_stamp: pr.IdentityStamp,
@@ -304,15 +307,37 @@ pub const Guard = struct {
     const Refusal = union(enum) { fresh: claim.Claim, stale_non_pr: ?claim.Claim };
 
     fn refuseClaim(g: *Guard, r: Refusal, now: i64) backend.OpenError {
+        return refuse(g.be.path, r, now);
+    }
+
+    fn refuse(path: []const u8, r: Refusal, now: i64) error{Busy} {
         guard.stats.claim_refusals.inc();
         var buf: [1024]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
         switch (r) {
-            .fresh => |c| claim.writeFreshRefusal(&w, g.be.path, c, now) catch {},
-            .stale_non_pr => |c| claim.writeStaleNonPrRefusal(&w, g.be.path, c, now) catch {},
+            .fresh => |c| claim.writeFreshRefusal(&w, path, c, now) catch {},
+            .stale_non_pr => |c| claim.writeStaleNonPrRefusal(&w, path, c, now) catch {},
         }
         log.err("{s}", .{w.buffered()});
         return error.Busy;
+    }
+
+    /// The backend's step 3b, before the host registers and anything is
+    /// written (review round 3, major 2): the gate's freshness refusal off a
+    /// private replay — a claim the gate would refuse as fresh (live, or
+    /// TTL-stale inside the skew term) refuses here, by the same words.
+    pub fn refuseFreshEarly(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, pool: *uring_fs.Pool, path: []const u8, local: claim.Identity, probe: claim.PidProbe) error{Busy}!void {
+        const raw = probeClaim(gpa, io, env, pool, path) catch |e| {
+            log.err("meta volume {s}: the writer claim cannot be read before the host's registration ({s}) — refusing the writer open", .{ path, @errorName(e) });
+            return error.Busy;
+        };
+        defer if (raw) |r| gpa.free(r);
+        const now = clock.realtimeCoarseNs();
+        switch (claim.classify(raw, local, now, probe)) {
+            .fresh_foreign => |f| return refuse(path, .{ .fresh = f.claim }, now),
+            .stale_foreign => |maybe| if (maybe) |c| if (!c.preemptable(now)) return refuse(path, .{ .fresh = c }, now),
+            .reclaimable => {},
+        }
     }
 
     /// The PR substrate: the test namespace, else the block node's char
@@ -323,6 +348,7 @@ pub const Guard = struct {
             g.posture = e.posture;
             g.fence_reg = e.reg;
             g.early_fresh = e.fresh;
+            g.early_preempted = e.preempted;
             gpa.destroy(e);
             return;
         }
@@ -393,7 +419,7 @@ pub const Guard = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.SiblingLive => error.Busy,
             error.RegisterFailed => g.prErrorLog(c, "register", error.DeviceStatus),
-            error.RegistryUnavailable, error.PagesUnreadable => {
+            error.RegistryUnavailable, error.PagesUnreadable, error.ReportUnreadable => {
                 log.err("meta volume {s}: the stale-sibling rule could not read its inputs ({s}; registry {s}) — refusing to register this host", .{ g.be.path, @errorName(e), reg.dir() });
                 return error.Busy;
             },
@@ -429,6 +455,9 @@ pub const Guard = struct {
             return error.Busy;
         };
         defer reg.unlock();
+        // `p` retired: from here the device's holder and appender 0's page
+        // judge this manager (review round 3, major 1).
+        reg.removeRegion(g.identity.pid, "p", g.identity.writerId(g.be.index));
         try g.enrolLocked(reg, .manager);
     }
 
@@ -455,18 +484,23 @@ pub const Guard = struct {
         // the superseded manager's host (charter §5.5, decision 0003 §DF); a
         // flat volume's single writer holds Write Exclusive.
         c.rtype = if (g.be.sb.symmetricPlaneStamped()) nvme.RTYPE_WERO else nvme.RTYPE_WRITE_EXCLUSIVE;
-        const locked = try g.lockRegistry();
-        defer if (locked) g.fence_reg.?.unlock();
-        const fresh = if (g.early_fresh) |f| f else blk: {
-            const f = try g.registerHost(c, true);
+        if (g.early_fresh) |f| {
+            // Registered and holding before the first device write (the
+            // backend's step 3b): only the counters here.
+            if (g.fence_reg != null) {
+                if (f) guard.stats.pr_host_registrations.inc() else guard.stats.pr_host_adoptions.inc();
+            }
+        } else {
+            const locked = try g.lockRegistry();
+            defer if (locked) g.fence_reg.?.unlock();
+            const fresh = try g.registerHost(c, true);
             // Enrolled under the register's lock: a co-located departure
             // sees this process (B3).
             if (g.fence_reg) |*reg| try g.enrolLocked(reg, .pending);
-            break :blk f;
-        };
-        try g.hold(c, evidence);
-        if (locked) {
-            if (fresh) guard.stats.pr_host_registrations.inc() else guard.stats.pr_host_adoptions.inc();
+            try g.hold(c, evidence);
+            if (locked) {
+                if (fresh) guard.stats.pr_host_registrations.inc() else guard.stats.pr_host_adoptions.inc();
+            }
         }
         // Rung 6's shared-identity probe: another rkey under our wire id.
         if (c.identityShared() catch false) log.warn("{s}: another registration shares this mount's wire host id — fencing between the two is PROCESS-LOCAL (co-located mounts on one registrant)", .{g.be.path});
@@ -525,6 +559,8 @@ pub const Guard = struct {
         // Release pairs with `close`'s acquire: the deletion runs iff the
         // claim landed.
         g.claimed.store(true, .release);
+        // Bound: its release follows the standard policy from here.
+        g.early_preempted = false;
     }
 
     fn barrier(g: *Guard) backend.OpenError!void {
@@ -644,10 +680,19 @@ pub const Guard = struct {
             log.warn("meta volume {s}: the host identity pair is unreadable this beat — identity stability skipped once", .{g.be.path});
         }
         const sqz = exec.SqzIo.fromIo(g.io);
-        const outcome = sqz.runBlocking(prRecheckBlocking, .{ g, c }) catch return true;
+        var outcome = sqz.runBlocking(prRecheckBlocking, .{ g, c }) catch return true;
+        if (outcome == .lapse) {
+            if (!g.deviceClaimIsOurs()) {
+                _ = g.be.lane.latch.noteFence("the reservation lapse: the device's claim names another writer");
+                log.err("meta volume {s}: the reservation lapsed and the claim on the device is not this incarnation's — a successor took the role (and left): this volume fail-stops instead of re-registering", .{g.be.path});
+                return false;
+            }
+            outcome = sqz.runBlocking(reacquireBlocking, .{ g, c }) catch return true;
+        }
         switch (outcome) {
             .ours => return true,
             .report_failed => return false,
+            .lapse => unreachable,
             .reacquired => {
                 guard.stats.pr_reacquires.inc();
                 log.warn("meta volume {s}: reservation holdership had lapsed (PTPL-less target power cycle?) — re-acquired key {x:0>16}; audit the fabric", .{ g.be.path, c.key });
@@ -665,7 +710,7 @@ pub const Guard = struct {
         }
     }
 
-    const Recheck = union(enum) { ours, report_failed, reacquired, reacquire_failed, usurped: u64 };
+    const Recheck = union(enum) { ours, report_failed, lapse, reacquired, reacquire_failed, usurped: u64 };
 
     fn prRecheckBlocking(g: *Guard, c: *pr.Client) Recheck {
         var rep = c.report() catch |e| {
@@ -683,14 +728,42 @@ pub const Guard = struct {
         // A reservation stands and our key holds none of it: usurped (under
         // All Registrants: this host's key preempted — the host fenced).
         if (rtype != 0) return .{ .usurped = foreign };
-        // No reservation at all (a PTPL-less target power-cycled): the
-        // registration admits the host afresh only through the rule.
+        // No reservation at all (a PTPL-less target power-cycled, or the
+        // successor's clean last leave): the beat's fiber reads the device's
+        // claim before anything re-registers (review round 3, major 3).
+        return .lapse;
+    }
+
+    /// The lapse's re-acquire, once the device's claim names this
+    /// incarnation: the registration through the rule, the hold.
+    fn reacquireBlocking(g: *Guard, c: *pr.Client) Recheck {
         const locked = g.lockRegistry() catch return .reacquire_failed;
         defer if (locked) g.fence_reg.?.unlock();
         const fresh = g.registerHost(c, false) catch return .reacquire_failed;
         c.acquire() catch return .reacquire_failed;
         if (locked and fresh) guard.stats.pr_host_registrations.inc();
         return .reacquired;
+    }
+
+    /// Does the claim on the DEVICE (a private replay, no write) still name
+    /// this incarnation? A successor took the role and left otherwise.
+    /// An unreadable claim is not ours (the volume fail-stops).
+    fn deviceClaimIsOurs(g: *Guard) bool {
+        // This mount's own checkpoint can recycle the nodes a probe's ledger
+        // record names mid-read; a later attempt reads the newer record.
+        const attempts = 3;
+        var raw: ?[]u8 = null;
+        for (0..attempts) |i| {
+            raw = probeClaim(g.gpa, g.io, g.be.env, g.be.pool, g.be.path) catch |e| {
+                log.warn("meta volume {s}: the claim probe after a reservation lapse failed ({s}, attempt {d} of {d})", .{ g.be.path, @errorName(e), i + 1, attempts });
+                continue;
+            };
+            break;
+        } else return false;
+        const bytes = raw orelse return false;
+        defer g.gpa.free(bytes);
+        const cl = claim.Claim.decode(bytes) catch return false;
+        return cl.writer_id == g.identity.writerId(g.be.index);
     }
 
     fn failStop(g: *Guard, why: []const u8) void {
@@ -750,26 +823,13 @@ pub const Guard = struct {
                         last = (reg.othersAlive(g.gpa, g.identity.pid) catch 1) == 0;
                     } else |_| last = false;
                 }
-                // Holding: the hold stays while another registrant stands.
-                // Not holding (an open refused after its early registration,
-                // or superseded): nothing to keep but the siblings' ride.
-                var holding = false;
                 // Never registered (a refusal before the arbitration, no
                 // early registration): nothing to take back.
                 const registered = g.pr_active or g.early_fresh != null;
                 if (!registered) last = false;
-                if (last) {
-                    var rep = c.report() catch null;
-                    if (rep) |*r| {
-                        defer r.deinit(c.gpa);
-                        holding = r.heldBy(c.key);
-                        if (holding) for (r.registrants) |reg| if (reg.rkey != c.key) {
-                            last = false;
-                        };
-                    } else last = false;
-                }
-                if (last and !holding) c.unregister(c.key) catch {};
-                if (last and holding) c.release() catch |e| {
+                // An open refused before its claim keeps a hold its early
+                // registration took by a preempt.
+                if (last) host_fence.leaveRegistration(c, g.early_preempted) catch |e| {
                     var buf: [128]u8 = undefined;
                     var w: Io.Writer = .fixed(&buf);
                     c.writeError(&w, e) catch {};

@@ -139,9 +139,10 @@ pub const Kind = enum {
 };
 
 /// `m` a manager whose role is durable (appender 0's page, or the claim on a
-/// flat volume), `p` a manager registered whose role is not yet (a sibling
-/// counts it alive; the rule judges it stale), `j` a joiner.
-pub const Role = enum { manager, pending, joiner };
+/// flat volume; its `p` line retired then), `p` a manager registered whose
+/// role is not yet, `j` a joiner, `l` a joiner leaving (its leave's writes
+/// still to land: judged by its pages, a Free one spared).
+pub const Role = enum { manager, pending, joiner, leaving };
 
 /// One region an entry's process holds (its writer id at its slot).
 pub const Region = struct { role: Role, slot: u32, writer_id: u64 };
@@ -191,7 +192,7 @@ pub const Entry = struct {
                 }
                 continue;
             }
-            const role: Role = if (std.mem.eql(u8, tag, "m")) .manager else if (std.mem.eql(u8, tag, "p")) .pending else if (std.mem.eql(u8, tag, "j")) .joiner else continue;
+            const role: Role = if (std.mem.eql(u8, tag, "m")) .manager else if (std.mem.eql(u8, tag, "p")) .pending else if (std.mem.eql(u8, tag, "j")) .joiner else if (std.mem.eql(u8, tag, "l")) .leaving else continue;
             const slot = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue; // a mount slot, decimal as `regionLine` writes it
             const w = std.fmt.parseInt(u64, f.next() orelse continue, 16) catch continue; // a writer id, hex as `regionLine` writes it
             if (e.n_regions < MAX_REGIONS) {
@@ -424,6 +425,7 @@ pub fn regionLine(buf: []u8, r: Region) []const u8 {
         .manager => "m",
         .pending => "p",
         .joiner => "j",
+        .leaving => "l",
     };
     return std.fmt.bufPrint(buf, "{s} {d} {x:0>16}\n", .{ tag, r.slot, r.writer_id }) catch unreachable;
 }
@@ -448,14 +450,24 @@ pub const Verdict = enum {
     stale,
 };
 
+/// What the report says while the rule runs (this host unregistered).
+pub const Facts = struct {
+    /// A reservation stands (rtype ≠ 0).
+    reserved: bool = false,
+    /// Its holder's key is ours (a lapse re-acquire race; never while this
+    /// host is unregistered on a spec target).
+    holder_ours: bool = false,
+};
+
 /// The verdict of one sibling's entry against one volume's pages (appender
 /// 0 = the manager's; `vol_index` = the volume's lane index, a manager's
-/// slot on it). `taking_manager` = the registering mount is winning the D0
-/// role on this volume: appender 0's page names a superseded holder.
-pub fn judge(e: *const Entry, pages: []const page.Page, node_token: u64, vol_index: u32, taking_manager: bool) Verdict {
+/// slot on it) and the report's `facts`. `taking_manager` = the registering
+/// mount is winning the D0 role on this volume: appender 0's page names a
+/// superseded holder.
+pub fn judge(e: *const Entry, pages: []const page.Page, node_token: u64, vol_index: u32, taking_manager: bool, facts: Facts) Verdict {
     var verdict: Verdict = .joining;
     for (e.regionSlice()) |r| {
-        const v = judgeRegion(e, r, pages, node_token, vol_index, taking_manager) orelse continue;
+        const v = judgeRegion(e, r, pages, node_token, vol_index, taking_manager, facts) orelse continue;
         switch (v) {
             .stale => return .stale,
             .current => verdict = .current,
@@ -468,25 +480,30 @@ pub fn judge(e: *const Entry, pages: []const page.Page, node_token: u64, vol_ind
     return verdict;
 }
 
-fn judgeRegion(e: *const Entry, r: Region, pages: []const page.Page, node_token: u64, vol_index: u32, taking_manager: bool) ?Verdict {
+fn judgeRegion(e: *const Entry, r: Region, pages: []const page.Page, node_token: u64, vol_index: u32, taking_manager: bool, facts: Facts) ?Verdict {
     switch (r.role) {
-        // The rule runs only when this host is unregistered; a pending
-        // manager registered it under the lock — preempted since: superseded.
-        .pending => return if (r.slot == vol_index) .stale else null,
-        .manager => {
+        // A manager of this host — registered (`p`) or durable (`m`) — is
+        // superseded once a reservation stands that this host's key does not
+        // hold: the device named another holder (review round 3, major 1 —
+        // and N1's frozen manager whose appender-0 page still reads Live).
+        // With no reservation (a lapse) appender 0's Live page decides.
+        .pending, .manager => {
             if (r.slot != vol_index) return null;
-            if (!taking_manager) for (pages) |p| {
+            if (taking_manager or (facts.reserved and !facts.holder_ours)) return .stale;
+            for (pages) |p| {
                 if (p.appender_id == 0 and p.state == .live and p.identity.node_token == node_token and p.identity.writer_id == r.writer_id) return .current;
-            };
+            }
             return .stale;
         },
-        .joiner => {
+        .joiner, .leaving => {
             var named = false;
             var uncovered = false;
             for (pages) |p| {
                 if (p.appender_id == 0 or p.identity.node_token != node_token or p.identity.writer_id != r.writer_id) continue;
                 if (p.state == .live) return .current;
                 named = true;
+                // A leaving joiner's Free page is its own landed leave.
+                if (r.role == .leaving and p.state == .free) continue;
                 if (!e.covers(p)) uncovered = true;
             }
             if (uncovered) return .stale;
@@ -500,6 +517,8 @@ fn judgeRegion(e: *const Entry, r: Region, pages: []const page.Page, node_token:
 // ---------------------------------------------------------------------------
 
 pub const RuleContext = struct {
+    /// The report's word for the judgement (set by `registerUnderRule`).
+    facts: Facts = .{},
     gpa: Allocator,
     env: *const std.process.Environ.Map,
     /// The volume's block node (the log's name; its queue's in-flight
@@ -531,7 +550,7 @@ pub fn clearStaleSiblings(ctx: RuleContext, reg: *const Registry, pages: []const
     var killed: u32 = 0;
     for (es) |*e| {
         if (e.pid == ctx.local.pid) continue;
-        const v = judge(e, pages, ctx.node_token, ctx.vol_index, ctx.taking_manager);
+        const v = judge(e, pages, ctx.node_token, ctx.vol_index, ctx.taking_manager, ctx.facts);
         if (v != .stale) {
             log.info("meta volume {s}: sibling pid {d} of this set on this host is {s} — spared by the host's registration (its region is its own)", .{ ctx.path, e.pid, @tagName(v) });
             continue;
@@ -560,7 +579,7 @@ fn anyStaleAlive(ctx: RuleContext, reg: *const Registry, pages: []const page.Pag
     defer ctx.gpa.free(es);
     for (es) |*e| {
         if (e.pid == ctx.local.pid) continue;
-        if (judge(e, pages, ctx.node_token, ctx.vol_index, ctx.taking_manager) == .stale and proveIncarnationAlive(ctx, e)) return true;
+        if (judge(e, pages, ctx.node_token, ctx.vol_index, ctx.taking_manager, ctx.facts) == .stale and proveIncarnationAlive(ctx, e)) return true;
     }
     return false;
 }
@@ -666,11 +685,21 @@ pub fn initialPidNamespace() bool {
 /// Is this host registered under `c.key` (a registrant with our wire host
 /// id and our key)? A registration there is idempotent: it re-admits nobody.
 pub fn hostRegistered(c: *pr.Client) pr.Error!bool {
+    return (try reportFacts(c)).registered;
+}
+
+pub const ReportFacts = struct { registered: bool, facts: Facts };
+
+/// One report: our host's registration and the reservation's word.
+pub fn reportFacts(c: *pr.Client) pr.Error!ReportFacts {
     const me = try c.wireHostId();
     var rep = try c.report();
     defer rep.deinit(c.gpa);
-    for (rep.registrants) |r| if (std.mem.eql(u8, &r.host_id, &me) and r.rkey == c.key) return true;
-    return false;
+    var registered = false;
+    for (rep.registrants) |r| if (std.mem.eql(u8, &r.host_id, &me) and r.rkey == c.key) {
+        registered = true;
+    };
+    return .{ .registered = registered, .facts = .{ .reserved = rep.rtype != 0, .holder_ours = rep.heldBy(c.key) } };
 }
 
 /// One volume's appender pages, read under the registry's lock (the
@@ -694,7 +723,7 @@ pub const Register = struct {
     run: *const fn (ctx: *anyopaque, c: *pr.Client) anyerror!void,
 };
 
-pub const AdmitError = RuleError || error{ PagesUnreadable, RegisterFailed };
+pub const AdmitError = RuleError || error{ PagesUnreadable, ReportUnreadable, RegisterFailed };
 
 /// How many times a register is retried when a sibling turned stale
 /// between the judgement and the register.
@@ -708,10 +737,17 @@ const REJUDGE_ROUNDS: u32 = 3; // a remote recovery's step 2 races at most once 
 /// meanwhile takes the registration away (our key unregistered: the host
 /// fenced again) before it is killed and the register retried. True =
 /// registered afresh.
-pub fn registerUnderRule(ctx: RuleContext, reg: *const Registry, c: *pr.Client, pages: PageSource, register: Register) AdmitError!bool {
-    if (hostRegistered(c) catch false) return false;
+pub fn registerUnderRule(ctx_in: RuleContext, reg: *const Registry, c: *pr.Client, pages: PageSource, register: Register) AdmitError!bool {
+    // Every judgement reads the report afresh (the device's word on the
+    // reservation, review round 3 major 1); one that fails judges nothing —
+    // the registration is refused, no sibling killed on a guess.
+    const first = reportFacts(c) catch return error.ReportUnreadable;
+    if (first.registered) return false;
+    var ctx = ctx_in;
+    ctx.facts = first.facts;
     var round: u32 = 0;
     while (round < REJUDGE_ROUNDS) : (round += 1) {
+        if (round > 0) ctx.facts = (reportFacts(c) catch return error.ReportUnreadable).facts;
         {
             const ps = try pages.get(ctx.gpa);
             defer ctx.gpa.free(ps);
@@ -721,10 +757,13 @@ pub fn registerUnderRule(ctx: RuleContext, reg: *const Registry, c: *pr.Client, 
         // Registered: an error from here takes the registration back (review
         // round 3, major 2 — never a fresh registration left unjudged).
         errdefer c.unregister(c.key) catch {};
+        // The re-judge: the report and the pages read again (a takeover or a
+        // remote recovery that raced the register is seen here).
+        ctx.facts = (reportFacts(c) catch return error.ReportUnreadable).facts;
         const ps = try pages.get(ctx.gpa);
         defer ctx.gpa.free(ps);
         if (!try anyStaleAlive(ctx, reg, ps)) return true;
-        log.warn("meta volume {s}: a sibling of this set on this host turned stale between the rule and the register (a remote recovery raced it) — the host's registration withdrawn before it is killed", .{ctx.path});
+        log.warn("meta volume {s}: a sibling of this set on this host turned stale between the rule and the register (a takeover or a remote recovery raced it) — the host's registration withdrawn before it is killed", .{ctx.path});
         c.unregister(c.key) catch {
             log.err("meta volume {s}: REFUSING the registration: it could not be withdrawn from a stale sibling's host", .{ctx.path});
             return error.SiblingLive;
@@ -797,17 +836,22 @@ pub const Early = struct {
     fresh: bool,
     /// This volume's writer id (its `p` line's word).
     writer_id: u64,
+    /// The hold was taken by preempting another key.
+    preempted: bool = false,
 
     /// An open that failed before its gate adopted this: the `p` line out,
-    /// the registration this made taken back when nobody else rides it.
+    /// the registration given back as `leaveRegistration` says (a hold
+    /// taken by a preempt stays).
     pub fn discard(self: *Early, gpa: Allocator) void {
         const c = self.posture.active;
-        if (self.reg) |*reg| if (reg.lock()) |_| {
-            defer reg.unlock();
-            const me = proc.localIdentity();
-            reg.removeRegion(me.pid, "p", self.writer_id);
-            if (self.fresh and departUnregisters(reg, gpa, c, me.pid)) c.unregister(c.key) catch {};
-        } else |_| {};
+        if (self.reg) |*reg| {
+            if (reg.lock()) |_| {
+                defer reg.unlock();
+                const me = proc.localIdentity();
+                reg.removeRegion(me.pid, "p", self.writer_id);
+                if ((reg.othersAlive(gpa, me.pid) catch 1) == 0) leaveRegistration(c, self.preempted) catch {};
+            } else |_| {}
+        } else leaveRegistration(c, self.preempted) catch {};
         c.deinit();
         gpa.destroy(c);
         self.device.deinit();
@@ -816,8 +860,13 @@ pub const Early = struct {
 };
 
 /// Null = no device fence here (a file, no char node, RESCAP 0, the seam):
-/// the gate's own path. `error.Busy` = refused (logged by name).
-pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map, path: []const u8, set_uuid: [16]u8, vol_index: u32, local: claim.Identity, node_token: u64, pages: PageSource) error{ Busy, OutOfMemory }!?*Early {
+/// the gate's own path. `error.Busy` = refused (logged by name). The
+/// caller ran it only when the claim is not a fresh foreign one (review
+/// round 3, major 2: `gate.probeClaim` first); it HOLDS the reservation
+/// before it returns (WERO on a symmetric volume, Write Exclusive on a
+/// flat one): the device's arbitration precedes every device write — two
+/// successors' pre-gate writes cannot both land.
+pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map, path: []const u8, set_uuid: [16]u8, vol_index: u32, local: claim.Identity, node_token: u64, pages: PageSource, symmetric: bool) error{ Busy, OutOfMemory }!?*Early {
     if (perMountIdentity(env)) return null;
     const dev = switch (pr_linux.resolve(gpa, path)) {
         .none => return null,
@@ -858,7 +907,7 @@ pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map,
                 log.err("meta volume {s}: this host's registration (key {x:0>16}) failed — refusing the mount", .{ path, c.key });
                 return error.Busy;
             },
-            error.RegistryUnavailable, error.PagesUnreadable => {
+            error.RegistryUnavailable, error.PagesUnreadable, error.ReportUnreadable => {
                 log.err("meta volume {s}: the stale-sibling rule could not read its inputs ({s}; registry {s}) — refusing to register this host", .{ path, @errorName(e), reg.dir() });
                 return error.Busy;
             },
@@ -869,12 +918,79 @@ pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map,
             if (fresh and departUnregisters(&reg, gpa, c, local.pid)) c.unregister(c.key) catch {};
             return error.Busy;
         };
+    } else {
+        var path_word = path;
+        ladderRegisterFn(@ptrCast(&path_word), c) catch {
+            log.err("meta volume {s}: this host's registration (key {x:0>16}) failed — refusing the mount", .{ path, c.key });
+            return error.Busy;
+        };
     }
-    const e = try gpa.create(Early);
+    const e = gpa.create(Early) catch |err| {
+        if (p.reg) |reg_in| {
+            var reg = reg_in;
+            if (reg.lock()) |_| {
+                defer reg.unlock();
+                reg.removeRegion(local.pid, "p", local.writerId(@intCast(vol_index)));
+                if ((reg.othersAlive(gpa, local.pid) catch 1) == 0) leaveRegistration(c, false) catch {};
+            } else |_| {}
+        } else leaveRegistration(c, false) catch {};
+        return err;
+    };
     e.* = .{ .device = dev, .posture = posture, .reg = p.reg, .fresh = fresh, .writer_id = local.writerId(@intCast(vol_index)) };
     keep_dev = true;
     keep_client = true;
+    c.rtype = if (symmetric) nvme.RTYPE_WERO else nvme.RTYPE_WRITE_EXCLUSIVE;
+    e.preempted = holdReservation(c, path) catch {
+        e.discard(gpa);
+        return error.Busy;
+    };
     return e;
+}
+
+/// What a process leaving the host's registration gives back (the gate's
+/// release, an open refused after its early registration), called when no
+/// other process of the set on this host rides it. A non-holder
+/// unregisters. A holder keeps the hold while another registrant stands (a
+/// successor preempts it) or when it took the hold by preempting
+/// (`keep_hold`: a release would re-admit the host it fenced); the
+/// namespace's last registrant releases (zero residue).
+pub fn leaveRegistration(c: *pr.Client, keep_hold: bool) pr.Error!void {
+    var rep = try c.report();
+    defer rep.deinit(c.gpa);
+    if (!rep.heldBy(c.key)) return c.unregister(c.key);
+    if (keep_hold) return;
+    for (rep.registrants) |r| if (r.rkey != c.key) return;
+    return c.release();
+}
+
+/// The hold under `c.rtype`: acquired, or the report's ONE holder preempted
+/// (the superseded writer's host unregistered, its writes refused from
+/// here). True = taken by a preempt.
+pub fn holdReservation(c: *pr.Client, path: []const u8) error{Refused}!bool {
+    c.acquire() catch |e| switch (e) {
+        error.ReservationConflict => {
+            const victim = (c.holder() catch {
+                log.err("{s}: the reservation report failed after an acquire conflict — refusing to arbitrate blind", .{path});
+                return error.Refused;
+            }) orelse {
+                log.err("{s}: reservation acquire conflicted but the report names no holder — refusing to arbitrate blind (single-writer guard)", .{path});
+                return error.Refused;
+            };
+            if (victim == c.key) return false;
+            c.preempt(victim) catch {
+                log.err("{s}: the preempt of the stale reservation holder key {x:0>16} failed — refusing the mount", .{ path, victim });
+                return error.Refused;
+            };
+            guard.stats.preempts.inc();
+            log.warn("{s}: preempted stale reservation holder key {x:0>16} (device-fenced takeover)", .{ path, victim });
+            return true;
+        },
+        else => {
+            log.err("{s}: reservation acquire failed on the PR-capable namespace — refusing the mount", .{path});
+            return error.Refused;
+        },
+    };
+    return false;
 }
 
 fn joinRegisterFn(ctx: *anyopaque, c: *pr.Client) anyerror!void {
@@ -937,7 +1053,7 @@ pub const Joiner = struct {
                 log.err("meta volume {s}: this host's registration (key {x:0>16}) failed — refusing the join", .{ ctx.path, c.key });
                 return error.HostAdmissionRefused;
             },
-            error.RegistryUnavailable, error.PagesUnreadable => {
+            error.RegistryUnavailable, error.PagesUnreadable, error.ReportUnreadable => {
                 log.err("meta volume {s}: the stale-sibling rule could not read its inputs ({s}) — refusing to register this host", .{ ctx.path, @errorName(e) });
                 return error.HostAdmissionRefused;
             },
@@ -972,12 +1088,23 @@ pub const Joiner = struct {
         self.reg.append(me.pid, me.start_ticks, retiredLine(&lb, .{ .writer_id = self.writer_id, .appender_id = appender_id, .term = term })) catch {};
     }
 
-    /// Before the clean leave: this region out of the registry (a leaving
-    /// incarnation's Free page must never read as a stale sibling's).
+    /// Before the clean leave: this region marked leaving (`l`) — judged by
+    /// its pages like a joiner's while the leave's writes are still to land
+    /// (review round 3, major 4), its Free page spared.
     pub fn depart(self: *Joiner) void {
         self.reg.lock() catch return;
         defer self.reg.unlock();
-        self.reg.removeRegion(proc.localIdentity().pid, "jr", self.writer_id);
+        const me = proc.localIdentity();
+        self.reg.removeRegion(me.pid, "j", self.writer_id);
+        var lb: [64]u8 = undefined;
+        self.reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .leaving, .slot = self.slot, .writer_id = self.writer_id })) catch {};
+    }
+
+    /// After the leave's last write: this region out of the registry.
+    pub fn departed(self: *Joiner) void {
+        self.reg.lock() catch return;
+        defer self.reg.unlock();
+        self.reg.removeRegion(proc.localIdentity().pid, "jlr", self.writer_id);
     }
 
     /// The last process of the set on this host takes the host's
@@ -987,7 +1114,7 @@ pub const Joiner = struct {
         if (self.reg.lock()) |_| {
             defer self.reg.unlock();
             const pid = proc.localIdentity().pid;
-            self.reg.removeRegion(pid, "jr", self.writer_id);
+            self.reg.removeRegion(pid, "jlr", self.writer_id);
             if (departUnregisters(&self.reg, self.gpa, self.client, pid)) self.client.unregister(self.client.key) catch {};
         } else |_| {}
         self.client.deinit();
@@ -1038,34 +1165,41 @@ test "the host key and the registry keys: one per (host identity, set), stable, 
     try testing.expect(fabricRegistryKey("nqn.s", "nqn.h", "id") != fabricRegistryKey("nqn.s", "nqn.h", "id2"));
 }
 
-test "the judgement: a Live page names a current sibling; a Recovering, Recovered or Free page under its writer id is stale unless its own retirement (writer id, appender id, term) covers it; no page yet is joining; the manager is current only on appender 0's Live page, stale once the role passed or while this mount takes it over; a pending manager is stale; another node's page never names a sibling" {
+test "the judgement: a Live page names a current sibling; a Recovering, Recovered or Free page under its writer id is stale unless its own retirement (writer id, appender id, term) covers it; no page yet is joining; the manager is current only on appender 0's Live page, stale once the role passed or while this mount takes it over; a manager of this host (pending or durable) is stale while a reservation stands that this host's key does not hold; another node's page never names a sibling" {
     const node: u64 = 0xA;
     var e = Entry.parse(42, "77\nj 9 00000000000000b1\n").?;
-    try testing.expectEqual(Verdict.joining, judge(&e, &.{}, node, 0, false));
-    try testing.expectEqual(Verdict.current, judge(&e, &.{pg(3, .live, node, 0xb1)}, node, 0, false));
-    try testing.expectEqual(Verdict.stale, judge(&e, &.{pg(3, .recovered, node, 0xb1)}, node, 0, false));
-    try testing.expectEqual(Verdict.stale, judge(&e, &.{pg(3, .recovering, node, 0xb1)}, node, 0, false));
-    try testing.expectEqual(Verdict.stale, judge(&e, &.{pg(3, .free, node, 0xb1)}, node, 0, false));
+    try testing.expectEqual(Verdict.joining, judge(&e, &.{}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.current, judge(&e, &.{pg(3, .live, node, 0xb1)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{pg(3, .recovered, node, 0xb1)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{pg(3, .recovering, node, 0xb1)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{pg(3, .free, node, 0xb1)}, node, 0, false, .{}));
     // A re-join in place: the old page Recovered, the new one Live.
-    try testing.expectEqual(Verdict.current, judge(&e, &.{ pg(3, .recovered, node, 0xb1), pg(5, .live, node, 0xb1) }, node, 0, false));
+    try testing.expectEqual(Verdict.current, judge(&e, &.{ pg(3, .recovered, node, 0xb1), pg(5, .live, node, 0xb1) }, node, 0, false, .{}));
     // Another node's page under the same writer id is not this sibling's.
-    try testing.expectEqual(Verdict.joining, judge(&e, &.{pg(3, .recovered, 0xB, 0xb1)}, node, 0, false));
+    try testing.expectEqual(Verdict.joining, judge(&e, &.{pg(3, .recovered, 0xB, 0xb1)}, node, 0, false, .{}));
     var r = Entry.parse(43, "78\nj 9 00000000000000b2\nr 00000000000000b2 4 0\n").?;
-    try testing.expectEqual(Verdict.retired, judge(&r, &.{pg(4, .recovered, node, 0xb2)}, node, 0, false));
+    try testing.expectEqual(Verdict.retired, judge(&r, &.{pg(4, .recovered, node, 0xb2)}, node, 0, false, .{}));
     // An `r` line short of a word retires nothing.
     var bare = Entry.parse(43, "78\nj 9 00000000000000b2\nr 00000000000000b2 4\n").?;
-    try testing.expectEqual(Verdict.stale, judge(&bare, &.{pg(4, .recovered, node, 0xb2)}, node, 0, false));
-    // A manager registered whose role is not durable yet: the rule runs only
-    // when this host is unregistered — superseded, stale.
+    try testing.expectEqual(Verdict.stale, judge(&bare, &.{pg(4, .recovered, node, 0xb2)}, node, 0, false, .{}));
+    // A manager of this host — pending or durable — is stale once a
+    // reservation stands that this host's key does not hold (superseded,
+    // its appender-0 page possibly still Live: review round 3 N1/major 1);
+    // with no reservation appender 0's Live page decides.
     var p = Entry.parse(45, "80\np 0 00000000000000c9\n").?;
-    try testing.expectEqual(Verdict.stale, judge(&p, &.{pg(0, .live, node, 0xd1)}, node, 0, false));
-    try testing.expectEqual(Verdict.joining, judge(&p, &.{pg(0, .live, node, 0xd1)}, node, 1, false));
+    try testing.expectEqual(Verdict.stale, judge(&p, &.{pg(0, .live, node, 0xc9)}, node, 0, false, .{ .reserved = true }));
+    try testing.expectEqual(Verdict.stale, judge(&p, &.{pg(0, .live, node, 0xd1)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.current, judge(&p, &.{pg(0, .live, node, 0xc9)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.joining, judge(&p, &.{pg(0, .live, node, 0xd1)}, node, 1, false, .{ .reserved = true }));
+    var mm = Entry.parse(47, "82\nm 0 00000000000000ca\n").?;
+    try testing.expectEqual(Verdict.stale, judge(&mm, &.{pg(0, .live, node, 0xca)}, node, 0, false, .{ .reserved = true }));
+    try testing.expectEqual(Verdict.current, judge(&mm, &.{pg(0, .live, node, 0xca)}, node, 0, false, .{ .reserved = true, .holder_ours = true }));
     var m = Entry.parse(44, "79\nm 0 00000000000000c1\nm 1 00000000000000c2\n").?;
-    try testing.expectEqual(Verdict.current, judge(&m, &.{pg(0, .live, node, 0xc1)}, node, 0, false));
-    try testing.expectEqual(Verdict.stale, judge(&m, &.{pg(0, .live, node, 0xd1)}, node, 0, false));
-    try testing.expectEqual(Verdict.stale, judge(&m, &.{pg(0, .live, node, 0xc1)}, node, 0, true));
+    try testing.expectEqual(Verdict.current, judge(&m, &.{pg(0, .live, node, 0xc1)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.stale, judge(&m, &.{pg(0, .live, node, 0xd1)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.stale, judge(&m, &.{pg(0, .live, node, 0xc1)}, node, 0, true, .{}));
     // Volume 1: only the manager region at slot 1 is judged.
-    try testing.expectEqual(Verdict.current, judge(&m, &.{pg(0, .live, node, 0xc2)}, node, 1, false));
+    try testing.expectEqual(Verdict.current, judge(&m, &.{pg(0, .live, node, 0xc2)}, node, 1, false, .{}));
     try testing.expect(Entry.parse(1, "") == null);
     try testing.expect(Entry.parse(1, "x\n") == null);
 }
@@ -1125,14 +1259,14 @@ test "the registry: entries append and parse; a dead process's entry is pruned b
 test "B1 (review): a re-joined-in-place member's retired mark covers ONLY its retired incarnation's page — the successor incarnation (the same writer id) evicted later, its page Recovering, is STALE; while its page is Live it is current; the retired page alone is spared" {
     const node: u64 = 0xA;
     var e = Entry.parse(42, "77\nj 9 00000000000000b1\nr 00000000000000b1 3 0\n").?;
-    try testing.expectEqual(Verdict.stale, judge(&e, &.{ pg(3, .recovered, node, 0xb1), pg(5, .recovering, node, 0xb1) }, node, 0, false));
-    try testing.expectEqual(Verdict.current, judge(&e, &.{ pg(3, .recovered, node, 0xb1), pg(5, .live, node, 0xb1) }, node, 0, false));
-    try testing.expectEqual(Verdict.retired, judge(&e, &.{pg(3, .recovered, node, 0xb1)}, node, 0, false));
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{ pg(3, .recovered, node, 0xb1), pg(5, .recovering, node, 0xb1) }, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.current, judge(&e, &.{ pg(3, .recovered, node, 0xb1), pg(5, .live, node, 0xb1) }, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.retired, judge(&e, &.{pg(3, .recovered, node, 0xb1)}, node, 0, false, .{}));
     // Round 3 major 1: the appender id comes back (the lowest Free pair) under
     // a later term — the old retirement does not cover the new page.
     var reused = Entry.parse(42, "77\nj 9 00000000000000b1\nr 00000000000000b1 5 4\nr 00000000000000b1 7 6\n").?;
-    try testing.expectEqual(Verdict.retired, judge(&reused, &.{ pgTerm(5, .recovered, node, 0xb1, 4), pgTerm(7, .recovered, node, 0xb1, 6) }, node, 0, false));
-    try testing.expectEqual(Verdict.stale, judge(&reused, &.{ pgTerm(5, .recovering, node, 0xb1, 8), pgTerm(7, .recovered, node, 0xb1, 6) }, node, 0, false));
+    try testing.expectEqual(Verdict.retired, judge(&reused, &.{ pgTerm(5, .recovered, node, 0xb1, 4), pgTerm(7, .recovered, node, 0xb1, 6) }, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.stale, judge(&reused, &.{ pgTerm(5, .recovering, node, 0xb1, 8), pgTerm(7, .recovered, node, 0xb1, 6) }, node, 0, false, .{}));
 }
 
 test "B3 (review): a joiner's departure never unregisters the host key while the reservation holder's key is ours — the manager re-mounting on this host holds it before it enrols" {
@@ -1226,13 +1360,13 @@ test "B2 (review): the rule re-judges AFTER the register, under the lock — a s
 test "round 3 major 1: a live manager's entry once its role is durable (`p` at registration, `m` at enrolment, appender 0's page Live under it) is CURRENT when no reservation stands (a target restart without PTPL): a co-located rule run before its heartbeat re-acquires never kills it" {
     const node: u64 = 0xA;
     var pm = Entry.parse(45, "80\np 0 00000000000000c9\nm 0 00000000000000c9\n").?;
-    try testing.expectEqual(Verdict.current, judge(&pm, &.{pg(0, .live, node, 0xc9)}, node, 0, false));
+    try testing.expectEqual(Verdict.current, judge(&pm, &.{pg(0, .live, node, 0xc9)}, node, 0, false, .{}));
 }
 
 test "round 3 major 4: a sibling mid-leave stays visible to the rule — its `l` line is judged by its pages like a joiner's: Recovering (frozen during its leave, evicted) is stale, Live is current, Free (its leave landed) is spared" {
     const node: u64 = 0xA;
     var e = Entry.parse(46, "81\nl 9 00000000000000d1\n").?;
-    try testing.expectEqual(Verdict.stale, judge(&e, &.{pg(4, .recovering, node, 0xd1)}, node, 0, false));
-    try testing.expectEqual(Verdict.current, judge(&e, &.{pg(4, .live, node, 0xd1)}, node, 0, false));
-    try testing.expect(judge(&e, &.{pg(4, .free, node, 0xd1)}, node, 0, false) != .stale);
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{pg(4, .recovering, node, 0xd1)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.current, judge(&e, &.{pg(4, .live, node, 0xd1)}, node, 0, false, .{}));
+    try testing.expect(judge(&e, &.{pg(4, .free, node, 0xd1)}, node, 0, false, .{}) != .stale);
 }

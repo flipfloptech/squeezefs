@@ -12,8 +12,10 @@
 //!         heartbeat, a write — each at any point of the schedule (the
 //!         resume). Its `m` line stands; appender 0's page names it.
 //!   1 P1  a successor on host B: the claim probed (no write), the host
-//!         registered (`p` enrolled under the registry's lock), the hold
-//!         (acquire, or the holder's key preempted), the claim probed again
+//!         registered (`p` enrolled under the registry's lock), the claim
+//!         read again and the hold in one step (acquire, or the holder's key
+//!         preempted; a fresh claim refuses without a preempt — review 5
+//!         major 1, the instant between them abstracted), the claim probed again
 //!         (a fresh claim whose writer this open's preempt fenced is taken
 //!         over), the replay and the pre-gate writes (held tail, fold,
 //!         cover), the gate's claim read, the bind (claim committed,
@@ -47,7 +49,8 @@
 //!   it) or `nvmet` 7.3 (a holder's preempt of another key is a no-op).
 //!
 //! Invariants: `KilledCurrent` the rule never kills the current manager or a
-//! Live member; `WroteOverLiveClaim` no open writes while another writer's
+//! Live member; `PreemptedLive` a hold never preempts a live manager's host
+//! (its acked-but-unsynced writes lost for nothing, review 5 major 1); `WroteOverLiveClaim` no open writes while another writer's
 //! claim is fresh and that writer can still write (review round 3 major 2);
 //! `WroteUnheld` a writer open writes only under its own hold;
 //! `OverwroteAcked` a superseded or stale incarnation — a manager whose
@@ -99,6 +102,9 @@ pub const ElectionConfig = struct {
     /// The claim probed before the registration (false: round 3 — register,
     /// pre-gate writes, the gate's claim read, the hold).
     claim_first: bool = true,
+    /// The claim read again right before the hold (review 5 major 1; false:
+    /// round 5 — the first probe's reading, from before the rule).
+    probe_before_hold: bool = true,
     /// The second probe under the hold takes over a fresh foreign claim
     /// whose writer this open's preempt fenced (review 4 minor 4; false:
     /// round 4 — the open refuses, the set managerless until the claim ages).
@@ -208,6 +214,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         wrote_unheld: bool = false,
         fenced_wrote: bool = false,
         overwrote_acked: bool = false,
+        preempted_live: bool = false,
         hit_lapse: bool = false,
         hit_register: bool = false,
 
@@ -439,12 +446,17 @@ pub fn Election(comptime cfg: ElectionConfig) type {
 
         fn hold(self: *Self, m: u8, h: u8) void {
             if (!self.reg[h]) return self.discard(m, h);
+            // The claim read right before the hold (review 5 major 1), one
+            // step with it: the instant between them is one report (the
+            // rule's tens of seconds are not).
+            if (cfg.probe_before_hold and self.claimFreshForeign(m)) return self.discard(m, h);
             if (self.holder == NONE) {
                 self.holder = h;
             } else if (self.holder != h) switch (cfg.hold) {
                 // A non-holder's preempt of the holder's key: the hold
                 // passes, the holder's host unregistered.
                 .wero => {
+                    self.notePreemptOf(self.holder);
                     self.reg[self.holder] = false;
                     self.holder = h;
                     self.preempted[m] = true;
@@ -459,6 +471,13 @@ pub fn Election(comptime cfg: ElectionConfig) type {
                     self.wear_held[h] = true;
                 },
             };
+        }
+
+        /// A preempt of host `victim`'s key: a live manager there (its claim
+        /// fresh) loses its acked-but-unsynced writes for nothing.
+        fn notePreemptOf(self: *Self, victim: u8) void {
+            const c = self.claim;
+            if (c != NONE and c != 0 and HOST[c] == victim and self.alive[c] and self.bound[c] and !self.failed[c]) self.preempted_live = true;
         }
 
         /// The manager line of incarnation `i` judged stale (`judgeRegion`).
@@ -533,6 +552,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
 
         pub fn invariant(self: *const Self) !void {
             if (self.killed_current) return error.KilledCurrent;
+            if (self.preempted_live) return error.PreemptedLive;
             if (self.wrote_over_live) return error.WroteOverLiveClaim;
             if (self.wrote_unheld) return error.WroteUnheld;
             if (self.overwrote_acked) return error.OverwroteAcked;
@@ -827,7 +847,7 @@ fn firstError(comptime M: type) ?anyerror {
     return null;
 }
 
-test "model: the election as built (WERO, the claim probed before the registration and again under the hold — a writer this open's preempt fenced taken over —, the rule judging a manager by the report then appender 0's page with `p` retired at enrolment, the re-judge, the lapse's claim check, a hold taken by a preempt kept at the last clean unmount, the departure that keeps our hold) holds — no current manager killed, no write over a live claim, outside its own hold or from a view a later manager's acked metadata superseded, no fenced write, one manager, never unreserved under the current manager" {
+test "model: the election as built (WERO, the claim probed before the registration, again right before the hold and again under it — a writer this open's preempt fenced taken over —, the rule judging a manager by the report then appender 0's page with `p` retired at enrolment, the re-judge, the lapse's claim check, a hold taken by a preempt kept at the last clean unmount, the departure that keeps our hold) holds — no current manager killed or preempted live, no write over a live claim, outside its own hold or from a view a later manager's acked metadata superseded, no fenced write, one manager, never unreserved under the current manager" {
     try explorer.expectHolds(Election(.{}), limits);
     const r = try statesOf(Election(.{}));
     std.debug.print("\nhost fence model (election): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
@@ -859,6 +879,11 @@ test "model, today's code (review 4 blockers 1 and 1b): a joined member's line w
     try explorer.expectFails(Member(.{ .aid_on_line = false, .leave_free_exception = true }), limits, error.InvariantViolated);
     try explorer.expectFails(Member(.{ .aid_on_line = false }), limits, error.InvariantViolated);
     try explorer.expectFails(Member(.{ .leave_free_exception = true }), limits, error.InvariantViolated);
+}
+
+test "model, today's code (review 5 major 1): the hold on the first probe's reading — a manager that bound during the rule is preempted live" {
+    try explorer.expectFails(Election(.{ .probe_before_hold = false }), limits, error.InvariantViolated);
+    try testing.expectEqual(@as(?anyerror, error.PreemptedLive), firstError(Election(.{ .probe_before_hold = false })));
 }
 
 test "model: the second probe that refuses a writer this open's preempt fenced (round 4) is safe too — review 4 minor 4 is availability, not safety" {
@@ -928,6 +953,7 @@ test "model: which invariant each weakening breaks" {
     try expectBreaks("the hold released at a takeover's last unmount: M0's checkpoint (blocker 2)", firstError(Election(.{ .keep_preempted_hold = false, .structural = false, .p2 = false })), &.{error.OverwroteAcked});
     try expectBreaks("no appender id on the line (blocker 1)", firstError(Member(.{ .aid_on_line = false })), &.{error.FencedMemberWrote});
     try expectBreaks("the l-line Free exception (blocker 1b)", firstError(Member(.{ .leave_free_exception = true })), &.{error.FencedMemberWrote});
+    try expectBreaks("the hold on the first probe's reading (review 5 major 1)", firstError(Election(.{ .probe_before_hold = false })), &.{error.PreemptedLive});
     try expectBreaks("rtype 5 (N1)", firstError(Election(.{ .hold = .wear_registered_holds })), &.{ error.TwoManagers, error.WroteOverLiveClaim, error.OverwroteAcked });
     try expectBreaks("no rule", firstError(Election(.{ .rule = false })), &.{ error.FencedWrote, error.TwoManagers, error.WroteUnheld, error.OverwroteAcked, error.WroteOverLiveClaim });
     try expectBreaks("round 3's judgement (major 1)", firstError(Election(.{ .judge = .round3 })), &.{error.KilledCurrent});

@@ -1266,9 +1266,11 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
                     made += 1;
                 }
             }
-            // The flips are the entry's records 0..n, so the first flip's
-            // seq IS the entry start.
-            const flip_floor = flips[0].seq;
+            // The parent's floor is the entry's start POSITION — the domain
+            // the checkpoint tail compares in. The flips' seqs are stamps
+            // (`position + seq_offset`), past the head on a ring with an
+            // offset (decision 0003 §DI); unjournaled, the minted seq.
+            const flip_floor = if (registered) |r| r.res.start else flips[0].seq;
             p.applyLockedStructural(pd.?, flips, flip_floor) catch |e| return mapApply(e);
         } else {
             // A root swap is the ONE routing change with no journaled

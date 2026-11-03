@@ -667,7 +667,9 @@ pub fn smoMerge(t: *KvTree, ctx: *SmoContext, parent: *CachedNode, left: *Cached
             flips[0].deinit();
             return e;
         };
-        parent.applyLockedStructural(pd, &flips, put_seq) catch |e| return smo.mapApply(e);
+        // The parent's floor is the entry's start POSITION, never the Put's
+        // stamp (`position + seq_offset`; decision 0003 §DI).
+        parent.applyLockedStructural(pd, &flips, if (registered) |r| r.res.start else put_seq) catch |e| return smo.mapApply(e);
         try cache.retire(left);
         try cache.retire(right);
         second.unlockWrite(io);

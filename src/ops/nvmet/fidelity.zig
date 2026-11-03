@@ -712,7 +712,8 @@ fn venue(gpa: Allocator, io: Io) !*Rig {
 /// The zero-residue census for a NQN: no subsystem, no record, no
 /// controller of it.
 /// After our last link left, the port is gone — or it carries only links
-/// another run made (a concurrent run's share on the shared loop port).
+/// another run made (an older binary's loop share joins any loop port; two
+/// runs racing for one free id share it).
 fn expectPortLastOut(rig: *Rig, port_id: u16) !void {
     var walk = try configfs.walkLive(configfs.RealFs.face(), rig.gpa);
     defer walk.deinit(rig.gpa);
@@ -798,8 +799,7 @@ fn roundtripLeg(transport: configfs.Trtype) !void {
     try rig.disconnect(&c);
     try rig.unshare(nqn);
     try expectNoResidue(rig, nqn);
-    // The port object went last-out unless another run's link rides it
-    // (the host's ONE loop port is every loop share's).
+    // The port object went last-out unless another run's link rides it.
     try expectPortLastOut(rig, rec.listeners[0].port_id);
 }
 
@@ -2565,9 +2565,10 @@ test "nvmet fidelity: adopt — A1: a hand-built foreign share with a small-int 
         defer f.close(rig.io);
         try f.setLength(rig.io, 64 << 20);
     }
-    // A tcp listener: a loop connect reaches only the FIRST loop port on
-    // the host, so a hand-built loop port would be unreachable beside any
-    // other (a concurrent run's); tcp addresses the port by ip:port.
+    // A tcp listener: a loop connect without an address reaches only the
+    // FIRST loop port on the host, so a hand-built address-less loop port
+    // would be unreachable beside any other (a concurrent run's); tcp
+    // addresses the port by ip:port.
     const hand_port = try rig.tcpPort();
     var hl = try configfs.Listener.tcp("127.0.0.1", hand_port);
     hl.port_id = try smallPortId(fs, rig.pid);
@@ -2631,9 +2632,8 @@ test "nvmet fidelity: adopt — A1: a hand-built foreign share with a small-int 
         break;
     };
     // The ledger-loss class needs an unmarked product NQN on a tcp port of
-    // the PRODUCT range (a loop port would be the harness's shared one and
-    // a harness port id refuses adoption): share it with the product base,
-    // lose the ledger, adopt, restore, unshare.
+    // the PRODUCT range (a harness port id refuses adoption): share it
+    // with the product base, lose the ledger, adopt, restore, unshare.
     var env_prod = try rig.envWith(ident_a);
     defer env_prod.deinit();
     try env_prod.put(port_base_knob, "53000");

@@ -76,7 +76,8 @@ pub const Trtype = configfs.Trtype;
 
 pub const ConnectSpec = struct {
     trtype: Trtype,
-    /// Empty on loop (`traddr` optional: the first loop port).
+    /// Empty on loop: `connect` names the address of the loop port that
+    /// links the subsystem (`configfs.loopPortTraddr`), else the first.
     traddr: []const u8 = "",
     trsvcid: u16 = configfs.DEFAULT_TRSVCID,
     subnqn: []const u8,
@@ -772,8 +773,16 @@ pub fn connect(gpa: Allocator, spec: ConnectSpec, expected_uuid: ?[16]u8) Connec
     }
     const fd: linux.fd_t = @intCast(rc);
     defer _ = linux.close(fd);
+    // A loop connect names the port that links the subsystem: without
+    // `traddr=` nvme-loop takes the FIRST enabled loop port, another's
+    // whenever one was enabled before ours.
+    var lb: [configfs.NVMF_TRADDR_SIZE]u8 = undefined;
+    var named = spec;
+    if (spec.trtype == .loop and spec.traddr.len == 0) {
+        if (configfs.loopPortTraddr(configfs.RealFs.face(), gpa, spec.subnqn, &lb)) |t| named.traddr = t;
+    }
     var sb: [1024]u8 = undefined;
-    const text = spec.text(&sb);
+    const text = named.text(&sb);
     const wn = linux.write(fd, text.ptr, text.len);
     if (linux.errno(wn) != .SUCCESS) {
         stats.fabric_connect_failures.inc();

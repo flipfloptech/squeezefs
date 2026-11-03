@@ -26,6 +26,8 @@
 //! OURS-AND-MATCHING iff its `(trtype, adrfam, traddr, trsvcid)` match and
 //! every link under it names a LEDGERED nqn — "ownership is ledger
 //! membership, never a prefix"; anything else is foreign and never touched.
+//! A loop port is no exception: the product's carries its own address
+//! (`loopTraddr`), which a loop connect names (`loopPortTraddr`).
 //!
 //! Every mutation goes through the `Fs` face: the real one over raw
 //! syscalls, the FAKE an in-process tree with the kernel's semantics
@@ -61,6 +63,8 @@ pub const NAMESPACE_INDEX: u32 = 1;
 /// The NVMe spec's NQN maximum (`NVMF_NQN_SIZE`; the kernel's field is
 /// 256 with its NUL).
 pub const NVMF_NQN_SIZE: usize = 223;
+/// `NVMF_TRADDR_SIZE` (`include/linux/nvme.h`): a port's `addr_traddr`.
+pub const NVMF_TRADDR_SIZE: usize = 256;
 
 /// Port ids: WIDTH 1000 ids per base, 900 hash slots ("the hash spreads
 /// over 900 slots; the last 100 are pure probe headroom", N:57-59).
@@ -118,7 +122,7 @@ pub const Trtype = enum(u8) {
 };
 
 pub const Adrfam = enum(u8) {
-    /// A loop port carries no address.
+    /// A loop port has no address family (its address is a name: `loopTraddr`).
     none = 0,
     ipv4 = 1,
     ipv6 = 2,
@@ -141,11 +145,12 @@ pub const Adrfam = enum(u8) {
     }
 };
 
-/// One listener of a share: a tcp `(ip, port)` or the one loop port.
+/// One listener of a share: a tcp `(ip, port)` or a loop port.
 pub const Listener = struct {
     trtype: Trtype,
     adrfam: Adrfam,
-    /// The IPv4 address in the first 4 bytes, an IPv6 address whole.
+    /// The IPv4 address in the first 4 bytes, an IPv6 address whole; zero
+    /// on loop (the port's address derives from its id: `loopTraddr`).
     traddr: [16]u8 = @splat(0),
     trsvcid: u16 = 0,
     /// The configfs port object (allocated before the pending record).
@@ -196,6 +201,15 @@ pub const Listener = struct {
         return a.trtype == b.trtype and a.adrfam == b.adrfam and a.trsvcid == b.trsvcid and std.mem.eql(u8, &a.traddr, &b.traddr);
     }
 };
+
+/// The product's loop port `ports/<id>` carries `addr_traddr =
+/// squeezefs-port-<id>`: `nvme_loop_find_port` matches a connect's
+/// `traddr=` against it, while a connect without one reaches only the
+/// FIRST enabled loop port — whoever made it. Port ids are unique on the
+/// host, so the name is too.
+pub fn loopTraddr(buf: *[24]u8, port_id: u16) []const u8 {
+    return std.fmt.bufPrint(buf, "squeezefs-port-{d}", .{port_id}) catch unreachable;
+}
 
 // ---------------------------------------------------------------------------
 // The filesystem face.
@@ -479,9 +493,14 @@ pub const PortEntry = struct {
     /// The subsystem NQNs linked under it.
     links: [][]u8,
 
+    /// Loop: a product-shaped port (its address is `loopTraddr` of its
+    /// id); an address-less or otherwise named one is not ours to join.
     pub fn matches(self: PortEntry, l: Listener) bool {
         if (self.trtype != l.trtype) return false;
-        if (l.trtype == .loop) return true;
+        if (l.trtype == .loop) {
+            var tb: [24]u8 = undefined;
+            return std.mem.eql(u8, self.traddr, loopTraddr(&tb, self.id));
+        }
         var ab: [64]u8 = undefined;
         var pb: [8]u8 = undefined;
         const port = std.fmt.bufPrint(&pb, "{d}", .{l.trsvcid}) catch unreachable;
@@ -532,18 +551,13 @@ pub const AllocError = error{PortRangeExhausted};
 /// that is FREE or OURS-AND-MATCHING; every id taken by a foreign or
 /// incompatible port ⇒ exhausted (the refusal names the knob).
 ///
-/// LOOP: ONE port object per host, whoever made it. The loop initiator
-/// addresses no port (`nvme_loop_find_port` takes the FIRST loop port when
-/// `traddr` is absent), so a second loop port would serve subsystems no
-/// `transport=loop` connect can reach (measured: a foreign-linked loop
-/// port skipped by the ownership law left the new share unreachable,
-/// `-EIO` at the connect). Links are per subsystem — sharing the object
-/// lets no one alter another's; last-out removal still needs every link
-/// gone, so a foreign-linked loop port survives our teardown.
+/// LOOP rides the same law (key `"loop"`): a loop port another made — an
+/// operator's, another ledger's (a second state dir: the fidelity harness,
+/// a perf rig) — is never joined. Joining one enabled it if link-free,
+/// removed it at our last-out, inherited its port parameters and tied two
+/// ledgers' shares to one object (decision 0003 §DK). Ours stays reachable
+/// beside any other by its address (`loopTraddr`, `loopPortTraddr`).
 pub fn allocatePortId(base: u16, l: Listener, snapshot: PortSnapshot, ownership: Ownership) AllocError!u16 {
-    if (l.trtype == .loop) {
-        for (snapshot.entries) |e| if (e.trtype == .loop) return e.id;
-    }
     var kb: [96]u8 = undefined;
     const start = firstCandidate(base, l.hashKey(&kb));
     var i: u16 = 0;
@@ -662,6 +676,27 @@ pub fn snapshotPorts(fs: Fs, gpa: Allocator) Error!PortSnapshot {
         try entries.append(gpa, .{ .id = id, .trtype = Trtype.parse(tr), .adrfam = adrfam, .traddr = traddr, .trsvcid = trsvcid, .links = links });
     }
     return .{ .entries = try entries.toOwnedSlice(gpa) };
+}
+
+/// The address a loop connect to `subnqn` names: the `addr_traddr` of the
+/// lowest-id loop port that links it and carries one (the target is this
+/// host's own tree); null when none does — the connect then reaches the
+/// first enabled loop port, as a connect without `traddr=` does.
+pub fn loopPortTraddr(fs: Fs, gpa: Allocator, subnqn: []const u8, out: *[NVMF_TRADDR_SIZE]u8) ?[]const u8 {
+    var snap = snapshotPorts(fs, gpa) catch return null;
+    defer snap.deinit(gpa);
+    var best: ?*const PortEntry = null;
+    for (snap.entries) |*e| {
+        if (e.trtype != .loop or e.traddr.len == 0 or e.traddr.len > out.len) continue;
+        if (best) |b| if (b.id < e.id) continue;
+        for (e.links) |linked| if (std.mem.eql(u8, linked, subnqn)) {
+            best = e;
+            break;
+        };
+    }
+    const p = best orelse return null;
+    @memcpy(out[0..p.traddr.len], p.traddr);
+    return out[0..p.traddr.len];
 }
 
 /// `8-4-4-4-12` → bytes; null when absent, malformed or the nil uuid
@@ -956,8 +991,15 @@ pub fn ensurePort(fs: Fs, l: Listener) ApplyError!void {
 
 fn fillPort(fs: Fs, l: Listener) ApplyError!void {
     var pb: [128]u8 = undefined;
+    if (l.trtype == .loop) {
+        // The address BEFORE the trtype: a crash between them leaves a
+        // shell `ensurePort` refills (an empty trtype), never a loop port
+        // without its address.
+        var tb: [24]u8 = undefined;
+        try write(fs, std.fmt.bufPrint(&pb, "ports/{d}/addr_traddr", .{l.port_id}) catch unreachable, loopTraddr(&tb, l.port_id));
+        return write(fs, std.fmt.bufPrint(&pb, "ports/{d}/addr_trtype", .{l.port_id}) catch unreachable, l.trtype.name());
+    }
     try write(fs, std.fmt.bufPrint(&pb, "ports/{d}/addr_trtype", .{l.port_id}) catch unreachable, l.trtype.name());
-    if (l.trtype == .loop) return;
     var ab: [64]u8 = undefined;
     var sb: [8]u8 = undefined;
     try write(fs, std.fmt.bufPrint(&pb, "ports/{d}/addr_adrfam", .{l.port_id}) catch unreachable, l.adrfam.name());
@@ -1480,10 +1522,7 @@ test "port ids: frozen hash64 first-candidate vectors inside the 900 slots; a re
     // Only the top id free: reached by wrapping from a candidate inside the 900 slots.
     const partial = full[0 .. PORT_ID_RANGE - 1];
     try testing.expectEqual(@as(u16, PORT_ID_BASE_DEFAULT + PORT_ID_RANGE - 1), try allocatePortId(PORT_ID_BASE_DEFAULT, l2, .{ .entries = partial }, none_ledgered));
-    // LOOP: the one existing loop port is reused whoever linked it (the
-    // initiator reaches only the first loop port); none ⇒ the candidate.
-    var loop_foreign = [_]PortEntry{.{ .id = 7, .trtype = .loop, .adrfam = "", .traddr = "", .trsvcid = "", .links = &links }};
-    try testing.expectEqual(@as(u16, 7), try allocatePortId(PORT_ID_BASE_DEFAULT, Listener.loop, .{ .entries = &loop_foreign }, none_ledgered));
+    // LOOP: no port ⇒ the candidate (the other loop shapes: the next test).
     try testing.expectEqual(c3, try allocatePortId(PORT_ID_BASE_DEFAULT, Listener.loop, .{ .entries = &.{} }, none_ledgered));
     try testing.expectEqual(@as(u16, 64536), PORT_ID_BASE_MAX);
     try testing.expectEqual(@as(u32, 65535), @as(u32, PORT_ID_BASE_MAX) + PORT_ID_RANGE - 1);
@@ -1624,7 +1663,7 @@ test "share over the fake tree: the EXACT attribute sequence (allow_any_host fir
     try testing.expect(again.subsystem_absent);
 }
 
-test "share: allow-host wiring (hosts/, the allowed_hosts link, attr 0); the loop port carries no address; a shared port is reused and removed last-out; a kernel without resv_enable serves loud without PR" {
+test "share: allow-host wiring (hosts/, the allowed_hosts link, attr 0); the loop port carries the product's address (written before its trtype); a shared port is reused and removed last-out; a kernel without resv_enable serves loud without PR" {
     const gpa = testing.allocator;
     var fake = try FakeFs.init(gpa);
     defer fake.deinit();
@@ -1633,12 +1672,15 @@ test "share: allow-host wiring (hosts/, the allowed_hosts link, attr 0); the loo
     l.port_id = 53500;
     const host = "nqn.2014-08.org.nvmexpress:uuid:host-1";
     _ = try apply(fs, .{ .subnqn = nqn_a, .backing_path = "/build/a.img", .ns_uuid = uuid_a, .allow_hosts = &.{host}, .listeners = &.{l} });
-    var b: [16]u8 = undefined;
+    var b: [32]u8 = undefined;
     try testing.expectEqualStrings("0", try fs.readAttr("subsystems/" ++ nqn_a ++ "/attr_allow_any_host", &b));
     try testing.expect(fs.exists("hosts/" ++ host));
     try testing.expect(fs.exists("subsystems/" ++ nqn_a ++ "/allowed_hosts/" ++ host));
     try testing.expectEqualStrings("loop", try fs.readAttr("ports/53500/addr_trtype", &b));
-    try testing.expectEqualStrings("", try fs.readAttr("ports/53500/addr_traddr", &b));
+    try testing.expectEqualStrings("squeezefs-port-53500", try fs.readAttr("ports/53500/addr_traddr", &b));
+    const first_ops = try fake.opLog(gpa);
+    defer gpa.free(first_ops);
+    try testing.expect(std.mem.indexOf(u8, first_ops, "mkdir ports/53500\nwrite ports/53500/addr_traddr = squeezefs-port-53500\nwrite ports/53500/addr_trtype = loop\nsymlink ports/53500/subsystems/") != null);
     // A second share on the SAME loop port: reused (no mkdir), two links.
     const nqn_b = "nqn.2026-10.io.squeezefs:share-bbbb";
     fake.clearOps();
@@ -1703,6 +1745,43 @@ test "the crash window: a port link that refuses leaves the namespace LIVE and t
     try log.testing.expectAllFired();
     try testing.expect(try removePortIfUnlinked(fs, gpa, 53100));
     try testing.expect(!(try removePortIfUnlinked(fs, gpa, 53100)));
+}
+
+test "loop ports: a crash shell is refilled with the address and ours is accepted as is; an address-less loop port on the chosen id refuses at ensurePort; a loop connect's address is the lowest-id addressed loop port linking the subsystem — linked only address-less, or not at all, ⇒ null" {
+    const gpa = testing.allocator;
+    var fake = try FakeFs.init(gpa);
+    defer fake.deinit();
+    const fs = fake.face();
+    var ours = Listener.loop;
+    ours.port_id = 53176;
+    try fs.mkdir("ports/53176");
+    try ensurePort(fs, ours);
+    var b: [32]u8 = undefined;
+    try testing.expectEqualStrings("squeezefs-port-53176", try fs.readAttr("ports/53176/addr_traddr", &b));
+    try testing.expectEqualStrings("loop", try fs.readAttr("ports/53176/addr_trtype", &b));
+    try ensurePort(fs, ours);
+    // An operator's loop port (no address) squatting the id.
+    try fs.mkdir("ports/53177");
+    try fs.writeAttr("ports/53177/addr_trtype", "loop");
+    var squatted = Listener.loop;
+    squatted.port_id = 53177;
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.PortLinkRefused, ensurePort(fs, squatted));
+    try log.testing.expectAllFired();
+    // The connect's address.
+    var tb: [NVMF_TRADDR_SIZE]u8 = undefined;
+    try testing.expect(loopPortTraddr(fs, gpa, nqn_a, &tb) == null);
+    try fs.mkdir("subsystems/" ++ nqn_a);
+    try fs.symlink("subsystems/" ++ nqn_a, "ports/53177/subsystems/" ++ nqn_a);
+    try testing.expect(loopPortTraddr(fs, gpa, nqn_a, &tb) == null);
+    try fs.mkdir("ports/53999");
+    try fs.writeAttr("ports/53999/addr_traddr", "squeezefs-port-53999");
+    try fs.writeAttr("ports/53999/addr_trtype", "loop");
+    try fs.symlink("subsystems/" ++ nqn_a, "ports/53999/subsystems/" ++ nqn_a);
+    try testing.expectEqualStrings("squeezefs-port-53999", loopPortTraddr(fs, gpa, nqn_a, &tb).?);
+    try fs.symlink("subsystems/" ++ nqn_a, "ports/53176/subsystems/" ++ nqn_a);
+    try testing.expectEqualStrings("squeezefs-port-53176", loopPortTraddr(fs, gpa, nqn_a, &tb).?);
+    try testing.expect(loopPortTraddr(fs, gpa, "nqn.2026-10.io.squeezefs:share-other", &tb) == null);
 }
 
 test "the real face: the nvmet tree is walkable on the venue (configfs mounted by preflight) and the status counts read; skipped loud without root" {

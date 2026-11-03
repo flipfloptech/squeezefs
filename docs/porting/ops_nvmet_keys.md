@@ -92,8 +92,9 @@ conflicts (the "spec-strict" measurement, R:1095-1098, GS:198-207); UNREGISTER i
 against the issuing host's own registration (`crkey`); Get Features FID 0x81 requires
 `EXHID=1` (16 B) else Invalid Field (R:1058-1062). `drivers/nvme/target/loop.c` registers the
 `loop` transport on BOTH sides: a port with `addr_trtype=loop` needs no address; the host
-connect `transport=loop,nqn=…[,traddr=…]` picks the first loop port when `traddr` is absent
-(`nvme_loop_find_port`). Deleting a subsystem under a LIVE tcp association makes the host
+connect `transport=loop,nqn=…[,traddr=…]` picks the first ENABLED loop port when `traddr` is
+absent and the loop port whose `addr_traddr` equals it otherwise (`nvme_loop_find_port`;
+`addr_traddr` is writable on a loop port while it is disabled). Deleting a subsystem under a LIVE tcp association makes the host
 controller reconnect (`reconnect_delay` 10 s, `ctrl_loss_tmo` 600 s — D:510 R3); under a LIVE
 loop association the host controller is DELETED (loop has no reconnect).
 
@@ -130,7 +131,7 @@ loop association the host controller is DELETED (loop has no reconnect).
 └── ports/<id>/                            # id from the reserved range (N:599)
     ├── addr_trtype                        # "tcp" | "loop"   (N:600 pins tcp; §1.4 adds loop)
     ├── addr_adrfam                        # "ipv4" | "ipv6"  (N:601; `adrfam_of` N:96-105)
-    ├── addr_traddr                        # the listener IP  (N:602)
+    ├── addr_traddr                        # the listener IP  (N:602); loop: "squeezefs-port-<id>"
     ├── addr_trsvcid                       # the TCP port as text (N:603)
     └── subsystems/<subnqn> -> ../../../subsystems/<subnqn>   # the link that ENABLES the port (N:716)
 ```
@@ -201,10 +202,16 @@ never touch. The scan→create race closes at `ensure_port` with a loud refusal 
 (N:591-597).
 
 **loop port** (the port's addition; the reference pins `addr_trtype=tcp` — D:667 residual 1):
-`mkdir ports/<id>`; `addr_trtype ← "loop"`; no address attributes (`nvmet_loop_add_port` ignores
-them; the kernel's `addr_adrfam` default `loop` suffices). ONE loop port per host serves every
-loop share (links are per subsystem); its probe key is the constant `"loop"`. The initiator
-side is `transport=loop,nqn=<subnqn>` (§3.1). `share --transport loop` needs no `--ip`;
+`mkdir ports/<id>`; `addr_traddr ← "squeezefs-port-<id>"` (`configfs.loopTraddr`) BEFORE
+`addr_trtype ← "loop"` (a crash between them leaves a shell the port step refills); no other
+address attribute (the kernel's `addr_adrfam` default suffices). The probe key is the constant
+`"loop"` and the reuse law is tcp's: OURS-AND-MATCHING = a loop port whose `addr_traddr` is
+`loopTraddr` of its id and whose links are all ledgered; an operator's, another ledger's (a
+second state dir) or an address-less loop port is FOREIGN — never joined (decision 0003 §DK:
+the first port carried every loop share on the host, whoever made it — a link-free foreign port
+was enabled by our link and removed at our last-out, and two ledgers' shares rode one object).
+The initiator side is `transport=loop,nqn=<subnqn>,traddr=<the address of the loop port that
+links the subsystem>` (§3.1; `configfs.loopPortTraddr`, read from this host's own tree). `share --transport loop` needs no `--ip`;
 `--transport tcp` (default) requires ≥ 1 `--ip`.
 
 **The reserved range** (N:52-58; D:358): `[base, base + 999]`, `base` default **53000**
@@ -458,8 +465,10 @@ transport=tcp,traddr=<ip>,trsvcid=<port>,nqn=<subnqn>,hostnqn=<hostnqn>,hostid=<
   [,host_traddr=<src ip>][,host_iface=<ifname>][,nr_io_queues=<n>]
   [,fast_io_fail_tmo=<s>,ctrl_loss_tmo=<s>,reconnect_delay=<s>]
 ```
-The port adds the loop shape `transport=loop,nqn=<subnqn>,hostnqn=…,hostid=…` (§0;
-`traddr` optional) and the PATH-LOSS CLOCKS (rung 10 multipath; the reference left the
+The port adds the loop shape `transport=loop,nqn=<subnqn>,hostnqn=…,hostid=…[,traddr=…]`
+(§0; a spec without `traddr` gets the address of the lowest-id addressed loop port linking the
+subsystem — `configfs.loopPortTraddr` — so a share on a port other than the first enabled one is
+reached; none ⇒ no `traddr`, the first port) and the PATH-LOSS CLOCKS (rung 10 multipath; the reference left the
 kernel's: fail-fast off, `ctrl_loss_tmo` 600 s): every daemon-owned connect and every
 `squeezefs nvmeof connect` carries `fast_io_fail_tmo` = the writer claim's staleness TTL
 (45 s — with EVERY path of a head down that long the holder is preemptable, so its held

@@ -192,7 +192,7 @@ pub fn share(ctx: *Ctx, o: ShareOptions) Outcome {
             }
         },
         .loop => {
-            if (o.ips.len != 0) return fail(ctx, "share: --transport loop takes no --ip (a loop port carries no address)", .{});
+            if (o.ips.len != 0) return fail(ctx, "share: --transport loop takes no --ip (a loop port is this host's own: its address is the product's `squeezefs-port-<id>`, never an IP)", .{});
             listeners_buf[0] = Listener.loop;
             n_listeners = 1;
         },
@@ -306,7 +306,8 @@ pub fn share(ctx: *Ctx, o: ShareOptions) Outcome {
     for (listeners) |li| {
         var ab: [64]u8 = undefined;
         if (li.trtype == .loop) {
-            ctx.stdout.print("  listener loop (port id {d}): connect with `squeezefs nvmeof connect --transport loop {s}`\n", .{ li.port_id, subnqn }) catch {};
+            var tb: [24]u8 = undefined;
+            ctx.stdout.print("  listener loop {s} (port id {d}): connect with `squeezefs nvmeof connect --transport loop {s}`\n", .{ configfs.loopTraddr(&tb, li.port_id), li.port_id, subnqn }) catch {};
         } else {
             ctx.stdout.print("  listener tcp {s}:{d} (port id {d}): connect with `squeezefs nvmeof connect --ip {s} --port {d} {s}`\n", .{ li.traddrText(&ab), li.trsvcid, li.port_id, li.traddrText(&ab), li.trsvcid, subnqn }) catch {};
         }

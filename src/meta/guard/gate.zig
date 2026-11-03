@@ -683,10 +683,20 @@ pub const Guard = struct {
         const sqz = exec.SqzIo.fromIo(g.io);
         var outcome = sqz.runBlocking(prRecheckBlocking, .{ g, c }) catch return true;
         if (outcome == .lapse) {
-            if (!g.deviceClaimIsOurs()) {
-                _ = g.be.lane.latch.noteFence("the reservation lapse: the device's claim names another writer");
-                log.err("meta volume {s}: the reservation lapsed and the claim on the device is not this incarnation's — a successor took the role (and left): this volume fail-stops instead of re-registering", .{g.be.path});
-                return false;
+            switch (g.deviceClaim()) {
+                .ours => {},
+                .foreign => {
+                    _ = g.be.lane.latch.noteFence("the reservation lapse: the device's claim names another writer");
+                    log.err("meta volume {s}: the reservation lapsed and the claim on the device is not this incarnation's — a successor took the role (and left): this volume fail-stops instead of re-registering", .{g.be.path});
+                    return false;
+                },
+                // Unreadable is not "another's" (review 4 minor 5: a live
+                // manager's own checkpoint churn): this beat skipped — no
+                // re-acquire, no refresh — the next one reads again.
+                .unreadable => {
+                    log.warn("meta volume {s}: the reservation lapsed and the claim on the device could not be read — this beat skipped (no re-acquire, no refresh); the next beat reads it again", .{g.be.path});
+                    return false;
+                },
             }
             outcome = sqz.runBlocking(reacquireBlocking, .{ g, c }) catch return true;
         }
@@ -746,10 +756,12 @@ pub const Guard = struct {
         return .reacquired;
     }
 
-    /// Does the claim on the DEVICE (a private replay, no write) still name
-    /// this incarnation? A successor took the role and left otherwise.
-    /// An unreadable claim is not ours (the volume fail-stops).
-    fn deviceClaimIsOurs(g: *Guard) bool {
+    const ClaimWord = enum { ours, foreign, unreadable };
+
+    /// What the claim on the DEVICE (a private replay, no write) says: this
+    /// incarnation's; another's or none (a successor took the role and
+    /// left); or unreadable.
+    fn deviceClaim(g: *Guard) ClaimWord {
         // This mount's own checkpoint can recycle the nodes a probe's ledger
         // record names mid-read; a later attempt reads the newer record.
         const attempts = 3;
@@ -764,11 +776,11 @@ pub const Guard = struct {
                 continue;
             };
             break;
-        } else return false;
-        const bytes = raw orelse return false;
+        } else return .unreadable;
+        const bytes = raw orelse return .foreign;
         defer g.gpa.free(bytes);
-        const cl = claim.Claim.decode(bytes) catch return false;
-        return cl.writer_id == g.identity.writerId(g.be.index);
+        const cl = claim.Claim.decode(bytes) catch return .unreadable;
+        return if (cl.writer_id == g.identity.writerId(g.be.index)) .ours else .foreign;
     }
 
     fn failStop(g: *Guard, why: []const u8) void {

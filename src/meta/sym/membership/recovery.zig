@@ -7,9 +7,10 @@
 //!  0. decide on a FRESH read (the page still Live/Recovering under the
 //!     same identity + term; the record still standing; a member the owner
 //!     lists LIVE again retires the record and leaves the region alone);
-//!  1. PREEMPT-AND-ABORT the dead registrant's key (the own-key guard for a
-//!     co-located appender; a no-op on a file substrate: the loud posture)
-//!     — `pr_fenced ≡ the meta preempt landed`;
+//!  1. PREEMPT-AND-ABORT the dead registrant's key — through the manager's
+//!     fencing registrant when one stands (decision 0003 §DG) — (the own-key
+//!     guard for a co-located appender; a no-op on a file substrate: the
+//!     loud posture) — `pr_fenced ≡ the meta preempt landed`;
 //!  2. page `Live → Recovering{recovered_by_term = writer_term}` to both
 //!     directory slots, barriered; the lessee's rule 4 SUSPENDED;
 //!  3. read the ring ≥ `ledger_tail_seq`; tree 0's leases of the dead id
@@ -320,6 +321,9 @@ pub const Mount = struct {
     identity: WriterIdentity,
     /// The metadata namespace's PR client (null on a file substrate).
     meta_pr: ?*pr.Client,
+    /// Its fencing registrant (decision 0003 §DG; null: none stands — the
+    /// holder's own preempt).
+    fencer: ?*pr.Client = null,
     /// The data namespaces this process holds WERO on.
     data_pr: []const *pr.Client = &.{},
     screen: *fencing.ScreenSource,
@@ -518,10 +522,10 @@ pub const Driver = struct {
         try self.fail(.decide);
         // ---- 1. preempt ----
         const t_preempt = clock.monotonicNs();
-        const meta = fencing.preemptDeadRegistrant(self.mount.meta_pr, standing.pr_key);
+        const meta = fencing.preemptDeadRegistrant(self.mount.meta_pr, self.mount.fencer, standing.pr_key);
         const pr_fenced = meta == .fenced;
         if (meta != .own_key_guard) {
-            for (self.mount.data_pr) |c| _ = fencing.preemptDeadRegistrant(c, standing.pr_key);
+            for (self.mount.data_pr) |c| _ = fencing.preemptDeadRegistrant(c, null, standing.pr_key);
         }
         phase(.preempt, t_preempt);
         try self.fail(.preempt);
@@ -535,10 +539,11 @@ pub const Driver = struct {
         // ---- 2b. the fence re-read (review B2): the dead member's host
         //      registered again while step 1 ran (its preempt found the key
         //      absent) is preempted again before the ring is read — never
-        //      after an ignored preempt (the key never left, decision 0003
-        //      §DF.12: spec-conformant targets only) ----
+        //      after an ignored preempt (the key never left: the holder's
+        //      no-op on nvmet 7.3, decision 0003 §DF.12; through the fencer
+        //      it lands there too, §DG) ----
         var fenced = pr_fenced;
-        if (meta != .own_key_guard and meta != .ignored) if (fencing.refenceAfterRecovering(self.mount.meta_pr, standing.pr_key)) |again| {
+        if (meta != .own_key_guard and meta != .ignored) if (fencing.refenceAfterRecovering(self.mount.meta_pr, self.mount.fencer, standing.pr_key)) |again| {
             fenced = again == .fenced;
         };
         try self.mount.screen.suspendLessee(p.appender_id);

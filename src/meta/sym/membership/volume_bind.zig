@@ -151,6 +151,7 @@ pub const VolumeBinding = struct {
             .mount = .{
                 .identity = identity,
                 .meta_pr = if (be.guard) |g| g.prClient() else null,
+                .fencer = if (be.guard) |g| g.fencerClient() else null,
                 // The data namespaces' registrants travel with the data
                 // planes' device arm (owed): the metadata preempt alone
                 // decides `pr_fenced`.

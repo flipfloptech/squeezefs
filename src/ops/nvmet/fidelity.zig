@@ -25,7 +25,9 @@
 //! registrants), `co-located mounts` and `stale sibling` (one host
 //! identity per host, decision 0003 §DF), `sigstop-preempt` (a stopped holder is preempted past
 //! `T_owner`; resumed, its next beat reads the usurpation and its barrier
-//! answers the device's `-EBADE` — FAILED), `g2-restore-tcp` (the PTPL
+//! answers the device's `-EBADE` — FAILED), the member-death rows (the
+//! manager's fencing registrant preempts the dead member's host, decision
+//! 0003 §DG; a frozen member's released windows refused), `g2-restore-tcp` (the PTPL
 //! lapse: the subsystem wiped by hand under a live mount, `restore`
 //! rebuilds it with the recorded uuid, the heartbeat re-acquires:
 //! `writer_guard_pr_reacquires` grows, `writer_guard_fenced` stays 0),
@@ -1564,7 +1566,7 @@ fn statNumber(text: []const u8, key: []const u8) !u64 {
     };
 }
 
-test "nvmet fidelity: co-located mounts — ONE host identity for every mount of a set on a host (owner ruling 2026-11-02, option C): a symmetric set on nvmet-loop, the manager A and a joiner B on this host under the one identity; ONE controller of the data subsystem serves both; ONE registration of the host (regctl 1) under the manager's WERO hold, A registered it, B adopted it (the same key, no device mutation); both read each other's files; B's umount leaves the shared association and the registration standing (A reads B's file and writes on), A's umount releases both (no controller, regctl 0)" {
+test "nvmet fidelity: co-located mounts — ONE host identity for every mount of a set on a host (owner ruling 2026-11-02, option C): a symmetric set on nvmet-loop, the manager A and a joiner B on this host under the one identity; ONE controller of the data subsystem serves both; ONE registration of the host under the manager's WERO hold, beside the manager's fencing registrant under the same key, never holding (regctl 2, decision 0003 §DG), A registered it, B adopted it (the same key, no device mutation); both read each other's files; B's umount leaves the shared association and the registration standing (A reads B's file and writes on), A's umount releases them all (no controller, regctl 0)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -1579,7 +1581,7 @@ test "nvmet fidelity: co-located mounts — ONE host identity for every mount of
     {
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
         try testing.expectEqual(@as(?u64, nvme.RTYPE_WERO), json_scan.number(rr, "rtype"));
         const sa = try rig.stats(a);
         defer gpa.free(sa);
@@ -1588,10 +1590,16 @@ test "nvmet fidelity: co-located mounts — ONE host identity for every mount of
         try testing.expectEqual(@as(u64, 1), try statNumber(sa, "pr_host_registrations"));
         try testing.expectEqual(@as(u64, 0), try statNumber(sb, "pr_host_registrations"));
         try testing.expectEqual(@as(u64, 1), try statNumber(sb, "pr_host_adoptions"));
+        // The manager stood its fencer; the joiner none.
+        try testing.expectEqual(@as(u64, 1), try statNumber(sa, "pr_fencer_registrations"));
+        try testing.expectEqual(@as(u64, 0), try statNumber(sb, "pr_fencer_registrations"));
         const key_a = json_scan.string(sa, "pr_key") orelse return error.StatMissing;
         const key_b = json_scan.string(sb, "pr_key") orelse return error.StatMissing;
         try testing.expectEqualStrings(key_a, key_b);
         try testing.expectEqualStrings(key_a, json_scan.string(rr, "holder_key") orelse return error.StatMissing);
+        // holder_key + the host and its fencer under the one key, one holding.
+        try testing.expectEqual(@as(usize, 3), std.mem.count(u8, rr, key_a));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rr, "\"holds_reservation\":true"));
     }
     const sum_a = try rig.onMount(a, "head -c 1048576 /dev/urandom > fa && sync -d fa && cksum fa | cut -d' ' -f1");
     defer gpa.free(sum_a);
@@ -1611,10 +1619,12 @@ test "nvmet fidelity: co-located mounts — ONE host identity for every mount of
     {
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
     }
     try rig.umount(a);
     try testing.expectEqual(@as(u32, 0), try rig.controllersOf(set.data_nqn, null));
+    // The fencer's controller went with its last user: the rig's own alone.
+    try testing.expectEqual(@as(u32, 1), try rig.controllersOf(set.meta_nqn, null));
     {
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
@@ -1673,9 +1683,10 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
         const sa = try rig.stats(a);
         defer gpa.free(sa);
         try testing.expectEqual(@as(u64, 1), try statNumber(sa, "pr_host_adoptions"));
+        // Host A and the manager B's fencer under host A's key.
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
     }
     try testing.expect(try scriptSucceeds(rig, a, "mkdir da && echo a > da/a && sync -d da/a"));
     const before = try rig.onMount(b, "echo before > f && sync -d f && cat f");
@@ -1706,9 +1717,11 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
     const a_wrote = scriptSucceeds(rig, a, "echo x > da/z && sync -d da/z") catch false;
     try testing.expect(!a_wrote);
     {
+        // Host C and P2's fencer: every takeover preempt took the superseded
+        // host's fencer with it (host A's, then P1's host B's).
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
     }
     // A stale sibling that can be neither proven dead nor killed refuses the
     // registration loud by name: the mount exits, B lives on, host A stays
@@ -1732,7 +1745,7 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
         try testing.expect(alive(pid_b));
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
     }
     // A, fenced with its host, is stopped by hand: whether P2 evicted it
     // yet is timing, so the rule below meets exactly one live stale sibling.

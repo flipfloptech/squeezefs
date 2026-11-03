@@ -11,7 +11,12 @@
 //! conflicts; a release under the wrong rtype is refused (Invalid Field);
 //! unregistering the holder's key releases; `SpecStrict` register refuses a
 //! different key from an already registered host (SPDK), `LenientReplace`
-//! replaces it in place (kernel nvmet).
+//! replaces it in place (kernel nvmet). The holder is a REGISTRANT — a host
+//! id and its key — as nvmet keeps it (`pr->holder`): another host under the
+//! holder's key (a fencing registrant, decision 0003 §DG) is not the holder.
+//! A preempt naming the holder's key takes the reservation and unregisters
+//! every other registrant of the key; one naming another key unregisters
+//! every registrant of it, the sender not skipped, the reservation kept.
 
 const std = @import("std");
 const nvme = @import("nvme_cmd.zig");
@@ -24,7 +29,9 @@ pub const Registered = struct { host_id: [16]u8, key: u64 };
 /// The one shared namespace every `Host` of a test drives.
 pub const Namespace = struct {
     gpa: std.mem.Allocator,
+    /// The holder's key and host id (null = no reservation).
     holder: ?u64 = null,
+    holder_host: [16]u8 = @splat(0),
     rtype: u8 = 0,
     registered: std.ArrayList(Registered) = .empty,
     semantics: RegisterSemantics = .spec_strict,
@@ -79,6 +86,7 @@ pub const Namespace = struct {
     pub fn seedHolder(self: *Namespace, key: u64) !void {
         try self.registered.append(self.gpa, .{ .host_id = foreign_host, .key = key });
         self.holder = key;
+        self.holder_host = foreign_host;
         self.rtype = nvme.RTYPE_WRITE_EXCLUSIVE;
         self.generation += 1;
     }
@@ -86,8 +94,7 @@ pub const Namespace = struct {
     /// A target without PTPL power-cycled: the reservation and every
     /// registration are gone.
     pub fn powerCycle(self: *Namespace) void {
-        self.holder = null;
-        self.rtype = 0;
+        self.clearHolder();
         self.registered.clearRetainingCapacity();
         self.generation += 1;
     }
@@ -95,9 +102,9 @@ pub const Namespace = struct {
     /// The device's write law: WE ⇒ the holder's host alone; WERO ⇒ any
     /// registrant; no reservation ⇒ anyone.
     pub fn writeAllowed(self: *const Namespace, host_id: [16]u8) bool {
-        const holder = self.holder orelse return true;
+        if (self.holder == null) return true;
         return switch (self.rtype) {
-            nvme.RTYPE_WRITE_EXCLUSIVE => if (self.find(host_id)) |r| r.key == holder else false,
+            nvme.RTYPE_WRITE_EXCLUSIVE => self.isHolder(host_id),
             nvme.RTYPE_WERO, nvme.RTYPE_WEAR => self.find(host_id) != null,
             else => false,
         };
@@ -113,13 +120,41 @@ pub const Namespace = struct {
         return false;
     }
 
-    fn remove(self: *Namespace, key: u64) void {
+    /// Is `host_id`'s registrant the holder?
+    pub fn isHolder(self: *const Namespace, host_id: [16]u8) bool {
+        return self.holder != null and std.mem.eql(u8, &self.holder_host, &host_id);
+    }
+
+    fn setHolder(self: *Namespace, key: u64, host_id: [16]u8) void {
+        self.holder = key;
+        self.holder_host = host_id;
+    }
+
+    fn clearHolder(self: *Namespace) void {
+        self.holder = null;
+        self.holder_host = @splat(0);
+        self.rtype = 0;
+    }
+
+    /// Every registrant of `key` but `spare`'s (null: none spared) out; the
+    /// holder's going releases a single-holder reservation and passes an All
+    /// Registrants one to a remaining registrant (`nvmet_pr_unregister_one`).
+    fn remove(self: *Namespace, key: u64, spare: ?[16]u8) void {
         var i: usize = 0;
         while (i < self.registered.items.len) {
-            if (self.registered.items[i].key == key) {
+            const r = self.registered.items[i];
+            if (r.key == key and !(spare != null and std.mem.eql(u8, &r.host_id, &spare.?))) {
                 _ = self.registered.swapRemove(i);
+                if (self.isHolder(r.host_id)) self.holderGone();
             } else i += 1;
         }
+    }
+
+    fn holderGone(self: *Namespace) void {
+        if (nvme.allRegistrants(self.rtype) and self.registered.items.len != 0) {
+            const next = self.registered.items[0];
+            self.setHolder(next.key, next.host_id);
+        } else self.clearHolder();
     }
 
     fn removeHost(self: *Namespace, host_id: [16]u8) void {
@@ -157,7 +192,7 @@ pub const Namespace = struct {
                         .spec_strict => return nvme.SC_RESERVATION_CONFLICT,
                         .lenient_replace => {
                             self.removeHost(host_id);
-                            if (self.holder == m.key) self.holder = nrkey;
+                            if (self.isHolder(host_id)) self.holder = nrkey;
                         },
                     }
                 }
@@ -171,16 +206,7 @@ pub const Namespace = struct {
                 if (!iekey and m.key != crkey) return nvme.SC_RESERVATION_CONFLICT;
                 self.removeHost(host_id);
                 self.unregisters += 1;
-                if (self.holder == m.key) {
-                    // Under All Registrants the reservation passes to a
-                    // remaining registrant (nvmet's `nvmet_pr_unregister_one`).
-                    if (nvme.allRegistrants(self.rtype) and self.registered.items.len != 0) {
-                        self.holder = self.registered.items[0].key;
-                    } else {
-                        self.holder = null;
-                        self.rtype = 0;
-                    }
-                }
+                if (self.isHolder(host_id)) self.holderGone();
                 self.generation += 1;
                 return nvme.STATUS_SUCCESS;
             },
@@ -189,7 +215,7 @@ pub const Namespace = struct {
                 if (!iekey and m.key != crkey) return nvme.SC_RESERVATION_CONFLICT;
                 self.removeHost(host_id);
                 try self.registered.append(self.gpa, .{ .host_id = host_id, .key = nrkey });
-                if (self.holder == m.key) self.holder = nrkey;
+                if (self.isHolder(host_id)) self.holder = nrkey;
                 self.generation += 1;
                 return nvme.STATUS_SUCCESS;
             },
@@ -208,11 +234,11 @@ pub const Namespace = struct {
         self.last_acquire = cmd.*;
         switch (racqa) {
             nvme.RACQA_ACQUIRE => {
-                if (self.holder) |h| {
-                    if (h == crkey and self.rtype == rtype) return nvme.STATUS_SUCCESS;
+                if (self.holder != null) {
+                    if (self.isHolder(host_id) and self.rtype == rtype) return nvme.STATUS_SUCCESS;
                     return nvme.SC_RESERVATION_CONFLICT;
                 }
-                self.holder = crkey;
+                self.setHolder(crkey, host_id);
                 self.rtype = rtype;
                 self.generation += 1;
                 return nvme.STATUS_SUCCESS;
@@ -220,34 +246,33 @@ pub const Namespace = struct {
             nvme.RACQA_PREEMPT, nvme.RACQA_PREEMPT_AND_ABORT => {
                 if (self.holder != null and nvme.allRegistrants(self.rtype) and prkey != 0) {
                     if (!self.isRegistered(prkey)) return nvme.SC_RESERVATION_CONFLICT;
-                    self.remove(prkey);
-                    if (self.holder.? == prkey) {
-                        if (self.registered.items.len == 0) {
-                            self.holder = null;
-                            self.rtype = 0;
-                        } else self.holder = self.registered.items[0].key;
-                    }
+                    self.remove(prkey, null);
                     self.preempts += 1;
                     self.generation += 1;
                     return nvme.STATUS_SUCCESS;
                 }
                 if (self.holder_preempt_retypes) {
-                    if (self.holder) |h| if (h == crkey) {
+                    if (self.isHolder(host_id)) {
                         self.rtype = rtype;
                         return nvme.STATUS_SUCCESS;
-                    };
+                    }
                     if (self.holder == null) {
                         if (!self.isRegistered(prkey)) return nvme.SC_RESERVATION_CONFLICT;
-                        self.remove(prkey);
+                        self.remove(prkey, null);
                         self.preempts += 1;
                         self.generation += 1;
                         return nvme.STATUS_SUCCESS;
                     }
                 }
                 if (!self.isRegistered(prkey)) return nvme.SC_INVALID_FIELD;
-                self.remove(prkey);
-                self.holder = crkey;
-                self.rtype = rtype;
+                if (self.holder == null or self.holder.? == prkey) {
+                    // The holder's key (or no reservation): the reservation
+                    // passes to the sender, every other registrant of the
+                    // key out.
+                    self.remove(prkey, host_id);
+                    self.setHolder(crkey, host_id);
+                    self.rtype = rtype;
+                } else self.remove(prkey, null);
                 self.preempts += 1;
                 self.generation += 1;
                 return nvme.STATUS_SUCCESS;
@@ -262,11 +287,10 @@ pub const Namespace = struct {
         const rtype: u8 = @intCast((cmd.cdw10 >> 8) & 0xff);
         const mine = self.find(host_id) orelse return nvme.SC_RESERVATION_CONFLICT;
         if (mine.key != crkey) return nvme.SC_RESERVATION_CONFLICT;
-        if (self.holder) |h| {
-            if (h != crkey) return nvme.STATUS_SUCCESS;
+        if (self.holder != null) {
+            if (!self.isHolder(host_id)) return nvme.STATUS_SUCCESS;
             if (self.rtype != rtype) return nvme.SC_INVALID_FIELD;
-            self.holder = null;
-            self.rtype = 0;
+            self.clearHolder();
             self.generation += 1;
         }
         return nvme.STATUS_SUCCESS;
@@ -280,7 +304,7 @@ pub const Namespace = struct {
         std.debug.assert(out.len == (@as(usize, cmd.cdw10) + 1) * 4);
         const regs = try self.gpa.alloc(nvme.Registrant, self.registered.items.len);
         defer self.gpa.free(regs);
-        for (self.registered.items, regs) |r, *o| o.* = .{ .cntlid = 1, .holds = self.holder != null and (self.holder.? == r.key or nvme.allRegistrants(self.rtype)), .rkey = r.key, .host_id = r.host_id };
+        for (self.registered.items, regs) |r, *o| o.* = .{ .cntlid = 1, .holds = self.holder != null and (self.isHolder(r.host_id) or nvme.allRegistrants(self.rtype)), .rkey = r.key, .host_id = r.host_id };
         nvme.encodeReport(out, extended, self.generation, self.rtype, 0, regs);
         return nvme.STATUS_SUCCESS;
     }

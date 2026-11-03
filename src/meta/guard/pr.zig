@@ -710,6 +710,7 @@ test "report: EDS first, the short form on 0x18; two steps sized by REGCTL (the 
     rig2.hosts();
     for (0..70) |i| try rig2.ns.registered.append(testing.allocator, .{ .host_id = @splat(@intCast(i + 1)), .key = 1000 + i });
     rig2.ns.holder = 1069;
+    rig2.ns.holder_host = @splat(70);
     rig2.ns.rtype = nvme.RTYPE_WERO;
     var c2 = try rig2.client(&rig2.a, 0x5);
     defer c2.deinit();

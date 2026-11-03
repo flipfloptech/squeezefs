@@ -131,6 +131,8 @@ pub const Guard = struct {
     /// The early registration's hold was taken by a preempt (cleared once
     /// the claim commits).
     early_preempted: bool = false,
+    /// Test seam: every claim probe after a lapse fails (checkpoint churn).
+    test_probe_unreadable: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// The configured host identity recorded at the gate (§1.4).
     identity_opts: pr.IdentityOptions,
     identity_stamp: pr.IdentityStamp,
@@ -754,6 +756,10 @@ pub const Guard = struct {
         const attempts = 3;
         var raw: ?[]u8 = null;
         for (0..attempts) |i| {
+            if (builtin.is_test and g.test_probe_unreadable) {
+                log.warn("meta volume {s}: the claim probe after a reservation lapse failed (the test seam, attempt {d} of {d})", .{ g.be.path, i + 1, attempts });
+                continue;
+            }
             raw = probeClaim(g.gpa, g.io, g.be.env, g.be.pool, g.be.path) catch |e| {
                 log.warn("meta volume {s}: the claim probe after a reservation lapse failed ({s}, attempt {d} of {d})", .{ g.be.path, @errorName(e), i + 1, attempts });
                 continue;
@@ -1501,6 +1507,34 @@ test "the heartbeat's PR re-check: a PTPL lapse (power cycle) is re-acquired and
         log.testing.expectErrorLogs(0);
     }
     try testing.expect((try v.probe()) != null);
+}
+
+test "review 4 minor 5: a lapse whose device claim cannot be read (every probe fails — the live manager's own checkpoint churn) skips the beat: no re-acquire, no fail-stop, no refresh; the next readable beat re-acquires" {
+    const gpa = testing.allocator;
+    const v = try Vol.create(gpa, "lapse-unreadable", "600000");
+    defer v.destroy();
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var host: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
+    const me = ident(boot_a, 4000, 777);
+    const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
+    defer be.close();
+    const g = be.guard.?;
+    const re0 = guard.stats.pr_reacquires.load();
+    const fenced0 = guard.stats.fenced.load();
+    ns.powerCycle();
+    g.test_probe_unreadable = true;
+    g.beat();
+    try testing.expect(!be.isFailed());
+    try testing.expectEqual(fenced0, guard.stats.fenced.load());
+    try testing.expectEqual(re0, guard.stats.pr_reacquires.load());
+    try testing.expectEqual(@as(?u64, null), ns.holder);
+    try testing.expectEqual(@as(u64, 0), (try v.probe()).?.heartbeat_seq);
+    g.test_probe_unreadable = false;
+    g.beat();
+    try testing.expectEqual(re0 + 1, guard.stats.pr_reacquires.load());
+    try testing.expectEqual(@as(?u64, claim.prKey(me.writerId(0), boot_a)), ns.holder);
+    try testing.expect(!be.isFailed());
 }
 
 test "a stats render is no atomic cut across the fence: the volume's verdict (`meta.set`) renders BEFORE the process-wide writer_guard_fenced (`meta.guard`), so a fence landing between the two sections reads `healthy` beside the count — a render begun after the count was seen reads `fenced` (the nvmet sigstop-preempt row's law)" {

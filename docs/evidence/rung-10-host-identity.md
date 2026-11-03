@@ -54,7 +54,7 @@ registration that re-admits a host while a stale sibling of the set lives there.
 
 Every NVMe writer open replays the claim privately twice (each: both superblock copies, the 128 KiB
 ledger, the WHOLE fixed ring). On a 256 MiB ring: 537,116,672 B per open, 0 frames on a clean first
-open, 8,014 on a kill -9 remount (4,007 per probe). The derived ring caps at 32 MiB (≈ 64 MiB per
+open, 8,014–8,016 on a kill -9 remount (≈ 4,000 per probe; four runs). The derived ring caps at 32 MiB (≈ 64 MiB per
 open); `--meta-journal-mb` reaches 1 GiB (≈ 2 GiB per open). A lapse adds up to three more.
 
 ## nvmet 7.3's holder preempt — detection only, with possible loss

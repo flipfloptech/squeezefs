@@ -1222,3 +1222,17 @@ test "B2 (review): the rule re-judges AFTER the register, under the lock — a s
     _ = try child.wait(testing.io);
     reaped = true;
 }
+
+test "round 3 major 1: a live manager's entry once its role is durable (`p` at registration, `m` at enrolment, appender 0's page Live under it) is CURRENT when no reservation stands (a target restart without PTPL): a co-located rule run before its heartbeat re-acquires never kills it" {
+    const node: u64 = 0xA;
+    var pm = Entry.parse(45, "80\np 0 00000000000000c9\nm 0 00000000000000c9\n").?;
+    try testing.expectEqual(Verdict.current, judge(&pm, &.{pg(0, .live, node, 0xc9)}, node, 0, false));
+}
+
+test "round 3 major 4: a sibling mid-leave stays visible to the rule — its `l` line is judged by its pages like a joiner's: Recovering (frozen during its leave, evicted) is stale, Live is current, Free (its leave landed) is spared" {
+    const node: u64 = 0xA;
+    var e = Entry.parse(46, "81\nl 9 00000000000000d1\n").?;
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{pg(4, .recovering, node, 0xd1)}, node, 0, false));
+    try testing.expectEqual(Verdict.current, judge(&e, &.{pg(4, .live, node, 0xd1)}, node, 0, false));
+    try testing.expect(judge(&e, &.{pg(4, .free, node, 0xd1)}, node, 0, false) != .stale);
+}

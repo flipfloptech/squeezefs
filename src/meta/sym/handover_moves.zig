@@ -252,6 +252,81 @@ test "linux: THE CACHE BARRIER AT A LEASE MOVE (0003 §X.5; found by the online 
     }
 }
 
+/// The log end of the leaf of `slot`'s tree that holds the slot's NEWEST
+/// inode keys (a lessee's fresh mints land there).
+fn newestLeafTail(be: *KvBackend, slot: u16) !usize {
+    const t = be.slotTree(slot).?;
+    const n = try t.resolveLeaf(&key.inodeKey(key.guestLocalIno(slot, 1 << 39)));
+    defer n.release();
+    n.lock.lockSharedUncancelable(be.io);
+    defer n.lock.unlockShared(be.io);
+    return n.dirty.tailOffset();
+}
+
+test "linux: A RELEASE LEAVES NO NODE OF ITS TREE DIRTY — ITS OWN COVER CYCLE'S SMO INCLUDED (decision 0003 §DI; found by the dir storm rows: the names a joined member created last in a directory it took by handover were gone after its unmount, fsck C9 counting their inodes): A grows a slot tree past one leaf and hands the slot to B; B fills the log of the leaf its new records land in to its last frame (a record and a cycle per frame), commits one more record and leaves — its leave's cover cycle must compact that leaf (no room for the frame), which journals the leaf's new address into the root PAST the slot's record frontier; the release waits until the root is on the device and A reads every record B wrote" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "release-smo", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    // No cycle by age during the row: the device images move only with the
+    // row's own cycles and the leave's.
+    try s.env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "60000");
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try wire_plane.WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    const slot = try managerRotorSlot(gpa, be0);
+    // A's tree: an interior root over several leaves.
+    try fillSlot(be0, slot, 1000, &@as([200]u8, @splat('a')));
+    try be0.checkpointNow();
+    try be0.checkpointNow();
+    {
+        const t = be0.slotTree(slot).?;
+        const root = try t.getNode(t.rootPtr().addr);
+        defer root.release();
+        try testing.expect(root.level >= 1);
+    }
+    var keys: std.ArrayList([key.INODE_KEY_LEN]u8) = .empty;
+    defer keys.deinit(gpa);
+    var frames: u32 = 0;
+    {
+        const b = try MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join = .{ .mountpoint = "/build/tmp/mnt-release-smo-b", .endpoint = plane.advertised } });
+        defer b.close();
+        const bj = b.volumes[0];
+        const me = bj.joined.?.appenderId();
+        try testing.expectEqual(acquire.Verbs.OfferResult.offered, try be0.slots.verbs.offerSlot(lt.MANAGER, slot, me, std.math.maxInt(u64)));
+        const sink = bj.slots.carriageSink();
+        sink.offered(sink.ctx, slot, lt.MANAGER);
+        try testing.expect(bj.slots.table.view(slot).leasedBy(me));
+        // A record and a cycle per frame (a 4 KiB page each) until the
+        // leaf's log has no room for another.
+        const node_size = bj.sb.node_size;
+        while (try newestLeafTail(bj, slot) + node.NODE_PAGE <= node_size) : (frames += 1) {
+            if (frames == 64) return error.TestLeafNeverFilled;
+            try keys.append(gpa, try commitRecord(bj, slot, "written by B"));
+            try bj.checkpointNow();
+        }
+        // One more: the leave's cover cycle lands it only by moving the leaf.
+        try keys.append(gpa, try commitRecord(bj, slot, "written by B, last"));
+    }
+    try testing.expect(be0.slots.table.view(slot).state == .unleased);
+    var lost: usize = 0;
+    for (keys.items) |*k| {
+        const v = (try set.lookup(gpa, key.TREE_INODES, k)) orelse {
+            lost += 1;
+            continue;
+        };
+        gpa.free(v);
+    }
+    if (lost != 0) std.debug.print("\nrelease-smo: {d} of {d} record(s) B wrote are gone after its leave ({d} frame(s) filled the leaf)\n", .{ lost, keys.items.len, frames });
+    try testing.expectEqual(@as(usize, 0), lost);
+}
+
 // ---------------------------------------------------------------------------
 // THE CUSTODY OF A MOVED TREE'S IMAGES (charter §5.5 "Extent grants": the
 // grant is a POOL, retired images recycle; 0003 §AD). Found by the shared
@@ -267,6 +342,7 @@ const cr = @import("control_records.zig");
 const grant_record = @import("grant_record.zig");
 const tree = @import("../tree.zig");
 const smo = @import("../smo.zig");
+const node = @import("../node.zig");
 const alloc_ext = @import("../alloc_ext.zig");
 
 /// The manager's record of `appender_id`'s grant as runs (empty: none).

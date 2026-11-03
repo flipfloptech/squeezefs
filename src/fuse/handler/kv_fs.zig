@@ -2055,12 +2055,16 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// written by a rename (the byte is the birth's). Both are
         /// `U64Map`s: a removal leaves no tombstone, so a mount's churn of
         /// fresh directories never lengthens a probe (decision 0003 §CU).
-        /// Every mkdir and directory lookup writes them: on cache lines of
-        /// their own, so no read-mostly field of `KvFs` shares one.
+        /// A mkdir takes the lock four times (`parentOf`, `takeOrdinal`,
+        /// `rememberParent`, `rememberDepth`), every waiter spinning on its
+        /// word: the lock and each map's header sit on cache lines of their
+        /// own (no `KvFs` field shares one) — a header beside the lock word
+        /// missed at every access in the critical section, the waiters
+        /// having pulled the line away (decision 0003 §DH.16).
         const Memo = struct {
             lock: jc.SpinLock align(std.atomic.cache_line) = .{},
-            parents: u64_map.U64Map(u64) = .empty,
-            depths: u64_map.U64Map(DepthMemo) = .empty,
+            parents: u64_map.U64Map(u64) align(std.atomic.cache_line) = .empty,
+            depths: u64_map.U64Map(DepthMemo) align(std.atomic.cache_line) = .empty,
         };
 
         /// The two memos' full scans (O(capacity): the tests' and the

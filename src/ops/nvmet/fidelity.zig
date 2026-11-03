@@ -1097,10 +1097,14 @@ fn symmetricSet(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports
 }
 
 fn daemonSetFormat(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [2]u16, mode: []const []const u8, format_extra: []const []const u8) !DaemonSet {
+    return daemonSetSized(rig, prefix, transport, ports, mode, format_extra, data_len);
+}
+
+fn daemonSetSized(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [2]u16, mode: []const []const u8, format_extra: []const []const u8, data_size: u64) !DaemonSet {
     var mb: [64]u8 = undefined;
     var db: [64]u8 = undefined;
     const meta_nqn = try rig.share(try std.fmt.bufPrint(&mb, "{s}meta", .{prefix}), meta_len, transport, ports[0]);
-    const data_nqn = try rig.share(try std.fmt.bufPrint(&db, "{s}data", .{prefix}), data_len, transport, ports[1]);
+    const data_nqn = try rig.share(try std.fmt.bufPrint(&db, "{s}data", .{prefix}), data_size, transport, ports[1]);
     const cm = try rig.connect(meta_nqn, transport, ports[0], null, &.{});
     const cd = try rig.connect(data_nqn, transport, ports[1], null, &.{});
     var out: DaemonSet = .{ .meta_nqn = meta_nqn, .data_nqn = data_nqn, .cm = cm };
@@ -2377,6 +2381,116 @@ test "nvmet fidelity: a frozen member fenced through the manager's fencing regis
     try rig.awaitLog(x, "journal: reservation-conflict errno at", 30 * std.time.ns_per_s);
     try rig.kill9(x);
     try rig.umount(m);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+/// The data-fence row's data volume: 32 MiB at 64 KiB blocks (510 usable),
+/// so a fill to ENOSPC takes every free block — the dead member's grant
+/// window's among them.
+const data_fence_volume: u64 = 32 << 20;
+
+/// Open the FIFO's write end once its reader is there (`ENXIO` until then),
+/// bounded: a held write whose process died never wedges the row.
+fn releaseFifoBounded(path: [:0]const u8, deadline_ns: u64) !void {
+    const deadline = clock.monotonicNs() + deadline_ns;
+    while (true) {
+        const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                _ = linux.close(@intCast(rc));
+                return;
+            },
+            .NXIO => {},
+            else => return error.FifoRefused,
+        }
+        if (clock.monotonicNs() >= deadline) return error.Timeout;
+        sleepMs(20);
+    }
+}
+
+test "nvmet fidelity: a member's death fences its host on the DATA namespace before its extents are reallocated (decision 0003 §DJ) — X (host A, a joiner) writes one whole block, a block of its grant window, and the write is held past X's own gates (SQUEEZEFS_TEST_DATA_WRITE_HOLD); X is SIGSTOPped; M (host B) evicts and recovers it; M unmounts (the allocation lease's pages released: X's unpublished window is free for the next holder) and M2 (host B) mounts and fills the data volume to ENOSPC with 'G' blocks — X's window block among them; X resumed, its held write reaches the device and is refused (a reservation conflict), and every byte M2 wrote reads back exact from a fresh mount" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try daemonSetSized(rig, "df", transport, try rig.servicePorts(transport), &.{}, &.{ "--block-size", "65536" }, data_fence_volume);
+    const cm = set.cm;
+    var tb: [16]u8 = undefined;
+    const t_owner = try std.fmt.bufPrint(&tb, "{d}", .{member_t_owner_ms});
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var fb: [128]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/x-data-write.fifo", .{rig.root}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    var env_m = try rig.envWith(ident_b);
+    defer env_m.deinit();
+    try env_m.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    var env_x = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    defer env_x.deinit();
+    try env_x.put("SQUEEZEFS_TEST_DATA_WRITE_HOLD", fifo);
+    const m = try rig.spawnMountEnv("df-m", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const x = try rig.spawnMountEnv("df-x", set.metaUri(), &env_x, &.{});
+    try rig.awaitLog(x, "ready: ", ready_wait_ns);
+    // X's first data write: one whole block of its own file, written through
+    // to a block of its grant window — in the background (its DMA is held).
+    try testing.expect(try scriptSucceeds(rig, x, "mkdir dx && (head -c 65536 /dev/zero | tr '\\000' X > dx/x) </dev/null >/dev/null 2>&1 &"));
+    try rig.awaitLog(x, "SQUEEZEFS_TEST_DATA_WRITE_HOLD — data volume", ready_wait_ns);
+    _ = linux.kill(rig.daemons.items[x].pid, .STOP);
+    {
+        const sm = try rig.awaitStat(m, "appender_recoveries", 1, ready_wait_ns);
+        defer gpa.free(sm);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
+    }
+    // M's clean unmount releases its allocation lease and the bitmap pages:
+    // the next holder's bitmap is the durable references', X's window free.
+    try rig.umount(m);
+    const m2 = try rig.spawnMountEnv("df-m2", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m2, "ready: ", ready_wait_ns);
+    // The fill: one 'G' block per file, each synced, until the store answers
+    // ENOSPC — every free block taken; the failed file goes.
+    const filled = blk: {
+        const out = try rig.onMount(m2, "i=0; while head -c 65536 /dev/zero | tr '\\000' G > g$i && sync -d g$i; do i=$((i+1)); done; rm -f g$i; echo $i");
+        defer gpa.free(out);
+        break :blk try std.fmt.parseInt(u64, std.mem.trim(u8, out, " \n"), 10);
+    };
+    try testing.expect(filled > 0);
+    // X resumed: its held write reaches the device.
+    _ = linux.kill(rig.daemons.items[x].pid, .CONT);
+    try releaseFifoBounded(fifo, 30 * std.time.ns_per_s);
+    try rig.awaitLog(x, "the held write at offset", 30 * std.time.ns_per_s);
+    // Byte-exact from a fresh mount (no cache of M2's): every file 'G' whole.
+    try rig.umount(m2);
+    const m3 = try rig.spawnMountEnv("df-m3", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m3, "ready: ", ready_wait_ns);
+    {
+        const out = try rig.onMount(m3, "printf '%s %s\\n' \"$(cat g* | wc -c)\" \"$(cat g* | tr -d G | wc -c)\"");
+        defer gpa.free(out);
+        var it = std.mem.tokenizeAny(u8, out, " \n");
+        const total = try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10);
+        const foreign = try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10);
+        try testing.expectEqual(@as(u64, 0), foreign);
+        try testing.expectEqual(filled * 65536, total);
+    }
+    // The device refused X's write (EBADE: X's data device latched the fence
+    // class).
+    {
+        const text = try rig.readLog(x);
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "the held write at offset") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "completed: refused") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "reservation-conflict errno class") != null);
+    }
+    try rig.kill9(x);
+    try rig.umount(m3);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
     try rig.disconnect(&cm_b);

@@ -50,12 +50,20 @@ registration that re-admits a host while a stale sibling of the set lives there.
   manager fail-stopped), `f17567a` (blocker 2: regctl 0 after the takeover's unmount), `94944ba`
   (minor 4: the open never ready). Green after `7c9ddef`, `f25afcf`, `4cb616c`, `9c79170`, `cf2258c`.
 
-## Round 5's probe cost (counter deltas, the probe-cost row)
+- **review 5 + the gate, round 6** — the gate's sigstop-preempt red was the journal lane running the
+  conveyor's acked-window rollback (it fail-stops) BEFORE classifying the write's reservation conflict:
+  the fence was never counted (reproduced 1/10 under `cpu+smoke`; red `86cf813` "expected 1, found 0",
+  fix `d8bac78`; the row then 15/15 under load, 5/5 idle). Major 1 (a live manager preempted on a claim
+  reading older than the rule): red `ae81450` (X's `writer_guard_preempts` "expected 0, found 1"), fix
+  `5cf4d64` (the claim read right before the hold). Minors 1–3: reds `0b08a17`, fix `bb932a4`.
 
-Every NVMe writer open replays the claim privately twice (each: both superblock copies, the 128 KiB
-ledger, the WHOLE fixed ring). On a 256 MiB ring: 537,116,672 B per open, 0 frames on a clean first
-open, 8,014–8,016 on a kill -9 remount (≈ 4,000 per probe; four runs). The derived ring caps at 32 MiB (≈ 64 MiB per
-open); `--meta-journal-mb` reaches 1 GiB (≈ 2 GiB per open). A lapse adds up to three more.
+## The probe cost (counter deltas, the probe-cost row)
+
+Every NVMe writer open replays the claim privately three times (round 6; each: both superblock copies,
+the 128 KiB ledger, the WHOLE fixed ring). On a 256 MiB ring: 805,675,008 B per open, 0 frames on a
+clean first open, 12,024 on a kill -9 remount (≈ 4,000 per probe). The derived ring caps at 32 MiB
+(≈ 96 MiB per open); `--meta-journal-mb` reaches 1 GiB (≈ 3 GiB per open). A lapse adds up to three
+more per beat. Documented (review 5 minor 4); a knob or a lighter probe is later work.
 
 ## nvmet 7.3's holder preempt — detection only, with possible loss
 
@@ -74,8 +82,8 @@ landed — the unfenced tail scan — regctl 2). The fencer is the owner's decis
 
 `src/meta/guard/host_fence_model.zig` (round 4: the code's inputs, the rule's read/register/re-judge
 as steps under the registry lock; round 5: a joined line's page, `releaseRecovered` and pair reuse,
-`OverwroteAcked`, the kept preempting hold): `Election` 258,798 states (depth 28) and `Member` 7,216
-(depth 21) hold. "A fenced member never writes" holds under spec semantics and FAILS under nvmet 7.3's (stated).
+`OverwroteAcked`, the kept preempting hold): `Election` 219,189 states (depth 28; round 6: the claim read right before the hold,
+`PreemptedLive`) and `Member` 7,216 (depth 21) hold. "A fenced member never writes" holds under spec semantics and FAILS under nvmet 7.3's (stated).
 The accepted windows (PTPL-less lapse, register→re-judge) are each shown reachable; round 4's release
 window is closed (a hold taken by a preempt or inherited stays at the last unmount). Every weakening fails — the invariant each breaks is §DF.14's table; majors 1–4 each
 have one (round 3's `p` judgement → `KilledCurrent`; register-before-claim → `WroteUnheld`; no lapse

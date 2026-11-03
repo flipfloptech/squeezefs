@@ -92,6 +92,7 @@ const group_mod = @import("../exec/group.zig");
 const sqz_io = @import("../exec/sqz_io.zig");
 const jc = @import("journal_core.zig");
 const journal = @import("journal.zig");
+const journal_guard = @import("guard.zig");
 const checkpoint = @import("checkpoint.zig");
 
 comptime {
@@ -2682,11 +2683,14 @@ const RollbackLog = struct {
     calls: std.ArrayList(struct { span: SeqSpan, window: Reservation }) = .empty,
     checkpoints: std.ArrayList(u64) = .empty,
     checkpoint_ok: bool = true,
+    /// The conveyor's rollback of an ACKED window: it fail-stops the volume.
+    acked: ?*journal.FailureLatch = null,
     gpa: Allocator,
 
     fn rollback(ctx: ?*anyopaque, span: SeqSpan, window: Reservation) void {
         const self: *RollbackLog = @ptrCast(@alignCast(ctx.?));
         self.calls.append(self.gpa, .{ .span = span, .window = window }) catch unreachable;
+        if (self.acked) |l| _ = l.failStop();
     }
 
     fn checkpointPast(ctx: ?*anyopaque, padded_end: u64) bool {
@@ -2738,6 +2742,27 @@ test "a torn window: the rollback hook runs with the stamped span, the hole is c
     try testing.expectEqualSlices(u64, &.{ 1, 3 }, recoveredInos(&rec, &inos));
     try testing.expectEqual(@as(u64, 1), rec.dropped_torn);
     try testing.expectEqual(c.res.paddedEnd(), rec.head_pos);
+}
+
+test "a reservation conflict on an ACKED window's write latches the FENCE class (the gate's sigstop-preempt row): the conveyor's acked rollback fail-stops after the fence — writer_guard_fenced counts once, the verdict reads fenced" {
+    const h = try Harness.init(testing.allocator, "fence-acked");
+    defer h.deinit();
+    var rl: RollbackLog = .{ .gpa = testing.allocator };
+    defer rl.deinit();
+    // The fence's one log line, on the lane thread.
+    try h.spawnLane(rl.hooks(), "600000", 1);
+    const lane = h.lane.?;
+    rl.acked = &lane.latch;
+    const fenced0 = journal_guard.stats.fenced.load();
+    test_seams.fail_errno.store(@backingInt(linux.E.BADE), .release);
+    defer test_seams.fail_errno.store(0, .release);
+    test_seams.fail_windows.store(1, .release);
+    const a = try h.append(1, page_entry, 0xA1);
+    try testing.expectError(error.ReservationConflict, a.ticket.wait().result);
+    try testing.expectEqual(fenced0 + 1, journal_guard.stats.fenced.load());
+    try testing.expectEqual(journal.FailureLatch.Verdict.fenced, lane.latch.verdict());
+    lane.shutdown();
+    try testing.expectEqual(@as(usize, 1), lane.testErrorLogsFired());
 }
 
 test "three consecutive journal-write failures latch the volume FAILED; every later op answers VolumeFailed" {

@@ -76,7 +76,7 @@ host is NOT fenced: a frozen member resumed after the tail scan writes into reco
 frame screen detects at load, and metadata frames written after the scan are lost. Data namespaces
 have no registrants at all (owed since rung 6). Pinned by the fidelity row "a member's death on
 nvmet 7.3 is DETECTED, not fenced" (`appender_recovery_preempts_ignored` 1, no preempt or re-fence
-landed — the unfenced tail scan — regctl 2). The fencer is the owner's decision. Draft upstream report: `~/tmp/nvmet-pr-preempt-bug.md`.
+landed — the unfenced tail scan — regctl 2). Superseded 2026-11-03 by the fencing registrant (decision 0003 §DG, `rung-10-fencing-registrant.md`): the row now reads the host FENCED. Draft upstream report: `~/tmp/nvmet-pr-preempt-bug.md`.
 
 ## The model
 

@@ -899,6 +899,7 @@ pub const ProbeError = tree.Error || error{ DeviceRefused, NotFormatted };
 /// writer's concurrent pages are whole checksummed units: a torn one drops
 /// as in any replay. Caller frees.
 pub fn probeClaim(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, pool: *uring_fs.Pool, path: []const u8) ProbeError!?[]u8 {
+    guard.stats.claim_probes.inc();
     const volume_len = device_loader.volumeLength(path) catch return error.DeviceRefused;
     const mode = uring_fs.registerMetaDevice(gpa, env, path) catch return error.DeviceRefused;
     var dev: device_loader.DeviceLoader = .{ .gpa = gpa, .pool = pool, .path = path, .mode = mode, .ledger_base = 0, .bitmap_base = 0 };
@@ -921,8 +922,10 @@ pub fn probeClaim(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, p
     const geo = journal.productionGeometry(ring_layout.pages, mode.grain());
     const ring_img = try dev.readRange(gpa, ring_layout.base, @intCast(ring_layout.ringBytes()));
     defer gpa.free(ring_img);
+    guard.stats.claim_probe_bytes.add(sector0.len + (if (backup) |b| b.len else 0) + ledger_img.len + ring_img.len);
     var recovery = try journal.replayScanImage(gpa, ring_img, geo, mounted.journal_tail_seq, journal.FIXED_RING_APPENDER);
     defer recovery.deinit();
+    guard.stats.claim_probe_frames.add(recovery.entries.len);
     const layout = node.NodeLayout.new(sb.node_size, null) catch return error.Corrupt;
     const cache = try node_cache.NodeCache.init(gpa, io, .{ .layout = layout, .heap_base = sb.heap.start, .budget_bytes = probe_cache_budget_bytes }, dev.loader());
     defer cache.deinit();

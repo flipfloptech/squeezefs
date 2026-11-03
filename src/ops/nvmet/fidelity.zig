@@ -1915,6 +1915,50 @@ test "nvmet fidelity: an open whose hold's preempt fenced the writer that commit
     try expectNoResidue(rig, set.data_nqn);
 }
 
+/// The ring of the probe-cost row: a 256 MiB override on the 1 GiB meta
+/// volume (the derived ring caps at 32 MiB; `--meta-journal-mb` reaches 1 GiB).
+const probe_cost_ring_mib: u64 = 256;
+
+test "nvmet fidelity: the early claim probes' cost on a large ring, as counter deltas (review 4 minor 6) — a symmetric set formatted with a 256 MiB ring: every NVMe writer open replays the claim privately twice (the probe, the probe under the hold), each reading both superblock copies, the ledger and the WHOLE ring; the first open and a kill -9 remount each count 2 probes, ≥ 2 × the ring in bytes, and the frames they replayed (printed)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    var jb: [16]u8 = undefined;
+    const ring_mib = try std.fmt.bufPrint(&jb, "{d}", .{probe_cost_ring_mib});
+    const set = try daemonSetFormat(rig, "pc", transport, try rig.servicePorts(transport), &.{}, &.{ "--meta-journal-mb", ring_mib });
+    const cm = set.cm;
+    const ring_bytes = probe_cost_ring_mib << 20;
+    const a = try rig.spawnMount("pc-a", set.metaUri(), null, &.{});
+    try rig.awaitLog(a, "ready: ", ready_wait_ns);
+    const first = try probeCost(rig, a);
+    try testing.expect(try scriptSucceeds(rig, a, "mkdir d && for i in $(seq 1 2000); do echo $i > d/f$i; done && sync -d d/f2000"));
+    try rig.kill9(a);
+    const a2 = try rig.spawnMount("pc-a2", set.metaUri(), null, &.{});
+    try rig.awaitLog(a2, "ready: ", ready_wait_ns);
+    const second = try probeCost(rig, a2);
+    std.debug.print("\nprobe cost (ring {d} MiB): first open {d} probes, {d} B, {d} frames; kill -9 remount {d} probes, {d} B, {d} frames\n", .{ probe_cost_ring_mib, first.probes, first.bytes, first.frames, second.probes, second.bytes, second.frames });
+    for ([_]ProbeCost{ first, second }) |c| {
+        try testing.expectEqual(@as(u64, 2), c.probes);
+        try testing.expect(c.bytes >= 2 * ring_bytes - 2 * (16 << 10));
+    }
+    try rig.umount(a2);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+const ProbeCost = struct { probes: u64, bytes: u64, frames: u64 };
+
+fn probeCost(rig: *Rig, d: usize) !ProbeCost {
+    const st = try rig.stats(d);
+    defer rig.gpa.free(st);
+    return .{ .probes = try statNumber(st, "writer_guard_claim_probes"), .bytes = try statNumber(st, "writer_guard_claim_probe_bytes"), .frames = try statNumber(st, "writer_guard_claim_probe_frames") };
+}
+
 /// The membership `T_owner` of the member-death row (the smoke rows' value).
 const member_t_owner_ms: u64 = 3000;
 

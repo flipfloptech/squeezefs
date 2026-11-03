@@ -131,6 +131,9 @@ pub const Guard = struct {
     /// The hold stays at this incarnation's end: taken by a preempt or
     /// inherited (review 4 blocker 2, `host_fence.HoldOutcome.kept`).
     keep_hold: bool = false,
+    /// The writer whose fresh claim the second early probe found, fenced by
+    /// this open's preempt (review 4 minor 4): the gate takes it over.
+    early_fenced_writer: ?u64 = null,
     /// Test seam: every claim probe after a lapse fails (checkpoint churn).
     test_probe_unreadable: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// The configured host identity recorded at the gate (§1.4).
@@ -236,8 +239,12 @@ pub const Guard = struct {
         const now = g.gate_now;
         switch (g.evidence) {
             .fresh_foreign => |f| {
-                if (f.future) log.warn("meta volume {s}: the writer claim is stamped {d} s in the FUTURE — check this host's clock (and the holder's)", .{ be.path, @divFloor(f.claim.ts_ns - now, std.time.ns_per_s) });
-                return g.refuseClaim(.{ .fresh = f.claim }, now);
+                if (g.early_fenced_writer == f.claim.writer_id) {
+                    log.warn("meta volume {s}: the writer claim of {x:0>16} is fresh, but its writer committed it between this open's two probes and this open's hold fenced it (review 4 minor 4) — taking over", .{ be.path, f.claim.writer_id });
+                } else {
+                    if (f.future) log.warn("meta volume {s}: the writer claim is stamped {d} s in the FUTURE — check this host's clock (and the holder's)", .{ be.path, @divFloor(f.claim.ts_ns - now, std.time.ns_per_s) });
+                    return g.refuseClaim(.{ .fresh = f.claim }, now);
+                }
             },
             .stale_foreign => |maybe| {
                 if (g.posture == .none) return g.refuseClaim(.{ .stale_non_pr = maybe }, now);
@@ -324,22 +331,27 @@ pub const Guard = struct {
         return error.Busy;
     }
 
-    /// The backend's step 3b, before the host registers and anything is
-    /// written (review round 3, major 2): the gate's freshness refusal off a
-    /// private replay — a claim the gate would refuse as fresh (live, or
-    /// TTL-stale inside the skew term) refuses here, by the same words.
-    pub fn refuseFreshEarly(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, pool: *uring_fs.Pool, path: []const u8, local: claim.Identity, probe: claim.PidProbe) error{Busy}!void {
+    /// The backend's step 3b, off a private replay that writes nothing
+    /// (review round 3, major 2): the claim the gate would refuse as fresh
+    /// (live, or TTL-stale inside the skew term), or null. Unreadable →
+    /// refused.
+    pub fn freshClaimEarly(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, pool: *uring_fs.Pool, path: []const u8, local: claim.Identity, probe: claim.PidProbe) error{Busy}!?claim.Claim {
         const raw = probeClaim(gpa, io, env, pool, path) catch |e| {
-            log.err("meta volume {s}: the writer claim cannot be read before the host's registration ({s}) — refusing the writer open", .{ path, @errorName(e) });
+            log.err("meta volume {s}: the writer claim cannot be read before this open writes ({s}) — refusing the writer open", .{ path, @errorName(e) });
             return error.Busy;
         };
         defer if (raw) |r| gpa.free(r);
         const now = clock.realtimeCoarseNs();
-        switch (claim.classify(raw, local, now, probe)) {
-            .fresh_foreign => |f| return refuse(path, .{ .fresh = f.claim }, now),
-            .stale_foreign => |maybe| if (maybe) |c| if (!c.preemptable(now)) return refuse(path, .{ .fresh = c }, now),
-            .reclaimable => {},
-        }
+        return switch (claim.classify(raw, local, now, probe)) {
+            .fresh_foreign => |f| f.claim,
+            .stale_foreign => |maybe| if (maybe) |c| (if (c.preemptable(now)) null else c) else null,
+            .reclaimable => null,
+        };
+    }
+
+    /// The gate's freshness refusal, by the same words.
+    pub fn refuseFresh(path: []const u8, c: claim.Claim) error{Busy} {
+        return refuse(path, .{ .fresh = c }, clock.realtimeCoarseNs());
     }
 
     /// The PR substrate: the test namespace, else the block node's char
@@ -351,6 +363,7 @@ pub const Guard = struct {
             g.fence_reg = e.reg;
             g.early_fresh = e.fresh;
             g.keep_hold = e.keep_hold;
+            g.early_fenced_writer = e.fenced_writer;
             gpa.destroy(e);
             return;
         }

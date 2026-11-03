@@ -883,8 +883,13 @@ pub const Early = struct {
     fresh: bool,
     /// This volume's writer id (its `p` line's word).
     writer_id: u64,
+    /// How the hold was taken.
+    hold: HoldOutcome = .acquired,
     /// The hold stays at this incarnation's end (`HoldOutcome.kept`).
     keep_hold: bool = false,
+    /// A writer whose claim committed between the open's two probes, fenced
+    /// by this open's preempt (the gate takes it over).
+    fenced_writer: ?u64 = null,
 
     /// An open that failed before its gate adopted this: the `p` line out,
     /// the registration given back as `leaveRegistration` says (a hold
@@ -991,8 +996,15 @@ pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map,
         e.discard(gpa);
         return error.Busy;
     };
+    e.hold = outcome;
     e.keep_hold = outcome.kept();
     return e;
+}
+
+/// The report names our key the holder (a failed report: not proven).
+pub fn holdStands(c: *pr.Client) bool {
+    const h = (c.holder() catch return false) orelse return false;
+    return h == c.key;
 }
 
 /// What a process leaving the host's registration gives back (the gate's

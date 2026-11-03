@@ -593,7 +593,7 @@ pub const KvBackend = struct {
             // this open registers nothing and writes nothing — no held tail,
             // no fold, no cover land in the live writer's volume.
             const probe = if (builtin.is_test) (opts.guard.test_pid_probe orelse guard.proc.probe) else guard.proc.probe;
-            try guard.gate.Guard.refuseFreshEarly(gpa, io, opts.env, pool, path, local, probe);
+            if (try guard.gate.Guard.freshClaimEarly(gpa, io, opts.env, pool, path, local, probe)) |c| return guard.gate.Guard.refuseFresh(path, c);
             holdEarlyProbeIfArmed(io, opts.env, path);
             var src: EarlyPages = .{ .dev = &dev, .sb = sb };
             early = guard.host_fence.registerBeforeWrites(gpa, opts.env, path, sb.set_uuid, opts.index, local, sym.join.nodeToken(local), .{ .ctx = &src, .read = &EarlyPages.read }, sb.symmetricPlaneStamped()) catch |e| return switch (e) {
@@ -601,9 +601,16 @@ pub const KvBackend = struct {
                 error.OutOfMemory => error.OutOfMemory,
             };
             // Once more under the hold: a writer that committed its claim
-            // between the probe and this hold (the hold's preempt fenced it)
-            // is never written over — the open refuses, the hold kept.
-            if (early != null) try guard.gate.Guard.refuseFreshEarly(gpa, io, opts.env, pool, path, local, probe);
+            // between the two probes held the reservation then, so this
+            // open's hold preempted its host — fenced, it can no longer
+            // write: the open takes over (review 4 minor 4), its replay below
+            // reads that writer's acked state. Any other fresh claim (this
+            // hold not a preempt, or preempted since) refuses, the hold kept.
+            if (early) |e| if (try guard.gate.Guard.freshClaimEarly(gpa, io, opts.env, pool, path, local, probe)) |c| {
+                if (e.hold != .preempted or !guard.host_fence.holdStands(e.posture.active)) return guard.gate.Guard.refuseFresh(path, c);
+                log.warn("meta volume {s}: the writer {x:0>16} committed its claim between this open's two probes; this open's hold preempted its host — taking over", .{ path, c.writer_id });
+                e.fenced_writer = c.writer_id;
+            };
         }
 
         // 4. The ledger.

@@ -2066,3 +2066,54 @@ test "B2 (review): recovery re-reads the report once the page is Recovering — 
     try testing.expectEqual(Outcome.acted, f.driver.recoverDead(f.death()));
     try testing.expect(!ns.writeAllowed("remote-host-id-2".*));
 }
+
+test "a member's death is recovered only once its host is fenced on every DATA namespace (decision 0003 §DJ): a WEAR data namespace whose report fails stops the recovery after the page went Recovering — the region stays Recovering (no slot released, nothing the dead member could write reallocatable) — and the next poll, the namespace answering again, preempts the dead host's key there with the manager's own client (WEAR's all-registrants arm: the spec path on nvmet 7.3 too) and converges" {
+    const gpa = testing.allocator;
+    const fake_nvme = @import("../../guard/fake_nvme.zig");
+    const nvme = @import("../../guard/nvme_cmd.zig");
+    const f = try Fixture.initKeyed(gpa, false, 0x2222);
+    defer f.deinit();
+    // The metadata namespace: the manager holds WERO, the dead host registered.
+    var mns = fake_nvme.Namespace.init(gpa);
+    defer mns.deinit();
+    var mh: fake_nvme.Host = .{ .ns = &mns, .host_id = "manager-host-id1".* };
+    var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer m.deinit();
+    try fencing.acquireManagerHold(&m);
+    var rh: fake_nvme.Host = .{ .ns = &mns, .host_id = "remote-host-id-2".* };
+    var r = try pr.Client.init(gpa, rh.face(), 1, 0x2222);
+    defer r.deinit();
+    _ = try fencing.joinAsRegistrant(&r, null);
+    // The data namespace: WEAR, both hosts registered under their keys.
+    var dns = fake_nvme.Namespace.init(gpa);
+    defer dns.deinit();
+    var dmh: fake_nvme.Host = .{ .ns = &dns, .host_id = "manager-host-id1".* };
+    var d = try pr.Client.init(gpa, dmh.face(), 1, 0x1111);
+    defer d.deinit();
+    d.rtype = nvme.RTYPE_WEAR;
+    _ = try d.registerLadder();
+    try d.acquire();
+    var drh: fake_nvme.Host = .{ .ns = &dns, .host_id = "remote-host-id-2".* };
+    var dr = try pr.Client.init(gpa, drh.face(), 1, 0x2222);
+    defer dr.deinit();
+    dr.rtype = nvme.RTYPE_WEAR;
+    _ = try dr.registerLadder();
+    try testing.expect(dns.writeAllowed("remote-host-id-2".*));
+    f.driver.mount.meta_pr = &m;
+    const clients = [_]*pr.Client{&d};
+    f.driver.mount.data_pr = &clients;
+    // The data namespace's next command fails: its fence cannot be proven.
+    dns.fail_next = error.InputOutput;
+    try testing.expectEqual(Outcome.failed, f.driver.recoverDead(f.death()));
+    try testing.expectEqual(page.State.recovering, f.rv.pages.get(2).?.state);
+    for ([_]u16{ 10, 11 }) |s| try testing.expect(f.rv.table.view(s).state != lt.State.unleased);
+    try testing.expect(!(try f.ledger.isRecovered(DEAD, 1)));
+    try testing.expect(dns.writeAllowed("remote-host-id-2".*));
+    // The next poll: the dead host's key preempted on the data namespace, the
+    // reservation kept, the region recovered.
+    try testing.expectEqual(Outcome.acted, f.driver.recoverDead(f.death()));
+    try f.expectConverged();
+    try testing.expect(!dns.writeAllowed("remote-host-id-2".*));
+    try testing.expect(dns.writeAllowed("manager-host-id1".*));
+    try testing.expectEqual(nvme.RTYPE_WEAR, dns.rtype);
+}

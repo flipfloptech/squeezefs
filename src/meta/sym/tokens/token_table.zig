@@ -83,9 +83,12 @@ pub const RECALL_DEADLINE_NS: u64 = T_OWNER_NS;
 /// "One value (≤ the record cap) always fits an empty page."
 pub const GRANT_PAGE_BUDGET: usize = frame.CONTROL_CAP / 2;
 /// The reader charges 128 B per cached entry (entry + bucket + index
-/// header) and 24 B per dentry (cookie + ino + type + index slot); the
-/// holder charges the dentry page the same so a page never exceeds what
-/// the reader will account for it.
+/// header) and 24 B per dentry (cookie + ino + type + index slot) beside
+/// its name; the holder charges a page's dentry as the wire encodes it —
+/// the 24 B head and the name padded to `codec.TAIL_ALIGN` — never less
+/// than the reader accounts, and never past the scratch half it encodes
+/// into (decision 0003 §DI: charged bare, 16,385 six-byte names overflowed
+/// it).
 pub const TOKEN_ENTRY_BYTES: u64 = 128;
 pub const DIR_RECORD_BYTES: u64 = 24;
 /// A block-map record the same way: 16 B (index + len + the value's
@@ -104,6 +107,9 @@ pub fn expiryTickNs(deadline_ns: u64) u64 {
 
 comptime {
     assert(GRANT_PAGE_BUDGET == 512 * 1024);
+    // A page's record charges are the encoder's heads (`buildPage`).
+    assert(DIR_RECORD_BYTES == codec.wireSize(verbs.DirRecordHead));
+    assert(MAP_RECORD_BYTES == codec.wireSize(verbs.MapRecordHead));
     assert(verbs.RECALL_BATCH_MAX == 16_384);
     assert(expiryTickNs(RECALL_DEADLINE_NS) == 11_250 * ns_per_ms);
 }
@@ -1349,7 +1355,7 @@ pub const Holder = struct {
             const more = try source.dentries(source.ctx, arena, ask.object, ask.after, max, &ds);
             var complete = !more;
             for (ds.items) |d| {
-                const cost = @as(usize, DIR_RECORD_BYTES) + d.name.len;
+                const cost = @as(usize, DIR_RECORD_BYTES) + codec.padTo(d.name.len, codec.TAIL_ALIGN);
                 if (cost > budget or d.name.len > record.NAME_MAX) {
                     complete = false;
                     break;

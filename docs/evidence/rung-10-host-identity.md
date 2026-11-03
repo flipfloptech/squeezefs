@@ -51,8 +51,8 @@ the manager; a member's death preempt on nvmet is detected as ignored (`.ignored
 host is NOT fenced: a frozen member resumed after the tail scan writes into recovered blocks — the
 frame screen detects at load, and metadata frames written after the scan are lost. Data namespaces
 have no registrants at all (owed since rung 6). Pinned by the fidelity row "a member's death on
-nvmet 7.3 is DETECTED, not fenced" (`appender_recovery_preempts_ignored` 1, regctl 2, the full tail
-scan ran). The fencer is the owner's decision. Draft upstream report: `~/tmp/nvmet-pr-preempt-bug.md`.
+nvmet 7.3 is DETECTED, not fenced" (`appender_recovery_preempts_ignored` 1, no preempt or re-fence
+landed — the unfenced tail scan — regctl 2). The fencer is the owner's decision. Draft upstream report: `~/tmp/nvmet-pr-preempt-bug.md`.
 
 ## The model
 

@@ -1840,7 +1840,7 @@ test "nvmet fidelity: a superseded manager never wins the hold back (review roun
 /// The membership `T_owner` of the member-death row (the smoke rows' value).
 const member_t_owner_ms: u64 = 3000;
 
-test "nvmet fidelity: a member's death on nvmet 7.3 is DETECTED, not fenced (the documented limit, decision 0003 §DF) — a symmetric set whose manager M (host B) holds WERO; the member X on host A, frozen past T_owner, is evicted; M's death preempt of host A's key answers success yet the key stays registered (appender_recovery_preempts_ignored 1, appender_recovery_preempts 0, regctl 2, host A's key in the report): the recovery's full tail scan ran (recovery_full_tail_scan_bytes > 0) — the only fence nvmet 7.3 gives" {
+test "nvmet fidelity: a member's death on nvmet 7.3 is DETECTED, not fenced (the documented limit, decision 0003 §DF) — a symmetric set whose manager M (host B) holds WERO; the member X on host A, frozen past T_owner, is evicted; M's death preempt of host A's key answers success yet the key stays registered (appender_recovery_preempts_ignored 1, appender_recovery_preempts 0, regctl 2, host A's key in the report) and is never re-fenced (appender_recovery_refences 0): no fence landed, so the recovery's tail scan walked every leaf — the only fence nvmet 7.3 gives" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -1881,7 +1881,11 @@ test "nvmet fidelity: a member's death on nvmet 7.3 is DETECTED, not fenced (the
     try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
     try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recovery_preempts_ignored"));
     try testing.expectEqual(@as(u64, 0), try statNumber(sm, "appender_recovery_preempts"));
-    try testing.expect(try statNumber(sm, "recovery_full_tail_scan_bytes") > 0);
+    // No fence landed (no preempt, no re-fence): the scan is the unfenced
+    // one, every leaf walked (`recovery_full_tail_scan_bytes` counts only
+    // the leaves not resident in the manager's cache — 0 on a set this
+    // small).
+    try testing.expectEqual(@as(u64, 0), try statNumber(sm, "appender_recovery_refences"));
     {
         // Host A still registered: the frozen X, resumed, would write.
         const rr = try rig.resvReportJson(cm.dev());

@@ -62,6 +62,11 @@ pub const Device = struct {
     /// `/dev/ngXnY` (for the log).
     node: [32]u8,
     node_len: usize,
+    /// Test seam: fired after a command's submit, before its completion is
+    /// reaped (the window two issuers on one ring meet in).
+    test_after_submit: if (builtin.is_test) ?TestHook else void = if (builtin.is_test) null else {},
+
+    pub const TestHook = struct { ctx: *anyopaque, fire: *const fn (ctx: *anyopaque) void };
 
     pub fn face(self: *Device) nvme.Namespace {
         return .{ .ctx = self, .issue = issueFn };
@@ -96,6 +101,7 @@ pub const Device = struct {
         uring128.prepUringCmd(sqe, .{ .raw = fd }, cmd_op, &cmd.toCmdArea());
         sqe.user_data = ud_cmd;
         _ = try self.ring.submitAndWait(1);
+        if (builtin.is_test) if (self.test_after_submit) |h| h.fire(h.ctx);
         var cqes: [1]uring128.Cqe32 = undefined;
         while (true) {
             const n = try self.ring.copyCqes(&cqes, 1);
@@ -308,4 +314,75 @@ test "the char twin and the controller node derive by name; a regular file resol
     var rep = try client.report();
     defer rep.deinit(testing.allocator);
     std.debug.print("report: rtype {d}, regctl {d}, ptpls {d}\n", .{ rep.rtype, rep.regctl, rep.ptpls });
+}
+
+const futex = @import("../../sync/futex.zig");
+
+/// Two issuers on one Device (review M2 of decision 0003 §DG): A parks
+/// after its submit until B is done — or, B shut out, for a bound.
+const IssueRace = struct {
+    fired: std.atomic.Value(bool) = .init(false),
+    a_submitted: futex.Word = .init(0),
+    b_done: futex.Word = .init(0),
+    a: ?errors.Error = null,
+    b: ?errors.Error = null,
+
+    fn park(ctx: *anyopaque) void {
+        const r: *IssueRace = @ptrCast(@alignCast(ctx));
+        if (r.fired.swap(true, .acq_rel)) return;
+        r.a_submitted.store(1, .release);
+        futex.wake(&r.a_submitted, 1);
+        const deadline = std.time.ns_per_s;
+        var waited: u64 = 0;
+        const step: u64 = 50 * std.time.ns_per_ms;
+        while (r.b_done.load(.acquire) == 0 and waited < deadline) : (waited += step) {
+            _ = futex.waitTimeout(&r.b_done, 0, step);
+        }
+    }
+
+    fn runA(dev: *Device, r: *IssueRace) void {
+        var cmd = std.mem.zeroes(nvme.UringCmd);
+        cmd.opcode = 0x0E;
+        cmd.nsid = 1;
+        _ = Device.issueFn(dev, .io, &cmd) catch |e| {
+            r.a = e;
+        };
+    }
+
+    fn runB(dev: *Device, r: *IssueRace) void {
+        while (r.a_submitted.load(.acquire) == 0) futex.wait(&r.a_submitted, 0);
+        var cmd = std.mem.zeroes(nvme.UringCmd);
+        cmd.opcode = 0x06;
+        _ = Device.issueFn(dev, .admin, &cmd) catch |e| {
+            r.b = e;
+        };
+        r.b_done.store(1, .release);
+        futex.wake(&r.b_done, 1);
+    }
+};
+
+test "review M2 (decision 0003 §DG): two threads issuing on ONE Device each reap their OWN completion — A's command (a uring_cmd on a regular file: the file system's refusal) submitted and parked before its reap, B's (no controller node: -EBADF) issued meanwhile; never one thread returning the other's answer (a stolen completion parsed as a report, its owner waiting on, or the kernel writing into a returned frame)" {
+    const gpa = testing.allocator;
+    const rc = linux.open("/proc/self/exe", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const dev = try gpa.create(Device);
+    dev.* = .{ .gpa = gpa, .fd = @intCast(rc), .ctrl_fd = -1, .ring = try uring128.Ring128.init(ring_entries, 0), .nsid = 1, .node = undefined, .node_len = 0 };
+    defer dev.deinit();
+    // Each command's own answer, one at a time (a file system with no
+    // uring_cmd answers -EOPNOTSUPP, btrfs -EINVAL): never -EBADF.
+    var alone: IssueRace = .{};
+    alone.fired.store(true, .release);
+    alone.a_submitted.store(1, .release);
+    IssueRace.runA(dev, &alone);
+    IssueRace.runB(dev, &alone);
+    try testing.expectEqual(@as(?errors.Error, error.BadFileDescriptor), alone.b);
+    try testing.expect(alone.a != null and alone.a.? != error.BadFileDescriptor);
+    var race: IssueRace = .{};
+    dev.test_after_submit = .{ .ctx = &race, .fire = IssueRace.park };
+    const ta = try std.Thread.spawn(.{}, IssueRace.runA, .{ dev, &race });
+    const tb = try std.Thread.spawn(.{}, IssueRace.runB, .{ dev, &race });
+    ta.join();
+    tb.join();
+    try testing.expectEqual(alone.a, race.a);
+    try testing.expectEqual(@as(?errors.Error, error.BadFileDescriptor), race.b);
 }

@@ -14,8 +14,9 @@ registration that re-admits a host while a stale sibling of the set lives there.
 | associations | users counted in `<run>/hosts/fabric-<key>/<pid>` under one bounded flock; the last user deletes the controllers |
 | key | `hostKey(wire host id, set)` (FID 0x81, not the configured text) |
 | symmetric PR | the manager holds **WERO** (the device keeps one manager); a writer open reads the claim off a private replay first (a refusable claim: no registration, no write), then registers its host and takes the hold before its first device write, and re-reads the claim under the hold; a joiner adopts (host registered) or registers before its JoinAppender; its membership join carries the key |
-| lapse | a heartbeat that finds no reservation re-acquires only while the device's claim names its incarnation, else fail-stops (symmetric and flat) |
-| the rule | `guard/host_fence.zig`: a register only when the host is unregistered; before it, stale siblings (a page of theirs Recovering/Recovered/Free their own `r <writer> <appender> <term>` does not cover; a manager `p`/`m` while a reservation stands that our key does not hold, or at no reservation unless appender 0's Live page names it; a leaving `l` joiner by its pages) proven dead or pidfd-killed and their writes drained; after it, the report and pages judged again under the lock; an unreadable report refuses |
+| lapse | a heartbeat that finds no reservation re-acquires only while the device's claim names its incarnation; another's fail-stops (symmetric and flat), an unreadable one skips the beat |
+| release | a hold taken by a preempt or inherited stays at the incarnation's last clean unmount (the next mount adopts or preempts it); only a fresh hold with no preempt under it releases |
+| the rule | `guard/host_fence.zig`: a register only when the host is unregistered; before it, stale siblings (a page of theirs Recovering/Recovered/Free their own `r <writer> <appender> <term>` does not cover; a manager `p`/`m` while a reservation stands that our key does not hold, or at no reservation unless appender 0's Live page names it; a joined `j`/`l` line by the page it names — appender id, term) proven dead or pidfd-killed and their writes drained; after it, the report and pages judged again under the lock; an unreadable report refuses |
 | recovery | the report re-read once the page is Recovering: a host registered meanwhile is preempted again |
 | death screen | the departed-key table kept; a key held on another node contradicts, the dead member's own node's hold does not |
 
@@ -41,6 +42,21 @@ registration that re-admits a host while a stale sibling of the set lives there.
   a superseded manager resumed after its successor's clean last unmount never fail-stopped — 2
   fail). Green after the fix commit.
 
+- **review 4, round 5** — the models first (`b2e1f1e`: today's code fails — a joined line without
+  its page spares a reused pair's member, the `l` Free exception spares a released recovery's page,
+  the hold released at a takeover's last unmount lets M0's checkpoint and a paused open overwrite
+  acked metadata, `OverwroteAcked`); reds alone: `a737216` (blockers 1/1b: "expected .stale, found
+  .joining / .retired"), `4e434e3` (minor 3: ".failed, found .fenced"), `e4747f8` (minor 5: the live
+  manager fail-stopped), `f17567a` (blocker 2: regctl 0 after the takeover's unmount), `94944ba`
+  (minor 4: the open never ready). Green after `7c9ddef`, `f25afcf`, `4cb616c`, `9c79170`, `cf2258c`.
+
+## Round 5's probe cost (counter deltas, the probe-cost row)
+
+Every NVMe writer open replays the claim privately twice (each: both superblock copies, the 128 KiB
+ledger, the WHOLE fixed ring). On a 256 MiB ring: 537,116,672 B per open, 0 frames on a clean first
+open, 8,014 on a kill -9 remount (4,007 per probe). The derived ring caps at 32 MiB (≈ 64 MiB per
+open); `--meta-journal-mb` reaches 1 GiB (≈ 2 GiB per open). A lapse adds up to three more.
+
 ## nvmet 7.3's holder preempt — detection only, with possible loss
 
 `nvmet_pr_preempt` answers `holder == reg` before it compares PRKEY: the WERO holder's preempt of a
@@ -57,10 +73,11 @@ landed — the unfenced tail scan — regctl 2). The fencer is the owner's decis
 ## The model
 
 `src/meta/guard/host_fence_model.zig` (round 4: the code's inputs, the rule's read/register/re-judge
-as steps under the registry lock): `Election` 255,611 states (depth 28) and `Member` 1,537 (depth 17)
-hold. "A fenced member never writes" holds under spec semantics and FAILS under nvmet 7.3's (stated).
-The accepted windows (PTPL-less lapse, a successor's clean last release, register→re-judge) are each
-shown reachable. Every weakening fails — the invariant each breaks is §DF.14's table; majors 1–4 each
+as steps under the registry lock; round 5: a joined line's page, `releaseRecovered` and pair reuse,
+`OverwroteAcked`, the kept preempting hold): `Election` 258,798 states (depth 28) and `Member` 7,216
+(depth 21) hold. "A fenced member never writes" holds under spec semantics and FAILS under nvmet 7.3's (stated).
+The accepted windows (PTPL-less lapse, register→re-judge) are each shown reachable; round 4's release
+window is closed (a hold taken by a preempt or inherited stays at the last unmount). Every weakening fails — the invariant each breaks is §DF.14's table; majors 1–4 each
 have one (round 3's `p` judgement → `KilledCurrent`; register-before-claim → `WroteUnheld`; no lapse
 claim check → `FencedWrote`; no `l` line → `FencedMemberWrote`).
 

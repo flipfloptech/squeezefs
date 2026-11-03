@@ -27,6 +27,7 @@ pub const nvme_cmd = @import("guard/nvme_cmd.zig");
 pub const fake_nvme = @import("guard/fake_nvme.zig");
 pub const pr = @import("guard/pr.zig");
 pub const host_fence_model = @import("guard/host_fence_model.zig");
+pub const data_fence_model = @import("guard/data_fence_model.zig");
 
 pub const proc = if (is_linux) @import("guard/proc.zig") else struct {};
 pub const pr_linux = if (is_linux) @import("guard/pr_linux.zig") else struct {};
@@ -131,6 +132,7 @@ test {
     _ = fake_nvme;
     _ = pr;
     _ = host_fence_model;
+    _ = data_fence_model;
     if (is_linux) {
         _ = proc;
         _ = pr_linux;

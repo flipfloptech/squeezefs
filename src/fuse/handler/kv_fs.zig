@@ -11587,6 +11587,19 @@ test "THE DELETE REGISTRY'S FILTER (decision 0003 §DH.14): a live object's chec
     }
 }
 
+test "THE MEMO'S LAYOUT (decision 0003 §DH.16): a mkdir takes the memo's spin lock four times while every waiter spins on its word — the word and each map's header (`parents`, `depths`) sit alone in cache-line blocks of their own, so the holder's reads and writes of a header never meet a line the waiters pull away; the memo itself starts a block of `KvFs` and fills whole blocks" {
+    const Fs = Harness.Fs;
+    const Memo = @FieldType(Fs, "memo");
+    try testing.expectEqual(@as(usize, 0), @offsetOf(Fs, "memo") % std.atomic.cache_line);
+    try testing.expectEqual(@as(usize, 0), @sizeOf(Memo) % std.atomic.cache_line);
+    const fields = .{ "lock", "parents", "depths" };
+    inline for (fields, 0..) |name, i| {
+        try testing.expectEqual(@as(usize, 0), @offsetOf(Memo, name) % std.atomic.cache_line);
+        try testing.expect(@sizeOf(@FieldType(Memo, name)) <= std.atomic.cache_line);
+        inline for (fields, 0..) |other, j| if (i != j) try testing.expect(@offsetOf(Memo, name) != @offsetOf(Memo, other));
+    }
+}
+
 test "THE CROSS-MEMBER DELETE, the member's side (decision 0003 §DH): every nodeid op whose inode record is gone answers ESTALE — getattr, open, read, write, a size setattr, a mode setattr, setxattr — counted and dropping this mount's kernel view of it; a name op on the gone name is negative (a lookup) or ENOENT (an unlink) as ever" {
     var h: Harness = undefined;
     try h.init();

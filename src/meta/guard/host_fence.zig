@@ -1363,10 +1363,26 @@ test "round 3 major 1: a live manager's entry once its role is durable (`p` at r
     try testing.expectEqual(Verdict.current, judge(&pm, &.{pg(0, .live, node, 0xc9)}, node, 0, false, .{}));
 }
 
-test "round 3 major 4: a sibling mid-leave stays visible to the rule — its `l` line is judged by its pages like a joiner's: Recovering (frozen during its leave, evicted) is stale, Live is current, Free (its leave landed) is spared" {
+test "round 3 major 4, review 4 blocker 1b: a sibling mid-leave stays visible to the rule — its `l` line names its appender id, term and volume: Live under it is current; Recovering (frozen during its leave, evicted) is stale; a Free page naming it — only `releaseRecovered` leaves one (the leave's own Free page clears the identity) — is stale; Free with the identity cleared (its own landed leave, the line removed next) is stale too: its writes all landed, a kill there costs nothing" {
     const node: u64 = 0xA;
-    var e = Entry.parse(46, "81\nl 9 00000000000000d1\n").?;
-    try testing.expectEqual(Verdict.stale, judge(&e, &.{pg(4, .recovering, node, 0xd1)}, node, 0, false, .{}));
-    try testing.expectEqual(Verdict.current, judge(&e, &.{pg(4, .live, node, 0xd1)}, node, 0, false, .{}));
-    try testing.expect(judge(&e, &.{pg(4, .free, node, 0xd1)}, node, 0, false, .{}) != .stale);
+    var e = Entry.parse(46, "81\nl 9 00000000000000d1 4 6 0\n").?;
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{pgTerm(4, .recovering, node, 0xd1, 6)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.current, judge(&e, &.{pgTerm(4, .live, node, 0xd1, 6)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{pgTerm(4, .free, node, 0xd1, 6)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{page.Page.free(4, 9, .{})}, node, 0, false, .{}));
+}
+
+test "review 4 blocker 1: a joined member's line names its appender id, term and volume (`j <slot> <writer id> <appender id> <term> <volume>`) — its pair released after its recovery and reused by a new joiner (the lowest Free pair) names no one: STALE, never joining; Live under its own writer id and term is current, under another term stale; a retirement covering its (appender id, term) spares it; a line without an appender id (before its JoinAppender) is joining; another volume's line is not judged here" {
+    const node: u64 = 0xA;
+    var e = Entry.parse(48, "83\nj 9 00000000000000d2 4 6 0\n").?;
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{pgTerm(4, .live, node, 0xe7, 7)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.current, judge(&e, &.{pgTerm(4, .live, node, 0xd2, 6)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{pgTerm(4, .live, node, 0xd2, 8)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{pgTerm(4, .free, node, 0xd2, 6)}, node, 0, false, .{}));
+    var r = Entry.parse(48, "83\nj 9 00000000000000d2 4 6 0\nr 00000000000000d2 4 6\n").?;
+    try testing.expectEqual(Verdict.retired, judge(&r, &.{pgTerm(4, .recovered, node, 0xd2, 6)}, node, 0, false, .{}));
+    var pre = Entry.parse(48, "83\nj 9 00000000000000d2\n").?;
+    try testing.expectEqual(Verdict.joining, judge(&pre, &.{pgTerm(4, .live, node, 0xe7, 7)}, node, 0, false, .{}));
+    var other = Entry.parse(48, "83\nj 9 00000000000000d2 4 6 1\n").?;
+    try testing.expect(judge(&other, &.{pgTerm(4, .live, node, 0xe7, 7)}, node, 0, false, .{}) != .stale);
 }

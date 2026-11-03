@@ -21,8 +21,8 @@ throughout). A writes through its descriptors and closes them — the delete, th
   write's 4 KiB** (7.3 keeps a fully copied folio uptodate when the WRITE fails).
 
 **Fix** (`0db35d7`; §DH.3–DH.7). The holder registers the delete (`KvFs.deleted`) before §DC's discard; a grant of
-a registered object answers `gone` (`PrepareSeam.deleted`, after the registration — register-then-check through
-the registry's lock); a shipped verb on a registered or absent object answers the new reply kind `gone`
+a registered object answers `gone` (`PrepareSeam.deleted`, after the registration — register-then-check, a
+Dekker pair since `8fde307`); a shipped verb on a registered or absent object answers the new reply kind `gone`
 (never a tripwire); a delete a member may hold a grant on kicks its destroy, whose pass recalls that grant. On B
 every nodeid op on a gone record answers ESTALE (`readHeld`), counted by cause, and drops B's kernel view of the
 inode; a publish answered `gone` is the merge's `NotFound`.
@@ -38,4 +38,27 @@ cross-daemon coherence rows); units `fuse.handler.kv_fs` + `data.` + `meta.` + `
 fail; xfstests generic/001 013 074 3/3, fsck 0 (alerts: §DB.3's syncfs line only); `zig fmt --check`; rails 32/32.
 Not changed (§DH.13): a full heap delays the kicked destroy; a non-holder's own unlink of an open file answers
 ESTALE once the holder forgets it; a served unlink of a file the holder's kernel never held waits for the next
-mount's sweep; the per-delete registry cost on a wired mount wants an A-B-B-A on mdtest's removal row.
+mount's sweep; a wired mount pays the registry at every delete (removal rows flat in the A-B-B-A below).
+
+**The creates' regression** (§DH.14). The orchestrator's A-B-B-A (dev `10f6182` vs `e4c0193`, mdtest -n 10000 -u,
+fresh RAM perf mount per run): File creation −2.6 to −4.3 % in all four shapes, plain np64 Directory creation
+−5.5 %, removal flat. The perf mount's own stats: `dlm_token_grants_served` 0 in both arms (one member, wire up), so
+the registry's lock never ran on a create; `fuse_delete_registry` 1,145,729 at exit (the gather's backlog — dev's
+§DC marks 1,148,865). Cause: the new `KvFs` fields re-ordered the auto layout, putting `next_fh` (a RMW per create)
+at 848 beside `xv` 840 and `io` 856 (read per op) and the `..` memo's header (written per mkdir) at 872.
+**Fix** (`8fde307`): `next_fh`, the memos, the destroy tally and the gather's count in `OwnLine` (own cache lines,
+pinned by a unit); the registry a 4,096-cell counting filter over 64 own-line shards — a clear cell answers a
+grant or shipped verb in one SeqCst load; the delete raises its cell THEN reads the holder's watch, the grant's
+registration raises the watch THEN reads the cell (both SeqCst). **Model** `tokens/delete_watch_model.zig`:
+holds over 2,704 states (4,576 with another deleted ino in the cell); the delete's raise un-fenced fails after
+17 states, the grant's after 1,773. **Counters** (a joined pair, temporary row): empty registry — B's 10,000
+stats of A's files: A's grants +10,016–10,021, `fuse_delete_registry_looks` +0; B's 10,000 creates in A's
+directory: grants +12,286–15,092, looks +0. 256 deletes registered: A's own 10,000 creates 0 grants, 0 looks;
+B's 10,000 stats of fresh files +10,010–10,012 grants, +512 looks (5.1 %); B's creates in A's directory +14,383
+grants, +0 looks. The old check locked once per grant. Seen on dev too, not changed (§DH.13 (h)): after B filled
+A's directory, A's unlink there answered EIO (B's `cluster_wire_service_refusals` tripwire), and one dev run's
+fsck found 169 live inodes named by no dentry.
+
+**Checks** (`8fde307`): the red ×3 (3/3), the §DH units ×3 (49/49 each), the 27 related rows ×1 (68/68), the full
+unit step 3,248 pass / 185 skip / 0 fail (one earlier run lost stats' eight-thread render test to load: 7/7
+alone), `zig fmt --check`, rails 32/32.

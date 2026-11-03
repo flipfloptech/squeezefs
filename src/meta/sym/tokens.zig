@@ -88,6 +88,7 @@ const log = @import("../../core/log.zig");
 const clock = @import("../../core/clock.zig");
 const verbs = @import("../../wire/verbs.zig");
 const service = @import("../../wire/service.zig");
+const frame = @import("../../wire/frame.zig");
 const loopback = @import("../../wire/loopback.zig");
 const auth = @import("../../wire/auth.zig");
 const record = @import("../record.zig");
@@ -210,6 +211,21 @@ const RamRecords = struct {
         const gop = try self.dentries.getOrPut(self.gpa, dir);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(self.gpa, .{ .cookie = cookie, .child = child, .name = name });
+        std.mem.sort(Dent, gop.value_ptr.items, {}, struct {
+            fn lt(_: void, a: Dent, b: Dent) bool {
+                return a.cookie < b.cookie;
+            }
+        }.lt);
+    }
+
+    /// Many dentries of `dir` at once (names borrowed): one sort, where a
+    /// `putDentry` per name re-sorts the whole set each time.
+    fn putDentries(self: *RamRecords, dir: u64, dents: []const Dent) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const gop = try self.dentries.getOrPut(self.gpa, dir);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.appendSlice(self.gpa, dents);
         std.mem.sort(Dent, gop.value_ptr.items, {}, struct {
             fn lt(_: void, a: Dent, b: Dent) bool {
                 return a.cookie < b.cookie;
@@ -819,6 +835,56 @@ test "the paged-resident dentry set (rung 10 item 5c, spec Q13): a directory lar
     try testing.expect(s.entry.?.coversName(hzz) or s.entry.?.lastCookie() < key.encodeReaddirCookie(hzz, 0));
     s.release(io);
     try testing.expectEqual(oversize0, cache.stats.dlm_token_oversize_refusals.load());
+}
+
+test "a holder's dentry page is charged as the wire encodes it — each name padded to 8 B (decision 0003 §DI): 18,000 six-byte names, a page from the start of a directory one wire page cannot carry, are granted and page through a reader without a refusal; charged 24 B + the bare name, the page overflowed the control scratch's half at the 16,385th record and answered Corrupt — the member's EIO and the holder's `cluster_wire_service_refusals` once a joined member's creates took a holder's directory past 16,384 entries" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 1);
+    defer f.deinit();
+    const name_key = key.NameKey.init(0xABCD);
+    const n: usize = 18_000;
+    const names = try gpa.alloc([6]u8, n);
+    defer gpa.free(names);
+    const dents = try gpa.alloc(RamRecords.Dent, n);
+    defer gpa.free(dents);
+    for (names, dents, 0..) |*nm, *d, i| {
+        _ = std.fmt.bufPrint(nm, "n{d:0>5}", .{i}) catch unreachable;
+        d.* = .{ .cookie = key.encodeReaddirCookie(key.dentryNameHash54(nm, &name_key), 0), .child = inos.makeGlobalIno(100 + i, SLOT, inos.ROUTING_WIDTH), .name = nm };
+    }
+    try f.records.putInode(objectOf(5), .{ .mode = 0o040755, .nlink = 2, .mtime = 100 });
+    try f.records.putDentries(objectOf(5), dents);
+    // The holder's page from the start, in the session's scratch: granted,
+    // its dentries inside the budget the encode check splits off.
+    {
+        const scratch = try gpa.alloc(u8, frame.CONTROL_CAP);
+        defer gpa.free(scratch);
+        const reply = try f.holder.serveGrant(io, .{ .client = 1, .object = objectOf(5), .wants_dentries = true, .wants_records = true, .after = 0, .xattr_after = "" }, f.records.source(), scratch);
+        const page = reply.granted;
+        try testing.expect(page.head.n_dir > 0 and page.head.n_dir < n);
+        try testing.expect(page.head.flags & verbs.PAGE_DIR_COMPLETE == 0);
+        try testing.expect(page.xattrs_bytes.len + page.dir_bytes.len <= table.GRANT_PAGE_BUDGET);
+    }
+    // The member's walk: every record once, in cookie order.
+    const b = f.reader(0);
+    var seen: usize = 0;
+    var after: u64 = 0;
+    var last_cookie: u64 = 0;
+    while (true) {
+        var s = (try b.serve(io, objectOf(5), .{ .dentries = true, .after = after })).?;
+        defer s.release(io);
+        const e = s.entry.?;
+        const page = e.pageAfter(after);
+        for (page) |r| {
+            try testing.expect(r.cookie > last_cookie);
+            last_cookie = r.cookie;
+            seen += 1;
+        }
+        if (e.dir_complete) break;
+        try testing.expect(page.len >= 1);
+        after = e.lastCookie();
+    }
+    try testing.expectEqual(n, seen);
 }
 
 test "the recall's purge reads the REVOKED entry's carried `layout` (held pinned through the sink's call): the ack and a voluntary release each hand it over; the shed purges each entry it drops at the drop, so a recall of a shed object owes the kernel its invalidation and the tiers nothing — no census (0003 §W.2)" {

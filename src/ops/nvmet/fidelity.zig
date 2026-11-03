@@ -1794,7 +1794,7 @@ test "nvmet fidelity: a remote joiner never registers or writes before its claim
     try expectNoResidue(rig, set.data_nqn);
 }
 
-test "nvmet fidelity: a superseded manager never wins the hold back (review round 3 major 3) — M0 (host A) frozen past its claim's TTL; the successor S (host B) takes over, writes and unmounts cleanly as the namespace's last registrant (unreserved); M0 resumed meets the lapse with a device claim that is not its own — it fail-stops its volume instead of re-registering (writer_guard_pr_reacquires 0, its writes refused)" {
+test "nvmet fidelity: a superseded manager never wins the hold back (review round 3 major 3) nor writes over its successor's acked data (review 4 blocker 2) — M0 (host A), its last files unsynced, frozen past its claim's TTL; the successor S (host B) takes over by a preempt, writes ds/s and unmounts cleanly: a hold taken by a preempt STAYS (regctl 1, rtype 3 — the next mount preempts or adopts it; releasing it re-admitted every host the preempt fenced); S2 on host B adopts the standing hold, reads ds/s, writes ds/t and unmounts: the inherited hold stays too; M0 resumed is refused at its first write or its beat (writer_guard_fenced 1, writer_guard_pr_reacquires 0) — its checkpoint lands nothing; a remount reads ds/s and ds/t back" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -1807,6 +1807,9 @@ test "nvmet fidelity: a superseded manager never wins the hold back (review roun
     const m0 = try rig.spawnMount("lp-m0", set.metaUri(), null, &.{});
     try rig.awaitLog(m0, "ready: ", ready_wait_ns);
     try testing.expect(try scriptSucceeds(rig, m0, "echo before > f && sync -d f"));
+    // Unsynced: M0's checkpoint has nodes, bitmap pages and a ledger record
+    // to land when it resumes.
+    try testing.expect(try scriptSucceeds(rig, m0, "mkdir d0 && for i in $(seq 1 200); do echo $i > d0/f$i; done"));
     const pid_m0 = rig.daemons.items[m0].pid;
     _ = linux.kill(pid_m0, .STOP);
     sleepMs(lease_clock.T_OWNER_MS + 5_000);
@@ -1814,11 +1817,17 @@ test "nvmet fidelity: a superseded manager never wins the hold back (review roun
     try rig.awaitLog(s, "ready: ", ready_wait_ns);
     try testing.expect(try scriptSucceeds(rig, s, "mkdir ds && echo s > ds/s && sync -d ds/s"));
     try rig.umount(s);
+    try expectHoldStands(rig, cm.dev());
+    const s2 = try rig.spawnMount("lp-s2", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(s2, "ready: ", ready_wait_ns);
     {
-        const rr = try rig.resvReportJson(cm.dev());
-        defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 0), json_scan.number(rr, "regctl"));
+        const seen = try rig.onMount(s2, "cat ds/s");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("s\n", seen);
     }
+    try testing.expect(try scriptSucceeds(rig, s2, "echo t > ds/t && sync -d ds/t"));
+    try rig.umount(s2);
+    try expectHoldStands(rig, cm.dev());
     _ = linux.kill(pid_m0, .CONT);
     const st = try rig.awaitStat(m0, "writer_guard_fenced", 1, 30 * std.time.ns_per_s);
     defer gpa.free(st);
@@ -1827,6 +1836,14 @@ test "nvmet fidelity: a superseded manager never wins the hold back (review roun
     const m0_wrote = scriptSucceeds(rig, m0, "echo x > z && sync -d z") catch false;
     try testing.expect(!m0_wrote);
     try rig.kill9(m0);
+    const r = try rig.spawnMount("lp-r", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(r, "ready: ", ready_wait_ns);
+    {
+        const seen = try rig.onMount(r, "cat ds/s ds/t");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("s\nt\n", seen);
+    }
+    try rig.umount(r);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
     try rig.disconnect(&cm_b);
@@ -1835,6 +1852,18 @@ test "nvmet fidelity: a superseded manager never wins the hold back (review roun
     try rig.unshare(set.meta_nqn);
     try expectNoResidue(rig, set.meta_nqn);
     try expectNoResidue(rig, set.data_nqn);
+}
+
+/// After a takeover successor's clean last unmount: its hold stands under
+/// WERO with its host's one registration (review 4 blocker 2).
+fn expectHoldStands(rig: *Rig, dev: []const u8) !void {
+    const rr = try rig.resvReportJson(dev);
+    defer rig.gpa.free(rr);
+    const regctl = json_scan.number(rr, "regctl");
+    const rtype = json_scan.number(rr, "rtype");
+    if (regctl != 1 or rtype != nvme.RTYPE_WERO) std.debug.print("\n--- the report after the takeover's last unmount: {s} ---\n", .{rr});
+    try testing.expectEqual(@as(?u64, 1), regctl);
+    try testing.expectEqual(@as(?u64, nvme.RTYPE_WERO), rtype);
 }
 
 /// The membership `T_owner` of the member-death row (the smoke rows' value).

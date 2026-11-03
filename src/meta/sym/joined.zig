@@ -544,6 +544,7 @@ pub const JoinedSet = struct {
             break;
         }
         const jr = &self.joiner.region.?;
+        if (self.fence) |f| f.joined(jr.appenderId(), jr.core.page.term);
         for (jr.grant.unclaimed.items) |e| {
             self.granted_bits.set(@intCast(e));
             self.granted += 1;

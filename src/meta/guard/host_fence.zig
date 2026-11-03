@@ -141,11 +141,16 @@ pub const Kind = enum {
 /// `m` a manager whose role is durable (appender 0's page, or the claim on a
 /// flat volume; its `p` line retired then), `p` a manager registered whose
 /// role is not yet, `j` a joiner, `l` a joiner leaving (its leave's writes
-/// still to land: judged by its pages, a Free one spared).
+/// still to land).
 pub const Role = enum { manager, pending, joiner, leaving };
 
-/// One region an entry's process holds (its writer id at its slot).
-pub const Region = struct { role: Role, slot: u32, writer_id: u64 };
+/// A joined region's page (review 4 blocker 1): the appender id and term
+/// its `JoinAppender` answered, on the volume it joined.
+pub const Joined = struct { appender_id: u32, term: u64, vol: u32 };
+
+/// One region an entry's process holds (its writer id at its slot; a
+/// joiner's page once joined).
+pub const Region = struct { role: Role, slot: u32, writer_id: u64, joined: ?Joined = null };
 
 /// One retired incarnation's page: the writer id, the appender id and the
 /// term its page carried when the latch failed (review B1: a §BS successor
@@ -168,13 +173,19 @@ pub const Entry = struct {
     }
 
     fn covers(self: *const Entry, p: page.Page) bool {
-        for (self.retired[0..self.n_retired]) |r| if (r.writer_id == p.identity.writer_id and r.appender_id == p.appender_id and r.term == p.term) return true;
+        return self.coversId(p.identity.writer_id, p.appender_id, p.term);
+    }
+
+    fn coversId(self: *const Entry, writer_id: u64, appender_id: u32, term: u64) bool {
+        for (self.retired[0..self.n_retired]) |r| if (r.writer_id == writer_id and r.appender_id == appender_id and r.term == term) return true;
         return false;
     }
 
-    /// The entry's text: the start ticks, then `m|p|j <slot> <writer id>`
-    /// per region, `r <writer id> <appender id> <term>` per retired
-    /// incarnation (an `r` line short of a word retires nothing).
+    /// The entry's text: the start ticks, then `m|p|j|l <slot> <writer id>`
+    /// per region — a joined `j`/`l` line adds `<appender id> <term>
+    /// <volume>` —, `r <writer id> <appender id> <term>` per retired
+    /// incarnation (an `r` line short of a word retires nothing; a region
+    /// line short of its page's words names no page).
     pub fn parse(pid: u32, text: []const u8) ?Entry {
         var lines = std.mem.tokenizeScalar(u8, text, '\n');
         const first = lines.next() orelse return null;
@@ -195,8 +206,15 @@ pub const Entry = struct {
             const role: Role = if (std.mem.eql(u8, tag, "m")) .manager else if (std.mem.eql(u8, tag, "p")) .pending else if (std.mem.eql(u8, tag, "j")) .joiner else if (std.mem.eql(u8, tag, "l")) .leaving else continue;
             const slot = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue; // a mount slot, decimal as `regionLine` writes it
             const w = std.fmt.parseInt(u64, f.next() orelse continue, 16) catch continue; // a writer id, hex as `regionLine` writes it
+            const joined: ?Joined = blk: {
+                if (role != .joiner and role != .leaving) break :blk null;
+                const a = std.fmt.parseInt(u32, f.next() orelse break :blk null, 10) catch break :blk null; // an appender id, decimal as `regionLine` writes it
+                const t = std.fmt.parseInt(u64, f.next() orelse break :blk null, 10) catch break :blk null; // the page's term, decimal as `regionLine` writes it
+                const v = std.fmt.parseInt(u32, f.next() orelse break :blk null, 10) catch break :blk null; // the volume's lane index, decimal as `regionLine` writes it
+                break :blk .{ .appender_id = a, .term = t, .vol = v };
+            };
             if (e.n_regions < MAX_REGIONS) {
-                e.regions[e.n_regions] = .{ .role = role, .slot = slot, .writer_id = w };
+                e.regions[e.n_regions] = .{ .role = role, .slot = slot, .writer_id = w, .joined = joined };
                 e.n_regions += 1;
             }
         }
@@ -338,10 +356,16 @@ pub const Registry = struct {
         try self.writeEntry(pid, w.buffered());
     }
 
+    /// Which of a writer id's lines `removeRegion` drops: all of them; a
+    /// joiner's lines not yet naming a page; or those naming one appender id
+    /// (its `j`/`l` line and its `r` retirement) — a re-joined successor
+    /// keeps the writer id, its predecessor's lines go with the predecessor.
+    pub const Which = union(enum) { any, unjoined, page: u32 };
+
     /// Drop this process's lines naming `writer_id` under `tags` (one
     /// region's — review major 10: never the whole file while another
     /// region of the process stands); the file goes with its last line.
-    pub fn removeRegion(self: *const Registry, pid: u32, tags: []const u8, writer_id: u64) void {
+    pub fn removeRegion(self: *const Registry, pid: u32, tags: []const u8, writer_id: u64, which: Which) void {
         var rb: [4096]u8 = undefined;
         const old = self.readEntry(pid, &rb) orelse return;
         var out: [4096]u8 = undefined;
@@ -351,18 +375,28 @@ pub const Registry = struct {
         w.print("{s}\n", .{header}) catch return;
         var kept: usize = 0;
         while (lines.next()) |line| {
-            var f = std.mem.tokenizeScalar(u8, line, ' ');
-            const tag = f.next() orelse continue;
-            const drop = tag.len == 1 and std.mem.indexOfScalar(u8, tags, tag[0]) != null and blk: {
-                if (tag[0] != 'r') _ = f.next();
-                const w_text = f.next() orelse break :blk false;
-                break :blk (std.fmt.parseInt(u64, w_text, 16) catch break :blk false) == writer_id; // a writer id, hex as written
-            };
-            if (drop) continue;
-            w.print("{s}\n", .{line}) catch return;
-            kept += 1;
+            if (!dropsLine(line, tags, writer_id, which)) {
+                w.print("{s}\n", .{line}) catch return;
+                kept += 1;
+            }
         }
         self.writeEntry(pid, if (kept == 0) "" else w.buffered()) catch {};
+    }
+
+    fn dropsLine(line: []const u8, tags: []const u8, writer_id: u64, which: Which) bool {
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        const tag = f.next() orelse return false;
+        if (tag.len != 1 or std.mem.indexOfScalar(u8, tags, tag[0]) == null) return false;
+        if (tag[0] != 'r') _ = f.next(); // the slot
+        const w_text = f.next() orelse return false;
+        if ((std.fmt.parseInt(u64, w_text, 16) catch return false) != writer_id) return false; // a writer id, hex as written
+        // `r`: the appender id next; a region line: its page's appender id.
+        const aid: ?u32 = if (f.next()) |a| std.fmt.parseInt(u32, a, 10) catch null else null; // decimal as written
+        return switch (which) {
+            .any => true,
+            .unjoined => tag[0] != 'r' and aid == null,
+            .page => |want| aid == want,
+        };
     }
 
     /// The whole entry (a dead process's, or a fabric association's user).
@@ -427,6 +461,7 @@ pub fn regionLine(buf: []u8, r: Region) []const u8 {
         .joiner => "j",
         .leaving => "l",
     };
+    if (r.joined) |j| return std.fmt.bufPrint(buf, "{s} {d} {x:0>16} {d} {d} {d}\n", .{ tag, r.slot, r.writer_id, j.appender_id, j.term, j.vol }) catch unreachable;
     return std.fmt.bufPrint(buf, "{s} {d} {x:0>16}\n", .{ tag, r.slot, r.writer_id }) catch unreachable;
 }
 
@@ -495,15 +530,27 @@ fn judgeRegion(e: *const Entry, r: Region, pages: []const page.Page, node_token:
             }
             return .stale;
         },
-        .joiner, .leaving => {
+        // A joined region names its page (review 4 blocker 1): current only
+        // while that page is Live under its writer id and term, retired when
+        // its own `r` covers that (appender id, term), else stale — a pair
+        // released after its recovery and reused names another writer, and
+        // the leave's own Free page clears the identity.
+        .joiner, .leaving => if (r.joined) |j| {
+            if (j.vol != vol_index) return null;
+            for (pages) |p| {
+                if (p.appender_id != j.appender_id) continue;
+                if (p.state == .live and p.identity.node_token == node_token and p.identity.writer_id == r.writer_id and p.term == j.term) return .current;
+                break;
+            }
+            return if (e.coversId(r.writer_id, j.appender_id, j.term)) .retired else .stale;
+        } else {
+            // Not joined yet: the pages naming its writer id judge it.
             var named = false;
             var uncovered = false;
             for (pages) |p| {
                 if (p.appender_id == 0 or p.identity.node_token != node_token or p.identity.writer_id != r.writer_id) continue;
                 if (p.state == .live) return .current;
                 named = true;
-                // A leaving joiner's Free page is its own landed leave.
-                if (r.role == .leaving and p.state == .free) continue;
                 if (!e.covers(p)) uncovered = true;
             }
             if (uncovered) return .stale;
@@ -848,7 +895,7 @@ pub const Early = struct {
             if (reg.lock()) |_| {
                 defer reg.unlock();
                 const me = proc.localIdentity();
-                reg.removeRegion(me.pid, "p", self.writer_id);
+                reg.removeRegion(me.pid, "p", self.writer_id, .any);
                 if ((reg.othersAlive(gpa, me.pid) catch 1) == 0) leaveRegistration(c, self.preempted) catch {};
             } else |_| {}
         } else leaveRegistration(c, self.preempted) catch {};
@@ -930,7 +977,7 @@ pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map,
             var reg = reg_in;
             if (reg.lock()) |_| {
                 defer reg.unlock();
-                reg.removeRegion(local.pid, "p", local.writerId(@intCast(vol_index)));
+                reg.removeRegion(local.pid, "p", local.writerId(@intCast(vol_index)), .any);
                 if ((reg.othersAlive(gpa, local.pid) catch 1) == 0) leaveRegistration(c, false) catch {};
             } else |_| {}
         } else leaveRegistration(c, false) catch {};
@@ -1007,6 +1054,10 @@ pub const Joiner = struct {
     reg: Registry,
     slot: u32,
     writer_id: u64,
+    /// The volume's lane index (a joined line names it).
+    vol: u32,
+    /// The page its `JoinAppender` answered (null before it).
+    page: ?Joined = null,
 
     /// The admission: the host registered under the key ⇒ adopted (no
     /// device mutation); else the rule and the register
@@ -1073,7 +1124,7 @@ pub const Joiner = struct {
             log.info("meta volume {s}: this host is registered on the namespace under the set's key {x:0>16} — adopted (no device mutation)", .{ ctx.path, c.key });
         }
         const self = try ctx.gpa.create(Joiner);
-        self.* = .{ .gpa = ctx.gpa, .device = dev, .client = c, .reg = reg, .slot = slot, .writer_id = writer_id };
+        self.* = .{ .gpa = ctx.gpa, .device = dev, .client = c, .reg = reg, .slot = slot, .writer_id = writer_id, .vol = ctx.vol_index };
         return self;
     }
 
@@ -1088,23 +1139,42 @@ pub const Joiner = struct {
         self.reg.append(me.pid, me.start_ticks, retiredLine(&lb, .{ .writer_id = self.writer_id, .appender_id = appender_id, .term = term })) catch {};
     }
 
+    /// After its `JoinAppender`: the line names the page — its appender id
+    /// and term on this volume (review 4 blocker 1: a pair released after a
+    /// recovery and reused names another writer, so a line naming no page
+    /// read such a member as joining).
+    pub fn joined(self: *Joiner, appender_id: u32, term: u64) void {
+        self.page = .{ .appender_id = appender_id, .term = term, .vol = self.vol };
+        self.reg.lock() catch return;
+        defer self.reg.unlock();
+        const me = proc.localIdentity();
+        self.reg.removeRegion(me.pid, "j", self.writer_id, .unjoined);
+        var lb: [96]u8 = undefined;
+        self.reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = self.slot, .writer_id = self.writer_id, .joined = self.page })) catch {};
+    }
+
+    /// This incarnation's lines (a re-joined successor keeps the writer id).
+    fn own(self: *const Joiner) Registry.Which {
+        return if (self.page) |p| .{ .page = p.appender_id } else .unjoined;
+    }
+
     /// Before the clean leave: this region marked leaving (`l`) — judged by
-    /// its pages like a joiner's while the leave's writes are still to land
-    /// (review round 3, major 4), its Free page spared.
+    /// its page while the leave's writes are still to land (review round 3,
+    /// major 4).
     pub fn depart(self: *Joiner) void {
         self.reg.lock() catch return;
         defer self.reg.unlock();
         const me = proc.localIdentity();
-        self.reg.removeRegion(me.pid, "j", self.writer_id);
-        var lb: [64]u8 = undefined;
-        self.reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .leaving, .slot = self.slot, .writer_id = self.writer_id })) catch {};
+        self.reg.removeRegion(me.pid, "j", self.writer_id, self.own());
+        var lb: [96]u8 = undefined;
+        self.reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .leaving, .slot = self.slot, .writer_id = self.writer_id, .joined = self.page })) catch {};
     }
 
     /// After the leave's last write: this region out of the registry.
     pub fn departed(self: *Joiner) void {
         self.reg.lock() catch return;
         defer self.reg.unlock();
-        self.reg.removeRegion(proc.localIdentity().pid, "jlr", self.writer_id);
+        self.reg.removeRegion(proc.localIdentity().pid, "jlr", self.writer_id, self.own());
     }
 
     /// The last process of the set on this host takes the host's
@@ -1114,7 +1184,7 @@ pub const Joiner = struct {
         if (self.reg.lock()) |_| {
             defer self.reg.unlock();
             const pid = proc.localIdentity().pid;
-            self.reg.removeRegion(pid, "jlr", self.writer_id);
+            self.reg.removeRegion(pid, "jlr", self.writer_id, self.own());
             if (departUnregisters(&self.reg, self.gpa, self.client, pid)) self.client.unregister(self.client.key) catch {};
         } else |_| {}
         self.client.deinit();
@@ -1229,7 +1299,7 @@ test "the registry: entries append and parse; a dead process's entry is pruned b
     try testing.expectEqual(@as(u64, 2), es[0].retired[0].term);
     try testing.expectEqual(@as(usize, 0), try reg.othersAlive(testing.allocator, me.pid));
     // One region out (its `r` line with it), the other stands.
-    reg.removeRegion(me.pid, "jr", 0xb1);
+    reg.removeRegion(me.pid, "jr", 0xb1, .any);
     {
         const one = try reg.entries(testing.allocator);
         defer testing.allocator.free(one);
@@ -1250,7 +1320,7 @@ test "the registry: entries append and parse; a dead process's entry is pruned b
         try testing.expectEqual(@as(usize, 1), fresh[0].n_regions);
         try testing.expectEqual(@as(u64, 0xb5), fresh[0].regions[0].writer_id);
     }
-    reg.removeRegion(me.pid, "j", 0xb5);
+    reg.removeRegion(me.pid, "j", 0xb5, .any);
     const none = try reg.entries(testing.allocator);
     defer testing.allocator.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
@@ -1361,6 +1431,39 @@ test "round 3 major 1: a live manager's entry once its role is durable (`p` at r
     const node: u64 = 0xA;
     var pm = Entry.parse(45, "80\np 0 00000000000000c9\nm 0 00000000000000c9\n").?;
     try testing.expectEqual(Verdict.current, judge(&pm, &.{pg(0, .live, node, 0xc9)}, node, 0, false, .{}));
+}
+
+test "review 4 blocker 1: a joined line round-trips its page (appender id, term, volume); a re-joined successor under the same writer id keeps its lines when its predecessor's go (`removeRegion` by page), an unjoined line is replaced at the join" {
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-joined-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var reg = Registry.at(base, .set, 0x5678);
+    reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer reg.unlock();
+    const me = proc.localIdentity();
+    var lb: [96]u8 = undefined;
+    // The predecessor joined at appender 4, term 6, retired; its successor
+    // (the same writer id) not joined yet.
+    try reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xd2, .joined = .{ .appender_id = 4, .term = 6, .vol = 1 } }));
+    try reg.append(me.pid, me.start_ticks, retiredLine(&lb, .{ .writer_id = 0xd2, .appender_id = 4, .term = 6 }));
+    try reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xd2 }));
+    {
+        const es = try reg.entries(testing.allocator);
+        defer testing.allocator.free(es);
+        try testing.expectEqual(@as(usize, 2), es[0].n_regions);
+        try testing.expectEqual(@as(?Joined, .{ .appender_id = 4, .term = 6, .vol = 1 }), es[0].regions[0].joined);
+        try testing.expectEqual(@as(?Joined, null), es[0].regions[1].joined);
+    }
+    // The successor's join replaces its unjoined line only.
+    reg.removeRegion(me.pid, "j", 0xd2, .unjoined);
+    try reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xd2, .joined = .{ .appender_id = 7, .term = 8, .vol = 1 } }));
+    // The predecessor goes: its line and its `r` only.
+    reg.removeRegion(me.pid, "jlr", 0xd2, .{ .page = 4 });
+    const es = try reg.entries(testing.allocator);
+    defer testing.allocator.free(es);
+    try testing.expectEqual(@as(usize, 1), es[0].n_regions);
+    try testing.expectEqual(@as(?Joined, .{ .appender_id = 7, .term = 8, .vol = 1 }), es[0].regions[0].joined);
+    try testing.expectEqual(@as(usize, 0), es[0].n_retired);
 }
 
 test "round 3 major 4, review 4 blocker 1b: a sibling mid-leave stays visible to the rule — its `l` line names its appender id, term and volume: Live under it is current; Recovering (frozen during its leave, evicted) is stale; a Free page naming it — only `releaseRecovered` leaves one (the leave's own Free page clears the identity) — is stale; Free with the identity cleared (its own landed leave, the line removed next) is stale too: its writes all landed, a kill there costs nothing" {

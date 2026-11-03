@@ -459,7 +459,7 @@ pub const Guard = struct {
         defer reg.unlock();
         // `p` retired: from here the device's holder and appender 0's page
         // judge this manager (review round 3, major 1).
-        reg.removeRegion(g.identity.pid, "p", g.identity.writerId(g.be.index));
+        reg.removeRegion(g.identity.pid, "p", g.identity.writerId(g.be.index), .any);
         try g.enrolLocked(reg, .manager);
     }
 
@@ -825,7 +825,7 @@ pub const Guard = struct {
                 if (g.fence_reg) |*reg| {
                     if (reg.lock()) |_| {
                         defer reg.unlock();
-                        reg.removeRegion(g.identity.pid, "mp", g.identity.writerId(g.be.index));
+                        reg.removeRegion(g.identity.pid, "mp", g.identity.writerId(g.be.index), .any);
                         last = (reg.othersAlive(g.gpa, g.identity.pid) catch 1) == 0;
                     } else |_| last = false;
                 }

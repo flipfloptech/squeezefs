@@ -2357,6 +2357,40 @@ test "scale: ≥ 100k keys at 64 KiB nodes ⇒ depth ≤ 3 (the fanout tie), eve
     try testing.expectEqual(KEYS, all.items.len);
 }
 
+test "a non-root SMO on a ring whose stamps run ahead of its positions (a seq offset: a ring that received a handed-over slot) floors its parent at the entry's POSITION, under the head, so the dirty parent holds the checkpoint tail below the entry until it is flushed (decision 0003 §DI: floored at its first record's STAMP the parent sat past the head, and a cycle's tail passed an entry whose pointer was in RAM only)" {
+    const gpa = testing.allocator;
+    var vol = try TestVolume.init(gpa, .{ .journaled = true });
+    defer vol.deinit();
+    // A joined ring that received a handed-over slot: its stamps exceed the
+    // departing holder's frontier, its positions are its own.
+    _ = vol.reg.raiseSeqFloor(vol.core, 1 << 20);
+    const t = try vol.createTree(.native);
+    var buf: [64]u8 = undefined;
+    var n: u64 = 0;
+    while (try t.rootLevel() == 0) {
+        for (0..64) |_| {
+            try vol.commit(t, &ikey(n), .put, tree.testValue(n, 40, &buf));
+            n += 1;
+        }
+        _ = try vol.drain(t);
+    }
+    try vol.flushPass(t);
+    // A leaf SMO under the interior root journals its pointer into the root.
+    const c0 = stats.meta_kv_node_compactions.load() + stats.meta_kv_node_splits.load();
+    var spins: u64 = 0;
+    while (stats.meta_kv_node_compactions.load() + stats.meta_kv_node_splits.load() == c0) : (spins += 1) {
+        for (0..64) |i| try vol.commit(t, &ikey(i), .put, tree.testValue(i * 3 + spins, 40, &buf));
+        _ = try vol.drain(t);
+        try testing.expect(spins < 10_000);
+    }
+    const leaf_smo = vol.journal.last_entry.?;
+    const root = try t.getNode(t.rootPtr().addr);
+    defer root.release();
+    try testing.expect(root.level >= 1);
+    try testing.expectEqual(leaf_smo.start, root.dirtyFloor());
+    try testing.expect(root.dirtyFloor() < vol.core.headPos());
+}
+
 test "the dying floor of a root swap pins the tail at the entry start; a root swap journals no pointer record; a non-root SMO journals Put(part.max → succ) per part and the alloc/free records" {
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .journaled = true });

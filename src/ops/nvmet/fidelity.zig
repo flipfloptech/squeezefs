@@ -1717,6 +1717,9 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
         defer gpa.free(rr);
         try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
     }
+    // A, fenced with its host, is stopped by hand: whether P2 evicted it
+    // yet is timing, so the rule below meets exactly one live stale sibling.
+    try rig.kill9(a);
     // A2 re-registers host A — never while the superseded B lives.
     const a2 = try rig.spawnMount("ss-a2", set.metaUri(), null, &.{});
     try rig.awaitLog(a2, "ready: ", ready_wait_ns);
@@ -1724,7 +1727,7 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
     {
         const s2 = try rig.stats(a2);
         defer gpa.free(s2);
-        try testing.expect(try statNumber(s2, "pr_stale_sibling_kills") >= 1);
+        try testing.expectEqual(@as(u64, 1), try statNumber(s2, "pr_stale_sibling_kills"));
         try testing.expectEqual(@as(u64, 1), try statNumber(s2, "pr_host_registrations"));
         try testing.expectEqual(@as(u64, 0), try statNumber(s2, "pr_stale_sibling_refusals"));
     }
@@ -1735,7 +1738,6 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
     defer gpa.free(seen);
     try testing.expectEqualStrings("after\n", seen);
     try rig.kill9(b);
-    try rig.kill9(a);
     try rig.kill9(p1);
     try rig.umount(a2);
     try rig.umount(p2);
@@ -1825,6 +1827,70 @@ test "nvmet fidelity: a superseded manager never wins the hold back (review roun
     const m0_wrote = scriptSucceeds(rig, m0, "echo x > z && sync -d z") catch false;
     try testing.expect(!m0_wrote);
     try rig.kill9(m0);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+/// The membership `T_owner` of the member-death row (the smoke rows' value).
+const member_t_owner_ms: u64 = 3000;
+
+test "nvmet fidelity: a member's death on nvmet 7.3 is DETECTED, not fenced (the documented limit, decision 0003 §DF) — a symmetric set whose manager M (host B) holds WERO; the member X on host A, frozen past T_owner, is evicted; M's death preempt of host A's key answers success yet the key stays registered (appender_recovery_preempts_ignored 1, appender_recovery_preempts 0, regctl 2, host A's key in the report): the recovery's full tail scan ran (recovery_full_tail_scan_bytes > 0) — the only fence nvmet 7.3 gives" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "md", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    var tb: [16]u8 = undefined;
+    const t_owner = try std.fmt.bufPrint(&tb, "{d}", .{member_t_owner_ms});
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var env_m = try rig.envWith(ident_b);
+    defer env_m.deinit();
+    try env_m.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    var env_x = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    defer env_x.deinit();
+    const m = try rig.spawnMountEnv("md-m", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const x = try rig.spawnMountEnv("md-x", set.metaUri(), &env_x, &.{});
+    try rig.awaitLog(x, "ready: ", ready_wait_ns);
+    // X's own directory: its creates land through X's own ring and slot.
+    try testing.expect(try scriptSucceeds(rig, x, "mkdir dx && echo x > dx/x && sync -d dx/x"));
+    const key_x = blk: {
+        const sx = try rig.stats(x);
+        defer gpa.free(sx);
+        break :blk try gpa.dupe(u8, json_scan.string(sx, "pr_key") orelse return error.StatMissing);
+    };
+    defer gpa.free(key_x);
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, nvme.RTYPE_WERO), json_scan.number(rr, "rtype"));
+    }
+    _ = linux.kill(rig.daemons.items[x].pid, .STOP);
+    const sm = try rig.awaitStat(m, "appender_recoveries", 1, ready_wait_ns);
+    defer gpa.free(sm);
+    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
+    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recovery_preempts_ignored"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(sm, "appender_recovery_preempts"));
+    try testing.expect(try statNumber(sm, "recovery_full_tail_scan_bytes") > 0);
+    {
+        // Host A still registered: the frozen X, resumed, would write.
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
+        try testing.expect(std.mem.indexOf(u8, rr, key_x) != null);
+    }
+    try rig.kill9(x);
+    try rig.umount(m);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
     try rig.disconnect(&cm_b);

@@ -5,8 +5,8 @@
 //! every member HOST a REGISTRANT under its host's key; the ledger's preempt
 //! of that key fences the host's members everywhere on a spec-conformant
 //! target (nvmet 7.3 answers a HOLDER's preempt of another key with success
-//! and keeps the key: the report proves it, `.failed`, the full tail scan —
-//! never a release). A joiner NEVER acquires: one whose host is registered
+//! and keeps the key: the report proves it, `.ignored`, the full tail scan —
+//! never a release, never re-fenced). A joiner NEVER acquires: one whose host is registered
 //! under the key ADOPTS with ZERO device mutation (a register here destroyed
 //! the fence in the rung-9 finding: `rtype 0, regctl 0`); another registers
 //! and walks the CAP GATE — the report
@@ -207,6 +207,11 @@ pub fn adoptColocated(client: *pr.Client, enrolled: []const u64) JoinError!u64 {
 pub const PreemptOutcome = enum {
     /// The preempt-and-abort LANDED: `pr_fenced`, the tail scan skipped.
     fenced,
+    /// The target answered success and KEPT the key (nvmet 7.3: the
+    /// holder's preempt only re-types its own hold): nothing fenced, the
+    /// full tail scan; no re-fence (the key never left — a re-read would
+    /// count it "registered again" and re-issue the same no-op).
+    ignored,
     /// The dead key is THIS host's registrant (a co-located appender): a
     /// preempt would take down our own fence — the full tail scan is the
     /// fence.
@@ -241,7 +246,7 @@ pub fn preemptDeadRegistrant(client: ?*pr.Client, victim_key: u64) PreemptOutcom
     if (kept) {
         stats.appender_recovery_preempts_ignored.inc();
         log.warn("recovery preempt: the target answered the preempt of key 0x{x} yet keeps it registered (nvmet 7.3: a holder's preempt only re-types its own hold) — the dead member's host is NOT fenced; the full tail scan is the fence", .{victim_key});
-        return .failed;
+        return .ignored;
     }
     stats.appender_recovery_preempts.inc();
     return .fenced;
@@ -670,7 +675,7 @@ test "the death preempt: a usurper's key is preempted-and-aborted (fenced; the v
     try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, 0x4444));
 }
 
-test "the death preempt under the manager's WERO hold: on nvmet 7.3's semantics the holder's preempt answers success yet keeps the victim registered — .failed (the full tail scan, counted), never a release that would leave the namespace unreserved; on a spec-conformant target the same preempt fences the victim's host with the hold kept; the re-fence preempts a key registered again" {
+test "the death preempt under the manager's WERO hold: on nvmet 7.3's semantics the holder's preempt answers success yet keeps the victim registered — .ignored (the full tail scan, counted, no re-fence), never a release that would leave the namespace unreserved; on a spec-conformant target the same preempt fences the victim's host with the hold kept; the re-fence preempts a key registered again" {
     const gpa = testing.allocator;
     var ns = fake.Namespace.init(gpa);
     defer ns.deinit();
@@ -684,7 +689,7 @@ test "the death preempt under the manager's WERO hold: on nvmet 7.3's semantics 
     defer r.deinit();
     _ = try joinAsRegistrant(&r, null);
     const ignored0 = stats.appender_recovery_preempts_ignored.load();
-    try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, 0x2222));
+    try testing.expectEqual(PreemptOutcome.ignored, preemptDeadRegistrant(&m, 0x2222));
     try testing.expectEqual(ignored0 + 1, stats.appender_recovery_preempts_ignored.load());
     try testing.expect(ns.writeAllowed(host_r));
     try testing.expectEqual(@as(?u64, 0x1111), ns.holder);

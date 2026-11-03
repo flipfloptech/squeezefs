@@ -534,9 +534,11 @@ pub const Driver = struct {
         }
         // ---- 2b. the fence re-read (review B2): the dead member's host
         //      registered again while step 1 ran (its preempt found the key
-        //      absent) is preempted again before the ring is read ----
+        //      absent) is preempted again before the ring is read — never
+        //      after an ignored preempt (the key never left, decision 0003
+        //      §DF.12: spec-conformant targets only) ----
         var fenced = pr_fenced;
-        if (meta != .own_key_guard) if (fencing.refenceAfterRecovering(self.mount.meta_pr, standing.pr_key)) |again| {
+        if (meta != .own_key_guard and meta != .ignored) if (fencing.refenceAfterRecovering(self.mount.meta_pr, standing.pr_key)) |again| {
             fenced = again == .fenced;
         };
         try self.mount.screen.suspendLessee(p.appender_id);

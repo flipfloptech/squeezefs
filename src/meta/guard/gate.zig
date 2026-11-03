@@ -148,6 +148,9 @@ pub const Guard = struct {
     /// Test seam: fired in a lapse's re-acquire between the hold and the
     /// fencer's re-register (a successor's hold landing in that window).
     test_after_reacquire: if (builtin.is_test) ?TestHook else void = if (builtin.is_test) null else {},
+    /// Test seam: fired after a lapse's claim probe read "ours" and before
+    /// the re-acquire (a successor's whole tenure landing in that window).
+    test_after_lapse_probe: if (builtin.is_test) ?TestHook else void = if (builtin.is_test) null else {},
     /// Test seam: every claim probe after a lapse fails (checkpoint churn).
     test_probe_unreadable: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// The configured host identity recorded at the gate (§1.4).
@@ -781,6 +784,7 @@ pub const Guard = struct {
                     return false;
                 },
             }
+            if (builtin.is_test) if (g.test_after_lapse_probe) |h| h.fire(h.ctx);
             outcome = sqz.runBlocking(reacquireBlocking, .{ g, c }) catch return true;
         }
         switch (outcome) {
@@ -1565,6 +1569,47 @@ test "the fencing registrant on a PR substrate (the fake, decision 0003 §DG): t
     }
     try testing.expectEqual(@as(?u64, null), ns.holder);
     try testing.expectEqual(@as(usize, 0), ns.registered.items.len);
+}
+
+/// A successor's whole tenure between a lapse's claim probe and the
+/// re-acquire: its claim committed over the manager's (the hold it took and
+/// gave back left the namespace unreserved again).
+const Tenure = struct {
+    g: *Guard,
+    be: *KvBackend,
+    other: claim.Identity,
+
+    fn run(ctx: *anyopaque) void {
+        const t: *Tenure = @ptrCast(@alignCast(ctx));
+        const tx = t.be.begin(@src()) catch return;
+        t.g.stageClaimPut(tx, t.other.claim(t.be.index, clock.realtimeCoarseNs())) catch {
+            t.be.abandon(tx);
+            return;
+        };
+        t.be.commit(tx) catch return;
+    }
+};
+
+test "review (the lapse claim window, decision 0003 §DG.13(h)): a lapse's re-acquire never runs on a view a successor's tenure superseded — the manager's beat probes its claim (ours), a successor's whole tenure lands before the re-acquire (the seam: its claim committed, the namespace free again), the manager's acquire succeeds on the free namespace; the claim read again after it names another writer: the manager fail-stops and never refreshes its claim over the successor's" {
+    const gpa = testing.allocator;
+    const v = try Vol.create(gpa, "lapse-window", "600000");
+    defer v.destroy();
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var host: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
+    const me = ident(boot_a, 4000, 777);
+    const other = ident(boot_b, 5000, 888);
+    const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
+    defer be.close();
+    const g = be.guard.?;
+    var tenure: Tenure = .{ .g = g, .be = be, .other = other };
+    g.test_after_lapse_probe = .{ .ctx = &tenure, .fire = Tenure.run };
+    log.testing.expectErrorLogs(2);
+    ns.powerCycle();
+    g.beat();
+    try testing.expect(be.isFailed());
+    try testing.expectEqual(other.writerId(0), (try v.probe()).?.writer_id);
+    try log.testing.expectAllFired();
 }
 
 /// A successor on host B taking the hold by preempting `victim` (the

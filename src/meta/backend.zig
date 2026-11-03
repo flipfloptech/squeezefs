@@ -594,6 +594,7 @@ pub const KvBackend = struct {
             // no fold, no cover land in the live writer's volume.
             const probe = if (builtin.is_test) (opts.guard.test_pid_probe orelse guard.proc.probe) else guard.proc.probe;
             try guard.gate.Guard.refuseFreshEarly(gpa, io, opts.env, pool, path, local, probe);
+            holdEarlyProbeIfArmed(io, opts.env, path);
             var src: EarlyPages = .{ .dev = &dev, .sb = sb };
             early = guard.host_fence.registerBeforeWrites(gpa, opts.env, path, sb.set_uuid, opts.index, local, sym.join.nodeToken(local), .{ .ctx = &src, .read = &EarlyPages.read }, sb.symmetricPlaneStamped()) catch |e| return switch (e) {
                 error.Busy => error.Busy,
@@ -1562,6 +1563,20 @@ pub const KvBackend = struct {
 
     /// The reader's device fd: read-only, no lock of any kind ("a reader
     /// claims nothing") — held for the mount's life like the guard fd.
+    /// `SQUEEZEFS_TEST_EARLY_PROBE_HOLD`: the open parks after its first
+    /// claim probe until a writer opens the FIFO.
+    fn holdEarlyProbeIfArmed(io: Io, env: *const std.process.Environ.Map, path: []const u8) void {
+        const fifo = knobs.parseStr(env.get("SQUEEZEFS_TEST_EARLY_PROBE_HOLD")) orelse return;
+        Io.Dir.cwd().access(io, fifo, .{}) catch return;
+        log.warn("meta volume {s}: SQUEEZEFS_TEST_EARLY_PROBE_HOLD — the open holds (the claim probed, the host not registered) until a writer opens {s}", .{ path, fifo });
+        const f = Io.Dir.cwd().openFile(io, fifo, .{}) catch |e| {
+            log.warn("meta volume {s}: the early probe hold could not open {s} ({t}); not holding", .{ path, fifo, e });
+            return;
+        };
+        f.close(io);
+        log.warn("meta volume {s}: SQUEEZEFS_TEST_EARLY_PROBE_HOLD released — the host registers", .{path});
+    }
+
     fn openReaderFd(path: []const u8) error{DeviceRefused}!linux.fd_t {
         var zbuf: [linux.PATH_MAX]u8 = undefined;
         const z = align_probe.pathZ(&zbuf, path) catch return error.DeviceRefused;

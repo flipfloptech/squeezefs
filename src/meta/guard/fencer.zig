@@ -46,17 +46,18 @@ const fencing = @import("../sym/membership/fencing.zig");
 const initiator = @import("../../ops/nvmet/initiator.zig");
 const multipath = @import("../../ops/nvmet/multipath.zig");
 const configfs = @import("../../ops/nvmet/configfs.zig");
+const align_probe = @import("../../io/align_probe.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("guard/fencer is Linux only (charter §1.2); gate the import on builtin.os.tag");
 }
 
 /// The fencer's host identity: a uuid hostid and a hostnqn under the
-/// product's fencer prefix (`pr.FENCER_HOSTNQN_PREFIX`: recognisable by the
+/// product's fencer prefix (`align_probe.FENCER_HOSTNQN_PREFIX`: recognisable by the
 /// refusal of a mount on its node and by the udev rule, review M3).
 pub const Identity = struct {
     hostid_buf: [36]u8 = undefined,
-    hostnqn_buf: [pr.FENCER_HOSTNQN_PREFIX.len + 36]u8 = undefined,
+    hostnqn_buf: [align_probe.FENCER_HOSTNQN_PREFIX.len + 36]u8 = undefined,
 
     pub fn hostid(self: *const Identity) []const u8 {
         return &self.hostid_buf;
@@ -90,7 +91,7 @@ pub fn identityOf(wire_host_id: []const u8, set_uuid: [16]u8) Identity {
     var id: Identity = .{};
     var w: Io.Writer = .fixed(&id.hostid_buf);
     configfs.writeUuid(&w, deriveHostId(wire_host_id, set_uuid)) catch unreachable;
-    _ = std.fmt.bufPrint(&id.hostnqn_buf, "{s}{s}", .{ pr.FENCER_HOSTNQN_PREFIX, id.hostid() }) catch unreachable;
+    _ = std.fmt.bufPrint(&id.hostnqn_buf, "{s}{s}", .{ align_probe.FENCER_HOSTNQN_PREFIX, id.hostid() }) catch unreachable;
     return id;
 }
 
@@ -256,15 +257,20 @@ pub const Fencer = struct {
         defer a.users.unlock();
         const me = proc.localIdentity().pid;
         var lb: [24]u8 = undefined;
-        const ours = a.users.removeLine(me, userLine(&lb, a.nsid)) catch true;
+        const line = userLine(&lb, a.nsid);
+        // The registration is the NAMESPACE's (review minor 2 of §DG): given
+        // back once no live process of this host holds this namespace's line
+        // — a takeover or a death preempt of the host's key may have removed
+        // it already (the unregister conflicts, nothing to give back).
+        const ours = a.users.removeLine(me, line) catch true;
+        const ns_users = a.users.othersWithLine(gpa, me, line) catch 1;
+        if (ns_users == 0) self.client.unregister(self.client.key) catch {};
+        // The controller is the association's: deleted once no line remains.
         const others = (a.users.othersAlive(gpa, me) catch 1) + @intFromBool(ours);
         if (others != 0) {
-            log.info("fencing registrant {s}: {d} other process(es) of this host ride it — its registration and controller stay", .{ self.identity.hostnqn(), others });
+            log.info("fencing registrant {s}: {s}; its controller stays ({d} user entr(y/ies) of this host ride it)", .{ self.identity.hostnqn(), if (ns_users == 0) "unregistered on this namespace" else "another process holds this namespace's registration", others });
             return;
         }
-        // A takeover or a death preempt of this host's key removed it
-        // already: the unregister conflicts, nothing to give back.
-        self.client.unregister(self.client.key) catch {};
         const n = initiator.disconnect(gpa, .{ .subsysnqn = a.subnqn(), .identity = .{ .hostnqn = self.identity.hostnqn(), .hostid = self.identity.hostid() } }) catch |e| {
             log.err("fencing registrant {s}: the disconnect of {s} failed ({s}) — `squeezefs nvmeof disconnect --identity-only {s}` under its pair", .{ self.identity.hostnqn(), a.subnqn(), @errorName(e), a.subnqn() });
             return;
@@ -452,8 +458,8 @@ test "the fencer's identity: a uuid4 hostid (version 4, variant 10) and a hostnq
     try testing.expectEqual(@as(u8, 0x40), id[6] & 0xf0);
     try testing.expectEqual(@as(u8, 0x80), id[8] & 0xc0);
     try testing.expect(proc.parseUuid(a1.hostid()) != null);
-    try testing.expect(std.mem.startsWith(u8, a1.hostnqn(), pr.FENCER_HOSTNQN_PREFIX));
-    try testing.expectEqualStrings(a1.hostid(), a1.hostnqn()[pr.FENCER_HOSTNQN_PREFIX.len..]);
+    try testing.expect(std.mem.startsWith(u8, a1.hostnqn(), align_probe.FENCER_HOSTNQN_PREFIX));
+    try testing.expectEqualStrings(a1.hostid(), a1.hostnqn()[align_probe.FENCER_HOSTNQN_PREFIX.len..]);
     try testing.expect(a1.hostnqn().len <= 223); // NVMF_NQN_SIZE − 1
     // The host identity's own derivation (machine id) is another domain.
     const host = initiator.deriveHostId(&wire_a);

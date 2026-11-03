@@ -264,6 +264,11 @@ pub fn preemptDeadRegistrant(client: ?*pr.Client, fencer: ?*pr.Client, victim_ke
     // registration changes only by a preempt between this read and the
     // preempt: a takeover, which removes it with our host (one key) and
     // makes its command conflict.
+    // The holder's sequence lock first, then the fencer's (the heartbeat's
+    // order): the holder client's state has one writer at a time (review
+    // minor 4).
+    c.lockOps();
+    defer c.unlockOps();
     if (fencer) |f| f.lockOps();
     defer if (fencer) |f| f.unlockOps();
     const ours = c.holdsHere() catch |e| {
@@ -305,7 +310,12 @@ pub fn preemptDeadRegistrant(client: ?*pr.Client, fencer: ?*pr.Client, victim_ke
 pub fn refenceAfterRecovering(client: ?*pr.Client, fencer: ?*pr.Client, victim_key: u64) ?PreemptOutcome {
     const c = client orelse return null;
     if (victim_key == 0 or victim_key == c.key) return null;
-    const back = keyRegistered(c, victim_key) catch return .failed;
+    c.lockOps();
+    const back = keyRegistered(c, victim_key) catch {
+        c.unlockOps();
+        return .failed;
+    };
+    c.unlockOps();
     if (!back) return null;
     stats.appender_recovery_refences.inc();
     log.warn("recovery preempt: key 0x{x} is registered again once the page is Recovering (the dead member's host registered meanwhile) — preempted again", .{victim_key});

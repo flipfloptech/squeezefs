@@ -2344,9 +2344,11 @@ test "nvmet fidelity: a metadata mount pointed at the fencing registrant's names
     const z = try rig.spawnMountEnv("fz-z", meta_uri_f, &env_z, &.{});
     try testing.expect(!(try readyOrDead(rig, z)));
     {
+        // The refusal's tail: the CLI's own stdout line is written at the
+        // log's offset 0 over the start of the stderr text that preceded it.
         const text = try rig.readLog(z);
         defer gpa.free(text);
-        try testing.expect(std.mem.indexOf(u8, text, "fencing registrant") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "use the host's own node of the namespace (decision 0003 §DG.16)") != null);
     }
     {
         // `appender clear` on the fencer's node: refused at the metadata

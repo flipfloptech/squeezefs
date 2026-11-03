@@ -153,6 +153,9 @@ pub const Refusal = error{
     UnalignedDirectWrite,
     GrainNotAdmissible,
     NotADeviceOrFile,
+    /// A metadata node of a fencing registrant's controller (decision 0003
+    /// §DG.16): never a metadata device.
+    FencerNode,
     DirectOpenRefused,
     CannotStat,
     /// Pooled read larger than the pool slot.
@@ -218,7 +221,7 @@ pub fn isMoveClass(err: Error) bool {
 pub fn classOf(err: Error) Class {
     return switch (err) {
         error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted, error.TokenChannelStale => .retryable,
-        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported, error.VolumeFailed, error.LaneStopped, error.Busy, error.UnsupportedVolume, error.MalformedKey, error.ValueTooLarge, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused, error.UnknownLease, error.ReaderFailStopped => .refusal,
+        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.FencerNode, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported, error.VolumeFailed, error.LaneStopped, error.Busy, error.UnsupportedVolume, error.MalformedKey, error.ValueTooLarge, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused, error.UnknownLease, error.ReaderFailStopped => .refusal,
         else => .terminal,
     };
 }
@@ -323,7 +326,7 @@ pub fn toErrno(err: Error) linux.E {
         error.QueueFull, error.LaneQueueFull, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted, error.TokenChannelStale => .AGAIN,
         // Refusals: the caller's shape or the device's admissibility; a
         // wire word the screen refused; a foreign vocabulary.
-        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.DirectIoUnsupported, error.UnsupportedVolume, error.MalformedKey, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused => .INVAL,
+        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.FencerNode, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.DirectIoUnsupported, error.UnsupportedVolume, error.MalformedKey, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused => .INVAL,
         error.DismountRefused => .ROFS,
         // A lease the owner does not know: the handle is stale; so is every
         // handle of a fail-stopped quiescent reader.

@@ -144,6 +144,12 @@ pub const Guard = struct {
     /// hold on a symmetric volume; null with `fencer_absent` naming why.
     fencer: ?*fencer.Fencer = null,
     fencer_absent: ?fencer.Absent = null,
+    /// Orders the holder client's multi-command sequences — the heartbeat's
+    /// report and re-acquire, recovery's check-preempt-verify, the teardown's
+    /// leave — so its shared state (the register ladder's status, the cached
+    /// wire host id, the counters) has one writer at a time (review minor 4
+    /// of §DG). Taken before the fencer's sequence lock, never after.
+    pr_seq_lock: pr_linux.IssueLock = .{},
     test_fencer: if (builtin.is_test) ?nvme.Namespace else void = if (builtin.is_test) null else {},
     /// Test seam: fired in a lapse's re-acquire between the hold and the
     /// fencer's re-register (a successor's hold landing in that window).
@@ -387,6 +393,11 @@ pub const Guard = struct {
     /// The PR substrate: the test namespace, else the block node's char
     /// twin; RESCAP decides the posture. Never fails the mount.
     fn resolvePr(g: *Guard, gpa: Allocator, opts: Options) backend.OpenError!void {
+        try g.resolvePrClient(gpa, opts);
+        if (g.prClient()) |c| c.op_lock = g.pr_seq_lock.opLock();
+    }
+
+    fn resolvePrClient(g: *Guard, gpa: Allocator, opts: Options) backend.OpenError!void {
         if (opts.early) |e| {
             g.device = e.device;
             g.posture = e.posture;
@@ -832,6 +843,8 @@ pub const Guard = struct {
     const Recheck = union(enum) { ours, report_failed, lapse, reacquired, reacquire_failed, usurped: u64 };
 
     fn prRecheckBlocking(g: *Guard, c: *pr.Client) Recheck {
+        c.lockOps();
+        defer c.unlockOps();
         var rep = c.report() catch |e| {
             var buf: [128]u8 = undefined;
             var w: Io.Writer = .fixed(&buf);
@@ -863,6 +876,8 @@ pub const Guard = struct {
     /// The lapse's re-acquire, once the device's claim names this
     /// incarnation: the registration through the rule, the hold.
     fn reacquireBlocking(g: *Guard, c: *pr.Client) Recheck {
+        c.lockOps();
+        defer c.unlockOps();
         const locked = g.lockRegistry() catch return .reacquire_failed;
         defer if (locked) g.fence_reg.?.unlock();
         const fresh = g.registerHost(c, false) catch return .reacquire_failed;
@@ -877,6 +892,8 @@ pub const Guard = struct {
     /// unregistered and this volume usurped.
     fn fencerReregisterBlocking(g: *Guard, c: *pr.Client) Recheck {
         if (builtin.is_test) if (g.test_after_reacquire) |h| h.fire(h.ctx);
+        c.lockOps();
+        defer c.unlockOps();
         if (g.fencer) |f| {
             if (!f.reregisterHeld(c)) {
                 const foreign = (c.holder() catch null) orelse 0;
@@ -958,6 +975,9 @@ pub const Guard = struct {
     pub fn releasePr(g: *Guard) void {
         switch (g.posture) {
             .active => |c| {
+                // The holder's sequence lock: no recovery check-preempt runs
+                // across the leave (review minor 4).
+                c.lockOps();
                 // The hold stays while anyone relies on it (review round 3,
                 // major 4): a sibling of the set on this host rides our
                 // host's registration, and another host's registrant writes
@@ -996,6 +1016,7 @@ pub const Guard = struct {
                     c.writeError(&w, e) catch {};
                     log.warn("meta volume {s}: reservation release/unregister failed ({s}) — a stale registration may remain (the next mount's ladder recovers it)", .{ g.be.path, w.buffered() });
                 };
+                c.unlockOps();
                 c.deinit();
                 g.gpa.destroy(c);
                 g.posture = .{ .none = .not_nvme_namespace };

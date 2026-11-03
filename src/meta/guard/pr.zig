@@ -26,11 +26,6 @@ const checksum = @import("../../core/checksum.zig");
 
 pub const Status = nvme.Status;
 
-/// The fencing registrant's hostnqn prefix (decision 0003 §DG, review M3):
-/// a controller under it is a fencer's — its namespace node never carries a
-/// mount, a udev rule lowers its by-id links and hides it from systemd.
-pub const FENCER_HOSTNQN_PREFIX = "nqn.2026-10.io.squeezefs:fencer:";
-
 pub const Error = error{
     /// The device answered Reservation Conflict (SC 0x83).
     ReservationConflict,

@@ -167,7 +167,7 @@ pub const fromErrno = errors.fromErrno;
 pub const toErrno = errors.toErrno;
 
 /// Registration's own error set (a subset of `Error`).
-pub const RegisterError = error{ CannotStat, NotADeviceOrFile, GrainNotAdmissible, DirectOpenRefused, OutOfMemory, NameTooLong };
+pub const RegisterError = error{ CannotStat, NotADeviceOrFile, FencerNode, GrainNotAdmissible, DirectOpenRefused, OutOfMemory, NameTooLong };
 
 /// A minimal mutex for the rare writer paths (registry rebuilds). Never on an
 /// I/O path.
@@ -1573,11 +1573,21 @@ pub fn clearMetaDevices() void {
 /// REGULAR FILE ⇒ BUFFERED, loud, counted. A block device refusing O_DIRECT
 /// for any reason, or a regular file failing with any other errno, REFUSES.
 pub fn registerMetaDevice(gpa: Allocator, env: *const std.process.Environ.Map, path: []const u8) RegisterError!MetaIoMode {
-    if (metaIoMode(path)) |m| return m;
+    // The door every metadata user passes (open, join, format, fsck,
+    // `appender clear`, the shim): a node of a fencing registrant's
+    // controller is refused before any cached registration answers — a
+    // name the host's own node held before may be the fencer's now
+    // (decision 0003 §DG.16).
     const st = (align_probe.statPath(path) catch null) orelse {
         log.err("metadata device {s}: cannot stat", .{path});
         return error.CannotStat;
     };
+    var nb: [256]u8 = undefined;
+    if (align_probe.fencerNodeHostnqn(st, &nb)) |nqn| {
+        log.err("metadata device {s}: the namespace node belongs to a fencing registrant's controller (hostnqn {s}) — REFUSED: use the host's own node of the namespace (decision 0003 §DG.16)", .{ path, nqn });
+        return error.FencerNode;
+    }
+    if (metaIoMode(path)) |m| return m;
     if (!st.is_bdev and !st.is_file) {
         log.err("metadata device {s}: neither a block device nor a regular file — REFUSING", .{path});
         return error.NotADeviceOrFile;

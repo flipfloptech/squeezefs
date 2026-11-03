@@ -246,7 +246,33 @@ fn statxPath(path: []const u8, stx: *linux.Statx, mask: linux.STATX) StatError!b
     };
 }
 
-/// Null-terminate a path for a raw syscall.
+/// The fencing registrant's hostnqn prefix (decision 0003 §DG.16): a
+/// controller under it is a fencer's — its namespace nodes never carry a
+/// metadata volume, and the repo's udev rule keeps the host's tools off them.
+pub const FENCER_HOSTNQN_PREFIX = "nqn.2026-10.io.squeezefs:fencer:";
+
+/// The hostnqn of a block device's controller when it is a fencing
+/// registrant's: `/sys/dev/block/M:m/device` is the controller under
+/// `nvme_core.multipath=N` (a head's is a subsystem, with no hostnqn). Null =
+/// not a fencer's node.
+pub fn fencerNodeHostnqn(st: PathStat, out: *[256]u8) ?[]const u8 {
+    if (!st.is_bdev) return null;
+    var pb: [96]u8 = undefined;
+    const p = std.fmt.bufPrint(&pb, "/sys/dev/block/{d}:{d}/device/hostnqn", .{ st.rdev_major, st.rdev_minor }) catch return null;
+    var zbuf: [linux.PATH_MAX]u8 = undefined;
+    const z = pathZ(&zbuf, p) catch return null;
+    const fd_raw = linux.open(z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd_raw) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(fd_raw);
+    defer _ = linux.close(fd);
+    const n = linux.read(fd, out, out.len);
+    if (linux.errno(n) != .SUCCESS) return null;
+    const text = std.mem.trim(u8, out[0..n], " \t\r\n");
+    if (!std.mem.startsWith(u8, text, FENCER_HOSTNQN_PREFIX)) return null;
+    return text;
+}
+
+/// Null-terminate a path for a raw syscall./// Null-terminate a path for a raw syscall.
 pub fn pathZ(buf: *[linux.PATH_MAX]u8, path: []const u8) error{NameTooLong}![:0]const u8 {
     if (path.len >= buf.len) return error.NameTooLong;
     @memcpy(buf[0..path.len], path);

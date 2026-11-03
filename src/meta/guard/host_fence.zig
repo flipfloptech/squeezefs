@@ -437,6 +437,27 @@ pub const Registry = struct {
         return kept != 0;
     }
 
+    /// LIVE entries other than `pid`'s holding `line` exactly (a dead
+    /// process's file is pruned by `entries`).
+    pub fn othersWithLine(self: *const Registry, gpa: Allocator, pid: u32, line: []const u8) (RegistryError || Allocator.Error)!usize {
+        const es = try self.entries(gpa);
+        defer gpa.free(es);
+        const want = std.mem.trimEnd(u8, line, "\n");
+        var n: usize = 0;
+        for (es) |e| {
+            if (e.pid == pid) continue;
+            var tb: [4096]u8 = undefined;
+            const text = self.readEntry(e.pid, &tb) orelse continue;
+            var lines = std.mem.tokenizeScalar(u8, text, '\n');
+            _ = lines.next(); // the start ticks
+            while (lines.next()) |l| if (std.mem.eql(u8, l, want)) {
+                n += 1;
+                break;
+            };
+        }
+        return n;
+    }
+
     /// The whole entry (a dead process's, or a fabric association's user).
     pub fn remove(self: *const Registry, pid: u32) void {
         var pb: [linux.PATH_MAX]u8 = undefined;
@@ -1384,6 +1405,15 @@ test "the registry's fabric users per namespace (review minor 2 of decision 0003
     defer testing.allocator.free(es);
     try testing.expectEqual(@as(usize, 0), es.len);
     try testing.expect(!(try reg.removeLine(me.pid, "f 2\n")));
+    // Another live process's line for a namespace counts; its other lines do
+    // not, a dead one's never (the parent of this process stands in).
+    const parent: u32 = @intCast(linux.getppid());
+    const parent_ticks = proc.startTicksOf(parent) orelse return;
+    try reg.append(parent, parent_ticks, "f 2\n");
+    try testing.expectEqual(@as(usize, 1), try reg.othersWithLine(testing.allocator, me.pid, "f 2\n"));
+    try testing.expectEqual(@as(usize, 0), try reg.othersWithLine(testing.allocator, me.pid, "f 1\n"));
+    try testing.expectEqual(@as(usize, 0), try reg.othersWithLine(testing.allocator, parent, "f 2\n"));
+    reg.remove(parent);
 }
 
 test "the registry: entries append and parse; a dead process's entry is pruned by its start ticks; the flock serializes; a region's lines leave alone; a reused pid's stale file is replaced" {

@@ -8,11 +8,14 @@
 //! exhaustively by `src/model/explorer.zig`.
 //!
 //! `Election` — hosts A, B, C on one metadata namespace, WERO:
-//!   0 M0  host A's manager, frozen past its claim's TTL: its fencing
-//!         registrant's death preempt of a host-B member's key (a recovery
-//!         it was running when frozen; decision 0003 §DG), a write, its
-//!         heartbeat, a write — each at any point of the schedule (the
-//!         resume). Its `m` line stands; appender 0's page names it.
+//!   0 M0  host A's manager, frozen past its claim's TTL: a write, its
+//!         heartbeat (the report; after a lapse whose device claim is ours
+//!         the re-acquire as separate commands — the host's register, the
+//!         hold's acquire, the claim read AGAIN (not ours: fail-stop, §DG.19),
+//!         the fencer's re-register, the check that the host still holds,
+//!         else the fencer unregistered and the volume usurped: review M1 of
+//!         §DG), a write — each at any point of the schedule (the resume).
+//!         Its `m` line stands; appender 0's page names it.
 //!   1 P1  a successor on host B: the claim probed (no write), the host
 //!         registered (`p` enrolled under the registry's lock), the claim
 //!         read again and the hold in one step (acquire, or the holder's key

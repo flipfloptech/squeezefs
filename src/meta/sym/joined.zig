@@ -544,7 +544,13 @@ pub const JoinedSet = struct {
             break;
         }
         const jr = &self.joiner.region.?;
-        if (self.fence) |f| f.joined(jr.appenderId(), jr.core.page.term);
+        // The registry names the joined page or the join fails (a member
+        // the stale-sibling rule cannot judge by its page is refused; its
+        // region the manager's to recover, the crash shape).
+        if (self.fence) |f| f.joined(jr.appenderId(), jr.core.page.term) catch |e| {
+            log.err("meta volume {s}: appender {d}'s page could not be recorded in the host's registry of the set ({s}) — refusing the join", .{ be.path, jr.appenderId(), @errorName(e) });
+            return error.Io;
+        };
         for (jr.grant.unclaimed.items) |e| {
             self.granted_bits.set(@intCast(e));
             self.granted += 1;

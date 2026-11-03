@@ -134,6 +134,8 @@ pub const Guard = struct {
     /// The writer whose fresh claim the second early probe found, fenced by
     /// this open's preempt (review 4 minor 4): the gate takes it over.
     early_fenced_writer: ?u64 = null,
+    /// Consecutive lapse beats whose device claim could not be read.
+    unreadable_lapse_beats: u32 = 0,
     /// Test seam: every claim probe after a lapse fails (checkpoint churn).
     test_probe_unreadable: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// The configured host identity recorded at the gate (§1.4).
@@ -472,7 +474,7 @@ pub const Guard = struct {
         defer reg.unlock();
         // `p` retired: from here the device's holder and appender 0's page
         // judge this manager (review round 3, major 1).
-        reg.removeRegion(g.identity.pid, "p", g.identity.writerId(g.be.index), .any);
+        reg.removeRegion(g.identity.pid, "p", g.identity.writerId(g.be.index), .any) catch {};
         try g.enrolLocked(reg, .manager);
     }
 
@@ -695,9 +697,10 @@ pub const Guard = struct {
         }
         const sqz = exec.SqzIo.fromIo(g.io);
         var outcome = sqz.runBlocking(prRecheckBlocking, .{ g, c }) catch return true;
+        if (outcome != .lapse) g.unreadable_lapse_beats = 0;
         if (outcome == .lapse) {
             switch (g.deviceClaim()) {
-                .ours => {},
+                .ours => g.unreadable_lapse_beats = 0,
                 .foreign => {
                     _ = g.be.lane.latch.noteFence("the reservation lapse: the device's claim names another writer");
                     log.err("meta volume {s}: the reservation lapsed and the claim on the device is not this incarnation's — a successor took the role (and left): this volume fail-stops instead of re-registering", .{g.be.path});
@@ -705,9 +708,17 @@ pub const Guard = struct {
                 },
                 // Unreadable is not "another's" (review 4 minor 5: a live
                 // manager's own checkpoint churn): this beat skipped — no
-                // re-acquire, no refresh — the next one reads again.
+                // re-acquire, no refresh — the next one reads again; for one
+                // claim TTL of beats at most (review 5 minor 3: a claim that
+                // never decodes must not keep a manager writing in an
+                // unreserved namespace).
                 .unreadable => {
-                    log.warn("meta volume {s}: the reservation lapsed and the claim on the device could not be read — this beat skipped (no re-acquire, no refresh); the next beat reads it again", .{g.be.path});
+                    g.unreadable_lapse_beats += 1;
+                    if (g.unreadable_lapse_beats >= unreadable_lapse_beats_max) {
+                        g.failStop("the reservation lapsed and the claim on the device stayed unreadable for one claim TTL of beats");
+                        return false;
+                    }
+                    log.warn("meta volume {s}: the reservation lapsed and the claim on the device could not be read — this beat skipped (no re-acquire, no refresh; {d} of {d}); the next beat reads it again", .{ g.be.path, g.unreadable_lapse_beats, unreadable_lapse_beats_max });
                     return false;
                 },
             }
@@ -770,6 +781,9 @@ pub const Guard = struct {
     }
 
     const ClaimWord = enum { ours, foreign, unreadable };
+
+    /// One claim TTL of beats: the TTL over the beat interval, rounded up.
+    const unreadable_lapse_beats_max: u32 = (claim.STALE_TTL_S + claim.HEARTBEAT_INTERVAL_S - 1) / claim.HEARTBEAT_INTERVAL_S;
 
     /// What the claim on the DEVICE (a private replay, no write) says: this
     /// incarnation's; another's or none (a successor took the role and
@@ -849,7 +863,7 @@ pub const Guard = struct {
                 if (g.fence_reg) |*reg| {
                     if (reg.lock()) |_| {
                         defer reg.unlock();
-                        reg.removeRegion(g.identity.pid, "mp", g.identity.writerId(g.be.index), .any);
+                        reg.removeRegion(g.identity.pid, "mp", g.identity.writerId(g.be.index), .any) catch {};
                         last = (reg.othersAlive(g.gpa, g.identity.pid) catch 1) == 0;
                     } else |_| last = false;
                 }

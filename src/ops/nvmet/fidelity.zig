@@ -1989,7 +1989,7 @@ test "nvmet fidelity: an open whose hold's preempt fenced the writer that commit
 /// volume (the derived ring caps at 32 MiB; `--meta-journal-mb` reaches 1 GiB).
 const probe_cost_ring_mib: u64 = 256;
 
-test "nvmet fidelity: the early claim probes' cost on a large ring, as counter deltas (review 4 minor 6) — a symmetric set formatted with a 256 MiB ring: every NVMe writer open replays the claim privately twice (the probe, the probe under the hold), each reading both superblock copies, the ledger and the WHOLE ring; the first open and a kill -9 remount each count 2 probes, ≥ 2 × the ring in bytes, and the frames they replayed (printed)" {
+test "nvmet fidelity: the early claim probes' cost on a large ring, as counter deltas (review 4 minor 6) — a symmetric set formatted with a 256 MiB ring: every NVMe writer open replays the claim privately three times (the probe before the rule, right before the hold, under the hold — review 5 major 1), each reading both superblock copies, the ledger and the WHOLE ring; the first open and a kill -9 remount each count 3 probes, ≥ 3 × the ring in bytes, and the frames they replayed (printed)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -2009,8 +2009,8 @@ test "nvmet fidelity: the early claim probes' cost on a large ring, as counter d
     const second = try probeCost(rig, a2);
     std.debug.print("\nprobe cost (ring {d} MiB): first open {d} probes, {d} B, {d} frames; kill -9 remount {d} probes, {d} B, {d} frames\n", .{ probe_cost_ring_mib, first.probes, first.bytes, first.frames, second.probes, second.bytes, second.frames });
     for ([_]ProbeCost{ first, second }) |c| {
-        try testing.expectEqual(@as(u64, 2), c.probes);
-        try testing.expect(c.bytes >= 2 * ring_bytes - 2 * (16 << 10));
+        try testing.expectEqual(@as(u64, 3), c.probes);
+        try testing.expect(c.bytes >= 3 * ring_bytes - 3 * (16 << 10));
     }
     try rig.umount(a2);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_a);

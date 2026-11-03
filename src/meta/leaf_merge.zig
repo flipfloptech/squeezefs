@@ -1417,6 +1417,37 @@ test "a_merge_is_admitted_at_the_compaction_floor_and_returns_extents: the merge
     try testing.expect(vol.alloc.freeExtents() > free0);
 }
 
+test "a merge on a ring whose stamps run ahead of its positions (a seq offset: a ring that received a handed-over slot) floors its parent at the entry's POSITION, under the head (decision 0003 §DI: floored at the Put's STAMP the parent sat past the head and never held the checkpoint tail below the merge entry)" {
+    const gpa = testing.allocator;
+    var vol = try TestVolume.init(gpa, .{ .journaled = true });
+    defer vol.deinit();
+    _ = vol.reg.raiseSeqFloor(vol.core, 1 << 20);
+    const t = try vol.createTree(.native);
+    var buf: [128]u8 = undefined;
+    var n: u64 = 0;
+    while (try t.rootLevel() < 1) : (n += 1) {
+        try vol.commit(t, &ikey(n), .put, tree.testValue(n, 64, &buf));
+        if (n % 64 == 63) _ = try vol.drain(t);
+    }
+    try vol.flushPass(t);
+    for (0..n) |i| if (i % 20 != 0) try vol.commit(t, &ikey(i), .delete, &.{});
+    try vol.flushDirty(t);
+    var o: MaintenanceOutcome = .{};
+    {
+        const left = try t.resolveLeaf(&ikey(0));
+        defer left.release();
+        const succ = (try mergeWithSibling(t, &vol.ctx, left, &o, false)) orelse return error.TestExpectedMerge;
+        succ.release();
+    }
+    try testing.expectEqual(@as(u64, 1), o.merges);
+    const merge_entry = vol.journal.last_entry.?;
+    const root = try vol.cache.get(t.rootPtr().addr);
+    defer root.release();
+    try testing.expect(root.level >= 1);
+    try testing.expectEqual(merge_entry.start, root.dirtyFloor());
+    try testing.expect(root.dirtyFloor() < vol.core.headPos());
+}
+
 test "replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse: the merge entry replays through the final routing; the collapse replays through the old root under the coverage gate" {
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .journaled = true });

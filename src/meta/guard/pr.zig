@@ -44,13 +44,12 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// One page-aligned arena for the guard's life (quirk Q12): Identify
-/// 4 KiB + 4 KiB for the report's header and body; a report past the arena
-/// half (≥ 63 extended registrants) borrows from the gpa.
-pub const ARENA_LEN: usize = 8192;
+/// One page-aligned arena for the guard's life (quirk Q12): the Identify
+/// page, read at the open before the client is shared. A report's buffers
+/// are per call (the heartbeat's and recovery's reports run on one client at
+/// once — review M2 of decision 0003 §DG).
+pub const ARENA_LEN: usize = nvme.IDENTIFY_NS_LEN;
 const IDENTIFY_OFF: usize = 0;
-const REPORT_OFF: usize = nvme.IDENTIFY_NS_LEN;
-const REPORT_ARENA_LEN: usize = ARENA_LEN - REPORT_OFF;
 
 pub const Stats = struct {
     registers: u64 = 0,
@@ -327,15 +326,17 @@ pub const Client = struct {
 
     fn reportWith(self: *Client, extended: bool) Error!nvme.Report {
         const h = nvme.reportHeaderLen(extended);
-        const head = self.arena[REPORT_OFF..][0..h];
+        // Per call, page-aligned (the passthrough maps it): two reports on one
+        // client at once never share a buffer.
+        const head = try self.gpa.alignedAlloc(u8, .fromByteUnits(4096), h);
+        defer self.gpa.free(head);
         try self.issue(.io, &nvme.reservationReport(self.nsid, head, extended));
         var regctl = nvme.reportRegctl(head, extended) orelse 0;
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
             const len = nvme.reportLen(extended, regctl);
-            const borrowed = len > REPORT_ARENA_LEN;
-            const buf: []u8 = if (borrowed) try self.gpa.alloc(u8, len) else self.arena[REPORT_OFF..][0..len];
-            defer if (borrowed) self.gpa.free(buf);
+            const buf = try self.gpa.alignedAlloc(u8, .fromByteUnits(4096), len);
+            defer self.gpa.free(buf);
             try self.issue(.io, &nvme.reservationReport(self.nsid, buf, extended));
             const seen = nvme.reportRegctl(buf, extended) orelse 0;
             if (seen > regctl and attempt == 0) {
@@ -686,7 +687,7 @@ test "register ladder fails CLOSED: a foreign registration is never unregistered
     try testing.expectEqual(LadderOutcome.registered, try c4.registerLadder());
 }
 
-test "report: EDS first, the short form on 0x18; two steps sized by REGCTL (the header alone, then header + stride × regctl); a report of 70 registrants borrows past the arena and decodes completely; gauges record the last transfer" {
+test "report: EDS first, the short form on 0x18; two steps sized by REGCTL (the header alone, then header + stride × regctl); a report of 70 registrants (past one page) decodes completely; gauges record the last transfer" {
     var rig = Rig.init(testing.allocator);
     defer rig.ns.deinit();
     rig.hosts();
@@ -718,7 +719,7 @@ test "report: EDS first, the short form on 0x18; two steps sized by REGCTL (the 
     defer big.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 70), big.registrants.len);
     try testing.expectEqual(@as(?u64, 1069), big.holder());
-    try testing.expect(c2.report_bytes > REPORT_ARENA_LEN);
+    try testing.expect(c2.report_bytes > 4096);
     try testing.expectEqual(@as(u16, 70), c2.regctl);
 }
 

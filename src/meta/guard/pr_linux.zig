@@ -30,6 +30,7 @@ const errors = @import("../../core/errors.zig");
 const log = @import("../../core/log.zig");
 const align_probe = @import("../../io/align_probe.zig");
 const uring128 = @import("../../io/uring128.zig");
+const futex = @import("../../sync/futex.zig");
 const nvme = @import("nvme_cmd.zig");
 const pr = @import("pr.zig");
 const proc = @import("proc.zig");
@@ -38,8 +39,9 @@ comptime {
     if (builtin.os.tag != .linux) @compileError("guard/pr_linux is Linux only (charter §1.2); gate the import on builtin.os.tag");
 }
 
-/// Eight entries: one command in flight at a time (the primitive is
-/// sequential), the ring floor a `Ring128` admits with the 2× CQ law.
+/// Eight entries: one command in flight at a time (`Device.issue_lock`
+/// serializes the issuers), the ring floor a `Ring128` admits with the 2× CQ
+/// law.
 const ring_entries: u16 = 8;
 const ud_cmd: u64 = 1;
 
@@ -62,6 +64,12 @@ pub const Device = struct {
     /// `/dev/ngXnY` (for the log).
     node: [32]u8,
     node_len: usize,
+    /// One command on the ring at a time: the guard's heartbeat, recovery's
+    /// preempts and reports and a lapse's re-register share a Device, and
+    /// every command rides one user_data — an issuer that reaped another's
+    /// completion would return before the kernel filled its buffer (review
+    /// M2 of decision 0003 §DG).
+    issue_lock: IssueLock = .{},
     /// Test seam: fired after a command's submit, before its completion is
     /// reaped (the window two issuers on one ring meet in).
     test_after_submit: if (builtin.is_test) ?TestHook else void = if (builtin.is_test) null else {},
@@ -89,6 +97,8 @@ pub const Device = struct {
     /// `-errno`; `big_cqe[0]` carries CDW0/CDW1.
     fn issueFn(ctx: *anyopaque, queue: nvme.Queue, cmd: *const nvme.UringCmd) errors.Error!nvme.Completion {
         const self: *Device = @ptrCast(@alignCast(ctx));
+        self.issue_lock.lock();
+        defer self.issue_lock.unlock();
         const sqe = self.ring.getSqe() orelse return error.SubmissionQueueOverflow;
         const cmd_op: u32 = switch (queue) {
             .admin => nvme.NVME_URING_CMD_ADMIN,
@@ -112,6 +122,24 @@ pub const Device = struct {
         const cqe = cqes[0];
         if (cqe.res < 0) return errors.fromCqeRes(cqe.res);
         return .{ .status = nvme.statusOf(cqe.res), .result = cqe.big_cqe[0] };
+    }
+};
+
+/// The issuers' lock: `std.Io.Mutex`'s three-state algorithm over the raw
+/// process-private futex (the Device holds no `Io`; a PR command is no hot
+/// path). 0 unlocked, 1 locked, 2 locked with waiters.
+const IssueLock = struct {
+    word: futex.Word = .init(0),
+
+    fn lock(self: *IssueLock) void {
+        // Acquire pairs with `unlock`'s release swap: the previous holder's
+        // ring state (its SQE written, its CQE reaped) is visible here.
+        if (self.word.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
+        while (self.word.swap(2, .acquire) != 0) futex.wait(&self.word, 2);
+    }
+
+    fn unlock(self: *IssueLock) void {
+        if (self.word.swap(0, .release) == 2) futex.wake(&self.word, 1);
     }
 };
 
@@ -315,8 +343,6 @@ test "the char twin and the controller node derive by name; a regular file resol
     defer rep.deinit(testing.allocator);
     std.debug.print("report: rtype {d}, regctl {d}, ptpls {d}\n", .{ rep.rtype, rep.regctl, rep.ptpls });
 }
-
-const futex = @import("../../sync/futex.zig");
 
 /// Two issuers on one Device (review M2 of decision 0003 §DG): A parks
 /// after its submit until B is done — or, B shut out, for a bound.

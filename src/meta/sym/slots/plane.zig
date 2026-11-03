@@ -1166,7 +1166,7 @@ pub const Plane = struct {
     // ---- the transfer's steps ----
 
     pub fn steps(self: *Plane) handover.Steps {
-        return .{ .ctx = self, .drainPendingTimes = drainPendingTimesFn, .cycleOnce = cycleOnceFn, .reusableUpto = reusableUptoFn, .rootPublished = rootPublishedFn, .recallTokens = recallTokensFn, .words = wordsFn, .tails = tailsFn, .pageReleasing = pageReleasingFn, .releaseDurably = releaseDurablyFn, .pageDrop = pageDropFn, .seam = &self.seam };
+        return .{ .ctx = self, .drainPendingTimes = drainPendingTimesFn, .cycleOnce = cycleOnceFn, .reusableUpto = reusableUptoFn, .rootPublished = rootPublishedFn, .treeClean = treeCleanFn, .recallTokens = recallTokensFn, .words = wordsFn, .tails = tailsFn, .pageReleasing = pageReleasingFn, .releaseDurably = releaseDurablyFn, .pageDrop = pageDropFn, .seam = &self.seam };
     }
 
     /// Step 0 of the handover: the slot's parked stamps (`economy.
@@ -1209,6 +1209,12 @@ pub const Plane = struct {
         const root = t.rootPtr();
         const p = self.publication(slot) orelse return false;
         return p.home != .unpublished and p.root.addr == root.addr and p.root.seq == root.seq;
+    }
+
+    fn treeCleanFn(ctx: *anyopaque, slot: u16) bool {
+        const self = self_(ctx);
+        const t = self.be.slotTree(slot) orelse return true;
+        return !self.be.cache.holdsDirty(t.forest_slot orelse return true);
     }
 
     fn recallTokensFn(_: *anyopaque, _: u16) void {}

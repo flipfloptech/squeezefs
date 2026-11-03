@@ -46,6 +46,11 @@ pub const stats = struct {
     pub var slot_handovers: counters.ShardedCounter = .{};
     /// A moving tail at the cover bound: the release aborted, retried.
     pub var slot_handover_deferrals: counters.ShardedCounter = .{};
+    /// Cover cycles a release ran because its tree still held a dirty node
+    /// once the tail had passed the record frontier — an SMO's pointer
+    /// records (the cover cycle's own included) journal past the frontier
+    /// (decision 0003 §DI).
+    pub var slot_handover_tree_dirty_cycles: counters.ShardedCounter = .{};
     /// Served ships / foreign touches evaluated.
     pub var slot_ships: counters.ShardedCounter = .{};
     /// Exact-sum `flush / page / tree0 / grant / total`.
@@ -458,6 +463,12 @@ pub const Steps = struct {
     reusableUpto: *const fn (ctx: *anyopaque, slot: u16) u64,
     /// Is the slot's live root named by a durable home (page or tree 0)?
     rootPublished: *const fn (ctx: *anyopaque, slot: u16) bool,
+    /// Does the device hold every node of the slot's tree as RAM does (no
+    /// dirty node)? The next holder opens the tree off the device and a
+    /// joiner's release forgets it, so a node dirty at the release is
+    /// records lost — the parent an SMO journaled a pointer into past the
+    /// record frontier is one (decision 0003 §DI).
+    treeClean: *const fn (ctx: *anyopaque, slot: u16) bool,
     /// Step 2b: every read token this holder granted on the slot's
     /// objects recalled and waited for (the tokens wave; inert until).
     recallTokens: *const fn (ctx: *anyopaque, slot: u16) void,
@@ -492,15 +503,22 @@ pub fn transfer(gpa: Allocator, door: *Door, table: *LeaseTable, steps: Steps, i
     defer if (!committed) door.endRelease(slot);
     // Step 1b: every admitted commit at its terminal outcome.
     _ = door.drain(slot, std.math.maxInt(u64));
-    // Step 2: cycle until the tail passes the slot's frontier and the
-    // root is published; bounded; the moving/unmoved split at the bound.
+    // Step 2: cycle until the tail passes the slot's frontier, the root
+    // is published and no node of the tree is dirty (an SMO's pointer
+    // records lie past the frontier: the cycle that moved a leaf leaves
+    // its parent dirty); bounded; the moving/unmoved split at the bound.
     const tail_start = steps.reusableUpto(steps.ctx, slot);
     var tail = tail_start;
     var cycles: u32 = 0;
+    var tree_dirty = false;
     while (true) {
-        if (tail >= table.frontierOf(slot) and steps.rootPublished(steps.ctx, slot)) break;
+        if (tail >= table.frontierOf(slot) and steps.rootPublished(steps.ctx, slot)) {
+            if (steps.treeClean(steps.ctx, slot)) break;
+            tree_dirty = true;
+            stats.slot_handover_tree_dirty_cycles.inc();
+        } else tree_dirty = false;
         if (cycles >= checkpoint.COVER_CYCLES_MAX) {
-            if (tail == tail_start) {
+            if (tail == tail_start and !tree_dirty) {
                 log.err("slot leases: the handover of slot {d} cycled {d} times and the region's tail never moved from {d} — a stuck reservation (a defect, never a longer wait)", .{ slot, cycles, tail });
                 return error.Corrupt;
             }
@@ -700,6 +718,8 @@ const TransferFixture = struct {
     tail: u64 = 0,
     tail_moves: bool = true,
     cycles_until_published: u32 = 0,
+    /// Cycles until no node of the tree is dirty (`maxInt`: never).
+    cycles_until_clean: u32 = 0,
     cycles: u32 = 0,
     paged: u32 = 0,
     released: u32 = 0,
@@ -732,6 +752,7 @@ const TransferFixture = struct {
         s.cycles += 1;
         if (s.tail_moves) s.tail += 10;
         if (s.cycles_until_published > 0) s.cycles_until_published -= 1;
+        if (s.cycles_until_clean > 0 and s.cycles_until_clean != std.math.maxInt(u32)) s.cycles_until_clean -= 1;
         return s.tail;
     }
     fn reusableUpto(ctx: *anyopaque, _: u16) u64 {
@@ -739,6 +760,9 @@ const TransferFixture = struct {
     }
     fn rootPublished(ctx: *anyopaque, _: u16) bool {
         return self_(ctx).cycles_until_published == 0;
+    }
+    fn treeClean(ctx: *anyopaque, _: u16) bool {
+        return self_(ctx).cycles_until_clean == 0;
     }
     fn recallTokens(ctx: *anyopaque, _: u16) void {
         self_(ctx).recalled += 1;
@@ -765,9 +789,38 @@ const TransferFixture = struct {
         self_(ctx).dropped += 1;
     }
     fn steps(self: *TransferFixture) Steps {
-        return .{ .ctx = self, .drainPendingTimes = drainPendingTimes, .cycleOnce = cycleOnce, .reusableUpto = reusableUpto, .rootPublished = rootPublished, .recallTokens = recallTokens, .words = words, .tails = tails, .pageReleasing = pageReleasing, .releaseDurably = releaseDurably, .pageDrop = pageDrop, .seam = &self.seam };
+        return .{ .ctx = self, .drainPendingTimes = drainPendingTimes, .cycleOnce = cycleOnce, .reusableUpto = reusableUpto, .rootPublished = rootPublished, .treeClean = treeClean, .recallTokens = recallTokens, .words = words, .tails = tails, .pageReleasing = pageReleasing, .releaseDurably = releaseDurably, .pageDrop = pageDrop, .seam = &self.seam };
     }
 };
+
+test "a release waits for its tree's last dirty node (decision 0003 §DI): past the frontier with the root published, a tree still dirty runs another cover cycle (counted) and releases once clean; a tree that never cleans defers at the bound — never Corrupt, whether or not the tail moved — with the door reopened" {
+    const gpa = testing.allocator;
+    const f = try TransferFixture.init(gpa);
+    defer f.deinit();
+    _ = try f.table.acquire(3, 1, false);
+    f.table.noteFrontier(3, 5);
+    // The tail already covers the frontier: only the dirty tree cycles.
+    f.tail = 10;
+    f.cycles_until_clean = 2;
+    const dirty0 = stats.slot_handover_tree_dirty_cycles.load();
+    _ = try transfer(gpa, &f.door, f.table, f.steps(), testing.io, 1, 3);
+    try testing.expectEqual(@as(u32, 2), f.cycles);
+    try testing.expectEqual(dirty0 + 2, stats.slot_handover_tree_dirty_cycles.load());
+    try testing.expectEqual(@as(u32, 1), f.released);
+    try testing.expectEqual(lt.State.unleased, f.table.view(3).state);
+    // Never clean: deferred at the bound, moving tail or not.
+    _ = try f.table.acquire(4, 1, false);
+    f.table.noteFrontier(4, 5);
+    f.cycles_until_clean = std.math.maxInt(u32);
+    for ([_]bool{ true, false }) |moves| {
+        f.tail_moves = moves;
+        const d0 = stats.slot_handover_deferrals.load();
+        try testing.expectError(error.HandoverDeferred, transfer(gpa, &f.door, f.table, f.steps(), testing.io, 1, 4));
+        try testing.expectEqual(d0 + 1, stats.slot_handover_deferrals.load());
+        try testing.expect(f.table.view(4).leasedBy(1) and f.table.view(4).state == .leased);
+    }
+    try testing.expectEqual(@as(u32, 1), f.released);
+}
 
 test "flush-then-transfer: the steps run in order (times drained, gate, drain, cycles until the tail passes the frontier and the root is published, page Releasing, tree 0, page drop); the phases are exact-sum; a slot not the holder's is Busy; a moving tail at the bound defers (door reopened), a stuck one is Corrupt; the kill seams stop after the page / after tree 0" {
     const gpa = testing.allocator;

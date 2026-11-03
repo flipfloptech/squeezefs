@@ -2301,6 +2301,23 @@ pub const NodeCache = struct {
         return out;
     }
 
+    /// Does a mapped node of slot tree `slot` hold records its extent lacks
+    /// (a dirty floor)? A slot release's cover precondition (decision 0003
+    /// §DI); superseded nodes are their successors' to answer for.
+    pub fn holdsDirty(self: *NodeCache, slot: ForestSlot) bool {
+        const Find = struct {
+            slot: ForestSlot,
+            dirty: bool = false,
+            fn visit(c: *@This(), n: *CachedNode) void {
+                if (c.dirty or n.forestSlot() != c.slot or n.state.isSuperseded()) return;
+                c.dirty = n.dirtyFloor() != no_floor;
+            }
+        };
+        var find: Find = .{ .slot = slot };
+        self.forEachNode(&find, Find.visit);
+        return find.dirty;
+    }
+
     // ---- the recovery's cache barrier (charter §5.5 "Death and recovery") ----
 
     /// Drop every mapping of `slot`'s nodes, DIRTY ONES INCLUDED — the

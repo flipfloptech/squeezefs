@@ -579,6 +579,18 @@ const Rig = struct {
         return Io.Dir.cwd().readFileAlloc(self.io, self.daemons.items[d].log_path, self.gpa, .limited(16 << 20));
     }
 
+    /// The daemon's last `n` log lines (a miss's diagnosis).
+    fn printLogTail(self: *Rig, d: usize, n: usize) void {
+        const text = self.readLog(d) catch return;
+        defer self.gpa.free(text);
+        var start = text.len;
+        var lines: usize = 0;
+        while (start > 0 and lines <= n) : (start -= 1) {
+            if (text[start - 1] == '\n') lines += 1;
+        }
+        std.debug.print("--- the last {d} lines of {s}'s log ---\n{s}\n", .{ n, self.daemons.items[d].mp, text[start..] });
+    }
+
     /// Bounded poll of the daemon's log for a needle; a dead daemon fails.
     fn awaitLog(self: *Rig, d: usize, needle: []const u8, deadline_ns: u64) !void {
         const deadline = clock.monotonicNs() + deadline_ns;
@@ -617,6 +629,7 @@ const Rig = struct {
             if (json_scan.number(text, key)) |v| if (v == want) return text;
             if (clock.monotonicNs() >= deadline) {
                 std.debug.print("\n--- {s} never reached {d}: {?d} ---\n", .{ key, want, json_scan.number(text, key) });
+                self.printLogTail(d, 60);
                 return text;
             }
             self.gpa.free(text);

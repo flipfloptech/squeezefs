@@ -8,7 +8,9 @@
 //! exhaustively by `src/model/explorer.zig`.
 //!
 //! `Election` — hosts A, B, C on one metadata namespace, WERO:
-//!   0 M0  host A's manager, frozen past its claim's TTL: a write, its
+//!   0 M0  host A's manager, frozen past its claim's TTL: its fencing
+//!         registrant's death preempt of a host-B member's key (a recovery
+//!         it was running when frozen; decision 0003 §DG), a write, its
 //!         heartbeat, a write — each at any point of the schedule (the
 //!         resume). Its `m` line stands; appender 0's page names it.
 //!   1 P1  a successor on host B: the claim probed (no write), the host
@@ -18,10 +20,12 @@
 //!         major 1, the instant between them abstracted), the claim probed again
 //!         (a fresh claim whose writer this open's preempt fenced is taken
 //!         over), the replay and the pre-gate writes (held tail, fold,
-//!         cover), the gate's claim read, the bind (claim committed,
+//!         cover), the gate's claim read and its fencing registrant stood
+//!         (registered under the host's key, §DG), the bind (claim committed,
 //!         appender 0's page, `m` enrolled, `p` retired); then its clean
-//!         unmount (the claim deleted; a hold taken by a preempt KEPT, else
-//!         released as the namespace's last registrant).
+//!         unmount (the claim deleted, the fencer unregistered; a hold taken
+//!         by a preempt KEPT, else released as the namespace's last
+//!         registrant).
 //!   2 P2  a successor on host C: the same — paused at any step across
 //!         P1's whole takeover; then (`release_cycle` only) the first §DF.11
 //!         death preempt of a host-B member.
@@ -32,21 +36,31 @@
 //!   5 L   a PTPL-less target power cycle: every registration and the hold
 //!         forgotten.
 //!
-//! `Member` — the manager MG on host A holds; members X and Y on host B:
+//! `Member` — the manager MG on host A holds, its fencing registrant F_A (a
+//! write-free second identity of host A under host A's key, a NON-holder)
+//! registered beside it; members X and Y on host B; W a member co-located
+//! with MG on host A (no write: its guarantee row is the flock, T_self and
+//! the frame screen, never the device):
 //!   0 X   a frozen member (re-joined in place once: its retirement `r`
 //!         names appender 1 at term 1; its page is appender 1 at term 2):
 //!         one write at any point.
 //!   1 Y   a member leaving: its line marked `l`, its leave's write (the
 //!         page Free, the identity cleared), the line removed.
 //!   2 MG  each member whose page is Live evicted in turn: the death
-//!         preempt of host B's key, the page Recovering, the re-fence
-//!         (§DF.12), the tail scan, `releaseRecovered` (Free, the identity
-//!         kept — the pair reusable from here).
+//!         preempt of its host's key (through F_A; the own-key guard for
+//!         W), the page Recovering, the re-fence (§DF.12), the tail scan,
+//!         `releaseRecovered` (Free, the identity kept — the pair reusable
+//!         from here); then MG's clean unmount (the hold kept when a preempt
+//!         landed under it, §DF.6).
 //!   3 S   a joiner mounting on host B: the rule, the register, the re-judge.
 //!   4 Z   a joiner elsewhere: `JoinAppender` takes the lowest Free pair and
 //!         writes its own identity.
-//!   Device semantics: `spec` (a holder's preempt of another key unregisters
-//!   it) or `nvmet` 7.3 (a holder's preempt of another key is a no-op).
+//!   Device semantics (nvmet 7.3.1 `pr.c`, a preempt by key): `spec` (a
+//!   holder's preempt of another key unregisters every registrant of it) or
+//!   `nvmet` 7.3 (a HOLDER's preempt of another key is a no-op; a
+//!   NON-holder's — the fencer's — unregisters every registrant of it, the
+//!   sender not skipped, the reservation kept). A preempt of the holder's own
+//!   key unregisters the holder: unreserved.
 //!
 //! Invariants: `KilledCurrent` the rule never kills the current manager or a
 //! Live member; `PreemptedLive` a hold never preempts a live manager's host
@@ -59,19 +73,27 @@
 //! `FencedWrote` a manager the device superseded never writes;
 //! `TwoManagers` at most one bound manager admitted under a standing
 //! reservation; `UnreservedUnderManager` never unreserved under the current
-//! manager; `FencedMemberWrote` an evicted member never writes after its
-//! region's tail scan.
+//! manager; `FencerHeld` a fencing registrant never holds the reservation;
+//! `FencedMemberWrote` an evicted member never writes after its region's
+//! tail scan; `FencerFenced` the manager's fencer is never the victim of a
+//! member preempt; `ManagerUnreserved` a member preempt never unreserves the
+//! manager's namespace; `FencedHostRegistered` once a death preempt landed,
+//! no registration of the fenced host (its own, its fencer's) stands until
+//! a rule's register re-admits it; `FencerWrote` no write lands under a
+//! fencer's identity.
 //!
 //! The ACCEPTED LIMITS (counted, not violations; `Strict` makes each one a
 //! violation and a test shows it reachable): `lapse` — a PTPL-less target
 //! power cycle forgets every fence until the manager's heartbeat re-acquires
 //! (anything superseded and resumed meanwhile writes); `register_window` —
 //! between a rule's register and its re-judge, a sibling that turned stale
-//! meanwhile is admitted. And on nvmet 7.3 the death preempt fences nothing:
-//! `Member(.{ .semantics = .nvmet })` FAILS `FencedMemberWrote` (detection
-//! only; decision 0003 §DF). Round 4's release window is closed (a hold
-//! taken by a preempt is kept): `keep_preempted_hold = false` FAILS
-//! `OverwroteAcked` — M0's checkpoint, or an open paused across the takeover.
+//! meanwhile is admitted. Without the fencer, on nvmet 7.3 the holder's
+//! death preempt fences nothing: `Member(.{ .semantics = .nvmet, .fencer =
+//! false })` FAILS `FencedMemberWrote` (§DF.11's limit, the no-fencer
+//! posture); with it the member model HOLDS under both semantics (§DG).
+//! Round 4's release window is closed (a hold taken by a preempt is kept):
+//! `keep_preempted_hold = false` FAILS `OverwroteAcked` — M0's checkpoint,
+//! or an open paused across the takeover.
 
 const std = @import("std");
 
@@ -94,6 +116,11 @@ pub const Hold = enum { wero, wear_registered_holds };
 /// 0's page (the fix of review round 3 major 1); round 3's (`p` stale
 /// whenever the rule runs, never retired; `m` by the page); the page alone.
 pub const JudgeManager = enum { report_then_page, round3, page_only };
+
+/// The fencing registrant's key (decision 0003 §DG): its host's own (`host`
+/// — a preempt of the host's key unregisters the host and its fencer in one
+/// command) or a key of its own (`distinct` — it outlives its host's fence).
+pub const FencerKey = enum { host, distinct };
 
 pub const ElectionConfig = struct {
     hold: Hold = .wero,
@@ -125,6 +152,10 @@ pub const ElectionConfig = struct {
     structural: bool = true,
     /// The second successor runs (off only to show M0's own write).
     p2: bool = true,
+    fencer_key: FencerKey = .host,
+    /// M0, resumed, finishes a recovery it ran when frozen: its fencer's
+    /// death preempt of a host-B member's key.
+    m0_fences: bool = true,
 };
 
 const Line = enum(u8) { none, p, m, pm };
@@ -175,10 +206,17 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         const SA_END = 3;
         const JB_DEPART = 3;
         const JB_END = 4;
+        const M0_STEPS: u8 = 3 + @as(u8, @intFromBool(cfg.m0_fences));
 
         reg: [3]bool = .{ true, false, false },
+        /// Each host's fencing registrant registered (M0 stood host A's at
+        /// its hold).
+        reg_f: [3]bool = .{ true, false, false },
         /// The holder's host (NONE: unreserved).
         holder: u8 = A,
+        /// The holder is that host's FENCER, not the host (nvmet's preempt of
+        /// the holder's key by a non-holder, `nvmet_pr_set_new_holder`).
+        holder_fencer: bool = false,
         /// WEAR's conflicting acquire taken as held (the N1 weakening).
         wear_held: [3]bool = @splat(false),
         /// The claim's incarnation (NONE: deleted); M0's is stale.
@@ -215,6 +253,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         fenced_wrote: bool = false,
         overwrote_acked: bool = false,
         preempted_live: bool = false,
+        fencer_held: bool = false,
         hit_lapse: bool = false,
         hit_register: bool = false,
 
@@ -227,7 +266,13 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         }
 
         fn holds(self: *const Self, h: u8) bool {
-            return self.holder == h or self.wear_held[h];
+            return (self.holder == h and !self.holder_fencer) or self.wear_held[h];
+        }
+
+        /// The report names host `h`'s KEY the holder: its own registration,
+        /// or its fencer's when that carries the same key.
+        fn keyHolds(self: *const Self, h: u8) bool {
+            return self.holder == h and (!self.holder_fencer or cfg.fencer_key == .host);
         }
 
         fn otherRegistered(self: *const Self, h: u8) bool {
@@ -235,10 +280,21 @@ pub fn Election(comptime cfg: ElectionConfig) type {
             return false;
         }
 
+        /// The host's own unregister (a departure, a release): by its host
+        /// id, so its fencer's registration stays.
         fn unregisterHost(self: *Self, h: u8) void {
             self.reg[h] = false;
             self.wear_held[h] = false;
-            if (self.holder == h) self.holder = NONE;
+            if (self.holder == h and !self.holder_fencer) self.holder = NONE;
+        }
+
+        /// A preempt of host `h`'s key by another registrant: every
+        /// registrant of the key goes — the host, and its fencer when that
+        /// carries the same key (nvmet `nvmet_pr_unreg_all_*_by_prkey`).
+        fn preemptKeyOf(self: *Self, h: u8) void {
+            self.reg[h] = false;
+            self.wear_held[h] = false;
+            if (cfg.fencer_key == .host) self.reg_f[h] = false;
         }
 
         /// Another writer's claim is fresh (M0's aged past the TTL).
@@ -253,12 +309,12 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         }
 
         fn isCurrent(self: *const Self, i: u8) bool {
-            return self.bound[i] and self.alive[i] and !self.failed[i] and self.claim == i and (self.holder == HOST[i] or self.holder == NONE);
+            return self.bound[i] and self.alive[i] and !self.failed[i] and self.claim == i and ((self.holder == HOST[i] and !self.holder_fencer) or self.holder == NONE);
         }
 
         pub fn done(self: *const Self, t: usize) bool {
             return switch (t) {
-                0 => self.pc[0] >= 3 or !self.alive[0] or self.failed[0],
+                0 => self.pc[0] >= M0_STEPS or !self.alive[0] or self.failed[0],
                 1 => self.pc[1] >= order[1].len or !self.alive[1] or self.failed[1],
                 2 => !cfg.p2 or self.pc[2] >= order[2].len or !self.alive[2] or self.failed[2],
                 3 => self.pc[3] >= SA_END,
@@ -271,7 +327,10 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         pub fn step(self: *Self, t: usize) void {
             switch (t) {
                 0 => {
-                    if (self.pc[0] == 1) {
+                    const k = self.pc[0];
+                    if (cfg.m0_fences and k == 0) {
+                        self.m0FencerPreempt();
+                    } else if (k - @intFromBool(cfg.m0_fences) == 1) {
                         if (!self.m0Beat()) return;
                     } else self.m0Write();
                     self.pc[0] += 1;
@@ -285,8 +344,10 @@ pub fn Election(comptime cfg: ElectionConfig) type {
                 } else self.ruleRunner(4, B, JB_DEPART),
                 5 => {
                     self.reg = @splat(false);
+                    self.reg_f = @splat(false);
                     self.wear_held = @splat(false);
                     self.holder = NONE;
+                    self.holder_fencer = false;
                     self.lapse_happened = true;
                     self.pc[5] = 1;
                 },
@@ -303,7 +364,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
                 return;
             }
             const stale = self.view[0] < self.epoch;
-            const fenced = self.holder != NONE and self.holder != A;
+            const fenced = self.holder != NONE and (self.holder != A or self.holder_fencer);
             if (!stale and !fenced) return;
             // Past its own re-acquire the write is the re-acquire's, not the
             // lapse window's (review round 3 major 3).
@@ -319,7 +380,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         /// The heartbeat's PR re-check (`gate.prRecheck`). False = waiting
         /// for host A's registry lock (the re-register).
         fn m0Beat(self: *Self) bool {
-            if (self.holder == A) return true;
+            if (self.keyHolds(A)) return true;
             if (self.holder != NONE) {
                 self.failed[0] = true; // usurped
                 return true;
@@ -330,9 +391,27 @@ pub fn Election(comptime cfg: ElectionConfig) type {
             }
             if (self.busy(A, 0)) return false;
             self.reg[A] = true;
+            // The re-acquire re-registers the fencer the lapse forgot.
+            self.reg_f[A] = true;
             self.holder = A;
             self.m0_reacquired = true;
             return true;
+        }
+
+        /// M0's fencer preempts a host-B member's key. Its registration gone,
+        /// the command conflicts (nvmet finds no registrant under its host
+        /// id and key); the victim's key holding, the fencer TAKES the
+        /// reservation and every other registrant of the key goes
+        /// (`nvmet_pr_set_new_holder` + `nvmet_pr_unreg_all_others_by_prkey`);
+        /// else every registrant of the key goes, the reservation kept.
+        fn m0FencerPreempt(self: *Self) void {
+            if (!self.reg_f[A]) return;
+            if (self.keyHolds(B)) {
+                self.holder = A;
+                self.holder_fencer = true;
+                self.fencer_held = true;
+            }
+            self.preemptKeyOf(B);
         }
 
         /// Host `h`'s registry lock is held by a thread other than `t`.
@@ -365,6 +444,8 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         fn discard(self: *Self, m: u8, h: u8) void {
             self.alive[m] = false;
             self.line[m] = .none;
+            // Its fencer's last user: unregistered.
+            self.reg_f[h] = false;
             if (!self.reg[h]) return;
             if (h == B and self.jb_enrolled) return;
             if (self.holder == h) {
@@ -402,7 +483,11 @@ pub fn Election(comptime cfg: ElectionConfig) type {
                 .reprobe => if (self.claimFreshForeign(m)) {
                     if (cfg.reprobe_proceeds and self.preempted[m] and self.holds(h)) self.fenced_claim[m] = self.claim else self.discard(m, h);
                 },
-                .gate => if (self.claimFreshForeign(m) and self.fenced_claim[m] != self.claim) self.discard(m, h),
+                // The gate's claim read; its fencer stood (registered under
+                // the host's key whatever the host's registration reads).
+                .gate => if (self.claimFreshForeign(m) and self.fenced_claim[m] != self.claim) self.discard(m, h) else {
+                    self.reg_f[h] = true;
+                },
                 // The replay (the view) and the pre-gate writes.
                 .write => {
                     self.view[m] = self.epoch;
@@ -418,6 +503,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
                     self.line[m] = if (cfg.judge == .round3) .pm else .m;
                 } else self.discard(m, h),
                 .unmount => {
+                    self.reg_f[h] = false;
                     if (self.writerWrite(m, h)) {
                         if (self.claim == m) self.claim = NONE;
                         if (self.page0 == m) self.page0 = NONE;
@@ -436,7 +522,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
                 .death_release => if (self.holder == h) {
                     self.holder = NONE;
                 },
-                .death_preempt => if (self.holder == NONE and self.reg[B]) self.unregisterHost(B),
+                .death_preempt => if (self.holder == NONE and self.reg[B]) self.preemptKeyOf(B),
                 .death_reacquire => if (self.holder == NONE and self.reg[h]) {
                     self.holder = h;
                 },
@@ -456,15 +542,24 @@ pub fn Election(comptime cfg: ElectionConfig) type {
                 // A non-holder's preempt of the holder's key: the hold
                 // passes, the holder's host unregistered.
                 .wero => {
-                    self.notePreemptOf(self.holder);
-                    self.reg[self.holder] = false;
+                    const v = self.holder;
+                    if (self.holder_fencer) {
+                        // The holder is host v's fencer: its key goes (the
+                        // host's registration with it when they share it).
+                        self.reg_f[v] = false;
+                        if (cfg.fencer_key == .host) self.reg[v] = false;
+                        self.holder_fencer = false;
+                    } else {
+                        self.notePreemptOf(v);
+                        self.preemptKeyOf(v);
+                    }
                     self.holder = h;
                     self.preempted[m] = true;
                 },
                 // rtype 5: the conflicting acquire taken as held; the stale
                 // claim's key (host A) preempted while it holds.
                 .wear_registered_holds => if (self.holder == A) {
-                    self.reg[A] = false;
+                    self.preemptKeyOf(A);
                     self.holder = h;
                     self.preempted[m] = true;
                 } else {
@@ -485,7 +580,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
             const ln = self.line[i];
             if (ln == .none) return false;
             return switch (cfg.judge) {
-                .report_then_page => (self.holder != NONE and self.holder != HOST[i]) or self.page0 != i,
+                .report_then_page => (self.holder != NONE and !self.keyHolds(HOST[i])) or self.page0 != i,
                 .round3 => ln == .p or ln == .pm or self.page0 != i,
                 .page_only => self.page0 != i,
             };
@@ -557,6 +652,7 @@ pub fn Election(comptime cfg: ElectionConfig) type {
             if (self.wrote_unheld) return error.WroteUnheld;
             if (self.overwrote_acked) return error.OverwroteAcked;
             if (self.fenced_wrote) return error.FencedWrote;
+            if (self.fencer_held) return error.FencerHeld;
             if (cfg.structural and (!self.lapse_happened or cfg.strict.lapse)) {
                 var managers: u8 = 0;
                 for (0..3) |i| {
@@ -582,6 +678,22 @@ pub const Semantics = enum { spec, nvmet };
 
 pub const MemberConfig = struct {
     semantics: Semantics = .spec,
+    /// The death preempt and the re-fence issued by the manager's FENCING
+    /// REGISTRANT — a write-free second identity of its host, a non-holder
+    /// (decision 0003 §DG); false: the holder's own preempt (the no-fencer
+    /// posture: multipath=Y, a failed connect — §DF.11's limit on nvmet).
+    fencer: bool = true,
+    fencer_key: FencerKey = .host,
+    /// multipath=Y: a member's write leaves through any controller of its
+    /// host's head — its host's fencer's included (the worst routing).
+    merged_path: bool = false,
+    /// The death preempt of the manager's OWN key withheld (a co-located
+    /// member: the device cannot fence inside one host).
+    own_key_guard: bool = true,
+    /// A preempt the fencer landed keeps the manager's hold at its clean
+    /// unmount like its own client's (§DF.6; false: only the holder's
+    /// client's preempts counted).
+    fencer_preempts_keep_hold: bool = true,
     /// The retirement covers a page only at its term (B1, round 3 major 1).
     retire_term: bool = true,
     /// A leaving member's line marked `l` until its leave's last write
@@ -611,23 +723,43 @@ pub fn Member(comptime cfg: MemberConfig) type {
         pub const thread_count: usize = 5;
         const X: u8 = 0;
         const Y: u8 = 1;
-        const Z: u8 = 2;
-        const MG_STEPS = 10;
+        /// The member co-located with the manager on host A (pair 2).
+        const W: u8 = 2;
+        /// The new joiner's identity (never a pair index).
+        const Z: u8 = 4;
+        const PAIRS = 3;
+        /// Five recovery steps per pair, then the manager's unmount.
+        const MG_UNMOUNT = 5 * PAIRS;
+        const MG_STEPS = MG_UNMOUNT + 1;
         const S_END = 3;
 
-        /// Host B registered (host A's — the manager's — always is).
+        /// Host B registered (host A's — the manager's — holds).
         reg_b: bool = true,
-        /// Two page pairs: pair 0 is X's region (appender 1), pair 1 Y's
-        /// (appender 2). Each names an owner (X, Y, Z or NONE: the identity
-        /// cleared) in a state.
-        owner: [2]u8 = .{ 0, 1 },
-        state: [2]Page = .{ .live, .live },
+        reg_a: bool = true,
+        /// The manager's fencer registered (stood at its hold).
+        reg_fa: bool = cfg.fencer,
+        /// Host B's fencer registered: B was the manager's host once; A's
+        /// takeover preempted host B's key, which took a fencer under that
+        /// key with it — a key of its own outlived it.
+        reg_fb: bool = cfg.fencer_key == .distinct,
+        /// The manager's reservation stands (WERO under host A's key).
+        reserved: bool = true,
+        /// A death preempt landed on host B's key; cleared by the rule's
+        /// register (the host re-admitted).
+        fenced_b: bool = false,
+        /// A preempt landed that keeps the hold at the manager's unmount.
+        keep_hold: bool = false,
+        /// Three page pairs: pair 0 is X's region (appender 1), pair 1 Y's
+        /// (appender 2), pair 2 W's (appender 3). Each names an owner (X, Y,
+        /// W, Z or NONE: the identity cleared) in a state.
+        owner: [PAIRS]u8 = .{ X, Y, W },
+        state: [PAIRS]Page = @splat(.live),
         line: [2]MLine = .{ .j, .j },
         alive: [2]bool = .{ true, true },
         failed: [2]bool = .{ false, false },
-        scanned: [2]bool = .{ false, false },
-        /// MG passed over this member (its page not Live at the eviction).
-        spared: [2]bool = .{ false, false },
+        scanned: [PAIRS]bool = @splat(false),
+        /// MG passed over this pair (its page not Live at the eviction).
+        spared: [PAIRS]bool = @splat(false),
         pc: [5]u8 = @splat(0),
         /// S holds host B's registry lock (from its read to its re-judge;
         /// Y's line changes wait for it).
@@ -635,6 +767,9 @@ pub fn Member(comptime cfg: MemberConfig) type {
         window: bool = false,
         killed_live: bool = false,
         wrote_after_scan: bool = false,
+        fencer_wrote: bool = false,
+        fencer_fenced: bool = false,
+        manager_unreserved: bool = false,
         hit_register: bool = false,
 
         pub fn init() Self {
@@ -656,12 +791,16 @@ pub fn Member(comptime cfg: MemberConfig) type {
             return self.owner[v] == v and self.state[v] == .live;
         }
 
-        /// A member's write. False = refused (the member latched).
+        /// A member's write. False = refused (the member latched). Under
+        /// multipath=Y the head routes it through host B's fencer's path.
         fn memberWrite(self: *Self, v: u8) bool {
-            if (!self.reg_b) {
+            const via_fencer = cfg.merged_path;
+            const registered = if (via_fencer) self.reg_fb else self.reg_b;
+            if (self.reserved and !registered) {
                 self.failed[v] = true;
                 return false;
             }
+            if (via_fencer and self.reserved) self.fencer_wrote = true;
             if (self.scanned[v]) {
                 if (self.window) self.hit_register = true else self.wrote_after_scan = true;
             }
@@ -690,14 +829,16 @@ pub fn Member(comptime cfg: MemberConfig) type {
                     self.pc[1] += 1;
                 },
                 2 => {
-                    self.recovery(@intCast(self.pc[2] / 5), self.pc[2] % 5);
+                    if (self.pc[2] == MG_UNMOUNT) {
+                        self.unmount();
+                    } else self.recovery(@intCast(self.pc[2] / 5), self.pc[2] % 5);
                     self.pc[2] += 1;
                 },
                 3 => self.rule(),
                 // A new joiner elsewhere: `JoinAppender` takes the lowest
                 // Free pair and writes its own identity.
                 4 => {
-                    for (0..2) |i| if (self.state[i] == .free) {
+                    for (0..PAIRS) |i| if (self.state[i] == .free) {
                         self.owner[i] = Z;
                         self.state[i] = .live;
                         break;
@@ -708,8 +849,40 @@ pub fn Member(comptime cfg: MemberConfig) type {
             }
         }
 
-        /// The manager's §5.9 recovery of member `v` (its own pair), step
-        /// `s`: the death preempt, Recovering, the re-fence, the tail scan,
+        /// The death preempt of pair `v`'s host key (host A's for W). By the
+        /// fencer: a non-holder — every registrant of the key goes, the
+        /// sender not skipped (nvmet `nvmet_pr_unreg_all_host_by_prkey`, the
+        /// spec's rule); its registration gone, its command conflicts. By the
+        /// holder: spec semantics unregister the key's registrants, nvmet's
+        /// only re-type the holder's own hold.
+        fn preempt(self: *Self, v: u8) void {
+            const own = v == W;
+            if (own and cfg.own_key_guard) return;
+            if (cfg.fencer) {
+                if (!self.reg_fa) return;
+            } else if (cfg.semantics == .nvmet or own) return;
+            if (own) {
+                if (!self.reg_a) return;
+                // Host A's key: the holder unregistered — unreserved — and
+                // the fencer under that key with it.
+                self.reg_a = false;
+                self.reserved = false;
+                self.manager_unreserved = true;
+                if (cfg.fencer_key == .host and self.reg_fa) {
+                    self.reg_fa = false;
+                    self.fencer_fenced = true;
+                }
+                return;
+            }
+            if (!self.reg_b) return;
+            self.reg_b = false;
+            if (cfg.fencer_key == .host) self.reg_fb = false;
+            self.fenced_b = true;
+            if (!cfg.fencer or cfg.fencer_preempts_keep_hold) self.keep_hold = true;
+        }
+
+        /// The manager's §5.9 recovery of pair `v`, step `s`: the death
+        /// preempt, Recovering, the re-fence, the tail scan,
         /// `releaseRecovered` (Free, the identity KEPT).
         fn recovery(self: *Self, v: u8, s: u8) void {
             if (s == 0) {
@@ -717,15 +890,15 @@ pub fn Member(comptime cfg: MemberConfig) type {
                     self.spared[v] = true;
                     return;
                 }
-                if (cfg.semantics == .spec) self.reg_b = false;
+                self.preempt(v);
                 return;
             }
             if (self.spared[v]) return;
             switch (s) {
                 1 => self.state[v] = .recovering,
-                2 => if (cfg.refence and self.reg_b and cfg.semantics == .spec) {
-                    self.reg_b = false;
-                },
+                // The re-fence: the key registered again is preempted again
+                // (never after an ignored holder preempt on nvmet).
+                2 => if (cfg.refence and v != W and self.reg_b) self.preempt(v),
                 3 => {
                     self.scanned[v] = true;
                     self.state[v] = .recovered;
@@ -735,13 +908,21 @@ pub fn Member(comptime cfg: MemberConfig) type {
             }
         }
 
+        /// The manager's clean unmount: its fencer unregistered (the last
+        /// user); the hold kept when a preempt landed under it, else released
+        /// (`host_fence.leaveRegistration`).
+        fn unmount(self: *Self) void {
+            self.reg_fa = false;
+            if (!self.keep_hold) self.reserved = false;
+        }
+
         /// X's retirement covers its page pair at term 1; its page is at
         /// term 2 (the term-less weakening covers the pair at any term).
         fn retired(v: u8, pair: u8) bool {
             return v == X and pair == X and !cfg.retire_term;
         }
 
-        /// `judgeRegion` for member `v`'s line.
+        /// `judgeRegion` for member `v`'s line (host B's registry: X, Y).
         fn stale(self: *const Self, v: u8) bool {
             const ln = self.line[v];
             if (ln == .none) return false;
@@ -752,7 +933,7 @@ pub fn Member(comptime cfg: MemberConfig) type {
             }
             // Round 4: the pages naming its writer id (none → joining).
             var uncovered = false;
-            for (0..2) |i| {
+            for (0..PAIRS) |i| {
                 if (self.owner[i] != v) continue;
                 if (self.state[i] == .live) return false;
                 if (cfg.leave_free_exception and ln == .l and self.state[i] == .free) continue;
@@ -784,6 +965,7 @@ pub fn Member(comptime cfg: MemberConfig) type {
                 },
                 1 => {
                     self.reg_b = true;
+                    self.fenced_b = false;
                     if (cfg.rejudge) self.window = true else {
                         self.locked = false;
                         self.pc[3] = S_END;
@@ -807,7 +989,11 @@ pub fn Member(comptime cfg: MemberConfig) type {
 
         pub fn invariant(self: *const Self) !void {
             if (self.killed_live) return error.KilledCurrent;
+            if (self.fencer_fenced) return error.FencerFenced;
+            if (self.manager_unreserved) return error.ManagerUnreserved;
+            if (self.fenced_b and (self.reg_b or self.reg_fb)) return error.FencedHostRegistered;
             if (self.wrote_after_scan) return error.FencedMemberWrote;
+            if (self.fencer_wrote) return error.FencerWrote;
             if (cfg.strict.register_window and self.hit_register) return error.RegisterWindow;
         }
 
@@ -847,21 +1033,49 @@ fn firstError(comptime M: type) ?anyerror {
     return null;
 }
 
-test "model: the election as built (WERO, the claim probed before the registration, again right before the hold and again under it — a writer this open's preempt fenced taken over —, the rule judging a manager by the report then appender 0's page with `p` retired at enrolment, the re-judge, the lapse's claim check, a hold taken by a preempt kept at the last clean unmount, the departure that keeps our hold) holds — no current manager killed or preempted live, no write over a live claim, outside its own hold or from a view a later manager's acked metadata superseded, no fenced write, one manager, never unreserved under the current manager" {
+test "model: the election as built (WERO, the claim probed before the registration, again right before the hold and again under it — a writer this open's preempt fenced taken over —, the rule judging a manager by the report then appender 0's page with `p` retired at enrolment, the re-judge, the lapse's claim check, a hold taken by a preempt kept at the last clean unmount, the departure that keeps our hold; every manager's fencing registrant under its host's key, the superseded manager's resumed fencer preempt) holds — no current manager killed or preempted live, no write over a live claim, outside its own hold or from a view a later manager's acked metadata superseded, no fenced write, no fencer holding, one manager, never unreserved under the current manager" {
     try explorer.expectHolds(Election(.{}), limits);
     const r = try statesOf(Election(.{}));
     std.debug.print("\nhost fence model (election): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
 }
 
-test "model: a member's fence as built under spec preempt semantics (a joined member's line naming its appender id and term, the term-keyed retirement, the `l` line until the leave's last write, the re-judge, the §DF.12 re-fence; recovered pages released and reused) holds — no Live member killed, no evicted member writes after its tail scan" {
+test "model: a member's fence as built under spec preempt semantics (the death preempt and the re-fence through the manager's fencing registrant under its host's key, the own-key guard, a joined member's line naming its appender id and term, the term-keyed retirement, the `l` line until the leave's last write, the re-judge, the §DF.12 re-fence, the hold kept at the manager's unmount; recovered pages released and reused) holds — no Live member killed, no fencer fenced, the manager's namespace never unreserved by a member preempt, no fenced host registered, no evicted member writes after its tail scan, no write under a fencer's identity" {
     try explorer.expectHolds(Member(.{}), limits);
     const r = try statesOf(Member(.{}));
-    std.debug.print("\nhost fence model (member): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
+    std.debug.print("\nhost fence model (member, spec): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
 }
 
-test "model, the accepted limit: on nvmet 7.3 the holder's death preempt fences nothing — an evicted member resumed after its tail scan writes (detection only, decision 0003 §DF)" {
-    try explorer.expectFails(Member(.{ .semantics = .nvmet }), limits, error.InvariantViolated);
-    try testing.expectEqual(@as(?anyerror, error.FencedMemberWrote), firstError(Member(.{ .semantics = .nvmet })));
+test "model: a member's fence as built under nvmet 7.3 semantics (decision 0003 §DG): the manager's fencing registrant — a non-holder under its host's key — preempts the dead member's host key, which the HOLDER's preempt cannot (nvmet_pr_preempt's holder == reg arm); a fenced member never writes" {
+    try explorer.expectHolds(Member(.{ .semantics = .nvmet }), limits);
+    const r = try statesOf(Member(.{ .semantics = .nvmet }));
+    std.debug.print("\nhost fence model (member, nvmet 7.3 + fencer): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
+}
+
+test "model weakening (§DF.11, the no-fencer posture): on nvmet 7.3 the holder's death preempt fences nothing — an evicted member resumed after its tail scan writes; on a spec-conformant target the holder's preempt alone holds" {
+    try explorer.expectFails(Member(.{ .semantics = .nvmet, .fencer = false }), limits, error.InvariantViolated);
+    try testing.expectEqual(@as(?anyerror, error.FencedMemberWrote), firstError(Member(.{ .semantics = .nvmet, .fencer = false })));
+    try explorer.expectHolds(Member(.{ .fencer = false }), limits);
+}
+
+test "model weakening (§DG.2): a fencer under a key of its own outlives its host's fence — the death preempt lands and the fenced host's fencer stays registered; under multipath=Y its path carries the fenced host's writes; a superseded manager's fencer, resumed, takes the reservation from the successor that preempted it" {
+    try explorer.expectFails(Member(.{ .semantics = .nvmet, .fencer_key = .distinct }), limits, error.InvariantViolated);
+    try explorer.expectFails(Member(.{ .semantics = .nvmet, .fencer_key = .distinct, .merged_path = true }), limits, error.InvariantViolated);
+    try explorer.expectFails(Election(.{ .fencer_key = .distinct }), limits, error.InvariantViolated);
+    try testing.expectEqual(@as(?anyerror, error.FencerHeld), firstError(Election(.{ .fencer_key = .distinct })));
+}
+
+test "model: under multipath=Y a fencer under its host's key is fenced with the host — a write routed through its path is refused (an availability cost, never a breach)" {
+    try explorer.expectHolds(Member(.{ .semantics = .nvmet, .merged_path = true }), limits);
+}
+
+test "model weakening (§DG.4): no own-key guard — the fencer's preempt of its own host's key unregisters the holder (unreserved) and the fencer itself (nvmet does not skip the sender)" {
+    try explorer.expectFails(Member(.{ .semantics = .nvmet, .own_key_guard = false }), limits, error.InvariantViolated);
+    try testing.expectEqual(@as(?anyerror, error.FencerFenced), firstError(Member(.{ .semantics = .nvmet, .own_key_guard = false })));
+}
+
+test "model weakening (§DG.5): the manager's unmount counts only its own client's preempts — after the fencer's death preempt the hold is released, the namespace unreserved, and the evicted member writes" {
+    try explorer.expectFails(Member(.{ .semantics = .nvmet, .fencer_preempts_keep_hold = false }), limits, error.InvariantViolated);
+    try testing.expectEqual(@as(?anyerror, error.FencedMemberWrote), firstError(Member(.{ .semantics = .nvmet, .fencer_preempts_keep_hold = false })));
 }
 
 test "model, the accepted windows are reachable: a PTPL-less lapse, a rule's register before its re-judge" {
@@ -922,20 +1136,29 @@ test "model weakening: the release → preempt → re-acquire death preempt (the
     try explorer.expectFails(Election(.{ .release_cycle = true }), limits, error.InvariantViolated);
 }
 
-test "model weakening (review B1, round 3 major 1): the retirement mark without the page term spares an evicted re-joined member" {
+test "model weakening (review B1, round 3 major 1): the retirement mark without the page term spares an evicted re-joined member (spec and nvmet + fencer)" {
     try explorer.expectFails(Member(.{ .retire_term = false }), limits, error.InvariantViolated);
+    try explorer.expectFails(Member(.{ .semantics = .nvmet, .retire_term = false }), limits, error.InvariantViolated);
 }
 
-test "model weakening (review round 3 major 4): a leaving member's line dropped before its leave's writes — the rule cannot see it" {
+test "model weakening (review round 3 major 4): a leaving member's line dropped before its leave's writes — the rule cannot see it (spec and nvmet + fencer)" {
     try explorer.expectFails(Member(.{ .leaving_line = false }), limits, error.InvariantViolated);
+    try explorer.expectFails(Member(.{ .semantics = .nvmet, .leaving_line = false }), limits, error.InvariantViolated);
 }
 
-test "model weakening: no §DF.12 re-fence once the page is Recovering" {
+test "model weakening: no §DF.12 re-fence once the page is Recovering (spec and nvmet + fencer)" {
     try explorer.expectFails(Member(.{ .refence = false }), limits, error.InvariantViolated);
+    try explorer.expectFails(Member(.{ .semantics = .nvmet, .refence = false }), limits, error.InvariantViolated);
 }
 
-test "model weakening (review B2): no re-judge after the rule's register" {
+test "model weakening (review B2): no re-judge after the rule's register (spec and nvmet + fencer)" {
     try explorer.expectFails(Member(.{ .rejudge = false }), limits, error.InvariantViolated);
+    try explorer.expectFails(Member(.{ .semantics = .nvmet, .rejudge = false }), limits, error.InvariantViolated);
+}
+
+test "model weakening (review 4 blockers 1 and 1b) under nvmet + fencer: a joined line without its appender id, the `l`-line Free exception" {
+    try explorer.expectFails(Member(.{ .semantics = .nvmet, .aid_on_line = false }), limits, error.InvariantViolated);
+    try explorer.expectFails(Member(.{ .semantics = .nvmet, .leave_free_exception = true }), limits, error.InvariantViolated);
 }
 
 fn expectBreaks(name: []const u8, found: ?anyerror, allowed: []const anyerror) !void {
@@ -948,6 +1171,7 @@ fn expectBreaks(name: []const u8, found: ?anyerror, allowed: []const anyerror) !
 test "model: which invariant each weakening breaks" {
     try testing.expectEqual(@as(?anyerror, null), firstError(Election(.{})));
     try testing.expectEqual(@as(?anyerror, null), firstError(Member(.{})));
+    try testing.expectEqual(@as(?anyerror, null), firstError(Member(.{ .semantics = .nvmet })));
     try expectBreaks("the hold released at a takeover's last unmount (blocker 2)", firstError(Election(.{ .keep_preempted_hold = false })), &.{ error.UnreservedUnderManager, error.OverwroteAcked });
     try expectBreaks("the hold released at a takeover's last unmount: the paused open (blocker 2)", firstError(Election(.{ .keep_preempted_hold = false, .structural = false })), &.{error.OverwroteAcked});
     try expectBreaks("the hold released at a takeover's last unmount: M0's checkpoint (blocker 2)", firstError(Election(.{ .keep_preempted_hold = false, .structural = false, .p2 = false })), &.{error.OverwroteAcked});
@@ -966,5 +1190,14 @@ test "model: which invariant each weakening breaks" {
     try expectBreaks("no leaving line (major 4)", firstError(Member(.{ .leaving_line = false })), &.{error.FencedMemberWrote});
     try expectBreaks("no re-fence (§DF.12)", firstError(Member(.{ .refence = false })), &.{error.FencedMemberWrote});
     try expectBreaks("no re-judge (B2)", firstError(Member(.{ .rejudge = false })), &.{error.FencedMemberWrote});
-    try expectBreaks("nvmet 7.3 (the accepted limit)", firstError(Member(.{ .semantics = .nvmet })), &.{error.FencedMemberWrote});
+    try expectBreaks("nvmet 7.3 without the fencer (§DF.11)", firstError(Member(.{ .semantics = .nvmet, .fencer = false })), &.{error.FencedMemberWrote});
+    try expectBreaks("a fencer key of its own (§DG.2)", firstError(Member(.{ .semantics = .nvmet, .fencer_key = .distinct })), &.{error.FencedHostRegistered});
+    try expectBreaks("a fencer key of its own under multipath=Y (§DG.2)", firstError(Member(.{ .semantics = .nvmet, .fencer_key = .distinct, .merged_path = true })), &.{ error.FencerWrote, error.FencedHostRegistered, error.FencedMemberWrote });
+    try expectBreaks("a fencer key of its own: the superseded manager's fencer (§DG.2)", firstError(Election(.{ .fencer_key = .distinct })), &.{error.FencerHeld});
+    try expectBreaks("no own-key guard (§DG.4)", firstError(Member(.{ .semantics = .nvmet, .own_key_guard = false })), &.{ error.FencerFenced, error.ManagerUnreserved });
+    try expectBreaks("the fencer's preempts not keeping the hold (§DG.5)", firstError(Member(.{ .semantics = .nvmet, .fencer_preempts_keep_hold = false })), &.{error.FencedMemberWrote});
+    try expectBreaks("no re-fence under nvmet + fencer", firstError(Member(.{ .semantics = .nvmet, .refence = false })), &.{error.FencedMemberWrote});
+    try expectBreaks("no re-judge under nvmet + fencer", firstError(Member(.{ .semantics = .nvmet, .rejudge = false })), &.{error.FencedMemberWrote});
+    try expectBreaks("term-less retirement under nvmet + fencer", firstError(Member(.{ .semantics = .nvmet, .retire_term = false })), &.{error.FencedMemberWrote});
+    try expectBreaks("no leaving line under nvmet + fencer", firstError(Member(.{ .semantics = .nvmet, .leaving_line = false })), &.{error.FencedMemberWrote});
 }

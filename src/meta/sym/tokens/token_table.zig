@@ -68,9 +68,11 @@ pub const PrepareSeam = struct {
     /// The object was deleted at its holder (decision 0003 §DH): the
     /// holder's final FORGET at nlink 0 discarded its custody and its
     /// destroy is pending, so every grant is `gone`. Read AFTER the
-    /// registration — the delete registers the object, THEN looks at the
-    /// registration filter (`Holder.mayHold`) to recall what was granted
-    /// before it; the pairing is the delete registry's lock.
+    /// registration — the registration raises the watch cell (SeqCst), the
+    /// check reads the delete registry's filter cell (SeqCst); the delete
+    /// raises that cell, THEN reads the watch (`mayHoldOrdered`) to recall
+    /// what was granted before it: one of the two sees the other
+    /// (`delete_watch_model.zig`). A live object's check is one load.
     deleted: ?*const fn (ctx: *anyopaque, object: Object) bool = null,
 };
 
@@ -697,9 +699,10 @@ pub const Holder = struct {
     /// THE REGISTRATION FILTER: per cell, the registered objects hashing
     /// there (an object counts once while it has a grant, live or pinned —
     /// `registerLocked` / `unregisterLocked` keep it under `lock`). Its
-    /// reader is the holder's own extending write (`mayHold`): one relaxed
-    /// load, exact when 0. A cell per object of the cap (a power of two):
-    /// the false positives a write meets are at most the table's fill, and
+    /// readers are the holder's own extending write (`mayHold`): one relaxed
+    /// load, exact when 0 — and the holder's delete (`mayHoldOrdered`, the
+    /// SeqCst load of the §DH Dekker pair). A cell per object of the cap (a
+    /// power of two): the false positives a write meets are at most the table's fill, and
     /// each costs one exact look under `lock` (`held`).
     watch: []std.atomic.Value(u32) = &.{},
 
@@ -728,6 +731,15 @@ pub const Holder = struct {
     pub fn mayHold(self: *const Holder, object: Object) bool {
         if (self.watch.len == 0) return false;
         return self.watchCell(object).load(.monotonic) != 0;
+    }
+
+    /// `mayHold` as the cross-member delete reads it: SeqCst, after the
+    /// delete raised its registry's filter cell (the Dekker pair with the
+    /// registration's raise, `delete_watch_model.zig`) — false is exact for
+    /// every grant registered before that raise.
+    pub fn mayHoldOrdered(self: *const Holder, object: Object) bool {
+        if (self.watch.len == 0) return false;
+        return self.watchCell(object).load(.seq_cst) != 0;
     }
 
     /// `mayHold` made exact (the filter's positive confirmed under `lock`).
@@ -778,7 +790,11 @@ pub const Holder = struct {
         const h = self.objects.getPtr(object) orelse blk: {
             if (self.objects.count() >= self.cap_objects) return error.TableFull;
             self.objects.putAssumeCapacity(object, .{});
-            _ = self.watchCell(object).fetchAdd(1, .monotonic);
+            // SeqCst: the grant's half of the cross-member delete's Dekker
+            // pair — the grant reads the delete registry's filter after it
+            // (`PrepareSeam.deleted`), the delete raises that filter, then
+            // reads this cell (`mayHoldOrdered`; `delete_watch_model.zig`).
+            _ = self.watchCell(object).fetchAdd(1, .seq_cst);
             break :blk self.objects.getPtr(object).?;
         };
         if (h.find(client)) |i| {

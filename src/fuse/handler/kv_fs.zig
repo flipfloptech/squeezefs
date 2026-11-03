@@ -442,6 +442,11 @@ pub var fuse_forget_judgements_deferred: counters.ShardedCounter = .{};
 /// grant — was kicked ahead of the tick.
 pub var fuse_delete_registry: counters.Gauge = .{};
 pub var fuse_delete_registry_refusals: counters.ShardedCounter = .{};
+/// `fuse_delete_registry_looks`: grants and shipped verbs whose object's
+/// filter cell was raised and asked the registry under a shard's lock (a
+/// deleted object, or another sharing its cell) — the registry's every
+/// lock on that path; a live object's check under a clear cell takes none.
+pub var fuse_delete_registry_looks: counters.ShardedCounter = .{};
 pub var fuse_delete_kicks: counters.ShardedCounter = .{};
 /// The member's side: a nodeid op answered ESTALE, by what found the file
 /// gone — its inode record (absent here, or `gone` at its holder:
@@ -696,6 +701,13 @@ pub const AfterCommit = struct {
     }
 };
 
+/// `T` alone on its cache line(s): the wrapper's size rounds up to its
+/// alignment, so a field written per op invalidates no neighbour whatever
+/// order the struct's auto layout picks.
+fn OwnLine(comptime T: type) type {
+    return struct { v: T align(std.atomic.cache_line) };
+}
+
 /// THE DELETE REGISTRY (decision 0003 §DH): the inos this holder DELETED —
 /// its final FORGET at nlink 0 judged them corpses (§DC.1) — whose record
 /// still stands: from that FORGET until the record is gone. Every other
@@ -707,62 +719,132 @@ pub const AfterCommit = struct {
 /// it; `trailing`: its record outlived its pass (a tree-mapped corpse's
 /// sweep destroys the inode at its terminal chunk; a failed destroy leaves
 /// it for the next mount's sweep) — the reclaim tick drops it once the
-/// record is gone. Spin-locked: the FORGET runs on the drain worker,
-/// which never parks; a member's grant looks under the same lock AFTER
-/// its registration (register-then-check: the FORGET inserts, THEN reads
-/// the registration filter).
+/// record is gone.
+///
+/// The common path takes no lock and writes no shared line: a counting
+/// FILTER in front of the set — a cell per ino hash counts the registered
+/// inos hashing there — answers a zero cell as an exact "not deleted" in
+/// one load, so a live object's grant (every create's on a peered set) and
+/// shipped verb read one word. A raised cell (the ino, or another deleted
+/// one sharing its cell) asks the set: sharded by the same hash, each
+/// shard spin-locked on a cache line of its own (the FORGET runs on the
+/// drain worker, which never parks), so a filter that a large corpse
+/// backlog saturates costs a grant one uncontended shard lock. The
+/// handshake with a grant registered before the delete is a Dekker pair:
+/// the delete puts the ino in its shard, raises the cell (SeqCst) THEN
+/// reads the holder's registration filter; the grant registers (the first
+/// registrant's raise of the holder's watch cell, SeqCst) THEN reads the
+/// cell — one sees the other (`tokens/delete_watch_model.zig`).
 pub const DeleteRegistry = struct {
     pub const Phase = enum(u8) { gathered, trailing };
 
-    lock: jc.SpinLock = .{},
-    set: u64_map.U64Map(Phase) = .empty,
+    /// The filter's cells, 16 KiB per mount: the registry holds the
+    /// gathered corpses (a few `RECLAIM_BATCH` between drains at a steady
+    /// delete rate), so a live object's cell is raised with probability ≤
+    /// entries / 4096 — each such false positive costs one shard lock.
+    pub const FILTER_CELLS: usize = 4096;
+    /// The set's shards (a shard per 64 cells: its index is the cell
+    /// index's top bits).
+    pub const SHARDS: usize = 64;
+
+    const Shard = struct {
+        lock: jc.SpinLock align(std.atomic.cache_line) = .{},
+        set: u64_map.U64Map(Phase) = .empty,
+    };
+
+    cells: []std.atomic.Value(u32) = &.{},
+    shards: []Shard = &.{},
     /// Trailing entries (the tick's prune reads nothing while 0).
     trailing: std.atomic.Value(usize) = .init(0),
 
+    pub fn init(gpa: Allocator) Allocator.Error!DeleteRegistry {
+        const cells = try gpa.alloc(std.atomic.Value(u32), FILTER_CELLS);
+        errdefer gpa.free(cells);
+        @memset(cells, .init(0));
+        const shards = try gpa.alloc(Shard, SHARDS);
+        @memset(shards, .{});
+        return .{ .cells = cells, .shards = shards };
+    }
+
     pub fn deinit(self: *DeleteRegistry, gpa: Allocator) void {
-        fuse_delete_registry.sub(self.set.count());
-        self.set.deinit(gpa);
+        for (self.shards) |*sh| {
+            fuse_delete_registry.sub(sh.set.count());
+            sh.set.deinit(gpa);
+        }
+        gpa.free(self.shards);
+        gpa.free(self.cells);
         self.* = undefined;
     }
 
-    /// `ino` was deleted here. False: the set could not grow (counted).
+    /// Fibonacci hashing: the top bits index the power-of-two tables.
+    fn hash(ino: u64) u64 {
+        return ino *% 0x9E3779B97F4A7C15;
+    }
+
+    fn cell(self: *const DeleteRegistry, ino: u64) *std.atomic.Value(u32) {
+        const shift: u6 = @intCast(@as(u32, @bitSizeOf(u64)) - std.math.log2_int(usize, FILTER_CELLS));
+        return &self.cells[@intCast(hash(ino) >> shift)];
+    }
+
+    fn shard(self: *const DeleteRegistry, ino: u64) *Shard {
+        const shift: u6 = @intCast(@as(u32, @bitSizeOf(u64)) - std.math.log2_int(usize, SHARDS));
+        return &self.shards[@intCast(hash(ino) >> shift)];
+    }
+
+    /// `ino` was deleted here: in its shard, THEN its cell raised (SeqCst —
+    /// the delete's store of the Dekker pair; its caller reads the holder's
+    /// registration filter next). False: the set could not grow (counted).
     pub fn insert(self: *DeleteRegistry, gpa: Allocator, ino: u64) bool {
-        self.lock.lock();
-        defer self.lock.unlock();
-        const gop = self.set.getOrPut(gpa, ino) catch {
-            fuse_delete_registry_refusals.inc();
-            return false;
-        };
-        if (!gop.found_existing) {
+        {
+            const sh = self.shard(ino);
+            sh.lock.lock();
+            defer sh.lock.unlock();
+            const gop = sh.set.getOrPut(gpa, ino) catch {
+                fuse_delete_registry_refusals.inc();
+                return false;
+            };
+            if (gop.found_existing) return true;
             gop.value_ptr.* = .gathered;
             fuse_delete_registry.add(1);
         }
+        _ = self.cell(ino).fetchAdd(1, .seq_cst);
         return true;
     }
 
-    /// Under the lock, always: a grant's look pairs with the FORGET's
-    /// insert through it (the struct doc).
+    /// Is `ino` registered? A zero cell answers no in one SeqCst load (the
+    /// grant's load of the Dekker pair, after its registration: a plain
+    /// load on x86, `ldar` on arm64); a raised one asks its shard under
+    /// the shard's lock (counted).
     pub fn has(self: *DeleteRegistry, ino: u64) bool {
-        self.lock.lock();
-        defer self.lock.unlock();
-        return self.set.contains(ino);
+        if (self.cell(ino).load(.seq_cst) == 0) return false;
+        fuse_delete_registry_looks.inc();
+        const sh = self.shard(ino);
+        sh.lock.lock();
+        defer sh.lock.unlock();
+        return sh.set.contains(ino);
     }
 
-    /// The record is gone, or the ino was found live.
+    /// The record is gone, or the ino was found live: out of its shard,
+    /// THEN its cell lowered (a raised cell never hides an entry).
     pub fn remove(self: *DeleteRegistry, ino: u64) void {
-        self.lock.lock();
-        defer self.lock.unlock();
-        const phase = self.set.get(ino) orelse return;
-        _ = self.set.remove(ino);
-        if (phase == .trailing) _ = self.trailing.fetchSub(1, .monotonic);
-        fuse_delete_registry.sub(1);
+        {
+            const sh = self.shard(ino);
+            sh.lock.lock();
+            defer sh.lock.unlock();
+            const phase = sh.set.get(ino) orelse return;
+            _ = sh.set.remove(ino);
+            if (phase == .trailing) _ = self.trailing.fetchSub(1, .monotonic);
+            fuse_delete_registry.sub(1);
+        }
+        _ = self.cell(ino).fetchSub(1, .release);
     }
 
     /// The destroy pass is over and the record still stands.
     pub fn markTrailing(self: *DeleteRegistry, ino: u64) void {
-        self.lock.lock();
-        defer self.lock.unlock();
-        const p = self.set.getPtr(ino) orelse return;
+        const sh = self.shard(ino);
+        sh.lock.lock();
+        defer sh.lock.unlock();
+        const p = sh.set.getPtr(ino) orelse return;
         if (p.* == .trailing) return;
         p.* = .trailing;
         _ = self.trailing.fetchAdd(1, .monotonic);
@@ -771,15 +853,17 @@ pub const DeleteRegistry = struct {
     /// Up to `out.len` trailing inos (the tick's prune).
     pub fn trailingInos(self: *DeleteRegistry, out: []u64) []u64 {
         if (self.trailing.load(.monotonic) == 0) return out[0..0];
-        self.lock.lock();
-        defer self.lock.unlock();
         var n: usize = 0;
-        var it = self.set.iterator();
-        while (it.next()) |e| {
-            if (n == out.len) break;
-            if (e.value_ptr.* != .trailing) continue;
-            out[n] = e.key;
-            n += 1;
+        for (self.shards) |*sh| {
+            sh.lock.lock();
+            defer sh.lock.unlock();
+            var it = sh.set.iterator();
+            while (it.next()) |e| {
+                if (n == out.len) return out[0..n];
+                if (e.value_ptr.* != .trailing) continue;
+                out[n] = e.key;
+                n += 1;
+            }
         }
         return out[0..n];
     }
@@ -909,18 +993,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// `afterTimerPass`).
         claims_landed: bool = false,
         locks: dlm.Manager,
-        /// The `..` memo (module doc). Both memos are `U64Map`s: a removal
-        /// leaves no tombstone, so a mount's churn of fresh directories
-        /// never lengthens a probe (decision 0003 §CU).
-        parents_lock: jc.SpinLock = .{},
-        parents: u64_map.U64Map(u64) = .empty,
-        /// A directory's depth byte (decision 0003 §BZ) and the count of
-        /// directories this mount placed under it (the pick's ordinal,
-        /// seeded from its `nlink − 2` at the first read after a mount),
-        /// beside the parent memo: written at its mkdir and at a depth
-        /// read, dropped with the parent memo; never written by a rename
-        /// (the byte is the birth's).
-        depths: u64_map.U64Map(DepthMemo) = .empty,
+        /// The `..` memo and the depth memo beside it (`Memo`).
+        memo: Memo = .{},
         /// The entry generation (charter §4 `FUSE_EXPORT_SUPPORT`): the
         /// kernel packs `(nodeid, i_generation)` into every file handle and
         /// a decode after the inode left its cache compares the generation
@@ -951,15 +1025,21 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         space_deferred: std.atomic.Value(bool) = .init(false),
         /// Corpses gathered or inside a destroy pass (`corpseUpstream`):
         /// raised at the gather, lowered once a pass's frees reached the
-        /// data plane (a deferred corpse rejoins the gather first).
-        corpses_pending: std.atomic.Value(usize) = .init(0),
+        /// data plane (a deferred corpse rejoins the gather first). Written
+        /// at every delete's FORGET and every pass: on a cache line of its
+        /// own.
+        corpses_pending: OwnLine(std.atomic.Value(usize)) = .{ .v = .init(0) },
         /// The data plane's ENOSPC valve asked for the gather's destroy
         /// before the tick (`kickCorpses`).
         corpse_kick: std.atomic.Value(bool) = .init(false),
         /// The inos this holder deleted whose record stands (decision 0003
         /// §DH; `DeleteRegistry`). Written only on a mount with a wire.
-        deleted: DeleteRegistry = .{},
-        next_fh: std.atomic.Value(u64) = .init(1),
+        deleted: DeleteRegistry,
+        /// Every open and create takes the next (a RMW per op): on a cache
+        /// line of its own, so no read-mostly field takes its invalidations
+        /// (a layout shift once put it beside `io` and `xv`, which every op
+        /// reads — the creates' regression of decision 0003 §DH.14).
+        next_fh: OwnLine(std.atomic.Value(u64)) = .{ .v = .init(1) },
         /// From the INIT reply.
         minor: u32 = abi.FUSE_KERNEL_MINOR_VERSION,
         killpriv_v2: bool = false,
@@ -1001,8 +1081,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         stripes: ?*Stripes = null,
         /// Committed corpse destroys on this volume: the subtrahend of the
         /// LIVE inode population `statfs.ffree` reports (POSIX-1: never the
-        /// monotone watermark, which made `IUsed` rise forever).
-        destroys: inos.DestroyTally = .{},
+        /// monotone watermark, which made `IUsed` rise forever). Written
+        /// at every destroy commit (the cadence, beside every op's reads):
+        /// on a cache line of its own.
+        destroys: OwnLine(inos.DestroyTally) = .{ .v = .{} },
 
         /// Bind the store and the data face (the daemon's mount; `init` is
         /// the FUSE op).
@@ -1029,6 +1111,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .landing_hold = opts.landing_hold,
                 .barrier_hold = opts.barrier_hold,
                 .locks = undefined,
+                .deleted = undefined,
                 .uid = opts.uid,
                 .gid = opts.gid,
                 .virtuals = virtual_inodes.Registry.init(gpa),
@@ -1037,6 +1120,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             errdefer self.pending.deinit();
             self.locks = try dlm.Manager.init(gpa, opts.dlm_stripes);
             errdefer self.locks.deinit();
+            self.deleted = try DeleteRegistry.init(gpa);
+            errdefer self.deleted.deinit(gpa);
             try self.reclaim.ensureTotalCapacity(gpa, 4 * RECLAIM_BATCH);
             return self;
         }
@@ -1045,8 +1130,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.virtuals.deinit();
             self.reclaim.deinit(self.gpa);
             self.deleted.deinit(self.gpa);
-            self.parents.deinit(self.gpa);
-            self.depths.deinit(self.gpa);
+            self.memo.parents.deinit(self.gpa);
+            self.memo.depths.deinit(self.gpa);
             self.locks.deinit();
             self.pending.deinit();
             self.* = undefined;
@@ -1066,8 +1151,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         /// The wire's faces this filesystem reads: does a foreign member hold
         /// a grant on this holder's `local` — `held` exact, `may_hold` the
-        /// registration filter (`tokens.table.Holder.mayHold`: one relaxed
-        /// load, false is exact) — and `drop_kernel_view`, this mount's
+        /// registration filter read SeqCst (`tokens.table.Holder.
+        /// mayHoldOrdered`: one load, false is exact for every grant
+        /// registered before the delete raised its registry cell — the
+        /// Dekker pair of `DeleteRegistry`) — and `drop_kernel_view`, this mount's
         /// kernel view of `local` invalidated as a recall invalidates it
         /// (its pages and attributes, queued on the sideband).
         pub const ForeignWatch = struct {
@@ -1939,42 +2026,58 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         fn rememberParent(self: *Self, dir: u64, parent: u64) void {
-            self.parents_lock.lock();
-            defer self.parents_lock.unlock();
-            self.parents.put(self.gpa, dir, parent) catch fuse_parent_memo_drops.inc();
+            self.memo.lock.lock();
+            defer self.memo.lock.unlock();
+            self.memo.parents.put(self.gpa, dir, parent) catch fuse_parent_memo_drops.inc();
         }
 
         fn parentOf(self: *Self, dir: u64) ?u64 {
             if (dir == inos.ROOT_INO) return inos.ROOT_INO;
-            self.parents_lock.lock();
-            defer self.parents_lock.unlock();
-            return self.parents.get(dir);
+            self.memo.lock.lock();
+            defer self.memo.lock.unlock();
+            return self.memo.parents.get(dir);
         }
 
         fn forgetParent(self: *Self, dir: u64) void {
-            self.parents_lock.lock();
-            defer self.parents_lock.unlock();
-            _ = self.parents.remove(dir);
-            _ = self.depths.remove(dir);
+            self.memo.lock.lock();
+            defer self.memo.lock.unlock();
+            _ = self.memo.parents.remove(dir);
+            _ = self.memo.depths.remove(dir);
         }
 
         const DepthMemo = struct { depth: u8, placed: u32 };
 
+        /// The `..` memo (module doc) and, beside it, a directory's depth
+        /// byte (decision 0003 §BZ) with the count of directories this
+        /// mount placed under it (the pick's ordinal, seeded from its
+        /// `nlink − 2` at the first read after a mount): written at a
+        /// mkdir and at a depth read, dropped with the parent memo; never
+        /// written by a rename (the byte is the birth's). Both are
+        /// `U64Map`s: a removal leaves no tombstone, so a mount's churn of
+        /// fresh directories never lengthens a probe (decision 0003 §CU).
+        /// Every mkdir and directory lookup writes them: on cache lines of
+        /// their own, so no read-mostly field of `KvFs` shares one.
+        const Memo = struct {
+            lock: jc.SpinLock align(std.atomic.cache_line) = .{},
+            parents: u64_map.U64Map(u64) = .empty,
+            depths: u64_map.U64Map(DepthMemo) = .empty,
+        };
+
         /// The two memos' full scans (O(capacity): the tests' and the
         /// evidence rigs', never an op's).
         fn memoCensus(self: *Self) MemoCensus {
-            self.parents_lock.lock();
-            defer self.parents_lock.unlock();
-            return .{ .parents = self.parents.census(), .depths = self.depths.census() };
+            self.memo.lock.lock();
+            defer self.memo.lock.unlock();
+            return .{ .parents = self.memo.parents.census(), .depths = self.memo.depths.census() };
         }
 
         /// The memos' gauges, published by the `.stats` lookup (the
         /// render reads them exact; never an op's work).
         fn publishMemoGauges(self: *Self) void {
-            self.parents_lock.lock();
-            const p = [3]u64{ self.parents.count(), self.parents.capacity(), self.parents.displacement };
-            const d = [3]u64{ self.depths.count(), self.depths.capacity(), self.depths.displacement };
-            self.parents_lock.unlock();
+            self.memo.lock.lock();
+            const p = [3]u64{ self.memo.parents.count(), self.memo.parents.capacity(), self.memo.parents.displacement };
+            const d = [3]u64{ self.memo.depths.count(), self.memo.depths.capacity(), self.memo.depths.displacement };
+            self.memo.lock.unlock();
             fuse_parent_memo_entries.set(p[0]);
             fuse_parent_memo_slots.set(p[1]);
             fuse_parent_memo_displacement.set(p[2]);
@@ -1985,23 +2088,23 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         /// A fresh directory: its byte, no child placed yet.
         fn rememberDepth(self: *Self, dir: u64, depth: u8) void {
-            self.parents_lock.lock();
-            defer self.parents_lock.unlock();
-            self.depths.put(self.gpa, dir, .{ .depth = depth, .placed = 0 }) catch fuse_parent_memo_drops.inc();
+            self.memo.lock.lock();
+            defer self.memo.lock.unlock();
+            self.memo.depths.put(self.gpa, dir, .{ .depth = depth, .placed = 0 }) catch fuse_parent_memo_drops.inc();
         }
 
         fn memoDepth(self: *Self, dir: u64) ?u8 {
-            self.parents_lock.lock();
-            defer self.parents_lock.unlock();
-            return if (self.depths.get(dir)) |m| m.depth else null;
+            self.memo.lock.lock();
+            defer self.memo.lock.unlock();
+            return if (self.memo.depths.get(dir)) |m| m.depth else null;
         }
 
         /// The parent's byte and the ordinal of the directory about to be
         /// placed under it (the count stepped); null = not in the memo.
         fn takeOrdinal(self: *Self, dir: u64) ?DepthMemo {
-            self.parents_lock.lock();
-            defer self.parents_lock.unlock();
-            const m = self.depths.getPtr(dir) orelse return null;
+            self.memo.lock.lock();
+            defer self.memo.lock.unlock();
+            const m = self.memo.depths.getPtr(dir) orelse return null;
             const out = m.*;
             m.placed +|= 1;
             return out;
@@ -2012,9 +2115,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// memory answers this placement off the record alone.
         fn seedOrdinal(self: *Self, dir: u64, pv: InodeValue) DepthMemo {
             const seed: DepthMemo = .{ .depth = pv.dirDepth(), .placed = pv.nlink -| 2 };
-            self.parents_lock.lock();
-            defer self.parents_lock.unlock();
-            const got = self.depths.getOrPut(self.gpa, dir) catch {
+            self.memo.lock.lock();
+            defer self.memo.lock.unlock();
+            const got = self.memo.depths.getOrPut(self.gpa, dir) catch {
                 fuse_parent_memo_drops.inc();
                 return seed;
             };
@@ -2046,7 +2149,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         fn mintFh(self: *Self) u64 {
-            return self.next_fh.fetchAdd(1, .monotonic);
+            return self.next_fh.v.fetchAdd(1, .monotonic);
         }
 
         // ---- the layout record ----
@@ -2658,11 +2761,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         fn noteCorpsesPending(self: *Self, n: usize) void {
-            fuse_reclaim_gathered.set(self.corpses_pending.fetchAdd(n, .acq_rel) + n);
+            fuse_reclaim_gathered.set(self.corpses_pending.v.fetchAdd(n, .acq_rel) + n);
         }
 
         fn noteCorpsesDone(self: *Self, n: usize) void {
-            fuse_reclaim_gathered.set(self.corpses_pending.fetchSub(n, .acq_rel) - n);
+            fuse_reclaim_gathered.set(self.corpses_pending.v.fetchSub(n, .acq_rel) - n);
         }
 
         /// THE GATHER AS SUPPLY (decision 0003 §CR): the data plane's
@@ -2681,7 +2784,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         fn corpsesPendingOf(ctx: *anyopaque) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            return self.corpses_pending.load(.acquire) != 0;
+            return self.corpses_pending.v.load(.acquire) != 0;
         }
 
         fn kickCorpses(ctx: *anyopaque) void {
@@ -2697,11 +2800,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         // ---- THE CROSS-MEMBER DELETE (decision 0003 §DH) ----
 
         /// The delete of `local`, the holder's side: registered (a mount
-        /// with a wire alone — a flat mount has no member to answer), THEN
-        /// the registration filter read: true when a member may hold a
-        /// grant made before the registration (`DeleteRegistry`'s pairing),
-        /// or the registry could not take it (its destroy is then the only
-        /// answer, wanted now).
+        /// with a wire alone — a flat mount has no member to answer; its
+        /// filter cell raised SeqCst), THEN the registration filter read
+        /// SeqCst: true when a member may hold a grant made before the
+        /// registration (`DeleteRegistry`'s Dekker pair), or the registry
+        /// could not take it (its destroy is then the only answer, wanted
+        /// now).
         fn registerDelete(self: *Self, local: u64) bool {
             const w = self.foreign_watch orelse return false;
             if (!self.deleted.insert(self.gpa, local)) return true;
@@ -2711,7 +2815,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// Did this holder delete `local`, its destroy pending? Registered,
         /// and the record still reads nlink 0 (a deferred judgement found
         /// live leaves at its destroy's re-read). The token holder's grant
-        /// and the record ship's served verbs ask it.
+        /// and the record ship's served verbs ask it: a live object under a
+        /// clear filter cell answers in one load, no lock, no record read.
         pub fn deletedHere(self: *Self, local: u64) bool {
             if (!self.deleted.has(local)) return false;
             const v = (self.readInodeOpt(local) catch return true) orelse return true;
@@ -2825,7 +2930,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const path = self.corpse_destroy_hold orelse return false;
             if (self.corpse_destroy_released.load(.acquire)) return false;
             Io.Dir.cwd().access(self.io, path, .{}) catch {
-                if (!self.corpse_destroy_said.swap(true, .acq_rel)) log.info("kv_fs: SQUEEZEFS_TEST_CORPSE_DESTROY_HOLD — no corpse is destroyed until {s} exists ({d} gathered)", .{ path, self.corpses_pending.load(.acquire) });
+                if (!self.corpse_destroy_said.swap(true, .acq_rel)) log.info("kv_fs: SQUEEZEFS_TEST_CORPSE_DESTROY_HOLD — no corpse is destroyed until {s} exists ({d} gathered)", .{ path, self.corpses_pending.v.load(.acquire) });
                 return true;
             };
             self.corpse_destroy_released.store(true, .release);
@@ -3178,7 +3283,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try self.commit(c, t);
             for (run) |*p| p.committed = true;
             fuse_reclaim_destroys.add(destroyed);
-            self.destroys.noteCommitted(destroyed);
+            self.destroys.v.noteCommitted(destroyed);
             fuse_reclaim_drains.inc();
         }
 
@@ -3207,7 +3312,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             _ = self.pending.retire(ino);
             fuse_reclaim_destroys.inc();
-            self.destroys.noteCommitted(1);
+            self.destroys.v.noteCommitted(1);
         }
 
         /// The try-only `lookup` the FUSE drain worker asks first (decision
@@ -5921,7 +6026,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// inode population (minted − destroyed, + the root), published as
         /// `live_inodes`.
         pub fn statfs(self: *Self, _: *Ctx, _: filesystem.StatfsArgs) Error!filesystem.Statfs {
-            const used_inos = inos.publishLiveInodes(&.{self.store.allocatedInos() -| self.destroys.load()});
+            const used_inos = inos.publishLiveInodes(&.{self.store.allocatedInos() -| self.destroys.v.load()});
             var total: u64 = 0;
             var free: u64 = 0;
             if (self.data.statfs()) |sp| {
@@ -11448,6 +11553,38 @@ test "THE CROSS-MEMBER DELETE, the holder's side (the owner's ruling 2026-11-03,
     h.release(x);
     h.forget(x, 1);
     try testing.expect(!h.fs.deleted.has(lx));
+}
+
+test "THE DELETE REGISTRY'S FILTER (decision 0003 §DH.14): a live object's check takes no lock — 10,000 checks of live inos over an empty registry ask no shard (`fuse_delete_registry_looks` unchanged), and over one holding 256 deleted inos only the checks whose cell another deleted ino raised do (each counted once); a deleted ino is found under its shard's lock and, removed, clears its cell; the fields written per op or per delete — `next_fh`, the memos, the destroy tally, the gather's count — sit on cache lines of their own" {
+    const gpa = testing.allocator;
+    var reg = try DeleteRegistry.init(gpa);
+    defer reg.deinit(gpa);
+    const live0: u64 = 1 << 20;
+    const looks0 = fuse_delete_registry_looks.load();
+    for (live0..live0 + 10_000) |ino| try testing.expect(!reg.has(ino));
+    try testing.expectEqual(looks0, fuse_delete_registry_looks.load());
+
+    const dead0: u64 = 1 << 40;
+    for (dead0..dead0 + 256) |ino| try testing.expect(reg.insert(gpa, ino));
+    var raised: u64 = 0;
+    for (live0..live0 + 10_000) |ino| {
+        if (reg.cell(ino).load(.monotonic) != 0) raised += 1;
+        try testing.expect(!reg.has(ino));
+    }
+    try testing.expectEqual(looks0 + raised, fuse_delete_registry_looks.load());
+    // 256 deleted inos raise at most 256 of the 4096 cells (1/16 of them;
+    // Fibonacci hashing spreads consecutive inos evenly).
+    try testing.expect(raised * 8 < 10_000);
+    for (dead0..dead0 + 256) |ino| try testing.expect(reg.has(ino));
+    for (dead0..dead0 + 256) |ino| reg.remove(ino);
+    for (reg.cells) |*c| try testing.expectEqual(@as(u32, 0), c.load(.monotonic));
+    for (dead0..dead0 + 256) |ino| try testing.expect(!reg.has(ino));
+
+    const Fs = Harness.Fs;
+    inline for (.{ "next_fh", "memo", "destroys", "corpses_pending" }) |name| {
+        try testing.expectEqual(@as(usize, 0), @offsetOf(Fs, name) % std.atomic.cache_line);
+        try testing.expectEqual(@as(usize, 0), @sizeOf(@FieldType(Fs, name)) % std.atomic.cache_line);
+    }
 }
 
 test "THE CROSS-MEMBER DELETE, the member's side (decision 0003 §DH): every nodeid op whose inode record is gone answers ESTALE — getattr, open, read, write, a size setattr, a mode setattr, setxattr — counted and dropping this mount's kernel view of it; a name op on the gone name is negative (a lookup) or ENOENT (an unlink) as ever" {

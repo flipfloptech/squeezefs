@@ -1324,7 +1324,7 @@ fn holderHeld(ctx: *anyopaque, local: u64) bool {
 
 fn holderMayHold(ctx: *anyopaque, local: u64) bool {
     const wp: *sym_wire.WirePlane = @ptrCast(@alignCast(ctx));
-    return wp.holder.mayHold(local);
+    return wp.holder.mayHoldOrdered(local);
 }
 
 fn dropKernelView(ctx: *anyopaque, local: u64) void {

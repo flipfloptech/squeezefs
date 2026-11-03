@@ -64,3 +64,12 @@ seam holds the destroy, and B answered from its cache. The row mounts B noatime 
 
 **Checks** (`6b39633`): the red ×13 (13/13), the §DH units ×3 (50/50 each), the full unit step 3,249 pass /
 185 skip / 0 fail, `zig fmt --check`, rails 32/32.
+
+**The mkdirs' bimodality** (§DH.19). The orchestrator's next four rounds (`e781832` vs `10f6182`): medians within
+±1.4 %, plain np32 Directory creation bimodal in the fix arm. Alignment is constant (six fresh mounts: `KvFs`
+and the memo's three blocks at 0 mod 128). Across all 64 legs Directory creation is bimodal in every shape and both
+builds — slow legs base 12/32, fix 11/32; within a mode the builds agree (272/274 k fast, 238/236 k slow) — and
+every slow leg (23/23) ran its mkdir phase under `sqz-thermal-governor`'s 3.2 GHz cap; none that started at
+≥ 4.0 GHz, or saw the cap lift within 2 s, was slow (0/38). The harness should start each leg at one governor level.
+Rebased onto origin/dev `a182be3`; on `0d410d9`: red ×3, §DH units ×3 (50/50), full units 3,271 pass / 188 skip /
+0 fail, fmt, rails 32/32. The §DH.13 (h) defects were fixed on dev by §DI.

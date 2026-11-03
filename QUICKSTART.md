@@ -142,9 +142,21 @@ squeezefs mount --daemon --log-file /var/log/squeezefs.log --supervise sqmeta://
 The second and later mounts find the set's manager through the set itself and join it; `--join
 host:port` is only needed when a manager moved its listener before that record landed.
 `squeezefs clients` lists every writer. Each host presents an NVMe host identity (`/etc/nvme/hostnqn`
-and `hostid`, or `SQUEEZEFS_HOSTNQN`/`SQUEEZEFS_HOSTID`); the data volumes are fenced with NVMe
-persistent reservations keyed on it, so a node that loses its lease loses its access to the devices
-too. `squeezefs nvmeof resv-report <dev>` shows the reservations.
+and `hostid`, or `SQUEEZEFS_HOSTNQN`/`SQUEEZEFS_HOSTID`); the metadata volumes are fenced with NVMe
+persistent reservations keyed on it, so a node that loses its lease loses its access to them too
+(the data volumes carry no reservation yet). `squeezefs nvmeof resv-report <dev>` shows the
+reservations.
+
+A node that manages a metadata volume also connects it under a second, write-free identity of its
+own — the fencing registrant, hostnqn `nqn.2026-10.io.squeezefs:fencer:<uuid>` — whose only command
+fences a dead member's host (nvmet answers that only from a non-holder; decision 0003 §DG). With
+`nvme_core.multipath=N` that connection shows up as a second block node of the namespace: install
+`scripts/udev/60-squeezefs-fencer.rules` into `/etc/udev/rules.d/` on every node (a package must
+ship it) so `/dev/disk/by-id` links, systemd and udisks keep to the host's own node, and on a node
+running `multipathd` keep dm-multipath off these namespaces (`blacklist { device { vendor "NVME"
+product "Linux" } }` for nvmet targets). A mount, `fsck` or `appender clear` on a fencer's node is
+refused by name. Under `nvme_core.multipath=Y` no fencer stands and a dead member is detected, not
+fenced, on an nvmet 7.3 target.
 
 ## 6. The bypass: skipping the kernel round trip
 

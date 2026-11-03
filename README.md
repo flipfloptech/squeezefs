@@ -66,6 +66,9 @@ removes/s, 284 k mkdir/s, 283 k rmdir/s. The measurement notes behind every numb
 - **Zig 0.17.0** to build. No other build dependency; zstd is vendored.
 - Optional: `nvme-cli` and the `nvmet` modules for NVMe-oF; OpenMPI + `mdtest`/`ior` for the metadata
   and bandwidth rows; `fio` for the bandwidth rows.
+- **NVMe-oF deployments** install `scripts/udev/60-squeezefs-fencer.rules` on every node (a package
+  must ship it; the venue's provisioning does): it keeps the host's tools off the fencing
+  registrant's namespace nodes (QUICKSTART §5, decision 0003 §DG.16).
 
 ## Build
 

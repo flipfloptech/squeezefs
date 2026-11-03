@@ -433,6 +433,24 @@ pub var fuse_reclaim_gathered: counters.Gauge = .{};
 /// resident, an SMO window) or refused; the ino joined the gather for the
 /// cadence's nlink judgement instead.
 pub var fuse_forget_judgements_deferred: counters.ShardedCounter = .{};
+/// THE CROSS-MEMBER DELETE (decision 0003 §DH), the holder's side:
+/// `fuse_delete_registry` the inos this holder deleted whose record still
+/// stands (0 at quiescence); `fuse_delete_registry_refusals` a delete the
+/// registry could not take (out of memory: its grants serve the corpse
+/// until its destroy, kicked at once); `fuse_delete_kicks` a delete a
+/// member may hold a grant on, whose destroy — the pass that recalls that
+/// grant — was kicked ahead of the tick.
+pub var fuse_delete_registry: counters.Gauge = .{};
+pub var fuse_delete_registry_refusals: counters.ShardedCounter = .{};
+pub var fuse_delete_kicks: counters.ShardedCounter = .{};
+/// The member's side: a nodeid op answered ESTALE, by what found the file
+/// gone — its inode record (absent here, or `gone` at its holder:
+/// `record_gone`), a shipped record verb or publish its holder answered
+/// `gone` (`ship_gone`), the data plane's layout resolve mid-op
+/// (`data_gone`). Each drops this mount's kernel view of the inode.
+pub var fuse_estale_record_gone: counters.ShardedCounter = .{};
+pub var fuse_estale_ship_gone: counters.ShardedCounter = .{};
+pub var fuse_estale_data_gone: counters.ShardedCounter = .{};
 /// A dentry that names an ino whose record is gone (a corpse reachable by
 /// name): fsck C9/C10 territory, never a handler outcome (must stay 0).
 pub var dentry_without_inode: counters.Tripwire = .init("fuse_dentry_without_inode");
@@ -678,6 +696,95 @@ pub const AfterCommit = struct {
     }
 };
 
+/// THE DELETE REGISTRY (decision 0003 §DH): the inos this holder DELETED —
+/// its final FORGET at nlink 0 judged them corpses (§DC.1) — whose record
+/// still stands: from that FORGET until the record is gone. Every other
+/// member reaches the file only through this holder (token grants, shipped
+/// record verbs), and the §DC discard took its custody at the FORGET, so
+/// from here a grant answers `gone` and a shipped verb applies nothing —
+/// the member's ESTALE, never the discarded resident's zeros. `gathered`:
+/// the corpse waits in the gather or a destroy pass, whose commit removes
+/// it; `trailing`: its record outlived its pass (a tree-mapped corpse's
+/// sweep destroys the inode at its terminal chunk; a failed destroy leaves
+/// it for the next mount's sweep) — the reclaim tick drops it once the
+/// record is gone. Spin-locked: the FORGET runs on the drain worker,
+/// which never parks; a member's grant looks under the same lock AFTER
+/// its registration (register-then-check: the FORGET inserts, THEN reads
+/// the registration filter).
+pub const DeleteRegistry = struct {
+    pub const Phase = enum(u8) { gathered, trailing };
+
+    lock: jc.SpinLock = .{},
+    set: u64_map.U64Map(Phase) = .empty,
+    /// Trailing entries (the tick's prune reads nothing while 0).
+    trailing: std.atomic.Value(usize) = .init(0),
+
+    pub fn deinit(self: *DeleteRegistry, gpa: Allocator) void {
+        fuse_delete_registry.sub(self.set.count());
+        self.set.deinit(gpa);
+        self.* = undefined;
+    }
+
+    /// `ino` was deleted here. False: the set could not grow (counted).
+    pub fn insert(self: *DeleteRegistry, gpa: Allocator, ino: u64) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const gop = self.set.getOrPut(gpa, ino) catch {
+            fuse_delete_registry_refusals.inc();
+            return false;
+        };
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .gathered;
+            fuse_delete_registry.add(1);
+        }
+        return true;
+    }
+
+    /// Under the lock, always: a grant's look pairs with the FORGET's
+    /// insert through it (the struct doc).
+    pub fn has(self: *DeleteRegistry, ino: u64) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.set.contains(ino);
+    }
+
+    /// The record is gone, or the ino was found live.
+    pub fn remove(self: *DeleteRegistry, ino: u64) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const phase = self.set.get(ino) orelse return;
+        _ = self.set.remove(ino);
+        if (phase == .trailing) _ = self.trailing.fetchSub(1, .monotonic);
+        fuse_delete_registry.sub(1);
+    }
+
+    /// The destroy pass is over and the record still stands.
+    pub fn markTrailing(self: *DeleteRegistry, ino: u64) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const p = self.set.getPtr(ino) orelse return;
+        if (p.* == .trailing) return;
+        p.* = .trailing;
+        _ = self.trailing.fetchAdd(1, .monotonic);
+    }
+
+    /// Up to `out.len` trailing inos (the tick's prune).
+    pub fn trailingInos(self: *DeleteRegistry, out: []u64) []u64 {
+        if (self.trailing.load(.monotonic) == 0) return out[0..0];
+        self.lock.lock();
+        defer self.lock.unlock();
+        var n: usize = 0;
+        var it = self.set.iterator();
+        while (it.next()) |e| {
+            if (n == out.len) break;
+            if (e.value_ptr.* != .trailing) continue;
+            out[n] = e.key;
+            n += 1;
+        }
+        return out[0..n];
+    }
+};
+
 /// The pre-op ring state of `key`: the image (owned, `alloc[0..len]`) the
 /// record held, re-staged on a failed commit; `alloc == null` = no record
 /// (a packed file's transformed re-stage), released on a failed commit.
@@ -849,6 +956,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The data plane's ENOSPC valve asked for the gather's destroy
         /// before the tick (`kickCorpses`).
         corpse_kick: std.atomic.Value(bool) = .init(false),
+        /// The inos this holder deleted whose record stands (decision 0003
+        /// §DH; `DeleteRegistry`). Written only on a mount with a wire.
+        deleted: DeleteRegistry = .{},
         next_fh: std.atomic.Value(u64) = .init(1),
         /// From the INIT reply.
         minor: u32 = abi.FUSE_KERNEL_MINOR_VERSION,
@@ -934,6 +1044,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pub fn unmount(self: *Self) void {
             self.virtuals.deinit();
             self.reclaim.deinit(self.gpa);
+            self.deleted.deinit(self.gpa);
             self.parents.deinit(self.gpa);
             self.depths.deinit(self.gpa);
             self.locks.deinit();
@@ -953,12 +1064,17 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.divert = d;
         }
 
-        /// May a foreign member hold a grant on this holder's `local`? The
-        /// wire's token holder answers (`tokens.table.Holder.held`: one
-        /// relaxed load when no member holds one).
+        /// The wire's faces this filesystem reads: does a foreign member hold
+        /// a grant on this holder's `local` — `held` exact, `may_hold` the
+        /// registration filter (`tokens.table.Holder.mayHold`: one relaxed
+        /// load, false is exact) — and `drop_kernel_view`, this mount's
+        /// kernel view of `local` invalidated as a recall invalidates it
+        /// (its pages and attributes, queued on the sideband).
         pub const ForeignWatch = struct {
             ctx: *anyopaque,
             held: *const fn (ctx: *anyopaque, local: u64) bool,
+            may_hold: *const fn (ctx: *anyopaque, local: u64) bool,
+            drop_kernel_view: *const fn (ctx: *anyopaque, local: u64) void,
         };
 
         /// Bind the token holder's filter (after `mount`, before the session
@@ -1066,7 +1182,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// ONE shipped record verb to the file's holder.
         fn shipRecord(self: *Self, global: u64, call: sym_xv.record_ship.Call) Error!sym_xv.record_ship.Reply {
             const p = self.xv.?;
-            return (sym_xv.record_ship.ship(p.resolver, p.volume, global, call, 0) catch |e| return sym_xv.record_ship.coreError(e)) orelse error.SlotMoved;
+            return (sym_xv.record_ship.ship(p.resolver, p.volume, global, call, 0) catch |e| {
+                if (e == error.Gone) return self.staleBy(try localOf(global), &fuse_estale_ship_gone);
+                return sym_xv.record_ship.coreError(e);
+            }) orelse error.SlotMoved;
         }
 
         /// Run `plan` as ONE intent under its travelling guards; a live
@@ -1940,9 +2059,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 // read divert's law — never this mount's projection, whose
                 // stale or absent record would read as an inline file of
                 // zeros). The record's collision seq is the holder's key;
-                // a reader never re-keys a foreign layout.
+                // a reader never re-keys a foreign layout. Gone at its
+                // holder: the file's stale handle — never "never written",
+                // whose inline zeros a deleted file's read would serve.
                 defer served.release(self.io);
-                const e = served.entry orelse return null;
+                const e = served.entry orelse return self.staleBy(ino, &fuse_estale_record_gone);
                 const v = e.xattr(LAYOUT_XATTR) orelse return null;
                 const value = try self.gpa.dupe(u8, v);
                 errdefer self.gpa.free(value);
@@ -2492,8 +2613,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     // and the kernel returned its last reference — no fd,
                     // mmap or lookup reaches these bytes again. A deferred
                     // judgement proves nothing: its destroy's re-read does.
+                    // Another member reaches them only through this holder
+                    // (§DH): registered BEFORE the discard, so a grant from
+                    // here on answers `gone`, never the discarded bytes.
+                    const may_be_held = self.registerDelete(local);
                     if (self.data.hasVolumes()) self.data.discardAtDelete(local);
                     self.gatherCorpse(c, local);
+                    // A grant made before the registration: the destroy's
+                    // pass recalls it — now, not at the tick.
+                    if (may_be_held) {
+                        fuse_delete_kicks.inc();
+                        kickCorpses(self);
+                    }
                 },
                 .deferred => {
                     fuse_forget_judgements_deferred.inc();
@@ -2561,6 +2692,75 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The cadence's wake asked for the tail (`kickCorpses`): consumed.
         pub fn takeCorpseKick(self: *Self) bool {
             return self.corpse_kick.swap(false, .acq_rel);
+        }
+
+        // ---- THE CROSS-MEMBER DELETE (decision 0003 §DH) ----
+
+        /// The delete of `local`, the holder's side: registered (a mount
+        /// with a wire alone — a flat mount has no member to answer), THEN
+        /// the registration filter read: true when a member may hold a
+        /// grant made before the registration (`DeleteRegistry`'s pairing),
+        /// or the registry could not take it (its destroy is then the only
+        /// answer, wanted now).
+        fn registerDelete(self: *Self, local: u64) bool {
+            const w = self.foreign_watch orelse return false;
+            if (!self.deleted.insert(self.gpa, local)) return true;
+            return w.may_hold(w.ctx, local);
+        }
+
+        /// Did this holder delete `local`, its destroy pending? Registered,
+        /// and the record still reads nlink 0 (a deferred judgement found
+        /// live leaves at its destroy's re-read). The token holder's grant
+        /// and the record ship's served verbs ask it.
+        pub fn deletedHere(self: *Self, local: u64) bool {
+            if (!self.deleted.has(local)) return false;
+            const v = (self.readInodeOpt(local) catch return true) orelse return true;
+            return v.nlink == 0;
+        }
+
+        /// `record_ship.TruncateFace.deleted` over `deletedHere`.
+        fn servedDeleted(ctx: *anyopaque, global: u64) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return self.deletedHere(localOf(global) catch return false);
+        }
+
+        /// The reclaim tick: a trailing delete whose record is gone (a
+        /// tree-mapped corpse's sweep finished, a failed destroy's corpse
+        /// destroyed since) leaves the registry.
+        pub fn pruneDeleted(self: *Self) void {
+            var buf: [RECLAIM_BATCH]u64 = undefined;
+            for (self.deleted.trailingInos(&buf)) |ino| {
+                const v = self.readInodeOpt(ino) catch continue;
+                if (v == null) self.deleted.remove(ino);
+            }
+        }
+
+        /// The inode of a nodeid the kernel holds. An absent record — its
+        /// holder destroyed it, or deleted it and answers `gone` (a member's
+        /// descriptor outlived the file) — answers ESTALE, never ENOENT: the
+        /// handle is stale, no name was asked.
+        fn readHeld(self: *Self, local: u64) Error!InodeValue {
+            return (try self.readInodeOpt(local)) orelse return self.staleBy(local, &fuse_estale_record_gone);
+        }
+
+        /// A nodeid op found `local` gone: counted by `cause`, this
+        /// mount's kernel view of it dropped (a refused buffered write left
+        /// its copied pages uptodate in the page cache; the recall that
+        /// would drop them never comes for a file no grant names), ESTALE.
+        fn staleBy(self: *Self, local: u64, cause: *counters.ShardedCounter) Error {
+            cause.inc();
+            if (self.foreign_watch) |w| w.drop_kernel_view(w.ctx, local);
+            return error.StaleHandle;
+        }
+
+        /// A FileNotFound out of a nodeid op's inner call (the data plane's
+        /// resolve, a shipped verb) is the file gone mid-op: ESTALE.
+        fn heldErr(self: *Self, local: u64, e: Error, cause: *counters.ShardedCounter) Error {
+            return switch (e) {
+                error.FileNotFound => self.staleBy(local, cause),
+                error.StaleHandle => self.staleBy(local, &fuse_estale_ship_gone),
+                else => e,
+            };
         }
 
         /// The kicked drain: every gathered corpse, the tail under
@@ -2726,6 +2926,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// gathered for the cadence untried (a retry may run the
         /// admission's return-room cycles; the mount does not wait on them).
         fn sweepBatch(self: *Self, c: *Ctx, batch: []const u64, swept: *Swept) Error!void {
+            // A member may hold a predecessor's corpse open across this
+            // daemon's death: deleted before its custody is discarded (§DH).
+            for (batch) |ino| _ = self.registerDelete(ino);
             var deferred: Deferred = .{};
             if (swept.deferred == 0) try self.destroyCorpses(c, batch, &deferred) else for (batch) |ino| deferred.push(ino);
             swept.destroyed += batch.len - deferred.n;
@@ -2780,6 +2983,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn destroyCorpses(self: *Self, c: *Ctx, corpses: []const u64, deferred: ?*Deferred) Error!void {
             const gpa = self.gpa;
             assert(corpses.len <= RECLAIM_BATCH);
+            // A pass that fails leaves its corpses' records standing: their
+            // deletes trail until the tick finds each record gone (§DH).
+            errdefer for (corpses) |ino| self.deleted.markTrailing(ino);
             // (1) The nlink re-check (a forget of a live inode never reached
             // the gather) and the settle.
             var live: [RECLAIM_BATCH]u64 = undefined;
@@ -2787,10 +2993,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             for (corpses) |ino| {
                 const v = (try self.readInodeOpt(ino)) orelse {
                     self.data.clearDeleted(ino);
+                    self.deleted.remove(ino);
                     continue;
                 };
                 if (v.nlink != 0) {
                     self.data.clearDeleted(ino);
+                    self.deleted.remove(ino);
                     continue;
                 }
                 const rec = try self.readLayout(ino);
@@ -2909,11 +3117,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 if (!p.committed) continue;
                 self.afterCommit(&p.after);
                 fuse_reclaim_blocks_freed.add(@intCast(p.after.n));
+                self.deleted.remove(p.ino);
             }
             for (sweeps.items) |sw| {
                 var after: AfterCommit = .{};
                 after.kvmap_sweep = .{ .ino = sw.ino, .removed = sw.removed };
                 self.afterCommit(&after);
+                // The sweep's terminal chunk destroys the inode (now, or on
+                // a meta lane): the record may outlive this pass.
+                self.deleted.markTrailing(sw.ino);
             }
             if (failed) |e| return e;
         }
@@ -3024,7 +3236,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pub fn getattr(self: *Self, c: *Ctx, a: filesystem.GetattrArgs) Error!filesystem.Attr {
             if (virtual_inodes.isVirtualIno(a.ino)) return self.virtualGetattr(a.ino);
             c.stage(.meta_backend_start);
-            const v = self.readInode(try localOf(a.ino)) catch |e| blk: {
+            const v = self.readHeld(try localOf(a.ino)) catch |e| blk: {
                 // The root under an unreachable holder (a parked joiner
                 // whose manager died): the kernel revalidates the root
                 // before every virtual lookup, so `.stats` stays reachable
@@ -3078,7 +3290,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var layout_lock: ?Data.LayoutGuard = null;
             errdefer if (layout_lock) |g| g.release(self.io);
             if (a.attr.size) |sz| {
-                const probe = (try self.readInodeOpt(local)) orelse return error.FileNotFound;
+                const probe = try self.readHeld(local);
                 // The flag law BEFORE the size path's side effects (its
                 // zeros, its custody settle).
                 if (judge_flags) try refuseSetattr(probe, a.attr);
@@ -3106,7 +3318,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
-            var stored = try self.readInode(local);
+            var stored = try self.readHeld(local);
             // The flag law on the record in hand (the size path judged
             // its probe above, before its side effects).
             if (judge_flags and a.attr.size == null) try refuseSetattr(stored, a.attr);
@@ -3246,7 +3458,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (punch and zero) return error.NotSupported;
             if (collapse and mode != FALLOC.COLLAPSE_RANGE) return error.InvalidArgument;
             if (insert and mode != FALLOC.INSERT_RANGE) return error.InvalidArgument;
-            const probe = (try self.readInodeOpt(local)) orelse return error.FileNotFound;
+            const probe = try self.readHeld(local);
             if (probe.mode & S.IFMT == S.IFDIR) return error.IsDir;
             if (probe.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
             const grows = !keep and !punch and !collapse;
@@ -3573,7 +3785,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         pub fn readlink(self: *Self, c: *Ctx, a: filesystem.ReadlinkArgs) Error!filesystem.Data {
             const local = try localOf(a.ino);
-            var v = try self.readInode(local);
+            var v = try self.readHeld(local);
             if (v.mode & S.IFMT != S.IFLNK) return error.InvalidArgument;
             _ = self.touchAtime(local, &v);
             const target = (try self.xattrValue(local, economy.SYMLINK_XATTR)) orelse return error.InputOutput;
@@ -4266,7 +4478,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 return .{ .fh = a.ino, .open_flags = abi.FOPEN_DIRECT_IO };
             }
             const local = try localOf(a.ino);
-            const v = try self.readInode(local);
+            const v = try self.readHeld(local);
             if (economy.isDirMode(v.mode)) return error.IsDir;
             // The served-open arm answers at the open what the kernel's
             // `may_open` would (under zero-message opens the WRITE does).
@@ -4293,7 +4505,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 const t = try self.beginExclusive(local, @src());
                 var t_owned = true;
                 errdefer if (t_owned) self.store.abandon(t);
-                var stored = try self.readInode(local);
+                var stored = try self.readHeld(local);
                 // The size epoch moves before the clip (as the truncate's).
                 try self.noteSizeSet(local, 0);
                 stored.size = self.claimedSize(local, stored);
@@ -4328,7 +4540,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             const local = try localOf(a.ino);
             c.stage(.meta_backend_start);
-            var v = try self.readInode(local);
+            var v = try self.readHeld(local);
             if (self.fileAccessed(local, &v, a.flags)) c.atime_parked = true;
             v.size = self.claimedSize(local, v);
             if (a.offset >= v.size) {
@@ -4359,7 +4571,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .staged, .packed_, .striped => {
                     c.stage(.read_routed);
                     defer c.stage(.read_return);
-                    const got = try self.data.read(self.io, local, a.offset, c.window[0..n], c.window.len > 0, a.flags & O_DIRECT != 0);
+                    const got = self.data.read(self.io, local, a.offset, c.window[0..n], c.window.len > 0, a.flags & O_DIRECT != 0) catch |e| return self.heldErr(local, e, &fuse_estale_data_gone);
                     return .{ .len = got };
                 },
             }
@@ -4488,7 +4700,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // promotion could place: fstests generic/030, fsstress). A
             // striped file never takes the arm: its reach is not read.
             const fits_inline = kind == .inline_ and end <= self.inline_max;
-            const reach: ?u64 = if (self.data.stagingOn() and kind != .striped) @max(end, (try self.readInode(local)).size) else null;
+            const reach: ?u64 = if (self.data.stagingOn() and kind != .striped) @max(end, (try self.readHeld(local)).size) else null;
             if (fits_inline and (reach == null or reach.? <= layout.inlineRecordMax())) return self.writeInline(c, local, a, rec, end, &layout_lock);
             if (reach != null and reach.? <= self.block_size) {
                 if (try self.writeStaged(c, local, a, rec, end, &layout_lock)) |w| return w;
@@ -4533,7 +4745,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
-            var v = try self.readInode(local);
+            var v = try self.readHeld(local);
             try self.refuseWriteOn(v, local, a);
             if (v.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
             // The new image: the old bytes zero-extended to max(old, end), the write overlaid.
@@ -4569,7 +4781,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// published): the caller's own-block arm.
         fn writeStaged(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64, layout_lock: *?Data.LayoutGuard) Error!?filesystem.Written {
             const data = try self.payloadBytes(a);
-            const probe = try self.readInode(local);
+            const probe = try self.readHeld(local);
             try self.refuseWriteOn(probe, local, a);
             if (probe.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
             const size = @max(probe.size, end);
@@ -4655,7 +4867,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
-            var v = try self.readInode(local);
+            var v = try self.readHeld(local);
             try self.publish(t, local, rec, Layout.staged(size, file_id, null), &.{});
             try self.stageInodePostlude(t, local, &v, size, a.write_flags);
             self.holdAfter(&after);
@@ -4725,7 +4937,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 };
                 return e;
             };
-            const size = if (rep.inode) |v| v.size else @max((try self.readInode(local)).size, wl.size_claim);
+            const size = if (rep.inode) |v| v.size else @max((try self.readHeld(local)).size, wl.size_claim);
             self.data.noteShape(local, size, .striped);
             fuse_write_striped.inc();
             return .{ .size = @intCast(wl.written) };
@@ -4792,7 +5004,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // the claim if a size set landed there since (a truncate crossed
             // this write).
             const claim_epoch = if (self.foreignSlot(globalOf(local))) try self.foreignSizeEpoch(local) else 0;
-            const probe = try self.readInode(local);
+            const probe = try self.readHeld(local);
             try self.refuseWriteOn(probe, local, a);
             if (probe.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
             // The base is the ACCEPTED size: a claim parked by an earlier
@@ -4835,7 +5047,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 var g = self.locks.lockManyUncancelable(self.io, &.{.{ .ino = local, .mode = .shared }}, &.{}) catch unreachable; // one request fits every plan
                 defer g.release(self.io);
                 if (self.write_hold) self.holdPostlude();
-                const v = try self.readInode(local);
+                const v = try self.readHeld(local);
                 const size = @max(self.claimedSize(local, v), self.sizeClaimOf(local, outcome));
                 parked_claim = if (size > v.size) size else 0;
                 try self.parkWriteTimes(local, parked_claim);
@@ -4845,7 +5057,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 var t_owned = true;
                 errdefer if (t_owned) self.store.abandon(t);
                 if (self.write_hold) self.holdPostlude();
-                var v = try self.readInode(local);
+                var v = try self.readHeld(local);
                 const size = @max(self.claimedSize(local, v), self.sizeClaimOf(local, outcome));
                 const claim: u64 = if (size > v.size) size else 0;
                 // Strict cadence (an ack is durable): the bytes land and
@@ -5152,7 +5364,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// settle, the clip, the extension zeros — on the wire service's
         /// own op context.
         pub fn servedTruncateFace(self: *Self) sym_xv.record_ship.TruncateFace {
-            return .{ .ctx = self, .truncate = &servedTruncate, .stale_claim = &servedStaleClaim };
+            return .{ .ctx = self, .truncate = &servedTruncate, .stale_claim = &servedStaleClaim, .deleted = &servedDeleted };
         }
 
         /// THE CLAIM'S EPOCH (the holder's half): a non-holder's write
@@ -5342,7 +5554,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 // holder stages the record and the `+ref` in its tree.
                 c.stage(.meta_backend_start);
                 defer c.stage(.meta_backend_done);
-                try self.data.publishForeign(self.io, local, new, proofs);
+                self.data.publishForeign(self.io, local, new, proofs) catch |e| return self.heldErr(local, e, &fuse_estale_ship_gone);
             } else {
                 const t = try self.beginExclusive(local, @src());
                 var t_owned = true;
@@ -5469,6 +5681,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const t0 = clock.monotonicNs();
             defer fuse_fsync_ns.record(clock.monotonicNs() -| t0);
             const local = try localOf(a.ino);
+            // A foreign file its holder deleted has nothing to make durable:
+            // its stale handle (its token: RAM while cached).
+            if (self.foreignSlot(a.ino)) _ = try self.readHeld(local);
             // The claim this fsync covers: every byte under it was accepted
             // before the data leg below began, so the leg lands it whole.
             const found = self.pending.claimOf(local);
@@ -5764,7 +5979,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
-            var v = try self.readInode(local);
+            var v = try self.readHeld(local);
             try refuseRestricted(v);
             const k = try self.xattrKeyFor(local, a.name);
             if (k.existing) |e| self.gpa.free(e);
@@ -5808,7 +6023,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 return .{ .data = blob.len };
             }
             try screenXattr(a.name, error.NoAttribute);
-            const value = (try self.xattrValue(try localOf(a.ino), a.name)) orelse return error.NoAttribute;
+            const local = try localOf(a.ino);
+            const value = (try self.xattrValue(local, a.name)) orelse {
+                // A foreign file gone at its holder carries no attribute
+                // either: its stale handle, asked on the miss alone.
+                if (self.foreignSlot(a.ino)) _ = try self.readHeld(local);
+                return error.NoAttribute;
+            };
             defer self.gpa.free(value);
             if (a.size == 0) return .{ .size = @intCast(value.len) };
             if (value.len > a.size or value.len > c.window.len) return error.BufferTooSmall;
@@ -5821,7 +6042,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const local = try localOf(a.ino);
             if (try self.tokenServe(local, .{})) |served| {
                 defer served.release(self.io);
-                const e = served.entry orelse return error.FileNotFound;
+                const e = served.entry orelse return self.staleBy(local, &fuse_estale_record_gone);
                 var total: usize = 0;
                 for (e.xattrs) |x| if (!isReservedXattr(x.name)) {
                     total += x.name.len + 1;
@@ -5874,7 +6095,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
-            var v = try self.readInode(local);
+            var v = try self.readHeld(local);
             try refuseRestricted(v);
             var occ: [256]u8 = undefined;
             var n: usize = 0;
@@ -5903,13 +6124,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const ok: filesystem.Ioctl = .{ .out = .{ .result = 0, .flags = 0, .in_iovs = 0, .out_iovs = 0 }, .data_len = 0 };
             const local = try localOf(a.ino);
             if (!cmd.isSet()) {
-                const v = try self.readInode(local);
+                const v = try self.readHeld(local);
                 const n = inode_flags.encodeGet(cmd, v.flags, a.out_size, c.window[filesystem.IOCTL_DATA_OFFSET..]) catch return error.InvalidArgument;
                 return .{ .out = ok.out, .data_len = n };
             }
             if (a.out_size != 0) return error.InvalidArgument;
             if (self.foreignSlot(a.ino)) {
-                const cur = try self.readInode(local);
+                const cur = try self.readHeld(local);
                 const want = inode_flags.resolveSet(cmd, cur.flags, a.in) catch |e| return setFlagsError(e);
                 if (want == cur.flags) return ok;
                 _ = try self.shipRecord(a.ino, .{ .setattr = .{ .flags = want & record.INODE_FLAGS_ATTR } });
@@ -5919,7 +6140,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
-            var v = try self.readInode(local);
+            var v = try self.readHeld(local);
             const want = inode_flags.resolveSet(cmd, v.flags, a.in) catch |e| return setFlagsError(e);
             if (want == v.flags) {
                 t_owned = false;
@@ -7538,7 +7759,7 @@ test "the corpse destroy settles the write-side custody BEFORE it reads the layo
     try testing.expectEqual(@as(u32, 0), h.data.locks_taken_at_flush);
     try testing.expectEqual(@as(u32, 1), h.data.base.layout_locks_taken);
     try testing.expectEqual(@as(u32, 0), h.data.base.layout_lock_held);
-    try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+    try testing.expectEqual(linux.E.STALE, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
 }
 
 test "a mkdir on a set that cannot spread (one member, D = 0, one healthy member) reads NO parent record for its depth and asks the mint for a directory at the saturated depth; the child still records its depth off the guarded parent read — /a 1, /a/b 2, /a/b/c 3 — and a legacy parent's child records 255 (decision 0003 §BZ)" {
@@ -7657,7 +7878,7 @@ test "a FORGET whose corpse judgement would park the drain worker (the inode rea
     // nothing of its kernel to invalidate.
     try testing.expect(h.store.last_leafwise and h.store.last_kernel_origin);
     try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
-    try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+    try testing.expectEqual(linux.E.STALE, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, g).errno());
     // Judged on the spot when the read serves: a corpse gathers, a live
     // inode does not. A name's change (the unlink) is never leafwise.
@@ -7691,7 +7912,7 @@ test "a FORGET whose corpse judgement read FAILED (not WouldBlock: the set face 
     try h.fs.reclaimDrain(&c);
     try testing.expectEqual(destroyed0 + 1, fuse_reclaim_destroys.load());
     try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
-    try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+    try testing.expectEqual(linux.E.STALE, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
 }
 
 test "a release is a live owner of its block from before its releasing commit until its free (decision 0003 §AH.1; the online fsck's `[C2] leaked` window — between the two the allocator tracks a block no record names): every binding the handler frees after a commit — the corpse destroy's, a truncate's, an O_TRUNC open's — is held in flight by a hold its commit followed and dropped after the free; the own block a promotion mints stays a live owner until its publish lands; nothing stays held" {
@@ -10965,7 +11186,7 @@ test "unlinked-open file: readable until the final FORGET; the forget gathers th
     try testing.expectEqual(commits0 + 1, h.store.commits);
     try testing.expectEqual(inodes0, h.store.countKind(key.TREE_INODES));
     try testing.expectEqual(xattrs0, h.store.countKind(key.TREE_XATTRS));
-    try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+    try testing.expectEqual(linux.E.STALE, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
     try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
     // A forget of a LIVE inode never gathers.
     const g = try h.create(1, "g", 0o644);
@@ -11118,9 +11339,152 @@ test "THE DELETE discards a corpse's custody and never lands it (the owner's rul
     }
     try testing.expectEqualSlices(u64, &.{le}, h.data.cleared.items);
     try testing.expectEqual(@as(u32, 0), h.data.flushes);
-    try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
-    try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, d).errno().?);
+    try testing.expectEqual(linux.E.STALE, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+    try testing.expectEqual(linux.E.STALE, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, d).errno().?);
     try testing.expectEqual(@as(usize, 0), h.fs.reclaim.items.len);
+}
+
+/// A wire's faces as `KvFs.ForeignWatch` sees them, recorded: the
+/// registration filter's answer (`may`) and what the delete had done when
+/// it read it; the kernel views dropped.
+fn DeleteWatch(comptime H: type) type {
+    return struct {
+        h: *H,
+        may: bool = true,
+        looks: u32 = 0,
+        registered_at_look: bool = false,
+        discards_at_look: usize = 0,
+        dropped: [8]u64 = @splat(0),
+        n_dropped: usize = 0,
+
+        const W = @This();
+
+        fn held(_: *anyopaque, _: u64) bool {
+            return false;
+        }
+        fn mayHold(ctx: *anyopaque, local: u64) bool {
+            const w: *W = @ptrCast(@alignCast(ctx));
+            w.looks += 1;
+            w.registered_at_look = w.h.fs.deleted.has(local);
+            if (@hasField(@TypeOf(w.h.data), "deletes")) w.discards_at_look = w.h.data.deletes.items.len;
+            return w.may;
+        }
+        fn drop(ctx: *anyopaque, local: u64) void {
+            const w: *W = @ptrCast(@alignCast(ctx));
+            if (w.n_dropped < w.dropped.len) w.dropped[w.n_dropped] = local;
+            w.n_dropped += 1;
+        }
+        fn face(w: *W) H.Fs.ForeignWatch {
+            return .{ .ctx = w, .held = &held, .may_hold = &mayHold, .drop_kernel_view = &drop };
+        }
+    };
+}
+
+test "THE CROSS-MEMBER DELETE, the holder's side (the owner's ruling 2026-11-03, decision 0003 §DH): on a mount with a wire the FORGET that proves a corpse REGISTERS it before the data plane's discard, THEN reads the registration filter and kicks the destroy when a member may hold a grant made before it — `deletedHere` answers true until the destroy commits; a member holding no grant kicks nothing; a deferred judgement registers nothing; a flat mount registers nothing; a trailing delete leaves the registry once the tick finds its record gone" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    var w: DeleteWatch(H) = .{ .h = &h };
+    h.fs.bindForeignWatch(w.face());
+    const f = try h.create(1, "f", 0o644);
+    const lf = try H.Fs.localOf(f);
+    const g = try h.create(1, "g", 0o644);
+    const lg = try H.Fs.localOf(g);
+    const e = try h.create(1, "e", 0o644);
+    const le = try H.Fs.localOf(e);
+    for ([_][]const u8{ "f", "g", "e" }) |name| try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = name } }, 1).errno());
+    for ([_]u64{ f, g, e }) |x| h.release(x);
+    const reg0 = fuse_delete_registry.load();
+    // Unlinked, not yet forgotten: alive to every member.
+    try testing.expect(!h.fs.deletedHere(lf));
+    const kicks0 = fuse_delete_kicks.load();
+    _ = h.fs.takeCorpseKick();
+    h.forget(f, 1);
+    try testing.expectEqual(@as(u32, 1), w.looks);
+    try testing.expect(w.registered_at_look);
+    try testing.expectEqual(@as(usize, 0), w.discards_at_look);
+    try testing.expectEqualSlices(u64, &.{lf}, h.data.deletes.items);
+    try testing.expect(h.fs.deletedHere(lf));
+    try testing.expectEqual(kicks0 + 1, fuse_delete_kicks.load());
+    try testing.expect(h.fs.takeCorpseKick());
+    // No member holds a grant on `g`: registered, nothing kicked.
+    w.may = false;
+    h.forget(g, 1);
+    try testing.expect(h.fs.deletedHere(lg));
+    try testing.expectEqual(kicks0 + 1, fuse_delete_kicks.load());
+    try testing.expect(!h.fs.takeCorpseKick());
+    // A judgement the try-only read refused proves nothing: unregistered.
+    h.store.try_only_refusals = 1;
+    h.forget(e, 1);
+    try testing.expect(!h.fs.deletedHere(le));
+    try testing.expectEqual(reg0 + 2, fuse_delete_registry.load());
+    var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
+    var win: [16]u8 = undefined;
+    var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
+    try h.fs.reclaimDrain(&c);
+    tr.finish();
+    // The destroys committed: every delete leaves the registry.
+    try testing.expect(!h.fs.deletedHere(lf) and !h.fs.deletedHere(lg));
+    try testing.expectEqual(reg0, fuse_delete_registry.load());
+    // A trailing delete (its record outlived its pass) leaves at the tick
+    // once the record is gone, never while it stands.
+    const x = try h.create(1, "x", 0o644);
+    const lx = try H.Fs.localOf(x);
+    try testing.expect(h.fs.deleted.insert(testing.allocator, lx));
+    try testing.expect(h.fs.deleted.insert(testing.allocator, lx + 1000));
+    h.fs.deleted.markTrailing(lx);
+    h.fs.deleted.markTrailing(lx + 1000);
+    h.fs.pruneDeleted();
+    try testing.expect(h.fs.deleted.has(lx));
+    try testing.expect(!h.fs.deleted.has(lx + 1000));
+    h.fs.deleted.remove(lx);
+    try testing.expectEqual(reg0, fuse_delete_registry.load());
+    // A flat mount (no wire): no member to answer, nothing registered.
+    h.fs.bindForeignWatch(null);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "x" } }, 1).errno());
+    h.release(x);
+    h.forget(x, 1);
+    try testing.expect(!h.fs.deleted.has(lx));
+}
+
+test "THE CROSS-MEMBER DELETE, the member's side (decision 0003 §DH): every nodeid op whose inode record is gone answers ESTALE — getattr, open, read, write, a size setattr, a mode setattr, setxattr — counted and dropping this mount's kernel view of it; a name op on the gone name is negative (a lookup) or ENOENT (an unlink) as ever" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var w: DeleteWatch(Harness) = .{ .h = &h, .may = false };
+    h.fs.bindForeignWatch(w.face());
+    const f = try h.create(1, "f", 0o644);
+    _ = h.write(f, 0, "payload", 0);
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "f" } }, 1).errno());
+    h.release(f);
+    h.forget(f, 1);
+    var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
+    var win: [16]u8 = undefined;
+    var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
+    try h.fs.reclaimDrain(&c);
+    tr.finish();
+    const gone0 = fuse_estale_record_gone.load();
+    try testing.expectEqual(linux.E.STALE, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+    try testing.expectEqual(linux.E.STALE, h.call(.{ .open = .{ .flags = 2, .open_flags = 0 } }, f).errno().?);
+    try testing.expectEqual(linux.E.STALE, h.read(f, 0, 7).errno().?);
+    try testing.expectEqual(linux.E.STALE, h.write(f, 0, "late", 0).errno().?);
+    var size: abi.fuse_setattr_in = std.mem.zeroes(abi.fuse_setattr_in);
+    size.valid = abi.FATTR_SIZE;
+    size.size = 1;
+    try testing.expectEqual(linux.E.STALE, h.setattr(f, size).errno().?);
+    var mode: abi.fuse_setattr_in = std.mem.zeroes(abi.fuse_setattr_in);
+    mode.valid = abi.FATTR_MODE;
+    mode.mode = 0o600;
+    try testing.expectEqual(linux.E.STALE, h.setattr(f, mode).errno().?);
+    try testing.expectEqual(linux.E.STALE, h.call(.{ .setxattr = .{ .name = "user.x", .value = "v", .flags = 0 } }, f).errno().?);
+    try testing.expectEqual(gone0 + 7, fuse_estale_record_gone.load());
+    try testing.expectEqual(@as(usize, 7), w.n_dropped);
+    for (w.dropped[0..7]) |d| try testing.expectEqual(try Harness.Fs.localOf(f), d);
+    try testing.expectEqual(@as(u64, 0), (try h.entry(h.lookup(1, "f"))).nodeid);
+    try testing.expectEqual(linux.E.NOENT, h.call(.{ .unlink = .{ .name = "f" } }, 1).errno().?);
 }
 
 test "the corpse sweep at mount: an unlinked file whose FORGET died with the daemon (nlink 0, no dentry) is destroyed by the next mount's sweep with its layout; live files are untouched; a clean store sweeps nothing" {
@@ -11678,7 +12042,8 @@ test "every reply's errno is a row of the ONE table" {
     defer h.deinit();
     const probes = [_]struct { req: codec.Request, nodeid: u64, want: errors.Error }{
         .{ .req = .{ .lookup = .{ .name = "" } }, .nodeid = 1, .want = error.InvalidArgument },
-        .{ .req = .{ .getattr = .{ .flags = 0, .fh = null } }, .nodeid = 999, .want = error.FileNotFound },
+        // A nodeid whose record is gone: the stale handle (decision 0003 §DH).
+        .{ .req = .{ .getattr = .{ .flags = 0, .fh = null } }, .nodeid = 999, .want = error.StaleHandle },
         .{ .req = .{ .rmdir = .{ .name = "nope" } }, .nodeid = 1, .want = error.FileNotFound },
         .{ .req = .{ .opendir = .{ .flags = 0, .open_flags = 0 } }, .nodeid = 999, .want = error.FileNotFound },
         .{ .req = .{ .removexattr = .{ .name = "user.x" } }, .nodeid = 1, .want = error.NoAttribute },

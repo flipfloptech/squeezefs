@@ -104,7 +104,6 @@ const sym_park = @import("../meta/sym/membership/park_reclaim.zig");
 const extent_grant = @import("../meta/sym/extent_grant.zig");
 const lease_clock = @import("../meta/guard/lease_clock.zig");
 const ro_mount = @import("../meta/sym/tokens/ro_mount.zig");
-const token_table = @import("../meta/sym/tokens/token_table.zig");
 const wire_endpoint = @import("../wire/endpoint.zig");
 const handler = @import("../fuse/handler.zig");
 const transport = @import("../fuse/transport.zig");
@@ -648,11 +647,16 @@ fn mountMain(ctx: *Ctx) u8 {
         // first: the write cache's residents promoted, every other write
         // custody landed and its size claim journaled (charter §6.1
         // coherence; `KvFs.landForGrant`).
-        wp.holder.prepare = .{ .ctx = &fs, .run = &landForGrant, .pending = &grantPending, .size_epoch = &grantSizeEpoch };
+        // ... and a grant of an object this holder deleted is `gone`
+        // (decision 0003 §DH: its bytes left with its FORGET).
+        wp.holder.prepare = .{ .ctx = &fs, .run = &landForGrant, .pending = &grantPending, .size_epoch = &grantSizeEpoch, .deleted = &grantDeleted };
         // ... and this mount's own extending write on an object a member
         // holds a grant on lands before its ack (register-then-check's
         // writer half, `KvFs.landIfWatched`).
-        fs.bindForeignWatch(.{ .ctx = &wp.holder, .held = &holderHeld });
+        // A delete a member may hold a grant on kicks the destroy that
+        // recalls it, and a file gone at its holder drops this mount's
+        // kernel view of it (decision 0003 §DH).
+        fs.bindForeignWatch(.{ .ctx = wp, .held = &holderHeld, .may_hold = &holderMayHold, .drop_kernel_view = &dropKernelView });
         // The read divert: a foreign slot's records come under a token or
         // answer the typed EAGAIN, never off this mount's cache; a token
         // whose records served the kernel stays this mount's at its holder
@@ -1306,10 +1310,26 @@ fn grantPending(ctx: *anyopaque, object: u64) bool {
     return fs.claimParked(object);
 }
 
-/// `KvFs.ForeignWatch` over the wire's token holder.
+/// `PrepareSeam.deleted`: this holder deleted the object (decision 0003 §DH).
+fn grantDeleted(ctx: *anyopaque, object: u64) bool {
+    const fs: *BackendFs = @ptrCast(@alignCast(ctx));
+    return fs.deletedHere(object);
+}
+
+/// `KvFs.ForeignWatch` over the wire's token holder and recall sink.
 fn holderHeld(ctx: *anyopaque, local: u64) bool {
-    const h: *token_table.Holder = @ptrCast(@alignCast(ctx));
-    return h.held(local);
+    const wp: *sym_wire.WirePlane = @ptrCast(@alignCast(ctx));
+    return wp.holder.held(local);
+}
+
+fn holderMayHold(ctx: *anyopaque, local: u64) bool {
+    const wp: *sym_wire.WirePlane = @ptrCast(@alignCast(ctx));
+    return wp.holder.mayHold(local);
+}
+
+fn dropKernelView(ctx: *anyopaque, local: u64) void {
+    const wp: *sym_wire.WirePlane = @ptrCast(@alignCast(ctx));
+    wp.dropKernelView(local);
 }
 
 fn stripeFloor(be: *meta_set.MetaSet) sym_xv.stripe.Floor {
@@ -1619,6 +1639,7 @@ const ReclaimCadence = struct {
             }
             _ = self.fs.takeCorpseKick();
             self.fs.reclaimDrain(&ctx) catch |e| log.err("reclaim cadence: drain failed: {t}", .{e});
+            self.fs.pruneDeleted();
             next_tick_ns = clock.monotonicNs() + RECLAIM_CADENCE_NS;
             self.drainIdleOwed(&ctx);
             // The cross-owner cadence rides the same meta fiber: the

@@ -1469,6 +1469,52 @@ test "a grant ask parked on the member's OWN pending recall whose lease lapses d
     try testing.expect(!f.holder.holdsGrant(io, objectOf(3), 1));
 }
 
+fn applyNothing(_: *TwoMembers) anyerror!void {}
+
+test "THE CROSS-MEMBER DELETE (the owner's ruling 2026-11-03, decision 0003 §DH): a grant of an object its holder deleted answers `gone` — its record still stands, nothing is registered, counted — and a reader's grant made BEFORE the delete is the registration the holder's next pass over the object recalls (the delete's kicked destroy): until it, the reader's cached entry serves; after it, the reader's next ask is `gone`; another object is served as ever" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 2);
+    defer f.deinit();
+    const Deletes = struct {
+        object: u64 = 0,
+        fn run(_: *anyopaque, _: Io, _: u64) void {}
+        fn deleted(ctx: *anyopaque, object: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return object == self.object;
+        }
+    };
+    var del: Deletes = .{};
+    f.holder.prepare = .{ .ctx = &del, .run = &Deletes.run, .deleted = &Deletes.deleted };
+    var s = (try f.reader(0).serve(io, objectOf(4), .{})).?;
+    try testing.expect(!s.gone());
+    s.release(io);
+    try testing.expect(f.holder.holdsGrant(io, objectOf(4), 1));
+    // The holder deletes the file; its record stands until the destroy.
+    del.object = objectOf(4);
+    const deleted0 = table.stats.dlm_token_grants_deleted.load();
+    s = (try f.reader(1).serve(io, objectOf(4), .{})).?;
+    try testing.expect(s.gone());
+    s.release(io);
+    try testing.expectEqual(deleted0 + 1, table.stats.dlm_token_grants_deleted.load());
+    try testing.expect(!f.holder.holdsGrant(io, objectOf(4), 2));
+    try testing.expect(f.records.inodes.get(objectOf(4)) != null);
+    s = (try f.reader(0).serve(io, objectOf(4), .{})).?;
+    try testing.expect(!s.gone());
+    s.release(io);
+    const sum = try f.commit(&.{objectOf(4)}, &applyNothing);
+    try testing.expectEqual(@as(u32, 1), sum.recalled);
+    try testing.expectEqual(@as(u32, 1), sum.acked);
+    s = (try f.reader(0).serve(io, objectOf(4), .{})).?;
+    try testing.expect(s.gone());
+    s.release(io);
+    try testing.expectEqual(deleted0 + 2, table.stats.dlm_token_grants_deleted.load());
+    try testing.expect(!f.holder.holdsGrant(io, objectOf(4), 1));
+    s = (try f.reader(0).serve(io, objectOf(3), .{})).?;
+    try testing.expect(!s.gone());
+    s.release(io);
+}
+
 test "a grant on a slot another appender leases is answered NotHolder and the reader follows the redirect ONCE inside the op" {
     const gpa = testing.allocator;
     const io = testing.io;

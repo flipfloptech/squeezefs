@@ -65,6 +65,13 @@ pub const PrepareSeam = struct {
     /// records (`GrantPageHead.size_epoch`): a truncate after the read
     /// makes a claim under it stale, never the reverse.
     size_epoch: ?*const fn (ctx: *anyopaque, object: Object) u64 = null,
+    /// The object was deleted at its holder (decision 0003 §DH): the
+    /// holder's final FORGET at nlink 0 discarded its custody and its
+    /// destroy is pending, so every grant is `gone`. Read AFTER the
+    /// registration — the delete registers the object, THEN looks at the
+    /// registration filter (`Holder.mayHold`) to recall what was granted
+    /// before it; the pairing is the delete registry's lock.
+    deleted: ?*const fn (ctx: *anyopaque, object: Object) bool = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -120,6 +127,10 @@ comptime {
 
 pub const stats = struct {
     pub var dlm_token_grants_served: counters.ShardedCounter = .{};
+    /// A grant of an object its holder deleted (decision 0003 §DH: the
+    /// holder's final FORGET at nlink 0, its destroy pending) answered
+    /// `gone`, the registration retracted — the member's ESTALE.
+    pub var dlm_token_grants_deleted: counters.ShardedCounter = .{};
     /// Grants recalled; closure `recalls ≡ recall_acks + recall_expired_
     /// with_lease + recall_timeouts_live` per holder at rest.
     pub var dlm_token_recalls: counters.ShardedCounter = .{};
@@ -1239,6 +1250,13 @@ pub const Holder = struct {
             if (self.prepare) |p| if (p.pending) |pending| if (pending(p.ctx, ask.object)) {
                 stats.dlm_token_grant_late_landings.inc();
                 p.run(p.ctx, io, ask.object);
+            };
+            // A deleted object is gone to every member (decision 0003 §DH):
+            // its record still stands, its bytes do not.
+            if (self.prepare) |p| if (p.deleted) |deleted| if (deleted(p.ctx, ask.object)) {
+                self.retract(io, ask.object, ask.client);
+                stats.dlm_token_grants_deleted.inc();
+                return .gone;
             };
             if (!try self.awaitSettled(io, ask.object, park_deadline)) {
                 self.retract(io, ask.object, ask.client);

@@ -1763,6 +1763,15 @@ pub const WirePlane = struct {
         return self.endpoint_buf[0..self.endpoint_len];
     }
 
+    /// This mount's kernel view of `object` dropped as a recall drops it
+    /// (its lease epoch moved, its pages and attributes invalidated, pruned
+    /// — queued on the sideband): a file gone at its holder (decision 0003
+    /// §DH), whose recall never comes once no grant names it.
+    pub fn dropKernelView(self: *WirePlane, object: u64) void {
+        const s = self.sink.sink();
+        s.noteRecalled(s.ctx, object);
+    }
+
     /// The data plane's foreign-layout face: a foreign slot's `layout`
     /// xattr off the holder's token page (the divert's serve; a `local`
     /// verdict reads the store).

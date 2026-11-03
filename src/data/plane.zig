@@ -3777,6 +3777,9 @@ pub const DataPlane = struct {
         var proofs: [verbs.PUBLISH_PROOFS_MAX]verbs.DmaProofWire = undefined;
         for (req.proofs, 0..) |p, i| proofs[i] = .{ .vol_tag = p.vol_tag, .offset = p.offset, .len = p.len, .completed_ns = p.completed_ns };
         f.ship(f.ctx, route_table.globalOfEffective(req.ino), value, proofs[0..req.proofs.len]) catch |e| {
+            // The holder deleted the file (decision 0003 §DH): nothing to
+            // land — the upload discards its custody and returns its mint.
+            if (e == error.StaleHandle) return error.NotFound;
             stats.layout_map_merge_failures.inc();
             log.warn("ino {d}: the shipped block-map publish of {d} binding(s) did not land ({s}) — the upload keeps its custody and retries", .{ req.ino, req.inserts.len, @errorName(e) });
             return switch (e) {

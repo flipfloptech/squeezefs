@@ -1775,7 +1775,10 @@ pub const StripeInosSuppliedHead = extern struct {
 };
 pub const StripeInosSupplied = HeadWithArray(StripeInosSuppliedHead, u64, "n", STRIPES_MAX);
 
-pub const RecordShipReplyKind = enum(u8) { served = 0, slot_moved = 1 };
+/// `gone`: the object has no live record at its holder — destroyed, or
+/// deleted there and waiting for its destroy (decision 0003 §DH): nothing
+/// applied, the requester's ESTALE.
+pub const RecordShipReplyKind = enum(u8) { served = 0, slot_moved = 1, gone = 2 };
 
 pub const RecordShipReply = extern struct {
     kind: u8,
@@ -1786,7 +1789,7 @@ pub const RecordShipReply = extern struct {
     reserved2: [4]u8,
 
     pub fn check(self: RecordShipReply) bool {
-        return self.kind <= 1 and self.has_inode <= 1;
+        return self.kind <= @backingInt(RecordShipReplyKind.gone) and self.has_inode <= 1;
     }
 };
 
@@ -2332,6 +2335,9 @@ test "cross-owner payloads: a step with a name, the exact lookup, travelling gua
     const inos_ = [_]u64{ 1 << 40 | 100, 1 << 40 | 101 };
     _ = try roundTrip(StripeInosSupplied, .{ .head = .{ .n = 2, .reserved = @splat(0) }, .items = &inos_ });
     _ = try roundTrip(RecordShipReply, .{ .kind = 1, .has_inode = 0, .reserved = 0, .holder = 4, .inode = std.mem.zeroes(InodeValueWire), .reserved2 = @splat(0) });
+    // `gone` (decision 0003 §DH) is the last kind; past it the shape refuses.
+    _ = try roundTrip(RecordShipReply, .{ .kind = @backingInt(RecordShipReplyKind.gone), .has_inode = 0, .reserved = 0, .holder = 0, .inode = std.mem.zeroes(InodeValueWire), .reserved2 = @splat(0) });
+    try testing.expect(!(RecordShipReply{ .kind = @backingInt(RecordShipReplyKind.gone) + 1, .has_inode = 0, .reserved = 0, .holder = 0, .inode = std.mem.zeroes(InodeValueWire), .reserved2 = @splat(0) }).check());
     const blocks = [_]u64{ 5, 6, 7 };
     _ = try roundTrip(FreeBlocksReq, .{ .head = .{ .volume = 0, .n = 3, .reserved = 0, .vol_tag = 11, .lease_epoch = 2 }, .items = &blocks });
     const fv = try roundTrip(FreeVerdicts, .{ .head = .{ .n = 3, .reserved = @splat(0) }, .verdicts = &.{ 0, 1, 2 } });

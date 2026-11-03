@@ -1223,6 +1223,54 @@ test "decision 0003 §AL.6 — a shipped size change runs the HOLDER's own size 
     try testing.expectEqual(@as(u32, S.IFREG | 0o640), rep.inode.?.mode);
 }
 
+test "THE CROSS-MEMBER DELETE (the owner's ruling 2026-11-03, decision 0003 §DH): a shipped verb on an object its holder deleted — a setattr, a size claim, a truncate, a setxattr, a publish — answers `gone`: nothing applied, no truncate face run, no merits tripwire, counted; a verb on an object with NO record answers `gone` too (it was destroyed under a member's descriptor); the requester's errno is ESTALE" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
+    defer f.deinit();
+    var view: HolderView = .{};
+    var rs_b: RecordShipService = .{ .plane = &f.b.plane, .sink = view.sink() };
+    rs_b.register(&f.b.svc);
+    var publish: RamPublish = .{};
+    const pface = publish.face();
+    rs_b.armPublish(&pface);
+    const file = gino(50, 3);
+    try f.b.seedFile(file, 0);
+    const Faces = struct {
+        truncates: u32 = 0,
+        deleted_ino: u64 = 0,
+        fn truncate(ctx: *anyopaque, _: u64, _: u64) errors.Error!void {
+            @as(*@This(), @ptrCast(@alignCast(ctx))).truncates += 1;
+        }
+        fn deleted(ctx: *anyopaque, global: u64) bool {
+            return @as(*@This(), @ptrCast(@alignCast(ctx))).deleted_ino == global;
+        }
+    };
+    var faces: Faces = .{ .deleted_ino = file };
+    const face: record_ship.TruncateFace = .{ .ctx = &faces, .truncate = &Faces.truncate, .deleted = &Faces.deleted };
+    rs_b.armTruncate(&face);
+    const before = (try f.b.inode(file)).?;
+    const gone0 = record_ship.stats.record_ships_gone.load();
+    const calls = [_]record_ship.Call{
+        .{ .setattr = .{ .mode = 0o600 } },
+        .{ .setattr = .{ .size = 4096, .size_claim = true, .mtime = 9, .ctime = 9 } },
+        .{ .setattr = .{ .size = 0 } },
+        .{ .setxattr = .{ .name = "user.x", .value = "v" } },
+        .{ .publish_layout = .{ .value = "never" } },
+    };
+    for (calls) |call| try testing.expectError(error.Gone, record_ship.ship(f.a.plane.resolver, 0, file, call, 0));
+    try testing.expectEqual(gone0 + calls.len, record_ship.stats.record_ships_gone.load());
+    try testing.expectEqual(@as(u32, 0), faces.truncates);
+    try testing.expectEqual(@as(u32, 0), publish.staged);
+    const after = (try f.b.inode(file)).?;
+    try testing.expectEqual(before.mode, after.mode);
+    try testing.expectEqual(before.size, after.size);
+    // No record at all: gone as well, the face's size path never reached.
+    faces.deleted_ino = 0;
+    try testing.expectError(error.Gone, record_ship.ship(f.a.plane.resolver, 0, gino(51, 3), .{ .setattr = .{ .mode = 0o600 } }, 0));
+    try testing.expectEqual(gone0 + calls.len + 1, record_ship.stats.record_ships_gone.load());
+    try testing.expectEqual(errors.Error.StaleHandle, record_ship.coreError(error.Gone));
+}
+
 test "THE CLAIM LAW — a non-holder WRITE's shipped size claim (SETATTR_SIZE_CLAIM) raises the holder's size to max(size, claim) in the verb's entry and NEVER runs the holder's size path (its extension zeros landed over the claimer's published bytes: a joiner's `>>` read back zeros on both mounts); a claim at or below the size moves nothing (a shrink by a stale view is impossible); the stamps ride; a truncate still runs the face; counted" {
     const gpa = testing.allocator;
     const f = try TwoHolders.init(gpa, testing.io, .{}, .{});

@@ -71,6 +71,10 @@ pub const stats = struct {
     /// A served verb refused on its merits (must stay 0; a slot-moved
     /// answer is the requester's re-resolve, not a refusal).
     pub var record_refusals: counters.Tripwire = .init("record_refusals");
+    /// Verbs served here on an object with no live record — destroyed, or
+    /// deleted and waiting for its destroy (decision 0003 §DH): answered
+    /// `gone`, nothing applied (a member's descriptor outlived the file).
+    pub var record_ships_gone: counters.ShardedCounter = .{};
     /// A `SlotMoved` answer re-resolved ONCE and re-dispatched.
     pub var record_ship_redirects: counters.ShardedCounter = .{};
     /// A foreign slot whose holder has no bound endpoint: EAGAIN.
@@ -229,9 +233,14 @@ pub const TruncateFace = struct {
     /// any block the claimer's late publish bound past it (the truncate
     /// wins: "write, then truncate"). Null = no claim is judged.
     stale_claim: ?*const fn (ctx: *anyopaque, global: u64, epoch: u64) errors.Error!bool = null,
+    /// The object was deleted here (its holder's final FORGET at nlink 0,
+    /// decision 0003 §DH) and waits for its destroy: every verb is `gone`.
+    /// Null = no delete is judged (a record's absence still is).
+    deleted: ?*const fn (ctx: *anyopaque, global: u64) bool = null,
 };
 
-pub const ShipError = error{ OutOfMemory, SlotMoved, HolderUnreachable, Deferred, Io, Rejected, ValueTooLarge, NoAttribute };
+/// `Gone`: the holder has no live record of the object (decision 0003 §DH).
+pub const ShipError = error{ OutOfMemory, SlotMoved, HolderUnreachable, Deferred, Io, Rejected, ValueTooLarge, NoAttribute, Gone };
 
 pub fn coreError(e: ShipError) errors.Error {
     return switch (e) {
@@ -243,6 +252,8 @@ pub fn coreError(e: ShipError) errors.Error {
         error.Rejected => error.Rejected,
         error.ValueTooLarge => error.ValueTooLarge,
         error.NoAttribute => error.NoAttribute,
+        // A member's descriptor outlived the file: the stale handle.
+        error.Gone => error.StaleHandle,
     };
 }
 
@@ -312,6 +323,10 @@ pub fn ship(resolver: ops.Resolver, volume: u16, global: u64, call: Call, lease_
                     },
                 };
                 const r = rep.record_ship;
+                if (r.kind == @backingInt(verbs.RecordShipReplyKind.gone)) {
+                    if (call.isPublish()) stats.foreign_publish_refusals.inc();
+                    return error.Gone;
+                }
                 if (r.kind == @backingInt(verbs.RecordShipReplyKind.slot_moved)) {
                     if (redirected) return error.SlotMoved;
                     redirected = true;
@@ -466,6 +481,7 @@ pub fn RecordShipService(comptime Store: type) type {
             };
             const rep = self.apply(r.head.ino, call) catch |e| return switch (e) {
                 error.SlotMoved => .{ .ok = .{ .record_ship = .{ .kind = @backingInt(verbs.RecordShipReplyKind.slot_moved), .has_inode = 0, .reserved = 0, .holder = 0, .inode = std.mem.zeroes(verbs.InodeValueWire), .reserved2 = @splat(0) } } },
+                error.Gone => .{ .ok = .{ .record_ship = .{ .kind = @backingInt(verbs.RecordShipReplyKind.gone), .has_inode = 0, .reserved = 0, .holder = 0, .inode = std.mem.zeroes(verbs.InodeValueWire), .reserved2 = @splat(0) } } },
                 error.Deferred => service.Answer.deferred("the holder's door deferred the verb"),
                 error.OutOfMemory => service.Answer.refused(error.OutOfMemory, "out of memory serving the record verb"),
                 error.ValueTooLarge => service.Answer.refused(error.ValueTooLarge, "the record value is past the cap"),
@@ -494,12 +510,15 @@ pub fn RecordShipService(comptime Store: type) type {
 
         /// Apply `call` to `global` at this holder under its door: ONE
         /// entry; the own-cache and kernel invalidation after it. A verb
-        /// naming an inode with NO record here is refused (a shipped
-        /// publish never plants a layout for a missing record — the
-        /// ordering law a reader relies on).
+        /// naming an inode with NO live record here — none, or one this
+        /// holder deleted (decision 0003 §DH) — is `Gone`, nothing applied
+        /// (a shipped publish never plants a layout for a missing record —
+        /// the ordering law a reader relies on; a member's write into a
+        /// deleted file lands nowhere).
         pub fn apply(self: *Self, global: u64, call: Call) ShipError!Reply {
             if (!self.plane.isLocal(global)) return error.SlotMoved;
             if (self.plane.seams.serve_hold) |h| h.park(self.plane.io);
+            if (self.truncate.load(.acquire)) |face| if (face.deleted) |deleted| if (deleted(face.ctx, global)) return gone();
             // A size change runs the holder's own size path first (its
             // commit carries the size); the verb's other fields ride the
             // entry below. A WRITE's size claim is no size change: it rides
@@ -509,6 +528,7 @@ pub fn RecordShipService(comptime Store: type) type {
                 face.truncate(face.ctx, global, sz) catch |e| return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
                     error.SlotMoved => error.SlotMoved,
+                    error.FileNotFound, error.StaleHandle => gone(),
                     else => error.Io,
                 };
             };
@@ -520,6 +540,7 @@ pub fn RecordShipService(comptime Store: type) type {
                 if (face.stale_claim) |stale| claim_refused = stale(face.ctx, global, call.setattr.claim_epoch) catch |e| return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,
                     error.SlotMoved => error.SlotMoved,
+                    error.FileNotFound, error.StaleHandle => gone(),
                     else => error.Io,
                 };
             }
@@ -561,7 +582,7 @@ pub fn RecordShipService(comptime Store: type) type {
             t.door = door;
             var owned = true;
             errdefer if (owned) a.store.abandon(t);
-            var v = (a.readInode(global) catch return error.Io) orelse return error.Io;
+            var v = (a.readInode(global) catch return error.Io) orelse return gone();
             const now: u64 = @bitCast(clock.realtimeCoarseNs());
             switch (call) {
                 .setattr => |s| if (s.atime_touch) {
@@ -658,6 +679,12 @@ pub fn RecordShipService(comptime Store: type) type {
             if (call.isPublish()) stats.foreign_publish_served.inc();
             self.sink.noteServed(global, call.isPublish());
             return .{ .inode = v };
+        }
+
+        /// A verb on an object with no live record here: counted, `Gone`.
+        fn gone() ShipError {
+            stats.record_ships_gone.inc();
+            return error.Gone;
         }
 
         pub const XattrHit = struct { k: [key.XATTR_KEY_LEN]u8 };

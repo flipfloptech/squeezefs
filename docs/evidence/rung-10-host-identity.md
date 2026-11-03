@@ -61,7 +61,7 @@ registration that re-admits a host while a stale sibling of the set lives there.
 
 Every NVMe writer open replays the claim privately three times (round 6; each: both superblock copies,
 the 128 KiB ledger, the WHOLE fixed ring). On a 256 MiB ring: 805,675,008 B per open, 0 frames on a
-clean first open, 12,024 on a kill -9 remount (≈ 4,000 per probe). The derived ring caps at 32 MiB
+clean first open, 12,021–12,030 on a kill -9 remount (≈ 4,000 per probe; six runs, two under load). The derived ring caps at 32 MiB
 (≈ 96 MiB per open); `--meta-journal-mb` reaches 1 GiB (≈ 3 GiB per open). A lapse adds up to three
 more per beat. Documented (review 5 minor 4); a knob or a lighter probe is later work.
 

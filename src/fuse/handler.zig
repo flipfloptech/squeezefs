@@ -322,7 +322,8 @@ test "ring binding: the session's vtable reaches the lifecycle — init negotiat
     f.dispatch(.{ .header = .{ .len = 40, .opcode = 3, .unique = 6, .nodeid = 777, .uid = 0, .gid = 0, .pid = 0, .total_extlen = 0, .padding = 0 }, .op = .{ .getattr = .{ .flags = 0, .fh = null } } }, h2, null);
     try testing.expectEqual(@as(u32, 2), rec.replies);
     try testing.expectEqual(@as(u32, 1), rec.fails);
-    try testing.expectEqual(linux.E.NOENT, rec.last_errno);
+    // A nodeid with no record is a stale handle (decision 0003 §DH): ESTALE.
+    try testing.expectEqual(linux.E.STALE, rec.last_errno);
     // RELEASE through the handle, then the worker-side forget hand-off:
     // the open table closes the ino with nothing stranded.
     const stranded0 = @import("../core/counters.zig").tripwireCount("open_count_stranded");

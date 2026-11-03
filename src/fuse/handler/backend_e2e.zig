@@ -179,7 +179,8 @@ test "first mount e2e: format → mount → create/write/read/mkdir/readdir/rena
         // DESTROY drains the gather (the dismount sweep).
         try testing.expectEqual(@as(?linux.E, null), m.call(.destroy, 1).errno());
         try testing.expectEqual(@as(usize, 0), m.fs.reclaim.items.len);
-        try testing.expectEqual(linux.E.NOENT, m.call(.{ .getattr = .{ .flags = 0, .fh = null } }, g).errno().?);
+        // The destroyed corpse's nodeid is a stale handle (decision 0003 §DH): ESTALE.
+        try testing.expectEqual(linux.E.STALE, m.call(.{ .getattr = .{ .flags = 0, .fh = null } }, g).errno().?);
         try testing.expectEqual(@as(u64, 0), m.opens.openCount());
     }
     try testing.expectEqual(stranded0, counters.tripwireCount("open_count_stranded"));

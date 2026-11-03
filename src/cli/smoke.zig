@@ -17908,7 +17908,7 @@ fn corpseCensus(rig: *Rig) !struct { gathered: u64, destroys: u64 } {
     };
 }
 
-test "smoke: A FILE ANOTHER MEMBER DELETED ANSWERS ESTALE ON A JOINED MEMBER'S OPEN DESCRIPTORS — NEVER ZEROS, NEVER SUCCESS, NEVER ANOTHER FILE'S BYTES (the owner's ruling 2026-11-03) — A (the manager) and B JOINED, both supervised (the write cache ON): A writes `d/s` (20,000 B, a resident of its write cache) and `d/g` (4 MiB + 4 KiB, fsync'd: striped, landed); a process on A and one on B open both read-write and B reads both byte-exact → A `rm`s them, still open on A: B reads both byte-exact and writes 4 KiB into `g`, which A's descriptor reads back (the file lives while its holder's kernel holds it) → A writes through its descriptors (`s` re-staged, `g` fsync'd) and closes them: its FORGETs are the delete, the destroy held (SQUEEZEFS_TEST_CORPSE_DESTROY_HOLD) → every op of B's descriptors — a read past the cached size, fstat, write, fsync, ftruncate — answers ESTALE, a buffered read inside the cached size EIO (the kernel's page-cache read path), an mmap'd read SIGBUS → the destroy lands → the same again → A creates 64 files in `d`: none takes a deleted ino and B's descriptors still answer so, never another file's bytes nor their own refused writes' → B closes both → no tripwire, no error line, no lost staged read; umount both, fsck clean (red on dev: after the delete B read `s` as 20,000 zero bytes — the discarded resident, staged_payload_lost_reads — and `g`'s bytes, and its write, fsync and ftruncate succeeded into the corpse; after the destroy fstat and write answered ENOENT, fsync succeeded, ftruncate answered EIO and fired A's record_refusals tripwire, and a read returned B's own refused write's page)" {
+test "smoke: A FILE ANOTHER MEMBER DELETED ANSWERS ESTALE ON A JOINED MEMBER'S OPEN DESCRIPTORS — NEVER ZEROS, NEVER SUCCESS, NEVER ANOTHER FILE'S BYTES (the owner's ruling 2026-11-03) — A (the manager) and B JOINED (noatime), both supervised (the write cache ON): A writes `d/s` (20,000 B, a resident of its write cache) and `d/g` (4 MiB + 4 KiB, fsync'd: striped, landed); a process on A and one on B open both read-write and B reads both byte-exact → A `rm`s them, still open on A: B reads both byte-exact and writes 4 KiB into `g`, which A's descriptor reads back (the file lives while its holder's kernel holds it) → A writes through its descriptors (`s` re-staged, `g` fsync'd) and closes them: its FORGETs are the delete, the destroy held (SQUEEZEFS_TEST_CORPSE_DESTROY_HOLD) → every op of B's descriptors — a read past the cached size, fstat, write, fsync, ftruncate — answers ESTALE, a buffered read inside the cached size EIO (the kernel's page-cache read path), an mmap'd read SIGBUS → the destroy lands → the same again → A creates 64 files in `d`: none takes a deleted ino and B's descriptors still answer so, never another file's bytes nor their own refused writes' → B closes both → no tripwire, no error line, no lost staged read; umount both, fsck clean (red on dev: after the delete B read `s` as 20,000 zero bytes — the discarded resident, staged_payload_lost_reads — and `g`'s bytes, and its write, fsync and ftruncate succeeded into the corpse; after the destroy fstat and write answered ENOENT, fsync succeeded, ftruncate answered EIO and fired A's record_refusals tripwire, and a read returned B's own refused write's page)" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -17925,7 +17925,12 @@ test "smoke: A FILE ANOTHER MEMBER DELETED ANSWERS ESTALE ON A JOINED MEMBER'S O
     _ = try rig.awaitReady(0);
     const b = try Peer.init(rig, "b");
     defer b.deinit();
-    try b.spawnAsSet(&.{});
+    // B mounts noatime: its relatime drain ships each read's access stamp
+    // and then serves the file's token to raise its cached atime — a grant
+    // asked in the background, which landing between A's last recall and
+    // A's delete is one the delete kicks a recall for (§DH.6) that the held
+    // destroy never sends (B then answered from its cache: 1 run in ~170).
+    try b.spawnAsSet(&.{ "-o", "noatime" });
     _ = try b.awaitReady();
     const mark_a = try rig.logLen();
     const mark_b = try b.logLen();
@@ -17995,8 +18000,9 @@ test "smoke: A FILE ANOTHER MEMBER DELETED ANSWERS ESTALE ON A JOINED MEMBER'S O
         defer gpa.free(back);
         book.expect("A reads B's write", back, try std.fmt.bufPrint(&nb, "sha={s} ", .{sha_b4k}));
     }
-    // 4. A writes through its descriptors (each write's commit recalls B)
-    //    and closes them: its FORGETs at nlink 0 are the delete.
+    // 4. A writes through its descriptors and closes them (the commits of
+    //    their stamps and of `g`'s fsync recall B): its FORGETs at nlink 0
+    //    are the delete.
     const c0 = try corpseCensus(rig);
     for ([_][]const u8{ "write d/s 4096 4096 41", "write d/g 8192 4096 41", "fsync d/g", "close d/s", "close d/g" }) |cmd| {
         const a = try ha.ask(cmd);
@@ -18094,6 +18100,8 @@ test "smoke: A FILE ANOTHER MEMBER DELETED ANSWERS ESTALE ON A JOINED MEMBER'S O
         std.debug.print("smoke[cross-member delete] B: staged_payload_lost_reads {d}, fuse_estale_record_gone {?d}, fuse_estale_ship_gone {?d}, fuse_estale_data_gone {?d}; A: dlm_token_grants_deleted {?d}, record_ships_gone {?d}, fuse_delete_kicks {?d}\n", .{ numberAfter(tb, "\"staged_payload_lost_reads\":") orelse 0, numberAfter(tb, "\"fuse_estale_record_gone\":"), numberAfter(tb, "\"fuse_estale_ship_gone\":"), numberAfter(tb, "\"fuse_estale_data_gone\":"), numberAfter(ta, "\"dlm_token_grants_deleted\":"), numberAfter(ta, "\"record_ships_gone\":"), numberAfter(ta, "\"fuse_delete_kicks\":") });
         for ([_]struct { what: []const u8, got: ?u64 }{
             .{ .what = "B's staged_payload_lost_reads", .got = numberAfter(tb, "\"staged_payload_lost_reads\":") },
+            // noatime: no background stamp ship, no background grant.
+            .{ .what = "B's fuse_atime_touches_shipped", .got = numberAfter(tb, "\"fuse_atime_touches_shipped\":") },
             .{ .what = "A's invariant_tripwires", .got = numberAfter(ta, "\"invariant_tripwires\":") },
             .{ .what = "B's invariant_tripwires", .got = numberAfter(tb, "\"invariant_tripwires\":") },
         }) |c| if (c.got != @as(?u64, 0)) {

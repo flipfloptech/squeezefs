@@ -55,6 +55,8 @@ pub const Error = error{
 /// once — review M2 of decision 0003 §DG).
 pub const ARENA_LEN: usize = nvme.IDENTIFY_NS_LEN;
 const IDENTIFY_OFF: usize = 0;
+/// A report buffer's alignment: one page, as the arena's — the passthrough maps the buffer without a bounce.
+const REPORT_BUF_ALIGN: std.mem.Alignment = .fromByteUnits(4096); // a page (the arena's alignment)
 
 pub const Stats = struct {
     registers: u64 = 0,
@@ -366,14 +368,14 @@ pub const Client = struct {
         const h = nvme.reportHeaderLen(extended);
         // Per call, page-aligned (the passthrough maps it): two reports on one
         // client at once never share a buffer.
-        const head = try self.gpa.alignedAlloc(u8, .fromByteUnits(4096), h);
+        const head = try self.gpa.alignedAlloc(u8, REPORT_BUF_ALIGN, h);
         defer self.gpa.free(head);
         try self.issue(.io, &nvme.reservationReport(self.nsid, head, extended));
         var regctl = nvme.reportRegctl(head, extended) orelse 0;
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
             const len = nvme.reportLen(extended, regctl);
-            const buf = try self.gpa.alignedAlloc(u8, .fromByteUnits(4096), len);
+            const buf = try self.gpa.alignedAlloc(u8, REPORT_BUF_ALIGN, len);
             defer self.gpa.free(buf);
             try self.issue(.io, &nvme.reservationReport(self.nsid, buf, extended));
             const seen = nvme.reportRegctl(buf, extended) orelse 0;

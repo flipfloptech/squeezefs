@@ -1940,6 +1940,51 @@ test "nvmet fidelity: a live manager that took over during another open's rule i
     try expectNoResidue(rig, set.data_nqn);
 }
 
+test "nvmet fidelity: an open whose hold's preempt fenced the writer that committed its claim in the instant before the hold takes over (review 4 minor 4) — O (host A) parks after its second claim probe, right before its hold (SQUEEZEFS_TEST_EARLY_HOLD_PARK, no claim yet); W (host B) mounts, binds and writes dw/w; O, released, preempts W's host at its hold, meets W's fresh claim at its third probe and proceeds: O binds as the manager and reads dw/w, W's writes are refused" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "pp", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var fb: [128]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/o-prehold.fifo", .{rig.root}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    var env_o = try rig.envWithKnob("SQUEEZEFS_TEST_EARLY_HOLD_PARK", fifo);
+    defer env_o.deinit();
+    const o = try rig.spawnMountEnv("pp-o", set.metaUri(), &env_o, &.{});
+    try rig.awaitLog(o, "SQUEEZEFS_TEST_EARLY_HOLD_PARK — the open holds", ready_wait_ns);
+    const w = try rig.spawnMount("pp-w", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(w, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, w, "mkdir dw && echo w > dw/w && sync -d dw/w"));
+    releaseFifo(fifo);
+    try testing.expect(try readyOrDead(rig, o));
+    {
+        const so = try rig.stats(o);
+        defer gpa.free(so);
+        try testing.expectEqual(@as(?bool, true), json_scan.boolean(so, "writer_guard_claimed"));
+        try testing.expectEqual(@as(u64, 1), try statNumber(so, "writer_guard_preempts"));
+    }
+    const seen = try rig.onMount(o, "cat dw/w");
+    defer gpa.free(seen);
+    try testing.expectEqualStrings("w\n", seen);
+    const w_wrote = scriptSucceeds(rig, w, "echo x > dw/z && sync -d dw/z") catch false;
+    try testing.expect(!w_wrote);
+    try rig.kill9(w);
+    try rig.umount(o);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
 /// The ring of the probe-cost row: a 256 MiB override on the 1 GiB meta
 /// volume (the derived ring caps at 32 MiB; `--meta-journal-mb` reaches 1 GiB).
 const probe_cost_ring_mib: u64 = 256;

@@ -894,6 +894,16 @@ pub const Early = struct {
     /// by this open's preempt (the gate takes it over).
     fenced_writer: ?u64 = null,
 
+    /// The hold under the early registration (WERO on a symmetric volume,
+    /// Write Exclusive on a flat one) — the caller read the claim right
+    /// before it (review 5 major 1).
+    pub fn takeHold(self: *Early, symmetric: bool, path: []const u8) error{Refused}!void {
+        const c = self.posture.active;
+        c.rtype = if (symmetric) nvme.RTYPE_WERO else nvme.RTYPE_WRITE_EXCLUSIVE;
+        self.hold = try holdReservation(c, path);
+        self.keep_hold = self.hold.kept();
+    }
+
     /// An open that failed before its gate adopted this: the `p` line out,
     /// the registration given back as `leaveRegistration` says (a hold
     /// taken by a preempt, or inherited, stays).
@@ -917,11 +927,11 @@ pub const Early = struct {
 /// Null = no device fence here (a file, no char node, RESCAP 0, the seam):
 /// the gate's own path. `error.Busy` = refused (logged by name). The
 /// caller ran it only when the claim is not a fresh foreign one (review
-/// round 3, major 2: `gate.probeClaim` first); it HOLDS the reservation
-/// before it returns (WERO on a symmetric volume, Write Exclusive on a
-/// flat one): the device's arbitration precedes every device write — two
+/// round 3, major 2: `gate.probeClaim` first), and reads the claim again
+/// before `Early.takeHold` (review 5 major 1: the rule here can outlast the
+/// claim's TTL): the device's arbitration precedes every device write — two
 /// successors' pre-gate writes cannot both land.
-pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map, path: []const u8, set_uuid: [16]u8, vol_index: u32, local: claim.Identity, node_token: u64, pages: PageSource, symmetric: bool) error{ Busy, OutOfMemory }!?*Early {
+pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map, path: []const u8, set_uuid: [16]u8, vol_index: u32, local: claim.Identity, node_token: u64, pages: PageSource) error{ Busy, OutOfMemory }!?*Early {
     if (perMountIdentity(env)) return null;
     const dev = switch (pr_linux.resolve(gpa, path)) {
         .none => return null,
@@ -994,13 +1004,6 @@ pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map,
     e.* = .{ .device = dev, .posture = posture, .reg = p.reg, .fresh = fresh, .writer_id = local.writerId(@intCast(vol_index)) };
     keep_dev = true;
     keep_client = true;
-    c.rtype = if (symmetric) nvme.RTYPE_WERO else nvme.RTYPE_WRITE_EXCLUSIVE;
-    const outcome = holdReservation(c, path) catch {
-        e.discard(gpa);
-        return error.Busy;
-    };
-    e.hold = outcome;
-    e.keep_hold = outcome.kept();
     return e;
 }
 

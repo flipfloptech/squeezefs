@@ -169,11 +169,11 @@ pub const ElectionConfig = struct {
     /// re-register and check, each one critical section (false: separate
     /// steps nothing orders).
     fencer_lock: bool = true,
-    /// The lapse's claim read and its re-acquire as separate steps (true:
-    /// the code's order — the claim probe, then the register and acquire —
-    /// with a successor's bind between them; shown reachable, an accepted
-    /// instant of the lapse class, §DF.13(k), §DG.13(h)).
-    lapse_acquire_split: bool = false,
+    /// After the lapse's re-acquire the device's claim is read AGAIN and the
+    /// volume fail-stops unless it is still this incarnation's (§DG.19; false:
+    /// the probe before the rule's tens of seconds is the only claim read —
+    /// a successor's whole tenure between it and the acquire is overwritten).
+    lapse_claim_reread: bool = true,
 };
 
 const Line = enum(u8) { none, p, m, pm };
@@ -224,9 +224,10 @@ pub fn Election(comptime cfg: ElectionConfig) type {
         const SA_END = 3;
         const JB_DEPART = 3;
         const JB_END = 4;
-        /// Write, the beat (report; after a lapse the host's register), the
-        /// acquire, the fencer's re-register, the check, write.
-        const M0_STEPS: u8 = 6;
+        /// Write, the beat (report; after a lapse the claim probe and the
+        /// host's register), the acquire, the claim's re-read, the fencer's
+        /// re-register, the check, write.
+        const M0_STEPS: u8 = 7;
         const R0 = 6;
 
         reg: [3]bool = .{ true, false, false },
@@ -358,11 +359,12 @@ pub fn Election(comptime cfg: ElectionConfig) type {
             switch (t) {
                 0 => {
                     switch (self.pc[0]) {
-                        0, 5 => self.m0Write(),
+                        0, 6 => self.m0Write(),
                         1 => if (!self.m0Beat()) return,
                         2 => self.m0Acquire(),
-                        3 => if (!self.m0FencerRegister()) return,
-                        4 => self.m0FencerCheck(),
+                        3 => self.m0ClaimReread(),
+                        4 => if (!self.m0FencerRegister()) return,
+                        5 => self.m0FencerCheck(),
                         else => unreachable,
                     }
                     self.pc[0] += 1;
@@ -443,8 +445,15 @@ pub fn Election(comptime cfg: ElectionConfig) type {
             if (self.busy(A, 0)) return false;
             self.reg[A] = true;
             self.m0_lapsed = true;
-            if (!cfg.lapse_acquire_split) self.m0Acquire();
             return true;
+        }
+
+        /// §DG.19: under the re-acquired hold the device's claim read again —
+        /// a successor that bound since the probe replaced it (and deleted it
+        /// at its clean unmount): not ours, the volume fail-stops.
+        fn m0ClaimReread(self: *Self) void {
+            if (!self.m0_reacquired or self.failed[0] or !cfg.lapse_claim_check or !cfg.lapse_claim_reread) return;
+            if (self.claim != 0) self.failed[0] = true;
         }
 
         /// The re-acquire's hold: an acquire on an unreserved namespace; a
@@ -1147,8 +1156,9 @@ test "model weakening (§DG.2): a fencer under a key of its own outlives its hos
     try explorer.expectFails(Election(.{ .fencer_key = .distinct }), limits, error.InvariantViolated);
 }
 
-test "model, an accepted instant (§DG.13(h)): the lapse's claim probe and its re-acquire are separate commands — a successor binding between them leaves the resumed manager re-acquiring on a stale view (OverwroteAcked); the claim's TTL and the lapse class bound it" {
-    try explorer.expectFails(Election(.{ .lapse_acquire_split = true }), limits, error.InvariantViolated);
+test "model weakening (§DG.19, the lapse claim window): without the claim's re-read under the re-acquired hold a successor's whole tenure between the lapse's claim probe and the acquire is overwritten by the resumed manager (OverwroteAcked)" {
+    try explorer.expectFails(Election(.{ .lapse_claim_reread = false }), limits, error.InvariantViolated);
+    try testing.expectEqual(@as(?anyerror, error.OverwroteAcked), firstError(Election(.{ .lapse_claim_reread = false })));
 }
 
 test "model weakening (review M1 of §DG): without the hold checks a fencer re-registered after a successor preempted its host's key (the lapse's re-acquire, the fencer's re-register as separate commands) preempts while its host does not hold — and takes the successor's reservation; without the fencer's lock the recovery's check and preempt straddle the takeover and the re-register" {
@@ -1290,6 +1300,7 @@ test "model: which invariant each weakening breaks" {
     try expectBreaks("a fencer key of its own: the superseded manager's fencer (§DG.2)", firstError(Election(.{ .fencer_key = .distinct })), &.{ error.FencerPreemptUnheld, error.FencerHeld });
     try expectBreaks("no hold checks around the fencer (review M1)", firstError(Election(.{ .fencer_hold_check = false })), &.{error.FencerPreemptUnheld});
     try expectBreaks("no fencer lock (review M1)", firstError(Election(.{ .fencer_lock = false })), &.{error.FencerPreemptUnheld});
+    try expectBreaks("no claim re-read after the lapse's re-acquire (§DG.19)", firstError(Election(.{ .lapse_claim_reread = false })), &.{error.OverwroteAcked});
     try expectBreaks("no own-key guard (§DG.4)", firstError(Member(.{ .semantics = .nvmet, .own_key_guard = false })), &.{ error.FencerFenced, error.ManagerUnreserved });
     try expectBreaks("the fencer's preempts not keeping the hold (§DG.5)", firstError(Member(.{ .semantics = .nvmet, .fencer_preempts_keep_hold = false })), &.{error.FencedMemberWrote});
     try expectBreaks("no re-fence under nvmet + fencer", firstError(Member(.{ .semantics = .nvmet, .refence = false })), &.{error.FencedMemberWrote});

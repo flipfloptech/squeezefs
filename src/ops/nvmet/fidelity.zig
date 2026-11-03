@@ -1751,6 +1751,90 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
     try expectNoResidue(rig, set.data_nqn);
 }
 
+test "nvmet fidelity: a remote joiner never registers or writes before its claim check (review round 3 major 2) — M on host B is the manager; J on host A mounts over M's fresh claim: J's writer attempt refuses before its host registers or its open writes (a held tail, the replay's fold), so the report's generation moves by J's one registration as a joiner" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "rj", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    const m = try rig.spawnMount("rj-m", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, m, "mkdir dm && echo m > dm/m && sync -d dm/m"));
+    const gen0 = blk: {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        break :blk json_scan.number(rr, "generation") orelse return error.StatMissing;
+    };
+    const j = try rig.spawnMount("rj-j", set.metaUri(), null, &.{});
+    try rig.awaitLog(j, "ready: ", ready_wait_ns);
+    const gen1 = blk: {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        break :blk json_scan.number(rr, "generation") orelse return error.StatMissing;
+    };
+    try testing.expectEqual(gen0 + 1, gen1);
+    const seen = try rig.onMount(j, "cat dm/m");
+    defer gpa.free(seen);
+    try testing.expectEqualStrings("m\n", seen);
+    try rig.umount(j);
+    try rig.umount(m);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+test "nvmet fidelity: a superseded manager never wins the hold back (review round 3 major 3) — M0 (host A) frozen past its claim's TTL; the successor S (host B) takes over, writes and unmounts cleanly as the namespace's last registrant (unreserved); M0 resumed meets the lapse with a device claim that is not its own — it fail-stops its volume instead of re-registering (writer_guard_pr_reacquires 0, its writes refused)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "lp", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    const m0 = try rig.spawnMount("lp-m0", set.metaUri(), null, &.{});
+    try rig.awaitLog(m0, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, m0, "echo before > f && sync -d f"));
+    const pid_m0 = rig.daemons.items[m0].pid;
+    _ = linux.kill(pid_m0, .STOP);
+    sleepMs(lease_clock.T_OWNER_MS + 5_000);
+    const s = try rig.spawnMount("lp-s", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(s, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, s, "mkdir ds && echo s > ds/s && sync -d ds/s"));
+    try rig.umount(s);
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, 0), json_scan.number(rr, "regctl"));
+    }
+    _ = linux.kill(pid_m0, .CONT);
+    const st = try rig.awaitStat(m0, "writer_guard_fenced", 1, 30 * std.time.ns_per_s);
+    defer gpa.free(st);
+    try testing.expectEqual(@as(?u64, 1), json_scan.number(st, "writer_guard_fenced"));
+    try testing.expectEqual(@as(?u64, 0), json_scan.number(st, "writer_guard_pr_reacquires"));
+    const m0_wrote = scriptSucceeds(rig, m0, "echo x > z && sync -d z") catch false;
+    try testing.expect(!m0_wrote);
+    try rig.kill9(m0);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
 test "nvmet fidelity: crash-window — W-N1: a share with a TEST-NET-1 listener fails at its second port link (EADDRNOTAVAIL) leaving a PENDING record claiming both ids; a second share of the backing refuses mid-window; restore finalizes; unshare removes both ports. W-N2: a never-linkable share → pending → the subsystem wiped by hand → restore garbage-collects it and sweeps the port shell" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);

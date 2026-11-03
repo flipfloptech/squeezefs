@@ -557,6 +557,7 @@ pub const Guard = struct {
     fn standFencer(g: *Guard, c: *pr.Client) void {
         if (builtin.is_test) if (g.test_fencer) |face| {
             g.fencer = fencer.Fencer.forTest(g.gpa, face, c.key) catch null;
+            if (g.fencer) |f| _ = f.confirmHeld(c);
             return;
         };
         const dev = g.device orelse return;
@@ -565,7 +566,14 @@ pub const Guard = struct {
         else |_|
             .{ .absent = .no_wire_host_id };
         switch (st) {
-            .stood => |f| g.fencer = f,
+            .stood => |f| {
+                // The hold may have passed since (a successor's preempt):
+                // the fencer never stands registered beside a host that does
+                // not hold (review M1 of §DG). The open then fails at its
+                // first write; the fencer is given back at its teardown.
+                _ = f.confirmHeld(c);
+                g.fencer = f;
+            },
             .absent => |why| {
                 g.fencer_absent = why;
                 fencing.stats.pr_fencer_unavailable.inc();
@@ -807,7 +815,14 @@ pub const Guard = struct {
             return .report_failed;
         };
         const rtype = rep.rtype;
-        const ours = rep.heldBy(c.key);
+        // Held by THIS host: our key under our host id — never another
+        // identity under the same key (the fencer, decision 0003 §DG).
+        const me = c.wireHostId() catch {
+            rep.deinit(c.gpa);
+            log.warn("meta volume {s}: the host identifier read failed on the heartbeat — retrying next beat", .{g.be.path});
+            return .report_failed;
+        };
+        const ours = rep.heldByHost(c.key, me);
         const foreign = rep.holder() orelse 0;
         rep.deinit(c.gpa);
         if (ours) return .ours;
@@ -829,8 +844,16 @@ pub const Guard = struct {
         c.acquire() catch return .reacquire_failed;
         if (locked and fresh) guard.stats.pr_host_registrations.inc();
         if (builtin.is_test) if (g.test_after_reacquire) |h| h.fire(h.ctx);
-        // The lapse forgot the fencer too.
-        if (g.fencer) |f| f.reregister();
+        // The lapse forgot the fencer too; re-registered, it must find this
+        // host holding (review M1 of §DG) — a successor's hold that landed
+        // between the acquire and here leaves it unregistered and this
+        // volume usurped.
+        if (g.fencer) |f| {
+            if (!f.reregisterHeld(c)) {
+                const foreign = (c.holder() catch null) orelse 0;
+                return .{ .usurped = foreign };
+            }
+        }
         return .reacquired;
     }
 

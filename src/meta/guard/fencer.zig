@@ -154,6 +154,9 @@ pub const Fencer = struct {
     /// The association on a real namespace; null = a fixture's fencer over a
     /// fake face.
     assoc: ?Association,
+    /// Orders recovery's check-then-preempt (`fencing.preemptDeadRegistrant`)
+    /// against the heartbeat's re-register-then-check (review M1 of §DG).
+    seq_lock: pr_linux.IssueLock = .{},
 
     const Association = struct {
         device: *pr_linux.Device,
@@ -179,13 +182,42 @@ pub const Fencer = struct {
         _ = try c.registerLadder();
         fencing.stats.pr_fencer_registrations.inc();
         const f = try gpa.create(Fencer);
-        f.* = .{ .gpa = gpa, .identity = .{}, .client = c, .assoc = null };
+        f.* = .{ .gpa = gpa, .identity = identityOf("fixture", @splat(0)), .client = c, .assoc = null };
+        c.op_lock = f.seq_lock.opLock();
         return f;
     }
 
+    /// After its registration: the host still holds (a report shows the
+    /// holder's key under the HOST's id), else the registration is taken
+    /// back — a successor that preempted the host's key before it landed
+    /// left it alone under a superseded key (review M1 of §DG). False = not
+    /// held (or unreadable): the fencer stands unregistered.
+    pub fn confirmHeld(self: *Fencer, host: *pr.Client) bool {
+        self.client.lockOps();
+        defer self.client.unlockOps();
+        return self.confirmHeldLocked(host);
+    }
+
+    fn confirmHeldLocked(self: *Fencer, host: *pr.Client) bool {
+        if (host.holdsHere() catch false) return true;
+        self.client.unregister(self.client.key) catch {};
+        fencing.stats.pr_fencer_unheld_unregistered.inc();
+        log.warn("fencing registrant {s}: the host does not hold the reservation after its registration (a successor preempted it) — unregistered", .{self.identity.hostnqn()});
+        return false;
+    }
+
     /// The registration again after a lapse forgot it (the manager's
-    /// re-acquire, through the stale-sibling rule).
-    pub fn reregister(self: *Fencer) void {
+    /// re-acquire, through the stale-sibling rule), then the host's hold
+    /// confirmed — one section under the sequence lock. False = the host
+    /// does not hold: the fencer stands unregistered.
+    pub fn reregisterHeld(self: *Fencer, host: *pr.Client) bool {
+        self.client.lockOps();
+        defer self.client.unlockOps();
+        self.reregister();
+        return self.confirmHeldLocked(host);
+    }
+
+    fn reregister(self: *Fencer) void {
         _ = self.client.registerLadder() catch |e| {
             var buf: [128]u8 = undefined;
             var w: Io.Writer = .fixed(&buf);
@@ -326,6 +358,7 @@ fn standOrRefuse(gpa: Allocator, env: *const std.process.Environ.Map, in: Input)
     };
     const f = try gpa.create(Fencer);
     f.* = .{ .gpa = gpa, .identity = id, .client = c, .assoc = .{ .device = dev, .users = users, .instance = got.instance, .reused = reused } };
+    c.op_lock = f.seq_lock.opLock();
     const a = &f.assoc.?;
     @memcpy(a.subnqn_buf[0..subnqn.len], subnqn);
     a.subnqn_len = subnqn.len;

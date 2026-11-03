@@ -963,9 +963,12 @@ test "nvmet fidelity: the fencing registrant's device laws on nvmet 7.3 (decisio
         try testing.expectEqual(@as(?u64, key_c), rep.holder());
         try testing.expect(!rep.registered(key_k));
     }
-    // A, superseded, finishing a recovery: its fencer's command conflicts.
+    // A, superseded, finishing a recovery: the report shows C holding — the
+    // preempt withheld (review M1); the fencer's own command conflicts at
+    // the device anyway.
     _ = try b.client.registerLadder();
     try testing.expectEqual(fencing.PreemptOutcome.failed, fencing.preemptDeadRegistrant(a.client, f.client, key_b));
+    try testing.expectError(error.ReservationConflict, f.client.preemptAndAbort(key_b));
     {
         var rep = try c.client.report();
         defer rep.deinit(gpa);

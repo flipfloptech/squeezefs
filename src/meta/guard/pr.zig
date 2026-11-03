@@ -122,7 +122,28 @@ pub const Client = struct {
     ptpls: u8 = 0,
     cap: CapLearner = .{},
     stats: Stats = .{},
+    /// The wire host id (FID 0x81) once read: its controller's, fixed for
+    /// the client's life.
+    wire_host_id: ?[16]u8 = null,
+    /// A lock its owner orders multi-command sequences with (the fencing
+    /// registrant's: recovery's check-then-preempt against the heartbeat's
+    /// re-register-then-check, decision 0003 §DG review M1); null = none.
+    op_lock: ?OpLock = null,
     arena: []align(4096) u8,
+
+    pub const OpLock = struct {
+        ctx: *anyopaque,
+        lock: *const fn (ctx: *anyopaque) void,
+        unlock: *const fn (ctx: *anyopaque) void,
+    };
+
+    pub fn lockOps(self: *Client) void {
+        if (self.op_lock) |l| l.lock(l.ctx);
+    }
+
+    pub fn unlockOps(self: *Client) void {
+        if (self.op_lock) |l| l.unlock(l.ctx);
+    }
 
     pub fn init(gpa: Allocator, ns: nvme.Namespace, nsid: u32, key: u64) Allocator.Error!Client {
         const arena = try gpa.alignedAlloc(u8, .fromByteUnits(4096), ARENA_LEN);
@@ -297,6 +318,7 @@ pub const Client = struct {
     /// FID 0x81: 16 B (EXHID = 1) first, 8 B on a device status (the PCIe
     /// 64-bit form); all-zero ⇒ unknown.
     pub fn wireHostId(self: *Client) Error![16]u8 {
+        if (self.wire_host_id) |w| return w;
         var out: [16]u8 = @splat(0);
         const s = try self.issueRaw(.admin, &nvme.getHostIdentifier(&out));
         if (s != nvme.STATUS_SUCCESS) {
@@ -310,7 +332,18 @@ pub const Client = struct {
             @memcpy(out[0..8], &short);
         }
         if (std.mem.allEqual(u8, &out, 0)) return error.HostIdUnknown;
+        self.wire_host_id = out;
         return out;
+    }
+
+    /// Does THIS host's registrant hold the reservation under our key — not
+    /// another host id under the same key (a fencing registrant, decision
+    /// 0003 §DG)? One report.
+    pub fn holdsHere(self: *Client) Error!bool {
+        const me = try self.wireHostId();
+        var rep = try self.report();
+        defer rep.deinit(self.gpa);
+        return rep.heldByHost(self.key, me);
     }
 
     /// The report in two steps sized by REGCTL (R:968-982): the header

@@ -80,6 +80,11 @@ pub const stats = struct {
     /// A symmetric manager's hold with no fencing registrant standing (the
     /// holder's-preempt posture; the guard's `.stats` names why).
     pub var pr_fencer_unavailable: counters.ShardedCounter = .{};
+    /// Death preempts withheld because a report did not show THIS host
+    /// holding (a superseded manager finishing a recovery — review M1 of
+    /// §DG); and fencer registrations taken back for the same reason.
+    pub var pr_preempts_unheld_refused: counters.ShardedCounter = .{};
+    pub var pr_fencer_unheld_unregistered: counters.ShardedCounter = .{};
     /// A preempt withheld because the dead key is THIS host's registrant.
     pub var appender_recovery_own_key_guards: counters.ShardedCounter = .{};
     /// The dead key found registered again after the page went Recovering
@@ -250,6 +255,25 @@ pub fn preemptDeadRegistrant(client: ?*pr.Client, fencer: ?*pr.Client, victim_ke
     if (victim_key == c.key) {
         stats.appender_recovery_own_key_guards.inc();
         return .own_key_guard;
+    }
+    // Only while THIS host holds (our key under our host id; review M1 of
+    // §DG): a fencer registered after a successor preempted our key would
+    // otherwise fence the successor's members, and take the reservation
+    // when the victim's key is the holder's. Under the fencer's lock — the
+    // heartbeat's re-register and its check take it too — so the fencer's
+    // registration changes only by a preempt between this read and the
+    // preempt: a takeover, which removes it with our host (one key) and
+    // makes its command conflict.
+    if (fencer) |f| f.lockOps();
+    defer if (fencer) |f| f.unlockOps();
+    const ours = c.holdsHere() catch |e| {
+        log.warn("recovery preempt: the report before the preempt of key 0x{x} failed ({s}) — nothing preempted; the full tail scan is the fence", .{ victim_key, @errorName(e) });
+        return .failed;
+    };
+    if (!ours) {
+        stats.pr_preempts_unheld_refused.inc();
+        log.warn("recovery preempt: the reservation is not held by this host — the preempt of key 0x{x} is withheld (a successor took the hold: this manager is superseded); the full tail scan is the fence", .{victim_key});
+        return .failed;
     }
     const issuer = fencer orelse c;
     issuer.preemptAndAbort(victim_key) catch |e| return preemptFailed(issuer, victim_key, e);
@@ -831,9 +855,14 @@ test "the fencer's key is its host's (decision 0003 §DG.2): a successor's takeo
     try testing.expect(ns.isHolder(host_s));
     try testing.expect(ns.find(host_m) == null);
     try testing.expect(ns.find(host_f) == null);
-    // The superseded manager, resumed mid-recovery: its fencer's command
-    // conflicts at the device — nothing fenced, the successor's hold intact.
+    // The superseded manager, resumed mid-recovery: the report shows another
+    // host holding — the preempt withheld (review M1); and the fencer's own
+    // command conflicts at the device anyway (its registration went with the
+    // host's) — nothing fenced, the successor's hold intact.
+    const refused0 = stats.pr_preempts_unheld_refused.load();
     try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, &f, 0x3333));
+    try testing.expectEqual(refused0 + 1, stats.pr_preempts_unheld_refused.load());
+    try testing.expectError(error.ReservationConflict, f.preemptAndAbort(0x3333));
     try testing.expect(ns.isHolder(host_s));
     try testing.expect(ns.writeAllowed(host_s));
     // The weakening on the device: a fencer under a key of its own.
@@ -875,9 +904,14 @@ test "review 4 minor 3: a report that fails after the death preempt fenced nothi
     defer r.deinit();
     _ = try joinAsRegistrant(&r, null);
     const preempts0 = stats.appender_recovery_preempts.load();
+    // The host id read and cached; the report before the preempt (two
+    // commands) and the preempt pass; the report after it fails.
+    _ = try m.wireHostId();
     ns.fail_next = error.InputOutput;
-    ns.fail_skip = 1;
+    ns.fail_skip = 3;
     try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, null, 0x2222));
+    // The preempt reached the device; the report after it failed.
+    try testing.expectEqual(nvme.RACQA_PREEMPT_AND_ABORT, ns.last_acquire.cdw10 & 0x7);
     try testing.expectEqual(preempts0, stats.appender_recovery_preempts.load());
     try testing.expect(ns.writeAllowed(host_r));
 }

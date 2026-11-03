@@ -330,6 +330,16 @@ pub const Report = struct {
         return false;
     }
 
+    /// Does the registrant of `key` under `host_id` hold the reservation
+    /// (any registrant under an All Registrants type)? A key may stand under
+    /// several host ids — the host's and its fencing registrant's (decision
+    /// 0003 §DG) —; only the host's own registrant is the host's hold.
+    pub fn heldByHost(self: Report, key: u64, host_id: [16]u8) bool {
+        if (self.rtype == 0) return false;
+        for (self.registrants) |r| if (r.rkey == key and std.mem.eql(u8, &r.host_id, &host_id) and (r.holds or allRegistrants(self.rtype))) return true;
+        return false;
+    }
+
     /// Is `key` a registrant's?
     pub fn registered(self: Report, key: u64) bool {
         for (self.registrants) |r| if (r.rkey == key) return true;

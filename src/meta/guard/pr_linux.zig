@@ -127,19 +127,35 @@ pub const Device = struct {
 
 /// The issuers' lock: `std.Io.Mutex`'s three-state algorithm over the raw
 /// process-private futex (the Device holds no `Io`; a PR command is no hot
-/// path). 0 unlocked, 1 locked, 2 locked with waiters.
-const IssueLock = struct {
+/// path). 0 unlocked, 1 locked, 2 locked with waiters. The fencing
+/// registrant's sequence lock is one too (`fencer.zig`).
+pub const IssueLock = struct {
     word: futex.Word = .init(0),
 
-    fn lock(self: *IssueLock) void {
+    pub fn lock(self: *IssueLock) void {
         // Acquire pairs with `unlock`'s release swap: the previous holder's
         // ring state (its SQE written, its CQE reaped) is visible here.
         if (self.word.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
         while (self.word.swap(2, .acquire) != 0) futex.wait(&self.word, 2);
     }
 
-    fn unlock(self: *IssueLock) void {
+    pub fn unlock(self: *IssueLock) void {
         if (self.word.swap(0, .release) == 2) futex.wake(&self.word, 1);
+    }
+
+    /// The `pr.Client.OpLock` face.
+    pub fn opLock(self: *IssueLock) pr.Client.OpLock {
+        return .{ .ctx = self, .lock = lockFn, .unlock = unlockFn };
+    }
+
+    fn lockFn(ctx: *anyopaque) void {
+        const self: *IssueLock = @ptrCast(@alignCast(ctx));
+        self.lock();
+    }
+
+    fn unlockFn(ctx: *anyopaque) void {
+        const self: *IssueLock = @ptrCast(@alignCast(ctx));
+        self.unlock();
     }
 };
 

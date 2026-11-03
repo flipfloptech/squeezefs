@@ -756,7 +756,7 @@ pub fn reportFacts(c: *pr.Client) pr.Error!ReportFacts {
     for (rep.registrants) |r| if (std.mem.eql(u8, &r.host_id, &me) and r.rkey == c.key) {
         registered = true;
     };
-    return .{ .registered = registered, .facts = .{ .reserved = rep.rtype != 0, .holder_ours = rep.heldBy(c.key) } };
+    return .{ .registered = registered, .facts = .{ .reserved = rep.rtype != 0, .holder_ours = rep.heldByHost(c.key, me) } };
 }
 
 /// One volume's appender pages, read under the registry's lock (the
@@ -838,9 +838,10 @@ pub fn registerUnderRule(ctx_in: RuleContext, reg: *const Registry, c: *pr.Clien
 pub fn departUnregisters(reg: *const Registry, gpa: Allocator, c: *pr.Client, pid: u32) bool {
     const others = reg.othersAlive(gpa, pid) catch return false;
     if (others != 0) return false;
+    const me = c.wireHostId() catch return false;
     var rep = c.report() catch return false;
     defer rep.deinit(c.gpa);
-    return !rep.heldBy(c.key);
+    return !rep.heldByHost(c.key, me);
 }
 
 /// What a writer's registration rides: its key (the host's, or the
@@ -1014,10 +1015,10 @@ pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map,
     return e;
 }
 
-/// The report names our key the holder (a failed report: not proven).
+/// The report names THIS host the holder under our key (a failed report:
+/// not proven).
 pub fn holdStands(c: *pr.Client) bool {
-    const h = (c.holder() catch return false) orelse return false;
-    return h == c.key;
+    return c.holdsHere() catch false;
 }
 
 /// What a process leaving the host's registration gives back (the gate's
@@ -1031,11 +1032,14 @@ pub fn holdStands(c: *pr.Client) bool {
 /// review 4 blocker 2); else the namespace's last registrant releases (zero
 /// residue).
 pub fn leaveRegistration(c: *pr.Client, keep_hold: bool) pr.Error!void {
+    const me = try c.wireHostId();
     var rep = try c.report();
     defer rep.deinit(c.gpa);
-    if (!rep.heldBy(c.key)) return c.unregister(c.key);
+    if (!rep.heldByHost(c.key, me)) return c.unregister(c.key);
     if (keep_hold) return;
-    for (rep.registrants) |r| if (r.rkey != c.key) return;
+    // Any registrant but this host's own keeps the hold (a fencer under our
+    // key that could not be given back included).
+    for (rep.registrants) |r| if (r.rkey != c.key or !std.mem.eql(u8, &r.host_id, &me)) return;
     return c.release();
 }
 
@@ -1058,11 +1062,11 @@ pub const HoldOutcome = enum {
 /// or the report's ONE holder preempted (the superseded writer's host
 /// unregistered, its writes refused from here).
 pub fn holdReservation(c: *pr.Client, path: []const u8) error{Refused}!HoldOutcome {
-    const before = c.holder() catch {
+    const here = c.holdsHere() catch {
         log.err("{s}: the reservation report failed before the hold — refusing to arbitrate blind", .{path});
         return error.Refused;
     };
-    if (before) |k| if (k == c.key) return .inherited;
+    if (here) return .inherited;
     c.acquire() catch |e| switch (e) {
         error.ReservationConflict => {
             const victim = (c.holder() catch {
@@ -1072,7 +1076,12 @@ pub fn holdReservation(c: *pr.Client, path: []const u8) error{Refused}!HoldOutco
                 log.err("{s}: reservation acquire conflicted but the report names no holder — refusing to arbitrate blind (single-writer guard)", .{path});
                 return error.Refused;
             };
-            if (victim == c.key) return .inherited;
+            // Our key holding under another host id (only the fencer could):
+            // a preempt of our own key would unregister this host — refused.
+            if (victim == c.key) {
+                log.err("{s}: the reservation is held under this host's key by another of its identities (the fencing registrant) — refusing the hold (decision 0003 §DG)", .{path});
+                return error.Refused;
+            }
             c.preempt(victim) catch {
                 log.err("{s}: the preempt of the stale reservation holder key {x:0>16} failed — refusing the mount", .{ path, victim });
                 return error.Refused;

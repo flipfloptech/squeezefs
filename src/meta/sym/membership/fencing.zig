@@ -240,9 +240,12 @@ pub fn preemptDeadRegistrant(client: ?*pr.Client, victim_key: u64) PreemptOutcom
     // The report proves it: a target that answered success yet kept the
     // key (nvmet 7.3: its HOLDER's preempt only re-types its own hold)
     // fenced nothing — the full tail scan, never a release (that would leave
-    // the namespace unreserved). A report that fails trusts the device's
-    // answer.
-    const kept = keyRegistered(c, victim_key) catch false;
+    // the namespace unreserved). A report that fails proves nothing fenced:
+    // the full tail scan too (review 4 minor 3).
+    const kept = keyRegistered(c, victim_key) catch {
+        log.warn("recovery preempt: the report after the preempt of key 0x{x} failed — nothing proven fenced; the full tail scan is the fence", .{victim_key});
+        return .failed;
+    };
     if (kept) {
         stats.appender_recovery_preempts_ignored.inc();
         log.warn("recovery preempt: the target answered the preempt of key 0x{x} yet keeps it registered (nvmet 7.3: a holder's preempt only re-types its own hold) — the dead member's host is NOT fenced; the full tail scan is the fence", .{victim_key});

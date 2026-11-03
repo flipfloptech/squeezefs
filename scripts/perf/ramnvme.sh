@@ -31,7 +31,10 @@ residue() {   # what of ours is still in the kernel
   for p in "$CFS"/ports/*/subsystems/"$NQN"-*; do [ -e "$p" ] && r="$r port-link:$p"; done
   grep -ls "^$NQN-" /sys/class/nvme/nvme*/subsysnqn 2>/dev/null | while read -r f; do echo -n " controller:$(basename "$(dirname "$f")")"; done
   [ -d /sys/module/brd ] && r="$r module:brd"
-  for p in $(ls "$CFS/ports" 2>/dev/null); do grep -qsx "$p" "$STATE/ports.before" || r="$r port:$p"; done
+  # Our port left link-free (a port another ledger's share still rides goes with that share).
+  for p in $(sort -u "$STATE/ports.ours" 2>/dev/null); do
+    [ -d "$CFS/ports/$p" ] && [ -z "$(ls "$CFS/ports/$p/subsystems")" ] && r="$r port:$p"
+  done
   echo -n "$r"
 }
 
@@ -40,9 +43,9 @@ up() {
   [ -d /sys/module/brd ] && die "brd is loaded by someone else; refusing to take it"
   [ -x "$BIN" ] || die "$BIN is absent (build: zig build -Dprofile=dist --prefix zig-out-perf dist)"
   mkdir -p "$STATE"
-  # What was here before us: down unloads only the modules and removes only the ports we added.
+  # down unloads only the modules we loaded and judges only the ports our shares made (ports.ours,
+  # from each share's `(port id N)` line): another tool's or a test run's port is never ours to report.
   local m; for m in nvme_loop nvmet; do [ -d "/sys/module/$m" ] || echo "$m" >> "$STATE/modules.ours"; done
-  ls "$CFS/ports" > "$STATE/ports.before" 2>/dev/null || : > "$STATE/ports.before"
   modprobe -a nvmet nvme_loop
   local kib=$(((2 * MDT_GIB + 2 * OST_GIB + 1) * 1024 * 1024))
   modprobe brd rd_nr=1 rd_size=$kib max_part=8
@@ -55,6 +58,7 @@ up() {
     [ -b /dev/ram0p$i ] || die "/dev/ram0p$i did not appear"
     "$BIN" nvmeof share --transport loop --subnqn "$NQN-$role" /dev/ram0p$i > "$STATE/share-$role.log" 2>&1 \
       || { cat "$STATE/share-$role.log" >&2; die "share $role failed"; }
+    sed -n 's/.*(port id \([0-9]*\)).*/\1/p' "$STATE/share-$role.log" >> "$STATE/ports.ours"
     "$BIN" nvmeof connect --transport loop "$NQN-$role" > "$STATE/connect-$role.log" 2>&1 \
       || { cat "$STATE/connect-$role.log" >&2; die "connect $role failed"; }
     dev=$(awk '$1 == "device" {print $2}' "$STATE/connect-$role.log")
@@ -82,10 +86,11 @@ down() {
     [ -d /sys/module/brd ] || break
     udevadm settle; rmmod brd 2>/dev/null || true; udevadm settle; sleep 1
   done
+  # The product removes its port at the last unshare; one left empty (an unshare that failed after
+  # its links went) is removed here.
   local p
-  for p in $(ls "$CFS/ports" 2>/dev/null); do
-    [ -f "$STATE/ports.before" ] || break
-    grep -qx "$p" "$STATE/ports.before" 2>/dev/null && continue
+  for p in $(sort -u "$STATE/ports.ours" 2>/dev/null); do
+    [ -d "$CFS/ports/$p" ] || continue
     [ -z "$(ls "$CFS/ports/$p/subsystems")" ] && rmdir "$CFS/ports/$p" && echo "ramnvme: removed our empty port $p" >&2
   done
   for p in $(cat "$STATE/modules.ours" 2>/dev/null); do modprobe -r "$p" || echo "ramnvme: modprobe -r $p failed" >&2; done

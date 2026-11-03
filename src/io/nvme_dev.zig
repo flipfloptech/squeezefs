@@ -1258,6 +1258,8 @@ pub const Device = struct {
     /// wake).
     wait_io: ?std.Io = null,
     closed: bool = false,
+    /// The FIFO an armed `seams.hold_next_write` parks on.
+    write_hold_fifo: [linux.PATH_MAX:0]u8 = undefined,
 
     /// `open_checked`: `probeDirectIo` FIRST (loud refusal), spawn lane 0,
     /// probe the write cache once, log the class.
@@ -1500,6 +1502,15 @@ pub const Device = struct {
         self.seams.stall_reads.store(count, .seq_cst);
     }
 
+    /// `SQUEEZEFS_TEST_DATA_WRITE_HOLD`: the next data write parks after its
+    /// fence gate until a writer opens `fifo`; a path too long arms nothing.
+    pub fn setTestWriteHold(self: *Device, fifo: []const u8) void {
+        if (fifo.len >= self.write_hold_fifo.len) return;
+        @memcpy(self.write_hold_fifo[0..fifo.len], fifo);
+        self.write_hold_fifo[fifo.len] = 0;
+        self.seams.hold_next_write.store(1, .seq_cst);
+    }
+
     pub fn setTestWriteStall(self: *Device, count: u32, ms: u64) void {
         self.seams.stall_write_ms.store(ms, .seq_cst);
         self.seams.stall_writes.store(count, .seq_cst);
@@ -1527,6 +1538,25 @@ pub const Device = struct {
             return nd.errnoToError(e);
         }
         try self.fenceGate();
+        if (takeArmed(&self.seams.hold_next_write)) return self.heldWrite(offset, data);
+        return self.submitWrite(offset, data);
+    }
+
+    /// The armed hold: past every gate of this process, the write waits for
+    /// the FIFO's writer, then reaches the device — whatever fenced it since.
+    fn heldWrite(self: *Device, offset: u64, data: []const u8) DeviceError!void {
+        const fifo = std.mem.sliceTo(&self.write_hold_fifo, 0);
+        log.warn("test seam: SQUEEZEFS_TEST_DATA_WRITE_HOLD — data volume {s}: the write at offset {d} ({d} B) parks past its fence gate until a writer opens {s}", .{ self.path, offset, data.len, fifo });
+        const rc = linux.open(&self.write_hold_fifo, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) == .SUCCESS) _ = linux.close(@intCast(rc));
+        const r = self.submitWrite(offset, data);
+        if (r) |_| {
+            log.warn("test seam: SQUEEZEFS_TEST_DATA_WRITE_HOLD — data volume {s}: the held write at offset {d} completed: landed", .{ self.path, offset });
+        } else |e| log.warn("test seam: SQUEEZEFS_TEST_DATA_WRITE_HOLD — data volume {s}: the held write at offset {d} completed: refused ({s})", .{ self.path, offset, @errorName(e) });
+        return r;
+    }
+
+    fn submitWrite(self: *Device, offset: u64, data: []const u8) DeviceError!void {
         // A zero-length DMA is a no-op by definition; never hand the kernel
         // a 0-byte SQE (the zero-length ReadFixed oops class, §2.1).
         if (data.len == 0) return;

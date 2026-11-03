@@ -985,6 +985,7 @@ pub const DataPlane = struct {
         // fiber's DMA holds the fiber, never its lane thread (before the
         // first request — the probe read below is one).
         dev.routeWaits(self.io);
+        if (holdPath(env, "SQUEEZEFS_TEST_DATA_WRITE_HOLD")) |fifo| dev.setTestWriteHold(fifo);
         // The identity through THIS device (the discovery pass read it
         // through a scratch one): tag, set, geometry, transform.
         {
@@ -1875,7 +1876,8 @@ pub const DataPlane = struct {
     }
 
     /// A FIFO-hold seam's path (`SQUEEZEFS_TEST_PROMOTION_HOLD`,
-    /// `SQUEEZEFS_TEST_RING_RELEASE_HOLD`); `off` (the rows' default) = no hold.
+    /// `SQUEEZEFS_TEST_RING_RELEASE_HOLD`, `SQUEEZEFS_TEST_DATA_WRITE_HOLD`);
+    /// `off` (the rows' default) = no hold.
     fn holdPath(env: *const std.process.Environ.Map, comptime key_name: []const u8) ?[]const u8 {
         const raw = knobs.parseStr(env.get(key_name)) orelse return null;
         return if (std.mem.eql(u8, raw, "off")) null else raw;

@@ -560,6 +560,11 @@ pub const Seams = struct {
     /// `ring_park` dead-ring verdict without a broken kernel) — every
     /// in-flight op and every later request answers `RingFailed`.
     kill_ring: std.atomic.Value(u32) = .init(0),
+    /// Armed count: the next data write parks after its fence gate, before
+    /// its submission, until a writer opens the device's hold FIFO — a
+    /// frozen member's write already past its own gates, reaching the
+    /// device after its fence (`SQUEEZEFS_TEST_DATA_WRITE_HOLD`).
+    hold_next_write: std.atomic.Value(u32) = .init(0),
 };
 
 /// Seam CAS-decrement: true when this call consumed one armed count; one

@@ -2318,7 +2318,7 @@ fn fencerController(rig: *Rig, nqn: []const u8) !?initiator.Controller {
     return null;
 }
 
-test "nvmet fidelity: a metadata mount pointed at the fencing registrant's namespace node is refused by name (review M3 of decision 0003 §DG) — M (host B) manages a symmetric set and stood its fencer; a mount with no explicit pair on the fencer's block node (a by-id link that picked it, a hand-typed path) never registers there: it exits naming the fencer, and the fencer's registration under M's key stands (no own-stale ladder unregistered it)" {
+test "nvmet fidelity: a metadata mount pointed at the fencing registrant's namespace node is refused by name (review M3 of decision 0003 §DG) — M (host B) manages a symmetric set and stood its fencer; a mount with no explicit pair on the fencer's block node (a by-id link that picked it, a hand-typed path) never registers there: it exits naming the fencer; `appender clear` on that node is refused the same way (review minor 1: the refusal sits at the metadata door every user passes); the fencer's registration under M's key stands (no own-stale ladder unregistered it)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -2347,6 +2347,15 @@ test "nvmet fidelity: a metadata mount pointed at the fencing registrant's names
         const text = try rig.readLog(z);
         defer gpa.free(text);
         try testing.expect(std.mem.indexOf(u8, text, "fencing registrant") != null);
+    }
+    {
+        // `appender clear` on the fencer's node: refused at the metadata
+        // door every user passes (review minor 1), never writing through the
+        // fencer's controller.
+        const r = try rig.sqzEnv(&.{ "appender", "clear", meta_uri_f, "1" }, &env_z);
+        defer rig.freeRun(r);
+        try testing.expect(!r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "fencing registrant") != null);
     }
     {
         // The fencer still registered under M's key beside M's host.

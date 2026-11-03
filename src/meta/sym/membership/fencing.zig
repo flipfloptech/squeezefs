@@ -719,6 +719,27 @@ test "the death preempt under the manager's WERO hold: on nvmet 7.3's semantics 
     try testing.expectEqual(@as(?PreemptOutcome, null), refenceAfterRecovering(null, 0x2222));
 }
 
+test "review 4 minor 3: a report that fails after the death preempt fenced nothing proven — .failed (the full tail scan), never .fenced" {
+    const gpa = testing.allocator;
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    ns.holder_preempt_retypes = true;
+    var mh: fake.Host = .{ .ns = &ns, .host_id = host_m };
+    var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer m.deinit();
+    try acquireManagerHold(&m);
+    var rh: fake.Host = .{ .ns = &ns, .host_id = host_r };
+    var r = try pr.Client.init(gpa, rh.face(), 1, 0x2222);
+    defer r.deinit();
+    _ = try joinAsRegistrant(&r, null);
+    const preempts0 = stats.appender_recovery_preempts.load();
+    ns.fail_next = error.InputOutput;
+    ns.fail_skip = 1;
+    try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, 0x2222));
+    try testing.expectEqual(preempts0, stats.appender_recovery_preempts.load());
+    try testing.expect(ns.writeAllowed(host_r));
+}
+
 const RamTerm = struct {
     term: ?u64 = null,
     stores: u32 = 0,

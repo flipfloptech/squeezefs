@@ -43,6 +43,8 @@ pub const Namespace = struct {
     wire_host_id_override: ?[16]u8 = null,
     /// An injected transport failure on the next command (a dead node).
     fail_next: ?errors.Error = null,
+    /// Commands that pass before `fail_next` fires.
+    fail_skip: u32 = 0,
     /// nvmet 7.3's preempt under a single-holder type: the HOLDER's preempt
     /// only re-types its own hold (`nvmet_pr_preempt` answers `holder ==
     /// reg` before it compares the key) and succeeds, the victim left
@@ -288,8 +290,12 @@ pub const Namespace = struct {
         self.last = cmd.*;
         self.last_queue = queue;
         if (self.fail_next) |e| {
-            self.fail_next = null;
-            return e;
+            if (self.fail_skip > 0) {
+                self.fail_skip -= 1;
+            } else {
+                self.fail_next = null;
+                return e;
+            }
         }
         const status: nvme.Status = switch (queue) {
             .admin => switch (cmd.opcode) {

@@ -2032,7 +2032,7 @@ fn probeCost(rig: *Rig, d: usize) !ProbeCost {
 /// The membership `T_owner` of the member-death row (the smoke rows' value).
 const member_t_owner_ms: u64 = 3000;
 
-test "nvmet fidelity: a member's death on nvmet 7.3 is DETECTED, not fenced (the documented limit, decision 0003 §DF) — a symmetric set whose manager M (host B) holds WERO; the member X on host A, frozen past T_owner, is evicted; M's death preempt of host A's key answers success yet the key stays registered (appender_recovery_preempts_ignored 1, appender_recovery_preempts 0, regctl 2, host A's key in the report) and is never re-fenced (appender_recovery_refences 0): no fence landed, so the recovery's tail scan walked every leaf — the only fence nvmet 7.3 gives" {
+test "nvmet fidelity: a member's death on nvmet 7.3 is FENCED by the manager's fencing registrant (decision 0003 §DG) — a symmetric set whose manager M (host B) holds WERO and stood its fencer (a second identity of host B under M's key, never holding); the member X on host A, frozen past T_owner, is evicted; M's fencer — a NON-holder — preempts host A's key (nvmet's spec path): host A unregistered, the reservation kept under M's key (appender_recovery_preempts 1, pr_fencer_preempts 1, appender_recovery_preempts_ignored 0, no re-fence; the report: M's host holding beside its fencer under the same key, host A's key gone)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -2055,36 +2055,113 @@ test "nvmet fidelity: a member's death on nvmet 7.3 is DETECTED, not fenced (the
     try rig.awaitLog(x, "ready: ", ready_wait_ns);
     // X's own directory: its creates land through X's own ring and slot.
     try testing.expect(try scriptSucceeds(rig, x, "mkdir dx && echo x > dx/x && sync -d dx/x"));
-    const key_x = blk: {
-        const sx = try rig.stats(x);
-        defer gpa.free(sx);
-        break :blk try gpa.dupe(u8, json_scan.string(sx, "pr_key") orelse return error.StatMissing);
-    };
+    const key_x = try statString(rig, x, "pr_key");
     defer gpa.free(key_x);
+    const key_m = try statString(rig, m, "pr_key");
+    defer gpa.free(key_m);
     {
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
         try testing.expectEqual(@as(?u64, nvme.RTYPE_WERO), json_scan.number(rr, "rtype"));
+        try testing.expect(std.mem.indexOf(u8, rr, key_x) != null);
     }
     _ = linux.kill(rig.daemons.items[x].pid, .STOP);
     const sm = try rig.awaitStat(m, "appender_recoveries", 1, ready_wait_ns);
     defer gpa.free(sm);
     try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
-    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recovery_preempts_ignored"));
-    try testing.expectEqual(@as(u64, 0), try statNumber(sm, "appender_recovery_preempts"));
-    // No fence landed (no preempt, no re-fence): the scan is the unfenced
-    // one, every leaf walked (`recovery_full_tail_scan_bytes` counts only
-    // the leaves not resident in the manager's cache — 0 on a set this
-    // small).
+    // The death preempt LANDED, through the fencer: no ignored preempt, and
+    // the key stood absent once the page was Recovering (no re-fence).
+    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recovery_preempts"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(sm, "appender_recovery_preempts_ignored"));
     try testing.expectEqual(@as(u64, 0), try statNumber(sm, "appender_recovery_refences"));
+    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "pr_fencer_preempts"));
+    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "pr_fencer_registrations"));
     {
-        // Host A still registered: the frozen X, resumed, would write.
+        // Host A unregistered (the frozen X, resumed, is refused at the
+        // device); the reservation kept: M's host holding, its fencer beside
+        // it under the same key, not holding.
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
+        try testing.expect(std.mem.indexOf(u8, rr, key_x) == null);
+        try testing.expectEqual(@as(?u64, nvme.RTYPE_WERO), json_scan.number(rr, "rtype"));
+        try testing.expectEqualStrings(key_m, json_scan.string(rr, "holder_key") orelse return error.StatMissing);
         try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
-        try testing.expect(std.mem.indexOf(u8, rr, key_x) != null);
+        // holder_key + the two registrants, one holding.
+        try testing.expectEqual(@as(usize, 3), std.mem.count(u8, rr, key_m));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rr, "\"holds_reservation\":true"));
     }
+    try rig.kill9(x);
+    try rig.umount(m);
+    // M's umount released its fencer (the last user): its registration and
+    // its controller gone, the hold kept (a preempt landed under it).
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+        try testing.expectEqualStrings(key_m, json_scan.string(rr, "holder_key") orelse return error.StatMissing);
+    }
+    try testing.expectEqual(@as(u32, 2), try rig.controllersOf(set.meta_nqn, null));
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+test "nvmet fidelity: a frozen member fenced through the manager's fencing registrant never lands its in-flight writes (decision 0003 §DG) — X (host A) writes behind a held landing (SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE: its acked windows admitted, never issued) and is SIGSTOPped; M (host B) evicts it at T_owner and fences host A through its fencer; X's held windows released (SQUEEZEFS_TEST_LANDING_HOLD_RELEASE) and X resumed: the device refuses them (a reservation conflict, -EBADE): X latches the fence class (its journal's reservation-conflict line) and never lands them" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "mr", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    var tb: [16]u8 = undefined;
+    const t_owner = try std.fmt.bufPrint(&tb, "{d}", .{member_t_owner_ms});
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var fb: [128]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/x-landing.fifo", .{rig.root}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    var env_m = try rig.envWith(ident_b);
+    defer env_m.deinit();
+    try env_m.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    var env_x = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    defer env_x.deinit();
+    // X's second FUSE WRITE arms the hold: that write's commit and every
+    // later one admitted and acked, never issued until the FIFO opens.
+    try env_x.put("SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", "2");
+    try env_x.put("SQUEEZEFS_TEST_LANDING_HOLD_RELEASE", fifo);
+    const m = try rig.spawnMountEnv("mr-m", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const x = try rig.spawnMountEnv("mr-x", set.metaUri(), &env_x, &.{});
+    try rig.awaitLog(x, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, x, "mkdir dx && echo a > dx/a && sync -d dx/a && echo b > dx/b"));
+    try rig.awaitLog(x, "test seam: SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", ready_wait_ns);
+    // The release's read end is open before the STOP: the release below
+    // never waits on X being scheduled.
+    try rig.awaitLog(x, "SQUEEZEFS_TEST_LANDING_HOLD_RELEASE — the release waits", ready_wait_ns);
+    _ = linux.kill(rig.daemons.items[x].pid, .STOP);
+    {
+        const sm = try rig.awaitStat(m, "appender_recoveries", 1, ready_wait_ns);
+        defer gpa.free(sm);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
+    }
+    // The held windows released while X is stopped (the FIFO's writer opens
+    // and closes beside X's read end), then X resumed: its lane issues them
+    // at its next poll.
+    releaseFifo(fifo);
+    _ = linux.kill(rig.daemons.items[x].pid, .CONT);
+    // The device's answer to X's released windows: the fence class latched
+    // (the journal's reservation-conflict line, logged once at the latch).
+    // X's `.stats` is no witness: the incarnation X learns is evicted holds
+    // un-landed windows, so it is poisoned (decision 0003 §BS) and its
+    // mount answers EIO.
+    try rig.awaitLog(x, "SQUEEZEFS_TEST_LANDING_HOLD_RELEASE released", 30 * std.time.ns_per_s);
+    try rig.awaitLog(x, "journal: reservation-conflict errno at", 30 * std.time.ns_per_s);
     try rig.kill9(x);
     try rig.umount(m);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
@@ -2095,6 +2172,17 @@ test "nvmet fidelity: a member's death on nvmet 7.3 is DETECTED, not fenced (the
     try rig.unshare(set.meta_nqn);
     try expectNoResidue(rig, set.meta_nqn);
     try expectNoResidue(rig, set.data_nqn);
+}
+
+/// A stats string that must be present, owned by the caller.
+fn statString(rig: *Rig, d: usize, key: []const u8) ![]u8 {
+    const st = try rig.stats(d);
+    defer rig.gpa.free(st);
+    const v = json_scan.string(st, key) orelse {
+        std.debug.print("\n--- .stats carries no \"{s}\" ---\n", .{key});
+        return error.StatMissing;
+    };
+    return rig.gpa.dupe(u8, v);
 }
 
 test "nvmet fidelity: crash-window — W-N1: a share with a TEST-NET-1 listener fails at its second port link (EADDRNOTAVAIL) leaving a PENDING record claiming both ids; a second share of the backing refuses mid-window; restore finalizes; unshare removes both ports. W-N2: a never-linkable share → pending → the subsystem wiped by hand → restore garbage-collects it and sweeps the port shell" {

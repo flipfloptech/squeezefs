@@ -241,6 +241,20 @@ fn openVerifiedChar(node: [:0]const u8, want: DevNum) ?linux.fd_t {
     return fd;
 }
 
+/// The hostnqn of `path`'s controller when it is a fencing registrant's
+/// (`pr.FENCER_HOSTNQN_PREFIX`; review M3 of decision 0003 §DG): a block
+/// node whose `device` is a controller (`nvme_core.multipath=N`; a head's is
+/// a subsystem, which carries no hostnqn). Null = not a fencer's node.
+pub fn fencerNodeHostnqn(path: []const u8, out: *[256]u8) ?[]const u8 {
+    const st = (align_probe.statPath(path) catch return null) orelse return null;
+    if (!st.is_bdev) return null;
+    var pb: [96]u8 = undefined;
+    const p = std.fmt.bufPrintSentinel(&pb, "/sys/dev/block/{d}:{d}/device/hostnqn", .{ st.rdev_major, st.rdev_minor }, 0) catch return null;
+    const text = std.mem.trim(u8, proc.readSmall(p.ptr, out) orelse return null, " \t\r\n");
+    if (!std.mem.startsWith(u8, text, pr.FENCER_HOSTNQN_PREFIX)) return null;
+    return text;
+}
+
 /// `path` is an NVMe namespace's block node (no open, no char twin).
 pub fn isNvmeNamespace(path: []const u8) bool {
     const st = (align_probe.statPath(path) catch return false) orelse return false;

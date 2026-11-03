@@ -562,7 +562,7 @@ pub const Guard = struct {
         };
         const dev = g.device orelse return;
         const st: fencer.Stood = if (c.wireHostId()) |wire|
-            fencer.stand(g.gpa, g.be.env, .{ .path = g.be.path, .node = dev.nodeName(), .wire_host_id = wire, .set_uuid = g.be.sb.set_uuid, .key = c.key })
+            fencer.stand(g.gpa, g.be.env, .{ .path = g.be.path, .node = dev.nodeName(), .nsid = dev.nsid, .wire_host_id = wire, .set_uuid = g.be.sb.set_uuid, .key = c.key })
         else |_|
             .{ .absent = .no_wire_host_id };
         switch (st) {

@@ -1,0 +1,13 @@
+# squeezefs (decision 0003 §DG, review M3): the fencing registrant — a write-free second NVMe host
+# identity of a manager's host, hostnqn nqn.2026-10.io.squeezefs:fencer:<uuid> — connects the
+# metadata subsystem, so under nvme_core.multipath=N the host sees a second block node of the
+# namespace. Nothing of the product opens it (a metadata mount on it is refused by name); this
+# rule keeps the host's tools off it: its /dev/disk/by-id links lose to the host's own node
+# (same wwid/uuid/serial), systemd and udisks ignore it, and SQZ_NVME_FENCER=1 names it for a
+# multipath.conf `blacklist { property "SQZ_NVME_FENCER" }`.
+# Installed by scripts/dev/provision-local-venue --apply and scripts/dev/provision-ssh-venue.
+ACTION=="remove", GOTO="sqz_fencer_end"
+SUBSYSTEM!="block", GOTO="sqz_fencer_end"
+KERNEL!="nvme*n*", GOTO="sqz_fencer_end"
+ATTRS{hostnqn}=="nqn.2026-10.io.squeezefs:fencer:*", ENV{SQZ_NVME_FENCER}="1", ENV{SYSTEMD_READY}="0", ENV{UDISKS_IGNORE}="1", OPTIONS+="link_priority=-100"
+LABEL="sqz_fencer_end"

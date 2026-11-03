@@ -10,12 +10,15 @@
 #      or Limine's);
 #   2. IOR/mdtest at io500's pinned hash into /opt/sqz-tools, exactly as
 #      scripts/dev/Containerfile builds them, and root runs allowed for OpenMPI;
-#   3. the facts a gate log is read against (kernel, openssl, fusermount3).
+#   3. the fencing registrant's udev rule (scripts/udev/60-squeezefs-fencer.rules,
+#      decision 0003 §DG) into /etc/udev/rules.d;
+#   4. the facts a gate log is read against (kernel, openssl, fusermount3).
 # Packages come from apt (Debian, Ubuntu) or pacman (Arch and its derivatives such
 # as Omarchy, which say ID_LIKE=arch).
 set -euo pipefail
 
 [ "$(id -u)" = 0 ] || { echo "provision: run as root" >&2; exit 1; }
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 . /etc/os-release
 case " $ID ${ID_LIKE:-} " in *" arch "*) FAMILY=arch ;; *) FAMILY=deb ;; esac
 
@@ -59,6 +62,14 @@ elif [ -d /etc/limine-entry-tool.d ] && command -v limine-mkinitcpio >/dev/null;
   fi
 else
   grep -qF "$mp_cmdline" /proc/cmdline || echo "provision: no GRUB drop-in dir and no limine-entry-tool here — put $mp_cmdline on the kernel command line yourself" >&2
+fi
+
+# The fencing registrant's namespace node (decision 0003 §DG, review M3): the repo's udev rule
+# keeps by-id links, systemd and udisks off it.
+fencer_rule=/etc/udev/rules.d/60-squeezefs-fencer.rules
+if ! cmp -s "$REPO/scripts/udev/60-squeezefs-fencer.rules" "$fencer_rule"; then
+  install -m 0644 "$REPO/scripts/udev/60-squeezefs-fencer.rules" "$fencer_rule"
+  udevadm control --reload
 fi
 
 # The hash io500 sc26 pins (docs/gates/brackets.md); the same as the image's.

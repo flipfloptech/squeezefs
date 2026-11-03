@@ -51,10 +51,12 @@ comptime {
     if (builtin.os.tag != .linux) @compileError("guard/fencer is Linux only (charter §1.2); gate the import on builtin.os.tag");
 }
 
-/// The fencer's host identity: a uuid hostid and its uuid-form hostnqn.
+/// The fencer's host identity: a uuid hostid and a hostnqn under the
+/// product's fencer prefix (`pr.FENCER_HOSTNQN_PREFIX`: recognisable by the
+/// refusal of a mount on its node and by the udev rule, review M3).
 pub const Identity = struct {
     hostid_buf: [36]u8 = undefined,
-    hostnqn_buf: [initiator.HOSTNQN_UUID_PREFIX.len + 36]u8 = undefined,
+    hostnqn_buf: [pr.FENCER_HOSTNQN_PREFIX.len + 36]u8 = undefined,
 
     pub fn hostid(self: *const Identity) []const u8 {
         return &self.hostid_buf;
@@ -88,7 +90,7 @@ pub fn identityOf(wire_host_id: []const u8, set_uuid: [16]u8) Identity {
     var id: Identity = .{};
     var w: Io.Writer = .fixed(&id.hostid_buf);
     configfs.writeUuid(&w, deriveHostId(wire_host_id, set_uuid)) catch unreachable;
-    _ = std.fmt.bufPrint(&id.hostnqn_buf, "{s}{s}", .{ initiator.HOSTNQN_UUID_PREFIX, id.hostid() }) catch unreachable;
+    _ = std.fmt.bufPrint(&id.hostnqn_buf, "{s}{s}", .{ pr.FENCER_HOSTNQN_PREFIX, id.hostid() }) catch unreachable;
     return id;
 }
 
@@ -136,6 +138,10 @@ pub const Input = struct {
     path: []const u8,
     /// The guard's char node (`ngXnY`): its controller is the template.
     node: []const u8,
+    /// The namespace's nsid: this process's user line names it (one process
+    /// may stand fencers for two namespaces of one subsystem — review minor
+    /// 2 of §DG).
+    nsid: u32,
     wire_host_id: [16]u8,
     set_uuid: [16]u8,
     /// The host's key on the namespace (the guard client's).
@@ -165,6 +171,7 @@ pub const Fencer = struct {
         subnqn_len: usize = 0,
         instance: u32,
         reused: bool,
+        nsid: u32,
 
         fn subnqn(self: *const Association) []const u8 {
             return self.subnqn_buf[0..self.subnqn_len];
@@ -248,8 +255,9 @@ pub const Fencer = struct {
         };
         defer a.users.unlock();
         const me = proc.localIdentity().pid;
-        a.users.remove(me);
-        const others = a.users.othersAlive(gpa, me) catch 1;
+        var lb: [24]u8 = undefined;
+        const ours = a.users.removeLine(me, userLine(&lb, a.nsid)) catch true;
+        const others = (a.users.othersAlive(gpa, me) catch 1) + @intFromBool(ours);
         if (others != 0) {
             log.info("fencing registrant {s}: {d} other process(es) of this host ride it — its registration and controller stay", .{ self.identity.hostnqn(), others });
             return;
@@ -324,7 +332,9 @@ fn standOrRefuse(gpa: Allocator, env: *const std.process.Environ.Map, in: Input)
     users.lock() catch return error.UsersUnavailable;
     defer users.unlock();
     const me = proc.localIdentity();
-    users.append(me.pid, me.start_ticks, "f\n") catch return error.UsersUnavailable;
+    var lb: [24]u8 = undefined;
+    const line = userLine(&lb, in.nsid);
+    users.append(me.pid, me.start_ticks, line) catch return error.UsersUnavailable;
     var reused = true;
     const got = findOurs(gpa, spec, want_uuid) orelse blk: {
         reused = false;
@@ -333,11 +343,11 @@ fn standOrRefuse(gpa: Allocator, env: *const std.process.Environ.Map, in: Input)
             var ew: Io.Writer = .fixed(&eb);
             initiator.writeConnectRefusal(&ew, e, spec) catch {};
             log.warn("meta volume {s}: the fencing registrant's connect of {s} under {s} failed: {s}", .{ in.path, subnqn, id.hostnqn(), ew.buffered() });
-            users.remove(me.pid);
+            _ = users.removeLine(me.pid, line) catch {};
             return error.ConnectFailed;
         };
     };
-    errdefer giveBack(gpa, &users, me.pid, got.instance);
+    errdefer giveBack(gpa, &users, me.pid, line, got.instance);
     var nb: [40]u8 = undefined;
     const dev = switch (pr_linux.resolve(gpa, got.ns.blockPath(&nb))) {
         .device => |d| d,
@@ -357,7 +367,7 @@ fn standOrRefuse(gpa: Allocator, env: *const std.process.Environ.Map, in: Input)
         return error.RegisterFailed;
     };
     const f = try gpa.create(Fencer);
-    f.* = .{ .gpa = gpa, .identity = id, .client = c, .assoc = .{ .device = dev, .users = users, .instance = got.instance, .reused = reused } };
+    f.* = .{ .gpa = gpa, .identity = id, .client = c, .assoc = .{ .device = dev, .users = users, .instance = got.instance, .reused = reused, .nsid = in.nsid } };
     c.op_lock = f.seq_lock.opLock();
     const a = &f.assoc.?;
     @memcpy(a.subnqn_buf[0..subnqn.len], subnqn);
@@ -375,11 +385,16 @@ fn registerUnder(c: *pr.Client) pr.Error!void {
     _ = try c.registerLadder();
 }
 
+/// This process's user line for the fencer of namespace `nsid`.
+fn userLine(buf: *[24]u8, nsid: u32) []const u8 {
+    return std.fmt.bufPrint(buf, "f {d}\n", .{nsid}) catch unreachable;
+}
+
 /// A refused stand's give-back: out of the users; the last deletes the
 /// controller it reused or connected.
-fn giveBack(gpa: Allocator, users: *host_fence.Registry, pid: u32, instance: u32) void {
-    users.remove(pid);
-    if ((users.othersAlive(gpa, pid) catch 1) == 0) {
+fn giveBack(gpa: Allocator, users: *host_fence.Registry, pid: u32, line: []const u8, instance: u32) void {
+    const ours = users.removeLine(pid, line) catch true;
+    if ((users.othersAlive(gpa, pid) catch 1) == 0 and !ours) {
         initiator.deleteController(instance) catch {};
         _ = initiator.awaitControllerGone(instance);
     }
@@ -415,7 +430,7 @@ fn findOurs(gpa: Allocator, spec: initiator.ConnectSpec, want_uuid: [16]u8) ?ini
 
 const testing = std.testing;
 
-test "the fencer's identity: a uuid4 hostid (version 4, variant 10) and its uuid-form hostnqn, derived from the wire host id and the set — the same on every derivation, another for another host or another set, never the host's own" {
+test "the fencer's identity: a uuid4 hostid (version 4, variant 10) and a hostnqn under the fencer prefix, derived from the wire host id and the set — the same on every derivation, another for another host or another set, never the host's own" {
     const wire_a: [16]u8 = "wire-host-id-a01".*;
     const wire_b: [16]u8 = "wire-host-id-b02".*;
     const set_1: [16]u8 = @splat(1);
@@ -437,8 +452,9 @@ test "the fencer's identity: a uuid4 hostid (version 4, variant 10) and its uuid
     try testing.expectEqual(@as(u8, 0x40), id[6] & 0xf0);
     try testing.expectEqual(@as(u8, 0x80), id[8] & 0xc0);
     try testing.expect(proc.parseUuid(a1.hostid()) != null);
-    try testing.expect(std.mem.startsWith(u8, a1.hostnqn(), initiator.HOSTNQN_UUID_PREFIX));
-    try testing.expectEqualStrings(a1.hostid(), a1.hostnqn()[initiator.HOSTNQN_UUID_PREFIX.len..]);
+    try testing.expect(std.mem.startsWith(u8, a1.hostnqn(), pr.FENCER_HOSTNQN_PREFIX));
+    try testing.expectEqualStrings(a1.hostid(), a1.hostnqn()[pr.FENCER_HOSTNQN_PREFIX.len..]);
+    try testing.expect(a1.hostnqn().len <= 223); // NVMF_NQN_SIZE − 1
     // The host identity's own derivation (machine id) is another domain.
     const host = initiator.deriveHostId(&wire_a);
     try testing.expect(!std.mem.eql(u8, &host, &id));
@@ -447,7 +463,7 @@ test "the fencer's identity: a uuid4 hostid (version 4, variant 10) and its uuid
 test "the fencer refuses a non-fabric namespace by name (its char node names no fabric controller): the holder's-preempt posture" {
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
-    const st = stand(testing.allocator, &env, .{ .path = "/nonexistent", .node = "ng999999n1", .wire_host_id = @splat(7), .set_uuid = @splat(9), .key = 0x55 });
+    const st = stand(testing.allocator, &env, .{ .path = "/nonexistent", .node = "ng999999n1", .nsid = 1, .wire_host_id = @splat(7), .set_uuid = @splat(9), .key = 0x55 });
     switch (st) {
         .stood => |f| {
             f.release();

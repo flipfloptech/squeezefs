@@ -409,6 +409,34 @@ pub const Registry = struct {
         };
     }
 
+    /// Drop one exact line of this process's entry (the file goes with its
+    /// last line); true = other lines of the process remain.
+    pub fn removeLine(self: *const Registry, pid: u32, line: []const u8) RegistryError!bool {
+        var rb: [4096]u8 = undefined;
+        const old = self.readEntry(pid, &rb) orelse return false;
+        var out: [4096]u8 = undefined;
+        var w: Io.Writer = .fixed(&out);
+        var lines = std.mem.tokenizeScalar(u8, old, '\n');
+        const header = lines.next() orelse {
+            self.remove(pid);
+            return false;
+        };
+        w.print("{s}\n", .{header}) catch return error.RegistryUnavailable;
+        const want = std.mem.trimEnd(u8, line, "\n");
+        var kept: usize = 0;
+        var dropped = false;
+        while (lines.next()) |l| {
+            if (!dropped and std.mem.eql(u8, l, want)) {
+                dropped = true;
+                continue;
+            }
+            w.print("{s}\n", .{l}) catch return error.RegistryUnavailable;
+            kept += 1;
+        }
+        try self.writeEntry(pid, if (kept == 0) "" else w.buffered());
+        return kept != 0;
+    }
+
     /// The whole entry (a dead process's, or a fabric association's user).
     pub fn remove(self: *const Registry, pid: u32) void {
         var pb: [linux.PATH_MAX]u8 = undefined;
@@ -1333,6 +1361,29 @@ test "the judgement: a Live page names a current sibling; a Recovering, Recovere
     try testing.expectEqual(Verdict.current, judge(&m, &.{pg(0, .live, node, 0xc2)}, node, 1, false, .{}));
     try testing.expect(Entry.parse(1, "") == null);
     try testing.expect(Entry.parse(1, "x\n") == null);
+}
+
+test "the registry's fabric users per namespace (review minor 2 of decision 0003 §DG): one process standing fencers for two namespaces of one subsystem holds a line per namespace — the first namespace's give-back leaves the process a user of the association, the second's ends it" {
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-users-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var reg = Registry.at(base, .fabric, 0x77);
+    reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer reg.unlock();
+    const me = proc.localIdentity();
+    try reg.append(me.pid, me.start_ticks, "f 1\n");
+    try reg.append(me.pid, me.start_ticks, "f 2\n");
+    try testing.expect(try reg.removeLine(me.pid, "f 1\n"));
+    {
+        const es = try reg.entries(testing.allocator);
+        defer testing.allocator.free(es);
+        try testing.expectEqual(@as(usize, 1), es.len);
+    }
+    try testing.expect(!(try reg.removeLine(me.pid, "f 2\n")));
+    const es = try reg.entries(testing.allocator);
+    defer testing.allocator.free(es);
+    try testing.expectEqual(@as(usize, 0), es.len);
+    try testing.expect(!(try reg.removeLine(me.pid, "f 2\n")));
 }
 
 test "the registry: entries append and parse; a dead process's entry is pruned by its start ticks; the flock serializes; a region's lines leave alone; a reused pid's stale file is replaced" {

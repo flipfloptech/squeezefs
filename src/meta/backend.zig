@@ -377,7 +377,20 @@ pub const FormatError = format.FormatError || error{ DeviceRefused, Io, OutOfMem
 /// plan the image, write the steps with their barriers in the plan's
 /// order (zero the fixed region → roots → bitmap → ledger → barrier →
 /// tail superblock → barrier → sector 0 → barrier).
+/// A metadata node reached through a fencing registrant's controller is
+/// never opened (review M3 of decision 0003 §DG): a mount there would present
+/// the FENCER's host id — its own-stale ladder unregistering the fencer, a
+/// "host" of its own to the stale-sibling rule, its controller deleted under
+/// it by the manager's teardown. Loud by name.
+fn refuseFencerNode(path: []const u8) bool {
+    var nb: [256]u8 = undefined;
+    const nqn = guard.pr_linux.fencerNodeHostnqn(path, &nb) orelse return false;
+    log.err("meta volume {s}: the namespace node belongs to a fencing registrant's controller (hostnqn {s}) — refused: mount the host's own node of the namespace (decision 0003 §DG)", .{ path, nqn });
+    return true;
+}
+
 pub fn formatVolume(gpa: Allocator, path: []const u8, opts: FormatOptions) FormatError!void {
+    if (refuseFencerNode(path)) return error.DeviceRefused;
     const mode = uring_fs.registerMetaDevice(gpa, opts.env, path) catch return error.DeviceRefused;
     const pool = opts.pool orelse (uring_fs.Pool.init(gpa, uring_fs.Config.resolve(opts.env, derive.Facts.probe())) catch return error.DeviceRefused);
     defer if (opts.pool == null) pool.deinit();
@@ -558,6 +571,7 @@ pub const KvBackend = struct {
         // The pass is a lane fiber: its waits must park the fiber (module doc).
         std.debug.assert(io.vtable == &exec.SqzIo.vtable);
         const t0 = clock.monotonicNs();
+        if (refuseFencerNode(path)) return error.DeviceRefused;
         // 1. Layer A (a test seam skips it: the "another host" simulation,
         // where the claim alone must refuse).
         const skip_flock = if (builtin.is_test) opts.guard.test_skip_flock else false;
@@ -1078,6 +1092,7 @@ pub const KvBackend = struct {
     pub fn openJoined(gpa: Allocator, io: Io, path: []const u8, opts: OpenOptions, jopts: JoinOptions) OpenError!*KvBackend {
         std.debug.assert(io.vtable == &exec.SqzIo.vtable);
         const t0 = clock.monotonicNs();
+        if (refuseFencerNode(path)) return error.DeviceRefused;
         // 1. The device fd without the flock (held for the mount's life, the
         // same dedicated-fd rule: never a pool fd).
         const guard_fd = openGuardFd(path) catch return error.DeviceRefused;

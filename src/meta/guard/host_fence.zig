@@ -232,6 +232,8 @@ pub const Registry = struct {
     dir_len: usize = 0,
     kind: Kind = .set,
     lock_fd: linux.fd_t = -1,
+    /// Test seam: every append fails (a full or unwritable run dir).
+    test_fail_append: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
 
     pub fn at(base: []const u8, kind: Kind, key: u64) Registry {
         var r: Registry = .{ .kind = kind };
@@ -345,6 +347,7 @@ pub const Registry = struct {
     /// this process's: a file a crashed predecessor under a reused pid left
     /// is replaced, never extended (review major 10).
     pub fn append(self: *const Registry, pid: u32, start_ticks: u64, line: []const u8) RegistryError!void {
+        if (builtin.is_test and self.test_fail_append) return error.RegistryUnavailable;
         try self.mkdirs();
         var rb: [4096]u8 = undefined;
         var out: [4096 + 128]u8 = undefined;
@@ -1500,6 +1503,50 @@ test "review 4 blocker 1: a joined line round-trips its page (appender id, term,
     try testing.expectEqual(@as(usize, 1), es[0].n_regions);
     try testing.expectEqual(@as(?Joined, .{ .appender_id = 7, .term = 8, .vol = 1 }), es[0].regions[0].joined);
     try testing.expectEqual(@as(usize, 0), es[0].n_retired);
+}
+
+test "review 5 minor 1: a retirement covers its page on ITS volume only — a member's volumes share its writer id and often its appender id: volume 0's `r` never spares volume 1's evicted page" {
+    const node: u64 = 0xA;
+    var e = Entry.parse(49, "84\nj 9 00000000000000d2 4 6 1\nr 00000000000000d2 4 6 0\n").?;
+    try testing.expectEqual(Verdict.stale, judge(&e, &.{pgTerm(4, .recovered, node, 0xd2, 6)}, node, 1, false, .{}));
+}
+
+test "review 5 minor 1: removing one volume's page lines leaves another volume's lines under the same writer id and appender id" {
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-vols-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var reg = Registry.at(base, .set, 0x9abc);
+    reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer reg.unlock();
+    const me = proc.localIdentity();
+    try reg.append(me.pid, me.start_ticks, "j 9 00000000000000d2 4 6 0\n");
+    try reg.append(me.pid, me.start_ticks, "j 9 00000000000000d2 4 6 1\n");
+    reg.removeRegion(me.pid, "jlr", 0xd2, .{ .page = 4 });
+    const es = try reg.entries(testing.allocator);
+    defer testing.allocator.free(es);
+    try testing.expectEqual(@as(usize, 1), es.len);
+    try testing.expectEqual(@as(usize, 1), es[0].n_regions);
+    try testing.expectEqual(@as(u32, 1), es[0].regions[0].joined.?.vol);
+}
+
+test "review 5 minor 2: a joiner's line naming its page is appended BEFORE its unjoined line goes — an append that fails leaves the unjoined line, never a process with no line" {
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-join-order-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var reg = Registry.at(base, .set, 0xdef0);
+    const me = proc.localIdentity();
+    {
+        reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+        defer reg.unlock();
+        try reg.append(me.pid, me.start_ticks, "j 9 00000000000000d2\n");
+    }
+    var j: Joiner = .{ .gpa = testing.allocator, .device = undefined, .client = undefined, .reg = reg, .slot = 9, .writer_id = 0xd2, .vol = 0 };
+    j.reg.test_fail_append = true;
+    _ = j.joined(4, 6);
+    const es = try reg.entries(testing.allocator);
+    defer testing.allocator.free(es);
+    try testing.expectEqual(@as(usize, 1), es.len);
+    try testing.expectEqual(@as(usize, 1), es[0].n_regions);
 }
 
 test "round 3 major 4, review 4 blocker 1b: a sibling mid-leave stays visible to the rule — its `l` line names its appender id, term and volume: Live under it is current; Recovering (frozen during its leave, evicted) is stale; a Free page naming it — only `releaseRecovered` leaves one (the leave's own Free page clears the identity) — is stale; Free with the identity cleared (its own landed leave, the line removed next) is stale too: its writes all landed, a kill there costs nothing" {

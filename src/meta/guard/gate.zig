@@ -1564,6 +1564,31 @@ test "review 4 minor 5: a lapse whose device claim cannot be read (every probe f
     try testing.expect(!be.isFailed());
 }
 
+test "review 5 minor 3: unreadable lapse beats are bounded — after one claim TTL of them the volume fail-stops (a never-decoding claim must not keep a manager writing in an unreserved namespace); fewer skip" {
+    const gpa = testing.allocator;
+    const v = try Vol.create(gpa, "lapse-unreadable-ttl", "600000");
+    defer v.destroy();
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var host: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
+    const be = try v.open(.{ .test_identity = ident(boot_a, 4000, 777), .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
+    defer be.close();
+    const g = be.guard.?;
+    ns.powerCycle();
+    g.test_probe_unreadable = true;
+    // One claim TTL of beats (the TTL over the beat interval, rounded up).
+    const beats = (claim.STALE_TTL_S + claim.HEARTBEAT_INTERVAL_S - 1) / claim.HEARTBEAT_INTERVAL_S;
+    for (0..beats - 1) |_| {
+        g.beat();
+        try testing.expect(!be.isFailed());
+    }
+    log.testing.expectErrorLogs(1);
+    g.beat();
+    try log.testing.expectAllFired();
+    try testing.expect(be.isFailed());
+    try testing.expectEqual(@as(?u64, null), ns.holder);
+}
+
 test "a stats render is no atomic cut across the fence: the volume's verdict (`meta.set`) renders BEFORE the process-wide writer_guard_fenced (`meta.guard`), so a fence landing between the two sections reads `healthy` beside the count — a render begun after the count was seen reads `fenced` (the nvmet sigstop-preempt row's law)" {
     const gpa = testing.allocator;
     const v = try Vol.create(gpa, "render", "600000");

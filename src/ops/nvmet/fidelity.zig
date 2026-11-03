@@ -56,6 +56,8 @@ const configfs = @import("configfs.zig");
 const ledger = @import("ledger.zig");
 const initiator = @import("initiator.zig");
 const multipath = @import("multipath.zig");
+const fencing = @import("../../meta/sym/membership/fencing.zig");
+const proc = @import("../../meta/guard/proc.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("ops/nvmet/fidelity is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -874,6 +876,118 @@ test "nvmet fidelity: pr-matrix-tcp — the same legs on nvmet-tcp, plus a regis
 /// before the record), the data volume's `fabric_endpoint` record set,
 /// the operator's data association released — the daemon connects its
 /// own at mount.
+/// A PR client on a connected namespace's char twin (the caller frees both).
+fn clientOn(gpa: Allocator, c: *const Connected, key: u64) !struct { dev: *pr_linux.Device, client: *pr.Client } {
+    const dev = switch (pr_linux.resolve(gpa, c.dev())) {
+        .device => |d| d,
+        .none => return error.NotAnNvmeNamespace,
+    };
+    errdefer dev.deinit();
+    const client = try gpa.create(pr.Client);
+    errdefer gpa.destroy(client);
+    client.* = try pr.Client.init(gpa, dev.face(), dev.nsid, key);
+    client.rtype = nvme.RTYPE_WERO;
+    _ = try client.probeRescap();
+    return .{ .dev = dev, .client = client };
+}
+
+const ident_fa: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:fafafafa-fafa-4afa-8afa-fafafafafafa", .hostid = "fafafafa-fafa-4afa-8afa-fafafafafafa" };
+
+test "nvmet fidelity: the fencing registrant's device laws on nvmet 7.3 (decision 0003 §DG) — four identities on one loop namespace: host A holds WERO under key K, host A's fencer F registered under the SAME key K from another host id, member host B under KB, successor host C under KC; F's preempt of KB unregisters B (its write refused, -EBADE) and keeps A's reservation — A the holder, F not; C's takeover preempt of K unregisters A AND F in one command; F's preempt then answers a conflict (nothing fenced, C's hold intact)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const nqn = try rig.share("fl", meta_len, .loop, 0);
+    const ca = try rig.connect(nqn, .loop, 0, null, &.{});
+    const cf = try rig.connect(nqn, .loop, 0, ident_fa, &.{});
+    const cb = try rig.connect(nqn, .loop, 0, ident_b, &.{});
+    const cc = try rig.connect(nqn, .loop, 0, ident_c, &.{});
+    const key_k: u64 = 0xFE4C_0000_0000_00A1;
+    const key_b: u64 = 0xFE4C_0000_0000_00B1;
+    const key_c: u64 = 0xFE4C_0000_0000_00C1;
+    const a = try clientOn(gpa, &ca, key_k);
+    defer {
+        a.client.deinit();
+        gpa.destroy(a.client);
+        a.dev.deinit();
+    }
+    const f = try clientOn(gpa, &cf, key_k);
+    defer {
+        f.client.deinit();
+        gpa.destroy(f.client);
+        f.dev.deinit();
+    }
+    const b = try clientOn(gpa, &cb, key_b);
+    defer {
+        b.client.deinit();
+        gpa.destroy(b.client);
+        b.dev.deinit();
+    }
+    const c = try clientOn(gpa, &cc, key_c);
+    defer {
+        c.client.deinit();
+        gpa.destroy(c.client);
+        c.dev.deinit();
+    }
+    try fencing.acquireManagerHold(a.client);
+    _ = try f.client.registerLadder();
+    _ = try b.client.registerLadder();
+    _ = uring_fs.registerMetaDevice(gpa, &rig.env, cb.dev()) catch return error.DirectOpenRefused;
+    var buf = try uring_fs.AlignedBuf.zeroed(gpa, 4096, 4096);
+    defer buf.deinit();
+    try rig.pool.writeAt(cb.dev(), 0, buf.bytes);
+    // F — a non-holder under the holder's key — preempts B's key.
+    try testing.expectEqual(fencing.PreemptOutcome.fenced, fencing.preemptDeadRegistrant(a.client, f.client, key_b));
+    {
+        var rep = try a.client.report();
+        defer rep.deinit(gpa);
+        try testing.expectEqual(nvme.RTYPE_WERO, rep.rtype);
+        try testing.expect(!rep.registered(key_b));
+        try testing.expectEqual(@as(?u64, key_k), rep.holder());
+        try testing.expectEqual(@as(usize, 2), rep.registrants.len);
+        var holders: u32 = 0;
+        for (rep.registrants) |r| {
+            if (!r.holds) continue;
+            holders += 1;
+            try testing.expectEqualSlices(u8, &(proc.parseUuid(ident_a.hostid) orelse return error.BadUuid), &r.host_id);
+        }
+        try testing.expectEqual(@as(u32, 1), holders);
+    }
+    try testing.expectError(error.ReservationConflict, rig.pool.writeAt(cb.dev(), 0, buf.bytes));
+    // C takes over by preempting the holder's key: A and its fencer go.
+    _ = try c.client.registerLadder();
+    try c.client.preempt(key_k);
+    {
+        var rep = try c.client.report();
+        defer rep.deinit(gpa);
+        try testing.expectEqual(@as(?u64, key_c), rep.holder());
+        try testing.expect(!rep.registered(key_k));
+    }
+    // A, superseded, finishing a recovery: its fencer's command conflicts.
+    _ = try b.client.registerLadder();
+    try testing.expectEqual(fencing.PreemptOutcome.failed, fencing.preemptDeadRegistrant(a.client, f.client, key_b));
+    {
+        var rep = try c.client.report();
+        defer rep.deinit(gpa);
+        try testing.expectEqual(@as(?u64, key_c), rep.holder());
+        try testing.expect(rep.registered(key_b));
+    }
+    // Zero residue.
+    try c.client.release();
+    try b.client.unregister(key_b);
+    {
+        const rr = try rig.resvReportJson(ca.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, 0), json_scan.number(rr, "regctl"));
+    }
+    try rig.disconnect(&cc);
+    try rig.disconnect(&cb);
+    try rig.disconnect(&cf);
+    try rig.disconnect(&ca);
+    try rig.unshare(nqn);
+    try expectNoResidue(rig, nqn);
+}
+
 const DaemonSet = struct {
     meta_nqn: []const u8,
     data_nqn: []const u8,

@@ -786,6 +786,27 @@ pub const Guard = struct {
             }
             if (builtin.is_test) if (g.test_after_lapse_probe) |h| h.fire(h.ctx);
             outcome = sqz.runBlocking(reacquireBlocking, .{ g, c }) catch return true;
+            if (outcome == .reacquired) {
+                // The claim read AGAIN under the hold (the lapse claim window,
+                // decision 0003 §DG.19): the probe above may predate a
+                // successor's whole tenure — it acquired the free namespace,
+                // bound, wrote acked metadata and left (a hold it acquired
+                // it released) — so the acquire alone proves nothing. Now
+                // this host holds: no successor binds without fencing it, and
+                // one that bound and left replaced or deleted the claim.
+                switch (g.deviceClaim()) {
+                    .ours => outcome = sqz.runBlocking(fencerReregisterBlocking, .{ g, c }) catch return true,
+                    .foreign => {
+                        _ = g.be.lane.latch.noteFence("the reservation lapse: the device's claim, read again after the re-acquire, names another writer");
+                        log.err("meta volume {s}: after the re-acquire the claim on the device is not this incarnation's — a successor bound (and left) between the claim probe and the hold: this volume fail-stops instead of running on a superseded view", .{g.be.path});
+                        return false;
+                    },
+                    .unreadable => {
+                        g.failStop("after the re-acquire the claim on the device could not be read — this incarnation's claim is not proven");
+                        return false;
+                    },
+                }
+            }
         }
         switch (outcome) {
             .ours => return true,
@@ -847,11 +868,15 @@ pub const Guard = struct {
         const fresh = g.registerHost(c, false) catch return .reacquire_failed;
         c.acquire() catch return .reacquire_failed;
         if (locked and fresh) guard.stats.pr_host_registrations.inc();
+        return .reacquired;
+    }
+
+    /// After the re-acquire and the claim's re-read: the lapse forgot the
+    /// fencer too; re-registered, it must find this host holding (review M1
+    /// of §DG) — a successor's hold that landed since the acquire leaves it
+    /// unregistered and this volume usurped.
+    fn fencerReregisterBlocking(g: *Guard, c: *pr.Client) Recheck {
         if (builtin.is_test) if (g.test_after_reacquire) |h| h.fire(h.ctx);
-        // The lapse forgot the fencer too; re-registered, it must find this
-        // host holding (review M1 of §DG) — a successor's hold that landed
-        // between the acquire and here leaves it unregistered and this
-        // volume usurped.
         if (g.fencer) |f| {
             if (!f.reregisterHeld(c)) {
                 const foreign = (c.holder() catch null) orelse 0;

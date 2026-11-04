@@ -1887,3 +1887,35 @@ test "review minor 2 (decision 0003 §DJ): a co-located member's death whose pro
     // Nothing was killed (the registry proved W gone by its start ticks).
     try testing.expectEqual(kills0, guard.stats.pr_stale_sibling_kills.load());
 }
+
+test "a co-located member whose MAIN thread exited first (a zombie in /proc/<pid>/stat while another thread still runs, holds its files and can still issue I/O) is alive to the registry and the §DA proof: its recoverer KILLS it and awaits the whole group's exit — never proves it dead and leaves that thread running" {
+    const gpa = testing.allocator;
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-threads-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var probe = Registry.at(base, .set, 0xd3);
+    probe.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    probe.unlock();
+    const local = proc.localIdentity();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const ctx: RuleContext = .{ .gpa = gpa, .env = &env, .path = "threads", .local = local, .node_token = 0xA, .vol_index = 0, .taking_manager = false, .label = "data volume" };
+    var cb: [160:0]u8 = undefined;
+    const claim_path = try std.fmt.bufPrintSentinel(&cb, "{s}/claim", .{base}, 0);
+    var w = try proc.ThreadedStandIn.start(claim_path.ptr);
+    defer w.deinit();
+    const pid: u32 = @intCast(w.pid);
+    const ticks = proc.startTicksOf(pid).?;
+    const id: claim.Identity = .{ .boot_id = local.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
+    const reg = Registry.at(base, .set, 0xd3);
+    var lb: [96]u8 = undefined;
+    try reg.append(pid, ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = id.writerId(9), .joined = .{ .appender_id = 3, .term = 2, .vol = 0 } }));
+    w.exitMainThread();
+    try testing.expect(proc.flockHeldElsewhere(claim_path.ptr));
+    const dead = pgTerm(3, .recovering, 0xA, id.writerId(9), 2);
+    const kills0 = guard.stats.pr_stale_sibling_kills.load();
+    try testing.expect(killColocatedMember(ctx, reg, &dead, &.{}));
+    try testing.expectEqual(kills0 + 1, guard.stats.pr_stale_sibling_kills.load());
+    // The whole group is gone: the claim's flock is free.
+    try testing.expect(!proc.flockHeldElsewhere(claim_path.ptr));
+}

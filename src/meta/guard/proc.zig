@@ -726,6 +726,164 @@ test "start ticks: field 22 after the last ')' (a comm with spaces and parenthes
     try testing.expect(probe.provablyDead(pid, 1));
 }
 
+/// The thread-group pins' stand-in (the guard's death proof and the
+/// umount verb's exit verdict), forked and never exec'd: only raw syscalls
+/// run in the child. It takes `lock_path`'s flock (a writer claim's
+/// stand-in), blocks SIGTERM, starts a second thread (a raw clone sharing
+/// its fd table) parked on a pipe, names itself ready, and on the TERM
+/// exits its MAIN thread alone (SYS_exit): the leader a zombie in
+/// `/proc/<pid>/stat` while the second thread holds the fd table — the
+/// flock with it — until `release`.
+pub const ThreadedStandIn = struct {
+    pid: linux.pid_t,
+    park_fd: linux.fd_t,
+    reaped: bool = false,
+
+    pub fn start(lock_path: [*:0]const u8) !ThreadedStandIn {
+        var ready: [2]linux.fd_t = undefined;
+        var hold: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true })) != .SUCCESS) return error.Unexpected;
+        if (linux.errno(linux.pipe2(&hold, .{ .CLOEXEC = true })) != .SUCCESS) return error.Unexpected;
+        const rc = linux.fork();
+        if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
+        if (rc == 0) {
+            _ = linux.close(ready[0]);
+            _ = linux.close(hold[1]);
+            child(lock_path, ready[1], hold[0]);
+        }
+        _ = linux.close(ready[1]);
+        _ = linux.close(hold[0]);
+        const self: ThreadedStandIn = .{ .pid = @intCast(rc), .park_fd = hold[1] };
+        var byte: u8 = 0;
+        const n = linux.read(ready[0], @ptrCast(&byte), 1);
+        _ = linux.close(ready[0]);
+        if (n != 1) {
+            var s = self;
+            s.deinit();
+            return error.Unexpected;
+        }
+        return self;
+    }
+
+    /// The TERM: the main thread exits alone; returns once `/proc` reads
+    /// the leader a zombie (the second thread still runs).
+    pub fn exitMainThread(self: *const ThreadedStandIn) void {
+        _ = linux.kill(self.pid, .TERM);
+        while (stateLetter(self.pid) != 'Z') std.Thread.yield() catch {};
+    }
+
+    /// Lets the second thread go: the last thread's exit is the group's.
+    pub fn release(self: *const ThreadedStandIn) bool {
+        const one: u8 = 'g';
+        return linux.write(self.park_fd, @ptrCast(&one), 1) == 1;
+    }
+
+    /// Waits until the whole group has exited (the leader reapable),
+    /// without reaping it.
+    pub fn awaitGroupExit(self: *const ThreadedStandIn) void {
+        var info: linux.siginfo_t = undefined;
+        while (linux.errno(linux.waitid(.PID, self.pid, &info, linux.W.EXITED | linux.W.NOWAIT, null)) == .INTR) {}
+    }
+
+    pub fn reap(self: *ThreadedStandIn) void {
+        var status: i32 = 0;
+        _ = linux.waitpid(self.pid, &status, 0);
+        self.reaped = true;
+    }
+
+    /// Our child, never reaped before this: the pid is its own.
+    pub fn deinit(self: *ThreadedStandIn) void {
+        _ = linux.close(self.park_fd);
+        if (self.reaped) return;
+        _ = linux.kill(self.pid, .KILL);
+        self.reap();
+    }
+
+    var stack: [64 << 10]u8 align(16) = undefined;
+
+    fn child(lock_path: [*:0]const u8, ready_fd: linux.fd_t, park_fd: linux.fd_t) noreturn {
+        const lrc = linux.open(lock_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+        if (linux.errno(lrc) != .SUCCESS) linux.exit_group(1);
+        if (linux.errno(linux.flock(@intCast(lrc), std.posix.LOCK.EX)) != .SUCCESS) linux.exit_group(2);
+        var term = linux.sigemptyset();
+        linux.sigaddset(&term, .TERM);
+        _ = linux.sigprocmask(linux.SIG.BLOCK, &term, null);
+        const sfd = linux.signalfd(-1, &term, linux.SFD.CLOEXEC);
+        if (linux.errno(sfd) != .SUCCESS) linux.exit_group(3);
+        const flags = linux.CLONE.VM | linux.CLONE.FS | linux.CLONE.FILES | linux.CLONE.SIGHAND | linux.CLONE.THREAD | linux.CLONE.SYSVSEM;
+        if (linux.errno(linux.clone(&parkThread, @intFromPtr(&stack) + stack.len, flags, @intCast(park_fd), null, 0, null)) != .SUCCESS) linux.exit_group(4);
+        const one: u8 = 'r';
+        _ = linux.write(ready_fd, @ptrCast(&one), 1);
+        var info: linux.signalfd_siginfo = undefined;
+        _ = linux.read(@intCast(sfd), @ptrCast(&info), @sizeOf(linux.signalfd_siginfo));
+        linux.exit(0);
+    }
+
+    /// The second thread: parked until a byte or EOF on its pipe; its
+    /// return is the clone trampoline's SYS_exit.
+    fn parkThread(arg: usize) callconv(.c) u8 {
+        var b: u8 = 0;
+        _ = linux.read(@intCast(arg), @ptrCast(&b), 1);
+        return 0;
+    }
+};
+
+/// The state letter of `/proc/<pid>/stat` (after the comm's closing
+/// paren); null when unreadable.
+pub fn stateLetter(pid: linux.pid_t) ?u8 {
+    var pb: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/stat", .{pid}, 0) catch return null;
+    var buf: [512]u8 = undefined;
+    const text = readSmall(path.ptr, &buf) orelse return null;
+    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return null;
+    const rest = std.mem.trimStart(u8, text[close + 1 ..], " ");
+    return if (rest.len == 0) null else rest[0];
+}
+
+/// Does another open file description hold an exclusive flock on `path`
+/// (ours, opened here, is refused)?
+pub fn flockHeldElsewhere(path: [*:0]const u8) bool {
+    const rc = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    defer _ = linux.close(@intCast(rc));
+    return linux.errno(linux.flock(@intCast(rc), std.posix.LOCK.EX | std.posix.LOCK.NB)) == .AGAIN;
+}
+
+test "the death proof is the THREAD GROUP's: a process whose main thread exited first — a zombie in /proc/<pid>/stat — while another thread still runs and holds its files (it can still issue I/O) is ALIVE to the claim prover, the §DA incarnation proof and liveWriterPid until its last thread is gone; then the zombie is dead, and so is its reaped pid; a stopped process is alive" {
+    const me = localIdentity();
+    var lb: [96:0]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintSentinel(&lb, "/build/tmp/guard-proc-threads-{d}", .{linux.getpid()}, 0);
+    _ = linux.mkdir("/build/tmp", 0o755);
+    defer _ = linux.unlink(lock_path.ptr);
+    var w = try ThreadedStandIn.start(lock_path.ptr);
+    defer w.deinit();
+    const pid: u32 = @intCast(w.pid);
+    const ticks = startTicksOf(pid).?;
+    const theirs: claim.Identity = .{ .boot_id = me.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = me.hostname_hash };
+    const wid = theirs.writerId(0x0819);
+    // Stopped: alive.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(w.pid, .STOP)));
+    var status: i32 = 0;
+    try testing.expectEqual(@as(usize, @intCast(w.pid)), linux.waitpid(w.pid, &status, linux.W.UNTRACED));
+    try testing.expect(!probe.provablyDead(pid, ticks));
+    try testing.expect(isWriterIncarnation(me, pid, 0x0819, wid));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(w.pid, .CONT)));
+    // The main thread gone, the second thread holding the claim's flock.
+    w.exitMainThread();
+    try testing.expect(flockHeldElsewhere(lock_path.ptr));
+    try testing.expect(!probe.provablyDead(pid, ticks));
+    try testing.expect(isWriterIncarnation(me, pid, 0x0819, wid));
+    try testing.expectEqual(@as(?linux.pid_t, w.pid), liveWriterPid(testing.io, me, 0x0819, wid));
+    // The last thread gone: the zombie leader alone is dead, the flock free.
+    try testing.expect(w.release());
+    w.awaitGroupExit();
+    try testing.expect(!flockHeldElsewhere(lock_path.ptr));
+    try testing.expect(probe.provablyDead(pid, ticks));
+    try testing.expect(!isWriterIncarnation(me, pid, 0x0819, wid));
+    w.reap();
+    try testing.expect(probe.provablyDead(pid, ticks));
+}
+
 test "liveWriterPid: an incarnation's writer id names its live process on this host (this process; a running child under its own pid and start ticks), and none once that child is killed and reaped; another slot's id, or a stranger's, names none (decision 0003 §DA)" {
     const me = localIdentity();
     try testing.expectEqual(@as(?linux.pid_t, @intCast(me.pid)), liveWriterPid(testing.io, me, 7, me.writerId(7)));

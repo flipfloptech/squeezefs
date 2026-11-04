@@ -762,6 +762,7 @@ pub const WirePlane = struct {
         self.leave_lost = knobs.boolKnob("SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST", env);
         self.online_arm_hold = knobs.boolKnob("SQUEEZEFS_TEST_ONLINE_ARM_HOLD", env);
         self.rejoin_member_refused = knobs.boolKnob("SQUEEZEFS_TEST_REJOIN_MEMBER_REFUSED", env);
+        if (self.mgr) |m| m.owner.row_drop.store(knobs.boolKnob("SQUEEZEFS_TEST_MEMBER_ROW_DROP", env), .monotonic);
         if (self.joined) |j| {
             j.beat_hold = knobs.parseStr(env.get("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD"));
             j.follow_hold = knobs.parseStr(env.get("SQUEEZEFS_TEST_MEMBERSHIP_FOLLOW_HOLD"));

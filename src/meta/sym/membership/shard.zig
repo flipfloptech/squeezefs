@@ -538,6 +538,9 @@ pub const Owner = struct {
     rows: ?RowStore = null,
     /// Test seam: fired at each `HookSite`.
     test_hook: if (builtin.is_test) ?TestHook else void = if (builtin.is_test) null else {},
+    /// Test seam (`SQUEEZEFS_TEST_MEMBER_ROW_DROP`): the first writer join
+    /// granted writes no row — the lost-row case (decision 0004 §2.4 G-b).
+    row_drop: std.atomic.Value(bool) = .init(false),
 
     fn hook(self: *const Owner, site: HookSite) void {
         if (builtin.is_test) if (self.test_hook) |h| h.fire(h.ctx, site);
@@ -730,7 +733,9 @@ pub const Owner = struct {
             }
             r.publishCounts();
         }
-        self.writeRow(&m) catch return .io;
+        if (m.row != null and self.row_drop.swap(false, .monotonic)) {
+            log.warn("membership shard {d}: SQUEEZEFS_TEST_MEMBER_ROW_DROP — this join's member row is NOT written (the lost-row case)", .{self.home_volume});
+        } else self.writeRow(&m) catch return .io;
         if (reclaim) stats.membership_grace_reclaims.inc();
         stats.membership_joins.inc();
         return .{ .granted = .{ .epoch = m.epoch, .ack_prior_epoch = if (reclaim) (req.prior_epoch orelse 0) else 0 } };

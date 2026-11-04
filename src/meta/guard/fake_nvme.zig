@@ -656,3 +656,208 @@ test "fake answers: Identify NS byte 31 = rescap; FID 0x81 = the host id (16 B, 
     c = try face.issue(face.ctx, .io, &nvme.reservationReport(1, &short, false));
     try testing.expectEqual(nvme.STATUS_SUCCESS, c.status);
 }
+
+/// Probes a victim's I/O at each step of a preempt-and-abort (the seam
+/// between the ref kill and the unregister is F7b's unit form).
+const DrainSeam = struct {
+    a: *Host,
+    b: *Host,
+    /// A's write admitted before the preempt-all: the drain waits for it.
+    ticket: u32,
+    steps: [4]AbortStep = undefined,
+    victims: [4][16]u8 = undefined,
+    n: usize = 0,
+    killed_write: ?IoAnswer = null,
+    killed_read: ?IoAnswer = null,
+    unreg_write: ?IoAnswer = null,
+    unreg_read: ?IoAnswer = null,
+    drain_read: ?IoAnswer = null,
+    drain_regctl: ?u16 = null,
+    drain_gen: ?u32 = null,
+    pr_sem_in_drain: bool = false,
+    b_write: ?IoAnswer = null,
+
+    fn fire(ctx: *anyopaque, step: AbortStep, victim: ?[16]u8) void {
+        const s: *DrainSeam = @ptrCast(@alignCast(ctx));
+        s.steps[s.n] = step;
+        s.victims[s.n] = victim orelse @splat(0);
+        s.n += 1;
+        switch (step) {
+            .killed => {
+                s.killed_write = s.a.submit(.write);
+                s.killed_read = s.a.submit(.read);
+            },
+            .unregistered => {
+                s.unreg_write = s.a.submit(.write);
+                s.unreg_read = s.a.submit(.read);
+            },
+            .draining => {
+                s.pr_sem_in_drain = s.a.ns.prSemHeld();
+                s.drain_read = s.a.submit(.read);
+                var rep: [64 * 4]u8 = undefined;
+                const face = s.b.face();
+                const c = face.issue(face.ctx, .io, &nvme.reservationReport(1, &rep, true)) catch return;
+                if (c.status == nvme.STATUS_SUCCESS) {
+                    s.drain_regctl = nvme.reportRegctl(&rep, true);
+                    s.drain_gen = std.mem.readInt(u32, rep[0..4], .little);
+                }
+                // A non-victim's write is admitted and lands; then the
+                // victim's admitted write completes, and the drain with it.
+                s.b_write = s.b.submit(.write);
+                if (s.b_write) |w| if (w == .admitted) s.a.ns.complete(w.admitted);
+                s.a.ns.complete(s.ticket);
+            },
+        }
+    }
+};
+
+test "fake drain (nvmet 7.3, decision 0004 §2.2 P9, P9a–P9c, P14): a preempt-all kills each victim's refs, then unregisters it; a victim's write in that instant gets INTERNAL (P9c), after it a conflict (P9a); its read gets INTERNAL for the whole drain (P9b); a Report during the drain reads the state after the unregistration (P14); the command completes only once the victim's admitted write completed; then reads are admitted again and writes stay refused" {
+    var ns = Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var a: Host = .{ .ns = &ns, .host_id = host_a };
+    var b: Host = .{ .ns = &ns, .host_id = host_b };
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&a, 0xa));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&b, 0xb));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    const w = a.submit(.write);
+    try testing.expect(w == .admitted);
+    var seam: DrainSeam = .{ .a = &a, .b = &b, .ticket = w.admitted };
+    ns.abort_hook = .{ .ctx = &seam, .fire = DrainSeam.fire };
+    const gen = ns.generation;
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&b, nvme.RACQA_PREEMPT_AND_ABORT, nvme.RTYPE_WEAR, 0xb, 0));
+    try testing.expectEqual(@as(usize, 3), seam.n);
+    try testing.expectEqualSlices(AbortStep, &.{ .killed, .unregistered, .draining }, seam.steps[0..3]);
+    try testing.expectEqualSlices(u8, &host_a, &seam.victims[0]);
+    try testing.expectEqualSlices(u8, &host_a, &seam.victims[1]);
+    try testing.expectEqual(@as(?IoAnswer, .internal), seam.killed_write);
+    try testing.expectEqual(@as(?IoAnswer, .internal), seam.killed_read);
+    try testing.expectEqual(@as(?IoAnswer, .conflict), seam.unreg_write);
+    try testing.expectEqual(@as(?IoAnswer, .internal), seam.unreg_read);
+    try testing.expectEqual(@as(?IoAnswer, .internal), seam.drain_read);
+    try testing.expect(seam.pr_sem_in_drain);
+    try testing.expectEqual(@as(?u16, 1), seam.drain_regctl);
+    try testing.expectEqual(@as(?u32, gen + 1), seam.drain_gen);
+    try testing.expect(seam.b_write != null and seam.b_write.? == .admitted);
+    try testing.expectEqual(@as(u32, 2), ns.landed);
+    try testing.expect(!ns.prSemHeld());
+    // The refs live again: a read is admitted; a write stays refused (P9a).
+    const r = a.submit(.read);
+    try testing.expect(r == .admitted);
+    ns.complete(r.admitted);
+    try testing.expectEqual(IoAnswer.conflict, a.submit(.write));
+}
+
+test "fake drain (nvmet 7.3, decision 0004 §2.2 P5, P9): a PRKEY k preempt-and-abort under All-Registrants kills and unregisters only k's host, keeps the reservation and the holder pointer, and drains k's admitted command" {
+    var ns = Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var a: Host = .{ .ns = &ns, .host_id = host_a };
+    var b: Host = .{ .ns = &ns, .host_id = host_b };
+    var c: Host = .{ .ns = &ns, .host_id = host_c };
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&a, 0xa));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&b, 0xb));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&c, 0xc));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    const w = c.submit(.write);
+    try testing.expect(w == .admitted);
+    var seam: DrainSeam = .{ .a = &c, .b = &b, .ticket = w.admitted };
+    ns.abort_hook = .{ .ctx = &seam, .fire = DrainSeam.fire };
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&b, nvme.RACQA_PREEMPT_AND_ABORT, nvme.RTYPE_WEAR, 0xb, 0xc));
+    try testing.expectEqualSlices(AbortStep, &.{ .killed, .unregistered, .draining }, seam.steps[0..seam.n]);
+    try testing.expectEqualSlices(u8, &host_c, &seam.victims[0]);
+    try testing.expect(ns.find(host_c) == null and ns.find(host_a) != null and ns.find(host_b) != null);
+    try testing.expect(ns.isHolder(host_a));
+    try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
+    try testing.expectEqual(@as(?u16, 2), seam.drain_regctl);
+}
+
+const Issued = struct {
+    host: *Host,
+    cmd: nvme.UringCmd,
+    payload: [16]u8 = undefined,
+    status: nvme.Status = 0xffff,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *Issued) void {
+        self.status = issueIo(self.host, self.cmd) catch 0xfffe;
+        self.done.store(true, .release);
+    }
+};
+
+test "fake drain (nvmet 7.3, decision 0004 §2.2 P9, P9d, P14, P15): the preempt-all's issuer waits for the victim's admitted write; a Register-Replace (the drain barrier) issued meanwhile parks on pr_sem until the drain ends; a Report does not wait; both complete once the write completes" {
+    var ns = Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var a: Host = .{ .ns = &ns, .host_id = host_a };
+    var b: Host = .{ .ns = &ns, .host_id = host_b };
+    var b2: Host = .{ .ns = &ns, .host_id = host_b };
+    var c: Host = .{ .ns = &ns, .host_id = host_c };
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&a, 0xa));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&b, 0xb));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    const w = a.submit(.write);
+    try testing.expect(w == .admitted);
+    const gen = ns.generation;
+    var pa: Issued = .{ .host = &b, .cmd = undefined };
+    pa.cmd = nvme.reservationAcquire(1, nvme.RACQA_PREEMPT_AND_ABORT, nvme.RTYPE_WEAR, 0xb, 0, &pa.payload);
+    const ts = try std.Thread.spawn(.{}, Issued.run, .{&pa});
+    ns.awaitDrainWaiting();
+    try testing.expect(!pa.done.load(.acquire));
+    var bar: Issued = .{ .host = &b2, .cmd = undefined };
+    bar.cmd = nvme.reservationRegister(1, nvme.RREGA_REPLACE, 0xb, 0xb, &bar.payload);
+    const tb = try std.Thread.spawn(.{}, Issued.run, .{&bar});
+    ns.awaitPrWaiters(1);
+    try testing.expect(!bar.done.load(.acquire));
+    // P14: a Report answers during the drain.
+    var rep: [64 * 4]u8 = undefined;
+    const face = c.face();
+    const rc = try face.issue(face.ctx, .io, &nvme.reservationReport(1, &rep, true));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, rc.status);
+    try testing.expectEqual(@as(?u16, 1), nvme.reportRegctl(&rep, true));
+    try testing.expect(!pa.done.load(.acquire) and !bar.done.load(.acquire));
+    ns.complete(w.admitted);
+    ts.join();
+    tb.join();
+    try testing.expectEqual(nvme.STATUS_SUCCESS, pa.status);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, bar.status);
+    try testing.expectEqual(gen + 2, ns.generation);
+    try testing.expectEqual(@as(u32, 1), ns.landed);
+}
+
+test "fake answers (decision 0004 §2.2 P15a): the holder pointer's Register-Replace answers INTERNAL while an injected GFP_ATOMIC copy failure lasts, changing nothing; a non-holder's Replace is untouched" {
+    var ns = Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var a: Host = .{ .ns = &ns, .host_id = host_a };
+    var b: Host = .{ .ns = &ns, .host_id = host_b };
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&a, 0xa));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&b, 0xb));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    ns.replace_holder_internal = 1;
+    const gen = ns.generation;
+    try testing.expectEqual(nvme.SC_INTERNAL, try replaceSame(&a, 0xa));
+    try testing.expectEqual(gen, ns.generation);
+    try testing.expect(ns.isHolder(host_a));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try replaceSame(&b, 0xb));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try replaceSame(&a, 0xa));
+    try testing.expectEqual(gen + 2, ns.generation);
+}
+
+test "fake answer modes (decision 0004 §4.4.6, KD22): nvmet answers a non-holder registrant's same-type All-Registrants acquire with a conflict; the conformant mode answers success; neither changes the reservation, the holder pointer, the registrants or the generation; an unregistered host's acquire conflicts in both (P8)" {
+    var ns = Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var a: Host = .{ .ns = &ns, .host_id = host_a };
+    var b: Host = .{ .ns = &ns, .host_id = host_b };
+    var c: Host = .{ .ns = &ns, .host_id = host_c };
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&a, 0xa));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&b, 0xb));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    const gen = ns.generation;
+    try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try acquireAs(&b, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xb, 0));
+    try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try acquireAs(&c, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xc, 0));
+    ns.conformant_all_registrants = true;
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&b, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xb, 0));
+    try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try acquireAs(&b, nvme.RACQA_ACQUIRE, nvme.RTYPE_WERO, 0xb, 0));
+    try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try acquireAs(&c, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xc, 0));
+    try testing.expectEqual(gen, ns.generation);
+    try testing.expect(ns.isHolder(host_a));
+    try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
+    try testing.expectEqual(@as(usize, 2), ns.registered.items.len);
+}

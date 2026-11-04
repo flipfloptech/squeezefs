@@ -840,7 +840,176 @@ test "stats JSON names every pr_* gauge" {
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try c.writeStatsJson(&w);
-    inline for (.{ "pr_registrants_per_namespace", "pr_report_bytes", "pr_registrant_cap", "pr_registrant_cap_refusals", "pr_preempts", "pr_ptpl_requested" }) |k| {
+    inline for (.{ "pr_registrants_per_namespace", "pr_report_bytes", "pr_registrant_cap", "pr_registrant_cap_refusals", "pr_preempts", "pr_ptpl_requested", "pr_preempt_alls", "pr_drain_barriers", "pr_drain_barrier_unknowns" }) |k| {
         try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"" ++ k ++ "\":") != null);
     }
+}
+
+fn wearClient(rig: *Rig, h: *fake.Host, key: u64) !Client {
+    var c = try rig.client(h, key);
+    c.rtype = nvme.RTYPE_WEAR;
+    _ = try c.probeRescap();
+    return c;
+}
+
+test "preemptAllAndAbort (decision 0004 §4.2, §5.1; P4, P6, P8): the byte-exact command — Acquire RACQA 2, RTYPE 5, CRKEY our key, PRKEY 0 — makes the sender the holder pointer and unregisters every other host id; on an unreserved namespace it conflicts (P6); a preempted client's conflicts (P8); pr_preempt_alls counts the commands issued" {
+    var rig = Rig.init(testing.allocator);
+    defer rig.ns.deinit();
+    rig.hosts();
+    var a = try wearClient(&rig, &rig.a, 0xa);
+    defer a.deinit();
+    var b = try wearClient(&rig, &rig.b, 0xb);
+    defer b.deinit();
+    _ = try a.registerLadder();
+    _ = try b.registerLadder();
+    try testing.expectError(error.ReservationConflict, b.preemptAllAndAbort());
+    try testing.expectEqual(@as(usize, 2), rig.ns.registered.items.len);
+    try a.acquire();
+    try b.preemptAllAndAbort();
+    try testing.expectEqual(nvme.RACQA_PREEMPT_AND_ABORT | (@as(u32, nvme.RTYPE_WEAR) << 8), rig.ns.last_acquire.cdw10);
+    try testing.expectEqual(@as(u64, 0xb), rig.ns.last_acquire_crkey);
+    try testing.expectEqual(@as(u64, 0), rig.ns.last_acquire_prkey);
+    try testing.expect(rig.ns.isHolder(host_b));
+    try testing.expect(rig.ns.find(host_a) == null);
+    try testing.expectEqual(nvme.RTYPE_WEAR, rig.ns.rtype);
+    try testing.expectError(error.ReservationConflict, a.preemptAllAndAbort());
+    try testing.expectEqual(@as(u64, 2), b.stats.preempt_alls);
+    try testing.expectEqual(@as(u64, 1), a.stats.preempt_alls);
+    try testing.expectEqual(@as(u64, 0), b.stats.preempts);
+}
+
+const LockCount = struct {
+    n: u32 = 0,
+    fn lock(ctx: *anyopaque) void {
+        const self: *LockCount = @ptrCast(@alignCast(ctx));
+        self.n += 1;
+    }
+    fn unlock(_: *anyopaque) void {}
+};
+
+test "drainBarrier (decision 0004 §4.2, §5.1; P15, P15a): the byte-exact command — Register RREGA 2, IEKEY 0, CRKEY = NRKEY = our key — answers registered for a registrant, the holder pointer's included, and moves only the generation; a conflict reads unregistered; INTERNAL (an injected GFP_ATOMIC copy failure) and a transport error (EINTR: a cancelled passthrough) read unknown; it never takes the client's sequence lock (DC18)" {
+    var rig = Rig.init(testing.allocator);
+    defer rig.ns.deinit();
+    rig.hosts();
+    var a = try wearClient(&rig, &rig.a, 0xa);
+    defer a.deinit();
+    var b = try wearClient(&rig, &rig.b, 0xb);
+    defer b.deinit();
+    var locks: LockCount = .{};
+    a.op_lock = .{ .ctx = &locks, .lock = LockCount.lock, .unlock = LockCount.unlock };
+    b.op_lock = a.op_lock;
+    _ = try a.registerLadder();
+    try a.acquire();
+    _ = try b.registerLadder();
+    const gen = rig.ns.generation;
+    try testing.expectEqual(Barrier.registered, a.drainBarrier());
+    try testing.expectEqual(nvme.RREGA_REPLACE, rig.ns.last.cdw10);
+    try testing.expectEqual(@as(u64, 0xa), rig.ns.last_register_crkey);
+    try testing.expectEqual(@as(u64, 0xa), rig.ns.last_register_nrkey);
+    try testing.expectEqual(gen + 1, rig.ns.generation);
+    try testing.expect(rig.ns.isHolder(host_a));
+    try testing.expectEqual(@as(usize, 2), rig.ns.registered.items.len);
+    try testing.expectEqual(Barrier.registered, b.drainBarrier());
+    rig.ns.replace_holder_internal = 1;
+    try testing.expectEqual(Barrier.unknown, a.drainBarrier());
+    try testing.expectEqual(nvme.SC_INTERNAL, a.last_status);
+    rig.ns.fail_next = error.Interrupted;
+    try testing.expectEqual(Barrier.unknown, b.drainBarrier());
+    try testing.expectEqual(@as(?errors.Error, error.Interrupted), b.last_errno);
+    try b.unregister(0xb);
+    try testing.expectEqual(Barrier.unregistered, b.drainBarrier());
+    try testing.expectEqual(@as(u64, 2), a.stats.drain_barriers);
+    try testing.expectEqual(@as(u64, 1), a.stats.drain_barrier_unknowns);
+    try testing.expectEqual(@as(u64, 3), b.stats.drain_barriers);
+    try testing.expectEqual(@as(u64, 1), b.stats.drain_barrier_unknowns);
+    try testing.expectEqual(@as(u32, 0), locks.n);
+}
+
+const BarrierRun = struct {
+    c: *Client,
+    answer: Barrier = .unknown,
+    done: std.atomic.Value(bool) = .init(false),
+    fn run(self: *BarrierRun) void {
+        self.answer = self.c.drainBarrier();
+        self.done.store(true, .release);
+    }
+};
+
+const PreemptAllRun = struct {
+    c: *Client,
+    result: Error!void = {},
+    done: std.atomic.Value(bool) = .init(false),
+    fn run(self: *PreemptAllRun) void {
+        self.result = self.c.preemptAllAndAbort();
+        self.done.store(true, .release);
+    }
+};
+
+test "drainBarrier waits out a drain (decision 0004 §2.2 P9, P9d, P15): issued while a preempt-all drains the victim's admitted write, it parks on the namespace's pr_sem; once the write completes the preempt-all succeeds and the barrier answers registered; the victim's barrier then answers unregistered" {
+    var rig = Rig.init(testing.allocator);
+    defer rig.ns.deinit();
+    rig.hosts();
+    var b2_host: fake.Host = .{ .ns = &rig.ns, .host_id = host_b };
+    var a = try wearClient(&rig, &rig.a, 0xa);
+    defer a.deinit();
+    var b = try wearClient(&rig, &rig.b, 0xb);
+    defer b.deinit();
+    var b2 = try wearClient(&rig, &b2_host, 0xb);
+    defer b2.deinit();
+    _ = try a.registerLadder();
+    try a.acquire();
+    _ = try b.registerLadder();
+    const w = rig.a.submit(.write);
+    try testing.expect(w == .admitted);
+    var pa: PreemptAllRun = .{ .c = &b };
+    const ts = try std.Thread.spawn(.{}, PreemptAllRun.run, .{&pa});
+    rig.ns.awaitDrainWaiting();
+    var bar: BarrierRun = .{ .c = &b2 };
+    const tb = try std.Thread.spawn(.{}, BarrierRun.run, .{&bar});
+    rig.ns.awaitPrWaiters(1);
+    try testing.expect(!pa.done.load(.acquire) and !bar.done.load(.acquire));
+    rig.ns.complete(w.admitted);
+    ts.join();
+    tb.join();
+    try pa.result;
+    try testing.expectEqual(Barrier.registered, bar.answer);
+    try testing.expectEqual(Barrier.unregistered, a.drainBarrier());
+}
+
+test "admittedHere (decision 0004 §5.1; P13): our key under our wire host id under a standing All-Registrants reservation is admitted — every registrant holds; unregistered, or with no reservation, it is not; our key under another host id (a fencing registrant) is not our admission; under WERO only the holder's registrant is" {
+    var rig = Rig.init(testing.allocator);
+    defer rig.ns.deinit();
+    rig.hosts();
+    var f_host: fake.Host = .{ .ns = &rig.ns, .host_id = "host-f-fencer-09".* };
+    var a = try wearClient(&rig, &rig.a, 0xa);
+    defer a.deinit();
+    var b = try wearClient(&rig, &rig.b, 0xb);
+    defer b.deinit();
+    var f = try wearClient(&rig, &f_host, 0xb);
+    defer f.deinit();
+    _ = try a.registerLadder();
+    try testing.expect(!try a.admittedHere());
+    try a.acquire();
+    _ = try b.registerLadder();
+    try testing.expect(try a.admittedHere());
+    try testing.expect(try b.admittedHere());
+    _ = try f.registerLadder();
+    try b.unregister(0xb);
+    try testing.expect(!try b.admittedHere());
+    try testing.expect(try f.admittedHere());
+
+    var wero = Rig.init(testing.allocator);
+    defer wero.ns.deinit();
+    wero.hosts();
+    var wa = try wero.client(&wero.a, 0xa);
+    defer wa.deinit();
+    var wb = try wero.client(&wero.b, 0xb);
+    defer wb.deinit();
+    wa.rtype = nvme.RTYPE_WERO;
+    wb.rtype = nvme.RTYPE_WERO;
+    _ = try wa.registerLadder();
+    try wa.acquire();
+    _ = try wb.registerLadder();
+    try testing.expect(try wa.admittedHere());
+    try testing.expect(!try wb.admittedHere());
 }

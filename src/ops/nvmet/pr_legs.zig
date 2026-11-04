@@ -26,6 +26,8 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const log = @import("../../core/log.zig");
+const clock = @import("../../core/clock.zig");
+const futex = @import("../../sync/futex.zig");
 const uring_fs = @import("../../io/uring_fs.zig");
 const nvme = @import("../../meta/guard/nvme_cmd.zig");
 const pr = @import("../../meta/guard/pr.zig");
@@ -43,9 +45,9 @@ pub const RESCAP_WRITE_EXCLUSIVE: u8 = 1 << 1;
 pub const RESCAP_WERO: u8 = 1 << 3;
 
 /// The keys the matrix uses: distinct from any writer's `claim.prKey`.
-const key_a1: u64 = 0xA1A1_A1A1_0000_0001;
-const key_a2: u64 = 0xA1A1_A1A1_0000_0002;
-const key_b1: u64 = 0xB1B1_B1B1_0000_0001;
+pub const key_a1: u64 = 0xA1A1_A1A1_0000_0001;
+pub const key_a2: u64 = 0xA1A1_A1A1_0000_0002;
+pub const key_b1: u64 = 0xB1B1_B1B1_0000_0001;
 
 /// A 4 KiB O_DIRECT write at offset 0 through the product's io_uring file
 /// layer on the BLOCK node: the fence arrives on the write CQE.
@@ -134,6 +136,11 @@ pub const Leg = enum {
     preempt_and_abort,
     release_zero_residue,
     shared_identity,
+    preempt_all,
+    preempt_all_single_holder,
+    all_registrants_acquire_canary,
+    drain_barrier,
+    preempt_all_write_storm,
 };
 
 pub const LegResult = struct {
@@ -393,8 +400,198 @@ pub fn legSharedIdentity(p: *Pair, r: *LegResult) void {
     set(r, shared and !not_shared_b, "another rkey under OUR wire host id reads shared on A's association ({}), not on B's ({})", .{ shared, not_shared_b });
 }
 
+/// One report's facts a leg compares across a command.
+const Seen = struct { gen: u32, rtype: u8, regctl: u16, a: bool, b: bool };
+
+fn seen(c: *pr.Client) !Seen {
+    var rep = try c.report();
+    defer rep.deinit(c.gpa);
+    return .{ .gen = rep.generation, .rtype = rep.rtype, .regctl = rep.regctl, .a = rep.registered(key_a1), .b = rep.registered(key_b1) };
+}
+
+pub fn wear(p: *Pair) void {
+    p.a.rtype = nvme.RTYPE_WEAR;
+    p.b.rtype = nvme.RTYPE_WEAR;
+    p.a_twin.rtype = nvme.RTYPE_WEAR;
+}
+
+/// The successor's takeover command on the real target (decision 0004
+/// §2.2, §4.2): P6 — an unreserved namespace's preempt-all conflicts (PRKEY
+/// 0 matches nobody) and changes nothing; P4 — under WEAR the sender
+/// becomes the holder pointer and every other host id is unregistered, the
+/// reservation kept, the generation one up (P16), the victim's write
+/// refused (-EBADE); P8 — the preempted host can neither preempt nor
+/// acquire; P3 — re-registered, it writes by registration alone but its
+/// acquire conflicts (the holder pointer is the sender's).
+pub fn legPreemptAll(p: *Pair, r: *LegResult) void {
+    wear(p);
+    _ = p.a.registerLadder() catch |e| return set(r, false, "a register failed: {s}", .{errName(e)});
+    _ = p.b.registerLadder() catch |e| return set(r, false, "b register failed: {s}", .{errName(e)});
+    const s0 = seen(p.a) catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
+    const p6 = if (p.b.preemptAllAndAbort()) false else |e| e == error.ReservationConflict;
+    const s1 = seen(p.a) catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
+    if (!p6 or s1.gen != s0.gen or s1.regctl != 2 or s1.rtype != 0) return set(r, false, "P6: the unreserved namespace's preempt-all did not conflict with nothing changed (conflict {}, gen {d} → {d}, regctl {d}, rtype {d})", .{ p6, s0.gen, s1.gen, s1.regctl, s1.rtype });
+    p.a.acquire() catch |e| return set(r, false, "a rtype-5 acquire failed: {s}", .{errName(e)});
+    const s2 = seen(p.a) catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
+    p.b.preemptAllAndAbort() catch |e| return set(r, false, "P4: B's preempt-all failed: {s}", .{errName(e)});
+    const s3 = seen(p.b) catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
+    const a_fenced = if (p.write(p.a_block)) false else |e| e == error.ReservationConflict;
+    p.write(p.b_block) catch |e| return set(r, false, "the preempting host's write failed: {s}", .{errName(e)});
+    if (!(s3.b and !s3.a and s3.regctl == 1 and s3.rtype == nvme.RTYPE_WEAR and s3.gen == s2.gen + 1 and a_fenced)) return set(r, false, "P4: after B's preempt-all: B registered {}, A registered {}, regctl {d}, rtype {d}, gen {d} → {d}, A's write refused {}", .{ s3.b, s3.a, s3.regctl, s3.rtype, s2.gen, s3.gen, a_fenced });
+    const p8_pa = if (p.a.preemptAllAndAbort()) false else |e| e == error.ReservationConflict;
+    const p8_acq = if (p.a.acquire()) false else |e| e == error.ReservationConflict;
+    _ = p.a.registerLadder() catch |e| return set(r, false, "a re-register failed: {s}", .{errName(e)});
+    p.write(p.a_block) catch |e| return set(r, false, "P3: A's write re-registered under WEAR failed: {s}", .{errName(e)});
+    const p3 = if (p.a.acquire()) false else |e| e == error.ReservationConflict;
+    set(r, p8_pa and p8_acq and p3, "P6: unreserved, the preempt-all conflicted, nothing changed; P4: B holds rtype 5 alone (regctl 1, gen {d} → {d}), A's write refused (-EBADE); P8: A's preempt-all and acquire conflict ({}, {}); P3: A re-registered writes, its acquire conflicts ({})", .{ s2.gen, s3.gen, p8_pa, p8_acq, p3 });
+}
+
+/// P7 on the real target: under a single-holder type a non-holder's PRKEY 0
+/// preempt is Invalid Field; the holder's own preempt only re-types its
+/// hold (to the command's rtype 5) and removes nobody — nvmet's `holder ==
+/// reg` arm ignores PRKEY.
+pub fn legPreemptAllSingleHolder(p: *Pair, r: *LegResult) void {
+    _ = p.a.registerLadder() catch |e| return set(r, false, "a register failed: {s}", .{errName(e)});
+    p.a.acquire() catch |e| return set(r, false, "a Write Exclusive acquire failed: {s}", .{errName(e)});
+    _ = p.b.registerLadder() catch |e| return set(r, false, "b register failed: {s}", .{errName(e)});
+    const invalid = if (p.b.preemptAllAndAbort()) false else |e| e == error.DeviceStatus and p.b.last_status == nvme.SC_INVALID_FIELD;
+    const status = p.b.last_status;
+    p.a.preemptAllAndAbort() catch |e| return set(r, false, "the holder's own preempt-all failed: {s}", .{errName(e)});
+    const s = seen(p.a) catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
+    set(r, invalid and s.rtype == nvme.RTYPE_WEAR and s.a and s.b and s.regctl == 2, "P7: a non-holder's PRKEY 0 preempt under Write Exclusive answered status 0x{x:0>3} (Invalid Field); the holder's own re-typed the hold to rtype {d} and removed nobody (regctl {d})", .{ status, s.rtype, s.regctl });
+}
+
+/// THE CANARY (decision 0004 KD22, DC21; `pr.c:450-452`): nvmet answers a
+/// registrant's same-type All-Registrants acquire with RESERVATION CONFLICT
+/// unless it is the reservation's holder pointer, and changes nothing. The
+/// lapse re-acquire's stand-down and the target-semantics probe's
+/// `nvmet_holder` verdict rest on that answer. Red if this target ever
+/// answers success: it is then spec-conformant and the WEAR posture must
+/// refuse it by name.
+pub fn legAllRegistrantsAcquireCanary(p: *Pair, r: *LegResult) void {
+    wear(p);
+    _ = p.a.registerLadder() catch |e| return set(r, false, "a register failed: {s}", .{errName(e)});
+    p.a.acquire() catch |e| return set(r, false, "a rtype-5 acquire failed: {s}", .{errName(e)});
+    _ = p.b.registerLadder() catch |e| return set(r, false, "b register failed: {s}", .{errName(e)});
+    const s0 = seen(p.a) catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
+    const conflict = if (p.b.acquire()) false else |e| e == error.ReservationConflict;
+    const s1 = seen(p.a) catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
+    const unchanged = s1.gen == s0.gen and s1.regctl == 2 and s1.rtype == nvme.RTYPE_WEAR and s1.a and s1.b;
+    if (!conflict) return set(r, false, "CANARY RED: this target answered a non-holder registrant's All-Registrants acquire with SUCCESS — it is spec-conformant, not nvmet's holder pointer (pr.c:450-452); DC21's stand-down signal is gone and the WEAR posture must refuse this target by name (decision 0004 KD22)", .{});
+    set(r, unchanged, "a non-holder registrant's rtype-5 acquire answered RESERVATION CONFLICT (nvmet's holder pointer, pr.c:450-452) and changed nothing (gen {d} → {d}, regctl {d}, rtype {d})", .{ s0.gen, s1.gen, s1.regctl, s1.rtype });
+}
+
+/// The drain barrier's answers with no drain running (P15, P16): a
+/// registrant's Register-Replace with CRKEY = NRKEY = its key answers
+/// registered — the holder pointer's (a GFP_ATOMIC copy on nvmet) and
+/// another's alike — and moves only the generation; another key under our
+/// host, or an unregistered host, conflicts: unregistered.
+pub fn legDrainBarrier(p: *Pair, r: *LegResult) void {
+    wear(p);
+    _ = p.a.registerLadder() catch |e| return set(r, false, "a register failed: {s}", .{errName(e)});
+    p.a.acquire() catch |e| return set(r, false, "a rtype-5 acquire failed: {s}", .{errName(e)});
+    _ = p.b.registerLadder() catch |e| return set(r, false, "b register failed: {s}", .{errName(e)});
+    const s0 = seen(p.a) catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
+    const holder = p.a.drainBarrier();
+    const other = p.b.drainBarrier();
+    const s1 = seen(p.a) catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
+    const pointer_kept = if (p.b.acquire()) false else |e| e == error.ReservationConflict;
+    const twin = p.a_twin.drainBarrier();
+    p.b.unregister(key_b1) catch |e| return set(r, false, "b unregister failed: {s}", .{errName(e)});
+    const s2 = seen(p.a) catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
+    const gone = p.b.drainBarrier();
+    const s3 = seen(p.a) catch |e| return set(r, false, "report failed: {s}", .{errName(e)});
+    set(r, holder == .registered and other == .registered and s1.gen == s0.gen + 2 and s1.regctl == 2 and s1.rtype == nvme.RTYPE_WEAR and pointer_kept and twin == .unregistered and gone == .unregistered and s3.gen == s2.gen, "the holder pointer's barrier {s}, another registrant's {s} (gen {d} → {d}, regctl {d}, rtype {d}, the pointer kept {}); another key under A's host {s}; an unregistered host's {s} (gen unchanged {})", .{ @tagName(holder), @tagName(other), s0.gen, s1.gen, s1.regctl, s1.rtype, pointer_kept, @tagName(twin), @tagName(gone), s3.gen == s2.gen });
+}
+
+/// The victim's write outcomes across a storm of preempt-alls (decision 0004
+/// §8.2): every write lands, is refused (-EBADE, P9a) or ends EIO — P9c's
+/// INTERNAL in the kill-to-unregister instant, retried by the host into the
+/// same instant (counted; a P9c write retried after the unregister reads
+/// -EBADE). Any other outcome fails the leg.
+pub const STORM_PREEMPT_ALLS: u32 = 50;
+
+const Storm = struct {
+    p: *Pair,
+    stop: std.atomic.Value(bool) = .init(false),
+    landed: futex.Word = .init(0),
+    refused: std.atomic.Value(u32) = .init(0),
+    eio: std.atomic.Value(u32) = .init(0),
+    other: std.atomic.Value(u32) = .init(0),
+    other_err: ?anyerror = null,
+
+    fn writer(self: *Storm) void {
+        var i: u64 = 0;
+        while (!self.stop.load(.acquire)) : (i += 1) {
+            if (self.p.pool.writeAt(self.p.a_block, (i % 64) * PROBE_WRITE_LEN, self.p.buf.bytes)) {
+                _ = self.landed.fetchAdd(1, .release);
+                futex.wake(&self.landed, 1);
+            } else |e| switch (e) {
+                error.ReservationConflict => _ = self.refused.fetchAdd(1, .monotonic),
+                error.InputOutput => _ = self.eio.fetchAdd(1, .monotonic),
+                else => {
+                    self.other_err = e;
+                    _ = self.other.fetchAdd(1, .monotonic);
+                },
+            }
+        }
+    }
+
+    /// Wait until the writer landed a write past `from` (bounded: a writer
+    /// that never lands fails the leg).
+    fn awaitLanded(self: *Storm, from: u32) bool {
+        const deadline = clock.monotonicNs() + STORM_LAND_WAIT_NS;
+        while (true) {
+            const now = self.landed.load(.acquire);
+            if (now > from) return true;
+            if (self.other.load(.monotonic) != 0 or clock.monotonicNs() >= deadline) return false;
+            _ = futex.waitTimeout(&self.landed, now, STORM_LAND_POLL_NS);
+        }
+    }
+};
+
+/// A re-registered victim's next write lands in well under a second on the
+/// venue's loop and tcp targets; 30 s is the leg's verdict, not a pace.
+const STORM_LAND_WAIT_NS: u64 = 30 * std.time.ns_per_s;
+const STORM_LAND_POLL_NS: u64 = 50 * std.time.ns_per_ms;
+
+pub fn legPreemptAllWriteStorm(p: *Pair, r: *LegResult) void {
+    wear(p);
+    _ = p.b.registerLadder() catch |e| return set(r, false, "b register failed: {s}", .{errName(e)});
+    _ = p.a.registerLadder() catch |e| return set(r, false, "a register failed: {s}", .{errName(e)});
+    p.b.acquire() catch |e| return set(r, false, "b rtype-5 acquire failed: {s}", .{errName(e)});
+    var storm: Storm = .{ .p = p };
+    const t = std.Thread.spawn(.{}, Storm.writer, .{&storm}) catch |e| return set(r, false, "the writer thread did not start: {s}", .{errName(e)});
+    var done: u32 = 0;
+    var failure: ?anyerror = null;
+    var stalled = false;
+    while (done < STORM_PREEMPT_ALLS) : (done += 1) {
+        if (done != 0) _ = p.a.registerLadder() catch |e| {
+            failure = e;
+            break;
+        };
+        if (!storm.awaitLanded(storm.landed.load(.acquire))) {
+            stalled = true;
+            break;
+        }
+        p.b.preemptAllAndAbort() catch |e| {
+            failure = e;
+            break;
+        };
+    }
+    storm.stop.store(true, .release);
+    t.join();
+    const landed = storm.landed.load(.acquire);
+    const refused = storm.refused.load(.monotonic);
+    const eio = storm.eio.load(.monotonic);
+    const other = storm.other.load(.monotonic);
+    if (failure) |e| return set(r, false, "preempt-all {d} of {d}: {s}", .{ done + 1, STORM_PREEMPT_ALLS, errName(e) });
+    if (stalled) return set(r, false, "the re-registered victim landed no write before preempt-all {d} (landed {d}, refused {d}, EIO {d}, other {d})", .{ done + 1, landed, refused, eio, other });
+    set(r, other == 0 and refused >= 1 and landed >= STORM_PREEMPT_ALLS, "{d} preempt-alls over the victim's write storm: landed {d}, refused -EBADE {d}, P9c EIO {d}, other {d}{s}", .{ done, landed, refused, eio, other, if (storm.other_err) |e| errName(e) else "" });
+}
+
 pub const MatrixReport = struct {
-    results: [10]LegResult,
+    results: [15]LegResult,
 
     pub fn allOk(self: *const MatrixReport) bool {
         for (self.results) |r| if (!r.ok) return false;
@@ -430,6 +627,11 @@ pub fn runMatrix(p: *Pair) MatrixReport {
         .{ .leg = .preempt_and_abort, .run = legPreemptAndAbort },
         .{ .leg = .release_zero_residue, .run = legReleaseZeroResidue },
         .{ .leg = .shared_identity, .run = legSharedIdentity },
+        .{ .leg = .preempt_all, .run = legPreemptAll },
+        .{ .leg = .preempt_all_single_holder, .run = legPreemptAllSingleHolder },
+        .{ .leg = .all_registrants_acquire_canary, .run = legAllRegistrantsAcquireCanary },
+        .{ .leg = .drain_barrier, .run = legDrainBarrier },
+        .{ .leg = .preempt_all_write_storm, .run = legPreemptAllWriteStorm },
     };
     for (legs, 0..) |l, i| {
         p.reset();

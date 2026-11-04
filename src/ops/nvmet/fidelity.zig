@@ -54,6 +54,8 @@ const pr_linux = @import("../../meta/guard/pr_linux.zig");
 const lease_clock = @import("../../meta/guard/lease_clock.zig");
 const configfs = @import("configfs.zig");
 const ledger = @import("ledger.zig");
+const storage = @import("storage.zig");
+const pr_legs = @import("pr_legs.zig");
 const initiator = @import("initiator.zig");
 const multipath = @import("multipath.zig");
 const fencing = @import("../../meta/sym/membership/fencing.zig");
@@ -347,18 +349,41 @@ const Rig = struct {
 
     /// `share --create-size` under the harness NQN; recorded in the manifest.
     fn share(self: *Rig, name: []const u8, size: u64, transport: configfs.Trtype, port: u16) ![]u8 {
-        var nb: [256]u8 = undefined;
-        const nqn = self.nqnFor(&nb, name);
         var bb: [linux.PATH_MAX]u8 = undefined;
         const backing = try std.fmt.bufPrint(&bb, "{s}/{s}.img", .{ self.root, name });
+        return self.shareWith(name, backing, size, transport, port);
+    }
+
+    /// `share` of a backing that exists (a block device the leg made);
+    /// `size` non-null creates a file backing of that size.
+    fn shareWith(self: *Rig, name: []const u8, backing: []const u8, size: ?u64, transport: configfs.Trtype, port: u16) ![]u8 {
+        var nb: [256]u8 = undefined;
+        const nqn = self.nqnFor(&nb, name);
         var sb: [32]u8 = undefined;
-        const size_text = try std.fmt.bufPrint(&sb, "{d}", .{size});
         var pb: [8]u8 = undefined;
         const port_text = try std.fmt.bufPrint(&pb, "{d}", .{port});
-        const out = switch (transport) {
-            .loop => try self.sqzOk(&.{ "nvmeof", "share", "--subnqn", nqn, "--transport", "loop", "--create-size", size_text, backing }),
-            .tcp => try self.sqzOk(&.{ "nvmeof", "share", "--subnqn", nqn, "--ip", "127.0.0.1", "--port", port_text, "--create-size", size_text, backing }),
+        var argv: [12][]const u8 = undefined;
+        var n: usize = 0;
+        for ([_][]const u8{ "nvmeof", "share", "--subnqn", nqn }) |a| {
+            argv[n] = a;
+            n += 1;
+        }
+        const tail: []const []const u8 = switch (transport) {
+            .loop => &.{ "--transport", "loop" },
+            .tcp => &.{ "--ip", "127.0.0.1", "--port", port_text },
         };
+        for (tail) |a| {
+            argv[n] = a;
+            n += 1;
+        }
+        if (size) |s| {
+            argv[n] = "--create-size";
+            argv[n + 1] = try std.fmt.bufPrint(&sb, "{d}", .{s});
+            n += 2;
+        }
+        argv[n] = backing;
+        n += 1;
+        const out = try self.sqzOk(argv[0..n]);
         defer self.gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "shared ") != null);
         try testing.expect(std.mem.indexOf(u8, out, "resv_enable=1") != null);
@@ -444,6 +469,15 @@ const Rig = struct {
             std.debug.print("\n--- disconnect {s} failed ({f}) ---\n{s}\n", .{ c.nqn(), r.term, r.stderr });
             return error.DisconnectFailed;
         }
+        for (self.connects.items, 0..) |cc, i| if (cc.instance == c.instance) {
+            _ = self.connects.orderedRemove(i);
+            break;
+        };
+    }
+
+    /// Drop a controller the leg removed by hand from the manifest: its
+    /// instance number may be another run's controller by the teardown.
+    fn forget(self: *Rig, c: *const Connected) void {
         for (self.connects.items, 0..) |cc, i| if (cc.instance == c.instance) {
             _ = self.connects.orderedRemove(i);
             break;
@@ -957,6 +991,385 @@ test "nvmet fidelity: pr-matrix-loop — the real reservation legs (RESCAP, EDS-
 
 test "nvmet fidelity: pr-matrix-tcp — the same legs on nvmet-tcp, plus a registration surviving the holder's disconnect" {
     try prMatrixLeg(.tcp);
+}
+
+// ---- the slow drain (decision 0004 §8.2, PR-2): a preempt-all's drain on a
+//      null_blk namespace whose every command completes `slow_completion_ns`
+//      after its submission ----
+
+/// The slow backend's completion delay. The drain lasts until the victim's
+/// admitted write completes, so the legs' probes (a report, a read's six
+/// attempts, a write, two barriers: each a round trip of tens of µs) run
+/// inside it with room under load; F7a's 50 ms (decision 0004 §8.2) × 5.
+const slow_completion_ns: u64 = 250 * std.time.ns_per_ms;
+const slow_size_mib: u64 = 64;
+/// The legs' verdict bound for one observable (the write reaching the
+/// backend, the victim's unregistration in a report, the drain's end): a
+/// miss fails the leg; the backend answers within `slow_completion_ns`.
+const drain_wait_ns: u64 = 30 * std.time.ns_per_s;
+/// A round whose probes all ran after the drain ended proves nothing and
+/// runs again, at most this many times.
+const drain_rounds_max: u32 = 3;
+/// Opt-in for the keep-alive-expiry variant of the P17 leg (decision 0004
+/// R12): it can oops the TARGET host — run it on a disposable venue only.
+const fatal_teardown_knob = "SQUEEZEFS_TEST_NVMET_FATAL_TEARDOWN";
+
+/// null_blk's configfs, loading the stock module with no default device
+/// when it is absent (as the smoke's dm rows load theirs).
+fn nullBlkReady(rig: *Rig) bool {
+    if (storage.NullBlk.available()) return true;
+    const r = std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "modprobe", "null_blk", "nr_devices=0" }, .environ_map = &rig.env }) catch return false;
+    rig.freeRun(r);
+    return storage.NullBlk.available();
+}
+
+/// A null_blk-backed share connected under both identities, the PR pair
+/// over it, and a second device on B's association: B's own device carries
+/// the preempt-all for its whole drain (one command per Device), so B's
+/// barrier rides the second.
+const SlowPair = struct {
+    nb: storage.NullBlk,
+    nqn: []const u8,
+    a: Connected,
+    b: Connected,
+    a_path: []u8,
+    b_path: []u8,
+    pair: pr_legs.Pair,
+    dev_b2: *pr_linux.Device,
+    b2: *pr.Client,
+    a_deleted: bool = false,
+
+    fn open(rig: *Rig, transport: configfs.Trtype, tag: []const u8) !SlowPair {
+        if (!nullBlkReady(rig)) return testkit.skip(@src(), .no_kernel_feature, "null_blk (its configfs) — the slow drain's backend");
+        const gpa = rig.gpa;
+        var nb_name: [32]u8 = undefined;
+        const nb = try storage.NullBlk.create(try std.fmt.bufPrint(&nb_name, "sqzdrain{s}{d}", .{ tag, rig.pid }), slow_size_mib, slow_completion_ns);
+        errdefer nb.destroy();
+        var db: [48]u8 = undefined;
+        const port = (try rig.servicePorts(transport))[0];
+        const nqn = try rig.shareWith("drain", nb.devPath(&db), null, transport, port);
+        errdefer rig.unshare(nqn) catch {};
+        const a = try rig.connect(nqn, transport, port, null, &.{});
+        const b = try rig.connect(nqn, transport, port, ident_b, &.{});
+        const a_path = try gpa.dupe(u8, a.dev());
+        errdefer gpa.free(a_path);
+        const b_path = try gpa.dupe(u8, b.dev());
+        errdefer gpa.free(b_path);
+        var pair = try pr_legs.Pair.open(gpa, &rig.env, rig.pool, a_path, b_path);
+        errdefer pair.close();
+        const dev_b2 = switch (pr_linux.resolve(gpa, b_path)) {
+            .device => |d| d,
+            .none => return error.NotAnNvmeNamespace,
+        };
+        errdefer dev_b2.deinit();
+        const b2 = try gpa.create(pr.Client);
+        errdefer gpa.destroy(b2);
+        b2.* = try pr.Client.init(gpa, dev_b2.face(), dev_b2.nsid, pr_legs.key_b1);
+        for ([_]*pr.Client{ pair.a, pair.b, pair.a_twin, b2 }) |c| _ = c.probeRescap() catch {};
+        return .{ .nb = nb, .nqn = nqn, .a = a, .b = b, .a_path = a_path, .b_path = b_path, .pair = pair, .dev_b2 = dev_b2, .b2 = b2 };
+    }
+
+    fn close(self: *SlowPair, rig: *Rig) void {
+        if (!self.a_deleted) self.pair.reset();
+        self.b2.deinit();
+        rig.gpa.destroy(self.b2);
+        self.dev_b2.deinit();
+        self.pair.close();
+        if (!self.a_deleted) rig.disconnect(&self.a) catch {};
+        rig.disconnect(&self.b) catch {};
+        rig.unshare(self.nqn) catch {};
+        self.nb.destroy();
+        rig.gpa.free(self.a_path);
+        rig.gpa.free(self.b_path);
+    }
+
+    /// Victim A holds WEAR, B registered; A's write submitted and held by
+    /// the backend (admitted at the target: its access check passed and its
+    /// per-controller ref is taken, so the drain waits for it).
+    fn arm(self: *SlowPair) !uring_fs.WriteCompletion {
+        const p = &self.pair;
+        p.reset();
+        pr_legs.wear(p);
+        self.b2.rtype = nvme.RTYPE_WEAR;
+        _ = try p.a.registerLadder();
+        try p.a.acquire();
+        _ = try p.b.registerLadder();
+        var w = try p.pool.submitWriteAtBatch(p.a_block, &.{.{ .offset = 0, .data = p.buf.bytes }});
+        errdefer _ = w.wait() catch {};
+        const deadline = clock.monotonicNs() + drain_wait_ns;
+        while ((self.nb.inflightWrites() orelse 0) == 0) {
+            if (clock.monotonicNs() >= deadline) return error.WriteNeverReachedTheBackend;
+            sleepMs(1);
+        }
+        return w;
+    }
+
+    /// The drain began: the report (P14: it takes no pr_sem) no longer
+    /// lists the victim. Rides A's device, so call it before anything
+    /// parks on that device.
+    fn awaitVictimUnregistered(self: *SlowPair) !void {
+        const deadline = clock.monotonicNs() + drain_wait_ns;
+        while (true) {
+            var rep = try self.pair.a_twin.report();
+            const gone = !rep.registered(pr_legs.key_a1);
+            rep.deinit(self.pair.gpa);
+            if (gone) return;
+            if (clock.monotonicNs() >= deadline) return error.VictimNeverUnregistered;
+            sleepMs(1);
+        }
+    }
+};
+
+const PreemptAllRun = struct {
+    c: *pr.Client,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *PreemptAllRun) void {
+        self.c.preemptAllAndAbort() catch |e| {
+            self.err = e;
+        };
+        self.done.store(true, .release);
+    }
+};
+
+const BarrierRun = struct {
+    c: *pr.Client,
+    answer: pr.Barrier = .unknown,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *BarrierRun) void {
+        self.answer = self.c.drainBarrier();
+        self.done.store(true, .release);
+    }
+};
+
+/// One slow drain: what the victim saw and what the barriers answered.
+const DrainRound = struct {
+    eio_reads: u32 = 0,
+    /// EIO reads submitted while both barriers were outstanding: the
+    /// barriers were issued inside the drain (0 ⇒ the round proves nothing).
+    eio_with_barriers_pending: u32 = 0,
+    /// EIO reads submitted after the preempt-all or a barrier returned: a
+    /// barrier that did not wait for the drain, or refs not resurrected.
+    late_eio: u32 = 0,
+    write_refused: ?bool = null,
+    other: ?anyerror = null,
+    preempt: ?anyerror = null,
+    registered_barrier: pr.Barrier = .unknown,
+    victim_barrier: pr.Barrier = .unknown,
+    admitted_write: ?anyerror = null,
+    read_after: ?anyerror = null,
+    write_after_refused: bool = false,
+
+    fn proves(self: *const DrainRound) bool {
+        return self.eio_with_barriers_pending != 0;
+    }
+};
+
+fn slowDrainRound(sp: *SlowPair, out: *DrainRound) !void {
+    const p = &sp.pair;
+    var w = try sp.arm();
+    var s: PreemptAllRun = .{ .c = p.b };
+    const ts = try std.Thread.spawn(.{}, PreemptAllRun.run, .{&s});
+    sp.awaitVictimUnregistered() catch |e| {
+        ts.join();
+        _ = w.wait() catch {};
+        return e;
+    };
+    var t_reg: BarrierRun = .{ .c = sp.b2 };
+    var t_victim: BarrierRun = .{ .c = p.a };
+    const tr = try std.Thread.spawn(.{}, BarrierRun.run, .{&t_reg});
+    const tv = try std.Thread.spawn(.{}, BarrierRun.run, .{&t_victim});
+    const deadline = clock.monotonicNs() + drain_wait_ns;
+    while (!(s.done.load(.acquire) and t_reg.done.load(.acquire) and t_victim.done.load(.acquire)) and clock.monotonicNs() < deadline) {
+        const returned = s.done.load(.acquire) or t_reg.done.load(.acquire) or t_victim.done.load(.acquire);
+        const pending = !t_reg.done.load(.acquire) and !t_victim.done.load(.acquire);
+        if (p.pool.readAt(p.a_block, 0, pr_legs.PROBE_WRITE_LEN)) |res| {
+            var rr = res;
+            rr.deinit();
+        } else |e| switch (e) {
+            error.InputOutput => {
+                out.eio_reads += 1;
+                if (pending) out.eio_with_barriers_pending += 1;
+                if (returned) out.late_eio += 1;
+                if (out.write_refused == null) out.write_refused = if (p.pool.writeAt(p.a_block, pr_legs.PROBE_WRITE_LEN, p.buf.bytes)) false else |we| we == error.ReservationConflict;
+            },
+            else => out.other = e,
+        }
+    }
+    ts.join();
+    tr.join();
+    tv.join();
+    out.preempt = s.err;
+    out.registered_barrier = t_reg.answer;
+    out.victim_barrier = t_victim.answer;
+    out.admitted_write = if (w.wait()) null else |e| e;
+    if (p.pool.readAt(p.a_block, 0, pr_legs.PROBE_WRITE_LEN)) |res| {
+        var rr = res;
+        rr.deinit();
+    } else |e| {
+        out.read_after = e;
+    }
+    out.write_after_refused = if (p.pool.writeAt(p.a_block, pr_legs.PROBE_WRITE_LEN, p.buf.bytes)) false else |e| e == error.ReservationConflict;
+}
+
+fn slowDrainLeg(transport: configfs.Trtype) !void {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    var sp = try SlowPair.open(rig, transport, if (transport == .tcp) "t" else "l");
+    defer sp.close(rig);
+    var round: DrainRound = .{};
+    var rounds: u32 = 0;
+    while (rounds < drain_rounds_max) {
+        round = .{};
+        rounds += 1;
+        try slowDrainRound(&sp, &round);
+        if (round.proves()) break;
+    }
+    std.debug.print("\nslow drain ({s}, {d} round(s)): victim reads EIO {d} ({d} while both barriers were outstanding, {d} after a return), victim write refused {?}, other {?s}; preempt-all {?s}; B's barrier {s}, A's barrier {s}; the admitted write {?s}; after the drain: read {?s}, write refused {}\n", .{ transport.name(), rounds, round.eio_reads, round.eio_with_barriers_pending, round.late_eio, round.write_refused, if (round.other) |e| @errorName(e) else null, if (round.preempt) |e| @errorName(e) else null, @tagName(round.registered_barrier), @tagName(round.victim_barrier), if (round.admitted_write) |e| @errorName(e) else null, if (round.read_after) |e| @errorName(e) else null, round.write_after_refused });
+    try testing.expect(round.proves());
+    try testing.expectEqual(@as(?anyerror, null), round.preempt);
+    try testing.expectEqual(@as(u32, 0), round.late_eio);
+    try testing.expectEqual(@as(?bool, true), round.write_refused);
+    try testing.expectEqual(@as(?anyerror, null), round.other);
+    try testing.expectEqual(pr.Barrier.registered, round.registered_barrier);
+    try testing.expectEqual(pr.Barrier.unregistered, round.victim_barrier);
+    try testing.expectEqual(@as(?anyerror, null), round.admitted_write);
+    try testing.expectEqual(@as(?anyerror, null), round.read_after);
+    try testing.expect(round.write_after_refused);
+}
+
+test "nvmet fidelity: slow-drain-loop — on a null_blk namespace completing every command 250 ms late, a preempt-all's victim with a write admitted: its reads end EIO for the whole drain (P9b), its write ends -EBADE (P9a), the admitted write lands (the drain waits for it, P9); the registered host's drain barrier and the victim's, issued inside the drain, answer registered and unregistered only once it ended — no read submitted after a return sees the drain (P15)" {
+    try slowDrainLeg(.loop);
+}
+
+test "nvmet fidelity: slow-drain-tcp — the same on nvmet-tcp" {
+    try slowDrainLeg(.tcp);
+}
+
+/// The kernel log's records from `start` on (root reads `/dev/kmsg`); a
+/// splat naming nvmet or a per-cpu ref fails the P17 legs.
+const KmsgWatch = struct {
+    fd: ?linux.fd_t,
+
+    const markers = [_][]const u8{ "BUG:", "Oops", "WARNING:", "KASAN", "KFENCE", "general protection fault", "list_del corruption", "refcount_t:" };
+
+    fn start() KmsgWatch {
+        const rc = linux.open("/dev/kmsg", .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return .{ .fd = null };
+        const fd: linux.fd_t = @intCast(rc);
+        _ = linux.lseek(fd, 0, linux.SEEK.END);
+        return .{ .fd = fd };
+    }
+
+    /// Every record since `start` when one carries a splat marker and one
+    /// names nvmet or a per-cpu ref; empty otherwise.
+    fn splat(self: *KmsgWatch, gpa: Allocator) ![]u8 {
+        const fd = self.fd orelse return gpa.alloc(u8, 0);
+        defer {
+            _ = linux.close(fd);
+            self.fd = null;
+        }
+        var all: Io.Writer.Allocating = .init(gpa);
+        defer all.deinit();
+        var rec: [8192]u8 = undefined;
+        while (true) {
+            const n = linux.read(fd, &rec, rec.len);
+            switch (linux.errno(n)) {
+                .SUCCESS => try all.writer.writeAll(rec[0..n]),
+                .PIPE => continue,
+                else => break,
+            }
+        }
+        const text = all.written();
+        var marked = false;
+        for (markers) |m| if (std.mem.indexOf(u8, text, m) != null) {
+            marked = true;
+        };
+        if (!marked or (std.mem.indexOf(u8, text, "nvmet") == null and std.mem.indexOf(u8, text, "percpu_ref") == null)) return gpa.alloc(u8, 0);
+        return gpa.dupe(u8, text);
+    }
+};
+
+const TeardownVariant = enum {
+    /// The victim host deletes its controller mid-drain (`nvme disconnect`).
+    disconnect,
+    /// The target tears the victim's controller down mid-drain through
+    /// `nvmet_ctrl_fatal_error` — what its keep-alive timer calls on
+    /// expiry (`core.c:404-422`) — via nvmet's debugfs `state` file.
+    keepalive_fatal,
+};
+
+/// P17 (decision 0004 §2.2, R12, §8.2): the victim's controller torn down
+/// while a preempt-all drains its admitted write.
+fn teardownLeg(transport: configfs.Trtype, variant: TeardownVariant) !void {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    var sp = try SlowPair.open(rig, transport, if (transport == .tcp) "t" else "l");
+    defer sp.close(rig);
+    const p = &sp.pair;
+    var kmsg = KmsgWatch.start();
+    var w = try sp.arm();
+    var s: PreemptAllRun = .{ .c = p.b };
+    const ts = try std.Thread.spawn(.{}, PreemptAllRun.run, .{&s});
+    sp.awaitVictimUnregistered() catch |e| {
+        ts.join();
+        _ = w.wait() catch {};
+        return e;
+    };
+    const t0 = clock.monotonicNs();
+    switch (variant) {
+        .disconnect => {
+            try initiator.deleteController(sp.a.instance);
+            _ = initiator.awaitControllerGone(sp.a.instance);
+            sp.a_deleted = true;
+            rig.forget(&sp.a);
+        },
+        .keepalive_fatal => {
+            var cb: [16]u8 = undefined;
+            const cntlid = std.mem.trim(u8, initiator.readSysfs(&cb, "/sys/class/nvme/nvme{d}/cntlid", .{sp.a.instance}) orelse return error.NoCntlid, " \t\r\n");
+            var pb: [512]u8 = undefined;
+            const path = try std.fmt.bufPrintSentinel(&pb, "/sys/kernel/debug/nvmet/{s}/ctrl{s}/state", .{ sp.nqn, cntlid }, 0);
+            const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+            if (linux.errno(rc) != .SUCCESS) return error.NoNvmetDebugfsState;
+            defer _ = linux.close(@intCast(rc));
+            if (linux.errno(linux.write(@intCast(rc), "fatal", 5)) != .SUCCESS) return error.FatalWriteRefused;
+        },
+    }
+    ts.join();
+    const drained_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+    const admitted = w.wait();
+    const victim_barrier = p.a.drainBarrier();
+    var rep = try sp.b2.report();
+    defer rep.deinit(gpa);
+    const text = try kmsg.splat(gpa);
+    defer gpa.free(text);
+    std.debug.print("\nteardown during the drain ({s}, {s}): preempt-all {?s} {d} ms after the teardown began; the admitted write {s}; the victim's barrier {s}; report rtype {d}, regctl {d}, B registered {}, A registered {}; kernel splat naming nvmet: {s}\n{s}\n", .{ transport.name(), @tagName(variant), if (s.err) |e| @errorName(e) else null, drained_ms, if (admitted) |_| "landed" else |e| @errorName(e), @tagName(victim_barrier), rep.rtype, rep.regctl, rep.registered(pr_legs.key_b1), rep.registered(pr_legs.key_a1), if (text.len == 0) "none" else "YES", text });
+    try testing.expectEqual(@as(usize, 0), text.len);
+    try testing.expectEqual(@as(?anyerror, null), s.err);
+    try testing.expect(rep.rtype == nvme.RTYPE_WEAR and rep.registered(pr_legs.key_b1) and !rep.registered(pr_legs.key_a1));
+    if (variant == .disconnect) {
+        try admitted;
+        try testing.expectEqual(pr.Barrier.unknown, victim_barrier);
+    }
+}
+
+test "nvmet fidelity: teardown-during-drain-loop — P17: the victim host deletes its controller while a preempt-all drains its admitted write; the host's delete waits for the write, so the drain ends before the target frees the controller's per-namespace ref: the preempt-all succeeds, the write lands, the victim's barrier on its deleted controller answers unknown, and the kernel log carries no nvmet splat" {
+    try teardownLeg(.loop, .disconnect);
+}
+
+test "nvmet fidelity: teardown-during-drain-tcp — P17's disconnect on nvmet-tcp" {
+    try teardownLeg(.tcp, .disconnect);
+}
+
+test "nvmet fidelity: keepalive-teardown-during-drain-tcp — P17's keep-alive-expiry variant (opt-in, SQUEEZEFS_TEST_NVMET_FATAL_TEARDOWN=1, a DISPOSABLE venue only): the target tears the victim's tcp controller down mid-drain, so its queue release and the abort work race for the per-namespace ref (decision 0004 R12)" {
+    var env = try std.testing.environ.createMap(testing.allocator);
+    defer env.deinit();
+    if (knobs.present(env.get(fatal_teardown_knob)) == null) return testkit.skip(@src(), .no_seam, fatal_teardown_knob ++ " unset: the keep-alive-expiry teardown races nvmet's abort work for a freed per-controller ref (decision 0004 R12) and can oops the target host — a disposable venue only");
+    try teardownLeg(.tcp, .keepalive_fatal);
 }
 
 /// A set whose data volume is the DAEMON's connect: meta + data shares,

@@ -173,6 +173,84 @@ pub fn nvmeFacts(gpa: Allocator, block_path: []const u8) ?NvmeFacts {
     }
 }
 
+/// A null_blk device made through configfs: memory-backed, every command
+/// completed by a timer `completion_ns` after its submission — the slow
+/// backend an nvmet namespace stands on for the drain legs (decision 0004
+/// §8.2: a preempt-and-abort's drain lasts until the victim's admitted
+/// commands complete). The configfs directory's name is the disk's name
+/// (`null_add_dev`), so `/dev/<name>` is its block node.
+pub const NullBlk = struct {
+    name_buf: [32]u8 = undefined,
+    name_len: usize = 0,
+
+    pub const CONFIGFS = "/sys/kernel/config/nullb";
+    /// null_blk's `irqmode` 2: completions by an hrtimer at `completion_nsec`.
+    const IRQMODE_TIMER = "2";
+
+    /// The module is loaded (its configfs subsystem is registered).
+    pub fn available() bool {
+        var st: linux.Statx = undefined;
+        return linux.errno(linux.statx(linux.AT.FDCWD, CONFIGFS, 0, .{ .TYPE = true }, &st)) == .SUCCESS;
+    }
+
+    pub fn create(dev_name: []const u8, size_mib: u64, completion_ns: u64) !NullBlk {
+        var self: NullBlk = .{};
+        if (dev_name.len >= self.name_buf.len) return error.NameTooLong;
+        @memcpy(self.name_buf[0..dev_name.len], dev_name);
+        self.name_len = dev_name.len;
+        var pb: [96]u8 = undefined;
+        const dir = try std.fmt.bufPrintSentinel(&pb, "{s}/{s}", .{ CONFIGFS, dev_name }, 0);
+        if (linux.errno(linux.mkdir(dir.ptr, 0o755)) != .SUCCESS) return error.NullBlkMkdirFailed;
+        errdefer self.destroy();
+        var vb: [24]u8 = undefined;
+        try self.attr("size", try std.fmt.bufPrint(&vb, "{d}", .{size_mib}));
+        try self.attr("memory_backed", "1");
+        try self.attr("irqmode", IRQMODE_TIMER);
+        try self.attr("completion_nsec", try std.fmt.bufPrint(&vb, "{d}", .{completion_ns}));
+        try self.attr("power", "1");
+        return self;
+    }
+
+    pub fn name(self: *const NullBlk) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+
+    pub fn devPath(self: *const NullBlk, buf: *[48]u8) []const u8 {
+        return std.fmt.bufPrint(buf, "/dev/{s}", .{self.name()}) catch unreachable;
+    }
+
+    /// Writes in flight on the device (`/sys/block/<name>/inflight`: reads,
+    /// then writes); null when unreadable.
+    pub fn inflightWrites(self: *const NullBlk) ?u64 {
+        var pb: [96]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&pb, "/sys/block/{s}/inflight", .{self.name()}, 0) catch return null;
+        var buf: [64]u8 = undefined;
+        const text = @import("../../meta/guard/proc.zig").readSmall(path.ptr, &buf) orelse return null;
+        var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+        _ = it.next() orelse return null;
+        return std.fmt.parseInt(u64, it.next() orelse return null, 10) catch null;
+    }
+
+    /// Power off and remove (best effort: a leg's teardown).
+    pub fn destroy(self: *const NullBlk) void {
+        self.attr("power", "0") catch {};
+        var pb: [96]u8 = undefined;
+        const dir = std.fmt.bufPrintSentinel(&pb, "{s}/{s}", .{ CONFIGFS, self.name() }, 0) catch return;
+        _ = linux.rmdir(dir.ptr);
+    }
+
+    fn attr(self: *const NullBlk, key: []const u8, value: []const u8) !void {
+        var pb: [128]u8 = undefined;
+        const path = try std.fmt.bufPrintSentinel(&pb, "{s}/{s}/{s}", .{ CONFIGFS, self.name(), key }, 0);
+        const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.NullBlkAttrOpenFailed;
+        const fd: linux.fd_t = @intCast(rc);
+        defer _ = linux.close(fd);
+        const n = linux.write(fd, value.ptr, value.len);
+        if (linux.errno(n) != .SUCCESS) return error.NullBlkAttrWriteFailed;
+    }
+};
+
 pub const Ctx = struct {
     gpa: Allocator,
     pool: *uring_fs.Pool,

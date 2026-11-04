@@ -348,25 +348,30 @@ pub fn daemonByProcess(io: Io, mountpoint: []const u8) ?linux.pid_t {
     return pickDaemon(cands[0..n]);
 }
 
-/// Is `pid` alive? A zombie counts as gone (it has run its teardown; the
-/// daemon is not this process's child, so nothing here reaps it) — the
-/// state letter of `/proc/<pid>/stat` after the comm's closing paren.
+/// Is `pid` alive? Monotone over its exit, so a verdict and any later look
+/// agree: a zombie (it has run its teardown; the daemon is not this
+/// process's child, so nothing here reaps it), a task being reaped and a
+/// released pid are gone. The state is read FIRST and `kill(pid, 0)`
+/// answers only a stat that cannot be read: a probe first passes a zombie,
+/// and its parent's reap landing before the read made the released pid's
+/// unreadable stat read as alive.
 fn alive(io: Io, pid: linux.pid_t) bool {
-    if (linux.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))) == .SRCH) return false;
     var pb: [64]u8 = undefined;
     var buf: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&pb, "/proc/{d}/stat", .{pid}) catch return true;
     if (builtin.is_test) if (test_before_stat_read) |h| h.fire(h.ctx, pid);
-    const text = Io.Dir.cwd().readFile(io, path, &buf) catch return true;
+    const text = Io.Dir.cwd().readFile(io, path, &buf) catch
+        return linux.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))) != .SRCH;
     return statAlive(text);
 }
 
 /// The state letter of a `/proc/<pid>/stat` line, after the comm's
-/// closing paren: a zombie ('Z') is gone.
+/// closing paren: a zombie ('Z') and a task its parent's wait is reaping
+/// ('X', EXIT_DEAD: from the wait's claim to the pid's release) are gone.
 fn statAlive(text: []const u8) bool {
     const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return true;
     const rest = std.mem.trimStart(u8, text[close + 1 ..], " ");
-    return rest.len == 0 or rest[0] != 'Z';
+    return rest.len == 0 or (rest[0] != 'Z' and rest[0] != 'X');
 }
 
 /// Test seam: fires as `alive` is about to read `/proc/<pid>/stat` — the

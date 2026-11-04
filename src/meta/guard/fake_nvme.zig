@@ -50,6 +50,11 @@ pub const Namespace = struct {
     wire_host_id_override: ?[16]u8 = null,
     /// An injected transport failure on the next command (a dead node).
     fail_next: ?errors.Error = null,
+    /// Fired once, before the Reservation Report that follows
+    /// `before_report_skip` more of them: a peer's act between two of a
+    /// caller's reports.
+    before_report: ?Hook = null,
+    before_report_skip: u32 = 0,
     /// Commands that pass before `fail_next` fires.
     fail_skip: u32 = 0,
     /// nvmet 7.3's preempt under a single-holder type: the HOLDER's preempt
@@ -309,7 +314,17 @@ pub const Namespace = struct {
         return nvme.STATUS_SUCCESS;
     }
 
+    pub const Hook = struct { ctx: *anyopaque, fire: *const fn (ctx: *anyopaque) void };
+
     fn issue(self: *Namespace, host_id: [16]u8, queue: nvme.Queue, cmd: *const nvme.UringCmd) errors.Error!nvme.Completion {
+        if (queue == .io and cmd.opcode == nvme.OP_RESV_REPORT) if (self.before_report) |h| {
+            if (self.before_report_skip > 0) {
+                self.before_report_skip -= 1;
+            } else {
+                self.before_report = null;
+                h.fire(h.ctx);
+            }
+        };
         self.commands += 1;
         self.last = cmd.*;
         self.last_queue = queue;

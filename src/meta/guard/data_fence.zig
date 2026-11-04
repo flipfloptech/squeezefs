@@ -815,3 +815,56 @@ test "review MAJOR 1 (decision 0003 §DJ): step 2c holds unless every non-retire
     try testing.expectEqual(fencing.DataFenceOutcome.failed, dm.fenceDead(&meta_m, 0x3333));
     try log.testing.expectAllFired();
 }
+
+test "review minor 1 (decision 0003 §DJ): the manager's reconcile preempts a key that left between its two reports — a joiner leaving data then metadata after the data report — and the target refuses (the key is gone): the data report is read again, the key absent is success, the admission proceeds and counts no preempt" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    const m_id: [16]u8 = "manager-host-id1".*;
+    const l_id: [16]u8 = "leaving-joiner-5".*;
+    var mns = fake.Namespace.init(gpa);
+    defer mns.deinit();
+    var mh: fake.Host = .{ .ns = &mns, .host_id = m_id };
+    var meta_m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer meta_m.deinit();
+    try fencing.acquireManagerHold(&meta_m);
+    var lh: fake.Host = .{ .ns = &mns, .host_id = l_id };
+    var meta_l = try pr.Client.init(gpa, lh.face(), 1, 0x5555);
+    defer meta_l.deinit();
+    _ = try fencing.joinAsRegistrant(&meta_l, null);
+    var dns = fake.Namespace.init(gpa);
+    defer dns.deinit();
+    var dlh: fake.Host = .{ .ns = &dns, .host_id = l_id };
+    var data_l = try pr.Client.init(gpa, dlh.face(), 1, 0x5555);
+    defer data_l.deinit();
+    data_l.rtype = nvme.RTYPE_WEAR;
+    _ = try data_l.registerLadder();
+    try data_l.acquire();
+    var no_pages: u8 = 0;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .manager = true });
+    defer dm.release();
+    var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
+    try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
+    try testing.expect(dns.isRegistered(0x5555));
+    // L leaves — data, then metadata — right before the reconcile's
+    // metadata report (after its hold check's report: a report is two
+    // commands, the header and the body).
+    const Leave = struct {
+        data: *pr.Client,
+        meta: *pr.Client,
+        fn fire(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.data.unregister(self.data.key) catch unreachable;
+            self.meta.unregister(self.meta.key) catch unreachable;
+        }
+    };
+    var leave: Leave = .{ .data = &data_l, .meta = &meta_l };
+    mns.before_report = .{ .ctx = &leave, .fire = Leave.fire };
+    mns.before_report_skip = 2;
+    const preempts0 = stats.data_pr_reconcile_preempts.load();
+    try dm.reconcile("fake-data", dm.clients[0]);
+    try testing.expect(mns.before_report == null);
+    try testing.expect(!dns.isRegistered(0x5555));
+    try testing.expectEqual(preempts0, stats.data_pr_reconcile_preempts.load());
+}

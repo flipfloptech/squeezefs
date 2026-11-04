@@ -435,7 +435,7 @@ pub var fuse_reclaim_gathered: counters.Gauge = .{};
 pub var fuse_forget_judgements_deferred: counters.ShardedCounter = .{};
 /// THE CROSS-MEMBER DELETE (decision 0003 §DH), the holder's side:
 /// `fuse_delete_registry` the inos this holder deleted whose record still
-/// stands (0 at quiescence); `fuse_delete_registry_refusals` a delete the
+/// stands (0 at quiescence; summed at the `.stats` read, never kept per op); `fuse_delete_registry_refusals` a delete the
 /// registry could not take (out of memory: its grants serve the corpse
 /// until its destroy, kicked at once); `fuse_delete_kicks` a delete a
 /// member may hold a grant on, whose destroy — the pass that recalls that
@@ -726,64 +726,64 @@ fn OwnLine(comptime T: type) type {
 /// inos hashing there — answers a zero cell as an exact "not deleted" in
 /// one load, so a live object's grant (every create's on a peered set) and
 /// shipped verb read one word. A raised cell (the ino, or another deleted
-/// one sharing its cell) asks the set: sharded by the same hash, each
-/// shard spin-locked on a cache line of its own (the FORGET runs on the
-/// drain worker, which never parks), so a filter that a large corpse
-/// backlog saturates costs a grant one uncontended shard lock. The
-/// handshake with a grant registered before the delete is a Dekker pair:
-/// the delete puts the ino in its shard, raises the cell (SeqCst) THEN
-/// reads the holder's registration filter; the grant registers (the first
-/// registrant's raise of the holder's watch cell, SeqCst) THEN reads the
-/// cell — one sees the other (`tokens/delete_watch_model.zig`).
+/// one sharing its cell) asks the set under its shard's lock (counted).
+/// A delete — and a destroy's removal — touches ONE shard: its spin lock
+/// and its cells share one cache line, so the lock's acquisition and the
+/// cell's raise are one line's transfer, the set's header the line after
+/// (the FORGET runs on the drain worker, which never parks); no level is
+/// kept per op — `fuse_delete_registry` is summed at the `.stats` read.
+/// The handshake with a grant registered before the delete is a Dekker
+/// pair: the delete puts the ino in its shard and raises its cell (SeqCst)
+/// THEN reads the holder's registration filter; the grant registers (the
+/// first registrant's raise of the holder's watch cell, SeqCst) THEN reads
+/// the cell — one sees the other (`tokens/delete_watch_model.zig`).
 pub const DeleteRegistry = struct {
-    pub const Phase = enum(u8) { gathered, trailing };
+    /// The shards: 256 × 128 B per mount. The filter's cells live in the
+    /// shards' lock lines, 15 each (a lock byte and 15 u32 cells fill 64 B):
+    /// 3,840 cells, so a live object's cell is raised with probability ≤
+    /// entries / 3,840 — each such false positive costs one shard lock.
+    pub const SHARDS: usize = 256;
+    pub const SHARD_CELLS: usize = 15;
 
-    /// The filter's cells, 16 KiB per mount: the registry holds the
-    /// gathered corpses (a few `RECLAIM_BATCH` between drains at a steady
-    /// delete rate), so a live object's cell is raised with probability ≤
-    /// entries / 4096 — each such false positive costs one shard lock.
-    pub const FILTER_CELLS: usize = 4096;
-    /// The set's shards (a shard per 64 cells: its index is the cell
-    /// index's top bits).
-    pub const SHARDS: usize = 64;
-
-    const Shard = struct {
-        lock: jc.SpinLock align(std.atomic.cache_line) = .{},
-        set: u64_map.U64Map(Phase) = .empty,
+    const Head = struct {
+        lock: jc.SpinLock = .{},
+        cells: [SHARD_CELLS]std.atomic.Value(u32) = @splat(.init(0)),
     };
+    const Shard = struct {
+        head: Head align(std.atomic.cache_line) = .{},
+        set: u64_map.U64Map(void) align(@sizeOf(Head)) = .empty,
+    };
+    comptime {
+        // The lock and the cells on one 64 B line; the set's header on the
+        // next (x86's coherence granule; `cache_line` is the 128 B pair).
+        std.debug.assert(@sizeOf(Head) <= std.atomic.cache_line / 2); // one 64 B line: half x86's 128 B adjacent-line pair
+        std.debug.assert(@offsetOf(Shard, "set") == @sizeOf(Head));
+    }
 
-    cells: []std.atomic.Value(u32) = &.{},
     shards: []Shard = &.{},
-    /// Trailing entries (the tick's prune reads nothing while 0).
+    /// The registered inos whose record outlived their destroy pass (rare:
+    /// a tree-mapped corpse's sweep, a failed pass), for the tick's prune;
+    /// `trailing` their count (the prune and a removal read nothing at 0).
+    trailing_lock: jc.SpinLock = .{},
+    trailing_set: u64_map.U64Map(void) = .empty,
     trailing: std.atomic.Value(usize) = .init(0),
 
     pub fn init(gpa: Allocator) Allocator.Error!DeleteRegistry {
-        const cells = try gpa.alloc(std.atomic.Value(u32), FILTER_CELLS);
-        errdefer gpa.free(cells);
-        @memset(cells, .init(0));
         const shards = try gpa.alloc(Shard, SHARDS);
         @memset(shards, .{});
-        return .{ .cells = cells, .shards = shards };
+        return .{ .shards = shards };
     }
 
     pub fn deinit(self: *DeleteRegistry, gpa: Allocator) void {
-        for (self.shards) |*sh| {
-            fuse_delete_registry.sub(sh.set.count());
-            sh.set.deinit(gpa);
-        }
+        for (self.shards) |*sh| sh.set.deinit(gpa);
         gpa.free(self.shards);
-        gpa.free(self.cells);
+        self.trailing_set.deinit(gpa);
         self.* = undefined;
     }
 
-    /// Fibonacci hashing: the top bits index the power-of-two tables.
+    /// Fibonacci hashing: the top bits pick the shard, the next its cell.
     fn hash(ino: u64) u64 {
         return ino *% 0x9E3779B97F4A7C15;
-    }
-
-    fn cell(self: *const DeleteRegistry, ino: u64) *std.atomic.Value(u32) {
-        const shift: u6 = @intCast(@as(u32, @bitSizeOf(u64)) - std.math.log2_int(usize, FILTER_CELLS));
-        return &self.cells[@intCast(hash(ino) >> shift)];
     }
 
     fn shard(self: *const DeleteRegistry, ino: u64) *Shard {
@@ -791,22 +791,24 @@ pub const DeleteRegistry = struct {
         return &self.shards[@intCast(hash(ino) >> shift)];
     }
 
+    fn cell(self: *const DeleteRegistry, ino: u64) *std.atomic.Value(u32) {
+        const below: u6 = @intCast(@as(u32, @bitSizeOf(u64)) - std.math.log2_int(usize, SHARDS) - @bitSizeOf(u32));
+        return &self.shard(ino).head.cells[@intCast((hash(ino) >> below) % SHARD_CELLS)];
+    }
+
     /// `ino` was deleted here: in its shard, THEN its cell raised (SeqCst —
     /// the delete's store of the Dekker pair; its caller reads the holder's
-    /// registration filter next). False: the set could not grow (counted).
+    /// registration filter next), under the shard's lock on the same line.
+    /// False: the set could not grow (counted).
     pub fn insert(self: *DeleteRegistry, gpa: Allocator, ino: u64) bool {
-        {
-            const sh = self.shard(ino);
-            sh.lock.lock();
-            defer sh.lock.unlock();
-            const gop = sh.set.getOrPut(gpa, ino) catch {
-                fuse_delete_registry_refusals.inc();
-                return false;
-            };
-            if (gop.found_existing) return true;
-            gop.value_ptr.* = .gathered;
-            fuse_delete_registry.add(1);
-        }
+        const sh = self.shard(ino);
+        sh.head.lock.lock();
+        defer sh.head.lock.unlock();
+        const gop = sh.set.getOrPut(gpa, ino) catch {
+            fuse_delete_registry_refusals.inc();
+            return false;
+        };
+        if (gop.found_existing) return true;
         _ = self.cell(ino).fetchAdd(1, .seq_cst);
         return true;
     }
@@ -819,51 +821,66 @@ pub const DeleteRegistry = struct {
         if (self.cell(ino).load(.seq_cst) == 0) return false;
         fuse_delete_registry_looks.inc();
         const sh = self.shard(ino);
-        sh.lock.lock();
-        defer sh.lock.unlock();
+        sh.head.lock.lock();
+        defer sh.head.lock.unlock();
         return sh.set.contains(ino);
     }
 
     /// The record is gone, or the ino was found live: out of its shard,
-    /// THEN its cell lowered (a raised cell never hides an entry).
+    /// its cell lowered with it (a raised cell never hides an entry).
     pub fn remove(self: *DeleteRegistry, ino: u64) void {
         {
             const sh = self.shard(ino);
-            sh.lock.lock();
-            defer sh.lock.unlock();
-            const phase = sh.set.get(ino) orelse return;
-            _ = sh.set.remove(ino);
-            if (phase == .trailing) _ = self.trailing.fetchSub(1, .monotonic);
-            fuse_delete_registry.sub(1);
+            sh.head.lock.lock();
+            defer sh.head.lock.unlock();
+            if (sh.set.remove(ino)) _ = self.cell(ino).fetchSub(1, .release);
         }
-        _ = self.cell(ino).fetchSub(1, .release);
+        // A trailing mark that raced this removal leaves with it too.
+        if (self.trailing.load(.monotonic) == 0) return;
+        self.trailing_lock.lock();
+        defer self.trailing_lock.unlock();
+        if (self.trailing_set.remove(ino)) _ = self.trailing.fetchSub(1, .monotonic);
     }
 
-    /// The destroy pass is over and the record still stands.
-    pub fn markTrailing(self: *DeleteRegistry, ino: u64) void {
-        const sh = self.shard(ino);
-        sh.lock.lock();
-        defer sh.lock.unlock();
-        const p = sh.set.getPtr(ino) orelse return;
-        if (p.* == .trailing) return;
-        p.* = .trailing;
-        _ = self.trailing.fetchAdd(1, .monotonic);
+    /// The destroy pass is over and the record still stands. The trailing
+    /// index could not grow (out of memory): the next mount's sweep finds
+    /// the corpse.
+    pub fn markTrailing(self: *DeleteRegistry, gpa: Allocator, ino: u64) void {
+        {
+            const sh = self.shard(ino);
+            sh.head.lock.lock();
+            defer sh.head.lock.unlock();
+            if (!sh.set.contains(ino)) return;
+        }
+        self.trailing_lock.lock();
+        defer self.trailing_lock.unlock();
+        const gop = self.trailing_set.getOrPut(gpa, ino) catch return;
+        if (!gop.found_existing) _ = self.trailing.fetchAdd(1, .monotonic);
+    }
+
+    /// The registered inos (the `.stats` read's `fuse_delete_registry`;
+    /// every shard's lock once — never on an op).
+    pub fn count(self: *DeleteRegistry) u64 {
+        var n: u64 = 0;
+        for (self.shards) |*sh| {
+            sh.head.lock.lock();
+            defer sh.head.lock.unlock();
+            n += sh.set.count();
+        }
+        return n;
     }
 
     /// Up to `out.len` trailing inos (the tick's prune).
     pub fn trailingInos(self: *DeleteRegistry, out: []u64) []u64 {
         if (self.trailing.load(.monotonic) == 0) return out[0..0];
+        self.trailing_lock.lock();
+        defer self.trailing_lock.unlock();
         var n: usize = 0;
-        for (self.shards) |*sh| {
-            sh.lock.lock();
-            defer sh.lock.unlock();
-            var it = sh.set.iterator();
-            while (it.next()) |e| {
-                if (n == out.len) return out[0..n];
-                if (e.value_ptr.* != .trailing) continue;
-                out[n] = e.key;
-                n += 1;
-            }
+        var it = self.trailing_set.iterator();
+        while (it.next()) |e| {
+            if (n == out.len) break;
+            out[n] = e.key;
+            n += 1;
         }
         return out[0..n];
     }
@@ -2075,13 +2092,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return .{ .parents = self.memo.parents.census(), .depths = self.memo.depths.census() };
         }
 
-        /// The memos' gauges, published by the `.stats` lookup (the
-        /// render reads them exact; never an op's work).
+        /// The memos' gauges and the delete registry's level, published by
+        /// the `.stats` lookup (the render reads them exact; never an op's
+        /// work).
         fn publishMemoGauges(self: *Self) void {
             self.memo.lock.lock();
             const p = [3]u64{ self.memo.parents.count(), self.memo.parents.capacity(), self.memo.parents.displacement };
             const d = [3]u64{ self.memo.depths.count(), self.memo.depths.capacity(), self.memo.depths.displacement };
             self.memo.lock.unlock();
+            fuse_delete_registry.set(self.deleted.count());
             fuse_parent_memo_entries.set(p[0]);
             fuse_parent_memo_slots.set(p[1]);
             fuse_parent_memo_displacement.set(p[2]);
@@ -3094,7 +3113,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             assert(corpses.len <= RECLAIM_BATCH);
             // A pass that fails leaves its corpses' records standing: their
             // deletes trail until the tick finds each record gone (§DH).
-            errdefer for (corpses) |ino| self.deleted.markTrailing(ino);
+            errdefer for (corpses) |ino| self.deleted.markTrailing(self.gpa, ino);
             // (1) The nlink re-check (a forget of a live inode never reached
             // the gather) and the settle.
             var live: [RECLAIM_BATCH]u64 = undefined;
@@ -3234,7 +3253,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 self.afterCommit(&after);
                 // The sweep's terminal chunk destroys the inode (now, or on
                 // a meta lane): the record may outlive this pass.
-                self.deleted.markTrailing(sw.ino);
+                self.deleted.markTrailing(self.gpa, sw.ino);
             }
             if (failed) |e| return e;
         }
@@ -11506,7 +11525,7 @@ test "THE CROSS-MEMBER DELETE, the holder's side (the owner's ruling 2026-11-03,
     const le = try H.Fs.localOf(e);
     for ([_][]const u8{ "f", "g", "e" }) |name| try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = name } }, 1).errno());
     for ([_]u64{ f, g, e }) |x| h.release(x);
-    const reg0 = fuse_delete_registry.load();
+    const reg0 = h.fs.deleted.count();
     // Unlinked, not yet forgotten: alive to every member.
     try testing.expect(!h.fs.deletedHere(lf));
     const kicks0 = fuse_delete_kicks.load();
@@ -11529,7 +11548,7 @@ test "THE CROSS-MEMBER DELETE, the holder's side (the owner's ruling 2026-11-03,
     h.store.try_only_refusals = 1;
     h.forget(e, 1);
     try testing.expect(!h.fs.deletedHere(le));
-    try testing.expectEqual(reg0 + 2, fuse_delete_registry.load());
+    try testing.expectEqual(reg0 + 2, h.fs.deleted.count());
     var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
     var win: [16]u8 = undefined;
     var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
@@ -11537,20 +11556,20 @@ test "THE CROSS-MEMBER DELETE, the holder's side (the owner's ruling 2026-11-03,
     tr.finish();
     // The destroys committed: every delete leaves the registry.
     try testing.expect(!h.fs.deletedHere(lf) and !h.fs.deletedHere(lg));
-    try testing.expectEqual(reg0, fuse_delete_registry.load());
+    try testing.expectEqual(reg0, h.fs.deleted.count());
     // A trailing delete (its record outlived its pass) leaves at the tick
     // once the record is gone, never while it stands.
     const x = try h.create(1, "x", 0o644);
     const lx = try H.Fs.localOf(x);
     try testing.expect(h.fs.deleted.insert(testing.allocator, lx));
     try testing.expect(h.fs.deleted.insert(testing.allocator, lx + 1000));
-    h.fs.deleted.markTrailing(lx);
-    h.fs.deleted.markTrailing(lx + 1000);
+    h.fs.deleted.markTrailing(testing.allocator, lx);
+    h.fs.deleted.markTrailing(testing.allocator, lx + 1000);
     h.fs.pruneDeleted();
     try testing.expect(h.fs.deleted.has(lx));
     try testing.expect(!h.fs.deleted.has(lx + 1000));
     h.fs.deleted.remove(lx);
-    try testing.expectEqual(reg0, fuse_delete_registry.load());
+    try testing.expectEqual(reg0, h.fs.deleted.count());
     // A flat mount (no wire): no member to answer, nothing registered.
     h.fs.bindForeignWatch(null);
     try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "x" } }, 1).errno());
@@ -11559,7 +11578,7 @@ test "THE CROSS-MEMBER DELETE, the holder's side (the owner's ruling 2026-11-03,
     try testing.expect(!h.fs.deleted.has(lx));
 }
 
-test "THE DELETE REGISTRY'S FILTER (decision 0003 §DH.14): a live object's check takes no lock — 10,000 checks of live inos over an empty registry ask no shard (`fuse_delete_registry_looks` unchanged), and over one holding 256 deleted inos only the checks whose cell another deleted ino raised do (each counted once); a deleted ino is found under its shard's lock and, removed, clears its cell; the fields written per op or per delete — `next_fh`, the memos, the destroy tally, the gather's count — sit on cache lines of their own" {
+test "THE DELETE REGISTRY'S FILTER (decision 0003 §DH.14): a live object's check takes no lock — 10,000 checks of live inos over an empty registry ask no shard (`fuse_delete_registry_looks` unchanged), and over one holding 256 deleted inos only the checks whose cell another deleted ino raised do (each counted once); a deleted ino is found under its shard's lock and, removed, clears its cell; a shard's lock and cells share one cache line, its set's header the next (decision 0003 §DH.21); the fields written per op or per delete — `next_fh`, the memos, the destroy tally, the gather's count — sit on cache lines of their own" {
     const gpa = testing.allocator;
     var reg = try DeleteRegistry.init(gpa);
     defer reg.deinit(gpa);
@@ -11576,12 +11595,20 @@ test "THE DELETE REGISTRY'S FILTER (decision 0003 §DH.14): a live object's chec
         try testing.expect(!reg.has(ino));
     }
     try testing.expectEqual(looks0 + raised, fuse_delete_registry_looks.load());
-    // 256 deleted inos raise at most 256 of the 4096 cells (1/16 of them;
+    // 256 deleted inos raise at most 256 of the 3,840 cells (1/15 of them;
     // Fibonacci hashing spreads consecutive inos evenly).
     try testing.expect(raised * 8 < 10_000);
     for (dead0..dead0 + 256) |ino| try testing.expect(reg.has(ino));
     for (dead0..dead0 + 256) |ino| reg.remove(ino);
-    for (reg.cells) |*c| try testing.expectEqual(@as(u32, 0), c.load(.monotonic));
+    for (reg.shards) |*sh| for (&sh.head.cells) |*c| try testing.expectEqual(@as(u32, 0), c.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), reg.count());
+    // A delete touches one shard: its lock word and every cell on one
+    // 64 B line, the set's header on the next.
+    for (reg.shards) |*sh| {
+        const line = @intFromPtr(&sh.head.lock) / @sizeOf(DeleteRegistry.Head);
+        try testing.expectEqual(line, (@intFromPtr(&sh.head.cells[DeleteRegistry.SHARD_CELLS - 1]) + @sizeOf(u32) - 1) / @sizeOf(DeleteRegistry.Head));
+        try testing.expectEqual(line + 1, @intFromPtr(&sh.set) / @sizeOf(DeleteRegistry.Head));
+    }
     for (dead0..dead0 + 256) |ino| try testing.expect(!reg.has(ino));
 
     const Fs = Harness.Fs;

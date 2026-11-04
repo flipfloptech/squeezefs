@@ -4,7 +4,9 @@
 //! DeleteRegistry.insert` / `has`, `PrepareSeam.deleted`).
 //!
 //! The delete D registers the ino under its registry shard's lock, THEN raises
-//! the registry's filter cell, THEN reads the holder's registration filter
+//! the registry's filter cell (still under the lock: the cells share its
+//! line; the unlock queues behind a buffered raise), THEN reads the holder's
+//! registration filter
 //! (a member may hold a grant made before the delete ⇒ D kicks the destroy,
 //! whose pass recalls that grant). A grant G registers under the holder's
 //! lock — the FIRST registrant of the object raises the filter's watch
@@ -51,6 +53,7 @@ fn DeleteWatch(comptime variant: Variant, comptime other_deleted: bool) type {
         // Pending (store-buffered) stores: the raises, and a grant's
         // unlock queued behind its raise (FIFO — TSO's order).
         d_cell_pending: bool = false,
+        d_unlock_pending: bool = false,
         g_watch_pending: [2]bool = @splat(false),
         g_unlock_pending: [2]bool = @splat(false),
         // What each side decided.
@@ -73,6 +76,8 @@ fn DeleteWatch(comptime variant: Variant, comptime other_deleted: bool) type {
         pub fn drainD(self: *Self) void {
             if (self.d_cell_pending) self.cell += 1;
             self.d_cell_pending = false;
+            if (self.d_unlock_pending) self.rlock = 0;
+            self.d_unlock_pending = false;
         }
 
         pub fn drainG(self: *Self, g: usize) void {
@@ -92,11 +97,17 @@ fn DeleteWatch(comptime variant: Variant, comptime other_deleted: bool) type {
                     self.rlock = D + 1;
                 },
                 1 => self.entry = true,
-                2 => self.rlock = 0,
-                // The filter cell's raise.
-                3 => {
+                // The filter cell's raise, under the shard's lock (the
+                // cells share its line).
+                2 => {
                     self.d_cell_pending = true;
                     if (variant != .no_delete_fence) self.drainD();
+                },
+                // The unlock's release store queues behind a pending raise.
+                3 => if (self.d_cell_pending) {
+                    self.d_unlock_pending = true;
+                } else {
+                    self.rlock = 0;
                 },
                 // The holder's registration filter.
                 4 => self.d_saw_watch = self.watch != 0,

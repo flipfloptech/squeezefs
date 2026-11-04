@@ -698,6 +698,22 @@ pub const LapseStrict = struct {
     /// post-check withdraws it (frozen between its pre-check and its
     /// register across its whole death).
     beat_window: bool = false,
+    /// The same window of a member's re-admission after a refused data write
+    /// (decision 0003 §DL): another of its writes admitted between that
+    /// register and its post-check.
+    ebade_window: bool = false,
+};
+
+/// When the manager's metadata grace may end before its length.
+pub const MetaEarly = enum {
+    /// Never: the hold returns after the grace (the code before §DL).
+    grace_only,
+    /// Once every live member's host key in the census is registered on the
+    /// metadata namespace (as built, decision 0003 §DL).
+    census,
+    /// Once every key the metadata namespace's own report lists is there —
+    /// trivially at once: the report knows only who came back.
+    registrants,
 };
 
 pub const LapseConfig = struct {
@@ -711,6 +727,25 @@ pub const LapseConfig = struct {
     /// The manager waits the grace (every live member's beat first) before
     /// it re-acquires or re-reserves.
     grace: bool = true,
+    /// The metadata grace's early end.
+    meta_early: MetaEarly = .census,
+    /// J's beat is slow on DATA: the grace's timing law covers its metadata
+    /// re-registration only, its data re-registration may come after the
+    /// re-reservation (its metadata part missing the grace stays the
+    /// documented fail-stop, §DJ.12(a)).
+    slow_member: bool = false,
+    /// A member whose data write the target refuses re-admits its host
+    /// (through the rule) and retries the write once when it saw a lapse,
+    /// is registered on the metadata namespace and is current, before and
+    /// after the register (as built, §DL); false: every refusal latches the
+    /// fence (the code before).
+    ebade_readmit: bool = true,
+    /// ... with those metadata and currency checks (false: the lapse alone).
+    ebade_checks: bool = true,
+    /// X's second write in flight beside the first (the re-admission's
+    /// window needs it; the slow-member runs leave it out to stay inside the
+    /// explorer's bound).
+    x_second_write: bool = true,
     /// A member's data re-registration requires its host registered on the
     /// metadata namespace (before and after).
     meta_check: bool = true,
@@ -725,7 +760,8 @@ pub const LapseConfig = struct {
 /// running set: the manager MG (host A) holds the metadata namespace (WERO)
 /// and every host is registered on it and on the WEAR data namespace; J (host
 /// C) a live joiner writing data and metadata; X (host B) a member frozen
-/// with a data write, its death recovered by MG at any point:
+/// with two data writes, its death recovered by MG at any point (its census
+/// row gone at its eviction, before the recovery):
 ///   0 L    the restart: every registration and both reservations forgotten
 ///          (`meta_too`: the metadata namespace on the same target), once the
 ///          namespace's in-flight requests completed.
@@ -735,19 +771,27 @@ pub const LapseConfig = struct {
 ///          unproven while the lapse is open, the next poll; then the release
 ///          and J's reallocation of X's block.
 ///   2 MGB  MG's beats after the lapse: the host re-registered on metadata
-///          (its claim ours), the GRACE, the WERO re-acquire; its own data
-///          re-registration, the wait (the metadata held and every metadata
-///          registrant registered on data, else the grace), the WEAR
-///          re-reservation, the reconcile (data report, metadata report, the
-///          preempt of every data key the metadata namespace lacks).
+///          (its claim ours), the GRACE — ended early once every census key
+///          is registered on metadata (`meta_early`) —, the WERO re-acquire;
+///          its own data re-registration, the wait (the metadata held and
+///          every metadata registrant registered on data, else the grace),
+///          the WEAR re-reservation, the reconcile (data report, metadata
+///          report, the preempt of every data key the metadata namespace
+///          lacks).
 ///   3 JB   J's first beat after the lapse: metadata — unreserved and the
 ///          host unregistered ⇒ register (its page Live); data — unreserved,
 ///          the host unregistered and registered on metadata ⇒ register, the
-///          re-check. The grace is the timing law that this beat runs first.
-///   4 JW   J's data write, then its metadata write (refused ⇒ `LiveFenced`).
+///          re-check. The grace is the timing law that this beat (with
+///          `slow_member`, its metadata part) runs first.
+///   4 JW   J's data write — refused ⇒ the re-admission (`ebade_readmit`):
+///          its lapse seen, its metadata registration and currency, the
+///          register, the post-check, the retry — then its metadata write
+///          (any refusal left ⇒ `LiveFenced`).
 ///   5 XB   X's first beat after the lapse (it resumes at any point): the same
 ///          steps under its currency (its page Live).
-///   6 XW   X's data write: issued, admitted or refused, landed.
+///   6 XW   X's data write: issued, admitted or refused, landed; refused ⇒
+///          the same re-admission and one retry.
+///   7 XW2  X's second data write, in flight beside the first.
 /// Invariants: `LiveFenced` a live member's write is never refused;
 /// `ReallocatedUnfenced`, `StaleDataWrite` as in `Death` outside the accepted
 /// windows (`LapseStrict`). `final`: `LapseUnbounded` both namespaces are
@@ -755,7 +799,7 @@ pub const LapseConfig = struct {
 pub fn Lapse(comptime cfg: LapseConfig) type {
     return extern struct {
         const Self = @This();
-        pub const thread_count: usize = 7;
+        pub const thread_count: usize = 8;
         const T_L = 0;
         const T_MGR = 1;
         const T_MGB = 2;
@@ -763,11 +807,22 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
         const T_JW = 4;
         const T_XB = 5;
         const T_XW = 6;
+        const T_XW2 = 7;
         const ROUNDS = 4;
         const R_P = 3;
         const R_END = 7;
         const MGB_END = 10;
         const BEAT_END = 7;
+        // J's writes: the data write, the re-admission (pre-check, register,
+        // post-check, retry), the metadata write.
+        const JW_PRE = 1;
+        const JW_META = 5;
+        const JW_END = 6;
+        // X's write: issue, arrival, landing; the re-admission (pre-check,
+        // register, post-check), the retry's issue, arrival, landing.
+        const XW_LAND = 2;
+        const XW_PRE = 3;
+        const XW_END = 9;
 
         m_res: bool = true,
         m_reg: [3]bool = @splat(true),
@@ -775,27 +830,50 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
         d_reg: [3]bool = @splat(true),
         lapsed: bool = false,
         x_page: Page = .live,
+        /// X's census row (gone at its eviction, which precedes the
+        /// recovery).
+        x_listed: bool = true,
         fenced: bool = false,
         released: bool = false,
         realloc: bool = false,
         round: u8 = 0,
-        /// J's first beat after the lapse ran (the grace's timing law).
+        /// A member's beat saw the lapse (its re-admission's lapse word).
+        seen: [3]bool = @splat(false),
+        /// J's first beat after the lapse ran (the grace's timing law), and
+        /// its metadata part (`slow_member`'s).
         j_beat_done: bool = false,
+        j_meta_done: bool = false,
         dsnap: [3]bool = @splat(false),
         msnap: [3]bool = @splat(false),
         xw: Wr = .idle,
-        /// X's write was admitted while the namespace was unreserved, or
-        /// inside its own beat's register window.
+        xw2: Wr = if (cfg.x_second_write) .idle else .none,
+        /// Where an X write was admitted: while the namespace was
+        /// unreserved, inside its own beat's register window, inside its
+        /// re-admission's.
         xw_unreserved: bool = false,
         xw_window: bool = false,
+        xw_ewindow: bool = false,
+        xw2_unreserved: bool = false,
+        xw2_window: bool = false,
+        xw2_ewindow: bool = false,
         /// X's beat registered host B on data and has not post-checked.
         x_window: bool = false,
-        pc: [7]u8 = @splat(0),
+        /// X's re-admission registered host B on data (checked before) and
+        /// has not post-checked.
+        x_ewindow: bool = false,
+        /// A re-admission's register found the host unregistered (its
+        /// withdrawal's word).
+        x_fresh: bool = false,
+        j_fresh: bool = false,
+        /// A beat's data register found its host unregistered.
+        beat_fresh: [3]bool = @splat(false),
+        pc: [8]u8 = @splat(0),
         live_fenced: bool = false,
         realloc_unfenced: bool = false,
         stale_write: bool = false,
         hit_lapse: bool = false,
         hit_beat_window: bool = false,
+        hit_ebade_window: bool = false,
 
         pub fn init() Self {
             return .{};
@@ -807,8 +885,9 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                 T_MGR => self.pc[t] >= R_END,
                 T_MGB => self.pc[t] >= MGB_END,
                 T_JB, T_XB => self.pc[t] >= BEAT_END,
-                T_JW => self.pc[t] >= 2,
-                T_XW => self.pc[t] >= 3,
+                T_JW => self.pc[t] >= JW_END,
+                T_XW => self.pc[t] >= XW_END,
+                T_XW2 => self.pc[t] >= 3,
                 else => unreachable,
             };
         }
@@ -825,6 +904,33 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
             return h != B or !cfg.currency or self.x_page == .live;
         }
 
+        /// The grace's timing law: J's beat (with `slow_member`, its
+        /// metadata part) ran.
+        fn graceOver(self: *const Self) bool {
+            return if (cfg.slow_member) self.j_meta_done else self.j_beat_done;
+        }
+
+        /// The metadata grace's early end: every key the census lists is
+        /// registered on the metadata namespace.
+        fn metaEarlyEnd(self: *const Self) bool {
+            return switch (cfg.meta_early) {
+                .grace_only => false,
+                .census => self.m_reg[C] and (!self.x_listed or self.m_reg[B]),
+                .registrants => true,
+            };
+        }
+
+        /// A refused member's re-admission may register: its lapse seen,
+        /// and (`ebade_checks`) its host registered on metadata and current.
+        fn readmitPasses(self: *const Self, h: u8) bool {
+            if (!self.seen[h]) return false;
+            return !cfg.ebade_checks or (self.m_reg[h] and self.current(h));
+        }
+
+        fn anyXAdmitted(self: *const Self) bool {
+            return self.xw == .admitted or self.xw2 == .admitted;
+        }
+
         pub fn step(self: *Self, t: usize) void {
             switch (t) {
                 T_L => {
@@ -833,7 +939,7 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                     // `nvmet_ns_disable`: `disable_done`, then
                     // `nvmet_pr_exit_ns`); a power loss lands or loses them
                     // — never after the restart.
-                    if (self.xw == .admitted) return;
+                    if (self.anyXAdmitted()) return;
                     self.d_res = false;
                     self.d_reg = @splat(false);
                     if (cfg.meta_too) {
@@ -849,19 +955,25 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                 T_JW => self.liveWrites(),
                 T_XB => self.memberBeat(T_XB, B),
                 T_XW => self.deadWrite(),
+                T_XW2 => self.deadWrite2(),
                 else => unreachable,
             }
         }
 
         fn recovery(self: *Self) void {
             switch (self.pc[T_MGR]) {
-                0 => self.m_reg[B] = false,
+                0 => {
+                    // The eviction (its census row gone), then the metadata
+                    // preempt of host B.
+                    self.x_listed = false;
+                    self.m_reg[B] = false;
+                },
                 1 => self.x_page = .recovering,
                 2 => self.m_reg[B] = false,
                 // MG's own data client (registered: a preempt's sender
                 // must be) preempts-and-aborts host B's key.
                 R_P => if (self.d_reg[A] and self.d_reg[B]) {
-                    if (self.xw == .admitted) return;
+                    if (self.anyXAdmitted()) return;
                     self.d_reg[B] = false;
                 },
                 4 => self.fenced = self.d_res and !self.d_reg[B],
@@ -890,26 +1002,30 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
             self.pc[T_MGR] += 1;
         }
 
+        /// Where X's write `w` admitted now (or already) would count: the
+        /// lapse, its beat's window, its re-admission's, or a breach.
+        fn classify(self: *Self, unreserved: bool, window: bool, ewindow: bool) void {
+            if (unreserved) {
+                self.hit_lapse = true;
+            } else if (window) {
+                self.hit_beat_window = true;
+            } else if (ewindow) {
+                self.hit_ebade_window = true;
+            } else self.realloc_unfenced = true;
+        }
+
         /// J reallocates X's block: X must not be able to land there,
         /// outside the accepted windows.
         fn reallocCheck(self: *Self) void {
-            switch (self.xw) {
-                .admitted => {
-                    if (self.xw_unreserved) {
-                        self.hit_lapse = true;
-                    } else if (self.xw_window) {
-                        self.hit_beat_window = true;
-                    } else self.realloc_unfenced = true;
-                },
-                .idle, .queued => if (self.admitsD(B)) {
-                    if (!self.d_res) {
-                        self.hit_lapse = true;
-                    } else if (self.x_window) {
-                        self.hit_beat_window = true;
-                    } else self.realloc_unfenced = true;
-                },
+            const ws = [2]struct { w: Wr, u: bool, bw: bool, ew: bool, alive: bool }{
+                .{ .w = self.xw, .u = self.xw_unreserved, .bw = self.xw_window, .ew = self.xw_ewindow, .alive = true },
+                .{ .w = self.xw2, .u = self.xw2_unreserved, .bw = self.xw2_window, .ew = self.xw2_ewindow, .alive = true },
+            };
+            for (ws) |x| switch (x.w) {
+                .admitted => self.classify(x.u, x.bw, x.ew),
+                .idle, .queued => if (self.admitsD(B)) self.classify(!self.d_res, self.x_window, self.x_ewindow),
                 .landed, .refused, .none => {},
-            }
+            };
         }
 
         fn allMetaOnData(self: *const Self) bool {
@@ -929,21 +1045,21 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                 1 => if (cfg.meta_too and !self.m_reg[A]) {
                     self.m_reg[A] = true;
                 },
-                2 => if (cfg.meta_too and !self.m_res and cfg.grace and !self.j_beat_done) return,
+                2 => if (cfg.meta_too and !self.m_res and cfg.grace and !self.graceOver() and !self.metaEarlyEnd()) return,
                 3 => if (cfg.meta_too and !self.m_res) {
                     self.m_res = true;
                 },
                 4 => if (!self.d_res and !self.d_reg[A] and self.m_reg[A]) {
                     self.d_reg[A] = true;
                 },
-                5 => if (!self.d_res and cfg.grace and !self.allMetaOnData() and !self.j_beat_done) return,
+                5 => if (!self.d_res and cfg.grace and !self.allMetaOnData() and !self.graceOver()) return,
                 6 => if (!self.d_res) {
                     self.d_res = true;
                 },
                 7 => self.dsnap = self.d_reg,
                 8 => self.msnap = self.m_reg,
                 9 => {
-                    if (self.xw == .admitted and self.d_reg[B] and self.dsnap[B] and !self.msnap[B]) return;
+                    if (self.anyXAdmitted() and self.d_reg[B] and self.dsnap[B] and !self.msnap[B]) return;
                     for (0..3) |k| {
                         if (k != A and self.dsnap[k] and !self.msnap[k]) self.d_reg[k] = false;
                     }
@@ -962,6 +1078,7 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                         self.endBeat(t);
                         return;
                     }
+                    self.seen[h] = true;
                 },
                 1 => if (!(cfg.meta_too and !self.m_res and !self.m_reg[h] and self.current(h))) {
                     self.pc[t] = 4;
@@ -971,17 +1088,24 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                 3 => if (!self.current(h)) {
                     self.m_reg[h] = false;
                 },
-                4 => if (!(!self.d_res and !self.d_reg[h] and (!cfg.meta_check or self.m_reg[h]) and self.current(h))) {
-                    self.endBeat(t);
-                    return;
+                4 => {
+                    if (h == C) self.j_meta_done = true;
+                    if (!(!self.d_res and !self.d_reg[h] and (!cfg.meta_check or self.m_reg[h]) and self.current(h))) {
+                        self.endBeat(t);
+                        return;
+                    }
                 },
                 5 => {
+                    // A registration that stands meanwhile (its own
+                    // re-admission's) is adopted: the post-check withdraws
+                    // only a fresh one.
+                    self.beat_fresh[h] = !self.d_reg[h];
                     self.d_reg[h] = true;
-                    if (h == B) self.x_window = true;
+                    if (h == B and self.beat_fresh[h]) self.x_window = true;
                 },
                 6 => {
                     if (h == B) self.x_window = false;
-                    if ((cfg.meta_check and !self.m_reg[h]) or !self.current(h)) self.d_reg[h] = false;
+                    if (self.beat_fresh[h] and ((cfg.meta_check and !self.m_reg[h]) or !self.current(h))) self.d_reg[h] = false;
                     self.endBeat(t);
                     return;
                 },
@@ -998,9 +1122,36 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
         fn liveWrites(self: *Self) void {
             switch (self.pc[T_JW]) {
                 0 => if (!self.admitsD(C)) {
+                    if (cfg.ebade_readmit) {
+                        self.pc[T_JW] = JW_PRE;
+                        return;
+                    }
+                    self.live_fenced = true;
+                    self.pc[T_JW] = JW_META;
+                    return;
+                } else {
+                    self.pc[T_JW] = JW_META;
+                    return;
+                },
+                JW_PRE => if (!self.readmitPasses(C)) {
+                    self.live_fenced = true;
+                    self.pc[T_JW] = JW_META;
+                    return;
+                },
+                2 => {
+                    self.j_fresh = !self.d_reg[C];
+                    self.d_reg[C] = true;
+                },
+                3 => if (cfg.ebade_checks and !(self.m_reg[C] and self.current(C))) {
+                    if (self.j_fresh) self.d_reg[C] = false;
+                    self.live_fenced = true;
+                    self.pc[T_JW] = JW_META;
+                    return;
+                },
+                4 => if (!self.admitsD(C)) {
                     self.live_fenced = true;
                 },
-                1 => if (!self.admitsM(C)) {
+                JW_META => if (!self.admitsM(C)) {
                     self.live_fenced = true;
                 },
                 else => unreachable,
@@ -1008,33 +1159,91 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
             self.pc[T_JW] += 1;
         }
 
+        /// A frozen X write's arrival at the target: admitted (with where)
+        /// or refused.
+        fn arrive(self: *Self, w: *Wr, unreserved: *bool, window: *bool, ewindow: *bool) bool {
+            if (!self.admitsD(B)) {
+                w.* = .refused;
+                return false;
+            }
+            w.* = .admitted;
+            unreserved.* = !self.d_res;
+            // Admitted between a register of its own process and that
+            // register's post-check: a withdrawal there unregisters without
+            // an abort.
+            window.* = self.x_window;
+            ewindow.* = self.x_ewindow;
+            return true;
+        }
+
+        fn land(self: *Self, w: *Wr, unreserved: bool, window: bool, ewindow: bool) void {
+            w.* = .landed;
+            if (self.realloc) {
+                if (unreserved) {
+                    self.hit_lapse = true;
+                } else if (window) {
+                    self.hit_beat_window = true;
+                } else if (ewindow) {
+                    self.hit_ebade_window = true;
+                } else self.stale_write = true;
+            }
+        }
+
         fn deadWrite(self: *Self) void {
             switch (self.pc[T_XW]) {
-                0 => self.xw = .queued,
-                1 => if (self.admitsD(B)) {
-                    self.xw = .admitted;
-                    self.xw_unreserved = !self.d_res;
-                    // Admitted between its own beat's register and post-check:
-                    // a withdrawal there unregisters without an abort.
-                    self.xw_window = self.x_window;
-                } else {
-                    self.xw = .refused;
-                    self.pc[T_XW] = 3;
+                0, 6 => self.xw = .queued,
+                1, 7 => if (!self.arrive(&self.xw, &self.xw_unreserved, &self.xw_window, &self.xw_ewindow)) {
+                    // A refusal: the re-admission once, then the fence.
+                    self.pc[T_XW] = if (cfg.ebade_readmit and self.pc[T_XW] == 1) XW_PRE else XW_END;
                     return;
                 },
-                2 => {
-                    self.xw = .landed;
-                    if (self.realloc) {
-                        if (self.xw_unreserved) {
-                            self.hit_lapse = true;
-                        } else if (self.xw_window) {
-                            self.hit_beat_window = true;
-                        } else self.stale_write = true;
+                XW_LAND, 8 => {
+                    self.land(&self.xw, self.xw_unreserved, self.xw_window, self.xw_ewindow);
+                    self.pc[T_XW] = XW_END;
+                    return;
+                },
+                XW_PRE => if (!self.readmitPasses(B)) {
+                    self.pc[T_XW] = XW_END;
+                    return;
+                },
+                4 => {
+                    // A registration standing already is adopted: the
+                    // post-check withdraws only its own.
+                    self.x_fresh = !self.d_reg[B];
+                    self.d_reg[B] = true;
+                    // Checked before: the accepted window until the
+                    // post-check (unchecked, a breach).
+                    if (cfg.ebade_checks and self.x_fresh) self.x_ewindow = true;
+                },
+                5 => {
+                    self.x_ewindow = false;
+                    if (cfg.ebade_checks and !(self.m_reg[B] and self.current(B))) {
+                        if (self.x_fresh) self.d_reg[B] = false;
+                        self.pc[T_XW] = XW_END;
+                        return;
                     }
                 },
                 else => unreachable,
             }
             self.pc[T_XW] += 1;
+        }
+
+        fn deadWrite2(self: *Self) void {
+            switch (self.pc[T_XW2]) {
+                0 => if (!cfg.x_second_write) {
+                    self.pc[T_XW2] = 3;
+                    return;
+                } else {
+                    self.xw2 = .queued;
+                },
+                1 => if (!self.arrive(&self.xw2, &self.xw2_unreserved, &self.xw2_window, &self.xw2_ewindow)) {
+                    self.pc[T_XW2] = 3;
+                    return;
+                },
+                2 => self.land(&self.xw2, self.xw2_unreserved, self.xw2_window, self.xw2_ewindow),
+                else => unreachable,
+            }
+            self.pc[T_XW2] += 1;
         }
 
         pub fn invariant(self: *const Self) !void {
@@ -1043,6 +1252,7 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
             if (self.stale_write) return error.StaleDataWrite;
             if (cfg.strict.lapse and self.hit_lapse) return error.LapseWindow;
             if (cfg.strict.beat_window and self.hit_beat_window) return error.BeatWindow;
+            if (cfg.strict.ebade_window and self.hit_ebade_window) return error.EbadeWindow;
         }
 
         pub fn final(self: *const Self) !void {
@@ -1196,4 +1406,32 @@ test "data fence model weakening (review MAJOR 2): a lapse re-registration witho
 test "data fence model, the lapse's accepted windows are reachable: a write admitted while the namespace is unreserved after the restart; a member's own re-registration admitting its write before its post-check withdraws it" {
     try testing.expectEqual(error.LapseWindow, firstError(Lapse(.{ .strict = .{ .lapse = true } })));
     try testing.expectEqual(error.BeatWindow, firstError(Lapse(.{ .strict = .{ .beat_window = true } })));
+}
+
+test "data fence model (decision 0003 §DL): the lapse as built with the metadata grace's early end — the manager re-acquires the metadata hold as soon as every live member's host key in the census is registered there (else after the grace) and re-reserves the data namespace at once when every metadata registrant is back on data — and a slow member (its data re-registration after the re-reservation) re-admitted at its refused write through its lapse, its metadata registration and its currency, before and after the register, its write retried — holds; the code before the early end holds too (the early end is liveness)" {
+    try explorer.expectHolds(Lapse(.{ .slow_member = true, .x_second_write = false }), limits);
+    try explorer.expectHolds(Lapse(.{ .slow_member = true, .x_second_write = false, .meta_too = false }), limits);
+    try explorer.expectHolds(Lapse(.{ .meta_early = .grace_only }), limits);
+    const r = try statesOf(Lapse(.{ .slow_member = true, .x_second_write = false }));
+    std.debug.print("\ndata fence model (lapse, slow member): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
+    const r2 = try statesOf(Lapse(.{ .slow_member = true, .x_second_write = false, .meta_too = false }));
+    std.debug.print("\ndata fence model (lapse, slow member, data only): {d} states explored, depth {d}\n", .{ r2.states, r2.max_depth_seen });
+}
+
+test "data fence model weakening (decision 0003 §DL): the metadata grace ended by the metadata report's own registrants (no census) — the hold returns before the live member re-registered, its metadata write refused" {
+    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .meta_early = .registrants })));
+}
+
+test "data fence model weakening (decision 0003 §DL): a slow member whose refused data write latches the fence (the code before) is fail-stopped although it is live and current" {
+    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .slow_member = true, .x_second_write = false, .ebade_readmit = false })));
+    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .slow_member = true, .x_second_write = false, .ebade_readmit = false, .meta_too = false })));
+}
+
+test "data fence model weakening (decision 0003 §DL): the re-admission at a refused data write without its metadata and currency checks re-admits the dead member's host — its retried write lands on its reallocated block" {
+    try testing.expectEqual(error.StaleDataWrite, firstError(Lapse(.{ .ebade_checks = false })));
+    try explorer.expectFails(Lapse(.{ .ebade_checks = false, .meta_too = false }), limits, error.InvariantViolated);
+}
+
+test "data fence model, the re-admission's accepted window is reachable (decision 0003 §DL): a member frozen between its re-admission's checks and its register across its whole death admits another in-flight write before its post-check withdraws the registration — the beat window's class" {
+    try testing.expectEqual(error.EbadeWindow, firstError(Lapse(.{ .strict = .{ .ebade_window = true } })));
 }

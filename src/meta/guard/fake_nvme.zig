@@ -407,10 +407,163 @@ const testing = std.testing;
 
 const host_a: [16]u8 = "host-a-host-a-01".*;
 const host_b: [16]u8 = "host-b-host-b-02".*;
+const host_c: [16]u8 = "host-c-host-c-03".*;
+const host_d: [16]u8 = "host-d-host-d-04".*;
 
 fn issueIo(h: *Host, cmd: nvme.UringCmd) !nvme.Status {
     const c = try h.face().issue(h.face().ctx, .io, &cmd);
     return c.status;
+}
+
+fn registerKey(h: *Host, key: u64) !nvme.Status {
+    var p: [16]u8 = undefined;
+    return issueIo(h, nvme.reservationRegister(1, nvme.RREGA_REGISTER | nvme.IEKEY, 0, key, &p));
+}
+
+fn acquireAs(h: *Host, racqa: u32, rtype: u8, crkey: u64, prkey: u64) !nvme.Status {
+    var p: [16]u8 = undefined;
+    return issueIo(h, nvme.reservationAcquire(1, racqa, rtype, crkey, prkey, &p));
+}
+
+/// Register-Replace with IEKEY 0 and CRKEY = NRKEY = `key`: the drain barrier's command (P15).
+fn replaceSame(h: *Host, key: u64) !nvme.Status {
+    var p: [16]u8 = undefined;
+    return issueIo(h, nvme.reservationRegister(1, nvme.RREGA_REPLACE, key, key, &p));
+}
+
+test "fake laws (nvmet 7.3, decision 0004 §2.2 P4/P8/P3): a preempt-all — Preempt-and-Abort PRKEY 0 RTYPE 5 under an All-Registrants reservation — makes the sender the holder pointer and unregisters every other host id; the sender stays, the reservation is kept, the generation moves by one; a preempted host can neither preempt nor acquire (P8); re-registered it is no holder pointer, so its acquire conflicts (P3)" {
+    var ns = Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var a: Host = .{ .ns = &ns, .host_id = host_a };
+    var b: Host = .{ .ns = &ns, .host_id = host_b };
+    var c: Host = .{ .ns = &ns, .host_id = host_c };
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&a, 0xa));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&b, 0xb));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&c, 0xc));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    const gen = ns.generation;
+    const s = try acquireAs(&b, nvme.RACQA_PREEMPT_AND_ABORT, nvme.RTYPE_WEAR, 0xb, 0);
+    try testing.expectEqual(@as(usize, 1), ns.registered.items.len);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, s);
+    try testing.expect(ns.isHolder(host_b));
+    try testing.expectEqual(@as(?u64, 0xb), ns.holder);
+    try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
+    try testing.expectEqual(gen + 1, ns.generation);
+    try testing.expect(ns.writeAllowed(host_b) and !ns.writeAllowed(host_a) and !ns.writeAllowed(host_c));
+    // P8: the preempted host's commands conflict.
+    try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try acquireAs(&a, nvme.RACQA_PREEMPT_AND_ABORT, nvme.RTYPE_WEAR, 0xa, 0));
+    try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    // P3: re-registered, A writes by registration alone, but the holder
+    // pointer is B's, so A's same-type acquire conflicts.
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&a, 0xa));
+    try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    try testing.expect(ns.writeAllowed(host_a));
+    try testing.expect(ns.isHolder(host_b));
+}
+
+test "fake laws (nvmet 7.3, decision 0004 §2.2 P6): on an unreserved namespace a preempt-all conflicts (PRKEY 0 matches nobody) and changes nothing; a PRKEY k preempt unregisters every registrant of k, the sender not skipped, and takes no hold" {
+    var ns = Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var a: Host = .{ .ns = &ns, .host_id = host_a };
+    var b: Host = .{ .ns = &ns, .host_id = host_b };
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&a, 0xa));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&b, 0xb));
+    const gen = ns.generation;
+    try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try acquireAs(&a, nvme.RACQA_PREEMPT_AND_ABORT, nvme.RTYPE_WEAR, 0xa, 0));
+    try testing.expectEqual(@as(usize, 2), ns.registered.items.len);
+    try testing.expectEqual(@as(?u64, null), ns.holder);
+    try testing.expectEqual(gen, ns.generation);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_PREEMPT, nvme.RTYPE_WEAR, 0xa, 0xb));
+    try testing.expect(ns.find(host_b) == null and ns.find(host_a) != null);
+    try testing.expectEqual(@as(?u64, null), ns.holder);
+    try testing.expectEqual(@as(u8, 0), ns.rtype);
+    try testing.expectEqual(gen + 1, ns.generation);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_PREEMPT_AND_ABORT, nvme.RTYPE_WEAR, 0xa, 0xa));
+    try testing.expectEqual(@as(usize, 0), ns.registered.items.len);
+    try testing.expectEqual(@as(?u64, null), ns.holder);
+}
+
+test "fake laws (nvmet 7.3, decision 0004 §2.2 P10): under All-Registrants the holder pointer passes to the FIRST remaining registrant in registration order when the holder unregisters; the last registrant's unregister ends the reservation" {
+    var ns = Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var a: Host = .{ .ns = &ns, .host_id = host_a };
+    var b: Host = .{ .ns = &ns, .host_id = host_b };
+    var c: Host = .{ .ns = &ns, .host_id = host_c };
+    var p: [16]u8 = undefined;
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&a, 0xa));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&b, 0xb));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&c, 0xc));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try issueIo(&a, nvme.reservationRegister(1, nvme.RREGA_UNREGISTER, 0xa, 0, &p)));
+    try testing.expectEqual(@as(?u64, 0xb), ns.holder);
+    try testing.expect(ns.isHolder(host_b));
+    try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
+    try testing.expect(!ns.writeAllowed(host_a) and ns.writeAllowed(host_b) and ns.writeAllowed(host_c));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try issueIo(&b, nvme.reservationRegister(1, nvme.RREGA_UNREGISTER, 0xb, 0, &p)));
+    try testing.expectEqual(@as(?u64, 0xc), ns.holder);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try issueIo(&c, nvme.reservationRegister(1, nvme.RREGA_UNREGISTER, 0xc, 0, &p)));
+    try testing.expectEqual(@as(?u64, null), ns.holder);
+    try testing.expectEqual(@as(u8, 0), ns.rtype);
+    try testing.expect(ns.writeAllowed(host_a));
+}
+
+test "fake laws (nvmet 7.3, decision 0004 §2.2 P15): Register-Replace with IEKEY 0 and CRKEY = NRKEY = own key succeeds for a registrant, keeping its place in registration order and the holder pointer, and moves the generation; an unregistered host's conflicts and changes nothing" {
+    var ns = Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var a: Host = .{ .ns = &ns, .host_id = host_a };
+    var b: Host = .{ .ns = &ns, .host_id = host_b };
+    var c: Host = .{ .ns = &ns, .host_id = host_c };
+    var d: Host = .{ .ns = &ns, .host_id = host_d };
+    var p: [16]u8 = undefined;
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&a, 0xa));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&b, 0xb));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&c, 0xc));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    const gen = ns.generation;
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try replaceSame(&b, 0xb));
+    try testing.expectEqual(gen + 1, ns.generation);
+    try testing.expectEqualSlices(u8, &host_b, &ns.registered.items[1].host_id);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try replaceSame(&a, 0xa));
+    try testing.expect(ns.isHolder(host_a));
+    try testing.expectEqual(gen + 2, ns.generation);
+    try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try replaceSame(&d, 0xd));
+    try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try issueIo(&b, nvme.reservationRegister(1, nvme.RREGA_REPLACE, 0xbad, 0xb, &p)));
+    try testing.expectEqual(gen + 2, ns.generation);
+    try testing.expectEqual(@as(usize, 3), ns.registered.items.len);
+    // The places kept: A's unregister hands the pointer to B, not C.
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try issueIo(&a, nvme.reservationRegister(1, nvme.RREGA_UNREGISTER, 0xa, 0, &p)));
+    try testing.expectEqual(@as(?u64, 0xb), ns.holder);
+}
+
+test "fake laws (nvmet 7.3, decision 0004 §2.2 P16): Register (an idempotent same-key one too), Unregister, Replace and Preempt move the generation on success; an Acquire and a Release do not" {
+    var ns = Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var a: Host = .{ .ns = &ns, .host_id = host_a };
+    var b: Host = .{ .ns = &ns, .host_id = host_b };
+    var p: [16]u8 = undefined;
+    var r8: [8]u8 = undefined;
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&a, 0xa));
+    try testing.expectEqual(@as(u32, 1), ns.generation);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&a, 0xa));
+    try testing.expectEqual(@as(u32, 2), ns.generation);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    try testing.expectEqual(@as(u32, 2), ns.generation);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try issueIo(&a, nvme.reservationRelease(1, nvme.RTYPE_WEAR, 0xa, &r8)));
+    try testing.expectEqual(@as(?u64, null), ns.holder);
+    try testing.expectEqual(@as(u32, 2), ns.generation);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try registerKey(&b, 0xb));
+    try testing.expectEqual(@as(u32, 3), ns.generation);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try replaceSame(&b, 0xb));
+    try testing.expectEqual(@as(u32, 4), ns.generation);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&a, nvme.RACQA_PREEMPT, nvme.RTYPE_WEAR, 0xa, 0xb));
+    try testing.expectEqual(@as(u32, 5), ns.generation);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try issueIo(&a, nvme.reservationRegister(1, nvme.RREGA_UNREGISTER, 0xa, 0, &p)));
+    try testing.expectEqual(@as(u32, 6), ns.generation);
+    // A refused command moves nothing.
+    try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try issueIo(&a, nvme.reservationRegister(1, nvme.RREGA_UNREGISTER, 0xa, 0, &p)));
+    try testing.expectEqual(@as(u32, 6), ns.generation);
 }
 
 test "fake laws: an unregistered acquire conflicts; register → acquire WE; the same key+rtype re-acquires idempotently; a changed rtype conflicts; a release under the wrong rtype is refused; unregistering the holder releases" {
@@ -452,7 +605,8 @@ test "fake laws: SpecStrict refuses a different key from a registered host, Leni
     // B registers and preempts A's key: the holder transfers, A is gone.
     try testing.expectEqual(nvme.STATUS_SUCCESS, try issueIo(&b, nvme.reservationRegister(1, nvme.RREGA_REGISTER | nvme.IEKEY, 0, 0xb, &p)));
     try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try issueIo(&b, nvme.reservationAcquire(1, nvme.RACQA_ACQUIRE, nvme.RTYPE_WRITE_EXCLUSIVE, 0xb, 0, &p)));
-    try testing.expectEqual(nvme.SC_INVALID_FIELD, try issueIo(&b, nvme.reservationAcquire(1, nvme.RACQA_PREEMPT, nvme.RTYPE_WRITE_EXCLUSIVE, 0xb, 0x999, &p)));
+    // A key nobody holds: nvmet's by-key arm finds no registrant and conflicts.
+    try testing.expectEqual(nvme.SC_RESERVATION_CONFLICT, try issueIo(&b, nvme.reservationAcquire(1, nvme.RACQA_PREEMPT, nvme.RTYPE_WRITE_EXCLUSIVE, 0xb, 0x999, &p)));
     try testing.expectEqual(nvme.STATUS_SUCCESS, try issueIo(&b, nvme.reservationAcquire(1, nvme.RACQA_PREEMPT, nvme.RTYPE_WRITE_EXCLUSIVE, 0xb, 0x2, &p)));
     try testing.expectEqual(@as(?u64, 0xb), ns.holder);
     try testing.expectEqual(@as(u32, 1), ns.preempts);

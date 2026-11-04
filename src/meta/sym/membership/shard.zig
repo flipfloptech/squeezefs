@@ -29,6 +29,7 @@
 //! (0002 row 259); the instruments alone are module globals.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fuzzkit = @import("../../../core/fuzzkit.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -404,6 +405,20 @@ fn nodeOf(id: MemberId) u64 {
 const PendingOffer = struct { to: MemberId, slot: u16, holder: u32 };
 const PendingRelease = struct { to: MemberId, slot: u16 };
 
+/// The owner's race windows a unit parks a caller in (decision 0003 §DM).
+pub const HookSite = enum {
+    /// `renew` found the member, before its stores.
+    renew_found,
+    /// The `RecordDeath` screen's held-key scan is about to visit a member.
+    key_scan,
+    /// `expireDue` judged a member due, before its eviction.
+    expire_due,
+    /// A caller found the roster lock held, before it waits.
+    lock_wait,
+};
+
+pub const TestHook = struct { ctx: *anyopaque, fire: *const fn (ctx: *anyopaque, site: HookSite) void };
+
 pub const Owner = struct {
     gpa: Allocator,
     clocks: LeaseClocks,
@@ -426,6 +441,20 @@ pub const Owner = struct {
     rows: ?RowStore = null,
     offers: std.ArrayList(PendingOffer) = .empty,
     releases: std.ArrayList(PendingRelease) = .empty,
+    /// Test seam: fired at each `HookSite`.
+    test_hook: if (builtin.is_test) ?TestHook else void = if (builtin.is_test) null else {},
+
+    fn hook(self: *const Owner, site: HookSite) void {
+        if (builtin.is_test) if (self.test_hook) |h| h.fire(h.ctx, site);
+    }
+
+    fn lockRoster(self: *Owner) void {
+        if (builtin.is_test) {
+            if (self.roster_lock.tryLock()) return;
+            self.hook(.lock_wait);
+        }
+        self.roster_lock.lock();
+    }
 
     /// `arm(term, prior_term)` REFUSES `term ≤ prior_term`: the successor
     /// bumps the term durably BEFORE arming. `expected` = the predecessor's
@@ -611,14 +640,14 @@ pub const Owner = struct {
         }
         const ack_prior: u64 = if (reclaim) (req.prior_epoch orelse 0) else 0;
         if (existing) |i| {
-            self.roster_lock.lock();
+            self.lockRoster();
             defer self.roster_lock.unlock();
             self.members.items[i] = m;
         } else {
             // Room for every member's departure: `rememberDepartedKey`
             // never allocates.
             self.departed_keys.ensureUnusedCapacity(self.gpa, self.members.items.len + 1) catch return .io;
-            self.roster_lock.lock();
+            self.lockRoster();
             defer self.roster_lock.unlock();
             self.members.append(self.gpa, m) catch return .io;
         }
@@ -644,6 +673,7 @@ pub const Owner = struct {
             stats.membership_renew_refusals.inc();
             return .unknown_lease;
         }
+        self.hook(.renew_found);
         m.renewed_ms = now_ms;
         m.deadline_ms = now_ms + self.clocks.t_owner_ms;
         m.acked_free_epoch = acked_free_epoch;
@@ -664,7 +694,7 @@ pub const Owner = struct {
     }
 
     fn removeMember(self: *Owner, i: usize) void {
-        self.roster_lock.lock();
+        self.lockRoster();
         defer self.roster_lock.unlock();
         _ = self.members.swapRemove(i);
     }
@@ -684,7 +714,7 @@ pub const Owner = struct {
             // outside it.
             var n: usize = 0;
             const fits = blk: {
-                self.roster_lock.lock();
+                self.lockRoster();
                 defer self.roster_lock.unlock();
                 for (self.members.items) |m| {
                     if (m.role != .writer or m.pr_key == 0) continue;
@@ -732,6 +762,7 @@ pub const Owner = struct {
         var i: usize = 0;
         while (i < self.members.items.len) {
             if (now_ms >= self.members.items[i].deadline_ms) {
+                self.hook(.expire_due);
                 self.evict(i, now_ms, self.members.items[i].epoch);
                 n += 1;
             } else i += 1;
@@ -795,7 +826,10 @@ pub const Owner = struct {
     /// registers the host's key (decision 0003 §DF): the dead member's own
     /// node holding it is its siblings' share, never a contradiction.
     pub fn holdsKeyElsewhere(self: *const Owner, key: u64, node_token: u64) bool {
-        for (self.members.items) |m| if (m.pr_key != 0 and m.pr_key == key and nodeOf(m.id) != node_token) return true;
+        for (self.members.items) |m| {
+            self.hook(.key_scan);
+            if (m.pr_key != 0 and m.pr_key == key and nodeOf(m.id) != node_token) return true;
+        }
         for (self.departed_keys.items) |d| if (d.key == key and d.node_token != node_token) return true;
         return false;
     }

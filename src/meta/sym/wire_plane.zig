@@ -2817,6 +2817,110 @@ test "linux: the daemon's wire plane over a real symmetric set — the listener 
     }
 }
 
+/// Incarnation 1 of the merged-set rows: the manager's plane up, one TCP
+/// joiner under `who` puts its page Live (JoinAppender) and, when
+/// `member`, joins the home shard; then the manager stops and closes with
+/// the joiner never leaving — frozen, as far as the successor can tell.
+fn liveJoinerThroughRemount(s: *meta_set.TestSet, who: verbs.WireIdentity, member: bool) !void {
+    const gpa = testing.allocator;
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    var client = dialer.Client.init(gpa, s.io(), plane.advertised, meta_set.TestSet.secret, who);
+    defer client.deinit();
+    var tl: join_ladder.TcpLink = .{ .client = &client };
+    var pages: DevicePages = .{ .be = be0 };
+    var wire: join_ladder.ManagerWire = .{ .gpa = gpa, .link = tl.link(), .volume = 0, .identity = who, .pages = pages.reader() };
+    var joiner = join_ladder.Joiner.init(gpa, &wire);
+    defer joiner.deinit();
+    const ident: page.Identity = .{ .node_token = who.node_token, .mount_slot = who.mount_slot, .writer_id = who.writer_id };
+    try joiner.joinRegion(.{ .identity = ident, .volume_base = node_seq.nodeSeqBase(be0.sb.uuid), .grain = be0.dev.mode.grain(), .ring0_head = be0.core.headPos() });
+    try testing.expectEqual(page.State.live, (try be0.sym.?.manager.readPageOf(joiner.appenderId())).?.state);
+    if (!member) return;
+    var gate = membership.park_reclaim.ParkGate.arm(s.io(), 0, membership.park_reclaim.tParkMaxMs(46_500, plane.mgr.?.owner.clocks.grace_ms));
+    var m: shard.Member = .{ .gpa = gpa, .id = shard.writerMemberId(who), .role = .writer, .link = tl.link(), .pid = 4242, .boot = @splat(1), .endpoint = .none, .pr_key = 0, .mount = "/mnt-lost-row", .gate = &gate, .poison = TestPoison.sink(), .carriage = joiner.carriageSink() };
+    try testing.expectEqual(shard.Member.JoinOutcome.granted, m.join(clock.monotonicNs() / std.time.ns_per_ms, null));
+    // The seam dropped its row: the successor's roster will not name it.
+    try testing.expect((try be0.lookup(gpa, key.TREE_CONTROL, cr.memberKey(.{ .node_token = who.node_token, .mount_slot = who.mount_slot }).slice())) == null);
+}
+
+/// The death record of `who` on volume 0's tree 0, decoded (null = none).
+fn deathRecordOf(be0: *KvBackend, who: verbs.WireIdentity) !?cr.DeadMember {
+    const v = (try be0.lookup(testing.allocator, key.TREE_CONTROL, cr.deadMemberKey(.{ .node_token = who.node_token, .mount_slot = who.mount_slot }).slice())) orelse return null;
+    defer testing.allocator.free(v);
+    return try cr.DeadMemberWire.decode(v);
+}
+
+test "linux: THE LOST ROW (decision 0004 §2.4 G-b, KD17) — a joiner whose member row the manager never wrote (SQUEEZEFS_TEST_MEMBER_ROW_DROP: the manager died within the flush interval after the join) and which never re-asserts after the manager's remount is still EXPECTED: its Live appender page opens the successor's grace by itself, and the grace deadline reaps it — its death record stands and its region is recovered (the page leaves Live) (red: no row, no grace — the page stays Live and nothing ever recovers it)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "lost-row", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try s.env.put("SQUEEZEFS_TEST_MEMBER_ROW_DROP", "1");
+    // The shortest T_owner whose T_self stays positive over the checkpoint
+    // landing ceiling's D_purge (2 × 1,100 ms): the grace is T_owner.
+    try s.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", "3000");
+    const who: verbs.WireIdentity = .{ .node_token = 0xB0B0, .writer_id = 78, .mount_slot = 0x5004, .reserved = 0 };
+    try liveJoinerThroughRemount(s, who, true);
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    try testing.expect(plane.mgr.?.owner.graceRemainingMs(WirePlane.nowMs()) > 0);
+    try testing.expect(try deathRecordOf(be0, who) == null);
+    // The deadline's reap, then the poll's recovery (bounded polls of the
+    // observables: the reap needs the grace's real deadline to pass).
+    const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+    while (try deathRecordOf(be0, who) == null) {
+        try testing.expect(clock.monotonicNs() < deadline);
+        plane.tick();
+        try s.io().sleep(.fromMilliseconds(20), .awake);
+    }
+    while ((try be0.sym.?.manager.readPageOf(1)).?.state == .live) {
+        try testing.expect(clock.monotonicNs() < deadline);
+        plane.tick();
+        try s.io().sleep(.fromMilliseconds(20), .awake);
+    }
+}
+
+test "linux: A SAME-HOST PAGE WHOSE WRITER IS PROVEN DEAD (decision 0004 §4.6, KD17) — a Live appender page under THIS host's node token whose writer id names no live process (the §DA writer-id proof) and no row: the successor never expects it (no grace) and ships its death once the death sink is bound, before its listener serves — the record stands when the plane is up, written exactly once (red: the page is neither expected nor recorded dead — nothing recovers it)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "pre-dead", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    const local = @import("../guard/proc.zig").localIdentity();
+    try testing.expect(local.start_ticks != 0);
+    const who: verbs.WireIdentity = .{ .node_token = join.nodeToken(local), .writer_id = 0x5EAD_0000_0000_5EAD, .mount_slot = 0x5003, .reserved = 0 };
+    try liveJoinerThroughRemount(s, who, false);
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const recorded0 = alloc_lease.stats.dead_members_recorded.load();
+    const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    try testing.expectEqual(@as(u64, 0), plane.mgr.?.owner.graceRemainingMs(WirePlane.nowMs()));
+    const rec = (try deathRecordOf(be0, who)) orelse return error.PreDeadNotRecorded;
+    try testing.expectEqual(@as(u64, 0), rec.epoch);
+    try testing.expectEqual(recorded0 + 1, alloc_lease.stats.dead_members_recorded.load());
+    plane.tick();
+    try testing.expectEqual(recorded0 + 1, alloc_lease.stats.dead_members_recorded.load());
+}
+
 test "linux: THE JOIN AFTER A MANAGER REMOUNT — incarnation 1 arms its listener and unmounts; incarnation 2 arms at a fresh ephemeral port with the checkpoint cadence held past the row (no cycle lands on its own): the newest checkpoint ALREADY names incarnation 2's listener when its plane is up, so a joiner reading `endpoint:{0}` off the projection (no `--join`) dials it and joins as appender 1 (red: the projection named incarnation 1's dead port — the dial refused, the open failed `Io`)" {
     const gpa = testing.allocator;
     const s = try meta_set.TestSet.create(gpa, "join-remount", 1);

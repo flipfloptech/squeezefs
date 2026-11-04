@@ -3155,6 +3155,148 @@ test "nvmet fidelity: a member's death fences its host on the DATA namespace bef
     try expectNoResidue(rig, set.data_nqn);
 }
 
+/// The reaped-member rows' bound on the successor's recovery: its grace
+/// (`member_t_owner_ms`), the reap's tick and one recovery, with margin.
+const reap_wait_ns: u64 = 30 * std.time.ns_per_s;
+
+/// The successor's recovery counters a reaped member's death shows, printed
+/// before the row asserts them (the red's evidence names every one).
+fn printReapCounters(sm: []const u8) void {
+    std.debug.print("\n--- the successor's recovery: appender_recoveries {?d}, appender_recovery_preempts {?d}, pr_fencer_preempts {?d}, data_pr_preempts {?d}, appender_recovery_key_from_page {?d} ---\n", .{ json_scan.number(sm, "appender_recoveries"), json_scan.number(sm, "appender_recovery_preempts"), json_scan.number(sm, "pr_fencer_preempts"), json_scan.number(sm, "data_pr_preempts"), json_scan.number(sm, "appender_recovery_key_from_page") });
+}
+
+test "nvmet fidelity: F9 — a member reaped at a successor's grace deadline is FENCED with its appender page's host key (decision 0004 §2.4 G-b, KD8) — M (host B) manages, X (host A) a joiner writes behind a held landing (SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE) and is SIGSTOPped; M is killed and M2 (host B) mounts: X's row is expected, X never re-asserts and the deadline reaps it with its page's host_key — M2's recovery preempts host A on the metadata namespace (appender_recovery_preempts 1, through its fencer) and on the data namespace (data_pr_preempts 1) before the region is released, host A's key gone from the report; X resumed is refused at the device (its journal's reservation-conflict line) (red: the reap shipped key 0 — no preempt on either plane, host A still registered while its region is released, X's held windows land)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "f9", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    var tb: [16]u8 = undefined;
+    const t_owner = try std.fmt.bufPrint(&tb, "{d}", .{member_t_owner_ms});
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var fb: [128]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/x-landing.fifo", .{rig.root}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    var env_m = try rig.envWith(ident_b);
+    defer env_m.deinit();
+    try env_m.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    var env_x = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    defer env_x.deinit();
+    try env_x.put("SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", "2");
+    try env_x.put("SQUEEZEFS_TEST_LANDING_HOLD_RELEASE", fifo);
+    const m = try rig.spawnMountEnv("f9-m", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const x = try rig.spawnMountEnv("f9-x", set.metaUri(), &env_x, &.{});
+    try rig.awaitLog(x, "ready: ", ready_wait_ns);
+    const key_x = try statString(rig, x, "pr_key");
+    defer gpa.free(key_x);
+    try testing.expect(try scriptSucceeds(rig, x, "mkdir dx && echo a > dx/a && sync -d dx/a && echo b > dx/b"));
+    try rig.awaitLog(x, "test seam: SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", ready_wait_ns);
+    try rig.awaitLog(x, "SQUEEZEFS_TEST_LANDING_HOLD_RELEASE — the release waits", ready_wait_ns);
+    // X frozen, then its manager killed well inside X's lease (M never
+    // evicts it): the successor's roster is the only thing naming X.
+    _ = linux.kill(rig.daemons.items[x].pid, .STOP);
+    try rig.kill9(m);
+    const m2 = try rig.spawnMountEnv("f9-m2", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m2, "ready: ", ready_wait_ns);
+    {
+        const sm = try rig.awaitStat(m2, "appender_recoveries", 1, reap_wait_ns);
+        defer gpa.free(sm);
+        printReapCounters(sm);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recovery_preempts"));
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "data_pr_preempts"));
+        try testing.expectEqual(@as(u64, 0), try statNumber(sm, "data_pr_fence_failures"));
+    }
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expect(std.mem.indexOf(u8, rr, key_x) == null);
+    }
+    // X resumed with its held windows released: the device refuses them.
+    releaseFifo(fifo);
+    _ = linux.kill(rig.daemons.items[x].pid, .CONT);
+    try rig.awaitLog(x, "SQUEEZEFS_TEST_LANDING_HOLD_RELEASE released", 30 * std.time.ns_per_s);
+    try rig.awaitLog(x, "journal: reservation-conflict errno at", 30 * std.time.ns_per_s);
+    try rig.kill9(x);
+    try rig.umount(m2);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+test "nvmet fidelity: F9b — a member whose row was LOST is still expected, reaped and fenced (decision 0004 §2.4 G-b, KD17) — M (host B) manages and drops X's member row (SQUEEZEFS_TEST_MEMBER_ROW_DROP: a manager dead within the flush interval after the join); X (host A) writes and syncs a file and is SIGSTOPped; M is killed and M2 (host B) mounts: no row names X, its Live appender page opens M2's grace by itself, X never re-asserts and the deadline reaps it with its page's host_key — recovered with both fences (appender_recovery_preempts 1, data_pr_preempts 1), host A's key gone, X's acked file read back whole through M2 (red: no row, no grace — X's page stays Live and its region is never recovered)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "f9b", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    var tb: [16]u8 = undefined;
+    const t_owner = try std.fmt.bufPrint(&tb, "{d}", .{member_t_owner_ms});
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var env_m = try rig.envWith(ident_b);
+    defer env_m.deinit();
+    try env_m.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    var env_m_drop = try rig.envWith(ident_b);
+    defer env_m_drop.deinit();
+    try env_m_drop.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    try env_m_drop.put("SQUEEZEFS_TEST_MEMBER_ROW_DROP", "1");
+    var env_x = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    defer env_x.deinit();
+    const m = try rig.spawnMountEnv("f9b-m", meta_uri_b, &env_m_drop, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const x = try rig.spawnMountEnv("f9b-x", set.metaUri(), &env_x, &.{});
+    try rig.awaitLog(x, "ready: ", ready_wait_ns);
+    try rig.awaitLog(m, "SQUEEZEFS_TEST_MEMBER_ROW_DROP — this join's member row is NOT written", ready_wait_ns);
+    const key_x = try statString(rig, x, "pr_key");
+    defer gpa.free(key_x);
+    try testing.expect(try scriptSucceeds(rig, x, "mkdir dx && echo x > dx/x && sync -d dx/x"));
+    _ = linux.kill(rig.daemons.items[x].pid, .STOP);
+    try rig.kill9(m);
+    const m2 = try rig.spawnMountEnv("f9b-m2", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m2, "ready: ", ready_wait_ns);
+    {
+        const sm = try rig.awaitStat(m2, "appender_recoveries", 1, reap_wait_ns);
+        defer gpa.free(sm);
+        printReapCounters(sm);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recovery_preempts"));
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "data_pr_preempts"));
+        try testing.expectEqual(@as(u64, 0), try statNumber(sm, "data_pr_fence_failures"));
+    }
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expect(std.mem.indexOf(u8, rr, key_x) == null);
+    }
+    {
+        const out = try rig.onMount(m2, "cat dx/x");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("x\n", out);
+    }
+    try rig.kill9(x);
+    try rig.umount(m2);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
 test "nvmet fidelity: a PTPL-less target restart under a running set (review MAJOR 2 of decision 0003 §DJ) — tcp: M (host B) manages, J (host C) a live joiner, X (host A) frozen with a held data write and recovered by M (its host preempted on data); both subsystems wiped by hand and restored (nvmet keeps no PTPL: every registration and reservation forgotten) and the controllers reconnect; once M holds the metadata namespace again J writes and syncs — never fail-stopped —, M re-reserves the data namespace WEAR with every live host registered, X resumed is refused by the device, and J's bytes read back exact" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);

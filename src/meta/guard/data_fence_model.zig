@@ -104,6 +104,14 @@ pub const DeathConfig = struct {
     /// Its recoverer — on the same host — kills it by the rule and drains
     /// its queue before the release (false: the own-key guard alone).
     colocated_kill: bool = true,
+    /// D1 was transiently absent at the manager's admission (its node
+    /// reconnecting): the manager holds no client there until a remedy (a
+    /// remount's admission once the node is back) — review MAJOR 1.
+    transient_d1: bool = false,
+    /// Step 2c holds while a non-retired set-config volume is neither fenced
+    /// nor provably unfenceable (as built); false: only the manager's table
+    /// is fenced (an untabled volume skipped).
+    complete_check: bool = true,
 };
 
 const Page = enum(u8) { live, recovering, released };
@@ -133,12 +141,15 @@ fn indexOf(comptime seq: []const MgStep, comptime s: MgStep) u8 {
 pub fn Death(comptime cfg: DeathConfig) type {
     return extern struct {
         const Self = @This();
-        pub const thread_count: usize = if (cfg.colocated) 6 else 5;
+        pub const thread_count: usize = 5 + @as(usize, @intFromBool(cfg.colocated)) + @intFromBool(cfg.transient_d1);
+        /// The remedy's thread (`transient_d1`): D1 joins the manager's table.
+        const T_REMEDY: usize = if (cfg.colocated) 6 else 5;
         const SEQ = mgSequence(cfg);
         const P0 = indexOf(SEQ, .p0);
         // The next poll re-runs: one round per registration a sibling can
-        // slip between a preempt and its proof (two per namespace), plus one.
-        const ROUNDS = 5;
+        // slip between a preempt and its proof (two per namespace), plus one
+        // (plus one for a round run while D1 was untabled).
+        const ROUNDS = if (cfg.transient_d1) 6 else 5;
         const S_DATA = 3;
         const S_END = S_DATA + 8;
         const fenced_ns = cfg.data_rtype != .none;
@@ -164,7 +175,9 @@ pub fn Death(comptime cfg: DeathConfig) type {
         released: bool = false,
         w_released: bool = false,
         round: u8 = 0,
-        pc: [6]u8 = @splat(0),
+        /// The manager holds a client on the namespace (its admission).
+        tabled: [2]bool = .{ true, !cfg.transient_d1 },
+        pc: [7]u8 = @splat(0),
         stale_write: bool = false,
         realloc_unfenced: bool = false,
         killed_current: bool = false,
@@ -174,6 +187,7 @@ pub fn Death(comptime cfg: DeathConfig) type {
         }
 
         pub fn done(self: *const Self, t: usize) bool {
+            if (cfg.transient_d1 and t == T_REMEDY) return self.pc[t] >= 1;
             return switch (t) {
                 0, 1 => self.pc[t] >= 3,
                 2 => self.pc[2] >= SEQ.len,
@@ -241,6 +255,11 @@ pub fn Death(comptime cfg: DeathConfig) type {
         }
 
         pub fn step(self: *Self, t: usize) void {
+            if (cfg.transient_d1 and t == T_REMEDY) {
+                self.tabled[1] = true;
+                self.pc[t] = 1;
+                return;
+            }
             switch (t) {
                 0 => self.write(0, &self.xw[0], self.x_alive, B, 0, self.realloc[0]),
                 1 => self.write(1, &self.xw[1], self.x_alive, B, 1, self.realloc[1]),
@@ -254,9 +273,10 @@ pub fn Death(comptime cfg: DeathConfig) type {
 
         /// The data fence's preempt on namespace `i`: host B's key, issued by
         /// MG's own client (a registrant). Waits while X has a write
-        /// admitted there (`abort`).
+        /// admitted there (`abort`). An untabled namespace: no client, no
+        /// command.
         fn preempt(self: *Self, i: usize) bool {
-            if (cfg.data_rtype == .none) return true;
+            if (cfg.data_rtype == .none or !self.tabled[i]) return true;
             if (cfg.abort and self.xw[i] == .admitted) return false;
             if (!self.reg_a[i] or !self.reg_b[i]) return true;
             switch (cfg.data_rtype) {
@@ -275,7 +295,14 @@ pub fn Death(comptime cfg: DeathConfig) type {
         /// The report after it: the namespace reserved and the key absent
         /// (no device fence on a namespace without PR: the posture proceeds).
         fn verify(self: *Self, i: usize) void {
-            self.fenced[i] = cfg.data_rtype == .none or (self.reserved[i] and !self.reg_b[i]);
+            self.fenced[i] = cfg.data_rtype == .none or (self.tabled[i] and self.reserved[i] and !self.reg_b[i]);
+        }
+
+        /// Namespace `i` counts as fenced at the decision: proven, or (only
+        /// without the completeness check) skipped because untabled.
+        fn proofOf(self: *const Self, i: usize) bool {
+            if (!self.tabled[i] and !cfg.complete_check) return true;
+            return self.fenced[i];
         }
 
         fn manager(self: *Self) void {
@@ -287,10 +314,14 @@ pub fn Death(comptime cfg: DeathConfig) type {
                 .p1 => if (!self.preempt(1)) return,
                 .v1 => self.verify(1),
                 .decide => {
-                    const proven = self.fenced[0] and self.fenced[1];
+                    const proven = self.proofOf(0) and self.proofOf(1);
                     if (cfg.order == .after_release or proven or cfg.proceed_unproven) {
                         self.released = true;
                         self.x_page = .released;
+                    } else if (cfg.transient_d1 and !self.tabled[1] and !self.done(T_REMEDY)) {
+                        // A set-config volume outside the table: the
+                        // recovery holds (re-polls) until the remedy.
+                        return;
                     } else if (self.round + 1 < ROUNDS) {
                         self.round += 1;
                         self.fenced = @splat(false);
@@ -449,14 +480,23 @@ pub const SuccessionConfig = struct {
     /// The admission checks, after its data register, that the host is still
     /// registered on the metadata namespace (withdrawn otherwise).
     meta_recheck: bool = true,
+    /// A joiner on host D leaves — data, then metadata — at any point: between
+    /// a successor's two reports its key is seen on data, absent from
+    /// metadata, and gone by the preempt (review minor 1).
+    leaver: bool = false,
+    /// A reconcile preempt the target refuses (the key already gone): the
+    /// data report read again and an absent key is success (as built), or
+    /// the admission refused.
+    preempt_error: enum { reread, refuse } = .reread,
 };
 
-const NONE: u8 = 3;
+const D: u8 = 3;
+const NONE: u8 = 4;
 
 pub fn Succession(comptime cfg: SuccessionConfig) type {
     return extern struct {
         const Self = @This();
-        pub const thread_count: usize = 3;
+        pub const thread_count: usize = 3 + @as(usize, @intFromBool(cfg.leaver));
         /// M's steps: the admission (check, register, re-check), then the
         /// write (issue, arrival, landing).
         const M_WRITE = 3;
@@ -467,18 +507,20 @@ pub fn Succession(comptime cfg: SuccessionConfig) type {
         const S_END = 7;
 
         reserved: bool = cfg.data_rtype == .wear,
-        dreg: [3]bool = .{ cfg.data_rtype == .wear and !cfg.late_admission, false, false },
-        mreg: [3]bool = .{ true, false, false },
+        dreg: [4]bool = .{ cfg.data_rtype == .wear and !cfg.late_admission, false, false, cfg.data_rtype == .wear and cfg.leaver },
+        mreg: [4]bool = .{ true, false, false, cfg.leaver },
         holder: u8 = A,
         m_admitted: bool = !cfg.late_admission,
         m_refused: bool = false,
         mw: Wr = .idle,
         realloc: bool = false,
         victim: [2]u8 = @splat(NONE),
-        dsnap: [2][3]bool = @splat(@splat(false)),
-        msnap: [2][3]bool = @splat(@splat(false)),
+        dsnap: [2][4]bool = @splat(@splat(false)),
+        msnap: [2][4]bool = @splat(@splat(false)),
         stopped: [2]bool = @splat(false),
-        pc: [3]u8 = .{ if (cfg.late_admission) 0 else M_WRITE, 0, 0 },
+        /// A successor's admission refused over a key that was already gone.
+        refused_spuriously: bool = false,
+        pc: [4]u8 = .{ if (cfg.late_admission) 0 else M_WRITE, 0, 0, 0 },
         stale_write: bool = false,
         realloc_unfenced: bool = false,
 
@@ -491,6 +533,7 @@ pub fn Succession(comptime cfg: SuccessionConfig) type {
                 0 => self.pc[0] >= M_END,
                 1 => self.pc[1] >= S_END or self.stopped[0],
                 2 => self.pc[2] >= S_END + 1 or self.stopped[1],
+                3 => self.pc[3] >= 2,
                 else => unreachable,
             };
         }
@@ -521,8 +564,19 @@ pub fn Succession(comptime cfg: SuccessionConfig) type {
                 0 => self.manager(),
                 1 => self.successor(0, B),
                 2 => self.successor(1, C),
+                3 => self.leave(),
                 else => unreachable,
             }
+        }
+
+        /// The joiner on host D leaves: data before metadata.
+        fn leave(self: *Self) void {
+            switch (self.pc[3]) {
+                0 => self.dreg[D] = false,
+                1 => self.mreg[D] = false,
+                else => unreachable,
+            }
+            self.pc[3] += 1;
         }
 
         fn manager(self: *Self) void {
@@ -593,14 +647,25 @@ pub fn Succession(comptime cfg: SuccessionConfig) type {
                     }
                     // Preempt-and-abort: M's admitted write lands first.
                     if (self.mw == .admitted) return;
-                    if (cfg.data_rtype == .wear and self.dreg[h]) for (0..3) |k| {
-                        if (k == h or !self.dreg[k]) continue;
+                    if (cfg.data_rtype == .wear and self.dreg[h]) for (0..4) |k| {
+                        if (k == h) continue;
                         const fence = switch (cfg.reconcile) {
                             .unregistered_on_meta => self.dsnap[s][k] and !self.msnap[s][k],
                             .victim_only => k == self.victim[s],
                             .none => false,
                         };
-                        if (fence) self.dreg[k] = false;
+                        if (!fence) continue;
+                        if (self.dreg[k]) {
+                            self.dreg[k] = false;
+                            continue;
+                        }
+                        // The key left between the reports and the preempt:
+                        // the target answers a reservation conflict.
+                        if (cfg.preempt_error == .refuse and cfg.reconcile == .unregistered_on_meta) {
+                            self.refused_spuriously = true;
+                            self.stopped[s] = true;
+                            return;
+                        }
                     };
                 },
                 // S2's first carve after its admission: M's block reallocated.
@@ -618,7 +683,372 @@ pub fn Succession(comptime cfg: SuccessionConfig) type {
             if (self.stale_write) return error.StaleDataWrite;
         }
 
-        pub fn final(_: *const Self) !void {}
+        pub fn final(self: *const Self) !void {
+            if (self.refused_spuriously) return error.ReconcileRefused;
+        }
+    };
+}
+
+/// The accepted windows of a lapse made violations (each shown reachable).
+pub const LapseStrict = struct {
+    /// A write admitted while the namespace is unreserved after the target
+    /// forgot every fence (from the restart until the re-reservation).
+    lapse: bool = false,
+    /// A member's own lapse re-registration admits its write before its
+    /// post-check withdraws it (frozen between its pre-check and its
+    /// register across its whole death).
+    beat_window: bool = false,
+};
+
+pub const LapseConfig = struct {
+    /// The metadata namespace lapses with the data namespace (one target).
+    meta_too: bool = true,
+    /// Members re-register after a lapse (the beat); false: the code before.
+    member_beat: bool = true,
+    /// The manager re-acquires the metadata hold and re-reserves the data
+    /// namespace after a lapse; false: nobody does.
+    manager_beat: bool = true,
+    /// The manager waits the grace (every live member's beat first) before
+    /// it re-acquires or re-reserves.
+    grace: bool = true,
+    /// A member's data re-registration requires its host registered on the
+    /// metadata namespace (before and after).
+    meta_check: bool = true,
+    /// A member re-registers only while its page is Live under its own
+    /// writer id (before and after).
+    currency: bool = true,
+    strict: LapseStrict = .{},
+};
+
+/// `Lapse` — a PTPL-less target restart (nvmet keeps no PTPL: every namespace
+/// enable starts with no registrant and no reservation, pr.c:1136) under a
+/// running set: the manager MG (host A) holds the metadata namespace (WERO)
+/// and every host is registered on it and on the WEAR data namespace; J (host
+/// C) a live joiner writing data and metadata; X (host B) a member frozen
+/// with a data write, its death recovered by MG at any point:
+///   0 L    the restart: every registration and both reservations forgotten
+///          (`meta_too`: the metadata namespace on the same target), once the
+///          namespace's in-flight requests completed.
+///   1 MGR  X's recovery: the metadata preempt of host B, the page
+///          Recovering, the re-fence, the data preempt-and-abort (MG's own
+///          client, registered), the proof (reserved WEAR, the key absent);
+///          unproven while the lapse is open, the next poll; then the release
+///          and J's reallocation of X's block.
+///   2 MGB  MG's beats after the lapse: the host re-registered on metadata
+///          (its claim ours), the GRACE, the WERO re-acquire; its own data
+///          re-registration, the wait (the metadata held and every metadata
+///          registrant registered on data, else the grace), the WEAR
+///          re-reservation, the reconcile (data report, metadata report, the
+///          preempt of every data key the metadata namespace lacks).
+///   3 JB   J's first beat after the lapse: metadata — unreserved and the
+///          host unregistered ⇒ register (its page Live); data — unreserved,
+///          the host unregistered and registered on metadata ⇒ register, the
+///          re-check. The grace is the timing law that this beat runs first.
+///   4 JW   J's data write, then its metadata write (refused ⇒ `LiveFenced`).
+///   5 XB   X's first beat after the lapse (it resumes at any point): the same
+///          steps under its currency (its page Live).
+///   6 XW   X's data write: issued, admitted or refused, landed.
+/// Invariants: `LiveFenced` a live member's write is never refused;
+/// `ReallocatedUnfenced`, `StaleDataWrite` as in `Death` outside the accepted
+/// windows (`LapseStrict`). `final`: `LapseUnbounded` both namespaces are
+/// reserved again; `RecoveryStuck` X's region released.
+pub fn Lapse(comptime cfg: LapseConfig) type {
+    return extern struct {
+        const Self = @This();
+        pub const thread_count: usize = 7;
+        const T_L = 0;
+        const T_MGR = 1;
+        const T_MGB = 2;
+        const T_JB = 3;
+        const T_JW = 4;
+        const T_XB = 5;
+        const T_XW = 6;
+        const ROUNDS = 4;
+        const R_P = 3;
+        const R_END = 7;
+        const MGB_END = 10;
+        const BEAT_END = 7;
+
+        m_res: bool = true,
+        m_reg: [3]bool = @splat(true),
+        d_res: bool = true,
+        d_reg: [3]bool = @splat(true),
+        lapsed: bool = false,
+        x_page: Page = .live,
+        fenced: bool = false,
+        released: bool = false,
+        realloc: bool = false,
+        round: u8 = 0,
+        /// J's first beat after the lapse ran (the grace's timing law).
+        j_beat_done: bool = false,
+        dsnap: [3]bool = @splat(false),
+        msnap: [3]bool = @splat(false),
+        xw: Wr = .idle,
+        /// X's write was admitted while the namespace was unreserved, or
+        /// inside its own beat's register window.
+        xw_unreserved: bool = false,
+        xw_window: bool = false,
+        /// X's beat registered host B on data and has not post-checked.
+        x_window: bool = false,
+        pc: [7]u8 = @splat(0),
+        live_fenced: bool = false,
+        realloc_unfenced: bool = false,
+        stale_write: bool = false,
+        hit_lapse: bool = false,
+        hit_beat_window: bool = false,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                T_L => self.pc[t] >= 1,
+                T_MGR => self.pc[t] >= R_END,
+                T_MGB => self.pc[t] >= MGB_END,
+                T_JB, T_XB => self.pc[t] >= BEAT_END,
+                T_JW => self.pc[t] >= 2,
+                T_XW => self.pc[t] >= 3,
+                else => unreachable,
+            };
+        }
+
+        fn admitsD(self: *const Self, h: u8) bool {
+            return !self.d_res or self.d_reg[h];
+        }
+
+        fn admitsM(self: *const Self, h: u8) bool {
+            return !self.m_res or self.m_reg[h];
+        }
+
+        fn current(self: *const Self, h: u8) bool {
+            return h != B or !cfg.currency or self.x_page == .live;
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                T_L => {
+                    // The namespace's disable waits for its in-flight
+                    // requests before it drops the PR state (core.c
+                    // `nvmet_ns_disable`: `disable_done`, then
+                    // `nvmet_pr_exit_ns`); a power loss lands or loses them
+                    // — never after the restart.
+                    if (self.xw == .admitted) return;
+                    self.d_res = false;
+                    self.d_reg = @splat(false);
+                    if (cfg.meta_too) {
+                        self.m_res = false;
+                        self.m_reg = @splat(false);
+                    }
+                    self.lapsed = true;
+                    self.pc[t] = 1;
+                },
+                T_MGR => self.recovery(),
+                T_MGB => self.managerBeat(),
+                T_JB => self.memberBeat(T_JB, C),
+                T_JW => self.liveWrites(),
+                T_XB => self.memberBeat(T_XB, B),
+                T_XW => self.deadWrite(),
+                else => unreachable,
+            }
+        }
+
+        fn recovery(self: *Self) void {
+            switch (self.pc[T_MGR]) {
+                0 => self.m_reg[B] = false,
+                1 => self.x_page = .recovering,
+                2 => self.m_reg[B] = false,
+                // MG's own data client (registered: a preempt's sender
+                // must be) preempts-and-aborts host B's key.
+                R_P => if (self.d_reg[A] and self.d_reg[B]) {
+                    if (self.xw == .admitted) return;
+                    self.d_reg[B] = false;
+                },
+                4 => self.fenced = self.d_res and !self.d_reg[B],
+                5 => {
+                    if (self.fenced) {
+                        self.released = true;
+                        self.x_page = .released;
+                    } else if (!self.d_res and !self.done(T_MGB)) {
+                        // The lapse still open: the next poll.
+                        return;
+                    } else if (self.round + 1 < ROUNDS) {
+                        self.round += 1;
+                        self.pc[T_MGR] = R_P;
+                        return;
+                    } else {
+                        self.pc[T_MGR] = R_END;
+                        return;
+                    }
+                },
+                6 => {
+                    self.reallocCheck();
+                    self.realloc = true;
+                },
+                else => unreachable,
+            }
+            self.pc[T_MGR] += 1;
+        }
+
+        /// J reallocates X's block: X must not be able to land there,
+        /// outside the accepted windows.
+        fn reallocCheck(self: *Self) void {
+            switch (self.xw) {
+                .admitted => {
+                    if (self.xw_unreserved) {
+                        self.hit_lapse = true;
+                    } else if (self.xw_window) {
+                        self.hit_beat_window = true;
+                    } else self.realloc_unfenced = true;
+                },
+                .idle, .queued => if (self.admitsD(B)) {
+                    if (!self.d_res) {
+                        self.hit_lapse = true;
+                    } else if (self.x_window) {
+                        self.hit_beat_window = true;
+                    } else self.realloc_unfenced = true;
+                },
+                .landed, .refused, .none => {},
+            }
+        }
+
+        fn allMetaOnData(self: *const Self) bool {
+            for (0..3) |k| if (self.m_reg[k] and !self.d_reg[k]) return false;
+            return true;
+        }
+
+        fn managerBeat(self: *Self) void {
+            switch (self.pc[T_MGB]) {
+                0 => {
+                    if (!self.lapsed) return;
+                    if (!cfg.manager_beat) {
+                        self.pc[T_MGB] = MGB_END;
+                        return;
+                    }
+                },
+                1 => if (cfg.meta_too and !self.m_reg[A]) {
+                    self.m_reg[A] = true;
+                },
+                2 => if (cfg.meta_too and !self.m_res and cfg.grace and !self.j_beat_done) return,
+                3 => if (cfg.meta_too and !self.m_res) {
+                    self.m_res = true;
+                },
+                4 => if (!self.d_res and !self.d_reg[A] and self.m_reg[A]) {
+                    self.d_reg[A] = true;
+                },
+                5 => if (!self.d_res and cfg.grace and !self.allMetaOnData() and !self.j_beat_done) return,
+                6 => if (!self.d_res) {
+                    self.d_res = true;
+                },
+                7 => self.dsnap = self.d_reg,
+                8 => self.msnap = self.m_reg,
+                9 => {
+                    if (self.xw == .admitted and self.d_reg[B] and self.dsnap[B] and !self.msnap[B]) return;
+                    for (0..3) |k| {
+                        if (k != A and self.dsnap[k] and !self.msnap[k]) self.d_reg[k] = false;
+                    }
+                },
+                else => unreachable,
+            }
+            self.pc[T_MGB] += 1;
+        }
+
+        /// A member's first beat after the lapse (host `h`).
+        fn memberBeat(self: *Self, t: usize, h: u8) void {
+            switch (self.pc[t]) {
+                0 => {
+                    if (!self.lapsed) return;
+                    if (!cfg.member_beat) {
+                        self.endBeat(t);
+                        return;
+                    }
+                },
+                1 => if (!(cfg.meta_too and !self.m_res and !self.m_reg[h] and self.current(h))) {
+                    self.pc[t] = 4;
+                    return;
+                },
+                2 => self.m_reg[h] = true,
+                3 => if (!self.current(h)) {
+                    self.m_reg[h] = false;
+                },
+                4 => if (!(!self.d_res and !self.d_reg[h] and (!cfg.meta_check or self.m_reg[h]) and self.current(h))) {
+                    self.endBeat(t);
+                    return;
+                },
+                5 => {
+                    self.d_reg[h] = true;
+                    if (h == B) self.x_window = true;
+                },
+                6 => {
+                    if (h == B) self.x_window = false;
+                    if ((cfg.meta_check and !self.m_reg[h]) or !self.current(h)) self.d_reg[h] = false;
+                    self.endBeat(t);
+                    return;
+                },
+                else => unreachable,
+            }
+            self.pc[t] += 1;
+        }
+
+        fn endBeat(self: *Self, t: usize) void {
+            if (t == T_JB) self.j_beat_done = true;
+            self.pc[t] = BEAT_END;
+        }
+
+        fn liveWrites(self: *Self) void {
+            switch (self.pc[T_JW]) {
+                0 => if (!self.admitsD(C)) {
+                    self.live_fenced = true;
+                },
+                1 => if (!self.admitsM(C)) {
+                    self.live_fenced = true;
+                },
+                else => unreachable,
+            }
+            self.pc[T_JW] += 1;
+        }
+
+        fn deadWrite(self: *Self) void {
+            switch (self.pc[T_XW]) {
+                0 => self.xw = .queued,
+                1 => if (self.admitsD(B)) {
+                    self.xw = .admitted;
+                    self.xw_unreserved = !self.d_res;
+                    // Admitted between its own beat's register and post-check:
+                    // a withdrawal there unregisters without an abort.
+                    self.xw_window = self.x_window;
+                } else {
+                    self.xw = .refused;
+                    self.pc[T_XW] = 3;
+                    return;
+                },
+                2 => {
+                    self.xw = .landed;
+                    if (self.realloc) {
+                        if (self.xw_unreserved) {
+                            self.hit_lapse = true;
+                        } else if (self.xw_window) {
+                            self.hit_beat_window = true;
+                        } else self.stale_write = true;
+                    }
+                },
+                else => unreachable,
+            }
+            self.pc[T_XW] += 1;
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            if (self.live_fenced) return error.LiveFenced;
+            if (self.realloc_unfenced) return error.ReallocatedUnfenced;
+            if (self.stale_write) return error.StaleDataWrite;
+            if (cfg.strict.lapse and self.hit_lapse) return error.LapseWindow;
+            if (cfg.strict.beat_window and self.hit_beat_window) return error.BeatWindow;
+        }
+
+        pub fn final(self: *const Self) !void {
+            if (!self.d_res or (cfg.meta_too and !self.m_res)) return error.LapseUnbounded;
+            if (!self.released) return error.RecoveryStuck;
+        }
     };
 }
 
@@ -713,4 +1143,57 @@ test "data fence model weakening: the successor fences only its own hold's victi
     try explorer.expectFails(Succession(.{ .reconcile = .victim_only }), limits, error.InvariantViolated);
     try explorer.expectFails(Succession(.{ .reconcile = .none }), limits, error.InvariantViolated);
     try explorer.expectFails(Succession(.{ .late_admission = true, .meta_recheck = false }), limits, error.InvariantViolated);
+}
+
+test "data fence model: a member's death with a data namespace transiently absent at the manager's admission (review MAJOR 1) — step 2c holds while a non-retired set-config volume is neither fenced nor provably unfenceable, until the remedy tables it — holds" {
+    try explorer.expectHolds(Death(.{ .transient_d1 = true }), limits);
+    const r = try statesOf(Death(.{ .transient_d1 = true }));
+    std.debug.print("\ndata fence model (death, transient-absent D1): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
+}
+
+test "data fence model weakening (review MAJOR 1): step 2c fences only the manager's table — the transiently absent namespace skipped, the dead member's write lands on its reallocated block there" {
+    try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .transient_d1 = true, .complete_check = false })));
+}
+
+test "data fence model: a manager succession with a joiner leaving between the successor's two reports (review minor 1) — the reconcile's preempt of the already-gone key re-reads the data report and proceeds — holds" {
+    try explorer.expectHolds(Succession(.{ .leaver = true }), limits);
+    try explorer.expectHolds(Succession(.{ .leaver = true, .late_admission = true }), limits);
+    const r = try statesOf(Succession(.{ .leaver = true, .late_admission = true }));
+    std.debug.print("\ndata fence model (succession, a leaver): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
+}
+
+test "data fence model weakening (review minor 1): a reconcile preempt the target refuses (the key already gone) refuses the successor's admission" {
+    try explorer.expectFails(Succession(.{ .leaver = true, .preempt_error = .refuse }), limits, error.FinalViolated);
+    try testing.expectEqual(error.ReconcileRefused, firstError(Succession(.{ .leaver = true, .preempt_error = .refuse })));
+}
+
+test "data fence model: a PTPL-less target restart under a running set as built (review MAJOR 2) — every member re-registers at its beat through its currency and the metadata check, the manager re-acquires and re-reserves after the grace (or once every metadata registrant is on data) and reconciles; with the metadata namespace on the same target and without — holds: no live member's write refused, no stale write outside the accepted windows, both namespaces reserved again, the dead member's region released" {
+    try explorer.expectHolds(Lapse(.{}), limits);
+    try explorer.expectHolds(Lapse(.{ .meta_too = false }), limits);
+    const r = try statesOf(Lapse(.{}));
+    std.debug.print("\ndata fence model (lapse): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
+    const r2 = try statesOf(Lapse(.{ .meta_too = false }));
+    std.debug.print("\ndata fence model (lapse, data only): {d} states explored, depth {d}\n", .{ r2.states, r2.max_depth_seen });
+}
+
+test "data fence model weakening (review MAJOR 2): no member beat (the code before) — the live member's write is refused once the manager re-reserves (fail-stopped); no manager beat — the namespaces stay unreserved (the lapse unbounded, the recovery stuck)" {
+    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .member_beat = false })));
+    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .member_beat = false, .meta_too = false })));
+    try testing.expectEqual(error.LapseUnbounded, firstError(Lapse(.{ .manager_beat = false })));
+    try testing.expectEqual(error.LapseUnbounded, firstError(Lapse(.{ .manager_beat = false, .meta_too = false })));
+}
+
+test "data fence model weakening (review MAJOR 2): the re-acquire and the re-reservation before the grace — the live member, not yet re-registered, is refused" {
+    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .grace = false })));
+    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .grace = false, .meta_too = false })));
+}
+
+test "data fence model weakening (review MAJOR 2): a lapse re-registration without the member's currency re-admits the dead member's host on metadata and data — its write lands on its reallocated block" {
+    try testing.expectEqual(error.StaleDataWrite, firstError(Lapse(.{ .currency = false })));
+    try explorer.expectFails(Lapse(.{ .currency = false, .meta_check = false, .meta_too = false }), limits, error.InvariantViolated);
+}
+
+test "data fence model, the lapse's accepted windows are reachable: a write admitted while the namespace is unreserved after the restart; a member's own re-registration admitting its write before its post-check withdraws it" {
+    try testing.expectEqual(error.LapseWindow, firstError(Lapse(.{ .strict = .{ .lapse = true } })));
+    try testing.expectEqual(error.BeatWindow, firstError(Lapse(.{ .strict = .{ .beat_window = true } })));
 }

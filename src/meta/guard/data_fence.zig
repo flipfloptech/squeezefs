@@ -612,7 +612,7 @@ pub const DataFence = struct {
     fn reconcile(self: *DataFence, path: []const u8, c: *pr.Client) AdmitError!void {
         const gpa = self.in.gpa;
         const meta = self.meta;
-        const held = meta.holdsHere() catch return reportRefusal(path, "the metadata namespace's report");
+        const held = meta.admittedHere() catch return reportRefusal(path, "the metadata namespace's report");
         if (!held) {
             log.err("data volume {s}: this mount no longer holds the metadata reservation — superseded during its open: it reconciles nothing and refuses", .{path});
             return error.Refused;
@@ -1042,7 +1042,7 @@ pub const DataFence = struct {
             }
         }
         if (!self.in.manager) return;
-        const held = self.meta.holdsHere() catch return;
+        const held = self.meta.admittedHere() catch return;
         if (!held) return;
         const back = self.everyMetaRegistrantOnData(c) catch return;
         const in_grace = now -| v.lapse_since_ns < self.grace_ns;
@@ -1577,11 +1577,12 @@ test "review MAJOR 1 (decision 0003 §DJ): the reconnect-at-mount interleaving �
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     var cfg: FixtureConfig = .{ .live = &.{ 1, 2 } };
+    // T1's namespace outlives the fence: its release reports on T1.
+    var t1 = fake.Namespace.init(gpa);
+    defer t1.deinit();
     const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = true });
     defer dm.release();
     // T1 is admitted.
-    var t1 = fake.Namespace.init(gpa);
-    defer t1.deinit();
     var t1h: fake.Host = .{ .ns = &t1, .host_id = m_id };
     try dm.admitClient(1, "fake-t1", null, try fixtureClient(gpa, t1h.face()));
     // T2's controller reconnects: its node is absent right now.
@@ -1627,11 +1628,12 @@ test "review MAJOR 1 (decision 0003 §DJ): step 2c holds unless every non-retire
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     var cfg: FixtureConfig = .{ .live = &.{ 1, 2 } };
+    // T1's namespace outlives the fence: its release reports on T1.
+    var t1 = fake.Namespace.init(gpa);
+    defer t1.deinit();
     const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = true });
     defer dm.release();
     // T1 admitted (M reserves WEAR); the member X registered there.
-    var t1 = fake.Namespace.init(gpa);
-    defer t1.deinit();
     var t1h: fake.Host = .{ .ns = &t1, .host_id = m_id };
     try dm.admitClient(1, "fake-t1", null, try fixtureClient(gpa, t1h.face()));
     var xh: fake.Host = .{ .ns = &t1, .host_id = x_id };

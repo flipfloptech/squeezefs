@@ -2066,3 +2066,107 @@ test "the census's writer keys (decision 0003 §DL): every listed writer's host 
     defer gpa.free(keys);
     try testing.expectEqual(@as(usize, 0), keys.len);
 }
+
+/// Two callers of one owner raced at a hook site (decision 0003 §DM): the
+/// PARKED caller stops at its `nth` firing of `site` until the RACER either
+/// ran to its end or found the owner's lock held (`lock_wait`) — the same
+/// interleaving on every run, ordered by no sleep.
+pub const Race = struct {
+    site: HookSite,
+    nth: u32 = 1,
+    seen: std.atomic.Value(u32) = .init(0),
+    parked: Io.Event = .unset,
+    racer_past: Io.Event = .unset,
+
+    fn fire(ctx: *anyopaque, site: HookSite) void {
+        const self: *Race = @ptrCast(@alignCast(ctx));
+        if (site == .lock_wait) return self.racer_past.set(testing.io);
+        if (site != self.site or self.seen.fetchAdd(1, .monotonic) + 1 != self.nth) return;
+        self.parked.set(testing.io);
+        self.racer_past.wait(testing.io) catch unreachable;
+    }
+
+    /// `parked(p_args)` on one thread up to its park (or its end: a caller
+    /// that never reaches the site leaves `seen` short, which the race
+    /// asserts), then `racer(r_args)` on another; both joined, the hook
+    /// unbound.
+    pub fn run(self: *Race, owner: *Owner, comptime parked: anytype, p_args: anytype, comptime racer: anytype, r_args: anytype) !void {
+        const Wrap = struct {
+            fn parkedThen(r: *Race, args: @TypeOf(p_args)) void {
+                @call(.auto, parked, args);
+                r.parked.set(testing.io);
+            }
+            fn racerThen(r: *Race, args: @TypeOf(r_args)) void {
+                @call(.auto, racer, args);
+                r.racer_past.set(testing.io);
+            }
+        };
+        owner.test_hook = .{ .ctx = self, .fire = &fire };
+        defer owner.test_hook = null;
+        const p = try std.Thread.spawn(.{}, Wrap.parkedThen, .{ self, p_args });
+        self.parked.wait(testing.io) catch unreachable;
+        const r = try std.Thread.spawn(.{}, Wrap.racerThen, .{ self, r_args });
+        p.join();
+        r.join();
+        try testing.expect(self.seen.load(.monotonic) >= self.nth);
+    }
+};
+
+test "a renewal is never lost to a join's append (decision 0003 §DM): a renew parked between its lookup and its stores while joins append and reallocate the roster lands — the member renewed is not due at its old deadline, no eviction, no death shipped" {
+    // Freed pages stay mapped: a store through a stale roster pointer lands
+    // in the freed buffer (a lost renewal), never a fault.
+    var dbg: std.heap.DebugAllocator(.{ .never_unmap = true, .retain_metadata = true }) = .init;
+    defer testing.expect(dbg.deinit() == .ok) catch unreachable;
+    const gpa = dbg.allocator();
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    defer o.deinit();
+    var deaths: Deaths = .{};
+    defer deaths.list.deinit(testing.allocator);
+    o.bindDeathSink(deaths.sink());
+    const id1 = writerMemberId(testIdentity(1));
+    const e1 = o.join(joinReqOf(1, null, "/m1"), 0).granted.epoch;
+    const Calls = struct {
+        fn renew(ow: *Owner, epoch: u64, out: *RenewVerdict) void {
+            out.* = ow.renew(writerMemberId(testIdentity(1)), epoch, 0, 30_000);
+        }
+        fn joins(ow: *Owner) void {
+            var n: u32 = 2;
+            while (n < 66) : (n += 1) _ = ow.join(joinReqOf(n, null, "/m"), 30_000).granted;
+        }
+    };
+    var verdict: RenewVerdict = .unknown_lease;
+    var race: Race = .{ .site = .renew_found };
+    try race.run(&o, Calls.renew, .{ &o, e1, &verdict }, Calls.joins, .{&o});
+    try testing.expect(verdict == .granted);
+    // Renewed at 30 000: due at 75 000, never at the join's 45 000.
+    try testing.expectEqual(@as(u32, 0), o.expireDue(45_000));
+    try testing.expectEqual(@as(usize, 0), deaths.list.items.len);
+    try testing.expectEqual(Liveness.live, o.liveness(id1, 45_000));
+    try testing.expectEqual(@as(u32, 65), o.expireDue(75_000));
+}
+
+test "an eviction and the renewal it races are one order (decision 0003 §DM): expireDue parked between judging a member due and evicting it while that member's renewal (its clock read just inside the deadline) arrives — either the renewal lands first and nothing is evicted, or the eviction does and the renewal answers UnknownLease; never a granted renewal AND an eviction (a live member's death shipped)" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    defer o.deinit();
+    var deaths: Deaths = .{};
+    defer deaths.list.deinit(gpa);
+    o.bindDeathSink(deaths.sink());
+    const e1 = o.join(joinReqOf(1, null, "/m1"), 0).granted.epoch;
+    const Calls = struct {
+        fn expire(ow: *Owner, out: *u32) void {
+            out.* = ow.expireDue(45_000);
+        }
+        fn renew(ow: *Owner, epoch: u64, out: *RenewVerdict) void {
+            out.* = ow.renew(writerMemberId(testIdentity(1)), epoch, 0, 44_999);
+        }
+    };
+    var evicted: u32 = 0;
+    var verdict: RenewVerdict = .unknown_lease;
+    var race: Race = .{ .site = .expire_due };
+    try race.run(&o, Calls.expire, .{ &o, &evicted }, Calls.renew, .{ &o, e1, &verdict });
+    try testing.expect((verdict == .granted) != (evicted == 1));
+    try testing.expectEqual(@as(usize, evicted), deaths.list.items.len);
+}

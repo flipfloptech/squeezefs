@@ -687,6 +687,39 @@ test "the screen: own identity, a live member, a key the census holds on another
     try testing.expectEqual(unval0 + 2, stats.dead_member_keys_unvalidated.load());
 }
 
+test "the screen reads one roster (decision 0003 §DM): a held-key scan parked mid-roster while a leave moves the last member into a place the scan passed and a join fills the vacated tail still finds the key a live member of another node holds through both — rejected, never accepted" {
+    const gpa = testing.allocator;
+    var rs = RamLedgerStore.init(gpa);
+    defer rs.deinit();
+    var l = Ledger.init(gpa, rs.store(), 2, wireOf(wid(0)), 45_000);
+    defer l.deinit();
+    const clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
+    var o = try shard.Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    defer o.deinit();
+    const member = struct {
+        fn of(n: u32, key: u64) shard.JoinRequest {
+            return .{ .id = shard.writerMemberId(wireOf(wid(n))), .role = .writer, .endpoint = .none, .pid = n, .boot = @splat(0), .prior_epoch = null, .pr_key = key, .mount = "/m", .row = null };
+        }
+    };
+    _ = o.join(member.of(3, 0x33), 0).granted;
+    _ = o.join(member.of(4, 0x44), 0).granted;
+    // X: node 5's live member under 0x77, listed throughout the race.
+    _ = o.join(member.of(5, 0x77), 0).granted;
+    const Calls = struct {
+        fn judge(ld: *Ledger, ow: *shard.Owner, out: *screen.Verdict) void {
+            out.* = ld.screenDeath(.{ .volume = 0, .reserved = 0, .reserved2 = 0, .member = wireOf(wid(9)), .epoch = 1, .pr_key = 0x77 }, ow, 0);
+        }
+        fn churn(ow: *shard.Owner) void {
+            _ = ow.leave(shard.writerMemberId(wireOf(wid(3))), 0);
+            _ = ow.join(member.of(6, 0x66), 0).granted;
+        }
+    };
+    var verdict: screen.Verdict = .ok;
+    var race: shard.Race = .{ .site = .key_scan, .nth = 2 };
+    try race.run(&o, Calls.judge, .{ &l, &o, &verdict }, Calls.churn, .{&o});
+    try testing.expect(!verdict.isOk());
+}
+
 test "an evicted member's key stays held through an allocation failure: the departure keeps it and the screen still rejects a death naming it (the screen never fails open)" {
     const gpa = testing.allocator;
     var rs = RamLedgerStore.init(gpa);

@@ -356,11 +356,23 @@ fn alive(io: Io, pid: linux.pid_t) bool {
     var pb: [64]u8 = undefined;
     var buf: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&pb, "/proc/{d}/stat", .{pid}) catch return true;
+    if (builtin.is_test) if (test_before_stat_read) |h| h.fire(h.ctx, pid);
     const text = Io.Dir.cwd().readFile(io, path, &buf) catch return true;
+    return statAlive(text);
+}
+
+/// The state letter of a `/proc/<pid>/stat` line, after the comm's
+/// closing paren: a zombie ('Z') is gone.
+fn statAlive(text: []const u8) bool {
     const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return true;
     const rest = std.mem.trimStart(u8, text[close + 1 ..], " ");
     return rest.len == 0 or rest[0] != 'Z';
 }
+
+/// Test seam: fires as `alive` is about to read `/proc/<pid>/stat` — the
+/// live-daemon pin lands the daemon's parent's reap there.
+var test_before_stat_read: if (builtin.is_test) ?AliveHook else void = if (builtin.is_test) null else {};
+const AliveHook = struct { ctx: *anyopaque, fire: *const fn (ctx: *anyopaque, pid: linux.pid_t) void };
 
 /// `<mountpoint>/.stats` (owned); null when unreadable. The 16 MiB bound
 /// is the renderer's own document cap.
@@ -737,20 +749,39 @@ test "the process census: a cmdline is the daemon's iff the mount verb's parser 
     try testing.expectEqual(@as(?linux.pid_t, null), pickDaemon(&.{ .{ .pid = 41, .ppid = 1 }, .{ .pid = 42, .ppid = 41 }, .{ .pid = 52, .ppid = 41 } }));
 }
 
-/// The stand-in daemon of the process-census test: `/bin/sh` exec'd under
+/// The stand-in daemon of the process-census test: `/bin/bash` exec'd under
 /// the daemon's own argv (`squeezefs mount … <dir>`), running the script
 /// `mount` in `dir` (a shell's command file is its first word), which
 /// names its pid on stdout and parks on stdin — so `/proc/<pid>/cmdline`
-/// is a daemon's line without a mount.
+/// is a daemon's line without a mount. Bash, never `/bin/sh`: bash's
+/// SIGCHLD handler reaps the seat's daemon (a child it never started) on
+/// every venue, where dash leaves it a zombie.
 fn standInDaemon(dir: [*:0]const u8, out_fd: linux.fd_t, in_fd: linux.fd_t) noreturn {
     _ = linux.chdir(dir);
     _ = linux.dup2(in_fd, 0);
     _ = linux.dup2(out_fd, 1);
     const argv = [_:null]?[*:0]const u8{ "squeezefs", "mount", "--daemon", "--log-file", "/l", "-o", "rw", "sqmeta:///dev/x", dir };
     const envp = [_:null]?[*:0]const u8{};
-    _ = linux.execve("/bin/sh", &argv, &envp);
+    _ = linux.execve("/bin/bash", &argv, &envp);
     linux.exit(127);
 }
+
+/// The live-daemon pin's reap: once, for the daemon's pid, the stopped seat
+/// continues and its SIGCHLD handler reaps the daemon's zombie; the hook
+/// returns once the pid is released.
+const SeatReap = struct {
+    seat: linux.pid_t,
+    daemon: linux.pid_t,
+    fired: bool = false,
+
+    fn fire(ctx: *anyopaque, pid: linux.pid_t) void {
+        const self: *SeatReap = @ptrCast(@alignCast(ctx));
+        if (pid != self.daemon or self.fired) return;
+        self.fired = true;
+        _ = linux.kill(self.seat, .CONT);
+        while (linux.errno(linux.kill(self.daemon, @fromBackingInt(@intCast(0)))) != .SRCH) std.Thread.yield() catch {};
+    }
+};
 
 test "a mount serving no .stats under a LIVE daemon (a FAILED volume's EIO; a connection the kernel ended — fstests generic/475's soak loop, where the verb detached and returned with the daemon still tearing down and the next mount met its claim): the verb finds the daemon by its process — the supervisor's seat sharing the argv excluded — signals it and waits for its exit; `--lazy` refuses with the build unknown and signals nothing; a path no process names keeps the stats_unreadable fallback" {
     const io = testing.io;
@@ -810,14 +841,37 @@ test "a mount serving no .stats under a LIVE daemon (a FAILED volume's EIO; a co
     // --lazy: no document, no proof of the build, no SIGUSR2 — the daemon lives on.
     try testing.expectEqual(Signalled{ .build_unknown = daemon.? }, signalDaemon(gpa, io, dir, true, "", &watched));
     try testing.expect(alive(io, daemon.?));
+    // The seat stopped: it holds its daemon's zombie until the reap below.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(seat, .STOP)));
+    defer _ = linux.kill(seat, .CONT);
+    var stop_status: i32 = 0;
+    try testing.expectEqual(@as(usize, @intCast(seat)), linux.waitpid(seat, &stop_status, linux.W.UNTRACED));
+    try testing.expect(linux.W.IFSTOPPED(@bitCast(stop_status)));
     // The orderly stop: TERM ends the stand-in (its default action) and the
     // verdict waits for that exit — the daemon's, never the seat's.
     try testing.expectEqual(Signalled{ .exited = daemon.? }, signalDaemon(gpa, io, dir, false, "", &watched));
+    // A daemon gone stays gone: its parent's reap landing as `alive` reads
+    // the state (a full gate's shard read the stat of the released pid).
+    var reap: SeatReap = .{ .seat = seat, .daemon = daemon.? };
+    test_before_stat_read = .{ .ctx = &reap, .fire = &SeatReap.fire };
+    defer test_before_stat_read = null;
     try testing.expect(!alive(io, daemon.?));
+    try testing.expect(reap.fired);
     try testing.expect(alive(io, seat));
     // (The seat left alone with its daemon as an unreaped zombie — the
     // supervisor between the daemon's exit and its next probe — is the
-    // pure census' row above: a shell seat reaps at once and cannot stage it.)
+    // pure census' row above.)
+}
+
+test "the state letter of /proc/<pid>/stat: a zombie ('Z') and a task its parent's wait is reaping ('X', EXIT_DEAD — from the wait's claim to the pid's release) are gone, every other state alive; the comm may hold a paren" {
+    for ("RSDTtPI") |s| {
+        var b: [64]u8 = undefined;
+        try testing.expect(statAlive(try std.fmt.bufPrint(&b, "42 (squeezefs) {c} 41 42 42 0 -1", .{s})));
+    }
+    try testing.expect(!statAlive("42 (squeezefs) Z 41 42 42 0 -1"));
+    try testing.expect(!statAlive("42 (squeezefs) X 41 42 42 0 -1"));
+    try testing.expect(statAlive("42 (a) Z) S 41 42 42 0 -1"));
+    try testing.expect(!statAlive("42 (a) S) X 41 42 42 0 -1"));
 }
 
 test "a .stats document naming a dead pid falls back as `daemon_gone`" {

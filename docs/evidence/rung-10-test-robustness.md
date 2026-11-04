@@ -150,4 +150,5 @@ the state first, the probe answers only an unreadable stat, and 'X' is gone. Red
 SIGSTOPped through the verdict, a test seam before the stat read continuing it until the pid is released): 5/5.
 Fix `2ec0224`: the unit 20/20 beside the full smoke's 16 shards and 16 busy loops (load 74–109), 10/10 with no
 noise of this work's; `cli.umount` 50/50, the full test, the full smoke, fmt, rails green. The verb's verdicts
-were never wrong (a false alive cost one more poll).
+were never wrong (a false alive cost one more poll). The 'Z' leader with live threads that §CO.38 saw is
+closed by §S: the verb waits on a pidfd for the whole thread group (`rung-10-umount-busy.md` §9).

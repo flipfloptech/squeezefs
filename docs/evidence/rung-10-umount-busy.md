@@ -174,3 +174,26 @@ the numbers: the runs below).
 - A wedged-daemon smoke for the escalation ladder itself still needs a `SQUEEZEFS_TEST_*` park seam in
   the handler lane (`rung-03-fuse.md` §owed); the ladder is unchanged by this rung and tested as the
   pure machine.
+
+## 9. The daemon's exit is its thread group's (2026-11-04; decision 0003 §S, closing §CO.38's seen-not-changed)
+
+The verb took a zombie LEADER for the daemon's exit. A daemon whose main thread exits first (an `exit_group`
+teardown: the leader's `do_exit` can finish before a sibling's) reads 'Z' in `/proc/<pid>/stat` while its
+other threads still run and hold the fd table: the writer claim, the devices. The verb answered `.exited`
+and returned, so the next mount could meet the old claim. Now the verb pins the located daemon with a pidfd
+before the signal (its start ticks from the locate re-read after `pidfd_open`: a reissued pid is another
+process), signals through it, and waits on its readiness. Linux 7.3's `pidfd_poll` raises POLLIN only once
+the leader has exited and its group is empty, and `do_exit` closes a thread's files before its
+`exit_notify`. A `pidfd_open` refused other than by ESRCH is the verdict `unpinned`: named, nothing
+signalled, exit 1.
+
+| check | result |
+|---|---|
+| red `59bb4b1`: forked stand-in, main thread exits alone on the TERM, a second thread holds a flock; the seam releases it one poll after the leader first reads 'Z' | at `.exited` the flock read EAGAIN, 5/5 |
+| fix `febe50e`, that test beside the full smoke's 16 shards + 16 busy loops | 40/40 (20 at load 22 rising, 20 at load 96–101 after a 150 s warm-up) |
+| the same, no noise of this work's (load 29, decaying) | 10/10 |
+| `cli.umount`; the full `zig build test`; the full smoke (every umount on the pidfd) | 51/51; 3,365 + 195 skipped of 3,560; 186 + 13 skipped of 199 |
+| fmt; rails | clean; 34/34 |
+
+Seen, not changed: `meta/guard/proc.zig`'s dead-pid prover reads a 'Z' leader as dead ("it holds no fd")
+though its live threads may still hold the claim's fds; the layer-A flock stands until they go.

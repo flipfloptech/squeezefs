@@ -2440,6 +2440,18 @@ test "nvmet fidelity: a member's death fences its host on the DATA namespace bef
     try rig.awaitLog(m, "ready: ", ready_wait_ns);
     const x = try rig.spawnMountEnv("df-x", set.metaUri(), &env_x, &.{});
     try rig.awaitLog(x, "ready: ", ready_wait_ns);
+    {
+        // Each host registered itself on the data namespace at its admission,
+        // M reserving it (WEAR).
+        const sm = try rig.stats(m);
+        defer gpa.free(sm);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "data_pr_registrations"));
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "data_pr_reservations"));
+        const sx = try rig.stats(x);
+        defer gpa.free(sx);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sx, "data_pr_registrations"));
+        try testing.expectEqual(@as(u64, 0), try statNumber(sx, "data_pr_reservations"));
+    }
     // X's first data write: one whole block of its own file, written through
     // to a block of its grant window — in the background (its DMA is held).
     try testing.expect(try scriptSucceeds(rig, x, "mkdir dx && (head -c 65536 /dev/zero | tr '\\000' X > dx/x) </dev/null >/dev/null 2>&1 &"));
@@ -2449,12 +2461,23 @@ test "nvmet fidelity: a member's death fences its host on the DATA namespace bef
         const sm = try rig.awaitStat(m, "appender_recoveries", 1, ready_wait_ns);
         defer gpa.free(sm);
         try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
+        // The recovery fenced host A on the data namespace (M's own client).
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "data_pr_preempts"));
+        try testing.expectEqual(@as(u64, 0), try statNumber(sm, "data_pr_fence_failures"));
     }
     // M's clean unmount releases its allocation lease and the bitmap pages:
     // the next holder's bitmap is the durable references', X's window free.
     try rig.umount(m);
     const m2 = try rig.spawnMountEnv("df-m2", meta_uri_b, &env_m, &.{});
     try rig.awaitLog(m2, "ready: ", ready_wait_ns);
+    {
+        // M kept host B's registration (a preempt landed under it, the kept
+        // law): M2 adopts; nothing to reconcile.
+        const s2 = try rig.stats(m2);
+        defer gpa.free(s2);
+        try testing.expectEqual(@as(u64, 1), try statNumber(s2, "data_pr_adoptions"));
+        try testing.expectEqual(@as(u64, 0), try statNumber(s2, "data_pr_reconcile_preempts"));
+    }
     // The fill: one 'G' block per file, each synced, until the store answers
     // ENOSPC — every free block taken; the failed file goes.
     const filled = blk: {

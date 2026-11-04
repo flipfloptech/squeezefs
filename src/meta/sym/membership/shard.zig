@@ -679,22 +679,33 @@ pub const Owner = struct {
         var cap: usize = 8;
         while (true) {
             const buf = try gpa.alloc(u64, cap);
+            defer gpa.free(buf);
+            // Copied under the lock (O(members)); sorted and deduplicated
+            // outside it.
             var n: usize = 0;
             const fits = blk: {
                 self.roster_lock.lock();
                 defer self.roster_lock.unlock();
                 for (self.members.items) |m| {
                     if (m.role != .writer or m.pr_key == 0) continue;
-                    if (std.mem.indexOfScalar(u64, buf[0..n], m.pr_key) != null) continue;
                     if (n == cap) break :blk false;
                     buf[n] = m.pr_key;
                     n += 1;
                 }
                 break :blk true;
             };
-            defer gpa.free(buf);
-            if (fits) return gpa.dupe(u64, buf[0..n]);
-            cap *= 4;
+            if (!fits) {
+                cap *= 4;
+                continue;
+            }
+            std.mem.sort(u64, buf[0..n], {}, std.sort.asc(u64));
+            var d: usize = 0;
+            for (buf[0..n]) |k| {
+                if (d != 0 and buf[d - 1] == k) continue;
+                buf[d] = k;
+                d += 1;
+            }
+            return gpa.dupe(u64, buf[0..d]);
         }
     }
 
@@ -2003,7 +2014,6 @@ test "the census's writer keys (decision 0003 §DL): every listed writer's host 
     {
         const keys = try o.writerKeys(gpa, 0);
         defer gpa.free(keys);
-        std.mem.sort(u64, keys, {}, std.sort.asc(u64));
         try testing.expectEqualSlices(u64, &.{ 0x1001, 0x1002 }, keys);
     }
     try testing.expect(o.leave(writerMemberId(testIdentity(2)), 1));

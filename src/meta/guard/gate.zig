@@ -224,13 +224,14 @@ pub const Guard = struct {
     }
 
     /// The grace's early end (decision 0003 §DL): every live member's host
-    /// key the census lists is registered on this namespace. False without
-    /// a census (no wire plane; its owner still re-asserting) or a report.
+    /// key the census lists is registered on this namespace. A flat volume
+    /// has no member: true at once. False on a symmetric one without a
+    /// census (no wire plane yet; its owner still re-asserting) or a report.
     fn everyLiveMemberRegistered(g: *Guard, c: *pr.Client) bool {
         const keys = blk: {
             g.hooks_lock.lock();
             defer g.hooks_lock.unlock();
-            const census = g.census orelse return false;
+            const census = g.census orelse return !g.be.sb.symmetricPlaneStamped();
             break :blk census.keys(census.ctx, g.gpa) catch return false;
         };
         defer g.gpa.free(keys);
@@ -1389,6 +1390,10 @@ const Vol = struct {
     }
 
     fn create(gpa: Allocator, name: []const u8, flush_ms: ?[]const u8) !*Vol {
+        return createClassed(gpa, name, flush_ms, .symmetric);
+    }
+
+    fn createClassed(gpa: Allocator, name: []const u8, flush_ms: ?[]const u8, class: geometry.Class) !*Vol {
         const self = try gpa.create(Vol);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .env = std.process.Environ.Map.init(gpa), .sqz = undefined, .pool = undefined };
@@ -1407,7 +1412,7 @@ const Vol = struct {
         const fd: linux.fd_t = @intCast(rc);
         defer _ = linux.close(fd);
         if (linux.errno(linux.ftruncate(fd, @intCast(test_volume_len))) != .SUCCESS) return error.CannotSizeDevice;
-        try backend.formatVolume(gpa, self.path(), .{ .env = &self.env, .pool = self.pool, .node_size = 65536, .journal_len_override = 1 << 20, .uuid = "guard-vol-uuid!!".*, .set = .{ .set_uuid = "guard-set-uuid!!".*, .hash_seed = 0x6A6A_6A6A_1234_5678 } });
+        try backend.formatVolume(gpa, self.path(), .{ .env = &self.env, .pool = self.pool, .node_size = 65536, .journal_len_override = 1 << 20, .uuid = "guard-vol-uuid!!".*, .set = .{ .set_uuid = "guard-set-uuid!!".*, .hash_seed = 0x6A6A_6A6A_1234_5678 }, .class = class });
         return self;
     }
 
@@ -2292,5 +2297,28 @@ test "decision 0003 §DL, the lapse grace's early end: the hold returns at the f
     try testing.expectEqual(@as(u64, 0), g.lapse_since_ns);
     try testing.expectEqual(@as(u32, 1), kicks.lapse);
     try testing.expectEqual(@as(u32, 1), kicks.hold);
+    try testing.expect(!be.isFailed());
+}
+
+test "decision 0003 §DL: a flat (single-writer) volume has no member to wait for — its lapse grace ends at the first lapse beat" {
+    const gpa = testing.allocator;
+    const v = try Vol.createClassed(gpa, "lapse-flat", "600000", .single_writer);
+    defer v.destroy();
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var host: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
+    const me = ident(boot_a, 4000, 779);
+    const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
+    defer be.close();
+    const g = be.guard.?;
+    g.lapse_grace_ns = 600 * std.time.ns_per_s;
+    try testing.expect(!be.sb.symmetricPlaneStamped());
+    const re0 = guard.stats.pr_reacquires.load();
+    const early0 = guard.stats.lapse_early_ends.load();
+    ns.powerCycle();
+    g.beat();
+    try testing.expectEqual(re0 + 1, guard.stats.pr_reacquires.load());
+    try testing.expectEqual(early0 + 1, guard.stats.lapse_early_ends.load());
+    try testing.expectEqual(@as(?u64, claim.prKey(me.writerId(0), boot_a)), ns.holder);
     try testing.expect(!be.isFailed());
 }

@@ -1012,7 +1012,7 @@ const TwoDaemons = struct {
         self.mh = .{ .mgr = &self.plane.mgr, .table = &self.handlers_table, .set_width = 1 };
         self.mh.register(&self.svc_a);
         self.clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
-        self.owner = try shard.Owner.arm(gpa, self.clocks, 0, 1, 0, &.{}, 0);
+        self.owner = try shard.Owner.arm(gpa, testing.io, self.clocks, 0, 1, 0, &.{}, 0);
         self.osvc = .{ .owner = &self.owner, .now = &manualNow };
         self.osvc.register(&self.svc_a);
         _ = try self.hub.addDaemon(&self.svc_a, secret, identityOf(0));
@@ -1382,7 +1382,7 @@ test "linux: two in-process daemons over REAL TCP on loopback — B dials A's li
     try testing.expect(gate.isParked());
     // The successor arms at term 2 expecting B and listens at a NEW port;
     // B's next beat re-dials it (a failover moved the manager).
-    var succ = try shard.Owner.arm(gpa, d.clocks, 0, 2, 1, &.{member.id}, t_self_at + 5_000);
+    var succ = try shard.Owner.arm(gpa, testing.io, d.clocks, 0, 2, 1, &.{member.id}, t_self_at + 5_000);
     defer succ.deinit();
     var ssvc: shard.OwnerService = .{ .owner = &succ, .now = &manualNow };
     var svc_s: service.Service = .init;

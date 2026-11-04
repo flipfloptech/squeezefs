@@ -48,7 +48,7 @@ const screen = @import("../../../wire/screen.zig");
 const codec = @import("../../../wire/codec.zig");
 const endpoint = @import("../../../wire/endpoint.zig");
 const park = @import("park_reclaim.zig");
-const jc = @import("../../journal_core.zig");
+const sync = @import("../../../sync/sync.zig");
 
 pub const WireIdentity = verbs.WireIdentity;
 pub const EndpointWire = endpoint.EndpointWire;
@@ -419,28 +419,123 @@ pub const HookSite = enum {
 
 pub const TestHook = struct { ctx: *anyopaque, fire: *const fn (ctx: *anyopaque, site: HookSite) void };
 
-pub const Owner = struct {
-    gpa: Allocator,
-    clocks: LeaseClocks,
-    term: u64,
-    /// The home volume this shard serves (the gauge's row).
-    home_volume: u16,
+/// The owner's shared state. Every connection thread (and its serve lanes),
+/// the membership cadence, the metadata guard's lapse beat and the `.stats`
+/// reader reach it, and only through `Owner.lockRoster` (decision 0003 §DM;
+/// the static rail counts the field's every use).
+const Roster = struct {
     members: std.ArrayList(MemberState) = .empty,
     next_epoch: u64 = 1,
     join_seq: u64 = 0,
     grace: ?Grace = null,
     /// A departure's registrant key kept `2 × T_owner` (the age a death
-    /// record can stand) for the `RecordDeath` screen.
+    /// record can stand) for the `RecordDeath` screen. Its spare capacity
+    /// covers every listed member's departure (a join reserves it): a
+    /// removal never allocates.
     departed_keys: std.ArrayList(DepartedKey) = .empty,
-    death_sink: ?DeathSink = null,
-    /// Orders `members`' structural changes (a join's append or replace, a
-    /// leave's or an eviction's removal) against `writerKeys`, the one
-    /// reader off the serving threads (the metadata guard's lapse beat,
-    /// decision 0003 §DL); never held across I/O or a sink.
-    roster_lock: jc.SpinLock = .{},
-    rows: ?RowStore = null,
     offers: std.ArrayList(PendingOffer) = .empty,
     releases: std.ArrayList(PendingRelease) = .empty,
+    /// The renewal's screen and declaration sink, bound once the data
+    /// planes open — while the face already serves.
+    data_volumes: []const screen.DataVolumeBounds = &.{},
+    windows: ?WindowSink = null,
+
+    fn deinit(r: *Roster, gpa: Allocator) void {
+        r.members.deinit(gpa);
+        if (r.grace) |*g| g.deinit(gpa);
+        r.departed_keys.deinit(gpa);
+        r.offers.deinit(gpa);
+        r.releases.deinit(gpa);
+    }
+
+    fn indexOf(r: *const Roster, id: MemberId) ?usize {
+        for (r.members.items, 0..) |m, i| if (std.mem.eql(u8, &m.id, &id)) return i;
+        return null;
+    }
+
+    fn publishCounts(r: *const Roster) void {
+        var writers: u64 = 0;
+        var readers: u64 = 0;
+        for (r.members.items) |m| if (m.role == .writer) {
+            writers += 1;
+        } else {
+            readers += 1;
+        };
+        stats.membership_members.set(writers + readers);
+        stats.membership_writers.set(writers);
+        stats.membership_readers.set(readers);
+    }
+
+    /// The grace window's halves, judged at `now_ms`.
+    fn graceOpenForFresh(r: *const Roster, now_ms: u64) ?u64 {
+        const g = r.grace orelse return null;
+        if (g.fresh_closed or now_ms >= g.until_ms) return null;
+        return g.until_ms - now_ms;
+    }
+
+    fn graceOpenForReassert(r: *const Roster, now_ms: u64) bool {
+        const g = r.grace orelse return false;
+        return now_ms < g.until_ms;
+    }
+
+    /// An EXPECTED member's FIRST join while the re-assertion half stands
+    /// is its re-assertion (no epoch needed). Once it re-asserted, or once
+    /// the window closed, a join without an epoch is a FRESH join — the
+    /// member left, was evicted (a re-join in place, decision 0003 §BS) or
+    /// remounted: its predecessor's roster row expects nothing of it any
+    /// more (a reclaim it could never hold answered `UnknownLease` for
+    /// every later join of that identity under this owner).
+    fn graceAwaitsReassertion(r: *const Roster, id: MemberId, now_ms: u64) bool {
+        const g = r.grace orelse return false;
+        return now_ms < g.until_ms and g.expects(id) and !g.hasReasserted(id);
+    }
+
+    /// The grace a reclaim of `id` re-asserts into (null: nothing to note).
+    fn reassertionOf(r: *Roster, id: MemberId) ?*Grace {
+        if (r.grace) |*g| if (g.expects(id) and !g.hasReasserted(id)) return g;
+        return null;
+    }
+
+    fn liveness(r: *const Roster, id: MemberId, now_ms: u64) Liveness {
+        if (r.indexOf(id)) |i| return if (now_ms < r.members.items[i].deadline_ms) .live else .dead;
+        return if (r.graceOpenForReassert(now_ms)) .unknown else .dead;
+    }
+
+    /// Member `i` out of the roster, its key remembered: the copy the
+    /// caller's row delete and death act on, outside the lock.
+    fn remove(r: *Roster, i: usize, now_ms: u64, t_owner_ms: u64) MemberState {
+        const m = r.members.swapRemove(i);
+        if (m.pr_key != 0) r.departed_keys.appendAssumeCapacity(.{ .key = m.pr_key, .until_ms = now_ms + DEPARTED_KEY_TTLS * t_owner_ms, .node_token = nodeOf(m.id) });
+        return m;
+    }
+
+    fn pruneDepartedKeys(r: *Roster, now_ms: u64) void {
+        var i: usize = 0;
+        while (i < r.departed_keys.items.len) {
+            if (now_ms >= r.departed_keys.items[i].until_ms) {
+                _ = r.departed_keys.swapRemove(i);
+            } else i += 1;
+        }
+    }
+};
+
+pub const Owner = struct {
+    gpa: Allocator,
+    io: Io,
+    clocks: LeaseClocks,
+    term: u64,
+    /// The home volume this shard serves (the gauge's row).
+    home_volume: u16,
+    /// THE OWNER'S ONE LOCK (decision 0003 §DM) over `owner_roster`: every
+    /// method that reads or writes the roster takes it, for RAM work only —
+    /// never across a row write, the death sink, a declaration or any other
+    /// callback, and never while taking another lock (the allocator's
+    /// aside): the innermost lock of every thread that takes it.
+    lock: sync.Mutex = .init,
+    owner_roster: Roster = .{},
+    /// Bound before the owner serves (the listener starts after both).
+    death_sink: ?DeathSink = null,
+    rows: ?RowStore = null,
     /// Test seam: fired at each `HookSite`.
     test_hook: if (builtin.is_test) ?TestHook else void = if (builtin.is_test) null else {},
 
@@ -448,39 +543,41 @@ pub const Owner = struct {
         if (builtin.is_test) if (self.test_hook) |h| h.fire(h.ctx, site);
     }
 
-    fn lockRoster(self: *Owner) void {
-        if (builtin.is_test) {
-            if (self.roster_lock.tryLock()) return;
-            self.hook(.lock_wait);
+    /// The roster, the owner's lock held until `unlockRoster`.
+    fn lockRoster(self: *Owner) *Roster {
+        if (!builtin.is_test or !self.lock.tryLock(self.io)) {
+            if (builtin.is_test) self.hook(.lock_wait);
+            self.lock.lockUncancelable(self.io);
         }
-        self.roster_lock.lock();
+        return &self.owner_roster;
+    }
+
+    fn unlockRoster(self: *Owner) void {
+        self.lock.unlock(self.io);
     }
 
     /// `arm(term, prior_term)` REFUSES `term ≤ prior_term`: the successor
     /// bumps the term durably BEFORE arming. `expected` = the predecessor's
     /// writer roster; a non-empty one opens the grace window.
-    pub fn arm(gpa: Allocator, clocks: LeaseClocks, home_volume: u16, term: u64, prior_term: u64, expected: []const MemberId, now_ms: u64) error{ StaleTerm, OutOfMemory }!Owner {
+    pub fn arm(gpa: Allocator, io: Io, clocks: LeaseClocks, home_volume: u16, term: u64, prior_term: u64, expected: []const MemberId, now_ms: u64) error{ StaleTerm, OutOfMemory }!Owner {
         if (term <= prior_term) return error.StaleTerm;
-        var o: Owner = .{ .gpa = gpa, .clocks = clocks, .term = term, .home_volume = home_volume };
+        var grace: ?Grace = null;
         if (expected.len != 0) {
             var g: Grace = .{ .until_ms = now_ms + clocks.grace_ms };
             errdefer g.deinit(gpa);
             try g.expected.appendSlice(gpa, expected);
-            o.grace = g;
+            grace = g;
         }
         stats.membership_mode.set(@backingInt(Mode.owner));
         stats.membership_term.set(term);
         stats.membership_lease_ttl_ms.set(clocks.t_owner_ms);
         stats.membership_shards.add(1);
-        return o;
+        return .{ .gpa = gpa, .io = io, .clocks = clocks, .term = term, .home_volume = home_volume, .owner_roster = .{ .grace = grace } };
     }
 
+    /// Once nothing serves the owner any more.
     pub fn deinit(self: *Owner) void {
-        self.members.deinit(self.gpa);
-        if (self.grace) |*g| g.deinit(self.gpa);
-        self.departed_keys.deinit(self.gpa);
-        self.offers.deinit(self.gpa);
-        self.releases.deinit(self.gpa);
+        self.owner_roster.deinit(self.gpa);
         stats.membership_shards.sub(1);
     }
 
@@ -492,27 +589,21 @@ pub const Owner = struct {
         self.rows = rows;
     }
 
-    fn indexOf(self: *const Owner, id: MemberId) ?usize {
-        for (self.members.items, 0..) |m, i| if (std.mem.eql(u8, &m.id, &id)) return i;
-        return null;
+    /// The renewal's screen bounds and declaration sink (the holder plane's,
+    /// bound at the data planes' open while renewals are served).
+    pub fn bindRenewals(self: *Owner, data_volumes: []const screen.DataVolumeBounds, windows: ?WindowSink) void {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        r.data_volumes = data_volumes;
+        r.windows = windows;
     }
 
-    pub fn find(self: *const Owner, id: MemberId) ?*const MemberState {
-        const i = self.indexOf(id) orelse return null;
-        return &self.members.items[i];
-    }
+    pub const RenewalBinding = struct { data_volumes: []const screen.DataVolumeBounds, windows: ?WindowSink };
 
-    fn publishCounts(self: *const Owner) void {
-        var writers: u64 = 0;
-        var readers: u64 = 0;
-        for (self.members.items) |m| if (m.role == .writer) {
-            writers += 1;
-        } else {
-            readers += 1;
-        };
-        stats.membership_members.set(writers + readers);
-        stats.membership_writers.set(writers);
-        stats.membership_readers.set(readers);
+    pub fn renewalBinding(self: *Owner) RenewalBinding {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        return .{ .data_volumes = r.data_volumes, .windows = r.windows };
     }
 
     fn writeRow(self: *Owner, m: *const MemberState) error{Io}!void {
@@ -524,106 +615,45 @@ pub const Owner = struct {
         stats.membership_registration_commits.inc();
     }
 
+    /// A departure's row deleted — outside the lock, so an incarnation that
+    /// joined under the same id meanwhile (a re-join in place, a remount)
+    /// may have written its row first: that row is written again after the
+    /// delete.
     fn deleteRow(self: *Owner, m: *const MemberState) void {
         const rows = self.rows orelse return;
         if (m.row == null) return;
         const identity = memberIdentity(m.id) orelse return;
         rows.delete(rows.ctx, cr.memberKey(stableOf(identity)).slice()) catch |e| log.warn("membership shard {d}: a departed member's row could not be deleted ({s}) — the dead-pid proof retires it at the next census", .{ self.home_volume, @errorName(e) });
         stats.membership_registration_commits.inc();
-    }
-
-    /// The grace window's halves, judged at `now_ms`.
-    fn graceOpenForFresh(self: *Owner, now_ms: u64) ?u64 {
-        const g = &(self.grace orelse return null);
-        if (g.fresh_closed or now_ms >= g.until_ms) return null;
-        return g.until_ms - now_ms;
+        const again = self.member(m.id) orelse return;
+        self.writeRow(&again) catch |e| log.warn("membership shard {d}: the row of a member that joined again during a departure's delete could not be written again ({s}) — its next join writes it", .{ self.home_volume, @errorName(e) });
     }
 
     /// The re-assertion window stands: a member the roster does not list
     /// may still be a predecessor's member on its way back (silence is
     /// unknown, never a death — the census page carries the word).
-    pub fn graceOpenForReassert(self: *const Owner, now_ms: u64) bool {
-        const g = self.grace orelse return false;
-        return now_ms < g.until_ms;
-    }
-
-    /// An EXPECTED member's FIRST join while the re-assertion half stands
-    /// is its re-assertion (no epoch needed). Once it re-asserted, or once
-    /// the window closed, a join without an epoch is a FRESH join — the
-    /// member left, was evicted (a re-join in place, decision 0003 §BS) or
-    /// remounted: its predecessor's roster row expects nothing of it any
-    /// more (a reclaim it could never hold answered `UnknownLease` for
-    /// every later join of that identity under this owner).
-    fn graceAwaitsReassertion(self: *const Owner, id: MemberId, now_ms: u64) bool {
-        const g = self.grace orelse return false;
-        return now_ms < g.until_ms and g.expects(id) and !g.hasReasserted(id);
-    }
-
-    fn noteReasserted(self: *Owner, id: MemberId) Allocator.Error!void {
-        const g = &(self.grace orelse return);
-        if (!g.expects(id) or g.hasReasserted(id)) return;
-        try g.reasserted.append(self.gpa, id);
-        // The fresh-refusal half closes EARLY once every expected member
-        // re-asserted; the re-assertion half stays open to the deadline.
-        if (g.reasserted.items.len == g.expected.items.len) g.fresh_closed = true;
+    pub fn graceOpenForReassert(self: *Owner, now_ms: u64) bool {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        return r.graceOpenForReassert(now_ms);
     }
 
     /// `join` (M:1492-1651): `reclaim = prior_epoch.is_some() ∨ expected`;
     /// grace ∧ !reclaim ⇒ refused with the remaining window; a reclaim of
     /// an epoch this owner does not hold with the re-assertion half closed
     /// ⇒ `unknown_lease`; the OQ-5 collision; else a NEW epoch replaces
-    /// any prior state and the row is written ONCE.
+    /// any prior state and the row is written ONCE. The roster changes
+    /// whole under the lock (every allocation first) or not at all.
     pub fn join(self: *Owner, req: JoinRequest, now_ms: u64) JoinVerdict {
         if (std.mem.allEqual(u8, &req.id, 0)) return .rejected;
-        const existing = self.indexOf(req.id);
-        const reclaim = req.prior_epoch != null or self.graceAwaitsReassertion(req.id, now_ms);
-        if (!reclaim) {
-            if (self.graceOpenForFresh(now_ms)) |remaining| {
-                stats.membership_grace_refusals.inc();
-                return .{ .grace_refused = .{ .retry_after_ms = remaining } };
-            }
-        } else {
-            // A reclaim whose epoch this owner does not hold: admissible
-            // only while the re-assertion half is open (the predecessor's
-            // epochs died with it; an EXPECTED member's first join is a
-            // re-assertion even without an epoch). HELD: the epoch this
-            // owner granted the member, or ANY epoch ≤ it from the SAME
-            // incarnation (pid and boot) — a member that missed a grant's
-            // reply (the lost-reply window of its own reclaim, or a park
-            // past a renewal this owner served) names its last epoch; the
-            // verb is idempotent against the state held, never a poison of
-            // a live member. Another incarnation under the id (a remount:
-            // another pid) is no reclaimer of this epoch.
-            const held = if (existing) |i| blk: {
-                const m = &self.members.items[i];
-                const named = req.prior_epoch orelse 0;
-                if (m.epoch == named) break :blk true;
-                break :blk req.prior_epoch != null and named < m.epoch and m.pid == req.pid and std.mem.eql(u8, &m.boot, &req.boot);
-            } else false;
-            if (!held and !self.graceOpenForReassert(now_ms)) {
-                stats.membership_reclaim_refusals.inc();
-                return .unknown_lease;
-            }
-        }
-        // OQ-5: the same id LIVE at another mount point.
-        if (existing) |i| {
-            const m = &self.members.items[i];
-            if (now_ms < m.deadline_ms and req.mount.len != 0 and !std.mem.eql(u8, m.mountPath(), req.mount[0..@min(req.mount.len, MOUNT_KEEP)]) and req.prior_epoch == null) {
-                stats.membership_mount_slot_collisions.inc();
-                return .{ .mount_slot_collision = .{ .other = m.mount, .other_len = m.mount_len } };
-            }
-        }
-        const epoch = self.next_epoch;
-        self.next_epoch += 1;
-        self.join_seq += 1;
         var m: MemberState = .{
             .id = req.id,
             .role = req.role,
             .endpoint = req.endpoint,
             .pid = req.pid,
             .boot = req.boot,
-            .epoch = epoch,
-            .join_seq = self.join_seq,
+            .epoch = undefined,
+            .join_seq = undefined,
             .joined_ms = now_ms,
             .renewed_ms = now_ms,
             .deadline_ms = now_ms + self.clocks.t_owner_ms,
@@ -634,41 +664,88 @@ pub const Owner = struct {
         const keep: u8 = @intCast(@min(req.mount.len, MOUNT_KEEP));
         @memcpy(m.mount[0..keep], req.mount[0..keep]);
         m.mount_len = keep;
-        if (m.row) |*r| {
-            r.epoch = epoch;
-            r.term = self.term;
-        }
-        const ack_prior: u64 = if (reclaim) (req.prior_epoch orelse 0) else 0;
-        if (existing) |i| {
-            self.lockRoster();
-            defer self.roster_lock.unlock();
-            self.members.items[i] = m;
-        } else {
-            // Room for every member's departure: `rememberDepartedKey`
-            // never allocates.
-            self.departed_keys.ensureUnusedCapacity(self.gpa, self.members.items.len + 1) catch return .io;
-            self.lockRoster();
-            defer self.roster_lock.unlock();
-            self.members.append(self.gpa, m) catch return .io;
+        var reclaim = false;
+        {
+            const r = self.lockRoster();
+            defer self.unlockRoster();
+            const existing = r.indexOf(req.id);
+            reclaim = req.prior_epoch != null or r.graceAwaitsReassertion(req.id, now_ms);
+            if (!reclaim) {
+                if (r.graceOpenForFresh(now_ms)) |remaining| {
+                    stats.membership_grace_refusals.inc();
+                    return .{ .grace_refused = .{ .retry_after_ms = remaining } };
+                }
+            } else {
+                // A reclaim whose epoch this owner does not hold: admissible
+                // only while the re-assertion half is open (the predecessor's
+                // epochs died with it; an EXPECTED member's first join is a
+                // re-assertion even without an epoch). HELD: the epoch this
+                // owner granted the member, or ANY epoch ≤ it from the SAME
+                // incarnation (pid and boot) — a member that missed a grant's
+                // reply (the lost-reply window of its own reclaim, or a park
+                // past a renewal this owner served) names its last epoch; the
+                // verb is idempotent against the state held, never a poison of
+                // a live member. Another incarnation under the id (a remount:
+                // another pid) is no reclaimer of this epoch.
+                const held = if (existing) |i| blk: {
+                    const cur = &r.members.items[i];
+                    const named = req.prior_epoch orelse 0;
+                    if (cur.epoch == named) break :blk true;
+                    break :blk req.prior_epoch != null and named < cur.epoch and cur.pid == req.pid and std.mem.eql(u8, &cur.boot, &req.boot);
+                } else false;
+                if (!held and !r.graceOpenForReassert(now_ms)) {
+                    stats.membership_reclaim_refusals.inc();
+                    return .unknown_lease;
+                }
+            }
+            // OQ-5: the same id LIVE at another mount point.
+            if (existing) |i| {
+                const cur = &r.members.items[i];
+                if (now_ms < cur.deadline_ms and req.mount.len != 0 and !std.mem.eql(u8, cur.mountPath(), req.mount[0..keep]) and req.prior_epoch == null) {
+                    stats.membership_mount_slot_collisions.inc();
+                    return .{ .mount_slot_collision = .{ .other = cur.mount, .other_len = cur.mount_len } };
+                }
+            }
+            const reasserts = if (reclaim) r.reassertionOf(req.id) else null;
+            if (existing == null) {
+                r.members.ensureUnusedCapacity(self.gpa, 1) catch return .io;
+                r.departed_keys.ensureUnusedCapacity(self.gpa, r.members.items.len + 1) catch return .io;
+            }
+            if (reasserts) |g| g.reasserted.ensureUnusedCapacity(self.gpa, 1) catch return .io;
+            m.epoch = r.next_epoch;
+            r.next_epoch += 1;
+            r.join_seq += 1;
+            m.join_seq = r.join_seq;
+            if (m.row) |*row| {
+                row.epoch = m.epoch;
+                row.term = self.term;
+            }
+            if (existing) |i| r.members.items[i] = m else r.members.appendAssumeCapacity(m);
+            if (reasserts) |g| {
+                g.reasserted.appendAssumeCapacity(req.id);
+                // The fresh-refusal half closes EARLY once every expected
+                // member re-asserted; the re-assertion half stays open to
+                // the deadline.
+                if (g.reasserted.items.len == g.expected.items.len) g.fresh_closed = true;
+            }
+            r.publishCounts();
         }
         self.writeRow(&m) catch return .io;
-        if (reclaim) {
-            stats.membership_grace_reclaims.inc();
-            self.noteReasserted(req.id) catch return .io;
-        }
+        if (reclaim) stats.membership_grace_reclaims.inc();
         stats.membership_joins.inc();
-        self.publishCounts();
-        return .{ .granted = .{ .epoch = epoch, .ack_prior_epoch = ack_prior } };
+        return .{ .granted = .{ .epoch = m.epoch, .ack_prior_epoch = if (reclaim) (req.prior_epoch orelse 0) else 0 } };
     }
 
     /// `renew`: ONE probe + two stores — the plane's hot op, commits
     /// nothing. An unknown `(id, epoch)` is `unknown_lease`.
     pub fn renew(self: *Owner, id: MemberId, epoch: u64, acked_free_epoch: u64, now_ms: u64) RenewVerdict {
-        const i = self.indexOf(id) orelse {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        const i = r.indexOf(id) orelse {
             stats.membership_renew_refusals.inc();
             return .unknown_lease;
         };
-        const m = &self.members.items[i];
+        const m = &r.members.items[i];
         if (m.epoch != epoch or now_ms >= m.deadline_ms) {
             stats.membership_renew_refusals.inc();
             return .unknown_lease;
@@ -684,19 +761,16 @@ pub const Owner = struct {
     /// The clean departure: out of the census, its key remembered, the
     /// row deleted; never a death.
     pub fn leave(self: *Owner, id: MemberId, now_ms: u64) bool {
-        const i = self.indexOf(id) orelse return false;
-        const m = self.members.items[i];
-        self.rememberDepartedKey(m.pr_key, now_ms, nodeOf(m.id));
-        self.deleteRow(&m);
-        self.removeMember(i);
-        self.publishCounts();
+        const gone = blk: {
+            const r = self.lockRoster();
+            defer self.unlockRoster();
+            const i = r.indexOf(id) orelse return false;
+            const gone = r.remove(i, now_ms, self.clocks.t_owner_ms);
+            r.publishCounts();
+            break :blk gone;
+        };
+        self.deleteRow(&gone);
         return true;
-    }
-
-    fn removeMember(self: *Owner, i: usize) void {
-        self.lockRoster();
-        defer self.roster_lock.unlock();
-        _ = self.members.swapRemove(i);
     }
 
     /// The keys of every listed WRITER (≠ 0, distinct) — the metadata
@@ -705,7 +779,6 @@ pub const Owner = struct {
     /// cadence's). `error.Incomplete` while the successor's re-assertion
     /// window stands: a predecessor's member not yet back is listed nowhere.
     pub fn writerKeys(self: *Owner, gpa: Allocator, now_ms: u64) error{ Incomplete, OutOfMemory }![]u64 {
-        if (self.graceOpenForReassert(now_ms)) return error.Incomplete;
         var cap: usize = 8;
         while (true) {
             const buf = try gpa.alloc(u64, cap);
@@ -714,9 +787,10 @@ pub const Owner = struct {
             // outside it.
             var n: usize = 0;
             const fits = blk: {
-                self.lockRoster();
-                defer self.roster_lock.unlock();
-                for (self.members.items) |m| {
+                const r = self.lockRoster();
+                defer self.unlockRoster();
+                if (r.graceOpenForReassert(now_ms)) return error.Incomplete;
+                for (r.members.items) |m| {
                     if (m.role != .writer or m.pr_key == 0) continue;
                     if (n == cap) break :blk false;
                     buf[n] = m.pr_key;
@@ -739,131 +813,180 @@ pub const Owner = struct {
         }
     }
 
-    fn rememberDepartedKey(self: *Owner, key: u64, now_ms: u64, node_token: u64) void {
-        if (key == 0) return;
-        self.departed_keys.appendAssumeCapacity(.{ .key = key, .until_ms = now_ms + DEPARTED_KEY_TTLS * self.clocks.t_owner_ms, .node_token = node_token });
-    }
-
-    fn evict(self: *Owner, i: usize, now_ms: u64, epoch_word: u64) void {
-        const m = self.members.items[i];
-        self.rememberDepartedKey(m.pr_key, now_ms, nodeOf(m.id));
-        self.deleteRow(&m);
-        self.removeMember(i);
-        stats.membership_evictions.inc();
-        if (self.death_sink) |s| s.noteDeath(s.ctx, .{ .id = m.id, .identity = memberIdentity(m.id), .epoch = epoch_word, .pr_key = m.pr_key });
-    }
-
     /// `expire_due` on the owner's cadence: every member with `now ≥
     /// deadline` is evicted and shipped to the sink — a member the owner
     /// evicts here passed `T_owner` under a LIVE owner, so the successor's
-    /// grace never lists it: never a reclaimer.
+    /// grace never lists it: never a reclaimer. Each is judged and removed
+    /// under one hold of the lock (a renewal lands before it or answers
+    /// `UnknownLease` after), its row and death acted outside.
     pub fn expireDue(self: *Owner, now_ms: u64) u32 {
         var n: u32 = 0;
-        var i: usize = 0;
-        while (i < self.members.items.len) {
-            if (now_ms >= self.members.items[i].deadline_ms) {
-                self.hook(.expire_due);
-                self.evict(i, now_ms, self.members.items[i].epoch);
-                n += 1;
-            } else i += 1;
+        var from: usize = 0;
+        while (self.evictOneDue(now_ms, &from)) |gone| {
+            self.deleteRow(&gone);
+            stats.membership_evictions.inc();
+            if (self.death_sink) |s| s.noteDeath(s.ctx, .{ .id = gone.id, .identity = memberIdentity(gone.id), .epoch = gone.epoch, .pr_key = gone.pr_key });
+            n += 1;
         }
-        self.pruneDepartedKeys(now_ms);
-        if (n != 0) self.publishCounts();
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        r.pruneDepartedKeys(now_ms);
+        if (n != 0) r.publishCounts();
         return n;
     }
 
-    fn pruneDepartedKeys(self: *Owner, now_ms: u64) void {
-        var i: usize = 0;
-        while (i < self.departed_keys.items.len) {
-            if (now_ms >= self.departed_keys.items[i].until_ms) {
-                _ = self.departed_keys.swapRemove(i);
-            } else i += 1;
+    /// The first due member at or after `from.*`, removed. A member a leave
+    /// swaps behind the cursor meanwhile is judged at the next tick.
+    fn evictOneDue(self: *Owner, now_ms: u64, from: *usize) ?MemberState {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        while (from.* < r.members.items.len) : (from.* += 1) {
+            if (now_ms < r.members.items[from.*].deadline_ms) continue;
+            self.hook(.expire_due);
+            // The member swapped into this place is judged next.
+            return r.remove(from.*, now_ms, self.clocks.t_owner_ms);
         }
+        return null;
     }
 
     /// `reap_grace_deadline`: at the deadline the EXPECTED members that
     /// never re-asserted are DEAD — shipped NOW with `epoch 0` and the
     /// roster's key (after grace, never at `T_owner`). Once.
     pub fn reapGraceDeadline(self: *Owner, now_ms: u64, roster_key: *const fn (id: MemberId) u64) u32 {
-        const g = &(self.grace orelse return 0);
-        if (g.reaped or now_ms < g.until_ms) return 0;
-        g.reaped = true;
+        {
+            const r = self.lockRoster();
+            defer self.unlockRoster();
+            const g = if (r.grace) |*g| g else return 0;
+            if (g.reaped or now_ms < g.until_ms) return 0;
+            g.reaped = true;
+        }
         var n: u32 = 0;
-        for (g.expected.items) |id| {
-            if (g.hasReasserted(id)) continue;
+        var next: usize = 0;
+        while (self.nextUnreasserted(&next)) |id| {
             if (self.death_sink) |s| s.noteDeath(s.ctx, .{ .id = id, .identity = memberIdentity(id), .epoch = 0, .pr_key = roster_key(id) });
             n += 1;
         }
         return n;
     }
 
-    pub fn graceRemainingMs(self: *const Owner, now_ms: u64) u64 {
-        const g = self.grace orelse return 0;
+    fn nextUnreasserted(self: *Owner, next: *usize) ?MemberId {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        const g = r.grace orelse return null;
+        while (next.* < g.expected.items.len) {
+            const id = g.expected.items[next.*];
+            next.* += 1;
+            if (!g.hasReasserted(id)) return id;
+        }
+        return null;
+    }
+
+    pub fn graceRemainingMs(self: *Owner, now_ms: u64) u64 {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        const g = r.grace orelse return 0;
         return g.until_ms -| now_ms;
     }
 
     /// Three-valued liveness (D:564): the F2 predicate refuses `dead`
     /// alone.
-    pub fn liveness(self: *const Owner, id: MemberId, now_ms: u64) Liveness {
-        if (self.find(id)) |m| return if (now_ms < m.deadline_ms) .live else .dead;
-        return if (self.graceOpenForReassert(now_ms)) .unknown else .dead;
+    pub fn liveness(self: *Owner, id: MemberId, now_ms: u64) Liveness {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        return r.liveness(id, now_ms);
     }
 
-    /// The `RecordDeath` screen's word: "not listed" = "not proven live".
-    pub fn memberIsLive(self: *const Owner, id: MemberId, now_ms: u64) bool {
+    /// "not listed" = "not proven live".
+    pub fn memberIsLive(self: *Owner, id: MemberId, now_ms: u64) bool {
         return self.liveness(id, now_ms) == .live;
     }
 
-    /// The key the census registered for a member (null = unknown).
-    pub fn registeredKey(self: *const Owner, id: MemberId) ?u64 {
-        const m = self.find(id) orelse return null;
-        return m.pr_key;
+    /// A listed member's state, copied (null = not listed).
+    pub fn member(self: *Owner, id: MemberId) ?MemberState {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        const i = r.indexOf(id) orelse return null;
+        return r.members.items[i];
     }
 
-    /// Is `key` held — a live member's or a departure's inside its TTL?
-    /// Is `key` held — a live member's or a departure's inside its TTL — on
-    /// a node OTHER than `node_token`? Every mount of a set on one host
-    /// registers the host's key (decision 0003 §DF): the dead member's own
-    /// node holding it is its siblings' share, never a contradiction.
-    pub fn holdsKeyElsewhere(self: *const Owner, key: u64, node_token: u64) bool {
-        for (self.members.items) |m| {
-            self.hook(.key_scan);
-            if (m.pr_key != 0 and m.pr_key == key and nodeOf(m.id) != node_token) return true;
-        }
-        for (self.departed_keys.items) |d| if (d.key == key and d.node_token != node_token) return true;
-        return false;
+    /// The first listed member whose `keyOf(id)` is `want`, copied.
+    pub fn memberWhere(self: *Owner, comptime T: type, want: T, comptime keyOf: fn (MemberId) T) ?MemberState {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        for (r.members.items) |m| if (keyOf(m.id) == want) return m;
+        return null;
     }
 
-    pub fn endpointOf(self: *const Owner, id: MemberId) ?EndpointWire {
-        const m = self.find(id) orelse return null;
-        return if (m.endpoint.isNone()) null else m.endpoint;
+    pub fn memberCount(self: *Owner) usize {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        return r.members.items.len;
+    }
+
+    pub fn writerCount(self: *Owner) usize {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        var n: usize = 0;
+        for (r.members.items) |m| n += @intFromBool(m.role == .writer);
+        return n;
+    }
+
+    /// The `RecordDeath` screen's words, read under ONE hold of the lock: a
+    /// join or a leave between them would pair a "not listed" with a
+    /// registration, or let a scan miss a member a removal moved.
+    pub const DeathScreen = struct {
+        listed_live: bool,
+        /// The key the census registered for the member (null = unknown).
+        registered_key: ?u64,
+        /// `key` held — a listed member's or a departure's inside its TTL —
+        /// on a node OTHER than `node_token`: every mount of a set on one
+        /// host registers the host's key (decision 0003 §DF), so the dead
+        /// member's own node holding it is its siblings' share.
+        held_elsewhere: bool,
+    };
+
+    pub fn deathScreen(self: *Owner, id: MemberId, key: u64, node_token: u64, now_ms: u64) DeathScreen {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        const registered: ?u64 = if (r.indexOf(id)) |i| r.members.items[i].pr_key else null;
+        const held = held: {
+            for (r.members.items) |m| {
+                self.hook(.key_scan);
+                if (m.pr_key != 0 and m.pr_key == key and nodeOf(m.id) != node_token) break :held true;
+            }
+            for (r.departed_keys.items) |d| if (d.key == key and d.node_token != node_token) break :held true;
+            break :held false;
+        };
+        return .{ .listed_live = r.liveness(id, now_ms) == .live, .registered_key = registered, .held_elsewhere = held };
     }
 
     /// The census page from `cursor` (a join_seq), ≤ `limit` rows, in
     /// join order; `next` = the cursor of the page after, null at the end.
-    pub fn census(self: *const Owner, cursor: u64, limit: u32, now_ms: u64, b: *codec.Builder) codec.BuildError!verbs.CensusPageHead {
+    pub fn census(self: *Owner, cursor: u64, limit: u32, now_ms: u64, b: *codec.Builder) codec.BuildError!verbs.CensusPageHead {
         stats.membership_census_serves.inc();
+        const r = self.lockRoster();
+        defer self.unlockRoster();
         var sorted: [verbs.CENSUS_PAGE_MAX + 1]usize = undefined;
         var n: usize = 0;
-        for (self.members.items, 0..) |m, i| {
+        for (r.members.items, 0..) |m, i| {
             if (m.join_seq < cursor) continue;
             if (n == sorted.len) break;
             sorted[n] = i;
             n += 1;
         }
-        std.mem.sort(usize, sorted[0..n], self, struct {
-            fn lt(o: *const Owner, a: usize, c: usize) bool {
-                return o.members.items[a].join_seq < o.members.items[c].join_seq;
+        std.mem.sort(usize, sorted[0..n], @as(*const Roster, r), struct {
+            fn lt(ro: *const Roster, a: usize, c: usize) bool {
+                return ro.members.items[a].join_seq < ro.members.items[c].join_seq;
             }
         }.lt);
         const take: usize = @min(n, @min(limit, verbs.CENSUS_PAGE_MAX));
         for (sorted[0..take]) |i| {
-            const m = &self.members.items[i];
+            const m = &r.members.items[i];
             const state: verbs.MemberState = if (now_ms < m.deadline_ms) .live else .departed;
             try verbs.CensusPage.encodeRow(b, .{ .head = .{ .id = m.id, .boot = m.boot, .endpoint = m.endpoint, .role = @backingInt(m.role), .state = @backingInt(state), .mount_len = m.mount_len, .pid = m.pid, .reserved = 0, .epoch = m.epoch, .age_ms = now_ms -| m.joined_ms, .expires_in_ms = m.deadline_ms -| now_ms, .acked_free_epoch = m.acked_free_epoch }, .mount = m.mountPath() });
         }
         const has_next = take < n;
-        return .{ .n = @intCast(take), .has_next = @intFromBool(has_next), .grace_open = @intFromBool(self.graceOpenForReassert(now_ms)), .reserved = @splat(0), .next = if (has_next) self.members.items[sorted[take]].join_seq else 0 };
+        return .{ .n = @intCast(take), .has_next = @intFromBool(has_next), .grace_open = @intFromBool(r.graceOpenForReassert(now_ms)), .reserved = @splat(0), .next = if (has_next) r.members.items[sorted[take]].join_seq else 0 };
     }
 
     // ---- the push carriage ----
@@ -871,33 +994,39 @@ pub const Owner = struct {
     /// A holder's OFFER to a wire requester: carried on the requester's
     /// next renewal `Grant` (`offered_slots`).
     pub fn pushOffer(self: *Owner, to: MemberId, slot: u16, holder: u32) Allocator.Error!void {
-        for (self.offers.items) |o| if (o.slot == slot and std.mem.eql(u8, &o.to, &to)) return;
-        try self.offers.append(self.gpa, .{ .to = to, .slot = slot, .holder = holder });
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        for (r.offers.items) |o| if (o.slot == slot and std.mem.eql(u8, &o.to, &to)) return;
+        try r.offers.append(self.gpa, .{ .to = to, .slot = slot, .holder = holder });
     }
 
     /// A release notice: the requester's standing offer lapsed / the slot
     /// moved; carried the same way (`slot_release_notices`).
     pub fn pushReleaseNotice(self: *Owner, to: MemberId, slot: u16) Allocator.Error!void {
-        try self.releases.append(self.gpa, .{ .to = to, .slot = slot });
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        try r.releases.append(self.gpa, .{ .to = to, .slot = slot });
     }
 
     /// Drain the carriage for `id` into the grant's tails (the builder's
     /// scratch); the pending rows are consumed.
     pub fn takeCarriage(self: *Owner, id: MemberId, offered: *std.ArrayList(verbs.OfferedSlotWire), notices: *std.ArrayList(u16)) Allocator.Error!void {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
         var i: usize = 0;
-        while (i < self.offers.items.len) {
-            const o = self.offers.items[i];
+        while (i < r.offers.items.len) {
+            const o = r.offers.items[i];
             if (std.mem.eql(u8, &o.to, &id)) {
                 try offered.append(self.gpa, .{ .slot = o.slot, .reserved = 0, .holder = o.holder });
-                _ = self.offers.orderedRemove(i);
+                _ = r.offers.orderedRemove(i);
             } else i += 1;
         }
         i = 0;
-        while (i < self.releases.items.len) {
-            const r = self.releases.items[i];
-            if (std.mem.eql(u8, &r.to, &id)) {
-                try notices.append(self.gpa, r.slot);
-                _ = self.releases.orderedRemove(i);
+        while (i < r.releases.items.len) {
+            const rel = r.releases.items[i];
+            if (std.mem.eql(u8, &rel.to, &id)) {
+                try notices.append(self.gpa, rel.slot);
+                _ = r.releases.orderedRemove(i);
             } else i += 1;
         }
     }
@@ -906,6 +1035,13 @@ pub const Owner = struct {
 
     pub fn registrationSource(self: *Owner, local: *const claim.Identity, probe: claim.PidProbe, now: *const fn (ctx: ?*anyopaque) u64, now_ctx: ?*anyopaque) OwnerRegistrations {
         return .{ .owner = self, .local = local, .probe = probe, .now = now, .now_ctx = now_ctx };
+    }
+
+    /// Every listed member, copied under the lock (the caller frees).
+    fn snapshot(self: *Owner, gpa: Allocator) Allocator.Error![]MemberState {
+        const r = self.lockRoster();
+        defer self.unlockRoster();
+        return gpa.dupe(MemberState, r.members.items);
     }
 };
 
@@ -931,7 +1067,10 @@ pub const OwnerRegistrations = struct {
         const self: *OwnerRegistrations = @ptrCast(@alignCast(ctx.?));
         const now_ns = clock.realtimeCoarseS() * std.time.ns_per_s;
         const now_ms = self.now(self.now_ctx);
-        for (self.owner.members.items) |m| {
+        // The dead-pid proof reads /proc: never under the owner's lock.
+        const members = try self.owner.snapshot(gpa);
+        defer gpa.free(members);
+        for (members) |m| {
             const live = now_ms < m.deadline_ms;
             if (m.row) |r| {
                 try out.append(gpa, r.registration(self.local.*, @intCast(now_ns), self.probe, live));
@@ -965,10 +1104,6 @@ pub const GenerationSource = struct {
 
 pub const OwnerService = struct {
     owner: *Owner,
-    /// The data volumes the renewal's window declarations are screened by.
-    data_volumes: []const screen.DataVolumeBounds = &.{},
-    /// Where a screened, granted renewal's declarations go.
-    windows: ?WindowSink = null,
     /// The owner's monotonic clock in ms (tests inject a manual one).
     now: *const fn (ctx: ?*anyopaque) u64,
     now_ctx: ?*anyopaque = null,
@@ -1053,7 +1188,8 @@ pub const OwnerService = struct {
         const t0 = clock.monotonicNs();
         defer stats.membership_renew_serve_ns.record(clock.monotonicNs() - t0);
         const r = req.payload.renew;
-        switch (screen.renew(r, self.data_volumes)) {
+        const bound = self.owner.renewalBinding();
+        switch (screen.renew(r, bound.data_volumes)) {
             .ok => {},
             .rejected => |why| return service.Answer.rejected(@tagName(why)),
         }
@@ -1063,7 +1199,7 @@ pub const OwnerService = struct {
                 // The declarations of a LIVE member (the renewal granted
                 // is the liveness proof): one per data volume, screened
                 // above, to the holder.
-                if (self.windows) |ws| if (memberIdentity(r.head.id)) |identity| {
+                if (bound.windows) |ws| if (memberIdentity(r.head.id)) |identity| {
                     var it = r.windows();
                     while (it.next()) |w| ws.declare(ws.ctx, identity, w.vol_tag, w.ranges);
                 };
@@ -1408,8 +1544,8 @@ test "the member row is the writer claim's shape at kind 1: round-trip, kind 0 r
 test "the owner: arm refuses a stale term; a join writes ONE row and grants an epoch; renewals write nothing; eviction at >= T_owner ships the death with the member's epoch and key; the key is remembered 2 × T_owner; a leave is never a death" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    try testing.expectError(error.StaleTerm, Owner.arm(gpa, clocks, 0, 3, 3, &.{}, 0));
-    var o = try Owner.arm(gpa, clocks, 0, 4, 3, &.{}, 1000);
+    try testing.expectError(error.StaleTerm, Owner.arm(gpa, testing.io, clocks, 0, 3, 3, &.{}, 0));
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 4, 3, &.{}, 1000);
     defer o.deinit();
     var deaths: Deaths = .{};
     defer deaths.list.deinit(gpa);
@@ -1434,7 +1570,7 @@ test "the owner: arm refuses a stale term; a join writes ONE row and grants an e
     try testing.expectEqual(commits0 + 1, stats.membership_registration_commits.load());
     try testing.expect(o.renew(id1, 2, 0, t) == .unknown_lease);
     try testing.expectEqual(Liveness.live, o.liveness(id1, t));
-    try testing.expectEqual(@as(?u64, 0x1001), o.registeredKey(id1));
+    try testing.expectEqual(@as(?u64, 0x1001), o.deathScreen(id1, 0x1001, testIdentity(9).node_token, t).registered_key);
     // Eviction at exactly the deadline (>=), never before.
     const ev0 = stats.membership_evictions.load();
     try testing.expectEqual(@as(u32, 0), o.expireDue(t + 44_999));
@@ -1447,11 +1583,11 @@ test "the owner: arm refuses a stale term; a join writes ONE row and grants an e
     try testing.expectEqual(@as(u32, 1), rows.deletes);
     try testing.expectEqual(Liveness.dead, o.liveness(id1, t + 45_000));
     try testing.expect(o.renew(id1, 1, 0, t + 45_001) == .unknown_lease);
-    try testing.expect(o.holdsKeyElsewhere(0x1001, testIdentity(9).node_token));
+    try testing.expect(o.deathScreen(writerMemberId(testIdentity(9)), 0x1001, testIdentity(9).node_token, t + 45_001).held_elsewhere);
     // Its own node's word: the host's key, shared by its siblings.
-    try testing.expect(!o.holdsKeyElsewhere(0x1001, testIdentity(1).node_token));
+    try testing.expect(!o.deathScreen(writerMemberId(testIdentity(9)), 0x1001, testIdentity(1).node_token, t + 45_001).held_elsewhere);
     _ = o.expireDue(t + 45_000 + 2 * 45_000);
-    try testing.expect(!o.holdsKeyElsewhere(0x1001, testIdentity(9).node_token));
+    try testing.expect(!o.deathScreen(writerMemberId(testIdentity(9)), 0x1001, testIdentity(9).node_token, t + 45_000 + 2 * 45_000).held_elsewhere);
     // A leave: departed, no death.
     _ = o.join(joinReqOf(2, null, "/mnt/b"), t);
     try testing.expect(o.leave(writerMemberId(testIdentity(2)), t));
@@ -1463,7 +1599,7 @@ test "the owner: arm refuses a stale term; a join writes ONE row and grants an e
 test "the reclaim is idempotent against the state held (a lost grant reply): with the grace closed, a reclaim naming the epoch granted re-points; one naming a STALE epoch from the SAME incarnation (pid, boot) re-points too — never UnknownLease, never a poison of a live member; the same id from ANOTHER incarnation with a stale epoch is UnknownLease; an epoch above the held one is UnknownLease; a dead-and-evicted member's reclaim is UnknownLease" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     const id = writerMemberId(testIdentity(1));
     const e1 = o.join(joinReqOf(1, null, "/mnt/a"), 0).granted.epoch;
@@ -1501,7 +1637,7 @@ test "grace, two halves on one deadline: a stranger is refused while the fresh h
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
     const a = writerMemberId(testIdentity(1));
     const b = writerMemberId(testIdentity(2));
-    var o = try Owner.arm(gpa, clocks, 0, 2, 1, &.{ a, b }, 10_000);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{ a, b }, 10_000);
     defer o.deinit();
     var deaths: Deaths = .{};
     defer deaths.list.deinit(gpa);
@@ -1527,7 +1663,7 @@ test "grace, two halves on one deadline: a stranger is refused while the fresh h
     try testing.expectEqual(@as(u32, 0), o.reapGraceDeadline(55_000, &rosterKey));
     try testing.expectEqual(@as(usize, 0), deaths.list.items.len);
     // A second owner whose expected member never returns: dead at the deadline, once.
-    var o2 = try Owner.arm(gpa, clocks, 1, 2, 1, &.{a}, 0);
+    var o2 = try Owner.arm(gpa, testing.io, clocks, 1, 2, 1, &.{a}, 0);
     defer o2.deinit();
     o2.bindDeathSink(deaths.sink());
     try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(44_999, &rosterKey));
@@ -1542,13 +1678,13 @@ test "a predecessor-roster member that re-asserted, then left or was evicted, jo
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(3_000, 0, 100);
     const a = writerMemberId(testIdentity(1));
-    var o = try Owner.arm(gpa, clocks, 0, 2, 1, &.{a}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{a}, 0);
     defer o.deinit();
     // The re-assertion (expected, no epoch) inside the window.
     const g1 = o.join(joinReqOf(1, null, "/m1"), 100).granted;
     // Evicted at T_owner (silent), then its re-join in place: a fresh join.
     try testing.expectEqual(@as(u32, 1), o.expireDue(100 + clocks.t_owner_ms));
-    try testing.expect(o.find(a) == null);
+    try testing.expect(o.member(a) == null);
     const g2 = o.join(joinReqOf(1, null, "/m1"), 200 + clocks.t_owner_ms).granted;
     try testing.expect(g2.epoch > g1.epoch);
     try testing.expectEqual(@as(u64, 0), g2.ack_prior_epoch);
@@ -1557,7 +1693,7 @@ test "a predecessor-roster member that re-asserted, then left or was evicted, jo
     try testing.expect(o.join(joinReqOf(1, null, "/m1"), 400 + clocks.t_owner_ms) == .granted);
     // An expected member that never re-asserted joins past the deadline: fresh.
     const b = writerMemberId(testIdentity(2));
-    var o2 = try Owner.arm(gpa, clocks, 1, 2, 1, &.{b}, 0);
+    var o2 = try Owner.arm(gpa, testing.io, clocks, 1, 2, 1, &.{b}, 0);
     defer o2.deinit();
     try testing.expect(o2.join(joinReqOf(2, null, "/m2"), clocks.grace_ms + 1) == .granted);
 }
@@ -1565,7 +1701,7 @@ test "a predecessor-roster member that re-asserted, then left or was evicted, jo
 test "OQ-5: the same (node, mount_slot) LIVE at another mount point refuses naming the other; the same mount point replaces the prior state; the census pages in join order with a cursor; the push carriage rides the next grant once" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     _ = o.join(joinReqOf(1, null, "/mnt/one"), 0).granted;
     const c = o.join(joinReqOf(1, null, "/mnt/two"), 1000).mount_slot_collision;
@@ -1673,7 +1809,7 @@ fn manualGeneration(_: ?*anyopaque) u64 {
 test "the member over the owner's wire face: join learns the clocks anchored on the send instant; the tick renews at the cadence and never between beats; the carriage's offer lands at the member and the owner's set-config generation rides every grant; a dead venue past T_self PARKS a symmetric appender (never the poison) and the reclaim beat rejoins once the successor admits it; a remote-custody lease poisons" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     manual_now_ms = 0;
     manual_generation = 3;
@@ -1716,7 +1852,7 @@ test "the member over the owner's wire face: join learns the clocks anchored on 
     // Parked beats against a dead venue keep the park.
     try testing.expectEqual(TickVerdict.parked, m.tick(t_self_at + 10_000, 2_000));
     // The successor arms at term 2 with this member expected; the reclaim lands.
-    var succ = try Owner.arm(gpa, clocks, 0, 2, 1, &.{m.id}, t_self_at + 20_000);
+    var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{m.id}, t_self_at + 20_000);
     defer succ.deinit();
     manual_now_ms = t_self_at + 20_000;
     var ssvc: OwnerService = .{ .owner = &succ, .now = &manualNow };
@@ -1728,7 +1864,8 @@ test "the member over the owner's wire face: join learns the clocks anchored on 
     try testing.expectEqual(reclaims0 + 1, park.stats.slot_lease_reclaims.load());
     try testing.expect(!gate.isParked());
     try testing.expectEqual(Liveness.live, succ.liveness(m.id, t_self_at + 20_000));
-    try testing.expect(succ.grace.?.fresh_closed);
+    // Every expected member re-asserted: the fresh half closed early.
+    try testing.expect(succ.join(joinReqOf(9, null, "/m9"), t_self_at + 20_000) == .granted);
     try m.leave();
     // A remote-custody lease at T_self: the poison, terminal.
     var r: Member = .{ .gpa = gpa, .id = @splat(0x44), .role = .reader, .link = sdl.link(), .pid = 8, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0, .mount = "/mnt/r", .poison = p.sink() };
@@ -1742,7 +1879,7 @@ test "the member over the owner's wire face: join learns the clocks anchored on 
 test "UnknownLease before T_self fences terminally and never parks; a leave over a standing park is refused" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     manual_now_ms = 0;
     var osvc: OwnerService = .{ .owner = &o, .now = &manualNow };
@@ -1768,7 +1905,7 @@ test "UnknownLease before T_self fences terminally and never parks; a leave over
 test "THE RE-JOIN IN PLACE's verdict (decision 0003 §BS): a member armed to re-join answers the owner's UnknownLease `evicted` — at a renewal before T_self and at the reclaim under the park — touching neither the gate nor the words nor the poison; an expired park stays the terminal fence; unarmed, the same answers fence and poison as before" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     manual_now_ms = 0;
     var osvc: OwnerService = .{ .owner = &o, .now = &manualNow };
@@ -1816,7 +1953,7 @@ test "THE RE-JOIN IN PLACE's verdict (decision 0003 §BS): a member armed to re-
 test "T_self is the member's clock, never its beat's liveness: with the beat stalled, a committer at the pre-admission gate past the deadline PARKS the gate itself (one park, one self-fence, acks held), the committer waits, the beat's next tick runs the reclaim beat and the re-point releases it; before the first grant nothing fences; a renewal in time fences nothing" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     manual_now_ms = 0;
     var osvc: OwnerService = .{ .owner = &o, .now = &manualNow };
@@ -1871,7 +2008,7 @@ test "T_self is the member's clock, never its beat's liveness: with the beat sta
 test "THE DOUBLE PARK (the kill matrix's, 2026-10-24) at the membership core: the manager dies ⇒ PARK #1 at T_self ⇒ the successor admits the reclaim in grace and the deadline is the reclaim's (its send instant + T_self, never a stale one); renewals carry the member past the grace window; the beat silent past T_self but short of T_owner ⇒ PARK #2, and its reclaim RE-POINTS against the epoch the successor holds (granted, no refusal, no poison: idempotent against the manager's view); the beat silent past T_owner is a REAL eviction (the successor evicts at T_owner and ships the death) ⇒ PARK #3, and the reclaim's UnknownLease is HONEST: the member fences, poisoned once" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     manual_now_ms = 0;
     var osvc: OwnerService = .{ .owner = &o, .now = &manualNow };
@@ -1889,7 +2026,7 @@ test "THE DOUBLE PARK (the kill matrix's, 2026-10-24) at the membership core: th
     // The successor arms at term 2 expecting the member; the reclaim lands
     // and re-arms the deadline at its own send instant.
     const t1 = clocks.t_self_ms + 5_000;
-    var succ = try Owner.arm(gpa, clocks, 0, 2, 1, &.{m.id}, t1);
+    var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{m.id}, t1);
     defer succ.deinit();
     var deaths: Deaths = .{};
     defer deaths.list.deinit(gpa);
@@ -1948,7 +2085,7 @@ test "THE DOUBLE PARK (the kill matrix's, 2026-10-24) at the membership core: th
 test "the clients seam lists every member of the shard: a writer through its row's classifier (dead-pid proof applies), a reader as a live row" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     _ = o.join(joinReqOf(1, null, "/m"), 0).granted;
     var rq = joinReqOf(2, null, "/r");
@@ -2005,11 +2142,11 @@ test "a successor's grace expects no same-host predecessor whose pid is proven d
     reader.id = @splat(0x99);
     reader.role = .reader;
     reader.row = null;
-    var succ = try Owner.arm(gpa, clocks, 0, 2, 1, roster.items, 10_000);
+    var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, roster.items, 10_000);
     defer succ.deinit();
     _ = succ.join(reader, 10_001).granted;
     // The roster that expected the dead row: the same reader is refused.
-    var stale = try Owner.arm(gpa, clocks, 0, 2, 1, &.{writerMemberId(testIdentity(1))}, 10_000);
+    var stale = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{writerMemberId(testIdentity(1))}, 10_000);
     defer stale.deinit();
     try testing.expect(stale.join(reader, 10_001) == .grace_refused);
 }
@@ -2032,7 +2169,7 @@ test "fuzz: the member row decoder is total on arbitrary and restamped claims; a
 test "the census's writer keys (decision 0003 §DL): every listed writer's host key once — distinct, never 0, never a reader's; a departure and an eviction take theirs out; a successor's census is incomplete while its re-assertion window stands (a predecessor's member not back is listed nowhere)" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     _ = o.join(joinReqOf(1, null, "/m1"), 0).granted;
     _ = o.join(joinReqOf(2, null, "/m2"), 0).granted;
@@ -2059,7 +2196,7 @@ test "the census's writer keys (decision 0003 §DL): every listed writer's host 
     }
     // A successor with a predecessor's roster: incomplete until the
     // re-assertion window closes.
-    var succ = try Owner.arm(gpa, clocks, 0, 2, 1, &.{writerMemberId(testIdentity(1))}, 1000);
+    var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{writerMemberId(testIdentity(1))}, 1000);
     defer succ.deinit();
     try testing.expectError(error.Incomplete, succ.writerKeys(gpa, 1000));
     const keys = try succ.writerKeys(gpa, 1000 + clocks.grace_ms);
@@ -2119,7 +2256,7 @@ test "a renewal is never lost to a join's append (decision 0003 §DM): a renew p
     defer testing.expect(dbg.deinit() == .ok) catch unreachable;
     const gpa = dbg.allocator();
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     var deaths: Deaths = .{};
     defer deaths.list.deinit(testing.allocator);
@@ -2149,7 +2286,7 @@ test "a renewal is never lost to a join's append (decision 0003 §DM): a renew p
 test "an eviction and the renewal it races are one order (decision 0003 §DM): expireDue parked between judging a member due and evicting it while that member's renewal (its clock read just inside the deadline) arrives — either the renewal lands first and nothing is evicted, or the eviction does and the renewal answers UnknownLease; never a granted renewal AND an eviction (a live member's death shipped)" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     var deaths: Deaths = .{};
     defer deaths.list.deinit(gpa);

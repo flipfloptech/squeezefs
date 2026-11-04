@@ -331,7 +331,7 @@ pub const Mount = struct {
     stamps: *fencing.FrameStamps,
     ledger: *death_ledger.Ledger,
     /// The home shard's owner (step 0's "listed LIVE again").
-    census: ?*const shard.Owner = null,
+    census: ?*shard.Owner = null,
     skew_max_ms: u64,
     /// `coherenceHoldMs` of the shard's clocks: the recovered slots take
     /// no write before the record's ts + this.
@@ -1855,7 +1855,7 @@ test "an EARLY record quarantines the recovered slots' custody for T_owner + 2 Ã
     const f2 = try Fixture.init(gpa, false);
     defer f2.deinit();
     const clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
-    var o = try shard.Owner.arm(gpa, clocks, 1, 1, 0, &.{}, 0);
+    var o = try shard.Owner.arm(gpa, testing.io, clocks, 1, 1, 0, &.{}, 0);
     defer o.deinit();
     _ = o.join(.{ .id = shard.writerMemberId(death_ledger.wireOf(DEAD)), .role = .writer, .endpoint = .none, .pid = 1, .boot = @splat(0), .prior_epoch = null, .pr_key = 0, .mount = "/m", .row = null }, 0).granted;
     f2.driver.mount.census = &o;

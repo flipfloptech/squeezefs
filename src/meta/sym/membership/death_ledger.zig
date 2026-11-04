@@ -269,7 +269,7 @@ pub const Ledger = struct {
     /// The `RecordDeath` screen: every verdict BEFORE anything is written.
     /// `census` supplies the owner's view (null = this node owns no shard
     /// the member could be in: the word is unvalidated).
-    pub fn screenDeath(self: *Ledger, req: verbs.RecordDeathReq, census: ?*const shard.Owner, now_ms: u64) screen.Verdict {
+    pub fn screenDeath(self: *Ledger, req: verbs.RecordDeathReq, census: ?*shard.Owner, now_ms: u64) screen.Verdict {
         // The one key the screen asks about, held or not: no allocation, so
         // the screen never fails open.
         const held = [1]u64{req.pr_key};
@@ -277,16 +277,17 @@ pub const Ledger = struct {
         var listed_live = false;
         var registered: ?u64 = null;
         if (census) |o| {
-            const id = shard.writerMemberId(req.member);
-            listed_live = o.memberIsLive(id, now_ms);
-            registered = o.registeredKey(id);
+            // One read of the roster (decision 0003 §DM).
+            const view = o.deathScreen(shard.writerMemberId(req.member), req.pr_key, req.member.node_token, now_ms);
+            listed_live = view.listed_live;
+            registered = view.registered_key;
             // The held-key check answers only for a member the census does
             // not know (review round 3, major 5): a known member's key is
             // checked against its registration — a host's key outlives its
             // reboot (its node token does not), so a pre-reboot member's
             // death is never refused because the rebooted host's new mount
             // holds the same key.
-            if (registered == null and o.holdsKeyElsewhere(req.pr_key, req.member.node_token)) n_held = 1;
+            if (registered == null and view.held_elsewhere) n_held = 1;
         }
         const b: screen.DeathBounds = .{ .own = self.own, .listed_live = listed_live, .registered_key = registered, .held_keys = held[0..n_held] };
         const v = screen.recordDeath(req, &b);
@@ -413,7 +414,7 @@ pub fn retirable(recorded_realtime_ns: u64, now_realtime_ns: u64, t_owner_ms: u6
 pub const LedgerHandlers = struct {
     ledger: *Ledger,
     /// The shard this node owns (the screen's census), if any.
-    census: ?*const shard.Owner,
+    census: ?*shard.Owner,
     now: *const fn (ctx: ?*anyopaque) u64,
     now_ctx: ?*anyopaque = null,
     is_vol0_manager: *const fn (ctx: ?*anyopaque) bool,
@@ -651,7 +652,7 @@ test "the screen: own identity, a live member, a key the census holds on another
     var l = Ledger.init(gpa, rs.store(), 2, wireOf(wid(0)), 45_000);
     defer l.deinit();
     const clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
-    var o = try shard.Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try shard.Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     _ = o.join(.{ .id = shard.writerMemberId(wireOf(wid(3))), .role = .writer, .endpoint = .none, .pid = 1, .boot = @splat(0), .prior_epoch = null, .pr_key = 0x33, .mount = "/m", .row = null }, 0).granted;
     const req = struct {
@@ -694,7 +695,7 @@ test "the screen reads one roster (decision 0003 §DM): a held-key scan parked m
     var l = Ledger.init(gpa, rs.store(), 2, wireOf(wid(0)), 45_000);
     defer l.deinit();
     const clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
-    var o = try shard.Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    var o = try shard.Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     const member = struct {
         fn of(n: u32, key: u64) shard.JoinRequest {
@@ -728,7 +729,7 @@ test "an evicted member's key stays held through an allocation failure: the depa
     var l = Ledger.init(failing.allocator(), rs.store(), 2, wireOf(wid(0)), 45_000);
     defer l.deinit();
     const clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
-    var o = try shard.Owner.arm(failing.allocator(), clocks, 0, 1, 0, &.{}, 0);
+    var o = try shard.Owner.arm(failing.allocator(), testing.io, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     _ = o.join(.{ .id = shard.writerMemberId(wireOf(wid(3))), .role = .writer, .endpoint = .none, .pid = 1, .boot = @splat(0), .prior_epoch = null, .pr_key = 0x33, .mount = "/m", .row = null }, 0).granted;
     failing.fail_index = failing.alloc_index;

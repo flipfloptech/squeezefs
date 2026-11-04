@@ -686,6 +686,71 @@ test "the skip scanner: an identifier counts, prose in a comment or a string doe
 }
 
 // ---------------------------------------------------------------------------
+// The membership owner's lock rail (decision 0003 §DM): the owner's shared
+// state is served by one thread per connection and the cadence, so it is
+// reached only through `lockRoster`, which takes the owner's lock. The field
+// `owner_roster` is named exactly at its declaration, `arm`, `deinit` (before
+// and after anything serves) and `lockRoster`, and in no other file.
+// ---------------------------------------------------------------------------
+
+const owner_path = "src/meta/sym/membership/shard.zig";
+const owner_state_field = "owner_roster";
+const owner_state_names = 4;
+
+/// The identifier tokens `name` in the file; prose in a comment or a string
+/// does not count.
+fn identifierCount(text: [:0]const u8, name: []const u8) usize {
+    var tok = std.zig.Tokenizer.init(text);
+    var n: usize = 0;
+    while (true) {
+        const t = tok.next();
+        if (t.tag == .eof) return n;
+        if (t.tag == .identifier and std.mem.eql(u8, text[t.loc.start..t.loc.end], name)) n += 1;
+    }
+}
+
+test "owner lock rail: the membership owner's shared state is named only where its lock hands it out (decision 0003 §DM)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (files.items) |f| gpa.free(f);
+        files.deinit(gpa);
+    }
+    const cwd = std.Io.Dir.cwd();
+    for (roots) |root| {
+        var d = try cwd.openDir(io, root, .{ .iterate = true });
+        defer d.close(io);
+        try walk(gpa, io, d, root, &files);
+    }
+    try std.testing.expect(files.items.len >= min_files);
+    var violations: std.Io.Writer.Allocating = .init(gpa);
+    defer violations.deinit();
+    var owner_seen = false;
+    for (files.items) |path| {
+        const text = try readWalked(gpa, io, cwd, path) orelse continue;
+        defer gpa.free(text);
+        const n = identifierCount(text, owner_state_field);
+        if (std.mem.eql(u8, path, owner_path)) {
+            owner_seen = true;
+            if (n != owner_state_names) try violations.writer.print("  {s}: `{s}` named {d} times, {d} expected (its declaration, arm, deinit, lockRoster) — reach the roster through lockRoster\n", .{ path, owner_state_field, n, owner_state_names });
+        } else if (n != 0) {
+            try violations.writer.print("  {s}: names the owner's `{s}` {d} time(s) — use an Owner method (it takes the lock)\n", .{ path, owner_state_field, n });
+        }
+    }
+    try std.testing.expect(owner_seen);
+    if (violations.written().len != 0) {
+        std.debug.print("owner state named off its lock:\n{s}", .{violations.written()});
+        return error.OwnerStateOffLock;
+    }
+}
+
+test "the identifier counter: identifiers count, prose in a comment or a string does not" {
+    try std.testing.expectEqual(@as(usize, 2), identifierCount("const owner_roster = 1;\n_ = x.owner_roster;\n", "owner_roster"));
+    try std.testing.expectEqual(@as(usize, 0), identifierCount("// owner_roster in prose\nconst s = \"owner_roster\";\n", "owner_roster"));
+}
+
+// ---------------------------------------------------------------------------
 // The transaction ownership rail (docs/evidence/rung-10-coherence-defects.md
 // item 1): every store's `commit(t)` CONSUMES the transaction on every path,
 // its refusals included (`KvBackend.commit` destroys it in a `defer`). An

@@ -138,7 +138,7 @@ pub const VolumeBinding = struct {
     /// `census` = the home shard's owner (step 0's "listed LIVE again");
     /// `skew_max_ms` the shard's clock skew bound (the quarantine's term),
     /// `renew_ms` its renew interval (the coherence hold's).
-    pub fn create(gpa: Allocator, be: *KvBackend, ledger: *death_ledger.Ledger, census: ?*const shard.Owner, skew_max_ms: u64, renew_ms: u64) Allocator.Error!*VolumeBinding {
+    pub fn create(gpa: Allocator, be: *KvBackend, ledger: *death_ledger.Ledger, census: ?*shard.Owner, skew_max_ms: u64, renew_ms: u64) Allocator.Error!*VolumeBinding {
         const aset = be.sym orelse unreachable;
         const self = try gpa.create(VolumeBinding);
         errdefer gpa.destroy(self);

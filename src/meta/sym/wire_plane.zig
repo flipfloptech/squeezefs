@@ -816,7 +816,7 @@ pub const WirePlane = struct {
         // incarnation).
         set.armTokens(&self.hook);
         if (self.mgr) |m| {
-            log.info("cluster wire: manager of {d} volume(s) listening at {s}; membership owner term {d} (T_owner {d} ms, grace {s})", .{ m.faces.len, self.endpointText(), m.owner.term, t_owner_ms, if (m.owner.grace != null) "open" else "closed" });
+            log.info("cluster wire: manager of {d} volume(s) listening at {s}; membership owner term {d} (T_owner {d} ms, grace {s})", .{ m.faces.len, self.endpointText(), m.owner.term, t_owner_ms, if (m.owner.graceOpenForReassert(nowMs())) "open" else "closed" });
         } else {
             log.info("cluster wire: JOINED mount listening at {s} (appender {d} of {d} volume(s)); member of the home shard at {f}, renew every {d} ms, T_self {d} ms", .{ self.endpointText(), be0.joined.?.appenderId(), set.volumes.len, be0.joined.?.managerEndpoint(), self.joined.?.member.clocks.?.renew_ms, self.joined.?.member.clocks.?.t_self_ms });
         }
@@ -868,7 +868,7 @@ pub const WirePlane = struct {
             else => error.Io,
         };
         const term = sym0.manager.term;
-        m.owner = shard.Owner.arm(gpa, clocks, 0, term, term -| 1, expected.items, nowMs()) catch |e| switch (e) {
+        m.owner = shard.Owner.arm(gpa, self.io, clocks, 0, term, term -| 1, expected.items, nowMs()) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             // `term ≤ prior` cannot happen: prior is `term − 1` by construction.
             error.StaleTerm => unreachable,
@@ -1525,7 +1525,7 @@ pub const WirePlane = struct {
                 refs[i] = g.refs;
                 holds[i] = .{ .refs = refs[i].slice(), .already = g.already };
             }
-            const hp = plane_arm.HolderPlane.create(gpa, self.io, dp, .{ .ctx = self, .isMember = &isMemberFn, .liveWriters = &liveWritersFn, .foreignSlots = &foreignSlotsFn }, kv.home(), terms, holds, m.owner.members.items.len + 1) catch |e| return switch (e) {
+            const hp = plane_arm.HolderPlane.create(gpa, self.io, dp, .{ .ctx = self, .isMember = &isMemberFn, .liveWriters = &liveWritersFn, .foreignSlots = &foreignSlotsFn }, kv.home(), terms, holds, m.owner.memberCount() + 1) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Io, error.Corrupt => error.Io,
             };
@@ -1538,8 +1538,7 @@ pub const WirePlane = struct {
             errdefer gpa.free(bounds);
             for (dp.vols.rows[0..n], bounds) |row, *b| b.* = .{ .vol_tag = row.?.vol_tag, .blocks = row.?.alloc.capacityBlocks() };
             self.decl_bounds = bounds;
-            m.owner_svc.data_volumes = bounds;
-            m.owner_svc.windows = .{ .ctx = hp, .declare = &declareWindowsFn };
+            m.owner.bindRenewals(bounds, .{ .ctx = hp, .declare = &declareWindowsFn });
             self.set.volumes[0].installKvdaSink(.{ .ctx = hp, .writePages = &plane_arm.HolderPlane.writeKvdaPages });
             return;
         }
@@ -1561,7 +1560,7 @@ pub const WirePlane = struct {
         const row = dp.vols.rows[ordinal].?;
         if (self.online_arm_hold) self.holdOnlineArm(row.vol_tag);
         const g = (try self.acquireAllocLease(dp, row.vol_tag, row.alloc.capacityBlocks())) orelse return error.Io;
-        hp.armVolume(ordinal, g.term, .{ .refs = g.refs.slice(), .already = g.already }, m.owner.members.items.len + 1) catch |e| return switch (e) {
+        hp.armVolume(ordinal, g.term, .{ .refs = g.refs.slice(), .already = g.already }, m.owner.memberCount() + 1) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io, error.Corrupt => error.Io,
         };
@@ -1745,9 +1744,7 @@ pub const WirePlane = struct {
     fn liveWritersFn(ctx: *anyopaque) u64 {
         const self: *WirePlane = @ptrCast(@alignCast(ctx));
         const m = self.mgr orelse return 0;
-        var n: u64 = 0;
-        for (m.owner.members.items) |mem| n += @intFromBool(mem.role == .writer);
-        return n;
+        return m.owner.writerCount();
     }
 
     /// Slot trees another appender holds in volume 0's lease table (a
@@ -1765,7 +1762,7 @@ pub const WirePlane = struct {
         const wire_id: verbs.WireIdentity = .{ .node_token = id.node_token, .writer_id = id.writer_id, .mount_slot = id.mount_slot, .reserved = 0 };
         if (std.meta.eql(wire_id, self.identity)) return true;
         const m = self.mgr orelse return false;
-        return m.owner.find(shard.writerMemberId(wire_id)) != null;
+        return m.owner.member(shard.writerMemberId(wire_id)) != null;
     }
 
     fn serveBlockGrant(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
@@ -1908,7 +1905,7 @@ pub const WirePlane = struct {
     /// the member (a joiner's).
     pub fn writeStatsJson(self: *WirePlane, w: *Io.Writer) Io.Writer.Error!void {
         if (self.mgr) |m| {
-            try w.print("{{\"wire_posture\":\"manager\",\"wire_endpoint\":\"{s}\",\"wire_listener_connections\":{d},\"wire_managed_volumes\":{d},\"membership_members\":{d},\"membership_term\":{d},\"membership_grace_remaining_ms\":{d},\"wire_peer_links\":{d}", .{ self.endpointText(), self.listener.liveConnections(), m.faces.len, m.owner.members.items.len, m.owner.term, m.owner.graceRemainingMs(nowMs()), self.peers.count() });
+            try w.print("{{\"wire_posture\":\"manager\",\"wire_endpoint\":\"{s}\",\"wire_listener_connections\":{d},\"wire_managed_volumes\":{d},\"membership_members\":{d},\"membership_term\":{d},\"membership_grace_remaining_ms\":{d},\"wire_peer_links\":{d}", .{ self.endpointText(), self.listener.liveConnections(), m.faces.len, m.owner.memberCount(), m.owner.term, m.owner.graceRemainingMs(nowMs()), self.peers.count() });
         } else {
             const j = self.joined.?;
             try w.print("{{\"wire_posture\":\"joined\",\"wire_endpoint\":\"{s}\",\"wire_listener_connections\":{d},\"wire_managed_volumes\":0,\"membership_members\":0,\"membership_term\":0,\"membership_grace_remaining_ms\":0,\"wire_peer_links\":{d},\"member_epoch\":{d},\"member_renewals\":{d},\"member_last_verdict\":{d},\"appender_parked\":{d},\"member_rejoins_in_place\":{d},\"member_appender\":{d}", .{ self.endpointText(), self.listener.liveConnections(), self.peers.count(), j.member.epoch, j.renewals.load(.monotonic), j.last_verdict.load(.acquire), @intFromBool(j.js.park_gate.isParked()), j.rejoins_in_place.load(.monotonic), j.js.appenderId() });
@@ -2298,10 +2295,10 @@ const LeaseOracle = struct {
         return .{ .ctx = self, .verdict = &verdict, .remaining = &remaining };
     }
 
-    fn find(self: *LeaseOracle, client: tokens.table.ClientId) ?shard.MemberId {
+    /// The roster's member under `client`, copied under the owner's lock.
+    fn find(self: *LeaseOracle, client: tokens.table.ClientId) ?shard.MemberState {
         const m = self.plane.mgr orelse return null;
-        for (m.owner.members.items) |ms| if (clientIdOf(ms.id) == client) return ms.id;
-        return null;
+        return m.owner.memberWhere(tokens.table.ClientId, client, clientIdOf);
     }
 
     /// The owner's word on a member's lease — ONE law for the token
@@ -2316,13 +2313,8 @@ const LeaseOracle = struct {
             if (client == clientIdOf(shard.writerMemberId(j.js.manager_identity))) return if (JoinedHalf.selfLive(j, now_ns)) .live else .expired;
             return j.census.verdict(client, since_ns, now_ns);
         }
-        const m = self.plane.mgr.?;
-        const id = self.find(client) orelse return .unknown;
-        return switch (m.owner.liveness(id, WirePlane.nowMs())) {
-            .live => .live,
-            .dead => .expired,
-            .unknown => .unknown,
-        };
+        const ms = self.find(client) orelse return .unknown;
+        return if (WirePlane.nowMs() < ms.deadline_ms) .live else .expired;
     }
 
     /// The token lane's verdict: `since_ns` is the client's last grant
@@ -2358,9 +2350,7 @@ const LeaseOracle = struct {
 
     fn remaining(ctx: ?*anyopaque, client: tokens.table.ClientId, _: u64) ?u64 {
         const self: *LeaseOracle = @ptrCast(@alignCast(ctx.?));
-        const m = self.plane.mgr orelse return null;
-        const id = self.find(client) orelse return null;
-        const ms = m.owner.find(id) orelse return null;
+        const ms = self.find(client) orelse return null;
         const now = WirePlane.nowMs();
         return if (ms.deadline_ms > now) (ms.deadline_ms - now) * std.time.ns_per_ms else 0;
     }
@@ -2506,11 +2496,8 @@ const PeerLinks = struct {
             return self.clientEndpointByCensus(js, client);
         }
         const m = self.plane.mgr orelse return null;
-        for (m.owner.members.items) |ms| if (clientIdOf(ms.id) == client) {
-            if (ms.endpoint.isNone()) return null;
-            return ms.endpoint;
-        };
-        return null;
+        const ms = m.owner.memberWhere(tokens.table.ClientId, client, clientIdOf) orelse return null;
+        return if (ms.endpoint.isNone()) null else ms.endpoint;
     }
 
     fn clientEndpointByCensus(self: *PeerLinks, js: *joined.JoinedSet, client: tokens.table.ClientId) ?endpoint.EndpointWire {
@@ -2757,13 +2744,13 @@ test "linux: the daemon's wire plane over a real symmetric set — the listener 
         var member: shard.Member = .{ .gpa = gpa, .id = shard.writerMemberId(joinerIdentity()), .role = .writer, .link = tl.link(), .pid = 4242, .boot = @splat(1), .endpoint = .none, .pr_key = 0, .mount = "/mnt-b", .gate = &gate, .poison = TestPoison.sink(), .carriage = joiner.carriageSink() };
         const now = clock.monotonicNs() / std.time.ns_per_ms;
         try testing.expectEqual(shard.Member.JoinOutcome.granted, member.join(now, null));
-        try testing.expectEqual(@as(usize, 1), plane.mgr.?.owner.members.items.len);
+        try testing.expectEqual(@as(usize, 1), plane.mgr.?.owner.memberCount());
         try testing.expectEqual(shard.Liveness.live, plane.mgr.?.owner.liveness(member.id, now));
         const row = (try be0.lookup(gpa, key.TREE_CONTROL, cr.memberKey(.{ .node_token = joinerIdentity().node_token, .mount_slot = joinerIdentity().mount_slot }).slice())).?;
         defer gpa.free(row);
         try testing.expectEqual(@as(u32, 4242), (try shard.MemberRow.decode(row)).pid);
         plane.tick();
-        try testing.expectEqual(@as(usize, 1), plane.mgr.?.owner.members.items.len);
+        try testing.expectEqual(@as(usize, 1), plane.mgr.?.owner.memberCount());
         // The renewal beat over the wire: idle before the cadence, renewed
         // at it (the shard's deadline moves; nothing is evicted).
         try testing.expectEqual(shard.TickVerdict.idle, member.tick(now + 1, 0));
@@ -2788,7 +2775,7 @@ test "linux: the daemon's wire plane over a real symmetric set — the listener 
         joiner.leased.items.len = 0;
         const left = try joiner.leave();
         try testing.expect(!left.already);
-        try testing.expectEqual(@as(usize, 0), plane.mgr.?.owner.members.items.len);
+        try testing.expectEqual(@as(usize, 0), plane.mgr.?.owner.memberCount());
         try testing.expect((try be0.lookup(gpa, key.TREE_CONTROL, cr.memberKey(.{ .node_token = joinerIdentity().node_token, .mount_slot = joinerIdentity().mount_slot }).slice())) == null);
         const p1 = (try be0.sym.?.manager.readPageOf(1)).?;
         try testing.expectEqual(page.State.free, p1.state);
@@ -2808,7 +2795,7 @@ test "linux: the daemon's wire plane over a real symmetric set — the listener 
         const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
         defer plane.stop();
         try testing.expectEqual(pubs0 + 2, stats.wire_endpoint_publications.load());
-        try testing.expect(plane.mgr.?.owner.grace == null);
+        try testing.expectEqual(@as(u64, 0), plane.mgr.?.owner.graceRemainingMs(WirePlane.nowMs()));
         try testing.expect(!std.mem.eql(u8, ep_text_buf[0..ep_text_len], plane.endpointText()));
     }
 }

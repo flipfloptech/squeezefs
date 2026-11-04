@@ -1679,6 +1679,61 @@ test "grace, two halves on one deadline: a stranger is refused while the fresh h
     try testing.expectEqual(Liveness.dead, o2.liveness(a, 45_000));
 }
 
+test "the merged expected set (decision 0004 §4.6, KD17): arm with no rows and one Live page's identity opens a grace by itself; the deadline reaps the page-only identity with its page's host key and a row with no page with key 0; a re-asserted entry is never reaped; the census's liveness reads unknown for both inside the window" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    const page_only = writerMemberId(testIdentity(1));
+    const row_only = writerMemberId(testIdentity(2));
+    const back = writerMemberId(testIdentity(3));
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{.{ .id = page_only, .key = 0xA11 }}, &.{}, 0);
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 45_000), o.graceRemainingMs(0));
+    try testing.expectEqual(Liveness.unknown, o.liveness(page_only, 1));
+    try testing.expect(o.join(joinReqOf(7, null, "/m7"), 1) == .grace_refused);
+    var o2 = try Owner.arm(gpa, testing.io, clocks, 1, 2, 1, &.{ .{ .id = page_only, .key = 0xA11 }, .{ .id = row_only, .key = 0 }, .{ .id = back, .key = 0xB33 } }, &.{}, 0);
+    defer o2.deinit();
+    var deaths: Deaths = .{};
+    defer deaths.list.deinit(gpa);
+    o2.bindDeathSink(deaths.sink());
+    try testing.expect(o2.join(joinReqOf(3, null, "/m3"), 10) == .granted);
+    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(44_999));
+    try testing.expectEqual(@as(u32, 2), o2.reapGraceDeadline(45_000));
+    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(46_000));
+    try testing.expectEqual(@as(usize, 2), deaths.list.items.len);
+    for (deaths.list.items) |d| {
+        try testing.expectEqual(@as(u64, 0), d.epoch);
+        if (std.mem.eql(u8, &d.id, &page_only)) {
+            try testing.expectEqual(@as(u64, 0xA11), d.pr_key);
+        } else {
+            try testing.expect(std.mem.eql(u8, &d.id, &row_only));
+            try testing.expectEqual(@as(u64, 0), d.pr_key);
+        }
+    }
+}
+
+test "a same-host page identity proven dead (decision 0004 §4.6, KD17) is never expected and is shipped to the death sink right after bindDeathSink — exactly once, never before the sink is bound, with its page's key and epoch 0" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    const dead = writerMemberId(testIdentity(4));
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{}, &.{.{ .id = dead, .key = 0xD44 }}, 0);
+    defer o.deinit();
+    try testing.expectEqual(@as(u64, 0), o.graceRemainingMs(0));
+    try testing.expectEqual(@as(u32, 0), o.reapGraceDeadline(45_000));
+    var deaths: Deaths = .{};
+    defer deaths.list.deinit(gpa);
+    o.bindDeathSink(deaths.sink());
+    try testing.expectEqual(@as(usize, 1), deaths.list.items.len);
+    const d = deaths.list.items[0];
+    try testing.expect(std.mem.eql(u8, &d.id, &dead));
+    try testing.expect(d.identity.?.sameMember(testIdentity(4)));
+    try testing.expectEqual(@as(u64, 0xD44), d.pr_key);
+    try testing.expectEqual(@as(u64, 0), d.epoch);
+    o.bindDeathSink(deaths.sink());
+    try testing.expectEqual(@as(u32, 0), o.reapGraceDeadline(90_000));
+    try testing.expectEqual(@as(u32, 0), o.expireDue(90_000));
+    try testing.expectEqual(@as(usize, 1), deaths.list.items.len);
+}
+
 test "a predecessor-roster member that re-asserted, then left or was evicted, joins FRESH under the same owner (a re-join in place, decision 0003 §BS): its join without an epoch is a re-assertion only while the window stands and it has not re-asserted; past the deadline, too, it is a fresh join, never UnknownLease" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(3_000, 0, 100);

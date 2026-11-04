@@ -840,6 +840,18 @@ test "the death preempt: a usurper's key is preempted-and-aborted (fenced; the v
     try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, null, 0x4444));
 }
 
+test "the death fence's key (decision 0004 §4.8, KD8): the death record's key when it carries one, else the dead appender page's host_key; both non-zero and different is a mismatch (the recovery holds); both zero is no key (the tail scan)" {
+    try testing.expectEqual(DeathKey{ .record = 0x11 }, deathKey(0x11, 0));
+    try testing.expectEqual(DeathKey{ .record = 0x11 }, deathKey(0x11, 0x11));
+    try testing.expectEqual(DeathKey{ .page = 0x22 }, deathKey(0, 0x22));
+    try testing.expectEqual(DeathKey.mismatch, deathKey(0x11, 0x22));
+    try testing.expectEqual(DeathKey.none, deathKey(0, 0));
+    try testing.expectEqual(@as(u64, 0x22), deathKey(0, 0x22).victim().?);
+    try testing.expectEqual(@as(u64, 0x11), deathKey(0x11, 0).victim().?);
+    try testing.expectEqual(@as(?u64, 0), deathKey(0, 0).victim());
+    try testing.expectEqual(@as(?u64, null), deathKey(0x11, 0x22).victim());
+}
+
 test "the death preempt under the manager's WERO hold: on nvmet 7.3's semantics the holder's preempt answers success yet keeps the victim registered — .ignored (the full tail scan, counted, no re-fence), never a release that would leave the namespace unreserved; on a spec-conformant target the same preempt fences the victim's host with the hold kept; the re-fence preempts a key registered again" {
     const gpa = testing.allocator;
     var ns = fake.Namespace.init(gpa);

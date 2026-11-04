@@ -1696,6 +1696,42 @@ test "B1 on a PR substrate (the fake): the symmetric volume's manager holds WERO
     try testing.expectEqual(@as(?u64, null), ns.holder);
 }
 
+/// Appender 0's newest valid page on the device, its host key.
+fn page0HostKey(be: *backend.KvBackend) !u64 {
+    const appender_page = @import("../sym/appender_page.zig");
+    const offs = appender_page.appender0PageOffsets(be.sb.journal.start);
+    var bufs: [appender_page.PAGE_SLOTS][appender_page.PAGE_LEN]u8 = undefined;
+    var imgs: [appender_page.PAGE_SLOTS]?[]const u8 = @splat(null);
+    for (offs, 0..) |off, i| {
+        const img = try be.dev.readRange(testing.allocator, off, appender_page.PAGE_LEN);
+        defer testing.allocator.free(img);
+        @memcpy(&bufs[i], img[0..appender_page.PAGE_LEN]);
+        imgs[i] = &bufs[i];
+    }
+    return ((try appender_page.newestValid(imgs)) orelse return error.PageMissing).host_key;
+}
+
+test "region 0's appender page carries the manager's registration key (decision 0004 §6.1, KD8: a superseded manager's host key, read off its page by the successor) — written at the bind; 0 with no PR posture" {
+    const gpa = testing.allocator;
+    const v = try Vol.create(gpa, "page0-key", null);
+    defer v.destroy();
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var host: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
+    const me = ident(boot_a, 4000, 777);
+    {
+        const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
+        defer be.close();
+        const manager_key = be.guard.?.prClient().?.key;
+        try testing.expect(manager_key != 0);
+        try testing.expectEqual(manager_key, try page0HostKey(be));
+    }
+    ns.rescap = 0;
+    const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
+    defer be.close();
+    try testing.expectEqual(@as(u64, 0), try page0HostKey(be));
+}
+
 const host_f_id: [16]u8 = "guard-fencer-03!".*;
 
 test "the fencing registrant on a PR substrate (the fake, decision 0003 §DG): the symmetric manager stands its fencer after the hold — registered under the manager's key beside its host, never the holder (regctl 2); a member's death preempt through it lands under nvmet 7.3's semantics; the clean unmount gives the fencer back and KEEPS the hold a preempt landed under; without a preempt the unmount leaves zero residue" {

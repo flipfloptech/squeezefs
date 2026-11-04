@@ -552,6 +552,50 @@ test "slot_page_budget derives from the page's fixed part: (4088 − 296) / 35 =
     try testing.expectEqual(@as(usize, 4088), CHECKSUM_OFF);
 }
 
+test "page layout v2 carries the host key (decision 0004 §6.1, KD8): host_key at @296, FIXED_LEN 304, the slot entries from @304; the slot budget stays (4088 − 304) / 35 = 108 r 4; a zero key round-trips as 0" {
+    try testing.expectEqual(@as(u16, 2), LAYOUT_VERSION);
+    try testing.expectEqual(@as(usize, 304), FIXED_LEN);
+    try testing.expectEqual(@as(usize, 296), HOST_KEY_OFF);
+    try testing.expectEqual(@as(usize, 108), (CHECKSUM_OFF - 304) / SLOT_ENTRY_LEN);
+    try testing.expectEqual(@as(usize, 4), (CHECKSUM_OFF - 304) % SLOT_ENTRY_LEN);
+    var p = samplePage();
+    p.host_key = 0x0123_4567_89AB_CDEF;
+    var img: [PAGE_LEN]u8 = undefined;
+    try p.encode(&img);
+    try testing.expectEqual(@as(u64, 0x0123_4567_89AB_CDEF), get(&img, u64, 296));
+    try testing.expectEqual(@as(u16, 3), get(&img, u16, 304));
+    const back = try decode(&img);
+    try testing.expectEqual(p.host_key, back.host_key);
+    try expectPageEql(&p, &back);
+    p.host_key = 0;
+    try p.encode(&img);
+    try testing.expectEqual(@as(u64, 0), (try decode(&img)).host_key);
+}
+
+test "a layout-1 page decodes as host_key 0 (the v1 arm, decision 0004 §6.1/§6.4, until PR-8): its slot entries at the v1 offset 296, every word kept; re-encoded it is layout 2 with key 0 and decodes to the same page; a v1 image with a non-zero tail past its entries refuses" {
+    const p = samplePage();
+    var v2: [PAGE_LEN]u8 = undefined;
+    try p.encode(&v2);
+    // The same words in layout 1: no key word, the entries 8 B lower.
+    var v1: [PAGE_LEN]u8 = @splat(0);
+    @memcpy(v1[0..296], v2[0..296]);
+    put(&v1, u16, 4, 1);
+    const n = @as(usize, p.n_slots) * SLOT_ENTRY_LEN;
+    @memcpy(v1[296..][0..n], v2[304..][0..n]);
+    put(&v1, u64, CHECKSUM_OFF, checksum.hash64(v1[0..CHECKSUM_OFF]));
+    const back = try decode(&v1);
+    try testing.expectEqual(@as(u64, 0), back.host_key);
+    try expectPageEql(&p, &back);
+    var re: [PAGE_LEN]u8 = undefined;
+    try back.encode(&re);
+    try testing.expectEqual(@as(u16, 2), get(&re, u16, 4));
+    try expectPageEql(&back, &(try decode(&re)));
+    var torn = v1;
+    torn[296 + n + 1] = 1;
+    put(&torn, u64, CHECKSUM_OFF, checksum.hash64(torn[0..CHECKSUM_OFF]));
+    try testing.expectError(error.Corrupt, decode(&torn));
+}
+
 test "the page round-trips at every bound (8 segments / 4 runs / 108 slots) and the encoder refuses one more of each" {
     var p = samplePage();
     var img: [PAGE_LEN]u8 = undefined;

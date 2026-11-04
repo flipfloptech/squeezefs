@@ -715,6 +715,15 @@ test "tokens, steps, guards, the record ship" {
     try expectRejected(.object_zero, recordShip(ship0, 16384));
 }
 
+test "JoinAppender's host key screen (decision 0004 §6.1, KD18): the key is non-zero iff the manager's volume carries a device fence — a zero key under a fence and a key without one are rejected by name before any report is read" {
+    var req: verbs.JoinAppenderReq = .{ .volume = 0, .reserved = 0, .reserved2 = 0, .identity = other, .ring_want_bytes = 0, .host_key = 0 };
+    try expectRejected(.join_key_zero, joinAppenderKey(req, true));
+    try testing.expect(joinAppenderKey(req, false).isOk());
+    req.host_key = 0x5555;
+    try testing.expect(joinAppenderKey(req, true).isOk());
+    try expectRejected(.join_key_unfenced, joinAppenderKey(req, false));
+}
+
 test "the joiner's node_seq_base screen: below the base, off the stride, the manager's own space, past capacity" {
     const B: u64 = 1 << 50;
     try testing.expect(joinedNodeSeqBase(B + node_seq.INCARNATION_SPACE, B).isOk());
@@ -748,6 +757,7 @@ fn screenFuzz(_: void, smith: *std.testing.Smith) !void {
     if (verbs.decodeRequest(.block_grant, bytes)) |r| _ = blockGrant(r.block_grant, dataVolume(&dvs, r.block_grant.vol_tag)) else |_| {}
     if (verbs.decodeRequest(.return_blocks, bytes)) |r| _ = returnBlocks(r.return_blocks, dataVolume(&dvs, r.return_blocks.vol_tag)) else |_| {}
     if (verbs.decodeRequest(.join, bytes)) |r| _ = join(r.join) else |_| {}
+    if (verbs.decodeRequest(.join_appender, bytes)) |r| _ = joinAppenderKey(r.join_appender, smith.value(bool)) else |_| {}
     _ = joinedNodeSeqBase(smith.value(u64), smith.value(u64));
 }
 

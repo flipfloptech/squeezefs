@@ -2100,6 +2100,112 @@ test "B2 (review): recovery re-reads the report once the page is Recovering — 
     try testing.expect(!ns.writeAllowed("remote-host-id-2".*));
 }
 
+/// The keyed-death fixture's device side (decision 0004 §4.8): a metadata
+/// namespace the manager (key 0x1111) holds WERO and a WEAR data namespace,
+/// the dead member's host registered on both under 0x2222.
+const KeyedDevices = struct {
+    mns: fake_nvme_mod.Namespace,
+    dns: fake_nvme_mod.Namespace,
+    mh: fake_nvme_mod.Host = undefined,
+    rh: fake_nvme_mod.Host = undefined,
+    dmh: fake_nvme_mod.Host = undefined,
+    drh: fake_nvme_mod.Host = undefined,
+    m: pr.Client = undefined,
+    r: pr.Client = undefined,
+    d: pr.Client = undefined,
+    dr: pr.Client = undefined,
+    clients: [1]*pr.Client = undefined,
+    df: FixtureDataFence = undefined,
+
+    fn init(self: *KeyedDevices, gpa: Allocator) !void {
+        const nvme = @import("../../guard/nvme_cmd.zig");
+        self.* = .{ .mns = fake_nvme_mod.Namespace.init(gpa), .dns = fake_nvme_mod.Namespace.init(gpa) };
+        self.mh = .{ .ns = &self.mns, .host_id = "manager-host-id1".* };
+        self.rh = .{ .ns = &self.mns, .host_id = "remote-host-id-2".* };
+        self.dmh = .{ .ns = &self.dns, .host_id = "manager-host-id1".* };
+        self.drh = .{ .ns = &self.dns, .host_id = "remote-host-id-2".* };
+        self.m = try pr.Client.init(gpa, self.mh.face(), 1, 0x1111);
+        self.r = try pr.Client.init(gpa, self.rh.face(), 1, 0x2222);
+        self.d = try pr.Client.init(gpa, self.dmh.face(), 1, 0x1111);
+        self.dr = try pr.Client.init(gpa, self.drh.face(), 1, 0x2222);
+        try fencing.acquireManagerHold(&self.m);
+        _ = try fencing.joinAsRegistrant(&self.r, null);
+        self.d.rtype = nvme.RTYPE_WEAR;
+        _ = try self.d.registerLadder();
+        try self.d.acquire();
+        self.dr.rtype = nvme.RTYPE_WEAR;
+        _ = try self.dr.registerLadder();
+        self.clients = .{&self.d};
+        self.df = .{ .clients = &self.clients };
+    }
+
+    fn deinit(self: *KeyedDevices) void {
+        self.dr.deinit();
+        self.d.deinit();
+        self.r.deinit();
+        self.m.deinit();
+        self.dns.deinit();
+        self.mns.deinit();
+    }
+
+    fn bind(self: *KeyedDevices, f: *Fixture) void {
+        f.driver.mount.meta_pr = &self.m;
+        f.driver.mount.data_fence = self.df.seam();
+    }
+
+    fn remoteFenced(self: *KeyedDevices) bool {
+        return !self.mns.writeAllowed("remote-host-id-2".*) and !self.dns.writeAllowed("remote-host-id-2".*);
+    }
+};
+
+const fake_nvme_mod = @import("../../guard/fake_nvme.zig");
+
+fn setDeadPageKey(f: *Fixture, host_key: u64) !void {
+    var p = f.rv.pages.get(2).?;
+    p.host_key = host_key;
+    try f.rv.pages.put(f.gpa, 2, p);
+}
+
+test "a death whose record carries no key is fenced with the dead appender page's host key (decision 0004 §4.8, KD8; G-b: a grace-reaped member) — both namespaces preempt the page's key before the region is released, counted as appender_recovery_key_from_page" {
+    const gpa = testing.allocator;
+    const f = try Fixture.initKeyed(gpa, false, 0);
+    defer f.deinit();
+    try setDeadPageKey(f, 0x2222);
+    var dev: KeyedDevices = undefined;
+    try dev.init(gpa);
+    defer dev.deinit();
+    dev.bind(f);
+    try testing.expect(!dev.remoteFenced());
+    const from_page0 = fencing.stats.appender_recovery_key_from_page.load();
+    const preempts0 = fencing.stats.appender_recovery_preempts.load();
+    const data0 = fencing.stats.data_pr_preempts.load();
+    try testing.expectEqual(Outcome.acted, f.driver.recoverDead(f.death()));
+    try f.expectConverged();
+    try testing.expect(dev.remoteFenced());
+    try testing.expectEqual(from_page0 + 1, fencing.stats.appender_recovery_key_from_page.load());
+    try testing.expectEqual(preempts0 + 1, fencing.stats.appender_recovery_preempts.load());
+    try testing.expectEqual(data0 + 1, fencing.stats.data_pr_preempts.load());
+}
+
+test "a death record's key and the dead page's host key that DIFFER hold the recovery (decision 0004 §4.8): the tripwire appender_recovery_key_mismatch, nothing preempted, the page left Live for the next poll" {
+    const gpa = testing.allocator;
+    const f = try Fixture.initKeyed(gpa, false, 0x3333);
+    defer f.deinit();
+    try setDeadPageKey(f, 0x2222);
+    var dev: KeyedDevices = undefined;
+    try dev.init(gpa);
+    defer dev.deinit();
+    dev.bind(f);
+    const mismatches0 = fencing.stats.appender_recovery_key_mismatch.load();
+    fencing.stats.appender_recovery_key_mismatch.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(Outcome.failed, f.driver.recoverDead(f.death()));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(mismatches0 + 1, fencing.stats.appender_recovery_key_mismatch.load());
+    try testing.expectEqual(page.State.live, f.rv.pages.get(2).?.state);
+    try testing.expect(!dev.remoteFenced());
+}
+
 /// The data fence over a fixture's clients (no co-located kill).
 const FixtureDataFence = struct {
     clients: []const *pr.Client,

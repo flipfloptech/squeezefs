@@ -2150,6 +2150,18 @@ test "manager payloads round-trip canonically: region, slots, rename, clone, all
     _ = try roundTrip(Empty, .{});
 }
 
+test "JoinAppenderReq carries the joiner's host key, appended (decision 0004 §6.1, KD18): 40 → 48 B on the wire, the key at the tail, round-tripped canonically; a truncated 40 B request (the pre-key shape) does not decode" {
+    try testing.expectEqual(@as(usize, 48), codec.wireSize(JoinAppenderReq));
+    try testing.expectEqual(@as(usize, 40), @offsetOf(JoinAppenderReq, "host_key"));
+    const r = try roundTrip(JoinAppenderReq, .{ .volume = 1, .reserved = 0, .reserved2 = 0, .identity = sample_identity, .ring_want_bytes = 0, .host_key = 0xFEED_FACE_CAFE_BEEF });
+    try testing.expectEqual(@as(u64, 0xFEED_FACE_CAFE_BEEF), r.host_key);
+    var buf: [128]u8 = undefined;
+    var b: Builder = .init(&buf);
+    try codec.encodePayload(JoinAppenderReq, r, &b);
+    try testing.expectEqual(@as(usize, 48), b.written().len);
+    try testing.expectError(error.Malformed, decodeRequest(.join_appender, b.written()[0..40]));
+}
+
 test "membership payloads: join with a mount path, the grant's three carriages, nested renewal windows, the census page" {
     var id: [16]u8 = @splat(0);
     @memcpy(id[0..12], &sample_identity.peerId());

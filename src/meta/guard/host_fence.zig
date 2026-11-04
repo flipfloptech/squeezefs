@@ -1463,6 +1463,34 @@ test "the host key and the registry keys: one per (host identity, set), stable, 
     try testing.expect(fabricRegistryKey("nqn.s", "nqn.h", "id") != fabricRegistryKey("nqn.s", "nqn.h", "id2"));
 }
 
+test "a joiner's claimed page key against the joined volume's report (decision 0004 §6.1, KD18): ok only when a registrant holds it under the host id it derives from (hostKey(registrant's wire host id, set)); a key held by no registrant is absent; one held only under another host id (a forged claim of the manager's key, held by its host and its fencer) is a mismatch; under incarnation keys (the per-mount seam) any registrant holding it suffices" {
+    const set: [16]u8 = @splat(7);
+    const host_a: [16]u8 = "host-a-wire-id01".*;
+    const host_b: [16]u8 = "host-b-wire-id02".*;
+    const fencer_b: [16]u8 = "fencer-b-wire-03".*;
+    const key_a = hostKey(&host_a, set);
+    const key_b = hostKey(&host_b, set);
+    var regs = [_]nvme.Registrant{
+        .{ .cntlid = 1, .holds = true, .rkey = key_b, .host_id = host_b },
+        .{ .cntlid = 2, .holds = false, .rkey = key_b, .host_id = fencer_b },
+        .{ .cntlid = 3, .holds = false, .rkey = key_a, .host_id = host_a },
+    };
+    const rep: nvme.Report = .{ .generation = 4, .rtype = nvme.RTYPE_WERO, .regctl = regs.len, .ptpls = 0, .extended = true, .registrants = &regs };
+    try testing.expectEqual(JoinKeyVerdict.ok, joinKeyVerdict(rep, key_a, set, true));
+    // The manager's own host key, claimed by host B's co-located joiner.
+    try testing.expectEqual(JoinKeyVerdict.ok, joinKeyVerdict(rep, key_b, set, true));
+    try testing.expectEqual(JoinKeyVerdict.absent, joinKeyVerdict(rep, key_a ^ 1, set, true));
+    try testing.expectEqual(JoinKeyVerdict.absent, joinKeyVerdict(rep, 0, set, true));
+    // Host A claiming another set's key for itself: no registrant derives it.
+    try testing.expectEqual(JoinKeyVerdict.absent, joinKeyVerdict(rep, hostKey(&host_a, @splat(8)), set, true));
+    // Registered under a key its host id does not derive (an incarnation
+    // key on a host-keyed set): a mismatch; under incarnation keys, ok.
+    regs[2].rkey = 0x1234;
+    try testing.expectEqual(JoinKeyVerdict.mismatch, joinKeyVerdict(rep, 0x1234, set, true));
+    try testing.expectEqual(JoinKeyVerdict.ok, joinKeyVerdict(rep, 0x1234, set, false));
+    try testing.expectEqual(JoinKeyVerdict.absent, joinKeyVerdict(rep, 0x9999, set, false));
+}
+
 test "the judgement: a Live page names a current sibling; a Recovering, Recovered or Free page under its writer id is stale unless its own retirement (writer id, appender id, term) covers it; no page yet is joining; the manager is current only on appender 0's Live page, stale once the role passed or while this mount takes it over; a manager of this host (pending or durable) is stale while a reservation stands that this host's key does not hold; another node's page never names a sibling" {
     const node: u64 = 0xA;
     var e = Entry.parse(42, "77\nj 9 00000000000000b1\n").?;

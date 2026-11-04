@@ -2218,6 +2218,54 @@ test "join: allocates the lowest free page, carves + zeroes a ring at the floor,
     try testing.expectEqual(@as(u64, 3), m.appenders_known);
 }
 
+test "join: the joiner's claimed host key is verified against the volume's report BEFORE the page is written (decision 0004 §6.1, KD18) — under a device fence an absent, a mismatched or a zero key refuses Rejected with nothing written (meta_pr_join_key_refusals, logged by name); an unreadable report defers; a verified key lands on the page; with no device fence a non-zero key refuses and 0 lands" {
+    const gpa = testing.allocator;
+    const tv = try TestVolume.init(gpa, 1 << 30, 65_536, 4000);
+    defer tv.deinit();
+    try tv.liveManagerPage();
+    var m = newManager(gpa, tv);
+    defer m.deinit();
+    const Stub = struct {
+        answer: JoinKeyVerdict,
+        seen: u64 = 0,
+        fn verify(ctx: *anyopaque, claimed: u64) JoinKeyVerdict {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen = claimed;
+            return self.answer;
+        }
+    };
+    var stub: Stub = .{ .answer = .absent };
+    m.key_check = .{ .ctx = &stub, .verify = &Stub.verify };
+    const refusals0 = stats.meta_pr_join_key_refusals.load();
+    const bits = tv.allocatedExtents();
+    const entries = tv.control_entries;
+    log.testing.expectErrorLogs(3);
+    try testing.expectError(error.Rejected, m.joinAppender(.{ .identity = ident_a, .host_key = 0x77 }));
+    try testing.expectEqual(@as(u64, 0x77), stub.seen);
+    stub.answer = .mismatch;
+    try testing.expectError(error.Rejected, m.joinAppender(.{ .identity = ident_a, .host_key = 0x77 }));
+    stub.answer = .ok;
+    try testing.expectError(error.Rejected, m.joinAppender(.{ .identity = ident_a, .host_key = 0 }));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(refusals0 + 3, stats.meta_pr_join_key_refusals.load());
+    try testing.expectEqual(bits, tv.allocatedExtents());
+    try testing.expectEqual(entries, tv.control_entries);
+    stub.answer = .unreadable;
+    try testing.expectError(error.Deferred, m.joinAppender(.{ .identity = ident_a, .host_key = 0x77 }));
+    try testing.expectEqual(entries, tv.control_entries);
+    stub.answer = .ok;
+    const j = try m.joinAppender(.{ .identity = ident_a, .host_key = 0x77 });
+    try testing.expectEqual(@as(u64, 0x77), (try m.readPageOf(j.appender_id)).?.host_key);
+    // No device fence on the volume: the key must be 0.
+    m.key_check = null;
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.Rejected, m.joinAppender(.{ .identity = ident_b, .host_key = 0x55 }));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(refusals0 + 4, stats.meta_pr_join_key_refusals.load());
+    const j2 = try m.joinAppender(.{ .identity = ident_b });
+    try testing.expectEqual(@as(u64, 0), (try m.readPageOf(j2.appender_id)).?.host_key);
+}
+
 test "join: another incarnation of a pair whose page is Live (the same node and mount slot, another writer id) is Deferred — nothing written, the page untouched; once that page leaves Live (its recovery) the successor joins on a fresh pair (decision 0003 §DA)" {
     const gpa = testing.allocator;
     const tv = try TestVolume.init(gpa, 1 << 30, 65_536, 4000);

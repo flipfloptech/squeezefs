@@ -2307,3 +2307,229 @@ test "an eviction and the renewal it races are one order (decision 0003 §DM): e
     try testing.expect((verdict == .granted) != (evicted == 1));
     try testing.expectEqual(@as(usize, evicted), deaths.list.items.len);
 }
+
+/// The churn's clock and accounting: the cadence advances the owner's clock
+/// one tick once every participant moved since the last (lockstep, so a
+/// steady member renews at least once per tick on any host load), and
+/// records each death with the clock it was judged at.
+const Churn = struct {
+    const STEP_MS: u64 = 50;
+    const TICKS: u32 = 4000;
+    const STEADY = 6;
+    const FLAKY = 4;
+    const CHURNERS = 3;
+    const READERS = 3;
+    const PARTICIPANTS = STEADY + FLAKY + CHURNERS + READERS;
+
+    owner: *Owner,
+    now: std.atomic.Value(u64) = .init(0),
+    stop: std.atomic.Value(bool) = .init(false),
+    progress: [PARTICIPANTS]std.atomic.Value(u64) = @splat(.init(0)),
+    /// The cadence's clock at the death being shipped (its thread alone).
+    judged_at: u64 = 0,
+    deaths: std.ArrayList(Death) = .empty,
+    grants: [PARTICIPANTS]std.ArrayList(Grant) = @splat(.empty),
+    renewals: std.atomic.Value(u64) = .init(0),
+    joins: std.atomic.Value(u64) = .init(0),
+    reads: std.atomic.Value(u64) = .init(0),
+
+    const Death = struct { id: MemberId, epoch: u64, at: u64 };
+    /// The latest clock a grant (a join or a renewal) of `(id, epoch)` carried.
+    const Grant = struct { id: MemberId, epoch: u64, latest: u64 };
+
+    fn note(ctx: ?*anyopaque, d: DeadMember) void {
+        const self: *Churn = @ptrCast(@alignCast(ctx.?));
+        self.deaths.append(testing.allocator, .{ .id = d.id, .epoch = d.epoch, .at = self.judged_at }) catch unreachable;
+    }
+
+    fn granted(self: *Churn, who: usize, id: MemberId, epoch: u64, at: u64) void {
+        const list = &self.grants[who];
+        if (list.items.len != 0) {
+            const last = &list.items[list.items.len - 1];
+            if (last.epoch == epoch and std.mem.eql(u8, &last.id, &id)) {
+                last.latest = @max(last.latest, at);
+                return;
+            }
+        }
+        list.append(testing.allocator, .{ .id = id, .epoch = epoch, .latest = at }) catch unreachable;
+    }
+
+    fn joinReq(n: u32, mount: []const u8) JoinRequest {
+        return joinReqOf(n, null, mount);
+    }
+
+    fn cadence(self: *Churn) void {
+        var seen: [PARTICIPANTS]u64 = @splat(0);
+        var tick: u32 = 0;
+        while (tick < TICKS) : (tick += 1) {
+            for (&self.progress, &seen) |*p, *s| {
+                while (p.load(.acquire) == s.*) std.Thread.yield() catch {};
+                s.* = p.load(.acquire);
+            }
+            const now = self.now.load(.monotonic) + STEP_MS;
+            self.judged_at = now;
+            // Release pairs with the participants' acquire loads.
+            self.now.store(now, .release);
+            _ = self.owner.expireDue(now);
+            _ = self.owner.reapGraceDeadline(now, &rosterKey);
+        }
+        self.stop.store(true, .release);
+    }
+
+    /// A steady member renews at every turn. A flaky one renews only at its
+    /// deadline's edge: the tick before it on even cycles (racing the
+    /// cadence's judgement at the deadline), the tick after it on odd ones
+    /// (its lease run out: evicted). Either re-joins at `UnknownLease`.
+    fn member(self: *Churn, who: usize, n: u32, flaky: bool) void {
+        const id = writerMemberId(testIdentity(n));
+        var at = self.now.load(.acquire);
+        var epoch = self.owner.join(joinReq(n, "/m"), at).granted.epoch;
+        self.granted(who, id, epoch, at);
+        var latest = at;
+        var offered: std.ArrayList(verbs.OfferedSlotWire) = .empty;
+        defer offered.deinit(testing.allocator);
+        var notices: std.ArrayList(u16) = .empty;
+        defer notices.deinit(testing.allocator);
+        var cycle: u32 = 0;
+        while (!self.stop.load(.acquire)) {
+            _ = self.progress[who].fetchAdd(1, .release);
+            at = self.now.load(.acquire);
+            if (flaky) {
+                const deadline = latest + self.owner.clocks.t_owner_ms;
+                if (at < if (cycle % 2 == 0) deadline - STEP_MS else deadline + STEP_MS) {
+                    std.Thread.yield() catch {};
+                    continue;
+                }
+                cycle += 1;
+            }
+            switch (self.owner.renew(id, epoch, 0, at)) {
+                .granted => {
+                    _ = self.renewals.fetchAdd(1, .monotonic);
+                    self.granted(who, id, epoch, at);
+                    latest = at;
+                    self.owner.takeCarriage(id, &offered, &notices) catch unreachable;
+                    offered.clearRetainingCapacity();
+                    notices.clearRetainingCapacity();
+                },
+                .unknown_lease => switch (self.owner.join(joinReq(n, "/m"), at)) {
+                    .granted => |g| {
+                        _ = self.joins.fetchAdd(1, .monotonic);
+                        epoch = g.epoch;
+                        self.granted(who, id, epoch, at);
+                        latest = at;
+                    },
+                    else => {},
+                },
+            }
+        }
+    }
+
+    /// Fresh ids join, renew a few turns, push and drain an offer, leave.
+    fn churner(self: *Churn, who: usize, base: u32) void {
+        var k: u32 = 0;
+        while (!self.stop.load(.acquire)) : (k += 1) {
+            _ = self.progress[who].fetchAdd(1, .release);
+            const n = base + k;
+            const id = writerMemberId(testIdentity(n));
+            var at = self.now.load(.acquire);
+            const epoch = switch (self.owner.join(joinReq(n, "/c"), at)) {
+                .granted => |g| g.epoch,
+                else => continue,
+            };
+            _ = self.joins.fetchAdd(1, .monotonic);
+            self.granted(who, id, epoch, at);
+            self.owner.pushOffer(id, @intCast(k % 64), 1) catch unreachable;
+            self.owner.pushReleaseNotice(id, @intCast(k % 64)) catch unreachable;
+            for (0..3) |_| {
+                at = self.now.load(.acquire);
+                if (self.owner.renew(id, epoch, 0, at) == .granted) self.granted(who, id, epoch, at);
+            }
+            var offered: std.ArrayList(verbs.OfferedSlotWire) = .empty;
+            defer offered.deinit(testing.allocator);
+            var notices: std.ArrayList(u16) = .empty;
+            defer notices.deinit(testing.allocator);
+            self.owner.takeCarriage(id, &offered, &notices) catch unreachable;
+            _ = self.owner.leave(id, self.now.load(.acquire));
+        }
+    }
+
+    /// Every reader face: census pages, the death screen, the census keys,
+    /// the counts, liveness and the lookups.
+    fn reader(self: *Churn, who: usize) void {
+        var scratch: [64 * 1024]u8 = undefined;
+        var k: u32 = 0;
+        while (!self.stop.load(.acquire)) : (k += 1) {
+            _ = self.progress[who].fetchAdd(1, .release);
+            const at = self.now.load(.acquire);
+            var cursor: u64 = 0;
+            while (true) {
+                var b: codec.Builder = .init(&scratch);
+                const h = self.owner.census(cursor, 64, at, &b) catch unreachable;
+                if (h.has_next == 0) break;
+                cursor = h.next;
+            }
+            const id = writerMemberId(testIdentity(1 + k % (STEADY + FLAKY)));
+            _ = self.owner.deathScreen(id, 0x1000 + 1 + k % (STEADY + FLAKY), 0xF00D, at);
+            const keys = self.owner.writerKeys(testing.allocator, at) catch unreachable;
+            testing.allocator.free(keys);
+            _ = self.owner.memberCount();
+            _ = self.owner.writerCount();
+            _ = self.owner.liveness(id, at);
+            _ = self.owner.member(id);
+            _ = self.owner.memberWhere(u64, nodeOf(id), nodeOf);
+            _ = self.owner.graceRemainingMs(at);
+            _ = self.reads.fetchAdd(1, .monotonic);
+        }
+    }
+};
+
+test "the owner under churn (decision 0003 §DM): steady and flaky members renewing, members joining and leaving, offers pushed and drained, every reader face, and the cadence's evictions on their own threads — no eviction of a member whose latest grant (join or renewal) is younger than T_owner at the eviction's clock, no steady member ever evicted, every flaky member's lease run out" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(3_000, 0, 100);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    defer o.deinit();
+    var c: Churn = .{ .owner = &o };
+    defer {
+        c.deaths.deinit(gpa);
+        for (&c.grants) |*g| g.deinit(gpa);
+    }
+    o.bindDeathSink(.{ .ctx = &c, .noteDeath = &Churn.note });
+    const ev0 = stats.membership_evictions.load();
+    var threads: [Churn.PARTICIPANTS + 1]std.Thread = undefined;
+    var t: usize = 0;
+    for (0..Churn.STEADY) |i| {
+        threads[t] = try std.Thread.spawn(.{}, Churn.member, .{ &c, t, @as(u32, @intCast(1 + i)), false });
+        t += 1;
+    }
+    for (0..Churn.FLAKY) |i| {
+        threads[t] = try std.Thread.spawn(.{}, Churn.member, .{ &c, t, @as(u32, @intCast(1 + Churn.STEADY + i)), true });
+        t += 1;
+    }
+    for (0..Churn.CHURNERS) |i| {
+        threads[t] = try std.Thread.spawn(.{}, Churn.churner, .{ &c, t, @as(u32, @intCast(1000 + i * 1_000_000)) });
+        t += 1;
+    }
+    for (0..Churn.READERS) |_| {
+        threads[t] = try std.Thread.spawn(.{}, Churn.reader, .{ &c, t });
+        t += 1;
+    }
+    threads[t] = try std.Thread.spawn(.{}, Churn.cadence, .{&c});
+    for (threads) |th| th.join();
+    // The verdicts: a death is wrongful when a grant of its epoch carried a
+    // clock younger than T_owner at the eviction's.
+    var wrongful: usize = 0;
+    var steady: usize = 0;
+    var flaky: usize = 0;
+    for (c.deaths.items) |d| {
+        const n = memberIdentity(d.id).?.mount_slot;
+        if (n <= Churn.STEADY) steady += 1 else if (n <= Churn.STEADY + Churn.FLAKY) flaky += 1;
+        for (c.grants) |list| for (list.items) |g| {
+            if (g.epoch == d.epoch and std.mem.eql(u8, &g.id, &d.id) and g.latest + clocks.t_owner_ms > d.at) wrongful += 1;
+        };
+    }
+    std.debug.print("owner churn: {d} ticks, {d} joins, {d} renewals, {d} reader passes, {d} evictions ({d} flaky, {d} steady), {d} wrongful\n", .{ Churn.TICKS, c.joins.load(.monotonic), c.renewals.load(.monotonic), c.reads.load(.monotonic), c.deaths.items.len, flaky, steady, wrongful });
+    try testing.expectEqual(@as(usize, 0), wrongful);
+    try testing.expectEqual(@as(usize, 0), steady);
+    try testing.expect(flaky >= Churn.FLAKY);
+    try testing.expectEqual(ev0 + c.deaths.items.len, stats.membership_evictions.load());
+}

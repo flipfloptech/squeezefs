@@ -695,7 +695,7 @@ pub const Owner = struct {
                 break :blk true;
             };
             if (!fits) {
-                cap *= 4;
+                cap *= 4; // geometric growth: a roster outgrowing the copy retries O(log n) times
                 continue;
             }
             std.mem.sort(u64, buf[0..n], {}, std.sort.asc(u64));

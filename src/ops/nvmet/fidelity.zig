@@ -2937,6 +2937,82 @@ test "nvmet fidelity: a restart of ANOTHER metadata volume's target than volume 
     for (set.meta_nqn) |nqn| try expectNoResidue(rig, nqn);
 }
 
+test "nvmet fidelity: a re-join in place refused AFTER its data re-admission never leaves the data fence on the closed successors (decision 0003 §DN.9; the safety review's MAJOR on §DN.7(b)) — tcp, a symmetric set of two metadata volumes: M (host B) manages; J (host C) joined both under SQUEEZEFS_TEST_REJOIN_MEMBER_REFUSED, idle-clean; J's member beat held past T_owner: M evicts and recovers it (its host preempted on both metadata namespaces and on data); released, J re-joins in place — its successors join every volume and its data fence re-admits the data namespace under them — then its membership join is refused and the successors close unpublished: J poisoned and alive, its data fence's beat runs on through the predecessor's clients and the predecessor's pages, never through a closed successor's device or backend (before: a use after free — the beat issued its report through the successor's freed pr_linux.Device)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const set = try twoMetaSet(rig, "rr", data_fence_volume);
+    var cm_b: [2]Connected = undefined;
+    var ub: [160]u8 = undefined;
+    const meta_uri_b = try set.connectHost(rig, ident_b, &cm_b, &ub);
+    var cm_c: [2]Connected = undefined;
+    var uc: [160]u8 = undefined;
+    const meta_uri_c = try set.connectHost(rig, ident_c, &cm_c, &uc);
+    var tb: [16]u8 = undefined;
+    const t_owner = try std.fmt.bufPrint(&tb, "{d}", .{member_t_owner_ms});
+    // The hold's FIFO is named now and created when the hold should begin.
+    var fb: [128]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/j-member-beat.fifo", .{rig.root}, 0);
+    var env_m = try rig.envWith(ident_b);
+    defer env_m.deinit();
+    try env_m.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    var env_j = try rig.envWith(ident_c);
+    defer env_j.deinit();
+    try env_j.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    try env_j.put("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD", fifo);
+    try env_j.put("SQUEEZEFS_TEST_REJOIN_MEMBER_REFUSED", "1");
+    const m = try rig.spawnMountEnv("rr-m", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const j = try rig.spawnMountEnv("rr-j", meta_uri_c, &env_j, &.{});
+    try rig.awaitLog(j, "ready: ", ready_wait_ns);
+    // J's directories on both members, landed: J idle-clean.
+    try testing.expect(try scriptSucceeds(rig, j, "for d in d0 d1 d2 d3; do mkdir $d && echo j > $d/f; done && sync -f ."));
+    {
+        const sj = try rig.stats(j);
+        defer gpa.free(sj);
+        try testing.expect(try statNumber(sj, "routing_dir_place_remote") >= 1);
+    }
+    // J's member beat held: M evicts it at T_owner and recovers its region
+    // on both volumes — its host fenced on metadata and on data.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    try rig.awaitLog(j, "the member's beat holds", ready_wait_ns);
+    {
+        const sm = try rig.awaitStat(m, "appender_recoveries", 2, g2_wait_ns);
+        defer gpa.free(sm);
+        try testing.expectEqual(@as(u64, 2), try statNumber(sm, "appender_recoveries"));
+        try testing.expect(try statNumber(sm, "data_pr_preempts") >= 1);
+    }
+    // Released: J re-joins in place, its data re-admitted under the
+    // successors, its membership join refused, the successors closed.
+    try releaseFifoBounded(fifo, 30 * std.time.ns_per_s);
+    try rig.awaitLog(j, "the successor's membership join was refused", g2_wait_ns);
+    try rig.awaitLog(j, "this joined mount is POISONED", ready_wait_ns);
+    // J's data fence beats on after the successors closed — every beat
+    // reports through each metadata client and reads every volume's pages
+    // (a poisoned mount answers `.stats` EIO: its log is the witness). A
+    // fence left on the successors issues through their freed devices.
+    try rig.awaitLog(j, "the data fence's first beat after the refused re-join ran on the predecessor", g2_wait_ns);
+    {
+        const text = try rig.readLog(j);
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "the data fence is re-pointed at the predecessor") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "RE-JOINED IN PLACE") == null);
+    }
+    try rig.umount(j);
+    try rig.umount(m);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    for (0..2) |v| {
+        try rig.disconnect(&cm_c[v]);
+        try rig.disconnect(&cm_b[v]);
+        try rig.disconnect(&set.cm[v]);
+    }
+    try rig.unshare(set.data_nqn);
+    for (set.meta_nqn) |nqn| try rig.unshare(nqn);
+    try expectNoResidue(rig, set.data_nqn);
+    for (set.meta_nqn) |nqn| try expectNoResidue(rig, nqn);
+}
+
 /// The manager's fencing registrant's controller of `nqn`: the one whose
 /// identity none of the rig's connects carries.
 fn fencerController(rig: *Rig, nqn: []const u8) !?initiator.Controller {

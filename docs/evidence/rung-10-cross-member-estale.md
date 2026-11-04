@@ -73,3 +73,14 @@ every slow leg (23/23) ran its mkdir phase under `sqz-thermal-governor`'s 3.2 GH
 ≥ 4.0 GHz, or saw the cap lift within 2 s, was slow (0/38). The harness should start each leg at one governor level.
 Rebased onto origin/dev `a182be3`; on `0d410d9`: red ×3, §DH units ×3 (50/50), full units 3,271 pass / 188 skip /
 0 fail, fmt, rails 32/32. The §DH.13 (h) defects were fixed on dev by §DI.
+
+**The deletes' per-op cost** (§DH.21). With the governor controlled, the orchestrator's A-B-B-A + B-A-A-B of
+`68ae1bb` vs `a182be3` put 15 of 16 rows lower (np64 −4…−9 %). Profiles of dev, the branch and a variant without
+the registry's insert (rw4k np64, counters only): cycles and instructions within ±1 %; in the branch alone the FUSE
+uring threads +12 s CPU per run and the FORGETs' latency sum +1.4 s — each delete touched four shared lines (the
+shard's lock, a cell in a separate array, the `fuse_delete_registry` Gauge RMW'd by every delete and destroy, the
+key and value slots). Fix `5febdb2`: a shard's lock and its cells on one line, its set's header the next, the
+level summed at the `.stats` read, no per-entry value. After: FUSE uring CPU 238 / 241 s, the FORGETs' sum
+19.7 / 19.5 s (dev 19.2, the variant 19.5). Model: holds over 2,792 / 4,032 states; the weakenings fail
+(17 / 2,015). Rebased onto `ea05b9f`; on `5febdb2`: red ×3, §DH units ×3 (50/50), full units 3,273 / 189 skip /
+0 fail, fmt, rails 32/32.

@@ -1837,3 +1837,41 @@ test "decision 0003 §DJ, a co-located member's death: its recoverer on this hos
     try testing.expect(!killColocatedMember(ctx, reg, &foreign, &.{}));
     try log.testing.expectAllFired();
 }
+
+test "review minor 2 (decision 0003 §DJ): a co-located member's death whose process is already proven dead — no kill — still drains every data node before the recovery proceeds (a gone process's writes can still sit in its block queues): a node whose queue cannot be read holds the recovery" {
+    const gpa = testing.allocator;
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-dj-drain-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var probe = Registry.at(base, .set, 0xd2);
+    probe.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    probe.unlock();
+    const local = proc.localIdentity();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const ctx: RuleContext = .{ .gpa = gpa, .env = &env, .path = "dj", .local = local, .node_token = 0xA, .vol_index = 0, .taking_manager = false, .label = "data volume" };
+    // W, the co-located member whose line names the dead page, has exited.
+    var w = try std.process.spawn(testing.io, .{ .argv = &.{"cat"}, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    const pid: u32 = @intCast(w.id.?);
+    const ticks = proc.startTicksOf(pid) orelse {
+        _ = linux.kill(w.id.?, .KILL);
+        _ = w.wait(testing.io) catch {};
+        return @import("../../core/testkit.zig").skip(@src(), .no_device, "/proc does not show the spawned member's start ticks");
+    };
+    _ = linux.kill(w.id.?, .KILL);
+    _ = try w.wait(testing.io);
+    const id: claim.Identity = .{ .boot_id = local.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
+    const reg = Registry.at(base, .set, 0xd2);
+    var lb: [96]u8 = undefined;
+    try reg.append(id.pid, id.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = id.writerId(9), .joined = .{ .appender_id = 3, .term = 2, .vol = 0 } }));
+    // The data node: one whose block queue cannot be read.
+    var nb: [160]u8 = undefined;
+    const node = try std.fmt.bufPrint(&nb, "{s}/data-node", .{base});
+    try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = node, .data = "" });
+    const dead = pgTerm(3, .recovering, 0xA, id.writerId(9), 2);
+    const proven0 = guard.stats.pr_siblings_proven_dead.load();
+    log.testing.expectErrorLogs(1);
+    try testing.expect(!killColocatedMember(ctx, reg, &dead, &.{node}));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(proven0 + 1, guard.stats.pr_siblings_proven_dead.load());
+}

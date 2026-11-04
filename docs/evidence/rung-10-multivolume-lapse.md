@@ -67,6 +67,45 @@ Trims, with two volumes only: J's post-checks are skipped (always no-ops for a l
 re-registration on volume 1 is not modelled (nothing reads it), and a guard with no lapse ends at
 once. The one-volume state counts are unchanged.
 
+## The re-join (§DN.9; the safety review's MAJOR on §DN.7(b))
+
+The bug predates this branch; this branch extended it to every volume. During a re-join in place,
+`readmitData` re-pointed the data fence at the successors and freed the predecessor's clients. If
+the membership join was then refused, the successors closed. From then on, every beat — and any
+refused data write's re-admission — issued PR commands through the successors' freed
+`pr_linux.Device`s and read their freed backends.
+
+The red row (`97392ea`) evicts a joiner of a two-volume set while it is live, using the
+member-beat hold seam, with `SQUEEZEFS_TEST_REJOIN_MEMBER_REFUSED` set. The joiner is re-admitted
+on data and then refused. On the code before the fix it crashed 3 runs of 3:
+
+```
+General protection exception
+uring128.zig:271 getSqe ← pr.zig:167 issueRaw ← report ← data_fence.zig:1025 metaVolumeLapseBeat
+```
+
+The fix makes the re-admission two-phase:
+
+- `readmit` keeps the predecessor's inputs and clients pending instead of freeing them.
+- The wire plane settles the re-admission through `RejoinHost.settleData`:
+  - It commits once the successors are published; the predecessor's clients are freed then.
+  - It aborts on both refusal arms (the membership join refused, `publishSuccessors` out of memory)
+    BEFORE the successors close. The fence goes back to the predecessor, which stays open until the
+    unmount.
+
+The row now sees the joiner poisoned but alive. The fence says it was re-pointed at the
+predecessor, and its next beat says it ran there.
+
+| Check, at `f8f1a1e` | Result |
+|---|---|
+| The red | Green ×5 |
+| The multi-volume lapse row | ×3 green |
+| Focused units | 650 / 75 skip / 0 fail |
+| nvmet tier ×1 | 72 / 1 skipped / 0 |
+| The 27 rows ×1 | 71/71 |
+| FULL `zig build test` | 23/23 steps, 3,323 / 3,518 (195 skipped), 0 failed |
+| Rails, `zig fmt --check` | 34/34, clean |
+
 ## Checks (kernel.org 7.3.1, `nvme_core.multipath=N`; the full list in decision 0003 §DN.8)
 
 | Check | Before the rebase onto §DM | At the final head |

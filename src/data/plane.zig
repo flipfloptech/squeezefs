@@ -466,6 +466,10 @@ pub const Options = struct {
     /// crashed predecessor: it refuses to open rather than serve those
     /// residents' files without them.
     mount: ?struct { unsupervised: bool } = null,
+    /// The data fence's re-admission at a refused write (decision 0003
+    /// §DL), on every device from its open — before the write cache's
+    /// recovery, the reclaimer and the sweeps write.
+    readmit: ?nvme_dev.ReadmitSource = null,
 };
 
 pub const OpenError = error{ OutOfMemory, DeviceRefused, IdentityMismatch, Io, StagingRefused, StagingOwnerLive, StagingForeignOwner, StagingHeldForSuccessor, TransformRefused, ReclaimRefused, InlineMaxAboveFormatBound };
@@ -501,6 +505,9 @@ pub const DataPlane = struct {
     passthrough: bool,
     vols: seams.Volumes = .{},
     devs: [router.MAX_VOLUMES]?*nvme_dev.Device = @splat(null),
+    /// The data fence's re-admission at a refused write (decision 0003
+    /// §DL), given to every device the plane opens (`Options.readmit`).
+    readmit: ?nvme_dev.ReadmitSource = null,
     /// The zcrx read lane (charter §6.3): the funnel the read path's volume
     /// seam runs through, the per-volume sessions, the NIC registry.
     zcrx_funnel: zcrx.funnel.Funnel = .{},
@@ -727,6 +734,7 @@ pub const DataPlane = struct {
             .sqz = sqz,
             .backend = be,
             .env = opts.env,
+            .readmit = opts.readmit,
             .block_size = cfg.block_size,
             .chunk = cfg.chunk_size,
             .inline_max = inline_max,
@@ -1020,6 +1028,7 @@ pub const DataPlane = struct {
         self.rt.addVolume(.{ .id = .{ .tag = d.vol_tag }, .state = rt_state, .capacity_bytes = d.capacity_blocks * self.block_size, .used_bytes = alloc.usedBlocks() * self.block_size }) catch return error.OutOfMemory;
         self.vols.add(.{ .vol_tag = d.vol_tag, .ordinal = ordinal, .alloc = alloc, .passthrough = self.passthrough, .write_cache_volatile = dev.writeCache() == .write_back or dev.writeCache() == .unknown, .active = .init(rt_state == .active) });
         self.devs[ordinal] = dev;
+        if (self.readmit) |src| dev.setReadmit(src.hookFor(src.ctx, d.vol_tag));
         // The zcrx lane for this device, judged by the probe ladder (loud
         // once, Absent on this host unless a steerable HDS NIC fronts an
         // nvme-tcp target); published to the funnel when present.

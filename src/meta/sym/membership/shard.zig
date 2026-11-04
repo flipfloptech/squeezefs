@@ -47,6 +47,7 @@ const screen = @import("../../../wire/screen.zig");
 const codec = @import("../../../wire/codec.zig");
 const endpoint = @import("../../../wire/endpoint.zig");
 const park = @import("park_reclaim.zig");
+const jc = @import("../../journal_core.zig");
 
 pub const WireIdentity = verbs.WireIdentity;
 pub const EndpointWire = endpoint.EndpointWire;
@@ -417,6 +418,11 @@ pub const Owner = struct {
     /// record can stand) for the `RecordDeath` screen.
     departed_keys: std.ArrayList(DepartedKey) = .empty,
     death_sink: ?DeathSink = null,
+    /// Orders `members`' structural changes (a join's append or replace, a
+    /// leave's or an eviction's removal) against `writerKeys`, the one
+    /// reader off the serving threads (the metadata guard's lapse beat,
+    /// decision 0003 §DL); never held across I/O or a sink.
+    roster_lock: jc.SpinLock = .{},
     rows: ?RowStore = null,
     offers: std.ArrayList(PendingOffer) = .empty,
     releases: std.ArrayList(PendingRelease) = .empty,
@@ -605,11 +611,15 @@ pub const Owner = struct {
         }
         const ack_prior: u64 = if (reclaim) (req.prior_epoch orelse 0) else 0;
         if (existing) |i| {
+            self.roster_lock.lock();
+            defer self.roster_lock.unlock();
             self.members.items[i] = m;
         } else {
             // Room for every member's departure: `rememberDepartedKey`
             // never allocates.
             self.departed_keys.ensureUnusedCapacity(self.gpa, self.members.items.len + 1) catch return .io;
+            self.roster_lock.lock();
+            defer self.roster_lock.unlock();
             self.members.append(self.gpa, m) catch return .io;
         }
         self.writeRow(&m) catch return .io;
@@ -648,9 +658,44 @@ pub const Owner = struct {
         const m = self.members.items[i];
         self.rememberDepartedKey(m.pr_key, now_ms, nodeOf(m.id));
         self.deleteRow(&m);
-        _ = self.members.swapRemove(i);
+        self.removeMember(i);
         self.publishCounts();
         return true;
+    }
+
+    fn removeMember(self: *Owner, i: usize) void {
+        self.roster_lock.lock();
+        defer self.roster_lock.unlock();
+        _ = self.members.swapRemove(i);
+    }
+
+    /// The keys of every listed WRITER (≠ 0, distinct) — the metadata
+    /// guard's lapse grace ends once each is registered again (decision 0003
+    /// §DL). A member past its deadline still counts until its eviction (the
+    /// cadence's). `error.Incomplete` while the successor's re-assertion
+    /// window stands: a predecessor's member not yet back is listed nowhere.
+    pub fn writerKeys(self: *Owner, gpa: Allocator, now_ms: u64) error{ Incomplete, OutOfMemory }![]u64 {
+        if (self.graceOpenForReassert(now_ms)) return error.Incomplete;
+        var cap: usize = 8;
+        while (true) {
+            const buf = try gpa.alloc(u64, cap);
+            var n: usize = 0;
+            const fits = blk: {
+                self.roster_lock.lock();
+                defer self.roster_lock.unlock();
+                for (self.members.items) |m| {
+                    if (m.role != .writer or m.pr_key == 0) continue;
+                    if (std.mem.indexOfScalar(u64, buf[0..n], m.pr_key) != null) continue;
+                    if (n == cap) break :blk false;
+                    buf[n] = m.pr_key;
+                    n += 1;
+                }
+                break :blk true;
+            };
+            defer gpa.free(buf);
+            if (fits) return gpa.dupe(u64, buf[0..n]);
+            cap *= 4;
+        }
     }
 
     fn rememberDepartedKey(self: *Owner, key: u64, now_ms: u64, node_token: u64) void {
@@ -662,7 +707,7 @@ pub const Owner = struct {
         const m = self.members.items[i];
         self.rememberDepartedKey(m.pr_key, now_ms, nodeOf(m.id));
         self.deleteRow(&m);
-        _ = self.members.swapRemove(i);
+        self.removeMember(i);
         stats.membership_evictions.inc();
         if (self.death_sink) |s| s.noteDeath(s.ctx, .{ .id = m.id, .identity = memberIdentity(m.id), .epoch = epoch_word, .pr_key = m.pr_key });
     }
@@ -1937,4 +1982,43 @@ fn memberRowFuzz(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: the member row decoder is total on arbitrary and restamped claims; a decoded row re-encodes byte-identically" {
     try fuzzkit.fuzz({}, memberRowFuzz, .{});
+}
+
+test "the census's writer keys (decision 0003 §DL): every listed writer's host key once — distinct, never 0, never a reader's; a departure and an eviction take theirs out; a successor's census is incomplete while its re-assertion window stands (a predecessor's member not back is listed nowhere)" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
+    defer o.deinit();
+    _ = o.join(joinReqOf(1, null, "/m1"), 0).granted;
+    _ = o.join(joinReqOf(2, null, "/m2"), 0).granted;
+    // A co-located sibling of member 1 shares its host key.
+    var sib = joinReqOf(3, null, "/m3");
+    sib.pr_key = 0x1001;
+    _ = o.join(sib, 0).granted;
+    // A writer with no device fence (key 0) and a reader carry no key.
+    var unfenced = joinReqOf(4, null, "/m4");
+    unfenced.pr_key = 0;
+    _ = o.join(unfenced, 0).granted;
+    _ = o.join(.{ .id = @splat(0x44), .role = .reader, .endpoint = .none, .pid = 9, .boot = "boot-boot-boot-0".*, .prior_epoch = null, .pr_key = 0x4444, .mount = "/r", .row = null }, 0).granted;
+    {
+        const keys = try o.writerKeys(gpa, 0);
+        defer gpa.free(keys);
+        std.mem.sort(u64, keys, {}, std.sort.asc(u64));
+        try testing.expectEqualSlices(u64, &.{ 0x1001, 0x1002 }, keys);
+    }
+    try testing.expect(o.leave(writerMemberId(testIdentity(2)), 1));
+    try testing.expectEqual(@as(u32, 4), o.expireDue(clocks.t_owner_ms + 10));
+    {
+        const keys = try o.writerKeys(gpa, clocks.t_owner_ms + 10);
+        defer gpa.free(keys);
+        try testing.expectEqual(@as(usize, 0), keys.len);
+    }
+    // A successor with a predecessor's roster: incomplete until the
+    // re-assertion window closes.
+    var succ = try Owner.arm(gpa, clocks, 0, 2, 1, &.{writerMemberId(testIdentity(1))}, 1000);
+    defer succ.deinit();
+    try testing.expectError(error.Incomplete, succ.writerKeys(gpa, 1000));
+    const keys = try succ.writerKeys(gpa, 1000 + clocks.grace_ms);
+    defer gpa.free(keys);
+    try testing.expectEqual(@as(usize, 0), keys.len);
 }

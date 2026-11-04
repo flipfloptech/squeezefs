@@ -911,6 +911,15 @@ pub const WirePlane = struct {
             if (be.sym == null) continue;
             be.slots.verbs.offer_push = .{ .ctx = self, .push = &offerPushFn };
         }
+        // Every managed volume's lapse grace ends once each live member's
+        // host key in this census is registered again (decision 0003 §DL).
+        for (set.volumes) |be| if (be.guard) |g| g.bindCensus(.{ .ctx = &m.owner, .keys = &censusKeysFn });
+    }
+
+    /// The census's writer keys (the metadata guards' lapse grace).
+    fn censusKeysFn(ctx: *anyopaque, gpa: Allocator) error{ Incomplete, OutOfMemory }![]u64 {
+        const owner: *shard.Owner = @ptrCast(@alignCast(ctx));
+        return owner.writerKeys(gpa, nowMs());
     }
 
     /// A served ship by `peer` on `slot` of `volume`: the peer's appender
@@ -1274,6 +1283,8 @@ pub const WirePlane = struct {
 
     fn stopHalf(self: *WirePlane) void {
         if (self.mgr) |m| {
+            // No guard's lapse beat reads the owner past here.
+            for (self.set.volumes) |be| if (be.guard) |g| g.bindCensus(null);
             for (m.bindings) |b| b.destroy();
             self.gpa.free(m.bindings);
             self.gpa.free(m.hooks);

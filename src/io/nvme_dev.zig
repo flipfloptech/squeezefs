@@ -55,6 +55,8 @@ pub const DeviceError = nd.DeviceError;
 pub const stats = nd.stats;
 pub const writeStatsJson = nd.writeStatsJson;
 pub const FenceSignal = nd.FenceSignal;
+pub const Readmit = nd.Readmit;
+pub const ReadmitSource = nd.ReadmitSource;
 pub const CustodyHooks = nd.CustodyHooks;
 pub const installCustodyHooks = nd.installCustodyHooks;
 pub const clearCustodyPoisonForTest = nd.clearCustodyPoisonForTest;
@@ -1406,6 +1408,12 @@ pub const Device = struct {
         _ = self.fence.signal.cmpxchgStrong(null, sig, .release, .monotonic);
     }
 
+    /// The data fence's re-admission at a refused write-class command
+    /// (decision 0003 §DL); null = every conflict latches.
+    pub fn setReadmit(self: *Device, r: ?*const nd.Readmit) void {
+        self.fence.readmit.store(r, .release);
+    }
+
     /// May latch.
     pub fn fenced(self: *Device) bool {
         return self.fence.isHalted(self.path);
@@ -1436,6 +1444,26 @@ pub const Device = struct {
     /// error itself passes through UNCHANGED (callers still see the class).
     /// Every other error passes untouched — a transient hiccup never
     /// self-inflicts a fail-stop.
+    /// A write-class command refused with the reservation conflict: the
+    /// data fence's re-admission asked once (decision 0003 §DL) — true =
+    /// the host is registered again and the command goes once more. Never
+    /// after the latch, never without a bound re-admission.
+    fn readmitted(self: *Device, err: DeviceError) bool {
+        if (err != error.ReservationConflict) return false;
+        if (self.fence.halted.load(.acquire)) return false;
+        const r = self.fence.readmit.load(.acquire) orelse return false;
+        if (!r.readmit(r.ctx)) return false;
+        // Counted here when re-admitted, else by the latch's funnel.
+        stats.data_pr_write_refusals.inc();
+        return true;
+    }
+
+    /// A write-class command's final error through the funnel.
+    fn refusedWith(self: *Device, err: DeviceError) DeviceError {
+        if (err == error.ReservationConflict) self.classifyDmaOutcome(.BADE);
+        return err;
+    }
+
     fn classifyDmaOutcome(self: *Device, e: linux.E) void {
         if (!nd.isReservationConflict(e)) return;
         stats.data_pr_write_refusals.inc();
@@ -1535,8 +1563,11 @@ pub const Device = struct {
         if (takeArmed(&self.seams.fail_next_writes)) {
             const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(self.seams.fail_errno.load(.seq_cst)))));
             if (e == .SUCCESS) return error.InputOutput;
-            self.classifyDmaOutcome(e);
-            return nd.errnoToError(e);
+            const err = nd.errnoToError(e);
+            if (!self.readmitted(err)) {
+                self.classifyDmaOutcome(e);
+                return err;
+            }
         }
         try self.fenceGate();
         if (takeArmed(&self.seams.hold_next_write)) return self.heldWrite(offset, data);
@@ -1557,7 +1588,17 @@ pub const Device = struct {
         return r;
     }
 
+    /// One write, issued once more when the data fence re-admitted the host
+    /// after the device refused it (decision 0003 §DL): the refused command
+    /// never executed, so the second is the first to land.
     fn submitWrite(self: *Device, offset: u64, data: []const u8) DeviceError!void {
+        self.submitWriteOnce(offset, data) catch |err| {
+            if (!self.readmitted(err)) return self.refusedWith(err);
+            self.submitWriteOnce(offset, data) catch |again| return self.refusedWith(again);
+        };
+    }
+
+    fn submitWriteOnce(self: *Device, offset: u64, data: []const u8) DeviceError!void {
         // A zero-length DMA is a no-op by definition; never hand the kernel
         // a 0-byte SQE (the zero-length ReadFixed oops class, §2.1).
         if (data.len == 0) return;
@@ -1608,8 +1649,8 @@ pub const Device = struct {
             .io => |res| res,
         };
         if (res < 0) {
+            // The conflict class is the caller's funnel (`submitWrite`).
             const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-res))));
-            self.classifyDmaOutcome(e);
             return nd.errnoToError(e);
         }
         if (@as(usize, @intCast(res)) != dma.len) return error.ShortWrite;
@@ -1759,6 +1800,13 @@ pub const Device = struct {
     /// (the metadata plane's `SyncCoalescer` wraps this later), so
     /// `data_device_sync_requests == data_device_syncs` for now.
     pub fn flush(self: *Device) DeviceError!void {
+        self.flushOnce() catch |err| {
+            if (!self.readmitted(err)) return self.refusedWith(err);
+            self.flushOnce() catch |again| return self.refusedWith(again);
+        };
+    }
+
+    fn flushOnce(self: *Device) DeviceError!void {
         stats.data_device_sync_requests.inc();
         try self.fenceGate();
         stats.data_device_syncs.inc();
@@ -1785,9 +1833,9 @@ pub const Device = struct {
             .io => |res| res,
         };
         if (res < 0) {
-            // A barrier is a write-class command: EBADE latches the fence.
+            // A barrier is a write-class command: EBADE latches the fence
+            // unless the data fence re-admits the host (`flush`).
             const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-res))));
-            self.classifyDmaOutcome(e);
             return nd.errnoToError(e);
         }
     }
@@ -1803,10 +1851,19 @@ pub const Device = struct {
     /// DSM Deallocate per the substrate (a `.skip` substrate refuses
     /// `NotSupported` — never a zeroing write). Write-class: fence-gated,
     /// on the block-offset write lane, counted on its watermark (a barrier
-    /// drains it like any write), its CQE through `classifyDmaOutcome`.
+    /// drains it like any write), its conflict through the write-class funnel
+    /// (issued once more after a re-admission, `readmitted`; else
+    /// `refusedWith`).
     /// The device's logical-block alignment of the range is the caller's
     /// (blocks are whole multiples of it).
     pub fn discardRange(self: *Device, offset: u64, len: u64) DeviceError!void {
+        self.discardOnce(offset, len) catch |err| {
+            if (!self.readmitted(err)) return self.refusedWith(err);
+            self.discardOnce(offset, len) catch |again| return self.refusedWith(again);
+        };
+    }
+
+    fn discardOnce(self: *Device, offset: u64, len: u64) DeviceError!void {
         if (self.substrate == .skip) return error.NotSupported;
         try self.fenceGate();
         if (len == 0) return;
@@ -1835,7 +1892,6 @@ pub const Device = struct {
         };
         if (res < 0) {
             const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-res))));
-            self.classifyDmaOutcome(e);
             return nd.errnoToError(e);
         }
     }
@@ -2930,6 +2986,52 @@ test "node liveness: TTL-cached existence; a deleted node is seen after the TTL 
     // Expire the cache deterministically and re-probe.
     dev.node_probe.at_ms.store(1, .monotonic);
     try testing.expect(!dev.nodeExistsCached());
+}
+
+test "decision 0003 §DL: a reservation conflict on a write asks the data fence's re-admission once — re-admitted, the write goes once more and lands, nothing latched, the refusal counted; declined, the fence latches as before" {
+    var tf: TestFile = .{};
+    try tf.create(4 * derive.MiB);
+    defer tf.destroy();
+    const dev = try Device.open(testing.allocator, tf.path);
+    defer dev.deinit();
+    defer clearCustodyPoisonForTest();
+    const DataFenceStub = struct {
+        answer: bool,
+        asked: u32 = 0,
+        fn readmit(ctx: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.asked += 1;
+            return self.answer;
+        }
+    };
+    var fence: DataFenceStub = .{ .answer = true };
+    const hook: Readmit = .{ .ctx = &fence, .readmit = &DataFenceStub.readmit };
+    dev.setReadmit(&hook);
+    var payload: [4096]u8 align(4096) = undefined;
+    fillPattern(&payload, 3);
+    const refusals0 = stats.data_pr_write_refusals.load();
+    dev.setFailNextWritesErrno(1, .BADE);
+    try dev.writeBlock(0, &payload);
+    try testing.expect(!dev.fenced());
+    try testing.expectEqual(@as(u32, 1), fence.asked);
+    try testing.expectEqual(refusals0 + 1, stats.data_pr_write_refusals.load());
+    {
+        const buf = try dev.readBlock(0, 4096);
+        defer buf.release();
+        try expectPattern(buf.bytes(), 3);
+    }
+    // Declined: the latch, as before (one refusal counted by the funnel).
+    fence.answer = false;
+    log.testing.expectErrorLogs(1);
+    dev.setFailNextWritesErrno(1, .BADE);
+    try testing.expectError(error.ReservationConflict, dev.writeBlock(0, &payload));
+    try log.testing.expectAllFired();
+    try testing.expect(dev.fenced());
+    try testing.expectEqual(@as(u32, 2), fence.asked);
+    try testing.expectEqual(refusals0 + 2, stats.data_pr_write_refusals.load());
+    // Latched: never asked again.
+    try testing.expectError(error.WriterGuardFenced, dev.writeBlock(0, &payload));
+    try testing.expectEqual(@as(u32, 2), fence.asked);
 }
 
 test "fence latch: an injected EBADE write latches the fence, poisons custody, refuses every later DMA; reads are never gated" {

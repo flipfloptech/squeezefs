@@ -142,9 +142,21 @@ pub const Guard = struct {
     unreadable_lapse_beats: u32 = 0,
     /// When a beat first saw the reservation lapsed (monotonic ns; 0 =
     /// none): the hold returns `lapse_grace_ns` later — every joiner's lapse
-    /// beat re-registers its host first (decision 0003 §DJ, review MAJOR 2).
+    /// beat re-registers its host first (decision 0003 §DJ, review MAJOR 2)
+    /// — or at the first beat that finds every census key back (§DL).
     lapse_since_ns: u64 = 0,
     lapse_grace_ns: u64 = claim.LAPSE_GRACE_S * std.time.ns_per_s,
+    /// The membership census's live writer keys (decision 0003 §DL: the
+    /// grace ends once each is registered again), bound by the wire plane's
+    /// manager half while its owner shard stands; null = no early end.
+    census: ?CensusKeys = null,
+    /// The data fence's lapse beat (volume 0's guard): kicked when this beat
+    /// first sees a lapse and when the hold returns (§DL).
+    data_kick: ?DataKick = null,
+    /// Orders `census` and `data_kick` against their unbinding (the wire
+    /// plane's stop, the data fence's release) — a heartbeat never calls
+    /// into a stopped plane or a released fence.
+    hooks_lock: pr_linux.IssueLock = .{},
     /// The manager's fencing registrant (decision 0003 §DG), stood after the
     /// hold on a symmetric volume; null with `fencer_absent` naming why.
     fencer: ?*fencer.Fencer = null,
@@ -177,6 +189,59 @@ pub const Guard = struct {
     gate_now: i64 = 0,
 
     pub const TestHook = struct { ctx: *anyopaque, fire: *const fn (ctx: *anyopaque) void };
+
+    /// The census's live writer keys: every writer member's host key (≠ 0,
+    /// distinct); `error.Incomplete` while a successor's census still fills
+    /// (its members re-asserting).
+    pub const CensusKeys = struct {
+        ctx: *anyopaque,
+        keys: *const fn (ctx: *anyopaque, gpa: Allocator) error{ Incomplete, OutOfMemory }![]u64,
+    };
+
+    /// The data fence's lapse beat kick; `lapse` = a lapse was seen.
+    pub const DataKick = struct {
+        ctx: *anyopaque,
+        kick: *const fn (ctx: *anyopaque, lapse: bool) void,
+    };
+
+    pub fn bindCensus(g: *Guard, src: ?CensusKeys) void {
+        g.hooks_lock.lock();
+        defer g.hooks_lock.unlock();
+        g.census = src;
+    }
+
+    pub fn bindDataKick(g: *Guard, k: ?DataKick) void {
+        g.hooks_lock.lock();
+        defer g.hooks_lock.unlock();
+        g.data_kick = k;
+    }
+
+    fn kickDataBeat(g: *Guard, lapse: bool) void {
+        g.hooks_lock.lock();
+        defer g.hooks_lock.unlock();
+        const k = g.data_kick orelse return;
+        k.kick(k.ctx, lapse);
+    }
+
+    /// The grace's early end (decision 0003 §DL): every live member's host
+    /// key the census lists is registered on this namespace. False without
+    /// a census (no wire plane; its owner still re-asserting) or a report.
+    fn everyLiveMemberRegistered(g: *Guard, c: *pr.Client) bool {
+        const keys = blk: {
+            g.hooks_lock.lock();
+            defer g.hooks_lock.unlock();
+            const census = g.census orelse return false;
+            break :blk census.keys(census.ctx, g.gpa) catch return false;
+        };
+        defer g.gpa.free(keys);
+        var rep = c.report() catch return false;
+        defer rep.deinit(c.gpa);
+        outer: for (keys) |k| {
+            for (rep.registrants) |r| if (r.rkey == k) continue :outer;
+            return false;
+        }
+        return true;
+    }
 
     /// `writer_guard_mode` (§2.8).
     pub fn modeName(self: *const Guard) []const u8 {
@@ -805,22 +870,34 @@ pub const Guard = struct {
             if (builtin.is_test) if (g.test_after_lapse_probe) |h| h.fire(h.ctx);
             // The grace (review MAJOR 2 of decision 0003 §DJ; nvmet keeps no
             // PTPL — every joiner's registration went too): the host
-            // re-registered now, the hold only once every joiner's lapse beat
-            // had its turn — a hold taken first refuses a joiner's next
-            // metadata write. The claim stays ours and fresh meanwhile (this
-            // beat refreshes it): no takeover.
+            // re-registered now, the hold once every live member's host key
+            // in the census is registered again (§DL), else after the grace —
+            // a hold taken first refuses a joiner's next metadata write. The
+            // claim stays ours and fresh meanwhile (this beat refreshes it):
+            // no takeover.
             const now = clock.monotonicNs();
-            if (g.lapse_since_ns == 0) {
+            guard.stats.lapse_beats.inc();
+            const first = g.lapse_since_ns == 0;
+            if (first) {
                 g.lapse_since_ns = @max(now, 1);
-                log.warn("meta volume {s}: the reservation lapsed (a PTPL-less target restart? nvmet keeps none) — this host re-registers now, the hold returns in {d} s once every joiner re-registered (decision 0003 §DJ)", .{ g.be.path, g.lapse_grace_ns / std.time.ns_per_s });
+                log.warn("meta volume {s}: the reservation lapsed (a PTPL-less target restart? nvmet keeps none) — this host re-registers now; the hold returns once every live member's host key in the census is registered again, or in {d} s (decision 0003 §DJ, §DL)", .{ g.be.path, g.lapse_grace_ns / std.time.ns_per_s });
             }
             if (now -| g.lapse_since_ns < g.lapse_grace_ns) {
-                const registered = sqz.runBlocking(lapseRegisterBlocking, .{ g, c }) catch return true;
-                if (!registered) {
-                    g.failStop("the host's re-registration after a reservation lapse failed — another mount may have taken the namespace");
-                    return false;
+                const word = sqz.runBlocking(lapseRegisterBlocking, .{ g, c }) catch return true;
+                // The data fence's beat at once: this host's data
+                // re-registration needs its metadata one, made just now.
+                if (first) g.kickDataBeat(true);
+                switch (word) {
+                    .refused => {
+                        g.failStop("the host's re-registration after a reservation lapse failed — another mount may have taken the namespace");
+                        return false;
+                    },
+                    .waiting => return true,
+                    .every_member_back => {
+                        guard.stats.lapse_early_ends.inc();
+                        log.warn("meta volume {s}: every live member's host key in the census is registered again — the lapse grace ends early (decision 0003 §DL)", .{g.be.path});
+                    },
                 }
-                return true;
             }
             outcome = sqz.runBlocking(reacquireBlocking, .{ g, c }) catch return true;
             if (outcome == .reacquired) {
@@ -853,6 +930,9 @@ pub const Guard = struct {
                 g.lapse_since_ns = 0;
                 guard.stats.pr_reacquires.inc();
                 log.warn("meta volume {s}: reservation holdership had lapsed (PTPL-less target power cycle?) — re-acquired key {x:0>16}; audit the fabric", .{ g.be.path, c.key });
+                // The data namespaces' re-reservation follows at once when
+                // every metadata registrant is back on them (§DL).
+                g.kickDataBeat(false);
                 return true;
             },
             .reacquire_failed => {
@@ -900,16 +980,20 @@ pub const Guard = struct {
         return .lapse;
     }
 
+    const LapseWord = enum { refused, waiting, every_member_back };
+
     /// The lapse's re-registration of the host (through the rule) during the
-    /// grace; false = refused.
-    fn lapseRegisterBlocking(g: *Guard, c: *pr.Client) bool {
+    /// grace, then the early end's check (§DL).
+    fn lapseRegisterBlocking(g: *Guard, c: *pr.Client) LapseWord {
         c.lockOps();
         defer c.unlockOps();
-        const locked = g.lockRegistry() catch return false;
-        defer if (locked) g.fence_reg.?.unlock();
-        const fresh = g.registerHost(c, false) catch return false;
-        if (locked and fresh) guard.stats.pr_host_registrations.inc();
-        return true;
+        {
+            const locked = g.lockRegistry() catch return .refused;
+            defer if (locked) g.fence_reg.?.unlock();
+            const fresh = g.registerHost(c, false) catch return .refused;
+            if (locked and fresh) guard.stats.pr_host_registrations.inc();
+        }
+        return if (g.everyLiveMemberRegistered(c)) .every_member_back else .waiting;
     }
 
     /// The lapse's re-acquire, once the device's claim names this
@@ -2128,4 +2212,85 @@ test "review MAJOR 2 of decision 0003 §DJ, the lapse grace: a beat that finds t
     try testing.expectEqual(@as(?u64, claim.prKey(me.writerId(0), boot_a)), ns.holder);
     try testing.expect(ns.writeAllowed(host_b_id));
     try testing.expectEqual(@as(u64, 0), g.lapse_since_ns);
+}
+
+/// A census fixture: the live writer keys the wire plane's owner would list.
+const FixtureCensus = struct {
+    keys: []const u64,
+    incomplete: bool = false,
+
+    fn source(self: *FixtureCensus) Guard.CensusKeys {
+        return .{ .ctx = self, .keys = &keysFn };
+    }
+
+    fn keysFn(ctx: *anyopaque, gpa: Allocator) error{ Incomplete, OutOfMemory }![]u64 {
+        const self: *FixtureCensus = @ptrCast(@alignCast(ctx));
+        if (self.incomplete) return error.Incomplete;
+        return gpa.dupe(u64, self.keys);
+    }
+};
+
+test "decision 0003 §DL, the lapse grace's early end: the hold returns at the first beat that finds every live member's host key in the census registered again — never while one is missing, never while the census is incomplete (a successor's members re-asserting) or unbound (the grace as before); the data fence's beat is kicked when the lapse is first seen and when the hold returns" {
+    const gpa = testing.allocator;
+    const v = try Vol.create(gpa, "lapse-early", "600000");
+    defer v.destroy();
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var host: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
+    const me = ident(boot_a, 4000, 778);
+    const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
+    defer be.close();
+    const g = be.guard.?;
+    g.lapse_grace_ns = 600 * std.time.ns_per_s;
+    const Kicks = struct {
+        lapse: u32 = 0,
+        hold: u32 = 0,
+        fn kick(ctx: *anyopaque, lapse: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (lapse) self.lapse += 1 else self.hold += 1;
+        }
+    };
+    var kicks: Kicks = .{};
+    g.bindDataKick(.{ .ctx = &kicks, .kick = &Kicks.kick });
+    defer g.bindDataKick(null);
+    const re0 = guard.stats.pr_reacquires.load();
+    const early0 = guard.stats.lapse_early_ends.load();
+    // Two live members: hosts B and C.
+    var census: FixtureCensus = .{ .keys = &.{ 0xb0b0, 0xc0c0 } };
+    // Unbound: the grace as before.
+    ns.powerCycle();
+    g.beat();
+    try testing.expectEqual(@as(?u64, null), ns.holder);
+    try testing.expectEqual(@as(u32, 1), kicks.lapse);
+    // Bound, B back, C not: still the grace.
+    g.bindCensus(census.source());
+    defer g.bindCensus(null);
+    var bhost: fake.Host = .{ .ns = &ns, .host_id = host_b_id };
+    var b = try pr.Client.init(gpa, bhost.face(), 1, 0xb0b0);
+    defer b.deinit();
+    _ = try fencing.joinAsRegistrant(&b, null);
+    g.beat();
+    try testing.expectEqual(@as(?u64, null), ns.holder);
+    // C back too, but the census incomplete (the owner's re-assertion window).
+    const c_id: [16]u8 = "host-c-identity1".*;
+    var chost: fake.Host = .{ .ns = &ns, .host_id = c_id };
+    var cc = try pr.Client.init(gpa, chost.face(), 1, 0xc0c0);
+    defer cc.deinit();
+    _ = try fencing.joinAsRegistrant(&cc, null);
+    census.incomplete = true;
+    g.beat();
+    try testing.expectEqual(@as(?u64, null), ns.holder);
+    try testing.expectEqual(early0, guard.stats.lapse_early_ends.load());
+    // Every census key registered: the hold returns at this beat, 600 s
+    // before the grace's end.
+    census.incomplete = false;
+    g.beat();
+    try testing.expectEqual(re0 + 1, guard.stats.pr_reacquires.load());
+    try testing.expectEqual(early0 + 1, guard.stats.lapse_early_ends.load());
+    try testing.expectEqual(@as(?u64, claim.prKey(me.writerId(0), boot_a)), ns.holder);
+    try testing.expect(ns.writeAllowed(host_b_id) and ns.writeAllowed(c_id));
+    try testing.expectEqual(@as(u64, 0), g.lapse_since_ns);
+    try testing.expectEqual(@as(u32, 1), kicks.lapse);
+    try testing.expectEqual(@as(u32, 1), kicks.hold);
+    try testing.expect(!be.isFailed());
 }

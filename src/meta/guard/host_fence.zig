@@ -244,7 +244,11 @@ pub const Registry = struct {
         return r;
     }
 
-    pub fn runtime(kind: Kind, key: u64) Registry {
+    /// Under the run dir; `SQUEEZEFS_TEST_HOST_REGISTRY_DIR` moves the
+    /// root (a test rig's pid-tagged dir: its rows leave nothing under the
+    /// real `/run`, and every process of the rig shares it).
+    pub fn runtime(env: *const std.process.Environ.Map, kind: Kind, key: u64) Registry {
+        if (knobs.parseStr(env.get("SQUEEZEFS_TEST_HOST_REGISTRY_DIR"))) |root| if (!std.mem.eql(u8, root, "off")) return at(root, kind, key);
         const d = journal_tail.HeldDir.runtimeOf(.hosts);
         return at(d.slice(), kind, key);
     }
@@ -951,7 +955,6 @@ pub fn killColocatedMember(ctx_in: RuleContext, reg_in: Registry, dead: *const p
     defer reg.unlock();
     const es = reg.entries(ctx.gpa) catch return false;
     defer ctx.gpa.free(es);
-    var killed = false;
     for (es) |*e| {
         if (e.pid == ctx.local.pid or !namesDeadPage(e, dead, ctx.vol_index)) continue;
         if (!proveIncarnationAlive(ctx, e)) {
@@ -965,14 +968,17 @@ pub fn killColocatedMember(ctx_in: RuleContext, reg_in: Registry, dead: *const p
             return false;
         }
         guard.stats.pr_stale_sibling_kills.inc();
-        killed = true;
         reg.remove(e.pid);
         log.warn("recovery data fence: killed the dead co-located member pid {d} (appender {d}) — the device cannot fence inside this host", .{ e.pid, dead.appender_id });
     }
-    if (killed) for (data_nodes) |n| {
+    // Every data node drained, killed or proven dead alike (review minor 2):
+    // a gone process's writes can still sit in its block queues. The drain
+    // reads the queue's in-flight count — a reconnect's requeued request is
+    // idle and uncounted (§DF.13(g), the accepted residual).
+    for (data_nodes) |n| {
         ctx.path = n;
         awaitWriteDrain(ctx) catch return false;
-    };
+    }
     return true;
 }
 
@@ -1026,7 +1032,7 @@ pub fn plan(env: *const std.process.Environ.Map, c: *pr.Client, set_uuid: [16]u8
         log.warn("meta volume {s}: the namespace answers no host identifier (FID 0x81) — the reservation key is this incarnation's and the stale-sibling rule cannot run", .{path});
         return .{ .key = incarnation_key, .reg = null };
     };
-    return .{ .key = hostKey(&wire, set_uuid), .reg = Registry.runtime(.set, setRegistryKey(&wire, set_uuid)) };
+    return .{ .key = hostKey(&wire, set_uuid), .reg = Registry.runtime(env, .set, setRegistryKey(&wire, set_uuid)) };
 }
 
 fn ladderRegisterFn(ctx: *anyopaque, c: *pr.Client) anyerror!void {
@@ -1258,6 +1264,11 @@ pub fn holdReservation(c: *pr.Client, path: []const u8) error{Refused}!HoldOutco
 fn joinRegisterFn(ctx: *anyopaque, c: *pr.Client) anyerror!void {
     const env: *const std.process.Environ.Map = @ptrCast(@alignCast(ctx));
     _ = try fencing.joinAsRegistrant(c, fencing.declaredRegistrantCap(env));
+}
+
+/// A joiner's metadata registration (the join's, a lapse's re-registration).
+pub fn joinRegister(env: *const std.process.Environ.Map) Register {
+    return .{ .ctx = @constCast(env), .run = &joinRegisterFn };
 }
 
 /// A joined mount's registration on a PR-capable metadata namespace: the
@@ -1869,9 +1880,10 @@ test "review minor 2 (decision 0003 §DJ): a co-located member's death whose pro
     const node = try std.fmt.bufPrint(&nb, "{s}/data-node", .{base});
     try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = node, .data = "" });
     const dead = pgTerm(3, .recovering, 0xA, id.writerId(9), 2);
-    const proven0 = guard.stats.pr_siblings_proven_dead.load();
+    const kills0 = guard.stats.pr_stale_sibling_kills.load();
     log.testing.expectErrorLogs(1);
     try testing.expect(!killColocatedMember(ctx, reg, &dead, &.{node}));
     try log.testing.expectAllFired();
-    try testing.expectEqual(proven0 + 1, guard.stats.pr_siblings_proven_dead.load());
+    // Nothing was killed (the registry proved W gone by its start ticks).
+    try testing.expectEqual(kills0, guard.stats.pr_stale_sibling_kills.load());
 }

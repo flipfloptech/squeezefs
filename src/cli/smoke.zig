@@ -208,6 +208,10 @@ const Rig = struct {
         // (ENOTDIR under it is no copy, but the copies would go nowhere).
         var held_buf: [96]u8 = undefined;
         try self.env.put("SQUEEZEFS_TEST_JOURNAL_TAIL_DIR", try std.fmt.bufPrint(&held_buf, "/build/tmp/smoke-{d}/" ++ rig_held_dir, .{pid}));
+        // The host registries likewise (review minor 3 of decision 0003 §DJ):
+        // under the work dir, never the host's /run.
+        var hosts_buf: [96]u8 = undefined;
+        try self.env.put("SQUEEZEFS_TEST_HOST_REGISTRY_DIR", try std.fmt.bufPrint(&hosts_buf, "/build/tmp/smoke-{d}/hosts", .{pid}));
         // The data dir's per-run folder (equals `work` unless the seam moved it).
         const data_work = try std.fmt.allocPrintSentinel(gpa, "{s}/smoke-{d}", .{ data_dir, pid }, 0);
         defer gpa.free(data_work);

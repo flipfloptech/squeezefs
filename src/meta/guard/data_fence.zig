@@ -26,11 +26,33 @@
 //! manager, a chain of them, a host whose metadata fence landed alone — is
 //! preempted-and-aborted, the data report read before the metadata's (a
 //! joiner registers metadata before data and leaves data before metadata),
-//! after a report shows this host holding.
+//! after a report shows this host holding. Only a STABLE fact leaves a data
+//! volume without a device fence (a file, a non-NVMe block node, RESCAP 0, a
+//! controller answering no host identifier): a node absent or unreadable
+//! right now, an Identify that failed, refuses the admission (review MAJOR 1:
+//! a reconnecting target read as "not NVMe" stayed unfenced for the mount's
+//! life). Only the manager reserves (a joiner registers), and only once every
+//! host registered on volume 0's metadata namespace is registered on the data
+//! namespace — else the lapse beat reserves after the grace.
+//!
+//! THE LAPSE BEAT (review MAJOR 2; heartbeat cadence, never per I/O): nvmet
+//! keeps no PTPL — a target restart forgets every registration and
+//! reservation. Every writer's beat reads each data namespace: unreserved and
+//! this host unregistered ⇒ re-register through the rule (the metadata
+//! registration checked before and after, its own page Live under its writer
+//! id before and after); the manager, once it holds volume 0's metadata
+//! namespace and every metadata registrant is back on data (or
+//! `claim.LAPSE_GRACE_S` passed), re-reserves WEAR and reconciles. A joiner's
+//! beat re-registers its host on the metadata namespace the same way
+//! (unreserved, its page Live); the manager's guard re-acquires the hold after
+//! the same grace.
 //!
 //! THE DEATH (`recovery.zig` step 2c, `fencing.fenceDataNamespaces`): the
 //! dead host's key preempted on every data namespace and proven before
-//! anything the member can write is reallocated, else the recovery holds; a
+//! anything the member can write is reallocated, else the recovery holds —
+//! every non-retired data volume of the SET CONFIG fenced or provably
+//! unfenceable (a retired one leaves the table; the operator's
+//! `volume waive-data-fence` escape for a target gone for good); a
 //! co-located member (the own-key guard) is killed by its recoverer on this
 //! host (`host_fence.killColocatedMember`). THE RELEASE, by the host's last
 //! process of the set: another registrant stands ⇒ unregister (WEAR keeps
@@ -47,6 +69,9 @@ const Io = std.Io;
 
 const counters = @import("../../core/counters.zig");
 const log = @import("../../core/log.zig");
+const clock = @import("../../core/clock.zig");
+const tick = @import("../../sync/tick.zig");
+const meta_key = @import("../key.zig");
 const claim = @import("claim.zig");
 const pr = @import("pr.zig");
 const nvme = @import("nvme_cmd.zig");
@@ -89,17 +114,42 @@ pub const stats = struct {
     pub var data_pr_volumes_unfenced: counters.Gauge = .{};
     /// Data volumes this process is registered on.
     pub var data_pr_volumes: counters.Gauge = .{};
+    /// Data volumes the last recovery's data fence could not prove (a
+    /// set-config volume outside the table, an unproven preempt): the alert.
+    pub var data_pr_fence_held_volumes: counters.Gauge = .{};
+    /// `volume waive-data-fence`: data volumes the operator declared
+    /// unfenceable on this manager.
+    pub var data_pr_operator_waivers: counters.ShardedCounter = .{};
+    /// The lapse beat: data namespaces the manager found unreserved, this
+    /// host's re-registrations there, the manager's re-reservations; a
+    /// joiner's re-registrations on volume 0's metadata namespace.
+    pub var data_pr_lapses: counters.ShardedCounter = .{};
+    pub var data_pr_lapse_reregistrations: counters.ShardedCounter = .{};
+    pub var data_pr_lapse_rereservations: counters.ShardedCounter = .{};
+    pub var meta_pr_lapse_reregistrations: counters.ShardedCounter = .{};
 };
 
-/// Why a data volume carries no device fence (the documented class).
+/// Why a data volume carries no device fence — stable facts only (review
+/// MAJOR 1), and the operator's waiver.
 pub const Absent = enum {
     not_nvme_namespace,
-    no_char_node,
     rescap_zero,
-    probe_error,
-    /// The data controller answers no host identifier (FID 0x81): the
-    /// registration cannot be judged.
+    /// The data controller (or volume 0's metadata controller) answers no
+    /// host identifier (FID 0x81 zeros): the registration cannot be judged.
     no_wire_host_id,
+    /// `volume waive-data-fence`: the operator confirmed out of band that no
+    /// dead member reaches the target (a target gone for good).
+    operator_waived,
+};
+
+/// The durable set config's non-retired data volumes (tree 0 of volume 0,
+/// `set_config.CONTROL_KEY`): what step 2c must find fenced or provably
+/// unfenceable, and what a retirement takes out of the table.
+pub const ConfigSource = struct {
+    ctx: *anyopaque,
+    read: *const fn (ctx: *anyopaque, gpa: Allocator, out: *[router.MAX_VOLUMES]u64) Error!usize,
+
+    pub const Error = error{ Io, Undecodable, TooManyVolumes, OutOfMemory };
 };
 
 pub const AdmitError = error{
@@ -128,7 +178,14 @@ pub const Inputs = struct {
     node_token: u64,
     /// Volume 0's appender pages.
     pages: host_fence.PageSource,
-    /// Volume 0's writer (the manager, or a flat set's): it reconciles.
+    /// Volume 0's metadata node (a joiner's lapse re-registration drains it).
+    meta_path: []const u8,
+    /// This incarnation's writer id: its page Live under it is its currency
+    /// (the manager's appender-0 page, a joiner's page).
+    writer_id: u64,
+    config: ConfigSource,
+    /// Volume 0's writer (the manager, or a flat set's): it reserves and
+    /// reconciles.
     manager: bool,
 };
 
@@ -143,6 +200,9 @@ pub const Volume = struct {
     fresh: bool,
     /// This process reserved the unreserved namespace.
     acquired: bool,
+    /// The manager's word: when it saw the namespace unreserved (monotonic
+    /// ns; 0 = reserved).
+    lapse_since_ns: u64 = 0,
 
     pub fn path(self: *const Volume) []const u8 {
         return self.node;
@@ -163,6 +223,22 @@ pub const DataFence = struct {
     n: usize = 0,
     absent: [router.MAX_VOLUMES]AbsentRow = undefined,
     n_absent: usize = 0,
+    /// The alert's last held set and when it was said (one line per change,
+    /// else one per `ALERT_EVERY_NS`).
+    alert_sig: u64 = 0,
+    alert_ns: u64 = 0,
+    /// The lapse beat (`startBeat`; the offline verbs run none).
+    io: ?Io = null,
+    beat_stop: std.atomic.Value(u32) = .init(0),
+    beat_fut: ?Io.Future(void) = null,
+
+    /// The alert's repeat: a held recovery polls every tick; one line per
+    /// half minute keeps the log readable and the alert loud.
+    const ALERT_EVERY_NS: u64 = 30 * std.time.ns_per_s;
+
+    /// What a held recovery's alert names (with the volumes or the key, its
+    /// signature).
+    const AlertWhy = enum(u8) { config_unreadable, untabled, unproven };
 
     pub fn create(in: Inputs) Allocator.Error!*DataFence {
         const self = try in.gpa.create(DataFence);
@@ -171,23 +247,28 @@ pub const DataFence = struct {
         return self;
     }
 
-    /// The metadata namespace answers its host identifier (the registrations
-    /// are judged by it); else no data volume can be fenced.
-    pub fn metaJudgeable(self: *DataFence) bool {
-        _ = self.meta.wireHostId() catch return false;
-        return true;
+    /// Volume 0's metadata namespace's host identifier: answered (the
+    /// registrations are judged by it), zeros (a stable fact: no data volume
+    /// can be fenced), or unreadable now (the admission refuses).
+    pub fn metaHostId(self: *DataFence) enum { known, unknown, unreadable } {
+        _ = self.meta.wireHostId() catch |e| return if (e == error.HostIdUnknown) .unknown else .unreadable;
+        return .known;
     }
 
-    /// The admission of one data volume by its live node path.
+    /// The admission of one data volume by its live node path. Only a
+    /// stable fact leaves it without a device fence; anything transient
+    /// refuses (review MAJOR 1).
     pub fn admitVolume(self: *DataFence, vol_tag: u64, path: []const u8) AdmitError!void {
         const gpa = self.in.gpa;
+        switch (pr_linux.classifyNode(path)) {
+            .not_nvme => return self.noteAbsent(vol_tag, path, .not_nvme_namespace),
+            .unknown => return transientRefusal(path, "its node is absent or unreadable right now (a controller reconnecting?)", null),
+            .nvme => {},
+        }
+        // An NVMe namespace on 7.3 always has its generic char twin and its
+        // controller node: one that cannot be opened now is transient.
         const dev = switch (pr_linux.resolve(gpa, path)) {
-            .none => |why| return self.noteAbsent(vol_tag, path, switch (why) {
-                .not_nvme_namespace => .not_nvme_namespace,
-                .no_char_node => .no_char_node,
-                .rescap_zero => .rescap_zero,
-                .probe_error => .probe_error,
-            }),
+            .none => |why| return transientRefusal(path, "its char node, controller node or PR ring cannot be opened right now", @tagName(why)),
             .device => |d| d,
         };
         const c = gpa.create(pr.Client) catch {
@@ -199,7 +280,10 @@ pub const DataFence = struct {
             dev.deinit();
             return error.OutOfMemory;
         };
-        const rescap = c.probeRescap() catch 0;
+        const rescap = c.probeRescap() catch |e| {
+            freeClient(gpa, dev, c);
+            return transientRefusal(path, "its Identify Namespace (RESCAP) failed", @errorName(e));
+        };
         if (rescap == 0) {
             freeClient(gpa, dev, c);
             return self.noteAbsent(vol_tag, path, .rescap_zero);
@@ -208,54 +292,92 @@ pub const DataFence = struct {
     }
 
     /// The admission's core over a client (owned from here: freed on a
-    /// refusal and at the release).
+    /// refusal and at the release), one PR sequence of this fence at a time.
     pub fn admitClient(self: *DataFence, vol_tag: u64, path: []const u8, device: ?*pr_linux.Device, client: *pr.Client) AdmitError!void {
         const gpa = self.in.gpa;
         var owned = true;
         defer if (owned) freeClient(gpa, device, client);
         client.key = self.in.key;
         client.rtype = nvme.RTYPE_WEAR;
-        _ = client.wireHostId() catch return self.noteAbsent(vol_tag, path, .no_wire_host_id);
-        const fresh = self.register(path, client) catch |e| {
-            stats.data_pr_admission_refusals.inc();
-            return e;
-        };
-        errdefer if (fresh) client.unregister(client.key) catch {};
-        const acquired = self.reserve(path, client) catch |e| {
-            stats.data_pr_admission_refusals.inc();
-            return e;
-        };
-        if (self.in.manager) self.reconcile(path, client) catch |e| {
-            stats.data_pr_admission_refusals.inc();
-            return e;
+        _ = client.wireHostId() catch |e| {
+            if (e == error.HostIdUnknown) return self.noteAbsent(vol_tag, path, .no_wire_host_id);
+            return transientRefusal(path, "its controller's host identifier (FID 0x81) could not be read", @errorName(e));
         };
         const node = try gpa.dupe(u8, path);
         errdefer gpa.free(node);
         self.lock.lock();
         defer self.lock.unlock();
         if (self.n == self.vols.len) return error.Refused;
-        self.vols[self.n] = .{ .vol_tag = vol_tag, .node = node, .device = device, .client = client, .fresh = fresh, .acquired = acquired };
+        const fresh = self.register(path, client) catch |e| {
+            stats.data_pr_admission_refusals.inc();
+            return e;
+        };
+        errdefer if (fresh) client.unregister(client.key) catch {};
+        var acquired = false;
+        var lapse_since_ns: u64 = 0;
+        if (self.in.manager) {
+            // The reservation returns only once every live host is
+            // registered here — else the beat takes it after the grace (a
+            // reservation taken first refuses every member not yet back).
+            const ready = self.everyMetaRegistrantOnData(client) catch return reportRefusal(path, "the reports before the reservation");
+            if (ready) {
+                acquired = self.reserve(path, client) catch |e| {
+                    stats.data_pr_admission_refusals.inc();
+                    return e;
+                };
+                self.reconcile(path, client) catch |e| {
+                    stats.data_pr_admission_refusals.inc();
+                    return e;
+                };
+            } else {
+                const rtype = reportRtype(client) catch return reportRefusal(path, "the data namespace's report");
+                if (rtype != 0 and rtype != nvme.RTYPE_WEAR) return foreignReservation(path, rtype);
+                if (rtype == 0) {
+                    lapse_since_ns = @max(clock.monotonicNs(), 1);
+                } else self.reconcile(path, client) catch |e| {
+                    stats.data_pr_admission_refusals.inc();
+                    return e;
+                };
+            }
+        }
+        self.vols[self.n] = .{ .vol_tag = vol_tag, .node = node, .device = device, .client = client, .fresh = fresh, .acquired = acquired, .lapse_since_ns = lapse_since_ns };
         self.clients[self.n] = client;
         self.n += 1;
         owned = false;
         stats.data_pr_volumes.set(self.n);
         if (fresh) stats.data_pr_registrations.inc() else stats.data_pr_adoptions.inc();
-        log.info("data volume {s}: vol-{x:0>16} {s} under the host's key {x:0>16} (WEAR{s}) — a fenced host's writes are refused by the device (decision 0003 §DJ)", .{ path, vol_tag, if (fresh) "registered this host" else "this host's registration adopted (no device mutation)", client.key, if (acquired) ", reserved by this mount" else "" });
+        log.info("data volume {s}: vol-{x:0>16} {s} under the host's key {x:0>16} (WEAR{s}) — a fenced host's writes are refused by the device (decision 0003 §DJ)", .{ path, vol_tag, if (fresh) "registered this host" else "this host's registration adopted (no device mutation)", client.key, if (acquired) ", reserved by this mount" else if (lapse_since_ns != 0) "; reserved by the beat once every live host is back, or after the grace" else "" });
     }
 
     fn noteAbsent(self: *DataFence, vol_tag: u64, path: []const u8, why: Absent) void {
         self.lock.lock();
         defer self.lock.unlock();
-        if (self.n_absent < self.absent.len) {
-            self.absent[self.n_absent] = .{ .vol_tag = vol_tag, .why = why };
-            self.n_absent += 1;
-        }
-        stats.data_pr_volumes_unfenced.set(self.n_absent);
+        self.noteAbsentLocked(vol_tag, why);
         // A file or a non-NVMe node is the single-kernel substrate class (said
         // once); an NVMe namespace that cannot be fenced is the operator's.
         if (why == .not_nvme_namespace) {
             log.info("data volume {s}: vol-{x:0>16} is not an NVMe namespace — no device fence (decision 0003 §DJ)", .{ path, vol_tag });
         } else log.warn("data volume {s}: vol-{x:0>16} carries no device fence ({t}) — a dead member's data writes are not refused there (the documented no-device-fence class, decision 0003 §DJ)", .{ path, vol_tag, why });
+    }
+
+    fn noteAbsentLocked(self: *DataFence, vol_tag: u64, why: Absent) void {
+        if (self.absentIndex(vol_tag)) |i| {
+            self.absent[i].why = why;
+        } else if (self.n_absent < self.absent.len) {
+            self.absent[self.n_absent] = .{ .vol_tag = vol_tag, .why = why };
+            self.n_absent += 1;
+        }
+        stats.data_pr_volumes_unfenced.set(self.n_absent);
+    }
+
+    fn tabledIndex(self: *const DataFence, vol_tag: u64) ?usize {
+        for (self.vols[0..self.n], 0..) |*v, i| if (v.vol_tag == vol_tag) return i;
+        return null;
+    }
+
+    fn absentIndex(self: *const DataFence, vol_tag: u64) ?usize {
+        for (self.absent[0..self.n_absent], 0..) |a, i| if (a.vol_tag == vol_tag) return i;
+        return null;
     }
 
     /// The host's registration: adopted when registered, else through the
@@ -351,6 +473,11 @@ pub const DataFence = struct {
             for (mrep.registrants) |mr| if (mr.rkey == r.rkey) continue :outer;
             for (done[0..n_done]) |k| if (k == r.rkey) continue :outer;
             c.preemptAndAbort(r.rkey) catch |e| {
+                // The key may have left since the data report (a joiner
+                // leaving data, then metadata, review minor 1): absent now
+                // is the fence's end state.
+                const gone = !(keyOnNamespace(c, r.rkey) catch true);
+                if (gone) continue :outer;
                 var buf: [128]u8 = undefined;
                 var w: Io.Writer = .fixed(&buf);
                 c.writeError(&w, e) catch {};
@@ -366,11 +493,110 @@ pub const DataFence = struct {
         }
     }
 
-    /// Recovery's step 2c (`recovery.DataFence.fence`).
+    /// Recovery's step 2c (`recovery.DataFence.fence`): every non-retired
+    /// data volume of the set config (review MAJOR 1: not only this table)
+    /// fenced or provably unfenceable, else the recovery holds — alerted.
     pub fn fenceDead(self: *DataFence, meta: ?*pr.Client, victim_key: u64) fencing.DataFenceOutcome {
         self.lock.lock();
         defer self.lock.unlock();
-        return fencing.fenceDataNamespaces(meta, self.clients[0..self.n], victim_key);
+        var live: [router.MAX_VOLUMES]u64 = undefined;
+        const n_live = self.in.config.read(self.in.config.ctx, self.in.gpa, &live) catch |e| {
+            stats.data_pr_fence_held_volumes.set(1);
+            if (self.alertDue(.config_unreadable, 0)) log.err("recovery data fence: the set config (tree 0 of volume 0) could not be read ({s}) — which data volumes the dead member (key {x:0>16}) can write is unknown: the recovery HOLDS (decision 0003 §DJ)", .{ @errorName(e), victim_key });
+            return .failed;
+        };
+        self.pruneLocked(live[0..n_live]);
+        var held: usize = 0;
+        var sig: u64 = 0;
+        var first: u64 = 0;
+        for (live[0..n_live]) |tag| {
+            if (self.tabledIndex(tag) != null or self.absentIndex(tag) != null) continue;
+            if (held == 0) first = tag;
+            held += 1;
+            sig = std.hash.Wyhash.hash(sig, std.mem.asBytes(&tag));
+        }
+        if (held != 0) {
+            stats.data_pr_fence_held_volumes.set(held);
+            if (self.alertDue(.untabled, sig)) log.err("recovery data fence: vol-{x:0>16} ({d} data volume(s) in all) is in the set config but neither admitted on this manager nor provably unfenceable — the dead member (key {x:0>16}) may write there: the recovery HOLDS, its slots leased and its grant windows set. {s}", .{ first, held, victim_key, escape_text });
+            return .failed;
+        }
+        var unproven: usize = 0;
+        const out = fencing.fenceDataNamespacesCounted(meta, self.clients[0..self.n], victim_key, &unproven);
+        stats.data_pr_fence_held_volumes.set(unproven);
+        if (out == .failed) {
+            if (self.alertDue(.unproven, victim_key)) log.err("recovery data fence: the dead member's host (key {x:0>16}) is not proven fenced on {d} data volume(s) — the recovery HOLDS (the next poll re-runs). {s}", .{ victim_key, unproven, escape_text });
+        } else self.alert_sig = 0;
+        return out;
+    }
+
+    const escape_text = "A target gone for good: fence the dead host out of band (power it off, or cut its host NQN from the target's allowed hosts), then run `squeezefs volume waive-data-fence <mountpoint> vol-<16 hex>` on this manager (decision 0003 §DJ)";
+
+    /// One line per held set, else one per `ALERT_EVERY_NS`.
+    fn alertDue(self: *DataFence, why: AlertWhy, payload: u64) bool {
+        const sig = std.hash.Wyhash.hash(@backingInt(why), std.mem.asBytes(&payload));
+        const now = clock.monotonicNs();
+        if (sig == self.alert_sig and now -| self.alert_ns < ALERT_EVERY_NS) return false;
+        self.alert_sig = sig;
+        self.alert_ns = now;
+        return true;
+    }
+
+    /// A volume retired (or gone) from the set config leaves the table at
+    /// once — never a fence of a namespace the set no longer holds. Its
+    /// client closes without a command (the target may be unreachable): its
+    /// registration stays there (§DJ.12 (c)).
+    fn pruneLocked(self: *DataFence, live: []const u64) void {
+        var i: usize = 0;
+        while (i < self.n) {
+            if (std.mem.indexOfScalar(u64, live, self.vols[i].vol_tag) != null) {
+                i += 1;
+                continue;
+            }
+            const v = self.vols[i];
+            log.info("data volume vol-{x:0>16}: retired from the set config — it leaves the data fence's table", .{v.vol_tag});
+            freeClient(self.in.gpa, v.device, v.client);
+            self.in.gpa.free(v.node);
+            self.n -= 1;
+            self.vols[i] = self.vols[self.n];
+            self.clients[i] = self.clients[self.n];
+        }
+        stats.data_pr_volumes.set(self.n);
+        i = 0;
+        while (i < self.n_absent) {
+            if (std.mem.indexOfScalar(u64, live, self.absent[i].vol_tag) != null) {
+                i += 1;
+                continue;
+            }
+            self.n_absent -= 1;
+            self.absent[i] = self.absent[self.n_absent];
+        }
+        stats.data_pr_volumes_unfenced.set(self.n_absent);
+    }
+
+    /// `volume waive-data-fence` (the operator's escape for a target gone for
+    /// good, review MAJOR 1): the volume counts as unfenceable on this
+    /// manager from now on — its client closed, the absent row
+    /// `operator_waived`. The operator confirmed out of band that no dead
+    /// member reaches the target. For this manager's life (no format
+    /// change); the next mount admits the volume again.
+    pub fn waive(self: *DataFence, vol_tag: u64) error{ UnknownVolume, ConfigUnreadable }!void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var live: [router.MAX_VOLUMES]u64 = undefined;
+        const n_live = self.in.config.read(self.in.config.ctx, self.in.gpa, &live) catch return error.ConfigUnreadable;
+        if (std.mem.indexOfScalar(u64, live[0..n_live], vol_tag) == null) return error.UnknownVolume;
+        if (self.tabledIndex(vol_tag)) |i| {
+            const v = self.vols[i];
+            freeClient(self.in.gpa, v.device, v.client);
+            self.in.gpa.free(v.node);
+            self.n -= 1;
+            self.vols[i] = self.vols[self.n];
+            self.clients[i] = self.clients[self.n];
+            stats.data_pr_volumes.set(self.n);
+        }
+        self.noteAbsentLocked(vol_tag, .operator_waived);
+        stats.data_pr_operator_waivers.inc();
+        log.err("data volume vol-{x:0>16}: the operator WAIVED its data fence (`volume waive-data-fence`) — a dead member's writes to it are no longer refused by its device on this manager; the operator confirmed out of band that no dead member reaches that target (decision 0003 §DJ)", .{vol_tag});
     }
 
     /// The own-key case (`recovery.DataFence.killColocated`): the dead
@@ -406,23 +632,26 @@ pub const DataFence = struct {
     /// client and registry (its admission ran), then every data volume's
     /// registration again — the death preempt removed the host's. Null = re-
     /// admitted; else why not.
-    pub fn readmit(self: *DataFence, meta_face: nvme.Namespace, meta_nsid: u32, key: u64, reg: ?host_fence.Registry, pages: host_fence.PageSource) ?[]const u8 {
+    pub fn readmit(self: *DataFence, s: Successor) ?[]const u8 {
         const gpa = self.in.gpa;
         self.lock.lock();
         defer self.lock.unlock();
-        const meta = metaClient(gpa, meta_face, meta_nsid, key) catch return "out of memory re-admitting the data volumes";
+        const meta = metaClient(gpa, s.meta_face, s.meta_nsid, s.key) catch return "out of memory re-admitting the data volumes";
         // The predecessor's inputs stay until every volume re-admitted (a
         // refused re-join closes the successor's set).
         const prior = self.in;
         const prior_meta = self.meta;
-        self.in.meta_face = meta_face;
-        self.in.meta_nsid = meta_nsid;
-        self.in.key = key;
-        self.in.reg = reg;
-        self.in.pages = pages;
+        self.in.meta_face = s.meta_face;
+        self.in.meta_nsid = s.meta_nsid;
+        self.in.key = s.key;
+        self.in.reg = s.reg;
+        self.in.pages = s.pages;
+        self.in.meta_path = s.meta_path;
+        self.in.writer_id = s.writer_id;
+        self.in.node_token = s.node_token;
         self.meta = meta;
         for (self.vols[0..self.n]) |*v| {
-            v.client.key = key;
+            v.client.key = s.key;
             const fresh = self.register(v.path(), v.client) catch |e| {
                 self.in = prior;
                 self.meta = prior_meta;
@@ -443,12 +672,169 @@ pub const DataFence = struct {
         return null;
     }
 
+    /// A re-join's successor's inputs (decision 0003 §BS).
+    pub const Successor = struct {
+        meta_face: nvme.Namespace,
+        meta_nsid: u32,
+        key: u64,
+        reg: ?host_fence.Registry,
+        pages: host_fence.PageSource,
+        meta_path: []const u8,
+        writer_id: u64,
+        node_token: u64,
+    };
+
+    // ---- the lapse beat (review MAJOR 2) ----
+
+    /// Spawn the lapse beat on the `sqz-meta` pool: every
+    /// `claim.HEARTBEAT_INTERVAL_S`, its PR work on the blocking pool.
+    pub fn startBeat(self: *DataFence, io: Io) error{ThreadSpawnFailed}!void {
+        self.io = io;
+        const sqz = exec.SqzIo.fromIo(io);
+        self.beat_fut = sqz.spawnMeta(beatMain, .{self}) catch return error.ThreadSpawnFailed;
+    }
+
+    fn stopBeat(self: *DataFence) void {
+        const fut = &(self.beat_fut orelse return);
+        const io = self.io.?;
+        // The wake IS the store (`tick.wake`): a parked beat ends at once.
+        tick.wake(io, &self.beat_stop);
+        fut.await(io);
+        self.beat_fut = null;
+    }
+
+    fn beatMain(self: *DataFence) void {
+        const io = self.io.?;
+        const interval_ns: u64 = claim.HEARTBEAT_INTERVAL_S * std.time.ns_per_s;
+        while (true) {
+            const deadline = clock.monotonicNs() + interval_ns;
+            while (self.beat_stop.load(.acquire) == 0) {
+                if (tick.parkUntilUncancelable(io, &self.beat_stop, deadline, null) == .deadline) break;
+            }
+            // Acquire pairs with `stopBeat`'s wake: no beat after the release.
+            if (self.beat_stop.load(.acquire) != 0) return;
+            exec.SqzIo.fromIo(io).runBlocking(beat, .{self}) catch {};
+        }
+    }
+
+    /// One lapse beat: a joiner's metadata namespace, then every data
+    /// namespace. A namespace whose report fails is skipped until the next
+    /// beat. (A retired volume leaves the table at the next fence, which
+    /// reads the set config under the table's lock.)
+    pub fn beat(self: *DataFence) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (!self.in.manager) self.metaLapseBeat();
+        const now = clock.monotonicNs();
+        for (self.vols[0..self.n]) |*v| self.volumeBeat(v, now);
+    }
+
+    /// A data namespace after a lapse (nvmet keeps no PTPL): unreserved and
+    /// this host unregistered ⇒ re-register through the rule while its
+    /// metadata registration and its currency hold; the manager re-reserves
+    /// once it holds the metadata namespace and every metadata registrant is
+    /// back here, or the grace passed, then reconciles. Never under WEAR:
+    /// this host unregistered there is fenced.
+    fn volumeBeat(self: *DataFence, v: *Volume, now: u64) void {
+        const c = v.client;
+        const f = host_fence.reportFacts(c) catch return;
+        if (f.facts.reserved) {
+            v.lapse_since_ns = 0;
+            return;
+        }
+        if (self.in.manager and v.lapse_since_ns == 0) {
+            v.lapse_since_ns = @max(now, 1);
+            stats.data_pr_lapses.inc();
+            log.warn("data volume {s}: the namespace carries no reservation (a PTPL-less target restart? nvmet keeps none) — every live host re-registers at its beat; re-reserved once they are back or after {d} s (decision 0003 §DJ)", .{ v.path(), claim.LAPSE_GRACE_S });
+        }
+        if (!f.registered) {
+            const mf = host_fence.reportFacts(self.meta) catch return;
+            if (!mf.registered or !self.current()) return;
+            const fresh = self.register(v.path(), c) catch return;
+            if (!self.current()) {
+                if (fresh) c.unregister(c.key) catch {};
+                log.warn("data volume {s}: this incarnation's page left Live during its lapse re-registration — withdrawn (decision 0003 §DJ)", .{v.path()});
+                return;
+            }
+            if (fresh) {
+                v.fresh = true;
+                stats.data_pr_lapse_reregistrations.inc();
+                log.warn("data volume {s}: re-registered this host under key {x:0>16} after the lapse (decision 0003 §DJ)", .{ v.path(), c.key });
+            }
+        }
+        if (!self.in.manager) return;
+        const held = self.meta.holdsHere() catch return;
+        if (!held) return;
+        const back = self.everyMetaRegistrantOnData(c) catch return;
+        if (!back and now -| v.lapse_since_ns < claim.LAPSE_GRACE_S * std.time.ns_per_s) return;
+        const acquired = self.reserve(v.path(), c) catch return;
+        self.reconcile(v.path(), c) catch return;
+        if (acquired) v.acquired = true;
+        v.lapse_since_ns = 0;
+        stats.data_pr_lapse_rereservations.inc();
+        log.warn("data volume {s}: re-reserved Write Exclusive – All Registrants after the lapse ({s}); every data registrant the metadata namespace lacks preempted (decision 0003 §DJ)", .{ v.path(), if (back) "every live host back" else "the grace elapsed" });
+    }
+
+    /// A joiner's metadata namespace after a lapse: unreserved and this host
+    /// unregistered ⇒ re-register through the stale-sibling rule while this
+    /// incarnation is current (its page Live under its writer id), before
+    /// and after. A hold standing with this host unregistered is a fence.
+    fn metaLapseBeat(self: *DataFence) void {
+        const meta = self.meta;
+        const f = host_fence.reportFacts(meta) catch return;
+        if (f.registered or f.facts.reserved) return;
+        var reg = self.in.reg orelse return;
+        if (!self.current()) return;
+        reg.lock() catch return;
+        defer reg.unlock();
+        const ctx: host_fence.RuleContext = .{ .gpa = self.in.gpa, .env = self.in.env, .path = self.in.meta_path, .local = self.in.local, .node_token = self.in.node_token, .vol_index = 0, .taking_manager = false };
+        const fresh = host_fence.registerUnderRule(ctx, &reg, meta, self.in.pages, host_fence.joinRegister(self.in.env)) catch |e| {
+            log.warn("meta volume {s}: the lapse re-registration of this host was refused ({s}) — the next beat tries again; once the manager's hold returns this joiner is fenced (decision 0003 §DJ)", .{ self.in.meta_path, @errorName(e) });
+            return;
+        };
+        if (!self.current()) {
+            if (fresh) meta.unregister(meta.key) catch {};
+            log.warn("meta volume {s}: this incarnation's page left Live during its lapse re-registration — withdrawn (decision 0003 §DJ)", .{self.in.meta_path});
+            return;
+        }
+        if (fresh) {
+            stats.meta_pr_lapse_reregistrations.inc();
+            log.warn("meta volume {s}: re-registered this host under key {x:0>16} after the lapse (a PTPL-less target restart) — before the manager's hold returns (decision 0003 §DJ)", .{ self.in.meta_path, meta.key });
+        }
+    }
+
+    /// This incarnation is current: a page of volume 0 Live under its own
+    /// writer id and node token (a dead or superseded one's page left Live).
+    fn current(self: *DataFence) bool {
+        const gpa = self.in.gpa;
+        const pages = self.in.pages.read(self.in.pages.ctx, gpa) catch return false;
+        defer gpa.free(pages);
+        for (pages) |p| if (p.state == .live and p.identity.node_token == self.in.node_token and p.identity.writer_id == self.in.writer_id) return true;
+        return false;
+    }
+
+    /// Every key registered on volume 0's metadata namespace is registered
+    /// on this data namespace (every live host back after a lapse).
+    fn everyMetaRegistrantOnData(self: *DataFence, c: *pr.Client) pr.Error!bool {
+        const gpa = self.in.gpa;
+        var mrep = try self.meta.report();
+        defer mrep.deinit(gpa);
+        var drep = try c.report();
+        defer drep.deinit(gpa);
+        outer: for (mrep.registrants) |mr| {
+            for (drep.registrants) |dr| if (dr.rkey == mr.rkey) continue :outer;
+            return false;
+        }
+        return true;
+    }
+
     /// The teardown, after the data plane closed its fds and before the
     /// metadata release: the host's last process of the set leaves each data
     /// namespace by the kept law; every client and node closed.
     pub fn release(self: *DataFence) void {
         const gpa = self.in.gpa;
         defer gpa.destroy(self);
+        self.stopBeat();
         self.lock.lock();
         defer self.lock.unlock();
         var last = true;
@@ -527,44 +913,74 @@ pub fn admitSet(gpa: Allocator, env: *const std.process.Environ.Map, io: Io, be0
         refused.* = "the blocking pool refused the admission";
         return error.Refused;
     };
-    if (r) |d| {
+    if (r) |what| {
         df.release();
-        refused.* = d.uri;
+        refused.* = what;
         return error.Refused;
     }
     return df;
 }
 
-fn admitAllBlocking(df: *DataFence, data: []const set_config.DataVolume) ?*const set_config.DataVolume {
-    if (!df.metaJudgeable()) {
-        log.warn("data fence: the metadata namespace answers no host identifier (FID 0x81) — the data namespaces' registrations cannot be judged: no data volume is fenced (decision 0003 §DJ)", .{});
-        return null;
+/// Null = admitted; else what refused (logged).
+fn admitAllBlocking(df: *DataFence, data: []const set_config.DataVolume) ?[]const u8 {
+    switch (df.metaHostId()) {
+        .known => {},
+        .unknown => {
+            log.warn("data fence: the metadata namespace answers no host identifier (FID 0x81 zeros) — the data namespaces' registrations cannot be judged: no data volume is fenced (decision 0003 §DJ)", .{});
+            df.lock.lock();
+            defer df.lock.unlock();
+            for (data) |*d| if (d.state != .retired) df.noteAbsentLocked(d.vol_tag, .no_wire_host_id);
+            return null;
+        },
+        .unreadable => {
+            stats.data_pr_admission_refusals.inc();
+            log.err("data fence: the metadata namespace's host identifier (FID 0x81) could not be read — refusing: the data namespaces' registrations cannot be judged blind (decision 0003 §DJ)", .{});
+            return "volume 0's metadata namespace (its host identifier)";
+        },
     }
     for (data) |*d| {
         if (d.state == .retired) continue;
-        df.admitVolume(d.vol_tag, d.uri) catch return d;
+        df.admitVolume(d.vol_tag, d.uri) catch return d.uri;
     }
     return null;
 }
 
 fn inputsOf(gpa: Allocator, env: *const std.process.Environ.Map, be0: *backend.KvBackend) ?Inputs {
     const pages: host_fence.PageSource = .{ .ctx = be0, .read = &volumePages };
+    const config: ConfigSource = .{ .ctx = be0, .read = &durableConfig };
     if (be0.guard) |g| {
         const c = g.prClient() orelse return null;
         const dev = g.device orelse return null;
-        return .{ .gpa = gpa, .env = env, .meta_face = dev.face(), .meta_nsid = dev.nsid, .key = c.key, .reg = g.fence_reg, .local = g.identity, .node_token = join.nodeToken(g.identity), .pages = pages, .manager = true };
+        return .{ .gpa = gpa, .env = env, .meta_face = dev.face(), .meta_nsid = dev.nsid, .key = c.key, .reg = g.fence_reg, .local = g.identity, .node_token = join.nodeToken(g.identity), .pages = pages, .meta_path = be0.path, .writer_id = g.identity.writerId(be0.index), .config = config, .manager = true };
     }
     const js = be0.joined orelse return null;
     const f = js.fence orelse return null;
-    const local = proc.localIdentity();
-    return .{ .gpa = gpa, .env = env, .meta_face = f.device.face(), .meta_nsid = f.device.nsid, .key = f.client.key, .reg = f.reg, .local = local, .node_token = join.nodeToken(local), .pages = pages, .manager = false };
+    return .{ .gpa = gpa, .env = env, .meta_face = f.device.face(), .meta_nsid = f.device.nsid, .key = f.client.key, .reg = f.reg, .local = proc.localIdentity(), .node_token = js.identity.node_token, .pages = pages, .meta_path = be0.path, .writer_id = js.identity.writer_id, .config = config, .manager = false };
 }
 
 /// A re-join's successor (decision 0003 §BS): its volume 0's joiner posture.
 pub fn readmitSuccessor(self: *DataFence, successor0: *backend.KvBackend) ?[]const u8 {
     const js = successor0.joined orelse return "the successor's volume 0 is not a joined incarnation";
     const f = js.fence orelse return null;
-    return self.readmit(f.device.face(), f.device.nsid, f.client.key, f.reg, .{ .ctx = successor0, .read = &volumePages });
+    return self.readmit(.{ .meta_face = f.device.face(), .meta_nsid = f.device.nsid, .key = f.client.key, .reg = f.reg, .pages = .{ .ctx = successor0, .read = &volumePages }, .meta_path = successor0.path, .writer_id = js.identity.writer_id, .node_token = js.identity.node_token });
+}
+
+/// The durable set config's non-retired data volumes (tree 0 of volume 0).
+fn durableConfig(ctx: *anyopaque, gpa: Allocator, out: *[router.MAX_VOLUMES]u64) ConfigSource.Error!usize {
+    const be0: *backend.KvBackend = @ptrCast(@alignCast(ctx));
+    const value = (be0.lookup(gpa, meta_key.TREE_CONTROL, set_config.CONTROL_KEY) catch return error.Io) orelse return error.Undecodable;
+    defer gpa.free(value);
+    var diag: set_config.Refusal = undefined;
+    var cfg = set_config.decode(gpa, value, &diag) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Undecodable;
+    defer cfg.deinit(gpa);
+    var n: usize = 0;
+    for (cfg.data) |d| {
+        if (d.state == .retired) continue;
+        if (n == out.len) return error.TooManyVolumes;
+        out[n] = d.vol_tag;
+        n += 1;
+    }
+    return n;
 }
 
 /// A volume's appender pages off its device (the rule's input).
@@ -604,6 +1020,22 @@ fn reportRtype(c: *pr.Client) pr.Error!u8 {
     return rep.rtype;
 }
 
+/// Is `rkey` registered on the namespace (one report)?
+fn keyOnNamespace(c: *pr.Client, rkey: u64) pr.Error!bool {
+    var rep = try c.report();
+    defer rep.deinit(c.gpa);
+    for (rep.registrants) |r| if (r.rkey == rkey) return true;
+    return false;
+}
+
+/// A transient condition refuses the admission, loud (review MAJOR 1): the
+/// mount, the online add or the re-join fails and is retried by its caller.
+fn transientRefusal(path: []const u8, what: []const u8, why: ?[]const u8) AdmitError {
+    stats.data_pr_admission_refusals.inc();
+    log.err("data volume {s}: {s}{s}{s}{s} — refusing the admission: only a stable fact (a file, a non-NVMe block node, RESCAP 0, no host identifier) leaves a data volume without a device fence (decision 0003 §DJ)", .{ path, what, if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
+    return error.Refused;
+}
+
 fn reportRefusal(path: []const u8, what: []const u8) AdmitError {
     log.err("data volume {s}: {s} failed — refusing (the data fence cannot be judged blind)", .{ path, what });
     return error.Refused;
@@ -633,7 +1065,7 @@ fn noPages(_: *anyopaque, gpa: std.mem.Allocator) error{ Io, Corrupt, OutOfMemor
     return gpa.alloc(appender_page.Page, 0);
 }
 
-test "the data admission registers this host on every DATA namespace before its first data write (decision 0003 §DJ): before it a reserved namespace refuses the host's write, after it admits it; the first registrant reserves WEAR, a later one only registers; a host already registered adopts with no device mutation; a host the metadata namespace no longer registers is refused, its data registration absent; the manager's admission preempts every data registrant the metadata namespace no longer registers (a superseded manager's host)" {
+test "the data admission registers this host on every DATA namespace before its first data write (decision 0003 §DJ): before it a reserved namespace refuses the host's write, after it admits it; a joiner only registers, the manager reserves WEAR once every metadata registrant is registered; a host already registered adopts with no device mutation; a host the metadata namespace no longer registers is refused, its data registration absent; the manager's admission preempts every data registrant the metadata namespace no longer registers (a superseded manager's host)" {
     const gpa = testing.allocator;
     const fake = @import("fake_nvme.zig");
     const m_id: [16]u8 = "manager-host-id1".*;
@@ -672,10 +1104,11 @@ test "the data admission registers this host on every DATA namespace before its 
     var no_pages: u8 = 0;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
+    var cfg: FixtureConfig = .{ .live = &.{ 1, 2 } };
     // M's admission (volume 0's writer): registered, the reservation kept,
     // O's key preempted (absent from the metadata namespace).
     const reconciles0 = stats.data_pr_reconcile_preempts.load();
-    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = local, .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .manager = true });
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = local, .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = true });
     defer dm.release();
     var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
     try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
@@ -686,31 +1119,35 @@ test "the data admission registers this host on every DATA namespace before its 
     // J (a joiner): refused by the device before its admission, admitted after.
     var djh: fake.Host = .{ .ns = &dns, .host_id = j_id };
     try testing.expect(!dns.writeAllowed(j_id));
-    const dj = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = jh.face(), .meta_nsid = 1, .key = 0x2222, .reg = null, .local = local, .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .manager = false });
+    const dj = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = jh.face(), .meta_nsid = 1, .key = 0x2222, .reg = null, .local = local, .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = false });
     defer dj.release();
     try dj.admitClient(1, "fake-data", null, try fixtureClient(gpa, djh.face()));
     try testing.expect(dns.writeAllowed(j_id));
     // A second process of host J adopts: nothing on the device moves.
     const gen = dns.generation;
     const commands_before = dns.commands;
-    const dj2 = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = jh.face(), .meta_nsid = 1, .key = 0x2222, .reg = null, .local = local, .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .manager = false });
+    const dj2 = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = jh.face(), .meta_nsid = 1, .key = 0x2222, .reg = null, .local = local, .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = false });
     defer dj2.release();
     try dj2.admitClient(1, "fake-data", null, try fixtureClient(gpa, djh.face()));
     try testing.expectEqual(gen, dns.generation);
     try testing.expect(dns.commands > commands_before);
     // Host F is not registered on the metadata namespace (fenced): refused,
     // never registered on data.
-    const dff = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = fh.face(), .meta_nsid = 1, .key = 0x4444, .reg = null, .local = local, .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .manager = false });
+    const dff = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = fh.face(), .meta_nsid = 1, .key = 0x4444, .reg = null, .local = local, .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = false });
     defer dff.release();
     var dfh: fake.Host = .{ .ns = &dns, .host_id = f_id };
     try testing.expectError(error.HostFenced, dff.admitClient(1, "fake-data", null, try fixtureClient(gpa, dfh.face())));
     try testing.expect(!dns.writeAllowed(f_id));
     try testing.expect(!dns.isRegistered(0x4444));
-    // An unreserved namespace: the first registrant reserves WEAR.
+    // An unreserved namespace: a joiner registers and reserves nothing; the
+    // manager reserves it WEAR once every metadata registrant is there.
     var d2h: fake.Host = .{ .ns = &dns2, .host_id = j_id };
     try dj.admitClient(2, "fake-data-2", null, try fixtureClient(gpa, d2h.face()));
+    try testing.expectEqual(@as(u8, 0), dns2.rtype);
+    var d2m: fake.Host = .{ .ns = &dns2, .host_id = m_id };
+    try dm.admitClient(2, "fake-data-2", null, try fixtureClient(gpa, d2m.face()));
     try testing.expectEqual(nvme.RTYPE_WEAR, dns2.rtype);
-    try testing.expect(!dns2.writeAllowed(m_id));
+    try testing.expect(!dns2.writeAllowed(o_id));
 }
 
 test "review MAJOR 1 (decision 0003 §DJ): the reconnect-at-mount interleaving — the manager mounts while data target T2 reconnects (its node absent at the admission): the admission refuses T2, loud, and never records it as carrying no device fence ('not an NVMe namespace' — a member registered there by its own admission would then die unfenced on T2 while the recovery fences T1 alone)" {
@@ -726,7 +1163,8 @@ test "review MAJOR 1 (decision 0003 §DJ): the reconnect-at-mount interleaving �
     var no_pages: u8 = 0;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
-    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .manager = true });
+    var cfg: FixtureConfig = .{ .live = &.{ 1, 2 } };
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = true });
     defer dm.release();
     // T1 is admitted.
     var t1 = fake.Namespace.init(gpa);
@@ -776,7 +1214,7 @@ test "review MAJOR 1 (decision 0003 §DJ): step 2c holds unless every non-retire
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     var cfg: FixtureConfig = .{ .live = &.{ 1, 2 } };
-    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .config = cfg.source(), .manager = true });
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = true });
     defer dm.release();
     // T1 admitted (M reserves WEAR); the member X registered there.
     var t1 = fake.Namespace.init(gpa);
@@ -842,7 +1280,8 @@ test "review minor 1 (decision 0003 §DJ): the manager's reconcile preempts a ke
     var no_pages: u8 = 0;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
-    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .manager = true });
+    var cfg: FixtureConfig = .{ .live = &.{1} };
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = true });
     defer dm.release();
     var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
     try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
@@ -867,4 +1306,124 @@ test "review minor 1 (decision 0003 §DJ): the manager's reconcile preempts a ke
     try testing.expect(mns.before_report == null);
     try testing.expect(!dns.isRegistered(0x5555));
     try testing.expectEqual(preempts0, stats.data_pr_reconcile_preempts.load());
+}
+
+/// A fixture's appender pages (copied out per read, as the device's are).
+const FixturePages = struct {
+    pages: []appender_page.Page,
+
+    fn source(self: *FixturePages) host_fence.PageSource {
+        return .{ .ctx = self, .read = &readFn };
+    }
+
+    fn readFn(ctx: *anyopaque, gpa: Allocator) error{ Io, Corrupt, OutOfMemory }![]appender_page.Page {
+        const self: *FixturePages = @ptrCast(@alignCast(ctx));
+        return gpa.dupe(appender_page.Page, self.pages);
+    }
+};
+
+fn livePage(aid: u32, node: u64, wid: u64) appender_page.Page {
+    var p = appender_page.Page.free(aid, 1, .{});
+    p.state = .live;
+    p.identity = .{ .node_token = node, .mount_slot = 7, .writer_id = wid };
+    return p;
+}
+
+test "review MAJOR 2 (decision 0003 §DJ), the lapse beat: a PTPL-less target restart forgets every registration and reservation — a joiner's beat re-registers its host on the metadata namespace (its page Live, the stale-sibling rule) and on the data namespace (its metadata registration checked), the manager's beat re-registers its own and re-reserves WEAR once every metadata registrant is back; a dead member's beat (its page left Live) re-registers nothing; nothing re-registers under a standing reservation" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/data-fence-lapse-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var probe = host_fence.Registry.at(base, .set, 0x1a);
+    probe.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    probe.unlock();
+    const m_id: [16]u8 = "manager-host-id1".*;
+    const j_id: [16]u8 = "joiner-host-id-2".*;
+    const x_id: [16]u8 = "dead-member-id-3".*;
+    var mns = fake.Namespace.init(gpa);
+    defer mns.deinit();
+    var dns = fake.Namespace.init(gpa);
+    defer dns.deinit();
+    var mh: fake.Host = .{ .ns = &mns, .host_id = m_id };
+    var jh: fake.Host = .{ .ns = &mns, .host_id = j_id };
+    var xh: fake.Host = .{ .ns = &mns, .host_id = x_id };
+    var meta_m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer meta_m.deinit();
+    try fencing.acquireManagerHold(&meta_m);
+    var meta_j = try pr.Client.init(gpa, jh.face(), 1, 0x2222);
+    defer meta_j.deinit();
+    _ = try fencing.joinAsRegistrant(&meta_j, null);
+    // M (host A, node 0xA) manages; J (host C, node 0xC) joined; X (host B,
+    // node 0xB) died: its page left Live, its host fenced on metadata.
+    var pages = [_]appender_page.Page{ livePage(0, 0xA, 0xA0), livePage(1, 0xC, 0xC0), pgRecovering(2, 0xB, 0xB0) };
+    var src: FixturePages = .{ .pages = &pages };
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var cfg: FixtureConfig = .{ .live = &.{1} };
+    const local = proc.localIdentity();
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = local, .node_token = 0xA, .pages = src.source(), .meta_path = "fake-meta", .writer_id = 0xA0, .config = cfg.source(), .manager = true });
+    defer dm.release();
+    const dj = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = jh.face(), .meta_nsid = 1, .key = 0x2222, .reg = host_fence.Registry.at(base, .set, 0x1a), .local = local, .node_token = 0xC, .pages = src.source(), .meta_path = "fake-meta", .writer_id = 0xC0, .config = cfg.source(), .manager = false });
+    defer dj.release();
+    const dx = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = xh.face(), .meta_nsid = 1, .key = 0x3333, .reg = host_fence.Registry.at(base, .set, 0x1b), .local = local, .node_token = 0xB, .pages = src.source(), .meta_path = "fake-meta", .writer_id = 0xB0, .config = cfg.source(), .manager = false });
+    defer dx.release();
+    var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
+    var djh: fake.Host = .{ .ns = &dns, .host_id = j_id };
+    var dxh: fake.Host = .{ .ns = &dns, .host_id = x_id };
+    try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
+    try dj.admitClient(1, "fake-data", null, try fixtureClient(gpa, djh.face()));
+    // The manager reserved once J registered too (its admission ran first:
+    // the beat takes the reservation once every metadata registrant is on).
+    dm.beat();
+    try testing.expectEqual(nvme.RTYPE_WEAR, dns.rtype);
+    // X is not registered on metadata: its admission is refused.
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.HostFenced, dx.admitClient(1, "fake-data", null, try fixtureClient(gpa, dxh.face())));
+    try log.testing.expectAllFired();
+    // The target restarts: every registration and both reservations gone.
+    mns.powerCycle();
+    dns.powerCycle();
+    try testing.expect(dns.writeAllowed(x_id));
+    const meta_re0 = stats.meta_pr_lapse_reregistrations.load();
+    const data_re0 = stats.data_pr_lapse_reregistrations.load();
+    const rereserve0 = stats.data_pr_lapse_rereservations.load();
+    // The manager's guard re-registers its host at its own beat (gate.zig's
+    // grace); here by hand.
+    _ = try fencing.joinAsRegistrant(&meta_m, null);
+    // J's beat: metadata first, then data.
+    dj.beat();
+    try testing.expect(mns.isRegistered(0x2222));
+    try testing.expect(dns.isRegistered(0x2222));
+    try testing.expectEqual(meta_re0 + 1, stats.meta_pr_lapse_reregistrations.load());
+    try testing.expectEqual(data_re0 + 1, stats.data_pr_lapse_reregistrations.load());
+    // X's beat: its page is not Live — nothing.
+    dx.beat();
+    try testing.expect(!mns.isRegistered(0x3333));
+    try testing.expect(!dns.isRegistered(0x3333));
+    // The manager's beat before its metadata hold returns: its own data
+    // registration back, no reservation yet.
+    dm.beat();
+    try testing.expect(dns.isRegistered(0x1111));
+    try testing.expectEqual(@as(u8, 0), dns.rtype);
+    try testing.expectEqual(data_re0 + 2, stats.data_pr_lapse_reregistrations.load());
+    // The hold returns (the guard's grace passed): every metadata registrant
+    // is on data — the next beat re-reserves at once.
+    try meta_m.acquire();
+    dm.beat();
+    try testing.expectEqual(nvme.RTYPE_WEAR, dns.rtype);
+    try testing.expectEqual(rereserve0 + 1, stats.data_pr_lapse_rereservations.load());
+    try testing.expect(dns.writeAllowed(j_id) and dns.writeAllowed(m_id) and !dns.writeAllowed(x_id));
+    // Under the standing reservation a host the beat finds unregistered is
+    // fenced: J preempted, its beat re-registers nothing.
+    try dm.clients[0].preemptAndAbort(0x2222);
+    dj.beat();
+    try testing.expect(!dns.isRegistered(0x2222));
+    try testing.expectEqual(data_re0 + 2, stats.data_pr_lapse_reregistrations.load());
+}
+
+fn pgRecovering(aid: u32, node: u64, wid: u64) appender_page.Page {
+    var p = livePage(aid, node, wid);
+    p.state = .recovering;
+    return p;
 }

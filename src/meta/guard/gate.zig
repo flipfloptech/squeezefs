@@ -140,6 +140,11 @@ pub const Guard = struct {
     early_fenced_writer: ?u64 = null,
     /// Consecutive lapse beats whose device claim could not be read.
     unreadable_lapse_beats: u32 = 0,
+    /// When a beat first saw the reservation lapsed (monotonic ns; 0 =
+    /// none): the hold returns `lapse_grace_ns` later — every joiner's lapse
+    /// beat re-registers its host first (decision 0003 §DJ, review MAJOR 2).
+    lapse_since_ns: u64 = 0,
+    lapse_grace_ns: u64 = claim.LAPSE_GRACE_S * std.time.ns_per_s,
     /// The manager's fencing registrant (decision 0003 §DG), stood after the
     /// hold on a symmetric volume; null with `fencer_absent` naming why.
     fencer: ?*fencer.Fencer = null,
@@ -771,6 +776,7 @@ pub const Guard = struct {
         const sqz = exec.SqzIo.fromIo(g.io);
         var outcome = sqz.runBlocking(prRecheckBlocking, .{ g, c }) catch return true;
         if (outcome != .lapse) g.unreadable_lapse_beats = 0;
+        if (outcome == .ours) g.lapse_since_ns = 0;
         if (outcome == .lapse) {
             switch (g.deviceClaim()) {
                 .ours => g.unreadable_lapse_beats = 0,
@@ -796,6 +802,25 @@ pub const Guard = struct {
                 },
             }
             if (builtin.is_test) if (g.test_after_lapse_probe) |h| h.fire(h.ctx);
+            // The grace (review MAJOR 2 of decision 0003 §DJ; nvmet keeps no
+            // PTPL — every joiner's registration went too): the host
+            // re-registered now, the hold only once every joiner's lapse beat
+            // had its turn — a hold taken first refuses a joiner's next
+            // metadata write. The claim stays ours and fresh meanwhile (this
+            // beat refreshes it): no takeover.
+            const now = clock.monotonicNs();
+            if (g.lapse_since_ns == 0) {
+                g.lapse_since_ns = @max(now, 1);
+                log.warn("meta volume {s}: the reservation lapsed (a PTPL-less target restart? nvmet keeps none) — this host re-registers now, the hold returns in {d} s once every joiner re-registered (decision 0003 §DJ)", .{ g.be.path, g.lapse_grace_ns / std.time.ns_per_s });
+            }
+            if (now -| g.lapse_since_ns < g.lapse_grace_ns) {
+                const registered = sqz.runBlocking(lapseRegisterBlocking, .{ g, c }) catch return true;
+                if (!registered) {
+                    g.failStop("the host's re-registration after a reservation lapse failed — another mount may have taken the namespace");
+                    return false;
+                }
+                return true;
+            }
             outcome = sqz.runBlocking(reacquireBlocking, .{ g, c }) catch return true;
             if (outcome == .reacquired) {
                 // The claim read AGAIN under the hold (the lapse claim window,
@@ -824,6 +849,7 @@ pub const Guard = struct {
             .report_failed => return false,
             .lapse => unreachable,
             .reacquired => {
+                g.lapse_since_ns = 0;
                 guard.stats.pr_reacquires.inc();
                 log.warn("meta volume {s}: reservation holdership had lapsed (PTPL-less target power cycle?) — re-acquired key {x:0>16}; audit the fabric", .{ g.be.path, c.key });
                 return true;
@@ -871,6 +897,18 @@ pub const Guard = struct {
         // successor's clean last leave): the beat's fiber reads the device's
         // claim before anything re-registers (review round 3, major 3).
         return .lapse;
+    }
+
+    /// The lapse's re-registration of the host (through the rule) during the
+    /// grace; false = refused.
+    fn lapseRegisterBlocking(g: *Guard, c: *pr.Client) bool {
+        c.lockOps();
+        defer c.unlockOps();
+        const locked = g.lockRegistry() catch return false;
+        defer if (locked) g.fence_reg.?.unlock();
+        const fresh = g.registerHost(c, false) catch return false;
+        if (locked and fresh) guard.stats.pr_host_registrations.inc();
+        return true;
     }
 
     /// The lapse's re-acquire, once the device's claim names this
@@ -1651,6 +1689,7 @@ test "review (the lapse claim window, decision 0003 §DG.13(h)): a lapse's re-ac
     var tenure: Tenure = .{ .g = g, .be = be, .other = other };
     g.test_after_lapse_probe = .{ .ctx = &tenure, .fire = Tenure.run };
     log.testing.expectErrorLogs(2);
+    g.lapse_grace_ns = 0; // the hold at the lapse's first beat (the grace has its own test)
     ns.powerCycle();
     g.beat();
     try testing.expect(be.isFailed());
@@ -1692,6 +1731,7 @@ test "review M1 (decision 0003 §DG): a fencer re-registered after its host was 
     var takeover: Takeover = .{ .s = &s, .victim = pr_key };
     g.test_after_reacquire = .{ .ctx = &takeover, .fire = Takeover.run };
     log.testing.expectErrorLogs(2);
+    g.lapse_grace_ns = 0; // the hold at the lapse's first beat (the grace has its own test)
     ns.powerCycle();
     g.beat();
     try testing.expect(ns.isHolder(host_b_id));
@@ -1787,6 +1827,7 @@ test "the heartbeat's PR re-check: a PTPL lapse (power cycle) is re-acquired and
         defer be.close();
         const g = be.guard.?;
         const re0 = guard.stats.pr_reacquires.load();
+        g.lapse_grace_ns = 0; // the hold at the lapse's first beat (the grace has its own test)
         ns.powerCycle();
         try testing.expectEqual(@as(?u64, null), ns.holder);
         g.beat();
@@ -1837,6 +1878,7 @@ test "review 4 minor 5: a lapse whose device claim cannot be read (every probe f
     const g = be.guard.?;
     const re0 = guard.stats.pr_reacquires.load();
     const fenced0 = guard.stats.fenced.load();
+    g.lapse_grace_ns = 0; // the hold at the lapse's first beat (the grace has its own test)
     ns.powerCycle();
     g.test_probe_unreadable = true;
     g.beat();
@@ -1862,6 +1904,7 @@ test "review 5 minor 3: unreadable lapse beats are bounded — after one claim T
     const be = try v.open(.{ .test_identity = ident(boot_a, 4000, 777), .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
     defer be.close();
     const g = be.guard.?;
+    g.lapse_grace_ns = 0; // the hold at the lapse's first beat (the grace has its own test)
     ns.powerCycle();
     g.test_probe_unreadable = true;
     // One claim TTL of beats (the TTL over the beat interval, rounded up).
@@ -2047,4 +2090,41 @@ test "a generic (EIO) barrier failure is NOT the fence: three in a row latch FAI
     try testing.expect(be.isFailed());
     try testing.expectEqual(journal.FailureLatch.Verdict.failed, be.lane.latch.verdict());
     try testing.expectEqual(fenced0, guard.stats.fenced.load());
+}
+
+test "review MAJOR 2 of decision 0003 §DJ, the lapse grace: a beat that finds the reservation lapsed (nvmet keeps no PTPL) registers the host at once and keeps refreshing its claim, but takes the hold only once the grace passed — a joiner re-registering in the grace stays admitted under the returning hold" {
+    const gpa = testing.allocator;
+    const v = try Vol.create(gpa, "lapse-grace", "600000");
+    defer v.destroy();
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var host: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
+    const me = ident(boot_a, 4000, 777);
+    const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
+    defer be.close();
+    const g = be.guard.?;
+    const re0 = guard.stats.pr_reacquires.load();
+    ns.powerCycle();
+    g.beat();
+    // The host registered, no hold yet; the claim refreshed (ours, fresh).
+    try testing.expectEqual(@as(?u64, null), ns.holder);
+    try testing.expect(ns.find(host_a_id) != null);
+    try testing.expectEqual(re0, guard.stats.pr_reacquires.load());
+    try testing.expectEqual(@as(u64, 1), (try v.probe()).?.heartbeat_seq);
+    try testing.expect(!be.isFailed());
+    // A joiner's lapse beat re-registers its host meanwhile.
+    var jhost: fake.Host = .{ .ns = &ns, .host_id = host_b_id };
+    var joiner = try pr.Client.init(gpa, jhost.face(), 1, 0xb0b0);
+    defer joiner.deinit();
+    _ = try fencing.joinAsRegistrant(&joiner, null);
+    // A beat still inside the grace: still no hold.
+    g.beat();
+    try testing.expectEqual(@as(?u64, null), ns.holder);
+    // The grace passed: the hold returns; the joiner writes under it.
+    g.lapse_since_ns = 1; // seen at boot: the grace long past
+    g.beat();
+    try testing.expectEqual(re0 + 1, guard.stats.pr_reacquires.load());
+    try testing.expectEqual(@as(?u64, claim.prKey(me.writerId(0), boot_a)), ns.holder);
+    try testing.expect(ns.writeAllowed(host_b_id));
+    try testing.expectEqual(@as(u64, 0), g.lapse_since_ns);
 }

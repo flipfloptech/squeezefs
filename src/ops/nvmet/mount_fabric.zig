@@ -315,7 +315,7 @@ pub const Plan = struct {
         const id = &self.identity.?;
         const pair_: initiator.HostPair = .{ .hostnqn = id.hostnqn(), .hostid = id.hostid() };
         const timeouts = multipath.resolveConnectTimeouts(env);
-        var b: Bound = .{ .vol_tag = d.vol_tag, .users = host_fence.Registry.runtime(.fabric, host_fence.fabricRegistryKey(f.subnqn, id.hostnqn(), id.hostid())) };
+        var b: Bound = .{ .vol_tag = d.vol_tag, .users = host_fence.Registry.runtime(env, .fabric, host_fence.fabricRegistryKey(f.subnqn, id.hostnqn(), id.hostid())) };
         @memcpy(b.subnqn_buf[0..f.subnqn.len], f.subnqn);
         b.subnqn_len = f.subnqn.len;
         // The reuse-or-connect and this mount's entry as ONE step under the

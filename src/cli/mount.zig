@@ -519,6 +519,9 @@ fn mountMain(ctx: *Ctx) u8 {
     //     first).
     const dfence: ?*guard.data_fence.DataFence = if (reader) null else admitDataFence(ctx, be, &cfg) catch return cli.exit_failed;
     defer if (dfence) |df| df.release();
+    // The lapse beat (review MAJOR 2 of decision 0003 §DJ): a target restart
+    // forgets every registration — re-registered at the heartbeat cadence.
+    if (dfence) |df| df.startBeat(ctx.sqz.io()) catch return ctx.failed("the data fence's lapse beat could not start", .{});
 
     // 2. The handler tables, the data plane, the filesystem, the binding.
     var registry = watchdog.Registry.init(gpa, watchdog.derivedShards(facts.possible_cpus)) catch return ctx.failed("out of memory (watchdog registry)", .{});
@@ -723,6 +726,7 @@ fn mountMain(ctx: *Ctx) u8 {
             .held = true,
             .random = &jobRandom,
             .data_arm = if (wire != null) data_arm.arm() else null,
+            .fence_waive = if (dfence) |df| .{ .ctx = df, .waive = &waiveDataFence } else null,
             .meta_set = be,
             // A joined member is a fleet READ worker over its own manager link.
             // Through the LIVE incarnation's session (a re-join in place
@@ -1413,9 +1417,19 @@ fn admitDataFence(ctx: *Ctx, be: *meta_set.MetaSet, cfg: *const set_config.Confi
     return guard.data_fence.admitSet(ctx.p.gpa, ctx.p.env, ctx.sqz.io(), be.volumes[0], cfg.data, &refused) catch |e| {
         _ = switch (e) {
             error.OutOfMemory => ctx.failed("out of memory (the data fence)", .{}),
-            error.Refused => ctx.failed("data volume {s}: its data namespace's admission was refused (decision 0003 §DJ) — see the log", .{refused orelse "?"}),
+            error.Refused => ctx.failed("the data fence's admission was refused at {s} (decision 0003 §DJ) — see the log; a transient condition (a reconnecting target) clears on a retry", .{refused orelse "?"}),
         };
         return error.Refused;
+    };
+}
+
+/// `volume waive-data-fence` (decision 0003 §DJ): the operator's escape for
+/// a data target gone for good, on this manager's data fence.
+fn waiveDataFence(ctx: *anyopaque, vol_tag: u64) error{ UnknownVolume, Io }!void {
+    const df: *guard.data_fence.DataFence = @ptrCast(@alignCast(ctx));
+    df.waive(vol_tag) catch |e| return switch (e) {
+        error.UnknownVolume => error.UnknownVolume,
+        error.ConfigUnreadable => error.Io,
     };
 }
 

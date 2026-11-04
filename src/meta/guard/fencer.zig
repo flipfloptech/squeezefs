@@ -334,7 +334,7 @@ fn standOrRefuse(gpa: Allocator, env: *const std.process.Environ.Map, in: Input)
     // The reuse-or-connect and this process's entry as ONE step under the
     // users' lock: a sibling's release never deletes a controller this
     // process is about to ride.
-    var users = host_fence.Registry.runtime(.fabric, host_fence.fabricRegistryKey(subnqn, id.hostnqn(), id.hostid()));
+    var users = host_fence.Registry.runtime(env, .fabric, host_fence.fabricRegistryKey(subnqn, id.hostnqn(), id.hostid()));
     users.lock() catch return error.UsersUnavailable;
     defer users.unlock();
     const me = proc.localIdentity();

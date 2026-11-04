@@ -172,6 +172,11 @@ const Rig = struct {
         try Io.Dir.cwd().createDirPath(io, self.root);
         try self.env.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
         try self.env.put(state_dir_knob, self.state);
+        // The host registries under the run's root, never the host's /run
+        // (review minor 3 of decision 0003 §DJ): every process of the run
+        // shares them; the root goes at the teardown.
+        var hosts_buf: [linux.PATH_MAX]u8 = undefined;
+        try self.env.put("SQUEEZEFS_TEST_HOST_REGISTRY_DIR", try std.fmt.bufPrint(&hosts_buf, "{s}/hosts", .{self.root}));
         try self.env.put(port_base_knob, "54000");
         try self.env.put(hostnqn_knob, ident_a.hostnqn);
         try self.env.put(hostid_knob, ident_a.hostid);
@@ -2591,7 +2596,7 @@ test "nvmet fidelity: a PTPL-less target restart under a running set (review MAJ
         try testing.expectEqual(@as(u64, 0), try statNumber(sm, "writer_guard_fenced"));
     }
     // J was never fail-stopped: it writes and syncs under M's hold.
-    try testing.expect(try scriptSucceeds(rig, j, "head -c 262144 /dev/zero | tr '\\000' L > jl && sync -f . && sync jl"));
+    try testing.expect(try scriptSucceeds(rig, j, "head -c 262144 /dev/zero | tr '\\000' L > jl && sync -f . && sync -d jl"));
     // M re-reserved the data namespace (every live host re-registered first).
     {
         const sm = try rig.awaitStat(m, "data_pr_lapse_rereservations", 1, g2_wait_ns);
@@ -2614,7 +2619,7 @@ test "nvmet fidelity: a PTPL-less target restart under a running set (review MAJ
     }
     // J's bytes, exact, and J writes on.
     {
-        const out = try rig.onMount(j, "printf '%s %s\\n' \"$(wc -c < jl)\" \"$(tr -d L < jl | wc -c)\"; head -c 65536 /dev/zero | tr '\\000' K > jk && sync jk");
+        const out = try rig.onMount(j, "printf '%s %s\\n' \"$(wc -c < jl)\" \"$(tr -d L < jl | wc -c)\"; head -c 65536 /dev/zero | tr '\\000' K > jk && sync -d jk");
         defer gpa.free(out);
         var it = std.mem.tokenizeAny(u8, out, " \n");
         try testing.expectEqual(@as(u64, 262144), try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10));

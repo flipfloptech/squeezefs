@@ -1107,10 +1107,21 @@ pub const DataArm = struct {
     arm: *const fn (ctx: *anyopaque, plane: *plane_mod.DataPlane, ordinal: u16) error{Io}!void,
 };
 
+/// `volume waive-data-fence`'s act (decision 0003 §DJ): the mount's data
+/// fence counts the volume unfenceable. `UnknownVolume` = not a non-retired
+/// data volume of the set; `Io` = the set config is unreadable.
+pub const FenceWaive = struct {
+    ctx: *anyopaque,
+    waive: *const fn (ctx: *anyopaque, vol_tag: u64) error{ UnknownVolume, Io }!void,
+};
+
 pub const PlaneAdmin = struct {
     node: *Node,
     world_: PlaneWorld,
     arm: ?DataArm,
+    /// Null: no data fence on this mount (no PR on volume 0's metadata
+    /// namespace) — the waiver refuses as an illegal transition.
+    fence_waive: ?FenceWaive = null,
     /// `volume add-data` online: the attach + the grant-plane arm run
     /// between the record tx and the placement publish — `publishPlacement`
     /// is the lattice's step 7, so the add binds its own publish hook.
@@ -1120,7 +1131,19 @@ pub const PlaneAdmin = struct {
         return .{ .ctx = self, .vtable = &vt };
     }
 
-    const vt: admin_mod.AdminWorld.VTable = .{ .addData = &addData, .removeData = &removeData, .undrain = &undrain, .fsckReport = &fsckReport, .rekey = &rekey };
+    const vt: admin_mod.AdminWorld.VTable = .{ .addData = &addData, .removeData = &removeData, .undrain = &undrain, .waiveDataFence = &waiveDataFence, .fsckReport = &fsckReport, .rekey = &rekey };
+
+    /// `volume waive-data-fence` on the manager: its data fence's escape for
+    /// a target gone for good.
+    fn waiveDataFence(ctx: *anyopaque, vol_tag: u64) lattice.Error!admin_mod.VolumeOutcome {
+        const self = self_(ctx);
+        const w = self.fence_waive orelse return error.IllegalTransition;
+        w.waive(w.ctx, vol_tag) catch |e| return switch (e) {
+            error.UnknownVolume => error.UnknownVolume,
+            error.Io => error.Io,
+        };
+        return .{ .vol_tag = vol_tag };
+    }
 
     fn self_(ctx: *anyopaque) *PlaneAdmin {
         return @ptrCast(@alignCast(ctx));
@@ -1388,6 +1411,9 @@ pub const Node = struct {
         /// mount with no wire (then `volume add-data` on the live mount
         /// refuses `io` — the offline verb is the path).
         data_arm: ?DataArm = null,
+        /// The data fence's waiver (`volume waive-data-fence`); null = no
+        /// data fence on this mount.
+        fence_waive: ?FenceWaive = null,
         /// The meta set the D4 arm (`defrag --meta`) compacts and merges;
         /// null = the arm is not bound (the body fails typed).
         meta_set: ?*meta_set.MetaSet = null,
@@ -1463,7 +1489,7 @@ pub const Node = struct {
             n.meta_body = .{ .gpa = gpa, .seam = m.seam() };
             n.fabric.registerBody(.defrag_meta, n.meta_body.body());
         }
-        n.admin_ = .{ .node = n, .world_ = n.world_, .arm = in.data_arm };
+        n.admin_ = .{ .node = n, .world_ = n.world_, .arm = in.data_arm, .fence_waive = in.fence_waive };
         n.admin_svc = .{ .io = io, .fabric = &n.fabric, .world = n.admin_.world() };
         return n;
     }

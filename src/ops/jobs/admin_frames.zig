@@ -211,14 +211,18 @@ pub const AdminFsckReport = struct {
 
 // ---- admin_volume ----
 
-pub const VolumeOp = enum(u8) { add_data = 0, remove_data = 1, undrain = 2 };
+/// `waive_data_fence`: the operator's escape for a data target gone for good
+/// (decision 0003 §DJ) — the manager's data fence counts the volume
+/// unfenceable.
+pub const VolumeOp = enum(u8) { add_data = 0, remove_data = 1, undrain = 2, waive_data_fence = 3 };
 
 pub const AdminVolumeHead = extern struct {
     op: u8,
     /// `add_data`: 1 ⇒ no queued rebalance.
     no_rebalance: u8,
     reserved: [6]u8,
-    /// `remove_data` / `undrain`: the victim; 0 for `add_data`.
+    /// `remove_data` / `undrain` / `waive_data_fence`: the victim; 0 for
+    /// `add_data`.
     vol_tag: u64,
     /// `add_data`: the device path's length; 0 otherwise.
     uri_len: u32,
@@ -229,7 +233,7 @@ pub const AdminVolumeHead = extern struct {
         if (self.no_rebalance > 1 or self.uri_len > URI_MAX) return false;
         return switch (op) {
             .add_data => self.vol_tag == 0 and self.uri_len != 0,
-            .remove_data, .undrain => self.vol_tag != 0 and self.uri_len == 0 and self.no_rebalance == 0,
+            .remove_data, .undrain, .waive_data_fence => self.vol_tag != 0 and self.uri_len == 0 and self.no_rebalance == 0,
         };
     }
 

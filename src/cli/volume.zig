@@ -70,8 +70,16 @@ pub fn run(p: cli.Process, v: args.Volume) u8 {
             var live: LiveData = .{ .p = p, .verb = .{ .undrain = .{ .volume = u.volume } } };
             return admin_lane.withLane(p, "volume undrain", meta_uri, .{ .ctx = &live, .run = LiveData.run });
         },
+        .waive_data_fence => |w| {
+            var live: LiveData = .{ .p = p, .verb = .{ .waive = .{ .volume = w.volume } } };
+            return admin_lane.withLane(p, "volume waive-data-fence", meta_uri, .{ .ctx = &live, .run = LiveData.run });
+        },
         else => {},
     };
+    if (v == .waive_data_fence) {
+        p.stderr.writeAll("squeezefs volume waive-data-fence: online only — the waiver acts on the running manager's data fence; name the manager's mountpoint (decision 0003 §DJ)\n") catch {};
+        return cli.exit_usage;
+    }
     var members: [uri.MAX_MEMBERS][]const u8 = undefined;
     var udiag: uri.Refusal = undefined;
     const meta = uri.parse(.meta, meta_uri, &members, &udiag) catch {
@@ -105,6 +113,7 @@ pub fn run(p: cli.Process, v: args.Volume) u8 {
             var body: DataBody = .{ .p = p, .verb = .{ .undrain = .{ .volume = u.volume } } };
             break :blk cli_offline.withSet(p, meta_uri, .{ .with_plane = false, .verb = "volume undrain" }, .{ .ctx = &body, .run = DataBody.run });
         },
+        .waive_data_fence => unreachable,
     };
 }
 
@@ -118,6 +127,7 @@ const LiveData = struct {
         add: struct { device: []const u8, no_rebalance: bool },
         remove: struct { volume: []const u8 },
         undrain: struct { volume: []const u8 },
+        waive: struct { volume: []const u8 },
     },
 
     fn run(ctx: *anyopaque, lane: *admin_lane.Lane) u8 {
@@ -128,6 +138,7 @@ const LiveData = struct {
             .add => "add-data",
             .remove => "remove-data",
             .undrain => "undrain",
+            .waive => "waive-data-fence",
         };
         const rep = switch (self.verb) {
             .add => |a| blk: {
@@ -145,6 +156,7 @@ const LiveData = struct {
             },
             .remove => |r| c.volume(.remove_data, lattice.parseVolumeId(r.volume) orelse return self.badId(verb, r.volume), "", false),
             .undrain => |u| c.volume(.undrain, lattice.parseVolumeId(u.volume) orelse return self.badId(verb, u.volume), "", false),
+            .waive => |w| c.volume(.waive_data_fence, lattice.parseVolumeId(w.volume) orelse return self.badId(verb, w.volume), "", false),
         } catch |e| {
             p.stderr.print("squeezefs volume {s}: the call failed ({s}, {t})\n", .{ verb, @errorName(e), @import("../core/errors.zig").toErrno(e) }) catch {};
             return cli.exit_failed;
@@ -168,6 +180,9 @@ const LiveData = struct {
             },
             .undrain => |u| {
                 p.stdout.print("{s} is Active again; {d} evacuation job(s) cancelled\n", .{ u.volume, rep.cancelled }) catch {};
+            },
+            .waive => |w| {
+                p.stdout.print("{s}: the manager's data fence counts it unfenceable from now on — a held recovery proceeds at its next poll; you confirmed that no dead member reaches its target. The next mount admits it again (decision 0003 §DJ)\n", .{w.volume}) catch {};
             },
         }
         p.stdout.flush() catch {};

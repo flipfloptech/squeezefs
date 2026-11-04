@@ -241,6 +241,37 @@ fn openVerifiedChar(node: [:0]const u8, want: DevNum) ?linux.fd_t {
     return fd;
 }
 
+/// What a data volume's node is, by facts a reconnect does not change
+/// (decision 0003 §DJ, review MAJOR 1): only a stable fact may leave a data
+/// volume without a device fence.
+pub const NodeFact = enum {
+    /// A regular file or another non-block node, or a block node sysfs knows
+    /// with no `nsid` (loop, brd, null_blk): never an NVMe namespace.
+    not_nvme,
+    nvme,
+    /// The node is absent or unreadable, or sysfs does not know its device
+    /// right now (a controller reconnecting): no fact.
+    unknown,
+};
+
+pub fn classifyNode(path: []const u8) NodeFact {
+    const st = (align_probe.statPath(path) catch return .unknown) orelse return .unknown;
+    if (!st.is_bdev) return .not_nvme;
+    if (!sysfsBlockDev(st.rdev_major, st.rdev_minor)) return .unknown;
+    if (sysfsNsid(st.rdev_major, st.rdev_minor) != null) return .nvme;
+    // No `nsid`: a device sysfs still knows is not a namespace; one that
+    // went meanwhile proves nothing.
+    return if (sysfsBlockDev(st.rdev_major, st.rdev_minor)) .not_nvme else .unknown;
+}
+
+/// `/sys/dev/block/M:m` exists: the kernel knows the device now.
+fn sysfsBlockDev(major: u32, minor: u32) bool {
+    var pb: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&pb, "/sys/dev/block/{d}:{d}", .{ major, minor }, 0) catch return false;
+    var st: linux.Statx = undefined;
+    return linux.errno(linux.statx(linux.AT.FDCWD, path.ptr, 0, .{ .TYPE = true }, &st)) == .SUCCESS;
+}
+
 /// `path` is an NVMe namespace's block node (no open, no char twin).
 pub fn isNvmeNamespace(path: []const u8) bool {
     const st = (align_probe.statPath(path) catch return false) orelse return false;
@@ -339,6 +370,10 @@ test "the char twin and the controller node derive by name; a regular file resol
     try testing.expect(controllerName("nvme0n1", &out) == null);
     try testing.expectEqual(Resolved{ .none = .not_nvme_namespace }, resolve(testing.allocator, "/proc/self/exe"));
     try testing.expectEqual(Resolved{ .none = .not_nvme_namespace }, resolve(testing.allocator, "/nonexistent/path"));
+    // The data fence's classifier: a file is a stable fact, an absent node
+    // none (review MAJOR 1 of decision 0003 §DJ).
+    try testing.expectEqual(NodeFact.not_nvme, classifyNode("/proc/self/exe"));
+    try testing.expectEqual(NodeFact.unknown, classifyNode("/nonexistent/path"));
     if (!anyCharNodePresent()) {
         return testkit.skip(@src(), .no_device, "no /dev/ng* on this venue — the real NVMe passthru leg needs the fidelity tier's nvmet-loop");
     }

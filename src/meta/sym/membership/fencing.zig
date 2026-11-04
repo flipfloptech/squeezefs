@@ -375,6 +375,14 @@ pub const DataFenceOutcome = enum {
 };
 
 pub fn fenceDataNamespaces(meta: ?*pr.Client, data: []const *pr.Client, victim_key: u64) DataFenceOutcome {
+    var unproven: usize = 0;
+    return fenceDataNamespacesCounted(meta, data, victim_key, &unproven);
+}
+
+/// The same; `unproven` = the namespaces whose fence is not proven (all of
+/// them when nothing was issued: the hold check failed).
+pub fn fenceDataNamespacesCounted(meta: ?*pr.Client, data: []const *pr.Client, victim_key: u64, unproven: *usize) DataFenceOutcome {
+    unproven.* = 0;
     if (data.len == 0) return .no_device;
     const m = meta orelse return .no_device;
     if (victim_key == 0) return .no_key;
@@ -386,6 +394,7 @@ pub fn fenceDataNamespaces(meta: ?*pr.Client, data: []const *pr.Client, victim_k
     const held = m.holdsHere() catch |e| {
         stats.data_pr_fence_failures.inc();
         log.warn("recovery data fence: the metadata report before the preempt of key 0x{x} failed ({s}) — nothing preempted; the recovery holds", .{ victim_key, @errorName(e) });
+        unproven.* = data.len;
         return .failed;
     };
     if (!held) {
@@ -393,11 +402,10 @@ pub fn fenceDataNamespaces(meta: ?*pr.Client, data: []const *pr.Client, victim_k
         log.warn("recovery data fence: the metadata reservation is not held by this host — the data preempt of key 0x{x} is withheld (a successor took the hold: this manager is superseded)", .{victim_key});
         return .unheld;
     }
-    var proven = true;
     for (data) |c| {
-        if (!fenceDataNamespace(c, victim_key)) proven = false;
+        if (!fenceDataNamespace(c, victim_key)) unproven.* += 1;
     }
-    return if (proven) .fenced else .failed;
+    return if (unproven.* == 0) .fenced else .failed;
 }
 
 /// One data namespace: the key registered ⇒ preempt-and-abort (RACQA 2: the

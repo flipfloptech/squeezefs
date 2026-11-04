@@ -57,6 +57,11 @@ pub const AdminWorld = struct {
         removeData: *const fn (ctx: *anyopaque, gpa: Allocator, vol_tag: u64) lattice.Error!VolumeOutcome,
         /// `volume undrain`: Active FIRST, then the live cancels.
         undrain: *const fn (ctx: *anyopaque, gpa: Allocator, vol_tag: u64) lattice.Error!VolumeOutcome,
+        /// `volume waive-data-fence`: the manager's data fence counts the
+        /// volume unfenceable (decision 0003 §DJ). `UnknownVolume` = not a
+        /// non-retired data volume of the set; `IllegalTransition` = no data
+        /// fence on this daemon.
+        waiveDataFence: *const fn (ctx: *anyopaque, vol_tag: u64) lattice.Error!VolumeOutcome,
         /// The fsck job's last bounded report (owned by `gpa`), or null.
         fsckReport: *const fn (ctx: *anyopaque, gpa: Allocator, job_id: u64) Allocator.Error!?[]u8,
         /// `defrag --rekey`: resolve the next key (the key dir), open the
@@ -188,6 +193,7 @@ pub const AdminService = struct {
             .add_data => w.vtable.addData(w.ctx, gpa, p.uri, p.head.no_rebalance == 0),
             .remove_data => w.vtable.removeData(w.ctx, gpa, p.head.vol_tag),
             .undrain => w.vtable.undrain(w.ctx, gpa, p.head.vol_tag),
+            .waive_data_fence => w.vtable.waiveDataFence(w.ctx, p.head.vol_tag),
         };
         const out = r catch |e| {
             const v: Verdict = switch (e) {
@@ -314,6 +320,7 @@ const RamAdminWorld = struct {
     adds: u32 = 0,
     removes: u32 = 0,
     undrains: u32 = 0,
+    waivers: u32 = 0,
     refuse_remove: bool = false,
     report: ?[]const u8 = null,
     rekeys: u32 = 0,
@@ -322,7 +329,7 @@ const RamAdminWorld = struct {
     fn world(self: *RamAdminWorld) AdminWorld {
         return .{ .ctx = self, .vtable = &vt };
     }
-    const vt: AdminWorld.VTable = .{ .addData = &addData, .removeData = &removeData, .undrain = &undrain, .fsckReport = &fsckReport, .rekey = &rekeyFn };
+    const vt: AdminWorld.VTable = .{ .addData = &addData, .removeData = &removeData, .undrain = &undrain, .waiveDataFence = &waiveDataFence, .fsckReport = &fsckReport, .rekey = &rekeyFn };
     fn self_(ctx: *anyopaque) *RamAdminWorld {
         return @ptrCast(@alignCast(ctx));
     }
@@ -342,6 +349,12 @@ const RamAdminWorld = struct {
         const self = self_(ctx);
         self.undrains += 1;
         return .{ .vol_tag = vol_tag, .config_generation = 4, .cancelled = 1 };
+    }
+    fn waiveDataFence(ctx: *anyopaque, vol_tag: u64) lattice.Error!VolumeOutcome {
+        const self = self_(ctx);
+        if (vol_tag != 0x77) return error.UnknownVolume;
+        self.waivers += 1;
+        return .{ .vol_tag = vol_tag };
     }
     fn fsckReport(ctx: *anyopaque, gpa: Allocator, _: u64) Allocator.Error!?[]u8 {
         const self = self_(ctx);
@@ -462,7 +475,7 @@ test "the job list carries a table past five records: the row-count arithmetic i
     for (ids, list.items) |id, rec| try testing.expectEqual(id, rec.job_id);
 }
 
-test "the admin lane's volume verbs run the world; a lattice refusal is the `refused` verdict with the victim named; the fsck report rides whole or answers no_report" {
+test "the admin lane's volume verbs run the world (the data-fence waiver too); a lattice refusal is the `refused` verdict with the victim named; the fsck report rides whole or answers no_report" {
     const gpa = testing.allocator;
     const io = testing.io;
     const r = try Rig.init(gpa, io);
@@ -485,6 +498,11 @@ test "the admin lane's volume verbs run the world; a lattice refusal is the `ref
     const un = try c.volume(.undrain, 0x77, "", false);
     try testing.expectEqual(Verdict.ok, un.get());
     try testing.expectEqual(@as(u32, 1), un.cancelled);
+    // The operator's data-fence waiver (decision 0003 §DJ) rides the same
+    // frame; an unknown volume is refused by name.
+    try testing.expectEqual(Verdict.ok, (try c.volume(.waive_data_fence, 0x77, "", false)).get());
+    try testing.expectEqual(@as(u32, 1), r.world.waivers);
+    try testing.expectEqual(Verdict.refused, (try c.volume(.waive_data_fence, 0x78, "", false)).get());
     try testing.expectEqual(@as(?[]u8, null), try c.fsckReport(gpa, 5));
     r.world.report = "{\"schema\":1}";
     const got = (try c.fsckReport(gpa, 5)).?;

@@ -254,6 +254,9 @@ pub const Volume = union(enum) {
     add_data: struct { meta_uri: []const u8, device: []const u8, no_rebalance: bool },
     remove_data: struct { meta_uri: []const u8, volume: []const u8 },
     undrain: struct { meta_uri: []const u8, volume: []const u8 },
+    /// The operator's escape for a data target gone for good (decision 0003
+    /// §DJ): online only — the running manager's data fence.
+    waive_data_fence: struct { meta_uri: []const u8, volume: []const u8 },
 };
 
 /// `job {list, status, pause, resume, cancel, throttle, worker,
@@ -536,6 +539,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs volume add-data [--no-rebalance] sqmeta://<path>[,…]|<mountpoint> <device>
         \\  squeezefs volume remove-data sqmeta://<path>[,…] vol-<16 hex>
         \\  squeezefs volume undrain sqmeta://<path>[,…] vol-<16 hex>
+        \\  squeezefs volume waive-data-fence <mountpoint> vol-<16 hex>
         \\  squeezefs job list [--json] sqmeta://<path>|<mountpoint>
         \\  squeezefs job status|pause|resume|cancel sqmeta://<path>|<mountpoint> job-<16 hex>
         \\  squeezefs job throttle <mountpoint> job-<16 hex> <pct>
@@ -585,7 +589,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .appender_clear => "usage: squeezefs appender clear sqmeta://<path> <id>\n",
         .fsck => "usage: squeezefs fsck [--online|--offline] [--json] [--scrub] [--throttle PCT] [--shards k/N] [--repair [--apply] [--quarantine-dir DIR]] sqmeta://<path>|<mountpoint>\n       squeezefs scrub [--online|--offline] [--json] [--throttle PCT] sqmeta://<path>|<mountpoint>\n",
         .fsck_merge => "usage: squeezefs fsck merge-reports [--json] <report.json>…\n",
-        .volume => "usage: squeezefs volume list sqmeta://<path>[,…]\n       squeezefs volume add-meta --take-slots K|s1,s2,… sqmeta://<path>[,…] <device>\n       squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>\n       squeezefs volume repair-set sqmeta://<path>[,…]\n       squeezefs volume enable-symmetric sqmeta://<path>[,…]\n       squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>\n       squeezefs volume add-data [--no-rebalance] sqmeta://<path>[,…]|<mountpoint> <device>\n       squeezefs volume remove-data sqmeta://<path>[,…]|<mountpoint> vol-<16 hex>\n       squeezefs volume undrain sqmeta://<path>[,…]|<mountpoint> vol-<16 hex>\n",
+        .volume => "usage: squeezefs volume list sqmeta://<path>[,…]\n       squeezefs volume add-meta --take-slots K|s1,s2,… sqmeta://<path>[,…] <device>\n       squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>\n       squeezefs volume repair-set sqmeta://<path>[,…]\n       squeezefs volume enable-symmetric sqmeta://<path>[,…]\n       squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>\n       squeezefs volume add-data [--no-rebalance] sqmeta://<path>[,…]|<mountpoint> <device>\n       squeezefs volume remove-data sqmeta://<path>[,…]|<mountpoint> vol-<16 hex>\n       squeezefs volume undrain sqmeta://<path>[,…]|<mountpoint> vol-<16 hex>\n       squeezefs volume waive-data-fence <mountpoint> vol-<16 hex>\n",
         .job => "usage: squeezefs job list [--json] sqmeta://<path>|<mountpoint>\n       squeezefs job status|pause|resume|cancel sqmeta://<path>|<mountpoint> job-<16 hex>\n       squeezefs job throttle <mountpoint> job-<16 hex> <pct>\n       squeezefs job worker sqmeta://<path>\n       squeezefs job rotate-enroll sqmeta://<path>\n",
         .defrag => "usage: squeezefs defrag [--data] [--pack] [--volume vol-<16 hex>] [--meta] [--fold] [--rebalance] [--report-only] [--throttle PCT] [--json] sqmeta://<path>|<mountpoint>\n       squeezefs defrag --rekey --encrypt-key <path|-> [--throttle PCT] <mountpoint>\n",
         .bench => "usage: squeezefs bench [-w] [-r] [--stat] [--del] [-t THREADS] [-n FILES] [-s SIZE] [-b BLOCK] [--rand] [--direct] [--time SECS] [-i ITERATIONS] [--abba] [--json] [--smoke] <mountpoint>\n       squeezefs bench --hash [--json]\n",
@@ -1547,6 +1551,17 @@ fn parseVolume(words: []const []const u8, diag: *Refusal) Error!Verb {
         const pos = try exactlyTwo(&c, "the sqmeta:// set or the mountpoint", "the data device");
         try checkTarget(pos[0], diag);
         return .{ .volume = .{ .add_data = .{ .meta_uri = pos[0], .device = pos[1], .no_rebalance = no_rebalance } } };
+    }
+    if (std.mem.eql(u8, sub, "waive-data-fence")) {
+        var c: Cursor = .{ .verb = "volume waive-data-fence", .words = rest, .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        const pos = try exactlyTwo(&c, "the mountpoint", "the volume id (vol-<16 hex>)");
+        try checkTarget(pos[0], diag);
+        if (!isVolumeIdWord(pos[1])) {
+            diag.* = .{ .bad_volume_id = pos[1] };
+            return error.Refused;
+        }
+        return .{ .volume = .{ .waive_data_fence = .{ .meta_uri = pos[0], .volume = pos[1] } } };
     }
     if (std.mem.eql(u8, sub, "remove-data") or std.mem.eql(u8, sub, "undrain")) {
         const is_remove = std.mem.eql(u8, sub, "remove-data");

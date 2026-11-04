@@ -42,6 +42,15 @@ pub const NVME_IO_TIMEOUT_S: u64 = 30;
 /// so `TTL > NVME_IO_TIMEOUT_S + HEARTBEAT_INTERVAL_S`; 45 = 4.5 × beat.
 pub const STALE_TTL_S: u64 = 45;
 
+/// After a PTPL-less lapse (nvmet keeps no PTPL: a target restart forgets
+/// every registration and reservation) the manager re-acquires the metadata
+/// hold and re-reserves the data namespaces only this long after it saw the
+/// lapse: two beats — every member's lapse beat (the same cadence, any phase)
+/// re-registers its host first, so the returning reservation refuses no live
+/// member (decision 0003 §DJ, review MAJOR 2). Below the TTL: the manager's
+/// claim stays fresh across it (no takeover of a lapsed manager that beats).
+pub const LAPSE_GRACE_S: u64 = 2 * HEARTBEAT_INTERVAL_S;
+
 /// Quirk Q10's skew term for cross-host claim ages: the membership
 /// derivation's `2 × skew_max` is 45 ms at ±500 ppm over one TTL, floored
 /// at 1 s because a wall clock STEPS (NTP) in whole-second grains. A claim
@@ -477,13 +486,16 @@ test "the record round-trips byte-exactly; decode is total (length, magic, versi
     try testing.expectError(error.Corrupt, Claim.decode(&[_]u8{}));
 }
 
-test "ties: TTL > nvme_io_timeout + beat (four lost beats tolerated), TTL = 4.5 × beat, the skew floor is one wall-clock grain" {
+test "ties: TTL > nvme_io_timeout + beat (four lost beats tolerated), TTL = 4.5 × beat, the skew floor is one wall-clock grain, the lapse grace two beats under the TTL" {
     try testing.expect(STALE_TTL_S > NVME_IO_TIMEOUT_S + HEARTBEAT_INTERVAL_S);
     try testing.expectEqual(STALE_TTL_S * 2, 9 * HEARTBEAT_INTERVAL_S);
     try testing.expectEqual(@as(u64, 4), STALE_TTL_S / HEARTBEAT_INTERVAL_S);
     try testing.expectEqual(@as(u64, 1), SKEW_BOUND_S);
     // 2 × skew_max at 500 ppm over one TTL is 45 ms — below the floor.
     try testing.expect(2 * STALE_TTL_S * 500 < SKEW_BOUND_S * 1_000_000);
+    // The lapse grace: two beats, under one TTL.
+    try testing.expectEqual(2 * HEARTBEAT_INTERVAL_S, LAPSE_GRACE_S);
+    try testing.expect(LAPSE_GRACE_S < STALE_TTL_S);
 }
 
 test "classify: absent → reclaimable; undecodable → stale foreign (null); own pid+boot → own residue; same boot + dead pid (absent or another incarnation) → reclaimable at ANY age; a live same-host pid is not proof" {

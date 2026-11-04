@@ -179,7 +179,7 @@ fn main(ctx: *Ctx) u8 {
     var refused: ?[]const u8 = null;
     const dfence = guard.data_fence.admitSet(gpa, p.env, io, be.volumes[0], cfg.data, &refused) catch |e| return switch (e) {
         error.OutOfMemory => ctx.failed("out of memory (the data fence)", .{}),
-        error.Refused => ctx.failed("data volume {s}: its data namespace's admission was refused (decision 0003 §DJ) — see the log", .{refused orelse "?"}),
+        error.Refused => ctx.failed("the data fence's admission was refused at {s} (decision 0003 §DJ) — see the log; a transient condition (a reconnecting target) clears on a retry", .{refused orelse "?"}),
     };
     defer if (dfence) |df| df.release();
     var guards = op_guard.Table.init(gpa, op_guard.INODE_GUARD_STRIPES) catch return ctx.failed("out of memory (op guards)", .{});

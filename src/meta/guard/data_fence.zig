@@ -712,3 +712,34 @@ test "the data admission registers this host on every DATA namespace before its 
     try testing.expectEqual(nvme.RTYPE_WEAR, dns2.rtype);
     try testing.expect(!dns2.writeAllowed(m_id));
 }
+
+test "review MAJOR 1 (decision 0003 §DJ): the reconnect-at-mount interleaving — the manager mounts while data target T2 reconnects (its node absent at the admission): the admission refuses T2, loud, and never records it as carrying no device fence ('not an NVMe namespace' — a member registered there by its own admission would then die unfenced on T2 while the recovery fences T1 alone)" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    const m_id: [16]u8 = "manager-host-id1".*;
+    var mns = fake.Namespace.init(gpa);
+    defer mns.deinit();
+    var mh: fake.Host = .{ .ns = &mns, .host_id = m_id };
+    var meta_m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer meta_m.deinit();
+    try fencing.acquireManagerHold(&meta_m);
+    var no_pages: u8 = 0;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .manager = true });
+    defer dm.release();
+    // T1 is admitted.
+    var t1 = fake.Namespace.init(gpa);
+    defer t1.deinit();
+    var t1h: fake.Host = .{ .ns = &t1, .host_id = m_id };
+    try dm.admitClient(1, "fake-t1", null, try fixtureClient(gpa, t1h.face()));
+    // T2's controller reconnects: its node is absent right now.
+    var pb: [96]u8 = undefined;
+    const t2 = try std.fmt.bufPrint(&pb, "/dev/nvme-sqz-reconnecting-{d}n1", .{linux.getpid()});
+    const refusals0 = stats.data_pr_admission_refusals.load();
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.Refused, dm.admitVolume(2, t2));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(refusals0 + 1, stats.data_pr_admission_refusals.load());
+    try testing.expectEqual(@as(usize, 0), dm.n_absent);
+}

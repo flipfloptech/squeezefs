@@ -598,10 +598,11 @@ pub const RejoinHost = struct {
     opsDrained: *const fn (ctx: *anyopaque) bool,
     /// The successor's DATA namespaces' admission (decision 0003 §DJ): the
     /// death preempt removed this host's data registrations — re-registered
-    /// through the rule under the successor's metadata registration
-    /// (`successor0`, volume 0's) before anything can reach it. Null = re-
-    /// admitted (or no data fence); else why not.
-    readmitData: *const fn (ctx: *anyopaque, successor0: *KvBackend, buf: []u8) ?[]const u8,
+    /// through the rule under the successors' metadata registrations
+    /// (`successors`, every member's: volume 0's and each other joined
+    /// volume's, §DN) before anything can reach it. Null = re-admitted (or no
+    /// data fence); else why not.
+    readmitData: *const fn (ctx: *anyopaque, successors: []const *KvBackend, buf: []u8) ?[]const u8,
 };
 
 /// A volume a joiner attaches online is admitted on its data namespace
@@ -1088,7 +1089,7 @@ pub const WirePlane = struct {
         };
         // The data namespaces again, before anything reaches the successor
         // (decision 0003 §DJ): the death preempt removed this host there.
-        if (self.rejoin_host.load(.acquire)) |h| if (h.readmitData(h.ctx, fresh[0], &why_buf)) |why| {
+        if (self.rejoin_host.load(.acquire)) |h| if (h.readmitData(h.ctx, fresh, &why_buf)) |why| {
             for (fresh) |be| be.close();
             self.gpa.free(fresh);
             return self.refuseRejoin(j, why);

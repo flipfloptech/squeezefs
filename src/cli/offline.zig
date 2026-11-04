@@ -177,7 +177,7 @@ fn main(ctx: *Ctx) u8 {
     // host registered before the plane's first write, released after it
     // closed (and before the metadata release).
     var refused: ?[]const u8 = null;
-    const dfence = guard.data_fence.admitSet(gpa, p.env, io, be.volumes[0], cfg.data, &refused) catch |e| return switch (e) {
+    const dfence = guard.data_fence.admitSet(gpa, p.env, io, be.volumes, cfg.data, &refused) catch |e| return switch (e) {
         error.OutOfMemory => ctx.failed("out of memory (the data fence)", .{}),
         error.Refused => ctx.failed("the data fence's admission was refused at {s} (decision 0003 §DJ) — see the log; a transient condition (a reconnecting target) clears on a retry", .{refused orelse "?"}),
     };

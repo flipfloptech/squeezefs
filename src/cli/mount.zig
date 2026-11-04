@@ -1414,7 +1414,7 @@ const DataArmCtx = struct {
 /// `data_fence.admitSet`): null = no data fence; `error.Refused` = reported.
 fn admitDataFence(ctx: *Ctx, be: *meta_set.MetaSet, cfg: *const set_config.Config) error{Refused}!?*guard.data_fence.DataFence {
     var refused: ?[]const u8 = null;
-    return guard.data_fence.admitSet(ctx.p.gpa, ctx.p.env, ctx.sqz.io(), be.volumes[0], cfg.data, &refused) catch |e| {
+    return guard.data_fence.admitSet(ctx.p.gpa, ctx.p.env, ctx.sqz.io(), be.volumes, cfg.data, &refused) catch |e| {
         _ = switch (e) {
             error.OutOfMemory => ctx.failed("out of memory (the data fence)", .{}),
             error.Refused => ctx.failed("the data fence's admission was refused at {s} (decision 0003 §DJ) — see the log; a transient condition (a reconnecting target) clears on a retry", .{refused orelse "?"}),
@@ -2348,12 +2348,13 @@ const RejoinHost = struct {
     }
 
     /// The successor's data namespaces' admission (decision 0003 §DJ):
-    /// under its volume 0's metadata registration and the host's registry.
-    fn readmitData(ctx: *anyopaque, successor0: *meta_set.KvBackend, buf: []u8) ?[]const u8 {
+    /// under its metadata registrations — volume 0's and every other joined
+    /// volume's (§DN) — and the host's registry.
+    fn readmitData(ctx: *anyopaque, successors: []const *meta_set.KvBackend, buf: []u8) ?[]const u8 {
         _ = buf;
         const self: *RejoinHost = @ptrCast(@alignCast(ctx));
         const df = self.dfence orelse return null;
-        return guard.data_fence.readmitSuccessor(df, successor0);
+        return guard.data_fence.readmitSuccessor(df, successors);
     }
 
     /// The successor is published: its node caches join the budget, the

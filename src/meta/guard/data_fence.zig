@@ -743,3 +743,75 @@ test "review MAJOR 1 (decision 0003 §DJ): the reconnect-at-mount interleaving �
     try testing.expectEqual(refusals0 + 1, stats.data_pr_admission_refusals.load());
     try testing.expectEqual(@as(usize, 0), dm.n_absent);
 }
+
+/// A fixture's set config: the non-retired data volumes' tags.
+const FixtureConfig = struct {
+    live: []const u64,
+    fail: bool = false,
+
+    fn source(self: *FixtureConfig) ConfigSource {
+        return .{ .ctx = self, .read = &readFn };
+    }
+
+    fn readFn(ctx: *anyopaque, _: Allocator, out: *[router.MAX_VOLUMES]u64) ConfigSource.Error!usize {
+        const self: *FixtureConfig = @ptrCast(@alignCast(ctx));
+        if (self.fail) return error.Io;
+        @memcpy(out[0..self.live.len], self.live);
+        return self.live.len;
+    }
+};
+
+test "review MAJOR 1 (decision 0003 §DJ): step 2c holds unless every non-retired data volume of the SET CONFIG is fenced or provably unfenceable — a volume the manager's table lacks holds the recovery, loud, its gauge raised, nothing preempted; the operator's waiver releases it at once; a volume retired meanwhile leaves the table at the next fence (no remount); an unreadable set config holds" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    const m_id: [16]u8 = "manager-host-id1".*;
+    const x_id: [16]u8 = "dead-member-id-2".*;
+    var mns = fake.Namespace.init(gpa);
+    defer mns.deinit();
+    var mh: fake.Host = .{ .ns = &mns, .host_id = m_id };
+    var meta_m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer meta_m.deinit();
+    try fencing.acquireManagerHold(&meta_m);
+    var no_pages: u8 = 0;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var cfg: FixtureConfig = .{ .live = &.{ 1, 2 } };
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .config = cfg.source(), .manager = true });
+    defer dm.release();
+    // T1 admitted (M reserves WEAR); the member X registered there.
+    var t1 = fake.Namespace.init(gpa);
+    defer t1.deinit();
+    var t1h: fake.Host = .{ .ns = &t1, .host_id = m_id };
+    try dm.admitClient(1, "fake-t1", null, try fixtureClient(gpa, t1h.face()));
+    var xh: fake.Host = .{ .ns = &t1, .host_id = x_id };
+    var data_x = try pr.Client.init(gpa, xh.face(), 1, 0x2222);
+    defer data_x.deinit();
+    data_x.rtype = nvme.RTYPE_WEAR;
+    _ = try data_x.registerLadder();
+    // T2 is in the set config but in no table row (its admission never
+    // landed): X's death holds, nothing preempted.
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(fencing.DataFenceOutcome.failed, dm.fenceDead(&meta_m, 0x2222));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(@as(u64, 1), stats.data_pr_fence_held_volumes.load());
+    try testing.expect(t1.isRegistered(0x2222));
+    // The operator's escape (`volume waive-data-fence`): T2 counts as
+    // unfenceable; the next poll fences T1 and converges.
+    const waivers0 = stats.data_pr_operator_waivers.load();
+    log.testing.expectErrorLogs(1);
+    try dm.waive(2);
+    try log.testing.expectAllFired();
+    try testing.expectEqual(waivers0 + 1, stats.data_pr_operator_waivers.load());
+    try testing.expectEqual(fencing.DataFenceOutcome.fenced, dm.fenceDead(&meta_m, 0x2222));
+    try testing.expect(!t1.isRegistered(0x2222));
+    try testing.expectEqual(@as(u64, 0), stats.data_pr_fence_held_volumes.load());
+    // T1 retired (and T2 waived): T1 leaves the table at the next fence.
+    cfg.live = &.{2};
+    try testing.expectEqual(fencing.DataFenceOutcome.no_device, dm.fenceDead(&meta_m, 0x3333));
+    try testing.expectEqual(@as(usize, 0), dm.n);
+    // An unreadable set config holds.
+    cfg.fail = true;
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(fencing.DataFenceOutcome.failed, dm.fenceDead(&meta_m, 0x3333));
+    try log.testing.expectAllFired();
+}

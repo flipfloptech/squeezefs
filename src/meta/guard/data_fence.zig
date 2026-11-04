@@ -1701,3 +1701,109 @@ test "decision 0003 §DL, a member slow on data: after a PTPL-less restart the j
     try testing.expect(!dj.readmitAfterRefusal(1));
     try testing.expect(!dns.isRegistered(0x2222));
 }
+
+test "decision 0003 §DN, a joiner of two metadata volumes: a restart of volume 1's target alone — its beat re-registers its host on VOLUME 1's namespace (its page Live on every joined volume, the stale-sibling rule judged by volume 1's pages), volume 0's and the data namespace's untouched; a member whose page on volume 1 left Live (its death recovered there first) re-registers nothing there, and after a data restart nothing on data either although volume 0 still reads it Live and registered — nor is its refused write re-admitted" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/data-fence-mv-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var probe = host_fence.Registry.at(base, .set, 0x3a);
+    probe.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    probe.unlock();
+    const m_id: [16]u8 = "manager-host-id1".*;
+    const j_id: [16]u8 = "joiner-host-id-2".*;
+    const x_id: [16]u8 = "dead-member-id-3".*;
+    // Two metadata namespaces (volumes 0 and 1), M holding both; J and X
+    // joined both; one data namespace.
+    var mns: [2]fake.Namespace = .{ fake.Namespace.init(gpa), fake.Namespace.init(gpa) };
+    defer for (&mns) |*n| n.deinit();
+    var dns = fake.Namespace.init(gpa);
+    defer dns.deinit();
+    var mh: [2]fake.Host = undefined;
+    var jh: [2]fake.Host = undefined;
+    var xh: [2]fake.Host = undefined;
+    var meta_m: [2]pr.Client = undefined;
+    var meta_j: [2]pr.Client = undefined;
+    var meta_x: [2]pr.Client = undefined;
+    for (0..2) |v| {
+        mh[v] = .{ .ns = &mns[v], .host_id = m_id };
+        jh[v] = .{ .ns = &mns[v], .host_id = j_id };
+        xh[v] = .{ .ns = &mns[v], .host_id = x_id };
+        meta_m[v] = try pr.Client.init(gpa, mh[v].face(), 1, 0x1111);
+        try fencing.acquireManagerHold(&meta_m[v]);
+        meta_j[v] = try pr.Client.init(gpa, jh[v].face(), 1, 0x2222);
+        _ = try fencing.joinAsRegistrant(&meta_j[v], null);
+        meta_x[v] = try pr.Client.init(gpa, xh[v].face(), 1, 0x3333);
+        _ = try fencing.joinAsRegistrant(&meta_x[v], null);
+    }
+    defer for (0..2) |v| {
+        meta_m[v].deinit();
+        meta_j[v].deinit();
+        meta_x[v].deinit();
+    };
+    var pages0 = [_]appender_page.Page{ livePage(0, 0xA, 0xA0), livePage(1, 0xC, 0xC0), livePage(2, 0xB, 0xB0) };
+    var pages1 = [_]appender_page.Page{ livePage(0, 0xA, 0xA1), livePage(1, 0xC, 0xC0), livePage(2, 0xB, 0xB0) };
+    var src0: FixturePages = .{ .pages = &pages0 };
+    var src1: FixturePages = .{ .pages = &pages1 };
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var cfg: FixtureConfig = .{ .live = &.{1} };
+    const local = proc.localIdentity();
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh[0].face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = local, .node_token = 0xA, .pages = src0.source(), .meta_path = "fake-meta0", .writer_id = 0xA0, .config = cfg.source(), .manager = true });
+    defer dm.release();
+    const dj = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = jh[0].face(), .meta_nsid = 1, .key = 0x2222, .reg = host_fence.Registry.at(base, .set, 0x3a), .local = local, .node_token = 0xC, .pages = src0.source(), .meta_path = "fake-meta0", .writer_id = 0xC0, .config = cfg.source(), .manager = false, .joined_metas = &.{.{ .face = jh[1].face(), .nsid = 1, .key = 0x2222, .pages = src1.source(), .path = "fake-meta1", .index = 1 }} });
+    defer dj.release();
+    const dx = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = xh[0].face(), .meta_nsid = 1, .key = 0x3333, .reg = host_fence.Registry.at(base, .set, 0x3b), .local = local, .node_token = 0xB, .pages = src0.source(), .meta_path = "fake-meta0", .writer_id = 0xB0, .config = cfg.source(), .manager = false, .joined_metas = &.{.{ .face = xh[1].face(), .nsid = 1, .key = 0x3333, .pages = src1.source(), .path = "fake-meta1", .index = 1 }} });
+    defer dx.release();
+    var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
+    var djh: fake.Host = .{ .ns = &dns, .host_id = j_id };
+    var dxh: fake.Host = .{ .ns = &dns, .host_id = x_id };
+    try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
+    try dj.admitClient(1, "fake-data", null, try fixtureClient(gpa, djh.face()));
+    try dx.admitClient(1, "fake-data", null, try fixtureClient(gpa, dxh.face()));
+    dm.beat();
+    try testing.expectEqual(nvme.RTYPE_WEAR, dns.rtype);
+    // Volume 1's target restarts alone; the manager's volume-1 guard
+    // re-registers its own host (gate.zig; here by hand).
+    mns[1].powerCycle();
+    _ = try fencing.joinAsRegistrant(&meta_m[1], null);
+    const meta_re0 = stats.meta_pr_lapse_reregistrations.load();
+    const data_re0 = stats.data_pr_lapse_reregistrations.load();
+    // J's beat: back on volume 1; volume 0 and data untouched (no lapse
+    // there, so no data lapse pending).
+    dj.beat();
+    try testing.expect(mns[1].isRegistered(0x2222));
+    try testing.expect(mns[0].isRegistered(0x2222) and dns.isRegistered(0x2222));
+    try testing.expectEqual(meta_re0 + 1, stats.meta_pr_lapse_reregistrations.load());
+    try testing.expectEqual(data_re0, stats.data_pr_lapse_reregistrations.load());
+    try testing.expect(!dj.vols[0].lapse_pending);
+    // X died and its region on volume 1 was recovered first: its page there
+    // Recovering, its host preempted on data; volume 0 still reads it Live
+    // and registered. Its beat re-registers nothing on volume 1.
+    pages1[2].state = .recovering;
+    try dm.clients[0].preemptAndAbort(0x3333);
+    dx.beat();
+    try testing.expect(!mns[1].isRegistered(0x3333));
+    try testing.expect(mns[0].isRegistered(0x3333));
+    try testing.expectEqual(meta_re0 + 1, stats.meta_pr_lapse_reregistrations.load());
+    // The data target restarts too: J re-registers on data, X — Live and
+    // registered on volume 0 alone — does not.
+    dns.powerCycle();
+    dj.beat();
+    try testing.expect(dns.isRegistered(0x2222));
+    dx.beat();
+    try testing.expect(!dns.isRegistered(0x3333));
+    try testing.expectEqual(data_re0 + 1, stats.data_pr_lapse_reregistrations.load());
+    // The manager re-reserves (its hold on volume 0 stood throughout): X's
+    // refused write is never re-admitted, its lapse pending or not.
+    _ = try fencing.joinAsRegistrant(&meta_m[0], null);
+    dm.grace_ns = 0;
+    dm.beat();
+    try testing.expectEqual(nvme.RTYPE_WEAR, dns.rtype);
+    try testing.expect(dx.vols[0].lapse_pending);
+    const declined0 = stats.data_pr_refusal_readmissions_declined.load();
+    try testing.expect(!dx.readmitAfterRefusal(1));
+    try testing.expect(!dns.isRegistered(0x3333));
+    try testing.expectEqual(declined0 + 1, stats.data_pr_refusal_readmissions_declined.load());
+}

@@ -100,6 +100,11 @@ pub const stats = struct {
     /// (its ring's landed entries are its recovery's): Deferred, nothing
     /// written (decision 0003 §DA).
     pub var appender_join_live_incarnation_deferrals: counters.ShardedCounter = .{};
+    /// A join whose claimed host key the volume's report does not prove
+    /// (absent, held only under another host id, 0 under a device fence,
+    /// non-zero without one): Rejected, nothing written (decision 0004
+    /// §6.1, KD18).
+    pub var meta_pr_join_key_refusals: counters.ShardedCounter = .{};
     pub var appender_pending_segments_returned: counters.ShardedCounter = .{};
     pub var appender_grow_ring_short_declines: counters.ShardedCounter = .{};
     pub var appender_ring_grows: counters.ShardedCounter = .{};
@@ -243,6 +248,30 @@ pub const JoinAppender = struct {
     ring_want_bytes: u64 = 0,
     /// The joiner's HOME volume ordinal (the membership shard key).
     home_volume: u16 = 0,
+    /// The joiner's host registration key, verified against the volume's
+    /// report and written on its page (decision 0004 §6.1, KD18; 0 = no
+    /// device fence).
+    host_key: u64 = 0,
+};
+
+/// A joiner's claimed host key read against the joined volume's report
+/// (decision 0004 §6.1, KD18).
+pub const JoinKeyVerdict = enum {
+    /// A registrant holds it under the host id it derives from.
+    ok,
+    /// No registrant holds it.
+    absent,
+    /// Held only under host ids it does not derive from.
+    mismatch,
+    /// The report could not be read: the join defers.
+    unreadable,
+};
+
+/// The volume's device fence as the join's key check reads it; null on the
+/// manager = no device fence (the claimed key must be 0).
+pub const JoinKeyCheck = struct {
+    ctx: *anyopaque,
+    verify: *const fn (ctx: *anyopaque, claimed: u64) JoinKeyVerdict,
 };
 
 pub const Joined = struct {
@@ -529,6 +558,9 @@ pub const Manager = struct {
     /// The mount's `PeerGate` (null = no kernel: the contracts, a tool);
     /// set before the wire serves its first join.
     peer_gate: ?*const PeerGate = null,
+    /// The volume's device fence for the join's key check (null = none);
+    /// set before the wire serves its first join.
+    key_check: ?JoinKeyCheck = null,
     /// The lease posture word: `held | peer:<node> | vacant`.
     lease: Lease = .vacant,
     peer_node: u64 = 0,
@@ -1091,6 +1123,11 @@ pub const Manager = struct {
 
     pub fn joinAppender(self: *Manager, req: JoinAppender) VerbError!Joined {
         self.requireLease() catch return error.Refused;
+        // The page key drives the death fence, the reap and the reconcile
+        // skip: proven by the device before the page names it (KD18). Read
+        // outside the verbs lock (the report takes the PR client's
+        // sequence lock).
+        try self.verifyJoinKey(req);
         self.verbs_lock.lockUncancelable(self.io);
         defer self.verbs_lock.unlock(self.io);
         const t0 = clock.monotonicNs();
@@ -1192,6 +1229,7 @@ pub const Manager = struct {
         p.identity = req.identity;
         p.is_manager = false;
         p.home_volume = req.home_volume;
+        p.host_key = req.host_key;
         p.segments = carve.table;
         const cont = region.seqContinuation(p.head_hint, self.vol.vt.ring0Head(self.vol.ctx));
         p.head_hint = cont;
@@ -1223,6 +1261,31 @@ pub const Manager = struct {
         const t_done = clock.monotonicNs();
         self.ledger.record(t_done, t_admit - t0, t_done - t_admit, 0);
         return out;
+    }
+
+    /// The claimed key against the volume's device fence: none ⇒ the key
+    /// must be 0; one ⇒ a registrant must hold it under the host id it
+    /// derives from. A refusal is loud and writes nothing.
+    fn verifyJoinKey(self: *Manager, req: JoinAppender) VerbError!void {
+        const why: []const u8 = blk: {
+            const check = self.key_check orelse {
+                if (req.host_key == 0) return;
+                break :blk "names a host key, but this volume carries no device fence";
+            };
+            if (req.host_key == 0) break :blk "names no host key, but this volume carries a device fence";
+            switch (check.verify(check.ctx, req.host_key)) {
+                .ok => return,
+                .absent => break :blk "names a host key no registrant of the volume's namespace holds (a host fenced since its registration, or a forged key)",
+                .mismatch => break :blk "names a host key registered only under host identifiers it does not derive from",
+                .unreadable => {
+                    log.warn("manager: JoinAppender by node 0x{x} / mount slot {d}: the namespace's report could not be read to verify its host key {x:0>16} — deferred", .{ req.identity.node_token, req.identity.mount_slot, req.host_key });
+                    return error.Deferred;
+                },
+            }
+        };
+        stats.meta_pr_join_key_refusals.inc();
+        log.err("manager: REFUSING JoinAppender by node 0x{x} / mount slot {d} (writer {x:0>16}): it {s} (claimed key {x:0>16}) — nothing written", .{ req.identity.node_token, req.identity.mount_slot, req.identity.writer_id, why, req.host_key });
+        return error.Rejected;
     }
 
     /// The counter read → `minted + 1` written as ONE control entry →

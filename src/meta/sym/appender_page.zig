@@ -8,10 +8,10 @@
 //! checkpoint, one read per recovery. It never names tree 0's root or the
 //! stamp, so two managers are unrepresentable (KD-SYM-3). PORTABLE.
 //!
-//! v4 layout (fixed 296 B, hash64 LAST over `[0..4088)`, the version right
+//! Layout 2 (fixed 304 B, hash64 LAST over `[0..4088)`, the version right
 //! after the magic — the superblock's conventions, 0002 row 43):
 //! ```
-//! @0   "KVAP"            @4  layout_version u16 = 1   @6  reserved u16
+//! @0   "KVAP"            @4  layout_version u16 = 2   @6  reserved u16
 //! @8   appender_id u32   @12 reserved u32              @16 generation u64
 //! @24  node_token u64    @32 mount_slot u32            @36 reserved u32
 //! @40  writer_id u64     @48 term u64
@@ -20,12 +20,22 @@
 //! @64  head_hint u64  @72 ledger_tail_seq u64  @80 ckpt_seq u64  @88 seq_offset u64
 //! @96  recovered_by_term u64
 //! @104 segments[8]{start u64, len u64}      @232 grants[4]{start u64, len u64}
-//! @296 SlotEntry × n_slots (35 B each, slot-ascending), zero tail to @4088
+//! @296 host_key u64
+//! @304 SlotEntry × n_slots (35 B each, slot-ascending), zero tail to @4088
 //! @4088 hash64 u64
 //! ```
-//! `SLOT_PAGE_BUDGET = (4088 − 296) / 35 = 108` — DERIVED from the fixed
+//! `host_key` (decision 0004 §6.1, KD8) is the registration key of the
+//! incarnation's host (the incarnation's key under the per-mount seam; 0
+//! with no PR posture): the manager writes it at `JoinAppender` (the
+//! joiner's claim, verified against the device) and at region 0's bind; a
+//! member's own page writes keep it. Deaths take it when their record
+//! carries none, so a member reaped at a successor's grace is fenced.
+//! `SLOT_PAGE_BUDGET = (4088 − 304) / 35 = 108` — DERIVED from the fixed
 //! part and the entry width, never a free constant (the charter's 108 at
-//! the fixed part's natural widths, restated by a comptime assert).
+//! the fixed part's natural widths, restated by a comptime assert; layout
+//! 1's 12 B of slack took the key word). Layout 1 (no key word, the entries
+//! from @296) decodes with `host_key = 0` until PR-8 retires the arm
+//! (decision 0004 §6.4; a decision 0002 row); every write is layout 2.
 //!
 //! Four slots, newest-valid-wins: `pageSlotFor(generation) = generation
 //! % 4` rotates so the three predecessors stay intact and a torn newest
@@ -45,10 +55,14 @@ const assert = std.debug.assert;
 
 pub const PAGE_LEN: usize = 4096;
 pub const MAGIC = "KVAP";
-pub const LAYOUT_VERSION: u16 = 1;
+pub const LAYOUT_VERSION: u16 = 2;
+/// Layout 1: no host key, the slot entries from `FIXED_LEN_V1` (read only).
+pub const LAYOUT_VERSION_V1: u16 = 1;
 /// The checksum's offset: LAST, over everything before it.
 pub const CHECKSUM_OFF: usize = PAGE_LEN - 8;
-pub const FIXED_LEN: usize = 296;
+pub const HOST_KEY_OFF: usize = 296;
+pub const FIXED_LEN: usize = HOST_KEY_OFF + 8;
+const FIXED_LEN_V1: usize = HOST_KEY_OFF;
 pub const SLOT_ENTRY_LEN: usize = 35;
 /// `(page − checksum − fixed) / entry`.
 pub const SLOT_PAGE_BUDGET: u16 = @intCast((CHECKSUM_OFF - FIXED_LEN) / SLOT_ENTRY_LEN);
@@ -184,6 +198,9 @@ pub const Page = struct {
     is_manager: bool = false,
     /// The joiner's HOME volume ordinal (spec Q-6: the membership shard key).
     home_volume: u16 = 0,
+    /// The registration key of the incarnation's host (0 = no PR posture,
+    /// or a layout-1 page).
+    host_key: u64 = 0,
     segments: SegmentTable = .{},
     /// The ring head (the seq-space watermark the next carve continues from).
     head_hint: u64 = 0,
@@ -241,7 +258,10 @@ const SlotEntryWire = extern struct {
 comptime {
     assert(@sizeOf(SlotEntryWire) == SLOT_ENTRY_LEN);
     assert(SLOT_PAGE_BUDGET == 108);
+    assert(FIXED_LEN == 304);
     assert(FIXED_LEN + @as(usize, SLOT_PAGE_BUDGET) * SLOT_ENTRY_LEN <= CHECKSUM_OFF);
+    // Layout 1's budget was the same 108: its decode arm reads every page it wrote.
+    assert((CHECKSUM_OFF - FIXED_LEN_V1) / SLOT_ENTRY_LEN == SLOT_PAGE_BUDGET);
     assert(APPENDER0_RESERVED_PAGES == PAGE_SLOTS);
 }
 
@@ -289,6 +309,7 @@ pub fn encodePage(p: *const Page, out: *[PAGE_LEN]u8) EncodeError!void {
         put(out, u64, 232 + i * 16, g.start);
         put(out, u64, 232 + i * 16 + 8, g.len);
     }
+    put(out, u64, HOST_KEY_OFF, p.host_key);
     for (p.slotEntries(), 0..) |e, i| {
         var w: SlotEntryWire = undefined;
         std.mem.writeInt(u16, &w.slot_le, e.slot, .little);
@@ -311,9 +332,9 @@ pub const Classified = union(enum) {
     blank,
     /// A torn or damaged image: the reader falls back to a predecessor.
     corrupt,
-    /// Magic + checksum verify but the layout version is not ours: the
-    /// whole four-slot read REFUSES, never a fallback (a newer binary's
-    /// page would be misread as "blank" otherwise).
+    /// Magic + checksum verify but the layout version is neither 2 nor the
+    /// read-only 1: the whole four-slot read REFUSES, never a fallback (a
+    /// newer binary's page would be misread as "blank" otherwise).
     foreign_layout,
 };
 
@@ -322,16 +343,21 @@ pub fn classify(img: []const u8) Classified {
     if (std.mem.allEqual(u8, img, 0)) return .blank;
     if (!std.mem.eql(u8, img[0..4], MAGIC)) return .corrupt;
     if (get(img, u64, CHECKSUM_OFF) != checksum.hash64(img[0..CHECKSUM_OFF])) return .corrupt;
-    if (get(img, u16, 4) != LAYOUT_VERSION) return .foreign_layout;
-    const p = decodeVerified(img) catch return .corrupt;
+    const fixed_len: usize = switch (get(img, u16, 4)) { // @4 layout_version (the module's layout table)
+        LAYOUT_VERSION => FIXED_LEN,
+        LAYOUT_VERSION_V1 => FIXED_LEN_V1,
+        else => return .foreign_layout,
+    };
+    const p = decodeVerified(img, fixed_len) catch return .corrupt;
     return .{ .valid = p };
 }
 
-/// The field decode of a checksum-verified image: every reserved word
-/// zero, every count within its bound BEFORE any element is read, unused
-/// table entries zero, slots ascending, the tail zero — decode ∘ encode
-/// = id.
-fn decodeVerified(img: []const u8) error{Corrupt}!Page {
+/// The field decode of a checksum-verified image whose slot entries start
+/// at `fixed_len` (layout 2's, or layout 1's with no key word: key 0):
+/// every reserved word zero, every count within its bound BEFORE any
+/// element is read, unused table entries zero, slots ascending, the tail
+/// zero — decode ∘ encode = id on layout 2.
+fn decodeVerified(img: []const u8, fixed_len: usize) error{Corrupt}!Page {
     if (get(img, u16, 6) != 0 or get(img, u32, 12) != 0 or get(img, u32, 36) != 0) return error.Corrupt;
     const state = std.enums.fromInt(State, img[56]) orelse return error.Corrupt;
     if (img[57] > 1) return error.Corrupt;
@@ -352,6 +378,7 @@ fn decodeVerified(img: []const u8) error{Corrupt}!Page {
         .ckpt_seq = get(img, u64, 80),
         .seq_offset = get(img, u64, 88),
         .recovered_by_term = get(img, u64, 96),
+        .host_key = if (fixed_len == FIXED_LEN) get(img, u64, HOST_KEY_OFF) else 0,
     };
     for (0..RING_SEGMENTS_MAX) |i| {
         const e: Extent = .{ .start = get(img, u64, 104 + i * 16), .len = get(img, u64, 104 + i * 16 + 8) };
@@ -371,7 +398,7 @@ fn decodeVerified(img: []const u8) error{Corrupt}!Page {
     }
     var i: usize = 0;
     while (i < n_slots) : (i += 1) {
-        const w = std.mem.bytesToValue(SlotEntryWire, img[FIXED_LEN + i * SLOT_ENTRY_LEN ..][0..SLOT_ENTRY_LEN]);
+        const w = std.mem.bytesToValue(SlotEntryWire, img[fixed_len + i * SLOT_ENTRY_LEN ..][0..SLOT_ENTRY_LEN]);
         const e: SlotEntry = .{
             .slot = std.mem.readInt(u16, &w.slot_le, .little),
             .state = std.enums.fromInt(SlotEntryState, w.state) orelse return error.Corrupt,
@@ -385,7 +412,7 @@ fn decodeVerified(img: []const u8) error{Corrupt}!Page {
         p.slots[i] = e;
     }
     p.n_slots = n_slots;
-    if (!std.mem.allEqual(u8, img[FIXED_LEN + @as(usize, n_slots) * SLOT_ENTRY_LEN .. CHECKSUM_OFF], 0)) return error.Corrupt;
+    if (!std.mem.allEqual(u8, img[fixed_len + @as(usize, n_slots) * SLOT_ENTRY_LEN .. CHECKSUM_OFF], 0)) return error.Corrupt;
     return p;
 }
 
@@ -534,6 +561,7 @@ fn expectPageEql(a: *const Page, b: *const Page) !void {
     try testing.expectEqual(a.state, b.state);
     try testing.expectEqual(a.is_manager, b.is_manager);
     try testing.expectEqual(a.home_volume, b.home_volume);
+    try testing.expectEqual(a.host_key, b.host_key);
     try testing.expect(a.segments.eql(&b.segments));
     try testing.expectEqual(a.head_hint, b.head_hint);
     try testing.expectEqual(a.ledger_tail_seq, b.ledger_tail_seq);
@@ -543,7 +571,7 @@ fn expectPageEql(a: *const Page, b: *const Page) !void {
     try testing.expectEqualSlices(SlotEntry, a.slotEntries(), b.slotEntries());
 }
 
-test "slot_page_budget derives from the page's fixed part: (4088 − 296) / 35 = 108, never a literal; the bounds are the charter's" {
+test "slot_page_budget derives from the page's fixed part: (4088 − 304) / 35 = 108, never a literal; the bounds are the charter's" {
     try testing.expectEqual(@as(u16, 108), SLOT_PAGE_BUDGET);
     try testing.expectEqual(@as(usize, 108), (CHECKSUM_OFF - FIXED_LEN) / SLOT_ENTRY_LEN);
     try testing.expectEqual(@as(u8, 8), RING_SEGMENTS_MAX);
@@ -601,7 +629,7 @@ test "the page round-trips at every bound (8 segments / 4 runs / 108 slots) and 
     var img: [PAGE_LEN]u8 = undefined;
     try p.encode(&img);
     try testing.expectEqualStrings("KVAP", img[0..4]);
-    try testing.expectEqual(@as(u16, 1), get(&img, u16, 4));
+    try testing.expectEqual(@as(u16, 2), get(&img, u16, 4));
     const back = try decode(&img);
     try expectPageEql(&p, &back);
     // Every bound.
@@ -679,7 +707,7 @@ test "decode is total and canonical: reserved bytes, an unsorted list, an unknow
     m[100] ^= 1;
     try testing.expectError(error.Corrupt, decode(&m));
     m = img;
-    put(&m, u16, 4, 2);
+    put(&m, u16, 4, 3);
     Mut.stamp(&m);
     try testing.expectError(error.ForeignLayout, decode(&m));
     try testing.expect(classify(&m) == .foreign_layout);
@@ -762,6 +790,17 @@ test "the four slots' device offsets: appender 0 at the fixed journal's first fo
     try testing.expect(f.state == .free and f.identity.eql(.none) and f.n_slots == 0 and f.grants.len == 0 and f.segments.eql(&t0));
 }
 
+/// A valid image re-encodes byte-identically when it is layout 2; a
+/// layout-1 image re-encodes as layout 2 decoding to the same page.
+fn expectCanonical(img: []const u8, p: *const Page) !void {
+    var re: [PAGE_LEN]u8 = undefined;
+    try p.encode(&re);
+    if (get(img, u16, 4) == LAYOUT_VERSION) return testing.expectEqualSlices(u8, img, &re);
+    try testing.expectEqual(LAYOUT_VERSION_V1, get(img, u16, 4));
+    try testing.expectEqual(@as(u64, 0), p.host_key);
+    try expectPageEql(p, &(try decode(&re)));
+}
+
 fn pageFuzz(_: void, smith: *std.testing.Smith) !void {
     var buf: [PAGE_LEN]u8 = undefined;
     const len = smith.slice(&buf);
@@ -772,14 +811,10 @@ fn pageFuzz(_: void, smith: *std.testing.Smith) !void {
         error.Corrupt => c == .corrupt,
         error.ForeignLayout => c == .foreign_layout,
     });
-    if (c == .valid) {
-        var re: [PAGE_LEN]u8 = undefined;
-        try c.valid.encode(&re);
-        try testing.expectEqualSlices(u8, buf[0..len], &re);
-    }
+    if (c == .valid) try expectCanonical(buf[0..len], &c.valid);
 }
 
-test "fuzz: classify is total; a valid page re-encodes byte-identically" {
+test "fuzz: classify is total; a valid layout-2 page re-encodes byte-identically, a layout-1 one as layout 2 to the same page" {
     var img: [PAGE_LEN]u8 = undefined;
     try samplePage().encode(&img);
     const framed = comptime blk: {
@@ -798,10 +833,7 @@ test "fuzz: classify is total; a valid page re-encodes byte-identically" {
         m = img;
         for (0..r.intRangeAtMost(usize, 1, 4)) |_| m[r.intRangeLessThan(usize, 0, PAGE_LEN)] ^= @as(u8, 1) << r.int(u3);
         put(&m, u64, CHECKSUM_OFF, checksum.hash64(m[0..CHECKSUM_OFF]));
-        if (classify(&m) == .valid) {
-            var re: [PAGE_LEN]u8 = undefined;
-            try classify(&m).valid.encode(&re);
-            try testing.expectEqualSlices(u8, &m, &re);
-        }
+        const c = classify(&m);
+        if (c == .valid) try expectCanonical(&m, &c.valid);
     }
 }

@@ -224,7 +224,10 @@ pub const Appenders = struct {
 };
 
 /// `squeezefs appender clear sqmeta://<path> <id>` (ids ≥ 1; 0 refuses at
-/// the verb — a dead manager's region is the D0 successor's).
+/// the verb — a dead manager's region is the D0 successor's). Its keyless
+/// record lets the page's host key decide the recovery's fences (decision
+/// 0004 §4.8): the cleared page's host is fenced, with every live mount of
+/// the set on it.
 pub const AppenderClear = struct {
     meta_uri: []const u8,
     appender_id: u32,
@@ -586,7 +589,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .config => "usage: squeezefs config show [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-fabric-endpoints sqmeta://<path> vol-<tag>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>[,<path>…]…\n       squeezefs config get-fabric-endpoints [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-dir-spread-depth 0…254 sqmeta://<path>   (directories at depth ≤ N round-robin over the members; 0 = never below /'s children; the set must be unmounted; takes effect at the next mount)\n",
         .claim_clear => "usage: squeezefs claim clear sqmeta://<path>\n",
         .appenders => "usage: squeezefs appenders [--json] sqmeta://<path>\n",
-        .appender_clear => "usage: squeezefs appender clear sqmeta://<path> <id>\n",
+        .appender_clear => "usage: squeezefs appender clear sqmeta://<path> <id>   (the set must be unmounted; the next mount's recovery fences the cleared page's host with its registration key: every live mount of the set on that host is fenced with it and fail-stops)\n",
         .fsck => "usage: squeezefs fsck [--online|--offline] [--json] [--scrub] [--throttle PCT] [--shards k/N] [--repair [--apply] [--quarantine-dir DIR]] sqmeta://<path>|<mountpoint>\n       squeezefs scrub [--online|--offline] [--json] [--throttle PCT] sqmeta://<path>|<mountpoint>\n",
         .fsck_merge => "usage: squeezefs fsck merge-reports [--json] <report.json>…\n",
         .volume => "usage: squeezefs volume list sqmeta://<path>[,…]\n       squeezefs volume add-meta --take-slots K|s1,s2,… sqmeta://<path>[,…] <device>\n       squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>\n       squeezefs volume repair-set sqmeta://<path>[,…]\n       squeezefs volume enable-symmetric sqmeta://<path>[,…]\n       squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>\n       squeezefs volume add-data [--no-rebalance] sqmeta://<path>[,…]|<mountpoint> <device>\n       squeezefs volume remove-data sqmeta://<path>[,…]|<mountpoint> vol-<16 hex>\n       squeezefs volume undrain sqmeta://<path>[,…]|<mountpoint> vol-<16 hex>\n       squeezefs volume waive-data-fence <mountpoint> vol-<16 hex>\n",

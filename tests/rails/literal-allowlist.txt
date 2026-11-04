@@ -393,7 +393,6 @@ src/meta/sym/appender_page.zig:289 | 232 | 1974bd293aa4b57c | encoding offset/wi
 src/meta/sym/appender_page.zig:290 | 16 | a01887d00f8efb31 | encoding offset/width of a fixed layout (the module's layout table; the comptime size asserts pin it)
 src/meta/sym/appender_page.zig:290 | 232 | a01887d00f8efb31 | encoding offset/width of a fixed layout (the module's layout table; the comptime size asserts pin it)
 src/meta/sym/appender_page.zig:290 | 8 | a01887d00f8efb31 | encoding offset/width of a fixed layout (the module's layout table; the comptime size asserts pin it)
-src/meta/sym/appender_page.zig:325 | 4 | f06bf106c42f5328 | encoding offset/width of a fixed layout (the module's layout table; the comptime size asserts pin it)
 src/meta/sym/appender_page.zig:343 | 8 | f2e42fb988281f37 | encoding offset/width of a fixed layout (the module's layout table; the comptime size asserts pin it)
 src/meta/sym/appender_page.zig:344 | 16 | ad76a344404f32d7 | encoding offset/width of a fixed layout (the module's layout table; the comptime size asserts pin it)
 src/meta/sym/appender_page.zig:345 | 24 | 4241a3f9ee67e3c3 | encoding offset/width of a fixed layout (the module's layout table; the comptime size asserts pin it)

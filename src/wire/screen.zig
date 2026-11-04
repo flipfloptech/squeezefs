@@ -76,6 +76,10 @@ pub const Reason = enum {
     node_seq_base_off_stride,
     node_seq_base_manager_space,
     node_seq_base_past_capacity,
+    /// A JoinAppender's host key is 0 on a volume with a device fence.
+    join_key_zero,
+    /// A JoinAppender names a host key on a volume with no device fence.
+    join_key_unfenced,
 };
 
 pub const Verdict = union(enum) {
@@ -166,6 +170,16 @@ pub const DeathBounds = struct {
 // ---------------------------------------------------------------------------
 // The screens.
 // ---------------------------------------------------------------------------
+
+/// `JoinAppender`'s host key (decision 0004 §6.1, KD18): non-zero iff the
+/// manager's volume carries a device fence (`fenced`). The report check —
+/// some registrant holds the key under the host id it derives from —
+/// follows this screen, in the manager.
+pub fn joinAppenderKey(req: verbs.JoinAppenderReq, fenced: bool) Verdict {
+    if (fenced and req.host_key == 0) return reject(.join_key_zero);
+    if (!fenced and req.host_key != 0) return reject(.join_key_unfenced);
+    return .ok;
+}
 
 /// A frame naming an ordinal the set lacks is `STATUS_NOT_MANAGER`; the
 /// screen's word is the same check for payload-internal ordinals.

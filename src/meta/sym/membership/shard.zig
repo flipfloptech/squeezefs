@@ -362,10 +362,15 @@ pub const RenewVerdict = union(enum) {
     unknown_lease,
 };
 
+/// One identity a successor's grace waits for, with the key its death
+/// carries if it never re-asserts (decision 0004 §4.6, KD17): the Live
+/// appender page's `host_key`, or 0 for a row with no page (no region).
+pub const Expected = struct { id: MemberId, key: u64 };
+
 const Grace = struct {
     until_ms: u64,
-    /// The writers the predecessor's roster named (the claim set).
-    expected: std.ArrayList(MemberId) = .empty,
+    /// The merged set: the predecessor's writer rows ∪ the Live pages.
+    expected: std.ArrayList(Expected) = .empty,
     /// Those that re-asserted so far.
     reasserted: std.ArrayList(MemberId) = .empty,
     /// The fresh-refusal half closed early.
@@ -379,7 +384,7 @@ const Grace = struct {
     }
 
     fn expects(self: *const Grace, id: MemberId) bool {
-        for (self.expected.items) |e| if (std.mem.eql(u8, &e, &id)) return true;
+        for (self.expected.items) |e| if (std.mem.eql(u8, &e.id, &id)) return true;
         return false;
     }
 
@@ -535,6 +540,9 @@ pub const Owner = struct {
     owner_roster: Roster = .{},
     /// Bound before the owner serves (the listener starts after both).
     death_sink: ?DeathSink = null,
+    /// Same-host identities proven dead at the arm, shipped by the first
+    /// `bindDeathSink` (owned; empty after).
+    pre_dead: []Expected = &.{},
     rows: ?RowStore = null,
     /// Test seam: fired at each `HookSite`.
     test_hook: if (builtin.is_test) ?TestHook else void = if (builtin.is_test) null else {},
@@ -560,32 +568,44 @@ pub const Owner = struct {
     }
 
     /// `arm(term, prior_term)` REFUSES `term ≤ prior_term`: the successor
-    /// bumps the term durably BEFORE arming. `expected` = the predecessor's
-    /// writer roster; a non-empty one opens the grace window.
-    pub fn arm(gpa: Allocator, io: Io, clocks: LeaseClocks, home_volume: u16, term: u64, prior_term: u64, expected: []const MemberId, now_ms: u64) error{ StaleTerm, OutOfMemory }!Owner {
+    /// bumps the term durably BEFORE arming. `expected` = the merged set,
+    /// the predecessor's writer rows ∪ every Live appender page (decision
+    /// 0004 §4.6, KD17), each with its death's key: a non-empty one opens
+    /// the grace window, so a member whose row was lost is expected — and
+    /// reaped — by its page alone. `pre_dead` = the same-host page
+    /// identities proven dead: never expected, shipped by `bindDeathSink`.
+    pub fn arm(gpa: Allocator, io: Io, clocks: LeaseClocks, home_volume: u16, term: u64, prior_term: u64, expected: []const Expected, pre_dead: []const Expected, now_ms: u64) error{ StaleTerm, OutOfMemory }!Owner {
         if (term <= prior_term) return error.StaleTerm;
         var grace: ?Grace = null;
+        errdefer if (grace) |*g| g.deinit(gpa);
         if (expected.len != 0) {
-            var g: Grace = .{ .until_ms = now_ms + clocks.grace_ms };
-            errdefer g.deinit(gpa);
-            try g.expected.appendSlice(gpa, expected);
-            grace = g;
+            grace = .{ .until_ms = now_ms + clocks.grace_ms };
+            try grace.?.expected.appendSlice(gpa, expected);
         }
+        const dead = try gpa.dupe(Expected, pre_dead);
         stats.membership_mode.set(@backingInt(Mode.owner));
         stats.membership_term.set(term);
         stats.membership_lease_ttl_ms.set(clocks.t_owner_ms);
         stats.membership_shards.add(1);
-        return .{ .gpa = gpa, .io = io, .clocks = clocks, .term = term, .home_volume = home_volume, .owner_roster = .{ .grace = grace } };
+        return .{ .gpa = gpa, .io = io, .clocks = clocks, .term = term, .home_volume = home_volume, .owner_roster = .{ .grace = grace }, .pre_dead = dead };
     }
 
     /// Once nothing serves the owner any more.
     pub fn deinit(self: *Owner) void {
         self.owner_roster.deinit(self.gpa);
+        self.gpa.free(self.pre_dead);
         stats.membership_shards.sub(1);
     }
 
+    /// The sink bound, then the arm's proven-dead identities shipped to it
+    /// once (decision 0004 §4.6: no death lost to an unbound sink, none
+    /// before it), each with its page's key and epoch 0.
     pub fn bindDeathSink(self: *Owner, sink: DeathSink) void {
         self.death_sink = sink;
+        const dead = self.pre_dead;
+        self.pre_dead = &.{};
+        defer self.gpa.free(dead);
+        for (dead) |d| sink.noteDeath(sink.ctx, .{ .id = d.id, .identity = memberIdentity(d.id), .epoch = 0, .pr_key = d.key });
     }
 
     pub fn bindRows(self: *Owner, rows: RowStore) void {
@@ -855,9 +875,11 @@ pub const Owner = struct {
     }
 
     /// `reap_grace_deadline`: at the deadline the EXPECTED members that
-    /// never re-asserted are DEAD — shipped NOW with `epoch 0` and the
-    /// roster's key (after grace, never at `T_owner`). Once.
-    pub fn reapGraceDeadline(self: *Owner, now_ms: u64, roster_key: *const fn (id: MemberId) u64) u32 {
+    /// never re-asserted are DEAD — shipped NOW with `epoch 0` and the key
+    /// each entry carries (its Live page's host key; decision 0004 §4.6),
+    /// one entry per hold of the lock, the sink outside it (after grace,
+    /// never at `T_owner`). Once.
+    pub fn reapGraceDeadline(self: *Owner, now_ms: u64) u32 {
         {
             const r = self.lockRoster();
             defer self.unlockRoster();
@@ -867,21 +889,21 @@ pub const Owner = struct {
         }
         var n: u32 = 0;
         var next: usize = 0;
-        while (self.nextUnreasserted(&next)) |id| {
-            if (self.death_sink) |s| s.noteDeath(s.ctx, .{ .id = id, .identity = memberIdentity(id), .epoch = 0, .pr_key = roster_key(id) });
+        while (self.nextUnreasserted(&next)) |e| {
+            if (self.death_sink) |s| s.noteDeath(s.ctx, .{ .id = e.id, .identity = memberIdentity(e.id), .epoch = 0, .pr_key = e.key });
             n += 1;
         }
         return n;
     }
 
-    fn nextUnreasserted(self: *Owner, next: *usize) ?MemberId {
+    fn nextUnreasserted(self: *Owner, next: *usize) ?Expected {
         const r = self.lockRoster();
         defer self.unlockRoster();
         const g = r.grace orelse return null;
         while (next.* < g.expected.items.len) {
-            const id = g.expected.items[next.*];
+            const e = g.expected.items[next.*];
             next.* += 1;
-            if (!g.hasReasserted(id)) return id;
+            if (!g.hasReasserted(e.id)) return e;
         }
         return null;
     }
@@ -1510,10 +1532,6 @@ const Rows = struct {
     }
 };
 
-fn rosterKey(_: MemberId) u64 {
-    return 0x9999;
-}
-
 test "the member row is the writer claim's shape at kind 1: round-trip, kind 0 refused, checksum total; a member id names its writer and a reader id names none; the clocks derive from T_owner alone" {
     const r = rowOf(3);
     const bytes = r.encode();
@@ -1549,8 +1567,8 @@ test "the member row is the writer claim's shape at kind 1: round-trip, kind 0 r
 test "the owner: arm refuses a stale term; a join writes ONE row and grants an epoch; renewals write nothing; eviction at >= T_owner ships the death with the member's epoch and key; the key is remembered 2 × T_owner; a leave is never a death" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    try testing.expectError(error.StaleTerm, Owner.arm(gpa, testing.io, clocks, 0, 3, 3, &.{}, 0));
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 4, 3, &.{}, 1000);
+    try testing.expectError(error.StaleTerm, Owner.arm(gpa, testing.io, clocks, 0, 3, 3, &.{}, &.{}, 0));
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 4, 3, &.{}, &.{}, 1000);
     defer o.deinit();
     var deaths: Deaths = .{};
     defer deaths.list.deinit(gpa);
@@ -1604,7 +1622,7 @@ test "the owner: arm refuses a stale term; a join writes ONE row and grants an e
 test "the reclaim is idempotent against the state held (a lost grant reply): with the grace closed, a reclaim naming the epoch granted re-points; one naming a STALE epoch from the SAME incarnation (pid, boot) re-points too — never UnknownLease, never a poison of a live member; the same id from ANOTHER incarnation with a stale epoch is UnknownLease; an epoch above the held one is UnknownLease; a dead-and-evicted member's reclaim is UnknownLease" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     const id = writerMemberId(testIdentity(1));
     const e1 = o.join(joinReqOf(1, null, "/mnt/a"), 0).granted.epoch;
@@ -1637,12 +1655,12 @@ test "the reclaim is idempotent against the state held (a lost grant reply): wit
     try testing.expect(o.join(joinReqOf(1, g3.epoch, "/mnt/a"), 400 + 45_001) == .unknown_lease);
 }
 
-test "grace, two halves on one deadline: a stranger is refused while the fresh half is open; an EXPECTED member's first join is a re-assertion; the fresh half closes early once every expected member re-asserted while the re-assertion half admits a prior epoch to the deadline; liveness reads unknown inside the window; the deadline ships the non-reclaimers with epoch 0 and the roster's key, once" {
+test "grace, two halves on one deadline: a stranger is refused while the fresh half is open; an EXPECTED member's first join is a re-assertion; the fresh half closes early once every expected member re-asserted while the re-assertion half admits a prior epoch to the deadline; liveness reads unknown inside the window; the deadline ships the non-reclaimers with epoch 0 and the key their entry carries, once" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
     const a = writerMemberId(testIdentity(1));
     const b = writerMemberId(testIdentity(2));
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{ a, b }, 10_000);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{ .{ .id = a, .key = 0 }, .{ .id = b, .key = 0 } }, &.{}, 10_000);
     defer o.deinit();
     var deaths: Deaths = .{};
     defer deaths.list.deinit(gpa);
@@ -1665,15 +1683,15 @@ test "grace, two halves on one deadline: a stranger is refused while the fresh h
     try testing.expect(o.join(joinReqOf(8, 3, "/m8"), 54_999) == .granted);
     try testing.expect(o.join(joinReqOf(9, 3, "/m9"), 55_000) == .unknown_lease);
     // Nobody died: both expected re-asserted.
-    try testing.expectEqual(@as(u32, 0), o.reapGraceDeadline(55_000, &rosterKey));
+    try testing.expectEqual(@as(u32, 0), o.reapGraceDeadline(55_000));
     try testing.expectEqual(@as(usize, 0), deaths.list.items.len);
     // A second owner whose expected member never returns: dead at the deadline, once.
-    var o2 = try Owner.arm(gpa, testing.io, clocks, 1, 2, 1, &.{a}, 0);
+    var o2 = try Owner.arm(gpa, testing.io, clocks, 1, 2, 1, &.{.{ .id = a, .key = 0x9999 }}, &.{}, 0);
     defer o2.deinit();
     o2.bindDeathSink(deaths.sink());
-    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(44_999, &rosterKey));
-    try testing.expectEqual(@as(u32, 1), o2.reapGraceDeadline(45_000, &rosterKey));
-    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(46_000, &rosterKey));
+    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(44_999));
+    try testing.expectEqual(@as(u32, 1), o2.reapGraceDeadline(45_000));
+    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(46_000));
     try testing.expectEqual(@as(u64, 0), deaths.list.items[0].epoch);
     try testing.expectEqual(@as(u64, 0x9999), deaths.list.items[0].pr_key);
     try testing.expectEqual(Liveness.dead, o2.liveness(a, 45_000));
@@ -1738,7 +1756,7 @@ test "a predecessor-roster member that re-asserted, then left or was evicted, jo
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(3_000, 0, 100);
     const a = writerMemberId(testIdentity(1));
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{a}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{.{ .id = a, .key = 0 }}, &.{}, 0);
     defer o.deinit();
     // The re-assertion (expected, no epoch) inside the window.
     const g1 = o.join(joinReqOf(1, null, "/m1"), 100).granted;
@@ -1753,7 +1771,7 @@ test "a predecessor-roster member that re-asserted, then left or was evicted, jo
     try testing.expect(o.join(joinReqOf(1, null, "/m1"), 400 + clocks.t_owner_ms) == .granted);
     // An expected member that never re-asserted joins past the deadline: fresh.
     const b = writerMemberId(testIdentity(2));
-    var o2 = try Owner.arm(gpa, testing.io, clocks, 1, 2, 1, &.{b}, 0);
+    var o2 = try Owner.arm(gpa, testing.io, clocks, 1, 2, 1, &.{.{ .id = b, .key = 0 }}, &.{}, 0);
     defer o2.deinit();
     try testing.expect(o2.join(joinReqOf(2, null, "/m2"), clocks.grace_ms + 1) == .granted);
 }
@@ -1761,7 +1779,7 @@ test "a predecessor-roster member that re-asserted, then left or was evicted, jo
 test "OQ-5: the same (node, mount_slot) LIVE at another mount point refuses naming the other; the same mount point replaces the prior state; the census pages in join order with a cursor; the push carriage rides the next grant once" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     _ = o.join(joinReqOf(1, null, "/mnt/one"), 0).granted;
     const c = o.join(joinReqOf(1, null, "/mnt/two"), 1000).mount_slot_collision;
@@ -1869,7 +1887,7 @@ fn manualGeneration(_: ?*anyopaque) u64 {
 test "the member over the owner's wire face: join learns the clocks anchored on the send instant; the tick renews at the cadence and never between beats; the carriage's offer lands at the member and the owner's set-config generation rides every grant; a dead venue past T_self PARKS a symmetric appender (never the poison) and the reclaim beat rejoins once the successor admits it; a remote-custody lease poisons" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     manual_now_ms = 0;
     manual_generation = 3;
@@ -1912,7 +1930,7 @@ test "the member over the owner's wire face: join learns the clocks anchored on 
     // Parked beats against a dead venue keep the park.
     try testing.expectEqual(TickVerdict.parked, m.tick(t_self_at + 10_000, 2_000));
     // The successor arms at term 2 with this member expected; the reclaim lands.
-    var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{m.id}, t_self_at + 20_000);
+    var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{.{ .id = m.id, .key = 0 }}, &.{}, t_self_at + 20_000);
     defer succ.deinit();
     manual_now_ms = t_self_at + 20_000;
     var ssvc: OwnerService = .{ .owner = &succ, .now = &manualNow };
@@ -1939,7 +1957,7 @@ test "the member over the owner's wire face: join learns the clocks anchored on 
 test "UnknownLease before T_self fences terminally and never parks; a leave over a standing park is refused" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     manual_now_ms = 0;
     var osvc: OwnerService = .{ .owner = &o, .now = &manualNow };
@@ -1965,7 +1983,7 @@ test "UnknownLease before T_self fences terminally and never parks; a leave over
 test "THE RE-JOIN IN PLACE's verdict (decision 0003 §BS): a member armed to re-join answers the owner's UnknownLease `evicted` — at a renewal before T_self and at the reclaim under the park — touching neither the gate nor the words nor the poison; an expired park stays the terminal fence; unarmed, the same answers fence and poison as before" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     manual_now_ms = 0;
     var osvc: OwnerService = .{ .owner = &o, .now = &manualNow };
@@ -2013,7 +2031,7 @@ test "THE RE-JOIN IN PLACE's verdict (decision 0003 §BS): a member armed to re-
 test "T_self is the member's clock, never its beat's liveness: with the beat stalled, a committer at the pre-admission gate past the deadline PARKS the gate itself (one park, one self-fence, acks held), the committer waits, the beat's next tick runs the reclaim beat and the re-point releases it; before the first grant nothing fences; a renewal in time fences nothing" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     manual_now_ms = 0;
     var osvc: OwnerService = .{ .owner = &o, .now = &manualNow };
@@ -2068,7 +2086,7 @@ test "T_self is the member's clock, never its beat's liveness: with the beat sta
 test "THE DOUBLE PARK (the kill matrix's, 2026-10-24) at the membership core: the manager dies ⇒ PARK #1 at T_self ⇒ the successor admits the reclaim in grace and the deadline is the reclaim's (its send instant + T_self, never a stale one); renewals carry the member past the grace window; the beat silent past T_self but short of T_owner ⇒ PARK #2, and its reclaim RE-POINTS against the epoch the successor holds (granted, no refusal, no poison: idempotent against the manager's view); the beat silent past T_owner is a REAL eviction (the successor evicts at T_owner and ships the death) ⇒ PARK #3, and the reclaim's UnknownLease is HONEST: the member fences, poisoned once" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     manual_now_ms = 0;
     var osvc: OwnerService = .{ .owner = &o, .now = &manualNow };
@@ -2086,7 +2104,7 @@ test "THE DOUBLE PARK (the kill matrix's, 2026-10-24) at the membership core: th
     // The successor arms at term 2 expecting the member; the reclaim lands
     // and re-arms the deadline at its own send instant.
     const t1 = clocks.t_self_ms + 5_000;
-    var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{m.id}, t1);
+    var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{.{ .id = m.id, .key = 0 }}, &.{}, t1);
     defer succ.deinit();
     var deaths: Deaths = .{};
     defer deaths.list.deinit(gpa);
@@ -2145,7 +2163,7 @@ test "THE DOUBLE PARK (the kill matrix's, 2026-10-24) at the membership core: th
 test "the clients seam lists every member of the shard: a writer through its row's classifier (dead-pid proof applies), a reader as a live row" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     _ = o.join(joinReqOf(1, null, "/m"), 0).granted;
     var rq = joinReqOf(2, null, "/r");
@@ -2191,10 +2209,10 @@ test "a successor's grace expects no same-host predecessor whose pid is proven d
     try testing.expect(MemberRow.expectsReassertion(&foreign, local, probe));
     try testing.expect(MemberRow.expectsReassertion("torn", local, probe));
     // The roster the successor arms from: the dead row dropped.
-    var roster: std.ArrayList(MemberId) = .empty;
+    var roster: std.ArrayList(Expected) = .empty;
     defer roster.deinit(gpa);
     for ([_]struct { n: u32, bytes: []const u8 }{.{ .n = 1, .bytes = &dead }}) |r| {
-        if (MemberRow.expectsReassertion(r.bytes, local, probe)) try roster.append(gpa, writerMemberId(testIdentity(r.n)));
+        if (MemberRow.expectsReassertion(r.bytes, local, probe)) try roster.append(gpa, .{ .id = writerMemberId(testIdentity(r.n)), .key = 0 });
     }
     try testing.expectEqual(@as(usize, 0), roster.items.len);
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
@@ -2202,11 +2220,11 @@ test "a successor's grace expects no same-host predecessor whose pid is proven d
     reader.id = @splat(0x99);
     reader.role = .reader;
     reader.row = null;
-    var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, roster.items, 10_000);
+    var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, roster.items, &.{}, 10_000);
     defer succ.deinit();
     _ = succ.join(reader, 10_001).granted;
     // The roster that expected the dead row: the same reader is refused.
-    var stale = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{writerMemberId(testIdentity(1))}, 10_000);
+    var stale = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{.{ .id = writerMemberId(testIdentity(1)), .key = 0 }}, &.{}, 10_000);
     defer stale.deinit();
     try testing.expect(stale.join(reader, 10_001) == .grace_refused);
 }
@@ -2229,7 +2247,7 @@ test "fuzz: the member row decoder is total on arbitrary and restamped claims; a
 test "the census's writer keys (decision 0003 §DL): every listed writer's host key once — distinct, never 0, never a reader's; a departure and an eviction take theirs out; a successor's census is incomplete while its re-assertion window stands (a predecessor's member not back is listed nowhere)" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     _ = o.join(joinReqOf(1, null, "/m1"), 0).granted;
     _ = o.join(joinReqOf(2, null, "/m2"), 0).granted;
@@ -2256,7 +2274,7 @@ test "the census's writer keys (decision 0003 §DL): every listed writer's host 
     }
     // A successor with a predecessor's roster: incomplete until the
     // re-assertion window closes.
-    var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{writerMemberId(testIdentity(1))}, 1000);
+    var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{.{ .id = writerMemberId(testIdentity(1)), .key = 0 }}, &.{}, 1000);
     defer succ.deinit();
     try testing.expectError(error.Incomplete, succ.writerKeys(gpa, 1000));
     const keys = try succ.writerKeys(gpa, 1000 + clocks.grace_ms);
@@ -2316,7 +2334,7 @@ test "a renewal is never lost to a join's append (decision 0003 §DM): a renew p
     defer testing.expect(dbg.deinit() == .ok) catch unreachable;
     const gpa = dbg.allocator();
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     var deaths: Deaths = .{};
     defer deaths.list.deinit(testing.allocator);
@@ -2346,7 +2364,7 @@ test "a renewal is never lost to a join's append (decision 0003 §DM): a renew p
 test "an eviction and the renewal it races are one order (decision 0003 §DM): expireDue parked between judging a member due and evicting it while that member's renewal (its clock read just inside the deadline) arrives — either the renewal lands first and nothing is evicted, or the eviction does and the renewal answers UnknownLease; never a granted renewal AND an eviction (a live member's death shipped)" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     var deaths: Deaths = .{};
     defer deaths.list.deinit(gpa);
@@ -2431,7 +2449,7 @@ const Churn = struct {
             // Release pairs with the participants' acquire loads.
             self.now.store(now, .release);
             _ = self.owner.expireDue(now);
-            _ = self.owner.reapGraceDeadline(now, &rosterKey);
+            _ = self.owner.reapGraceDeadline(now);
         }
         self.stop.store(true, .release);
     }
@@ -2546,7 +2564,7 @@ const Churn = struct {
 test "the owner under churn (decision 0003 §DM): steady and flaky members renewing, members joining and leaving, offers pushed and drained, every reader face, and the cadence's evictions on their own threads — no eviction of a member whose latest grant (join or renewal) is younger than T_owner at the eviction's clock, no steady member ever evicted, every flaky member's lease run out" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(3_000, 0, 100);
-    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     var c: Churn = .{ .owner = &o };
     defer {

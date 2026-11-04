@@ -12,7 +12,10 @@
 //! `Live` entries attest nothing at the bring-up's settle), the writer
 //! bring-up (the set opened through the writer door exactly as `mount`
 //! opens it), the EARLY death record on volume 0's control tree + barrier
-//! + `checkpoint_now`, the clean leave (the close). Linux only.
+//! + `checkpoint_now`, the clean leave (the close). The record is keyless,
+//! so the recovery fences with the page's host key (decision 0004 §4.8):
+//! the cleared page's host is fenced, and every live mount of the set on
+//! it with it — each fail-stops (decision 0004 Q4). Linux only.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -357,7 +360,7 @@ fn clearMain(c: *ClearCtx) u8 {
             return cli.exit_failed;
         },
         .cleared => |cl| {
-            p.stdout.print("appender {d} cleared (was {s}): its page attests nothing, the death record stands on volume 0 — the next ledger poll recovers its slots\n", .{ c.appender_id, @tagName(cl.was) }) catch {};
+            p.stdout.print("appender {d} cleared (was {s}): its page attests nothing, the death record stands on volume 0 — the next ledger poll recovers its slots and fences the page's host with its registration key (every live mount of this set on that host is fenced with it and fail-stops)\n", .{ c.appender_id, @tagName(cl.was) }) catch {};
             p.stdout.flush() catch {};
             return cli.exit_ok;
         },

@@ -772,6 +772,10 @@ pub const WirePlane = struct {
         // peers' dialled links.
         self.holder = tokens.table.Holder.init(gpa, io, identity.writer_id, self.oracle.oracle(), TOKEN_OBJECTS_CAP, listener.deriveMaxConnections(raw_cpus, listener.raiseNofile())) catch return error.OutOfMemory;
         errdefer self.holder.deinit();
+        // The owner's death sink, before the listener serves: the arm's
+        // same-host proven-dead pages ship through it here, once (decision
+        // 0004 §4.6) — recovered without waiting out the grace.
+        if (self.mgr) |m| m.owner.bindDeathSink(m.death_fanout.sink());
         // The recall-hold FIFO is the daemon's seam (the contracts' seams
         // in `Seams` stay the in-process rigs').
         self.holder.seams.recall_hold_fifo = knobs.parseStr(env.get("SQUEEZEFS_TEST_TOKEN_RECALL_HOLD"));
@@ -866,16 +870,20 @@ pub const WirePlane = struct {
             .death_fanout = undefined,
         };
         self.mgr = m;
-        // The owner shard at the manager's term, the predecessor's roster
-        // as the grace window's expectation.
-        var expected: std.ArrayList(shard.MemberId) = .empty;
+        // The owner shard at the manager's term, the merged set (the
+        // predecessor's rows ∪ the Live pages) as the grace window's
+        // expectation; the same-host proven-dead pages shipped once the
+        // death sink is bound.
+        var expected: std.ArrayList(shard.Expected) = .empty;
         defer expected.deinit(gpa);
-        self.priorRoster(&expected) catch |e| return switch (e) {
+        var pre_dead: std.ArrayList(shard.Expected) = .empty;
+        defer pre_dead.deinit(gpa);
+        self.priorRoster(&expected, &pre_dead) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Io,
         };
         const term = sym0.manager.term;
-        m.owner = shard.Owner.arm(gpa, self.io, clocks, 0, term, term -| 1, expected.items, nowMs()) catch |e| switch (e) {
+        m.owner = shard.Owner.arm(gpa, self.io, clocks, 0, term, term -| 1, expected.items, pre_dead.items, nowMs()) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             // `term ≤ prior` cannot happen: prior is `term − 1` by construction.
             error.StaleTerm => unreachable,
@@ -884,8 +892,9 @@ pub const WirePlane = struct {
         m.owner.bindRows(m.rows.store());
         m.ledger = death_ledger.Ledger.init(gpa, m.ledger_store.store(), @intCast(set.volumes.len), identity, t_owner_ms);
         errdefer m.ledger.deinit();
+        // Bound in `start` once the token holder exists: the fan-out's
+        // first act is the holder's sweep.
         m.death_fanout = .{ .plane = self, .ledger = m.ledger.deathSink() };
-        m.owner.bindDeathSink(m.death_fanout.sink());
         m.owner_svc = .{ .owner = &m.owner, .now = &nowMsFn, .generation = .{ .ctx = null, .read = &configGenerationFn } };
         m.ledger_handlers = .{ .ledger = &m.ledger, .census = &m.owner, .now = &nowMsFn, .is_vol0_manager = &isVol0ManagerFn, .now_ctx = self };
         // The recovery driver bound over every managed volume: the poll's
@@ -1910,7 +1919,7 @@ pub const WirePlane = struct {
         const m = self.mgr orelse return;
         const now = nowMs();
         const evicted = m.owner.expireDue(now);
-        const reaped = m.owner.reapGraceDeadline(now, &rosterKey);
+        const reaped = m.owner.reapGraceDeadline(now);
         const rep = m.projection.run(now, @intCast(clock.realtimeCoarseNs()));
         if (evicted != 0 or reaped != 0 or rep.deaths != 0 or rep.released != 0 or rep.retired != 0) {
             log.info("cluster wire: tick — {d} evicted at T_owner, {d} reaped at the grace deadline; ledger: {d} death record(s) standing, {d} acted, {d} region(s) released, {d} retired, {d} parked record(s) drained", .{ evicted, reaped, rep.deaths, rep.acted, rep.released, rep.retired, rep.drained });
@@ -1972,22 +1981,89 @@ pub const WirePlane = struct {
         }
     }
 
-    /// The predecessor's writer roster: every `member:` row of volume 0's
-    /// tree 0 (a `-o ro` reader is in no claim set, so never expected).
-    fn priorRoster(self: *WirePlane, out: *std.ArrayList(shard.MemberId)) backend.Error!void {
+    /// The successor's merged expectation (decision 0004 §4.6, KD17): every
+    /// `member:` row of volume 0's tree 0 (a `-o ro` reader is in no claim
+    /// set, so never expected) ∪ every Live directory page the open's census
+    /// found on every managed volume, each keyed by its page's host key (a
+    /// row with no page: 0, no region). A row lost with its manager is
+    /// expected — and reaped with its key — by its page alone. A same-host
+    /// page whose writer the §DA writer-id proof shows dead goes to
+    /// `pre_dead` instead; a page this process writes (an in-process region)
+    /// and one whose death record stands (its recovery is the ledger's) add
+    /// nothing.
+    fn priorRoster(self: *WirePlane, expected: *std.ArrayList(shard.Expected), pre_dead: *std.ArrayList(shard.Expected)) backend.Error!void {
+        const gpa = self.gpa;
+        const proc = @import("../guard/proc.zig");
         const r = cr.rangeOf(.member);
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
-        defer tree.deinitKeyValues(self.gpa, &kvs);
-        try self.set.volumes[0].range(self.gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), std.math.maxInt(usize), &kvs);
-        const local = @import("../guard/proc.zig").localIdentity();
+        defer tree.deinitKeyValues(gpa, &kvs);
+        const be0 = self.set.volumes[0];
+        try be0.range(gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), std.math.maxInt(usize), &kvs);
+        const local = proc.localIdentity();
         for (kvs.items) |kv| {
             const id = cr.identityOfKey(kv.key) orelse continue;
-            if (!shard.MemberRow.expectsReassertion(kv.value, local, @import("../guard/proc.zig").probe)) {
+            if (!shard.MemberRow.expectsReassertion(kv.value, local, proc.probe)) {
                 shard.stats.membership_grace_dead_rows.inc();
                 continue;
             }
-            try out.append(self.gpa, shard.writerMemberId(.{ .node_token = id.node_token, .writer_id = 0, .mount_slot = id.mount_slot, .reserved = 0 }));
+            try mergeExpected(gpa, expected, memberIdOfStable(id), 0);
         }
+        // The same-host proof needs this host's words: a boot id and its own
+        // start ticks (`/proc` readable), else no page is judged here.
+        const node: ?u64 = if (local.bootIdReadable() and local.start_ticks != 0) @import("join.zig").nodeToken(local) else null;
+        for (self.set.volumes) |be| {
+            const s = be.sym orelse continue;
+            for (s.live_pages.items) |lp| {
+                const stable: cr.StableIdentity = .{ .node_token = lp.identity.node_token, .mount_slot = lp.identity.mount_slot };
+                const id = memberIdOfStable(stable);
+                const proof: proc.WriterProof = if (node == lp.identity.node_token) proc.proveWriter(self.io, local, @truncate(lp.identity.mount_slot), lp.identity.writer_id) else .unknown;
+                switch (proof) {
+                    .alive => |pid| if (pid == local.pid) continue,
+                    .dead => {
+                        dropExpected(expected, id);
+                        if (try deathStands(be0, gpa, stable)) continue;
+                        if (indexOfExpected(pre_dead.items, id) == null) {
+                            try pre_dead.append(gpa, .{ .id = id, .key = lp.host_key });
+                            log.warn("cluster wire: appender {d} on volume {d} (node 0x{x}, mount slot 0x{x}) is Live under a writer of THIS host proven dead (the §DA writer-id proof) — its death is recorded before the listener serves, for its recovery", .{ lp.appender_id, be.index, stable.node_token, stable.mount_slot });
+                        }
+                        continue;
+                    },
+                    .unknown => {},
+                }
+                if (try deathStands(be0, gpa, stable)) continue;
+                try mergeExpected(gpa, expected, id, lp.host_key);
+            }
+        }
+    }
+
+    fn memberIdOfStable(id: cr.StableIdentity) shard.MemberId {
+        return shard.writerMemberId(.{ .node_token = id.node_token, .writer_id = 0, .mount_slot = id.mount_slot, .reserved = 0 });
+    }
+
+    fn indexOfExpected(set: []const shard.Expected, id: shard.MemberId) ?usize {
+        for (set, 0..) |e, i| if (std.mem.eql(u8, &e.id, &id)) return i;
+        return null;
+    }
+
+    /// One entry per identity: a page's key fills a row's 0 (a joiner of
+    /// several volumes carries one host key on every page).
+    fn mergeExpected(gpa: Allocator, set: *std.ArrayList(shard.Expected), id: shard.MemberId, k: u64) Allocator.Error!void {
+        if (indexOfExpected(set.items, id)) |i| {
+            if (set.items[i].key == 0) set.items[i].key = k;
+            return;
+        }
+        try set.append(gpa, .{ .id = id, .key = k });
+    }
+
+    fn dropExpected(set: *std.ArrayList(shard.Expected), id: shard.MemberId) void {
+        if (indexOfExpected(set.items, id)) |i| _ = set.orderedRemove(i);
+    }
+
+    /// A death record stands for the identity on volume 0's tree 0.
+    fn deathStands(be0: *KvBackend, gpa: Allocator, id: cr.StableIdentity) backend.Error!bool {
+        const v = (try be0.lookup(gpa, key.TREE_CONTROL, cr.deadMemberKey(id).slice())) orelse return false;
+        gpa.free(v);
+        return true;
     }
 
     // ---- tree-0 writes: ONE control entry through the manager's volume seam ----
@@ -2040,12 +2116,6 @@ pub const WirePlane = struct {
         if (!isVol0ManagerFn(self)) return;
         const id: death_ledger.WriterIdentity = .{ .node_token = identity.node_token, .mount_slot = identity.mount_slot, .writer_id = identity.writer_id };
         if (try m.ledger.retireJoiner(id, m.projection.volumes)) log.warn("cluster wire: JoinAppender by node 0x{x} / mount slot {d} RETIRED the identity's standing death record — the join is its newer incarnation (the predecessor's regions are the recovery's)", .{ identity.node_token, identity.mount_slot });
-    }
-
-    /// The registrant key of a roster member (a file substrate holds no
-    /// PR key: 0).
-    fn rosterKey(_: shard.MemberId) u64 {
-        return 0;
     }
 };
 

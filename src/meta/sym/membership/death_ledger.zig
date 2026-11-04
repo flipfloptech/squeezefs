@@ -652,7 +652,7 @@ test "the screen: own identity, a live member, a key the census holds on another
     var l = Ledger.init(gpa, rs.store(), 2, wireOf(wid(0)), 45_000);
     defer l.deinit();
     const clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
-    var o = try shard.Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try shard.Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     _ = o.join(.{ .id = shard.writerMemberId(wireOf(wid(3))), .role = .writer, .endpoint = .none, .pid = 1, .boot = @splat(0), .prior_epoch = null, .pr_key = 0x33, .mount = "/m", .row = null }, 0).granted;
     const req = struct {
@@ -695,7 +695,7 @@ test "the screen reads one roster (decision 0003 §DM): a held-key scan parked m
     var l = Ledger.init(gpa, rs.store(), 2, wireOf(wid(0)), 45_000);
     defer l.deinit();
     const clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
-    var o = try shard.Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try shard.Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     const member = struct {
         fn of(n: u32, key: u64) shard.JoinRequest {
@@ -729,7 +729,7 @@ test "an evicted member's key stays held through an allocation failure: the depa
     var l = Ledger.init(failing.allocator(), rs.store(), 2, wireOf(wid(0)), 45_000);
     defer l.deinit();
     const clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
-    var o = try shard.Owner.arm(failing.allocator(), testing.io, clocks, 0, 1, 0, &.{}, 0);
+    var o = try shard.Owner.arm(failing.allocator(), testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     _ = o.join(.{ .id = shard.writerMemberId(wireOf(wid(3))), .role = .writer, .endpoint = .none, .pid = 1, .boot = @splat(0), .prior_epoch = null, .pr_key = 0x33, .mount = "/m", .row = null }, 0).granted;
     failing.fail_index = failing.alloc_index;

@@ -93,6 +93,12 @@ pub const stats = struct {
     /// A preempt the target answered with success yet kept the key (nvmet
     /// 7.3's holder preempt): the dead host NOT fenced, the tail scan.
     pub var appender_recovery_preempts_ignored: counters.ShardedCounter = .{};
+    /// A death whose record carried no key fenced with the dead appender
+    /// page's host key (decision 0004 §4.8, KD8: a grace-reaped member).
+    pub var appender_recovery_key_from_page: counters.ShardedCounter = .{};
+    /// A death record's key and the dead page's host key both non-zero and
+    /// different: the recovery holds (must stay 0).
+    pub var appender_recovery_key_mismatch: counters.Tripwire = .init("appender_recovery_key_mismatch");
     /// The per-volume era in force.
     pub var writer_term: counters.Gauge = .{};
     /// Slots whose lessee's page is `Recovering` (rule 4 suspended).
@@ -232,6 +238,34 @@ pub fn adoptColocated(client: *pr.Client, enrolled: []const u64) JoinError!u64 {
         return k;
     };
     return error.HolderNotEnrolled;
+}
+
+/// The death fence's victim key (decision 0004 §4.8, KD8): the death
+/// record's when it carries one, else the dead appender page's host key —
+/// a member reaped at a successor's grace deadline is shipped with its
+/// page's key, but a record written before the page carried one (a layout-1
+/// page, an operator's `appender clear`) names 0.
+pub const DeathKey = union(enum) {
+    record: u64,
+    page: u64,
+    /// Both non-zero and different: the recovery holds.
+    mismatch,
+    /// Neither names a key: the tail scan is the fence.
+    none,
+
+    /// The key the fences take (0 = none); null on a mismatch.
+    pub fn victim(self: DeathKey) ?u64 {
+        return switch (self) {
+            .record, .page => |k| k,
+            .none => 0,
+            .mismatch => null,
+        };
+    }
+};
+
+pub fn deathKey(record_key: u64, page_key: u64) DeathKey {
+    if (record_key != 0) return if (page_key == 0 or page_key == record_key) .{ .record = record_key } else .mismatch;
+    return if (page_key != 0) .{ .page = page_key } else .none;
 }
 
 pub const PreemptOutcome = enum {

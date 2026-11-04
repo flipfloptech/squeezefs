@@ -512,6 +512,7 @@ pub const JoinedSet = struct {
                 .volume_base = node_seq.nodeSeqBase(be.sb.uuid),
                 .grain = be.dev.mode.grain(),
                 .ring0_head = be.mounted.journal_tail_seq,
+                .host_key = if (self.fence) |f| f.client.key else 0,
             }) catch |e| {
                 if (e == error.Deferred and clock.monotonicNs() < join_deadline) {
                     if (join_deferrals % LIVE_RECHECK_DEFERRALS == 0) {

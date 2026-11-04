@@ -289,7 +289,7 @@ test "four in-process daemons exchange every verb family's shape over the hub: e
     const me = identityOf(0);
     var c = &conns[0][1].?;
     // Manager region + slots.
-    const j = try c.call(.{ .join_appender = .{ .volume = 0, .reserved = 0, .reserved2 = 0, .identity = me, .ring_want_bytes = 0 } });
+    const j = try c.call(.{ .join_appender = .{ .volume = 0, .reserved = 0, .reserved2 = 0, .identity = me, .ring_want_bytes = 0, .host_key = 0 } });
     try testing.expectEqual(@as(u32, 101), j.join_appender.head.appender_id);
     const rs = try c.call(.{ .resolve_slot = .{ .volume = 0, .slot = 17, .reserved = 0 } });
     try testing.expectEqual(@as(u32, 17), rs.resolve_slot.g);

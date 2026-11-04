@@ -408,7 +408,15 @@ pub const JoinAppenderReq = extern struct {
     identity: WireIdentity,
     /// 0 = derived; else clamped to [floor, ceiling] by the manager.
     ring_want_bytes: u64,
+    /// The joiner's host registration key for its appender page (decision
+    /// 0004 §6.1, KD18; 0 = no device fence): appended, the reserved words
+    /// being 6 B. The manager verifies it against the volume's report.
+    host_key: u64,
 };
+
+comptime {
+    std.debug.assert(codec.wireSize(JoinAppenderReq) == 48);
+}
 
 pub const JoinedHead = extern struct {
     appender_id: u32,
@@ -2090,7 +2098,7 @@ fn roundTrip(comptime P: type, v: P) !P {
 const sample_identity: WireIdentity = .{ .node_token = 0xDEAD, .writer_id = 0xBEEF, .mount_slot = 3, .reserved = 0 };
 
 test "manager payloads round-trip canonically: region, slots, rename, clone, alloc, death" {
-    _ = try roundTrip(JoinAppenderReq, .{ .volume = 1, .reserved = 0, .reserved2 = 0, .identity = sample_identity, .ring_want_bytes = 0 });
+    _ = try roundTrip(JoinAppenderReq, .{ .volume = 1, .reserved = 0, .reserved2 = 0, .identity = sample_identity, .ring_want_bytes = 0, .host_key = 0 });
     const segs = [_]RunWire{ .{ .start = 4096, .len = 1 << 20 }, .{ .start = 1 << 30, .len = 4096 } };
     const grant = [_]GrantRunWire{.{ .start = 10, .len = 8, .reserved = 0 }};
     const j = try roundTrip(Joined, .{ .head = .{ .appender_id = 7, .already = 1, .n_segments = 2, .n_grant = 1, .reserved = 0, .page_addr = 8192, .node_seq_base = 1 << 38, .ring_bytes = 1 << 20 }, .segments = &segs, .grant = &grant });

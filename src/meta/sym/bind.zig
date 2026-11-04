@@ -55,6 +55,7 @@ const join = @import("join.zig");
 const cr = @import("control_records.zig");
 const slots = @import("slots.zig");
 const slots_plane = @import("slots/plane.zig");
+const host_fence = @import("../guard/host_fence.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("sym/bind is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -92,6 +93,10 @@ pub const Region = struct {
     }
 };
 
+/// A Live directory page found at open (an appender ≥ 1; the manager's own
+/// page is appender 0's, outside the directory).
+pub const LivePage = struct { appender_id: u32, identity: page.Identity, host_key: u64 };
+
 pub const AppenderSet = struct {
     gpa: Allocator,
     be: *KvBackend,
@@ -104,6 +109,9 @@ pub const AppenderSet = struct {
     /// Live pages of OTHER appenders found at open: unrecovered (their
     /// rings are the recovery wave's; their slots are refused).
     unrecovered: std.ArrayList(u32) = .empty,
+    /// The same pages' identities and host keys: the successor's expected
+    /// set reads them (decision 0004 §4.6, KD17).
+    live_pages: std.ArrayList(LivePage) = .empty,
     /// Appender 0's identity as its page carried it when THIS open read
     /// it — the predecessor manager the D0 ladder was won over (null: a
     /// blank page, the first manager ever). The allocation leases'
@@ -136,6 +144,7 @@ pub const AppenderSet = struct {
         @memset(self.zeros, 0);
         self.manager = manager.Manager.init(gpa, be.io, self.volume());
         errdefer self.manager.deinit();
+        if (g.prClient() != null) self.manager.key_check = .{ .ctx = self, .verify = &verifyJoinKeyFn };
         try self.census();
         try self.joinRegion0();
         // The slot-lease plane: region 0 is ours; the arm leases the native
@@ -156,6 +165,7 @@ pub const AppenderSet = struct {
         for (self.regions.items) |r| self.destroyRegion(r);
         self.regions.deinit(self.gpa);
         self.unrecovered.deinit(self.gpa);
+        self.live_pages.deinit(self.gpa);
         self.manager.deinit();
         self.gpa.free(self.zeros);
         sym.stats.symmetric_meta.sub(1);
@@ -204,6 +214,7 @@ pub const AppenderSet = struct {
                 rings_in_use += p.ringBytes();
                 sym.stats.appender_live_pages_at_mount.inc();
                 try self.unrecovered.append(self.gpa, p.appender_id);
+                try self.live_pages.append(self.gpa, .{ .appender_id = p.appender_id, .identity = p.identity, .host_key = p.host_key });
                 log.warn("meta volume {s}: appender {d} (node 0x{x}, mount slot {d}, term {d}) is LIVE on the directory with its ring unrecovered — its slots are refused until the recovery ladder recovers it", .{ be.path, p.appender_id, p.identity.node_token, p.identity.mount_slot, p.term });
             }
         }
@@ -263,6 +274,8 @@ pub const AppenderSet = struct {
         words.identity = self.identity;
         words.is_manager = true;
         words.home_volume = be.stamp.member_position;
+        // The successor's predecessor key (decision 0004 §6.1, KD8).
+        words.host_key = self.hostKey();
         words.segments = page.SegmentTable.one(.{ .start = be.sb.journal.start, .len = be.sb.journal.len });
         words.head_hint = be.core.headPos();
         words.ledger_tail_seq = be.mounted.journal_tail_seq;
@@ -372,6 +385,7 @@ pub const AppenderSet = struct {
             .volume_base = node_seq.nodeSeqBase(be.sb.uuid),
             .grain = be.dev.mode.grain(),
             .ring0_head = be.core.headPos(),
+            .host_key = self.hostKey(),
         }) catch |e| return switch (e) {
             error.Capacity => error.Capacity,
             error.Rejected => error.Rejected,
@@ -502,6 +516,41 @@ pub const AppenderSet = struct {
             const r = self.regions.items[self.regions.items.len - 1];
             const id = r.appenderId();
             self.leaveInProcess(r) catch |e| log.err("meta volume {s}: appender {d} could not leave cleanly ({s}) — its page stays Live for the next open's recovery", .{ self.be.path, id, @errorName(e) });
+        }
+    }
+
+    /// This mount's host registration key on the volume (0 = no PR
+    /// posture): region 0's page and its in-process regions carry it.
+    pub fn hostKey(self: *const AppenderSet) u64 {
+        const g = self.be.guard orelse return 0;
+        const c = g.prClient() orelse return 0;
+        return c.key;
+    }
+
+    /// `manager.JoinKeyCheck` over the guard's client (decision 0004 §6.1,
+    /// KD18): one report under the client's sequence lock. Keys are
+    /// `hostKey(wire host id, set)` when the host's registry stands; under
+    /// incarnation keys (the per-mount seam, no wire host id) a registrant
+    /// holding the key suffices.
+    fn verifyJoinKeyFn(ctx: *anyopaque, claimed: u64) manager.JoinKeyVerdict {
+        const self: *AppenderSet = @ptrCast(@alignCast(ctx));
+        const g = self.be.guard orelse return .unreadable;
+        const c = g.prClient() orelse return .unreadable;
+        c.lockOps();
+        defer c.unlockOps();
+        var rep = c.report() catch return .unreadable;
+        defer rep.deinit(c.gpa);
+        const verdict = host_fence.joinKeyVerdict(rep, claimed, self.be.sb.set_uuid, g.fence_reg != null);
+        switch (verdict) {
+            .ok => return .ok,
+            .absent => {
+                log.warn("meta volume {s}: no registrant holds the claimed join key {x:0>16} ({d} registrant(s))", .{ self.be.path, claimed, rep.registrants.len });
+                return .absent;
+            },
+            .mismatch => {
+                for (rep.registrants) |r| if (r.rkey == claimed) log.warn("meta volume {s}: the claimed join key {x:0>16} is held by host id {x} — not the host it derives from", .{ self.be.path, claimed, r.host_id[0..] });
+                return .mismatch;
+            },
         }
     }
 

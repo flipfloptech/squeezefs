@@ -239,7 +239,7 @@ test "the service law: unknown verb, foreign schema, malformed payload, an unreg
     try testing.expectEqual(Status.malformed, svc.serve(h, req_bytes[0..3], null, 1, &reply, &scratch).status);
     var payload2: [64]u8 = undefined;
     var jb: codec.Builder = .init(&payload2);
-    try verbs.encodeRequest(.{ .join_appender = .{ .volume = 0, .reserved = 0, .reserved2 = 0, .identity = .zero, .ring_want_bytes = 0 } }, &jb);
+    try verbs.encodeRequest(.{ .join_appender = .{ .volume = 0, .reserved = 0, .reserved2 = 0, .identity = .zero, .ring_want_bytes = 0, .host_key = 0 } }, &jb);
     try testing.expectEqual(Status.not_manager, svc.serve(callHeader(.join_appender), jb.written(), null, 1, &reply, &scratch).status);
     var payload3: [64]u8 = undefined;
     var tb: codec.Builder = .init(&payload3);

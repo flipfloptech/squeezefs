@@ -111,12 +111,16 @@ pub const JoinInputs = struct {
     resume_page: ?page.Page = null,
     /// Ring 0's head as the seq continuation's other term.
     ring0_head: u64,
+    /// This host's registration key (0 = no device fence): claimed at the
+    /// join, verified by the manager, kept by every page write of the
+    /// region (decision 0004 §6.1, KD18).
+    host_key: u64 = 0,
 };
 
 /// The ladder. Every refusal is typed; the capacity refusal's message is
 /// `writeCapacityRefusal`'s.
 pub fn join(gpa: Allocator, door: Door, in: JoinInputs) JoinError!JoinedRegion {
-    const reply = door.join(door.ctx, .{ .identity = in.identity, .ring_want_bytes = in.ring_want_bytes, .home_volume = in.home_volume }) catch |e| return switch (e) {
+    const reply = door.join(door.ctx, .{ .identity = in.identity, .ring_want_bytes = in.ring_want_bytes, .home_volume = in.home_volume, .host_key = in.host_key }) catch |e| return switch (e) {
         error.Capacity => blk: {
             stats.joined_capacity_refusals.inc();
             break :blk error.Capacity;
@@ -155,6 +159,7 @@ pub fn join(gpa: Allocator, door: Door, in: JoinInputs) JoinError!JoinedRegion {
     words.generation = @max(words.generation, reply.generation);
     words.state = .live;
     words.identity = in.identity;
+    words.host_key = in.host_key;
     words.segments = reply.ring_segments;
     if (in.resume_page == null) {
         const cont = region.seqContinuation(reply.head_hint, in.ring0_head);

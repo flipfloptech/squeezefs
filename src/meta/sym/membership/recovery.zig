@@ -384,6 +384,9 @@ const SlotPlan = struct {
     recorded: bool = false,
 };
 
+/// The key-mismatch hold's log budget: one line a second (every poll holds).
+var mismatch_last_log_s: std.atomic.Value(u64) = .init(0);
+
 pub const Driver = struct {
     gpa: Allocator,
     vol: Volume,
@@ -538,10 +541,25 @@ pub const Driver = struct {
             self.mount.ledger.retireForJoin(death.identity) catch return error.Io;
             return .skipped;
         };
+        // The fences' key: the record's, else the dead page's (decision 0004
+        // §4.8, KD8 — a member reaped at a successor's grace carries its
+        // page's key; a record that names none falls back to it). Two keys
+        // that differ hold the recovery: which host to fence is unknown. Both
+        // are durable, so every poll holds alike until an operator's
+        // `appender clear` rewrites the record keyless (each held poll is
+        // the tripwire's count).
+        const key_word = fencing.deathKey(standing.pr_key, p.host_key);
+        const victim_key = key_word.victim() orelse {
+            const now_s = clock.realtimeCoarseS();
+            if (mismatch_last_log_s.swap(now_s, .monotonic) != now_s) log.warn("recovery: appender {d} (node 0x{x} mount slot {d}) on volume {d}: its death record names key {x:0>16} but its page names {x:0>16} — the recovery HOLDS, nothing fenced or released, at every poll: unmount the set and run `squeezefs appender clear <sqmeta uri> {d}` from a host other than the page's — it rewrites the record keyless, and the page's key then decides (one line a second at most)", .{ p.appender_id, p.identity.node_token, p.identity.mount_slot, vol_ordinal, standing.pr_key, p.host_key, p.appender_id });
+            fencing.stats.appender_recovery_key_mismatch.fire("a death record's key and the dead appender page's host key differ");
+            return .failed;
+        };
+        if (key_word == .page) fencing.stats.appender_recovery_key_from_page.inc();
         try self.fail(.decide);
         // ---- 1. preempt ----
         const t_preempt = clock.monotonicNs();
-        const meta = fencing.preemptDeadRegistrant(self.mount.meta_pr, self.mount.fencer, standing.pr_key);
+        const meta = fencing.preemptDeadRegistrant(self.mount.meta_pr, self.mount.fencer, victim_key);
         const pr_fenced = meta == .fenced;
         phase(.preempt, t_preempt);
         try self.fail(.preempt);
@@ -559,7 +577,7 @@ pub const Driver = struct {
         //      no-op on nvmet 7.3, decision 0003 §DF.12; through the fencer
         //      it lands there too, §DG) ----
         var fenced = pr_fenced;
-        if (meta != .own_key_guard and meta != .ignored) if (fencing.refenceAfterRecovering(self.mount.meta_pr, self.mount.fencer, standing.pr_key)) |again| {
+        if (meta != .own_key_guard and meta != .ignored) if (fencing.refenceAfterRecovering(self.mount.meta_pr, self.mount.fencer, victim_key)) |again| {
             fenced = again == .fenced;
         };
         try self.mount.screen.suspendLessee(p.appender_id);
@@ -574,7 +592,7 @@ pub const Driver = struct {
         //      rule judges it stale. Unproven, the recovery holds (the page
         //      stays Recovering, the next poll re-runs): data carries no
         //      frame screen to fall back on ----
-        if (self.mount.data_fence) |df| switch (df.fence(df.ctx, self.mount.meta_pr, standing.pr_key)) {
+        if (self.mount.data_fence) |df| switch (df.fence(df.ctx, self.mount.meta_pr, victim_key)) {
             .fenced, .no_device, .no_key => {},
             .own_key_guard => if (df.killColocated(df.ctx, vol_ordinal, &p)) {
                 fencing.stats.data_pr_colocated_kills.inc();
@@ -1855,7 +1873,7 @@ test "an EARLY record quarantines the recovered slots' custody for T_owner + 2 �
     const f2 = try Fixture.init(gpa, false);
     defer f2.deinit();
     const clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
-    var o = try shard.Owner.arm(gpa, testing.io, clocks, 1, 1, 0, &.{}, 0);
+    var o = try shard.Owner.arm(gpa, testing.io, clocks, 1, 1, 0, &.{}, &.{}, 0);
     defer o.deinit();
     _ = o.join(.{ .id = shard.writerMemberId(death_ledger.wireOf(DEAD)), .role = .writer, .endpoint = .none, .pid = 1, .boot = @splat(0), .prior_epoch = null, .pr_key = 0, .mount = "/m", .row = null }, 0).granted;
     f2.driver.mount.census = &o;
@@ -2187,7 +2205,7 @@ test "a death whose record carries no key is fenced with the dead appender page'
     try testing.expectEqual(data0 + 1, fencing.stats.data_pr_preempts.load());
 }
 
-test "a death record's key and the dead page's host key that DIFFER hold the recovery (decision 0004 §4.8): the tripwire appender_recovery_key_mismatch, nothing preempted, the page left Live for the next poll" {
+test "a death record's key and the dead page's host key that DIFFER hold the recovery (decision 0004 §4.8): the tripwire appender_recovery_key_mismatch at every poll, nothing preempted, the page left Live — until `appender clear` rewrites the record keyless (the PR-3 review's minor 2): then the page's key decides and both namespaces fence it" {
     const gpa = testing.allocator;
     const f = try Fixture.initKeyed(gpa, false, 0x3333);
     defer f.deinit();
@@ -2204,6 +2222,24 @@ test "a death record's key and the dead page's host key that DIFFER hold the rec
     try testing.expectEqual(mismatches0 + 1, fencing.stats.appender_recovery_key_mismatch.load());
     try testing.expectEqual(page.State.live, f.rv.pages.get(2).?.state);
     try testing.expect(!dev.remoteFenced());
+    // Both keys are durable: the next poll holds alike.
+    fencing.stats.appender_recovery_key_mismatch.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(Outcome.failed, f.driver.recoverDead(f.death()));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(mismatches0 + 2, fencing.stats.appender_recovery_key_mismatch.load());
+    try testing.expectEqual(page.State.live, f.rv.pages.get(2).?.state);
+    // `appender clear`'s record (`cli/appenders.zig` recordEarlyDeath): keyless, early.
+    const rec = cr.DeadMemberWire.init(.{ .epoch = 0, .ts_realtime_ns = 2_000 * std.time.ns_per_ms, .pr_key = 0, .early = true }).encode();
+    const cs = f.ledger.store.control;
+    try cs.vtable.put(cs.ctx, cr.deadMemberKey(DEAD.stable()).slice(), &rec, .parking);
+    const from_page0 = fencing.stats.appender_recovery_key_from_page.load();
+    try testing.expectEqual(Outcome.acted, f.driver.recoverDead(f.death()));
+    try testing.expectEqual(page.State.recovered, f.rv.pages.get(2).?.state);
+    try testing.expect(try f.ledger.isRecovered(DEAD, 1));
+    try testing.expect(dev.remoteFenced());
+    try testing.expectEqual(from_page0 + 1, fencing.stats.appender_recovery_key_from_page.load());
+    try testing.expectEqual(mismatches0 + 2, fencing.stats.appender_recovery_key_mismatch.load());
 }
 
 /// The data fence over a fixture's clients (no co-located kill).

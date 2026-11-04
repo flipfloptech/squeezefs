@@ -89,6 +89,33 @@ pub fn hostKey(wire_host_id: []const u8, set_uuid: [16]u8) u64 {
     return if (k == 0) 1 else k;
 }
 
+/// A joiner's claimed page key read against the joined volume's report
+/// (decision 0004 §6.1, KD18).
+pub const JoinKeyVerdict = enum { ok, absent, mismatch };
+
+/// `host_keyed` (the host's registry stands): ok iff a registrant holds
+/// `claimed` under a host id `claimed` derives from — `hostKey(host id,
+/// set)` —, so a page key is the key of a host the device reports
+/// registered: a stale key (a host fenced since), another set's, or one
+/// registered only under ids it does not derive from never passes. It is
+/// SOME registered host's key, not provably the joiner's: the manager sees
+/// neither the joiner's controller nor its NVMe host id, so a joiner that
+/// claims another live host's key passes (decision 0003 §DO.19's residue —
+/// a lying member, which already holds the set's secret). Under incarnation
+/// keys (the per-mount seam, no wire host id) a registrant holding it
+/// suffices. The extended report's 16 B host ids are the FID 0x81 words
+/// `plan` derives keys from.
+pub fn joinKeyVerdict(rep: nvme.Report, claimed: u64, set_uuid: [16]u8, host_keyed: bool) JoinKeyVerdict {
+    if (claimed == 0) return .absent;
+    var held = false;
+    for (rep.registrants) |r| {
+        if (r.rkey != claimed) continue;
+        held = true;
+        if (!host_keyed or hostKey(&r.host_id, set_uuid) == claimed) return .ok;
+    }
+    return if (held) .mismatch else .absent;
+}
+
 /// The registry key of the set's mounts under one wire host id.
 pub fn setRegistryKey(wire_host_id: []const u8, set_uuid: [16]u8) u64 {
     var h: checksum.Hasher = .init();
@@ -1463,7 +1490,7 @@ test "the host key and the registry keys: one per (host identity, set), stable, 
     try testing.expect(fabricRegistryKey("nqn.s", "nqn.h", "id") != fabricRegistryKey("nqn.s", "nqn.h", "id2"));
 }
 
-test "a joiner's claimed page key against the joined volume's report (decision 0004 §6.1, KD18): ok only when a registrant holds it under the host id it derives from (hostKey(registrant's wire host id, set)); a key held by no registrant is absent; one held only under another host id (a forged claim of the manager's key, held by its host and its fencer) is a mismatch; under incarnation keys (the per-mount seam) any registrant holding it suffices" {
+test "a joiner's claimed page key against the joined volume's report (decision 0004 §6.1, KD18): ok only when a registrant holds it under the host id it derives from (hostKey(registrant's wire host id, set)); a key held by no registrant (stale, another set's) is absent; one held only under host ids it does not derive from is a mismatch; under incarnation keys (the per-mount seam) any registrant holding it suffices — and another live host's key passes: the check binds the key to SOME registered host, not to the joiner's (decision 0003 §DO.19's residue)" {
     const set: [16]u8 = @splat(7);
     const host_a: [16]u8 = "host-a-wire-id01".*;
     const host_b: [16]u8 = "host-b-wire-id02".*;
@@ -1477,7 +1504,9 @@ test "a joiner's claimed page key against the joined volume's report (decision 0
     };
     const rep: nvme.Report = .{ .generation = 4, .rtype = nvme.RTYPE_WERO, .regctl = regs.len, .ptpls = 0, .extended = true, .registrants = &regs };
     try testing.expectEqual(JoinKeyVerdict.ok, joinKeyVerdict(rep, key_a, set, true));
-    // The manager's own host key, claimed by host B's co-located joiner.
+    // Host B's key: right from host B's co-located joiner — and the same
+    // answer to a joiner on host A claiming it (the residue: the report
+    // names no requester).
     try testing.expectEqual(JoinKeyVerdict.ok, joinKeyVerdict(rep, key_b, set, true));
     try testing.expectEqual(JoinKeyVerdict.absent, joinKeyVerdict(rep, key_a ^ 1, set, true));
     try testing.expectEqual(JoinKeyVerdict.absent, joinKeyVerdict(rep, 0, set, true));

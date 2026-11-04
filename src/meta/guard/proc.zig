@@ -377,6 +377,29 @@ pub fn liveWriterPid(io: Io, local: claim.Identity, slot: u16, writer_id: u64) ?
     return null;
 }
 
+/// The §DA proof where a wrong "none" WOULD cost safety (decision 0004
+/// §4.6: a successor ships a same-host page's death at its arm): `dead`
+/// only when `/proc` was walked whole and every pid's stat was read — a
+/// refused stat (hidepid's EACCES, EMFILE, a refused pidfd) could be the
+/// writer, so the walk answers `unknown`, as does an unreadable `/proc`.
+pub const WriterProof = union(enum) { alive: linux.pid_t, dead, unknown };
+
+pub fn proveWriter(io: Io, local: claim.Identity, slot: u16, writer_id: u64) WriterProof {
+    var proc_dir = Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return .unknown;
+    defer proc_dir.close(io);
+    var it = proc_dir.iterate();
+    var any_unproven = false;
+    while (true) {
+        const ent = (it.next(io) catch return .unknown) orelse return if (any_unproven) .unknown else .dead;
+        const pid = std.fmt.parseInt(u32, ent.name, 10) catch continue; // a pid directory, decimal
+        switch (matchIncarnation(local, pid, slot, writer_id)) {
+            .yes => return .{ .alive = @intCast(pid) },
+            .no => {},
+            .unproven => any_unproven = true,
+        }
+    }
+}
+
 /// The proof for ONE pid a registry names (`host_fence.zig`): the live
 /// process `pid` of this host (a thread of its group still runs,
 /// `lifeOf`) IS the incarnation `writer_id` at `slot` — its start ticks
@@ -1135,6 +1158,17 @@ test "liveWriterPid: an incarnation's writer id names its live process on this h
     _ = try child.wait(testing.io);
     reaped = true;
     try testing.expectEqual(@as(?linux.pid_t, null), liveWriterPid(testing.io, me, 0x0819, theirs.writerId(0x0819)));
+}
+
+test "proveWriter (decision 0004 §4.6: a successor ships a same-host page's death at its arm): alive names the live incarnation; dead only once every pid's stat was read; a refused stat anywhere leaves a walk that found no writer unknown, never dead" {
+    const me = localIdentity();
+    try testing.expectEqual(WriterProof{ .alive = @intCast(me.pid) }, proveWriter(testing.io, me, 7, me.writerId(7)));
+    const stranger = me.writerId(8) +% 1;
+    try testing.expectEqual(WriterProof.dead, proveWriter(testing.io, me, 7, stranger));
+    var fault: TestSeams.StatFault = .{ .pid = me.pid, .errno = .ACCES };
+    test_seams.stat_fault.store(&fault, .release);
+    defer test_seams.stat_fault.store(null, .release);
+    try testing.expectEqual(WriterProof.unknown, proveWriter(testing.io, me, 7, stranger));
 }
 
 test "an UNREADABLE stat proves nothing: a /proc/<pid>/stat whose open the kernel refuses other than ENOENT (EMFILE under fd exhaustion, ENFILE, ENOMEM, EACCES under hidepid) reads ALIVE to every judgement — the claim prover, the §DA proof, the pin's re-check after pidfd_open (which can take the last free fd) — never dead; ENOENT is gone" {

@@ -311,11 +311,18 @@ pub const ManagerHandlers = struct {
             .ok => {},
             .rejected => |why| return service.Answer.rejected(@tagName(why)),
         }
+        switch (screen.joinAppenderKey(r, self.mgr.key_check != null)) {
+            .ok => {},
+            .rejected => |why| {
+                manager.stats.meta_pr_join_key_refusals.inc();
+                return service.Answer.rejected(@tagName(why));
+            },
+        }
         if (self.join_retire) |jr| jr.retire(jr.ctx, pageIdentity(r.identity)) catch |e| return classifyVerb(e);
         // The kernel's posture before the joiner can write (decision 0003
         // §AB.2).
         if (self.mgr.peer_gate) |g| g.enter(g.ctx);
-        const out = self.mgr.joinAppender(.{ .identity = pageIdentity(r.identity), .ring_want_bytes = r.ring_want_bytes, .home_volume = r.volume }) catch |e| return classifyVerb(e);
+        const out = self.mgr.joinAppender(.{ .identity = pageIdentity(r.identity), .ring_want_bytes = r.ring_want_bytes, .home_volume = r.volume, .host_key = r.host_key }) catch |e| return classifyVerb(e);
         // The tails ride the scratch: the segments, then the grant runs.
         const segs: []align(1) verbs.RunWire = @ptrCast(scratch[0 .. out.ring_segments.len * @sizeOf(verbs.RunWire)]);
         for (out.ring_segments.slice(), 0..) |s, i| segs[i] = .{ .start = s.start, .len = s.len };
@@ -549,7 +556,7 @@ pub const ManagerWire = struct {
     /// `JoinAppender` over the wire → the manager's reply shape, the
     /// page's words read at `page_addr`.
     pub fn joinAppender(self: *ManagerWire, req: manager.JoinAppender) manager.VerbError!manager.Joined {
-        const rep = self.call(.{ .join_appender = .{ .volume = self.volume, .reserved = 0, .reserved2 = 0, .identity = wireIdentity(req.identity), .ring_want_bytes = req.ring_want_bytes } }) catch |e| return verbError(e);
+        const rep = self.call(.{ .join_appender = .{ .volume = self.volume, .reserved = 0, .reserved2 = 0, .identity = wireIdentity(req.identity), .ring_want_bytes = req.ring_want_bytes, .host_key = req.host_key } }) catch |e| return verbError(e);
         const j = rep.join_appender;
         if (!j.head.check()) {
             stats.joined_wire_words_rejected.fire("Joined head out of range");
@@ -1012,7 +1019,7 @@ const TwoDaemons = struct {
         self.mh = .{ .mgr = &self.plane.mgr, .table = &self.handlers_table, .set_width = 1 };
         self.mh.register(&self.svc_a);
         self.clocks = try shard.LeaseClocks.derive(45_000, 0, 100);
-        self.owner = try shard.Owner.arm(gpa, testing.io, self.clocks, 0, 1, 0, &.{}, 0);
+        self.owner = try shard.Owner.arm(gpa, testing.io, self.clocks, 0, 1, 0, &.{}, &.{}, 0);
         self.osvc = .{ .owner = &self.owner, .now = &manualNow };
         self.osvc.register(&self.svc_a);
         _ = try self.hub.addDaemon(&self.svc_a, secret, identityOf(0));
@@ -1382,7 +1389,7 @@ test "linux: two in-process daemons over REAL TCP on loopback — B dials A's li
     try testing.expect(gate.isParked());
     // The successor arms at term 2 expecting B and listens at a NEW port;
     // B's next beat re-dials it (a failover moved the manager).
-    var succ = try shard.Owner.arm(gpa, testing.io, d.clocks, 0, 2, 1, &.{member.id}, t_self_at + 5_000);
+    var succ = try shard.Owner.arm(gpa, testing.io, d.clocks, 0, 2, 1, &.{.{ .id = member.id, .key = 0 }}, &.{}, t_self_at + 5_000);
     defer succ.deinit();
     var ssvc: shard.OwnerService = .{ .owner = &succ, .now = &manualNow };
     var svc_s: service.Service = .init;

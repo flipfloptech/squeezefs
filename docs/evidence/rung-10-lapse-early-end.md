@@ -29,7 +29,8 @@ The round-2 safety review of data-namespace fencing (§DJ, landable) left two mi
 
   Then the command is issued once more. Any other refusal latches the fence as before.
 - The census gets a roster lock. The owner shard is served on one thread per connection with no lock
-  at all. That race is pre-existing and still open for its other readers (§DL.4).
+  at all. That race was pre-existing and still open for its other readers (§DL.4); closed by §DM
+  (`rung-10-owner-lock.md`).
 
 ## The window, in beats (the red row "the lapse grace ends early", tcp, M under a 600 s grace seam)
 

@@ -208,7 +208,7 @@ pub const RingRead = struct {
 pub const TreeState = struct { root: cr.Root, floor: u64 };
 pub const FlushedRoot = struct { root: cr.Root, extents: u32 };
 
-pub const Error = error{ Io, Corrupt, OutOfMemory, Deferred, Violation, Refused };
+pub const Error = error{ Io, Corrupt, OutOfMemory, Deferred, Violation, Refused, DataUnfenced };
 
 pub const Volume = struct {
     ctx: *anyopaque,
@@ -324,8 +324,9 @@ pub const Mount = struct {
     /// Its fencing registrant (decision 0003 §DG; null: none stands — the
     /// holder's own preempt).
     fencer: ?*pr.Client = null,
-    /// The data namespaces this process holds WERO on.
-    data_pr: []const *pr.Client = &.{},
+    /// The data namespaces' fence (decision 0003 §DJ); null = no data
+    /// namespace carries PR (the documented no-device-fence class).
+    data_fence: ?DataFence = null,
     screen: *fencing.ScreenSource,
     stamps: *fencing.FrameStamps,
     ledger: *death_ledger.Ledger,
@@ -337,9 +338,27 @@ pub const Mount = struct {
     coherence_hold_ms: u64,
 };
 
+/// What the recovery reads of the DATA namespaces (decision 0003 §DJ): this
+/// process's data registrants (every data namespace reserved WEAR, the
+/// manager's own client preempting by key) and, for a co-located member's
+/// death, the kill on this host.
+pub const DataFence = struct {
+    ctx: *anyopaque,
+    /// Step 2c (`fencing.fenceDataNamespaces` over this process's data
+    /// clients): the dead host's key gone from every data namespace,
+    /// proven; issued only while `meta` shows this host holding.
+    fence: *const fn (ctx: *anyopaque, meta: ?*pr.Client, victim_key: u64) fencing.DataFenceOutcome,
+    /// The own-key case (the dead member shares this host's key): its
+    /// process on this host — the one whose registry line names the page
+    /// `dead` on volume `vol` — proven dead or killed and every data node's
+    /// block queue drained (the stale-sibling rule's kill and drain). False =
+    /// not proven: the recovery holds.
+    killColocated: *const fn (ctx: *anyopaque, vol: u16, dead: *const page.Page) bool,
+};
+
 /// The crash-window seam: the driver fails right AFTER the named step's
 /// durable effects (the re-run must converge from them).
-pub const Step = enum(u8) { decide, preempt, page_recovering, read_ring, mark_dead, replay, flush, tails, tree0, table_release, returns, page_recovered, recovered_record };
+pub const Step = enum(u8) { decide, preempt, page_recovering, data_fence, read_ring, mark_dead, replay, flush, tails, tree0, table_release, returns, page_recovered, recovered_record };
 
 pub const Seams = struct {
     fail_at: ?Step = null,
@@ -524,9 +543,6 @@ pub const Driver = struct {
         const t_preempt = clock.monotonicNs();
         const meta = fencing.preemptDeadRegistrant(self.mount.meta_pr, self.mount.fencer, standing.pr_key);
         const pr_fenced = meta == .fenced;
-        if (meta != .own_key_guard) {
-            for (self.mount.data_pr) |c| _ = fencing.preemptDeadRegistrant(c, null, standing.pr_key);
-        }
         phase(.preempt, t_preempt);
         try self.fail(.preempt);
         // ---- 2. page Live → Recovering ----
@@ -549,6 +565,23 @@ pub const Driver = struct {
         try self.mount.screen.suspendLessee(p.appender_id);
         defer self.mount.screen.resumeLessee(p.appender_id);
         try self.fail(.page_recovering);
+        // ---- 2c. the DATA fence (decision 0003 §DJ): the dead host's key
+        //      preempted on every data namespace and the report proving it
+        //      BEFORE anything the member can write is reallocated — its
+        //      slots stay leased to it (first touches refused) and its grant
+        //      windows SET until the release below. After Recovering: from
+        //      here every sibling's
+        //      rule judges it stale. Unproven, the recovery holds (the page
+        //      stays Recovering, the next poll re-runs): data carries no
+        //      frame screen to fall back on ----
+        if (self.mount.data_fence) |df| switch (df.fence(df.ctx, self.mount.meta_pr, standing.pr_key)) {
+            .fenced, .no_device, .no_key => {},
+            .own_key_guard => if (df.killColocated(df.ctx, vol_ordinal, &p)) {
+                fencing.stats.data_pr_colocated_kills.inc();
+            } else return error.DataUnfenced,
+            .unheld, .failed => return error.DataUnfenced,
+        };
+        try self.fail(.data_fence);
         // ---- 3. read the ring from the page's tail; tree 0's leases ----
         const t_read = clock.monotonicNs();
         var window: std.ArrayList(WindowRecord) = .empty;
@@ -1717,7 +1750,7 @@ test "every crash window: a recovery that fails right after each step's durable 
         const p = f.rv.pages.get(2).?;
         switch (step) {
             .decide, .preempt => try testing.expectEqual(page.State.live, p.state),
-            .page_recovering, .read_ring, .mark_dead, .replay, .flush, .tails, .tree0, .table_release, .returns => try testing.expectEqual(page.State.recovering, p.state),
+            .page_recovering, .data_fence, .read_ring, .mark_dead, .replay, .flush, .tails, .tree0, .table_release, .returns => try testing.expectEqual(page.State.recovering, p.state),
             .page_recovered, .recovered_record => try testing.expectEqual(page.State.recovered, p.state),
         }
         if (step != .page_recovered and step != .recovered_record) try testing.expect(!f.screen.isRecovering(2));
@@ -2067,6 +2100,24 @@ test "B2 (review): recovery re-reads the report once the page is Recovering — 
     try testing.expect(!ns.writeAllowed("remote-host-id-2".*));
 }
 
+/// The data fence over a fixture's clients (no co-located kill).
+const FixtureDataFence = struct {
+    clients: []const *pr.Client,
+
+    fn seam(self: *FixtureDataFence) DataFence {
+        return .{ .ctx = self, .fence = &fenceFn, .killColocated = &killFn };
+    }
+
+    fn fenceFn(ctx: *anyopaque, meta: ?*pr.Client, victim_key: u64) fencing.DataFenceOutcome {
+        const self: *FixtureDataFence = @ptrCast(@alignCast(ctx));
+        return fencing.fenceDataNamespaces(meta, self.clients, victim_key);
+    }
+
+    fn killFn(_: *anyopaque, _: u16, _: *const page.Page) bool {
+        return false;
+    }
+};
+
 test "a member's death is recovered only once its host is fenced on every DATA namespace (decision 0003 §DJ): a WEAR data namespace whose report fails stops the recovery after the page went Recovering — the region stays Recovering (no slot released, nothing the dead member could write reallocatable) — and the next poll, the namespace answering again, preempts the dead host's key there with the manager's own client (WEAR's all-registrants arm: the spec path on nvmet 7.3 too) and converges" {
     const gpa = testing.allocator;
     const fake_nvme = @import("../../guard/fake_nvme.zig");
@@ -2100,8 +2151,9 @@ test "a member's death is recovered only once its host is fenced on every DATA n
     _ = try dr.registerLadder();
     try testing.expect(dns.writeAllowed("remote-host-id-2".*));
     f.driver.mount.meta_pr = &m;
-    const clients = [_]*pr.Client{&d};
-    f.driver.mount.data_pr = &clients;
+    var clients = [_]*pr.Client{&d};
+    var df: FixtureDataFence = .{ .clients = &clients };
+    f.driver.mount.data_fence = df.seam();
     // The data namespace's next command fails: its fence cannot be proven.
     dns.fail_next = error.InputOutput;
     try testing.expectEqual(Outcome.failed, f.driver.recoverDead(f.death()));

@@ -152,10 +152,10 @@ pub const VolumeBinding = struct {
                 .identity = identity,
                 .meta_pr = if (be.guard) |g| g.prClient() else null,
                 .fencer = if (be.guard) |g| g.fencerClient() else null,
-                // The data namespaces' registrants travel with the data
-                // planes' device arm (owed): the metadata preempt alone
-                // decides `pr_fenced`.
-                .data_pr = &.{},
+                // The data namespaces' fence binds once the data plane's
+                // admission ran (`WirePlane.bindDataFence`, decision 0003
+                // §DJ).
+                .data_fence = null,
                 .screen = &be.slots.frames.screen,
                 .stamps = &be.slots.frames.stamps,
                 .ledger = ledger,
@@ -1750,7 +1750,7 @@ test "linux: every crash window of the §5.9 procedure over the real backend —
         const p = (try aset.manager.readPageOf(1)).?;
         switch (step) {
             .decide, .preempt => try testing.expectEqual(page.State.live, p.state),
-            .page_recovering, .read_ring, .mark_dead, .replay, .flush, .tails, .tree0, .table_release, .returns => try testing.expectEqual(page.State.recovering, p.state),
+            .page_recovering, .data_fence, .read_ring, .mark_dead, .replay, .flush, .tails, .tree0, .table_release, .returns => try testing.expectEqual(page.State.recovering, p.state),
             .page_recovered, .recovered_record => try testing.expectEqual(page.State.recovered, p.state),
         }
         // The dead slot's first touch is refused while the page is Recovering.

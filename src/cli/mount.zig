@@ -510,6 +510,16 @@ fn mountMain(ctx: *Ctx) u8 {
     defer gpa.free(data_uri);
     ctx.data_uri = data_uri;
 
+    // 1c. The DATA namespaces' admission (decision 0003 §DJ): a writer's
+    //     host registered on every PR-capable data namespace — after its
+    //     metadata admission, before the data plane's first write (its write
+    //     cache's recovery, the reclaimer, the sweeps); volume 0's writer
+    //     reconciles them. Released after the plane closed its fds and before
+    //     the fabric's disconnect and the metadata release (data leaves
+    //     first).
+    const dfence: ?*guard.data_fence.DataFence = if (reader) null else admitDataFence(ctx, be, &cfg) catch return cli.exit_failed;
+    defer if (dfence) |df| df.release();
+
     // 2. The handler tables, the data plane, the filesystem, the binding.
     var registry = watchdog.Registry.init(gpa, watchdog.derivedShards(facts.possible_cpus)) catch return ctx.failed("out of memory (watchdog registry)", .{});
     defer registry.deinit();
@@ -599,6 +609,7 @@ fn mountMain(ctx: *Ctx) u8 {
     };
     defer vs.renderer.deinit();
     vs.renderer.sources.fabric = &ctx.fabric;
+    vs.renderer.sources.data_fence = dfence;
     fs.bindVirtual(vs.face());
     op_trace.armTrace(gpa, env, facts.possible_cpus, ctx.budget_bytes) catch return ctx.failed("out of memory (op-trace ring)", .{});
     defer op_trace.disarmTrace();
@@ -643,6 +654,10 @@ fn mountMain(ctx: *Ctx) u8 {
     if (wire) |wp| {
         vs.renderer.sources.mount.wire_endpoint = wp.endpointText();
         vs.renderer.sources.wire = wp;
+        // Every managed volume's recovery fences a dead host on the data
+        // namespaces before its region is released (decision 0003 §DJ);
+        // bound before the membership cadence's first tick.
+        if (dfence) |df| wp.bindDataFence(df.recoverySeam(), .{ .ctx = df, .admit = &admitDataVolume });
         // A foreign reader's grant lands this mount's custody of the object
         // first: the write cache's residents promoted, every other write
         // custody landed and its size claim journaled (charter §6.1
@@ -694,7 +709,7 @@ fn mountMain(ctx: *Ctx) u8 {
     // Admission opens once the allocation lease armed (the grant plane is
     // the mover's mint source); a reader runs no fabric.
     var node: ?*jobs.coordinator.Node = null;
-    var data_arm: DataArmCtx = .{ .wire = wire };
+    var data_arm: DataArmCtx = .{ .wire = wire, .dfence = dfence };
     if (!reader) {
         seedJobIds(io);
         const local = proc.localIdentity();
@@ -865,7 +880,7 @@ fn mountMain(ctx: *Ctx) u8 {
     // is un-landed — the plane's and the filesystem's words are the
     // mount's to judge; the kernel's view and the read cache drop at the
     // successor. Unbound before the wire stops (LIFO).
-    var rejoin_host: RejoinHost = .{ .fs = &fs, .plane = plane, .set = be, .coherence = &coherence, .registry = &registry, .gpa = gpa, .io = io };
+    var rejoin_host: RejoinHost = .{ .fs = &fs, .plane = plane, .set = be, .coherence = &coherence, .registry = &registry, .gpa = gpa, .io = io, .dfence = dfence };
     defer rejoin_host.deinit();
     const rejoin_face = rejoin_host.face();
     if (wire) |wp| if (wp.joined != null) wp.bindRejoinHost(&rejoin_face);
@@ -1371,17 +1386,45 @@ fn holderBitmapOf(ctx: *anyopaque, vol_tag: u64) ?*data_bitmap.DataBitmap {
 
 const DataArmCtx = struct {
     wire: ?*sym_wire.WirePlane,
+    dfence: ?*guard.data_fence.DataFence,
 
     fn arm(self: *DataArmCtx) jobs.coordinator.DataArm {
         return .{ .ctx = self, .arm = &call };
     }
 
+    /// The new volume's data namespace admitted (and reconciled) before its
+    /// grant plane arms and it takes placement (decision 0003 §DJ).
     fn call(ctx: *anyopaque, plane: *plane_mod.DataPlane, ordinal: u16) error{Io}!void {
         const self: *DataArmCtx = @ptrCast(@alignCast(ctx));
         const wp = self.wire orelse return error.Io;
+        if (self.dfence) |df| {
+            const row = plane.vols.rows[ordinal] orelse return error.Io;
+            const dev = plane.devs[ordinal] orelse return error.Io;
+            df.admitVolume(row.vol_tag, dev.path) catch return error.Io;
+        }
         wp.armDataVolume(plane, ordinal) catch return error.Io;
     }
 };
+
+/// The DATA namespaces' admission of a writer (decision 0003 §DJ;
+/// `data_fence.admitSet`): null = no data fence; `error.Refused` = reported.
+fn admitDataFence(ctx: *Ctx, be: *meta_set.MetaSet, cfg: *const set_config.Config) error{Refused}!?*guard.data_fence.DataFence {
+    var refused: ?[]const u8 = null;
+    return guard.data_fence.admitSet(ctx.p.gpa, ctx.p.env, ctx.sqz.io(), be.volumes[0], cfg.data, &refused) catch |e| {
+        _ = switch (e) {
+            error.OutOfMemory => ctx.failed("out of memory (the data fence)", .{}),
+            error.Refused => ctx.failed("data volume {s}: its data namespace's admission was refused (decision 0003 §DJ) — see the log", .{refused orelse "?"}),
+        };
+        return error.Refused;
+    };
+}
+
+/// A joiner's online attach (`sym_wire.DataAdmit`).
+fn admitDataVolume(ctx: *anyopaque, vol_tag: u64, path: []const u8) bool {
+    const df: *guard.data_fence.DataFence = @ptrCast(@alignCast(ctx));
+    df.admitVolume(vol_tag, path) catch return false;
+    return true;
+}
 
 /// Read + decode `set_config` from tree 0 (the record a format writes;
 /// its absence or refusal is a mount refusal by name), discover the data
@@ -2188,6 +2231,8 @@ const RejoinHost = struct {
     registry: *watchdog.Registry,
     gpa: Allocator,
     io: Io,
+    /// The data namespaces' fence (decision 0003 §DJ; null: none).
+    dfence: ?*guard.data_fence.DataFence,
     /// Guards the drain's words: the beat marks and polls, the teardown
     /// unbinds the interception host (before it disarms) and frees them.
     lock: Io.Mutex = .init,
@@ -2206,7 +2251,7 @@ const RejoinHost = struct {
     const Marked = struct { slot: u32, unique: u64 };
 
     fn face(self: *RejoinHost) sym_wire.RejoinHost {
-        return .{ .ctx = self, .unlanded = &unlanded, .rebound = &rebound, .opsMark = &opsMark, .opsDrained = &opsDrained };
+        return .{ .ctx = self, .unlanded = &unlanded, .rebound = &rebound, .opsMark = &opsMark, .opsDrained = &opsDrained, .readmitData = &readmitData };
     }
 
     fn bindIpc(self: *RejoinHost, h: ?*ipc_host.IpcHost) void {
@@ -2278,9 +2323,23 @@ const RejoinHost = struct {
     fn unlanded(ctx: *anyopaque, buf: []u8) ?[]const u8 {
         const self: *RejoinHost = @ptrCast(@alignCast(ctx));
         if (self.plane.unlandedWord(buf)) |w| return w;
+        // A data device the target refused (fenced, decision 0003 §DJ)
+        // latched the fence class: no DMA for this process's life.
+        for (self.plane.devs[0..self.plane.vols.n()]) |d| if (d) |dev| if (dev.fence.halted.load(.acquire)) {
+            return std.fmt.bufPrint(buf, "data volume {s} latched the fence class (the device refused a write: this host was fenced there)", .{dev.path}) catch "a data volume latched the fence class";
+        };
         const parked = self.fs.pending.len();
         if (parked != 0) return std.fmt.bufPrint(buf, "{d} parked time refinement(s) never journaled", .{parked}) catch "parked time refinements";
         return null;
+    }
+
+    /// The successor's data namespaces' admission (decision 0003 §DJ):
+    /// under its volume 0's metadata registration and the host's registry.
+    fn readmitData(ctx: *anyopaque, successor0: *meta_set.KvBackend, buf: []u8) ?[]const u8 {
+        _ = buf;
+        const self: *RejoinHost = @ptrCast(@alignCast(ctx));
+        const df = self.dfence orelse return null;
+        return guard.data_fence.readmitSuccessor(df, successor0);
     }
 
     /// The successor is published: its node caches join the budget, the

@@ -596,6 +596,19 @@ pub const RejoinHost = struct {
     /// last readers).
     opsMark: *const fn (ctx: *anyopaque) void,
     opsDrained: *const fn (ctx: *anyopaque) bool,
+    /// The successor's DATA namespaces' admission (decision 0003 §DJ): the
+    /// death preempt removed this host's data registrations — re-registered
+    /// through the rule under the successor's metadata registration
+    /// (`successor0`, volume 0's) before anything can reach it. Null = re-
+    /// admitted (or no data fence); else why not.
+    readmitData: *const fn (ctx: *anyopaque, successor0: *KvBackend, buf: []u8) ?[]const u8,
+};
+
+/// A volume a joiner attaches online is admitted on its data namespace
+/// before it takes placement (decision 0003 §DJ); false = refused.
+pub const DataAdmit = struct {
+    ctx: *anyopaque,
+    admit: *const fn (ctx: *anyopaque, vol_tag: u64, path: []const u8) bool,
 };
 
 pub const WirePlane = struct {
@@ -676,6 +689,8 @@ pub const WirePlane = struct {
     /// The mount's half of a re-join in place (`bindRejoinHost`; Release
     /// there, Acquire on the beat that re-joins).
     rejoin_host: std.atomic.Value(?*const RejoinHost) = .init(null),
+    /// The online attach's data admission (a joiner's; `bindDataFence`).
+    data_admit: ?DataAdmit = null,
 
     /// Arm the plane (module doc); null on a set whose volume 0 carries no
     /// symmetric plane (the `--single-writer` class: no wire). The posture
@@ -1018,6 +1033,18 @@ pub const WirePlane = struct {
         self.rejoin_host.store(host, .release);
     }
 
+    /// The DATA namespaces' fence (decision 0003 §DJ), bound by the mount
+    /// once its admission ran and before the membership cadence's first
+    /// tick: every managed volume's recovery fences a dead host on the data
+    /// namespaces before its region is released; a joiner's online attach is
+    /// admitted there first.
+    pub fn bindDataFence(self: *WirePlane, fence: membership.recovery.DataFence, admit: DataAdmit) void {
+        if (self.mgr) |m| for (m.bindings) |b| {
+            b.driver.mount.data_fence = fence;
+        };
+        self.data_admit = admit;
+    }
+
     /// THE RE-JOIN IN PLACE (charter §5.5 "A live member evicted …";
     /// decision 0003 §BS), on the beat that met the home shard's
     /// `UnknownLease`. The follower ends first (it reads the incarnation's
@@ -1048,6 +1075,13 @@ pub const WirePlane = struct {
         if (self.judgeUnlanded(&why_buf)) |why| return self.refuseRejoin(j, why);
         const fresh = self.set.openSuccessors() catch |e| {
             const why = std.fmt.bufPrint(&why_buf, "the successor's join failed ({t})", .{e}) catch "the successor's join failed";
+            return self.refuseRejoin(j, why);
+        };
+        // The data namespaces again, before anything reaches the successor
+        // (decision 0003 §DJ): the death preempt removed this host there.
+        if (self.rejoin_host.load(.acquire)) |h| if (h.readmitData(h.ctx, fresh[0], &why_buf)) |why| {
+            for (fresh) |be| be.close();
+            self.gpa.free(fresh);
             return self.refuseRejoin(j, why);
         };
         // The member joins under the successor BEFORE anything can reach
@@ -1417,6 +1451,12 @@ pub const WirePlane = struct {
                 complete = false;
                 continue;
             }
+            if (self.data_admit) |a| if (!a.admit(a.ctx, d.vol_tag, d.uri)) {
+                lifecycle_stats.volume_config_pull_failures.inc();
+                log.err("set config: vol {x} ({s}): its data namespace's admission was refused (decision 0003 §DJ) — it joins at the next mount", .{ d.vol_tag, d.uri });
+                complete = false;
+                continue;
+            };
             const ordinal = dp.attachVolume(d) catch |e| {
                 lifecycle_stats.volume_config_pull_failures.inc();
                 log.err("set config: vol {x} ({s}) could not be attached to this joiner's plane ({s}) — it joins at the next mount", .{ d.vol_tag, d.uri, @errorName(e) });

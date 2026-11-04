@@ -17,6 +17,7 @@ const cli = @import("cli.zig");
 const uri = @import("uri.zig");
 const exec = @import("../exec/exec.zig");
 const meta_set = @import("../meta/meta_set.zig");
+const guard = @import("../meta/guard.zig");
 const node_cache = @import("../meta/node_cache.zig");
 const dlm = @import("../meta/dlm.zig");
 const sym_xv = @import("../meta/sym/xv.zig");
@@ -172,6 +173,15 @@ fn main(ctx: *Ctx) u8 {
             return ctx.failed("encrypted set: {s}", .{w.buffered()});
         };
     }
+    // The data namespaces' admission (decision 0003 §DJ): this writer's
+    // host registered before the plane's first write, released after it
+    // closed (and before the metadata release).
+    var refused: ?[]const u8 = null;
+    const dfence = guard.data_fence.admitSet(gpa, p.env, io, be.volumes[0], cfg.data, &refused) catch |e| return switch (e) {
+        error.OutOfMemory => ctx.failed("out of memory (the data fence)", .{}),
+        error.Refused => ctx.failed("data volume {s}: its data namespace's admission was refused (decision 0003 §DJ) — see the log", .{refused orelse "?"}),
+    };
+    defer if (dfence) |df| df.release();
     var guards = op_guard.Table.init(gpa, op_guard.INODE_GUARD_STRIPES) catch return ctx.failed("out of memory (op guards)", .{});
     defer guards.deinit();
     const plane = plane_mod.DataPlane.open(gpa, io, ctx.sqz, be, &cfg, .{ .env = p.env, .facts = ctx.facts, .budget_bytes = ctx.budget_bytes, .derived_key = derived_key, .guards = &guards }) catch |e| return ctx.failed("the data plane could not open ({s}) — see the log", .{@errorName(e)});

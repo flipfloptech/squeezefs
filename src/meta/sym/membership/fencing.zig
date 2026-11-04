@@ -100,6 +100,20 @@ pub const stats = struct {
     /// A `(0, 0)` stamp asked of a leased slot before the prime: must
     /// stay 0.
     pub var appender_unstamped_frame: counters.Tripwire = .init("appender_unstamped_frame");
+    /// DATA namespaces (decision 0003 §DJ): a dead host's key preempted and
+    /// proven gone (one per namespace).
+    pub var data_pr_preempts: counters.ShardedCounter = .{};
+    /// A data fence that could not be proven (a namespace's report or
+    /// preempt failed, the key still registered, the namespace unreserved):
+    /// the recovery holds, the next poll re-runs.
+    pub var data_pr_fence_failures: counters.ShardedCounter = .{};
+    /// A data fence withheld because a report did not show THIS host
+    /// holding the metadata namespace (§DG.14's check on data).
+    pub var data_pr_fence_unheld: counters.ShardedCounter = .{};
+    /// A co-located member's death (the own-key guard) fenced by its
+    /// recoverer on this host: the member's process proven dead or killed,
+    /// every data node drained.
+    pub var data_pr_colocated_kills: counters.ShardedCounter = .{};
 };
 
 // ---------------------------------------------------------------------------
@@ -328,6 +342,95 @@ fn preemptFailed(c: *pr.Client, victim_key: u64, e: pr.Error) PreemptOutcome {
     c.writeError(&w, e) catch {};
     log.warn("recovery preempt: preempt-and-abort of key 0x{x} did not land ({s}) — the full tail scan is the fence", .{ victim_key, w.buffered() });
     return .failed;
+}
+
+/// Recovery's data fence (decision 0003 §DJ; step 2c, after the page went
+/// Recovering): every DATA namespace — reserved Write Exclusive – All
+/// Registrants, so ANY registrant's preempt of another key unregisters every
+/// registrant of it and keeps the reservation (nvmet 7.3's `nvmet_pr_preempt`
+/// runs its all-registrants arm before the single-holder re-type: the
+/// manager's own client fences, no fencer) — loses the dead host's key, and
+/// the report proves it: the namespace reserved WEAR and no registrant under
+/// the key. Issued only while a report shows THIS host holding the metadata
+/// namespace `meta` (§DG.14), under its sequence lock. `.failed` / `.unheld`
+/// hold the recovery: the dead member's extents are reallocatable only once
+/// every namespace that can hold them fences its host — data carries no
+/// frame screen to fall back on.
+pub const DataFenceOutcome = enum {
+    /// Every data namespace proven: the key absent, the reservation standing.
+    fenced,
+    /// No data namespace carries PR (the documented no-device-fence class).
+    no_device,
+    /// A key-less record (`appender clear`, an EARLY same-node death): the
+    /// member is proven dead otherwise.
+    no_key,
+    /// The dead key is this host's (a co-located member): the device cannot
+    /// fence inside one host — the caller's kill on its own host.
+    own_key_guard,
+    /// This host does not hold the metadata namespace: a superseded manager
+    /// fences nobody.
+    unheld,
+    /// A namespace's fence is not proven.
+    failed,
+};
+
+pub fn fenceDataNamespaces(meta: ?*pr.Client, data: []const *pr.Client, victim_key: u64) DataFenceOutcome {
+    if (data.len == 0) return .no_device;
+    const m = meta orelse return .no_device;
+    if (victim_key == 0) return .no_key;
+    // Every data client registers under this host's key (the metadata
+    // preempt counted the own-key guard already).
+    if (victim_key == data[0].key) return .own_key_guard;
+    m.lockOps();
+    defer m.unlockOps();
+    const held = m.holdsHere() catch |e| {
+        stats.data_pr_fence_failures.inc();
+        log.warn("recovery data fence: the metadata report before the preempt of key 0x{x} failed ({s}) — nothing preempted; the recovery holds", .{ victim_key, @errorName(e) });
+        return .failed;
+    };
+    if (!held) {
+        stats.data_pr_fence_unheld.inc();
+        log.warn("recovery data fence: the metadata reservation is not held by this host — the data preempt of key 0x{x} is withheld (a successor took the hold: this manager is superseded)", .{victim_key});
+        return .unheld;
+    }
+    var proven = true;
+    for (data) |c| {
+        if (!fenceDataNamespace(c, victim_key)) proven = false;
+    }
+    return if (proven) .fenced else .failed;
+}
+
+/// One data namespace: the key registered ⇒ preempt-and-abort (RACQA 2: the
+/// target drains the victim's admitted writes before it completes); then the
+/// report: reserved WEAR, the key absent. True = proven.
+fn fenceDataNamespace(c: *pr.Client, victim_key: u64) bool {
+    const before = keyRegistered(c, victim_key) catch |e| return dataFenceFailed(c, victim_key, "the report", e);
+    if (before) c.preemptAndAbort(victim_key) catch |e| {
+        var buf: [128]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        c.writeError(&w, e) catch {};
+        log.warn("recovery data fence: the preempt-and-abort of key 0x{x} on data nsid {d} did not land ({s}) — the report decides", .{ victim_key, c.nsid, w.buffered() });
+    };
+    var rep = c.report() catch |e| return dataFenceFailed(c, victim_key, "the report after the preempt", e);
+    defer rep.deinit(c.gpa);
+    var kept = false;
+    for (rep.registrants) |r| kept = kept or r.rkey == victim_key;
+    if (kept or rep.rtype != nvme.RTYPE_WEAR) {
+        stats.data_pr_fence_failures.inc();
+        log.warn("recovery data fence: data nsid {d} {s} after the preempt of key 0x{x} (rtype {d}) — the dead member's host is NOT fenced there; the recovery holds", .{ c.nsid, if (kept) "keeps the key registered" else "carries no WEAR reservation", victim_key, rep.rtype });
+        return false;
+    }
+    if (before) stats.data_pr_preempts.inc();
+    return true;
+}
+
+fn dataFenceFailed(c: *pr.Client, victim_key: u64, what: []const u8, e: pr.Error) bool {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    c.writeError(&w, e) catch {};
+    stats.data_pr_fence_failures.inc();
+    log.warn("recovery data fence: {s} of data nsid {d} for key 0x{x} failed ({s}) — the fence is not proven; the recovery holds", .{ what, c.nsid, victim_key, w.buffered() });
+    return false;
 }
 
 /// Does a registrant hold `key` on the namespace (the report)?

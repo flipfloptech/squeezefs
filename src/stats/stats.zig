@@ -186,6 +186,9 @@ pub const Sources = struct {
     /// The daemon-owned fabric associations (`mount_fabric.Plan`): the
     /// `fabric_daemon_bound` rows of the nvmet family.
     fabric: if (is_linux) ?*const nvmet_mount_fabric.Plan else ?*void = null,
+    /// The data namespaces' fence (decision 0003 §DJ): the `data_pr` rows
+    /// of the nvmet family.
+    data_fence: if (is_linux) ?*guard.data_fence.DataFence else ?*void = null,
     key_census: ?KeyCensus = null,
     /// The CPU census as the sampler last published it (`Renderer.sample`;
     /// the render reads it, never walks `/proc` itself — decision 0003
@@ -356,6 +359,7 @@ pub const sources = [_]Source{
     .{ .path = "src/ops/lifecycle/stats.zig", .family = "jobs" },
     .{ .path = "src/ops/defrag/metrics.zig", .family = "jobs" },
     .{ .path = "src/ops/nvmet/stats.zig", .family = "nvmet" },
+    .{ .path = "src/meta/guard/data_fence.zig", .family = "nvmet" },
     .{ .path = "src/ops/zcrx/stats.zig", .family = "zcrx" },
 };
 
@@ -712,10 +716,19 @@ fn writeNvmet(src: *Sources, w: *Writer) Error!void {
     if (is_linux) nvmet_stats.fabric_sampled_age_ms.set(nvmet_initiator.sampledAgeMs());
     try w.writeByte('{');
     const any = try counters.writeNamespaceEntries(nvmet_stats, w);
-    if (is_linux) if (src.fabric) |plan| {
-        if (any) try w.writeByte(',');
-        try plan.writeStatsJson(w);
-    };
+    if (is_linux) {
+        if (src.fabric) |plan| {
+            if (any) try w.writeByte(',');
+            try plan.writeStatsJson(w);
+        }
+        // The data namespaces' fence (decision 0003 §DJ).
+        if (any or src.fabric != null) try w.writeByte(',');
+        _ = try counters.writeNamespaceEntries(guard.data_fence.stats, w);
+        if (src.data_fence) |df| {
+            try w.writeByte(',');
+            try df.writeStatsJson(w);
+        }
+    }
     try w.writeByte('}');
 }
 

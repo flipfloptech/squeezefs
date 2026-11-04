@@ -1438,6 +1438,7 @@ pub const Device = struct {
     /// self-inflicts a fail-stop.
     fn classifyDmaOutcome(self: *Device, e: linux.E) void {
         if (!nd.isReservationConflict(e)) return;
+        stats.data_pr_write_refusals.inc();
         if (!self.fence.halted.swap(true, .acq_rel)) {
             log.err("DEVICE {s} rejected a DMA with the reservation-conflict errno class (EBADE/os error 52): another writer holds the persistent reservation — writer guard FENCED; refusing ALL further data-plane DMA permanently (DLM S7; remount required)", .{self.path});
         }

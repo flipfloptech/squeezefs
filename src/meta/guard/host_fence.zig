@@ -634,6 +634,9 @@ pub const RuleContext = struct {
     node_token: u64,
     vol_index: u32,
     taking_manager: bool,
+    /// The namespace's kind in the log lines (a DATA namespace's admission
+    /// runs the same rule, decision 0003 §DJ).
+    label: []const u8 = "meta volume",
 };
 
 /// How long a SIGKILLed sibling may take to exit (an I/O it sleeps in must
@@ -658,7 +661,7 @@ pub fn clearStaleSiblings(ctx: RuleContext, reg: *const Registry, pages: []const
         if (e.pid == ctx.local.pid) continue;
         const v = judge(e, pages, ctx.node_token, ctx.vol_index, ctx.taking_manager, ctx.facts);
         if (v != .stale) {
-            log.info("meta volume {s}: sibling pid {d} of this set on this host is {s} — spared by the host's registration (its region is its own)", .{ ctx.path, e.pid, @tagName(v) });
+            log.info("{s} {s}: sibling pid {d} of this set on this host is {s} — spared by the host's registration (its region is its own)", .{ ctx.label, ctx.path, e.pid, @tagName(v) });
             continue;
         }
         if (!proveIncarnationAlive(ctx, e)) {
@@ -668,13 +671,13 @@ pub fn clearStaleSiblings(ctx: RuleContext, reg: *const Registry, pages: []const
         }
         if (killSibling(ctx, e)) |why| {
             guard.stats.pr_stale_sibling_refusals.inc();
-            log.err("meta volume {s}: REFUSING to register this host: the stale sibling pid {d} (writer id {x:0>16}) of this set on this host is alive and {s} — a registration would re-admit it to the device its region's recoverer owns; kill it by hand (`kill -9 {d}`) and remount", .{ ctx.path, e.pid, e.regionSlice()[0].writer_id, why, e.pid });
+            log.err("{s} {s}: REFUSING to register this host: the stale sibling pid {d} (writer id {x:0>16}) of this set on this host is alive and {s} — a registration would re-admit it to the device its region's recoverer owns; kill it by hand (`kill -9 {d}`) and remount", .{ ctx.label, ctx.path, e.pid, e.regionSlice()[0].writer_id, why, e.pid });
             return error.SiblingLive;
         }
         guard.stats.pr_stale_sibling_kills.inc();
         killed += 1;
         reg.remove(e.pid);
-        log.warn("meta volume {s}: killed the stale sibling pid {d} (writer id {x:0>16}) of this set on this host before registering the host — its region was recovered, a registration would have re-admitted its writes", .{ ctx.path, e.pid, e.regionSlice()[0].writer_id });
+        log.warn("{s} {s}: killed the stale sibling pid {d} (writer id {x:0>16}) of this set on this host before registering the host — its region was recovered, a registration would have re-admitted its writes", .{ ctx.label, ctx.path, e.pid, e.regionSlice()[0].writer_id });
     }
     return killed;
 }
@@ -753,7 +756,7 @@ fn awaitWriteDrain(ctx: RuleContext) error{SiblingLive}!void {
         const now = clock.monotonicNs();
         if (now >= deadline) {
             guard.stats.pr_stale_sibling_refusals.inc();
-            log.err("meta volume {s}: REFUSING to register this host: {d} write(s) stay in flight on its block queue {d} ms after a stale sibling's kill — a registration would re-admit them", .{ ctx.path, writes, DRAIN_WAIT_MS });
+            log.err("{s} {s}: REFUSING to register this host: {d} write(s) stay in flight on its block queue {d} ms after a stale sibling's kill — a registration would re-admit them", .{ ctx.label, ctx.path, writes, DRAIN_WAIT_MS });
             return error.SiblingLive;
         }
         const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(@min(backoff_ns, deadline - now)) };
@@ -764,7 +767,7 @@ fn awaitWriteDrain(ctx: RuleContext) error{SiblingLive}!void {
 
 fn refuseDrain(ctx: RuleContext, why: []const u8) error{SiblingLive} {
     guard.stats.pr_stale_sibling_refusals.inc();
-    log.err("meta volume {s}: REFUSING to register this host after a stale sibling's kill: {s} — its writes cannot be proven drained", .{ ctx.path, why });
+    log.err("{s} {s}: REFUSING to register this host after a stale sibling's kill: {s} — its writes cannot be proven drained", .{ ctx.label, ctx.path, why });
     return error.SiblingLive;
 }
 
@@ -878,6 +881,111 @@ pub fn registerUnderRule(ctx_in: RuleContext, reg: *const Registry, c: *pr.Clien
     guard.stats.pr_stale_sibling_refusals.inc();
     log.err("meta volume {s}: REFUSING to register this host: siblings kept turning stale across {d} registers", .{ ctx.path, REJUDGE_ROUNDS });
     return error.SiblingLive;
+}
+
+pub const DataAdmitError = AdmitError || error{HostFenced};
+
+/// A DATA namespace's registration under the rule (decision 0003 §DJ), the
+/// caller holding the registry's lock: `data` registered under our wire host
+/// id and key ⇒ false, nothing mutated (an adoption). Else, while this host is
+/// registered on the METADATA namespace `meta` (a host a takeover or a death
+/// preempt fenced never re-admits itself on data: `HostFenced`): the stale
+/// siblings judged by `meta`'s report and the metadata pages (a data
+/// namespace's WEAR report names every registrant a holder — it says nothing
+/// of the manager role), killed, the DATA node's block queue drained
+/// (`ctx.path`), the register, then the metadata registration and the pages
+/// judged again — a sibling turned stale meanwhile takes the data
+/// registration away before it is killed and the register retried. True =
+/// registered afresh.
+pub fn registerDataUnderRule(ctx_in: RuleContext, reg: *const Registry, meta: *pr.Client, data: *pr.Client, pages: PageSource, register: Register) DataAdmitError!bool {
+    const first = reportFacts(data) catch return error.ReportUnreadable;
+    if (first.registered) return false;
+    var ctx = ctx_in;
+    var round: u32 = 0;
+    while (round < REJUDGE_ROUNDS) : (round += 1) {
+        const mf = reportFacts(meta) catch return error.ReportUnreadable;
+        if (!mf.registered) return error.HostFenced;
+        ctx.facts = mf.facts;
+        {
+            const ps = try pages.get(ctx.gpa);
+            defer ctx.gpa.free(ps);
+            if (try clearStaleSiblings(ctx, reg, ps) > 0) try awaitWriteDrain(ctx);
+        }
+        register.run(register.ctx, data) catch return error.RegisterFailed;
+        // Registered: an error from here takes the registration back.
+        errdefer data.unregister(data.key) catch {};
+        const after = reportFacts(meta) catch return error.ReportUnreadable;
+        if (!after.registered) return error.HostFenced;
+        ctx.facts = after.facts;
+        const ps = try pages.get(ctx.gpa);
+        defer ctx.gpa.free(ps);
+        if (!try anyStaleAlive(ctx, reg, ps)) return true;
+        log.warn("{s} {s}: a sibling of this set on this host turned stale between the rule and the register — the host's data registration withdrawn before it is killed", .{ ctx.label, ctx.path });
+        data.unregister(data.key) catch {
+            log.err("{s} {s}: REFUSING the registration: it could not be withdrawn from a stale sibling's host", .{ ctx.label, ctx.path });
+            return error.SiblingLive;
+        };
+    }
+    guard.stats.pr_stale_sibling_refusals.inc();
+    log.err("{s} {s}: REFUSING to register this host: siblings kept turning stale across {d} registers", .{ ctx.label, ctx.path, REJUDGE_ROUNDS });
+    return error.SiblingLive;
+}
+
+/// A co-located member's death (decision 0003 §DJ; the own-key guard: the
+/// device cannot fence inside one host): the recoverer — on the same host —
+/// takes the registry's lock and kills the process whose line names the dead
+/// page `dead` on volume `ctx.vol_index` (its appender id and term, or no
+/// page yet under its writer id) unless its own retirement covers that page,
+/// proven dead by the §DA writer-id proof or SIGKILLed through a pidfd and
+/// its exit awaited; then every data node's block queue drained. True =
+/// proven (dead, killed, or no live process names the page); false = a kill
+/// or a drain refused, or the page names another node — the recovery holds.
+pub fn killColocatedMember(ctx_in: RuleContext, reg_in: Registry, dead: *const page.Page, data_nodes: []const []const u8) bool {
+    var ctx = ctx_in;
+    if (dead.identity.node_token != ctx.node_token) {
+        log.err("recovery data fence: the dead appender {d} shares this host's registration key but names node 0x{x}, not this host's 0x{x} — two hosts under one host identifier (decision 0003 §DF.3): neither a device fence nor a kill holds it; the recovery holds", .{ dead.appender_id, dead.identity.node_token, ctx.node_token });
+        return false;
+    }
+    var reg = reg_in;
+    reg.lock() catch return false;
+    defer reg.unlock();
+    const es = reg.entries(ctx.gpa) catch return false;
+    defer ctx.gpa.free(es);
+    var killed = false;
+    for (es) |*e| {
+        if (e.pid == ctx.local.pid or !namesDeadPage(e, dead, ctx.vol_index)) continue;
+        if (!proveIncarnationAlive(ctx, e)) {
+            guard.stats.pr_siblings_proven_dead.inc();
+            reg.remove(e.pid);
+            continue;
+        }
+        if (killSibling(ctx, e)) |why| {
+            guard.stats.pr_stale_sibling_refusals.inc();
+            log.err("recovery data fence: the dead co-located member pid {d} (appender {d}) is alive and {s} — its writes could land in extents the recovery would reallocate; the recovery holds (kill it by hand: `kill -9 {d}`)", .{ e.pid, dead.appender_id, why, e.pid });
+            return false;
+        }
+        guard.stats.pr_stale_sibling_kills.inc();
+        killed = true;
+        reg.remove(e.pid);
+        log.warn("recovery data fence: killed the dead co-located member pid {d} (appender {d}) — the device cannot fence inside this host", .{ e.pid, dead.appender_id });
+    }
+    if (killed) for (data_nodes) |n| {
+        ctx.path = n;
+        awaitWriteDrain(ctx) catch return false;
+    };
+    return true;
+}
+
+/// Does entry `e` name the dead page on volume `vol` (a joined line's page,
+/// or an unjoined line under its writer id), uncovered by its retirement?
+fn namesDeadPage(e: *const Entry, dead: *const page.Page, vol: u32) bool {
+    for (e.regionSlice()) |r| {
+        if ((r.role != .joiner and r.role != .leaving) or r.writer_id != dead.identity.writer_id) continue;
+        if (r.joined) |j| {
+            if (j.vol == vol and j.appender_id == dead.appender_id and j.term == dead.term and !e.coversId(r.writer_id, j.appender_id, j.term, vol)) return true;
+        } else if (!e.covers(dead.*, vol)) return true;
+    }
+    return false;
 }
 
 /// A joiner's clean departure: does it take the host's registration with
@@ -1674,4 +1782,58 @@ test "review 4 blocker 1: a joined member's line names its appender id, term and
     try testing.expectEqual(Verdict.joining, judge(&pre, &.{pgTerm(4, .live, node, 0xe7, 7)}, node, 0, false, .{}));
     var other = Entry.parse(48, "83\nj 9 00000000000000d2 4 6 1\n").?;
     try testing.expect(judge(&other, &.{pgTerm(4, .live, node, 0xe7, 7)}, node, 0, false, .{}) != .stale);
+}
+
+test "decision 0003 §DJ, a co-located member's death: its recoverer on this host kills the process whose registry line names the dead page (appender id, term, volume) and proves it gone; a process whose own retirement covers that page is spared; a dead page naming another node (two hosts under one host identifier) holds the recovery" {
+    const gpa = testing.allocator;
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-dj-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var probe = Registry.at(base, .set, 0xd1);
+    probe.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    probe.unlock();
+    const local = proc.localIdentity();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const ctx: RuleContext = .{ .gpa = gpa, .env = &env, .path = "dj", .local = local, .node_token = 0xA, .vol_index = 0, .taking_manager = false, .label = "data volume" };
+    // Two co-located members of this host whose lines name a Recovering page
+    // (appender 3, term 2): W, dead, and R, re-joining in place — its own
+    // retirement covers that page.
+    var children: [2]std.process.Child = undefined;
+    var reaped: [2]bool = .{ false, false };
+    for (&children) |*ch| ch.* = try std.process.spawn(testing.io, .{ .argv = &.{"cat"}, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    defer for (&children, reaped) |*ch, done| if (!done) {
+        _ = linux.kill(ch.id.?, .KILL);
+        _ = ch.wait(testing.io) catch {};
+    };
+    var ids: [2]claim.Identity = undefined;
+    for (children, &ids) |ch, *id| {
+        const pid: u32 = @intCast(ch.id.?);
+        const ticks = proc.startTicksOf(pid) orelse return @import("../../core/testkit.zig").skip(@src(), .no_device, "/proc does not show the spawned member's start ticks");
+        id.* = .{ .boot_id = local.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
+    }
+    const reg = Registry.at(base, .set, 0xd1);
+    var lb: [96]u8 = undefined;
+    const joined: Joined = .{ .appender_id = 3, .term = 2, .vol = 0 };
+    try reg.append(ids[0].pid, ids[0].start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = ids[0].writerId(9), .joined = joined }));
+    try reg.append(ids[1].pid, ids[1].start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = ids[1].writerId(9), .joined = joined }));
+    try reg.append(ids[1].pid, ids[1].start_ticks, retiredLine(&lb, .{ .writer_id = ids[1].writerId(9), .appender_id = 3, .term = 2, .vol = 0 }));
+    // R's retired page: spared (its own retirement covers it).
+    const r_dead = pgTerm(3, .recovering, 0xA, ids[1].writerId(9), 2);
+    try testing.expect(killColocatedMember(ctx, reg, &r_dead, &.{}));
+    try testing.expect(proc.isWriterIncarnation(local, ids[1].pid, 9, ids[1].writerId(9)));
+    // W's page: W killed and proven gone.
+    const kills0 = guard.stats.pr_stale_sibling_kills.load();
+    const w_dead = pgTerm(3, .recovering, 0xA, ids[0].writerId(9), 2);
+    try testing.expect(killColocatedMember(ctx, reg, &w_dead, &.{}));
+    try testing.expectEqual(kills0 + 1, guard.stats.pr_stale_sibling_kills.load());
+    _ = try children[0].wait(testing.io);
+    reaped[0] = true;
+    try testing.expect(!proc.isWriterIncarnation(local, ids[0].pid, 9, ids[0].writerId(9)));
+    // A dead page of another node under this host's key: nothing to kill
+    // here, nothing the device can fence — the recovery holds.
+    log.testing.expectErrorLogs(1);
+    const foreign = pgTerm(3, .recovering, 0xB, ids[1].writerId(9), 2);
+    try testing.expect(!killColocatedMember(ctx, reg, &foreign, &.{}));
+    try log.testing.expectAllFired();
 }

@@ -386,6 +386,10 @@ pub const stats = struct {
     pub var data_dma_fence_refusals: counters.ShardedCounter = .{};
     /// DMA refused in the dismount class (EROFS); 0 on a serving mount.
     pub var data_dma_dismount_refusals: counters.ShardedCounter = .{};
+    /// A data write or barrier the DEVICE refused with the reservation
+    /// conflict (EBADE): this host is not registered on the data namespace
+    /// (fenced, decision 0003 §DJ). The fence class latches at the first.
+    pub var data_pr_write_refusals: counters.ShardedCounter = .{};
     /// Whole-block pool reuse vs fresh mappings (moved by bounce allocs).
     pub var aligned_pool_hits: counters.ShardedCounter = .{};
     pub var aligned_pool_misses: counters.ShardedCounter = .{};

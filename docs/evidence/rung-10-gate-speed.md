@@ -362,3 +362,7 @@ script or an agent (no TTY) the heartbeat arrives as the gate runs:
   `THE KILL ROWS (b)`'s manager teardown outlasted `umount`'s 32 s with 2.6 GiB available; the
   kmbuf ENOMEM of §4. And `exec.lane … 1 ms timer parks … count 0 tick rescues` under a saturated
   host (8 × `yes`, §5.3).
+- The `roundtrip-loop` item above was closed on 2026-11-03 by decision 0003 §DK. A loop share now
+  takes a port of its own ledger, addressed `squeezefs-port-<id>`, and every loop connect names
+  that address, so the share never joins a loop port another made (red `d40d1ae`, fix `87cabd0`).
+  The nvmet tier passed beside the RAM rig's pre-fix, address-less port 53176.

@@ -207,7 +207,7 @@ pub const Fencer = struct {
     }
 
     fn confirmHeldLocked(self: *Fencer, host: *pr.Client) bool {
-        if (host.holdsHere() catch false) return true;
+        if (host.admittedHere() catch false) return true;
         self.client.unregister(self.client.key) catch {};
         fencing.stats.pr_fencer_unheld_unregistered.inc();
         log.warn("fencing registrant {s}: the host does not hold the reservation after its registration (a successor preempted it) — unregistered", .{self.identity.hostnqn()});

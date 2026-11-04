@@ -58,11 +58,24 @@ pub const Stats = struct {
     unregisters: u64 = 0,
     acquires: u64 = 0,
     preempts: u64 = 0,
+    /// Preempt-and-Abort with PRKEY 0 under WEAR: a manager takeover
+    /// (decision 0004 §4.2).
+    preempt_alls: u64 = 0,
     releases: u64 = 0,
     reports: u64 = 0,
     /// A register ladder that recovered a crashed incarnation's registration.
     own_stale_recoveries: u64 = 0,
+    /// Drain barriers issued, and those answered `unknown` (P15a).
+    drain_barriers: u64 = 0,
+    drain_barrier_unknowns: u64 = 0,
 };
+
+/// The drain barrier's three answers (decision 0004 P15, P15a): this host
+/// is registered under our key, it is not, or the command gave no answer —
+/// a status other than success or a conflict, or a transport error (a
+/// cancelled passthrough's EINTR, a dead node). The caller re-issues an
+/// `unknown`, never reading it as either answer.
+pub const Barrier = enum { registered, unregistered, unknown };
 
 /// The registrant cap learn rule (R:376-420, charter §5.5): a cap is
 /// LEARNED only when a device-answered command-/vendor-specific status is
@@ -296,6 +309,34 @@ pub const Client = struct {
         return self.issue(.io, &nvme.reservationAcquire(self.nsid, nvme.RACQA_PREEMPT, self.rtype, self.key, victim, &payload));
     }
 
+    /// The successor's takeover (decision 0004 §4.2, §5.1): RACQA 2, PRKEY
+    /// 0, RTYPE 5 (P4 + P9). The sender becomes the holder with rtype 5 and
+    /// every registrant of another host id is unregistered, each after its
+    /// controllers' refs were killed; the command completes after their
+    /// admitted commands drained. Our own host id stays. On an unreserved
+    /// namespace it conflicts (P6); a preempted host's conflicts (P8).
+    pub fn preemptAllAndAbort(self: *Client) Error!void {
+        var payload: [16]u8 = undefined;
+        self.stats.preempt_alls += 1;
+        return self.issue(.io, &nvme.reservationAcquire(self.nsid, nvme.RACQA_PREEMPT_AND_ABORT, nvme.RTYPE_WEAR, self.key, 0, &payload));
+    }
+
+    /// Register-Replace, IEKEY 0, CRKEY = NRKEY = our key (P15): it waits on
+    /// the namespace's pr_sem, so it returns only after any
+    /// preempt-and-abort drain ended, and has no side effect but the
+    /// generation. One command under the Device's issue lock only, never
+    /// the client's sequence lock (DC18).
+    pub fn drainBarrier(self: *Client) Barrier {
+        var payload: [16]u8 = undefined;
+        self.stats.drain_barriers += 1;
+        const answer: Barrier = if (self.issue(.io, &nvme.reservationRegister(self.nsid, nvme.RREGA_REPLACE, self.key, self.key, &payload))) .registered else |e| switch (e) {
+            error.ReservationConflict => .unregistered,
+            else => .unknown,
+        };
+        if (answer == .unknown) self.stats.drain_barrier_unknowns += 1;
+        return answer;
+    }
+
     /// `RACQA 2` (rung 6's dead-registrant arm; nvmet runs it as a plain
     /// preempt).
     pub fn preemptAndAbort(self: *Client, victim: u64) Error!void {
@@ -338,10 +379,12 @@ pub const Client = struct {
         return out;
     }
 
-    /// Does THIS host's registrant hold the reservation under our key — not
-    /// another host id under the same key (a fencing registrant, decision
-    /// 0003 §DG)? One report.
-    pub fn holdsHere(self: *Client) Error!bool {
+    /// Is this host — our key under our wire host id — admitted by the
+    /// reservation: registered under a standing WEAR reservation, where
+    /// every registrant holds (P13), or the holder under a single-holder
+    /// type? Another host id under the same key (a fencing registrant,
+    /// decision 0003 §DG) is not this host's admission. One report.
+    pub fn admittedHere(self: *Client) Error!bool {
         const me = try self.wireHostId();
         var rep = try self.report();
         defer rep.deinit(self.gpa);
@@ -407,7 +450,7 @@ pub const Client = struct {
     }
 
     pub fn writeStatsJson(self: *const Client, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("{{\"pr_key\":\"{x:0>16}\",\"pr_rtype\":{d},\"pr_rescap\":{d},\"pr_ptpl_requested\":{},\"pr_registrants_per_namespace\":{d},\"pr_report_bytes\":{d},\"pr_registrant_cap\":{d},\"pr_registrant_cap_refusals\":{d},\"pr_registers\":{d},\"pr_unregisters\":{d},\"pr_acquires\":{d},\"pr_preempts\":{d},\"pr_releases\":{d},\"pr_reports\":{d},\"pr_own_stale_recoveries\":{d}}}", .{ self.key, self.rtype, self.rescap, self.ptpl_requested, self.regctl, self.report_bytes, self.cap.effective(null), self.cap.refusals, self.stats.registers, self.stats.unregisters, self.stats.acquires, self.stats.preempts, self.stats.releases, self.stats.reports, self.stats.own_stale_recoveries });
+        try w.print("{{\"pr_key\":\"{x:0>16}\",\"pr_rtype\":{d},\"pr_rescap\":{d},\"pr_ptpl_requested\":{},\"pr_registrants_per_namespace\":{d},\"pr_report_bytes\":{d},\"pr_registrant_cap\":{d},\"pr_registrant_cap_refusals\":{d},\"pr_registers\":{d},\"pr_unregisters\":{d},\"pr_acquires\":{d},\"pr_preempts\":{d},\"pr_releases\":{d},\"pr_reports\":{d},\"pr_own_stale_recoveries\":{d},\"pr_preempt_alls\":{d},\"pr_drain_barriers\":{d},\"pr_drain_barrier_unknowns\":{d}}}", .{ self.key, self.rtype, self.rescap, self.ptpl_requested, self.regctl, self.report_bytes, self.cap.effective(null), self.cap.refusals, self.stats.registers, self.stats.unregisters, self.stats.acquires, self.stats.preempts, self.stats.releases, self.stats.reports, self.stats.own_stale_recoveries, self.stats.preempt_alls, self.stats.drain_barriers, self.stats.drain_barrier_unknowns });
     }
 
     /// The error's detail for a log line.

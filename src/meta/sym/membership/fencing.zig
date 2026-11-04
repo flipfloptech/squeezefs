@@ -285,7 +285,7 @@ pub fn preemptDeadRegistrant(client: ?*pr.Client, fencer: ?*pr.Client, victim_ke
     defer c.unlockOps();
     if (fencer) |f| f.lockOps();
     defer if (fencer) |f| f.unlockOps();
-    const ours = c.holdsHere() catch |e| {
+    const ours = c.admittedHere() catch |e| {
         log.warn("recovery preempt: the report before the preempt of key 0x{x} failed ({s}) — nothing preempted; the full tail scan is the fence", .{ victim_key, @errorName(e) });
         return .failed;
     };
@@ -391,7 +391,7 @@ pub fn fenceDataNamespacesCounted(meta: ?*pr.Client, data: []const *pr.Client, v
     if (victim_key == data[0].key) return .own_key_guard;
     m.lockOps();
     defer m.unlockOps();
-    const held = m.holdsHere() catch |e| {
+    const held = m.admittedHere() catch |e| {
         stats.data_pr_fence_failures.inc();
         log.warn("recovery data fence: the metadata report before the preempt of key 0x{x} failed ({s}) — nothing preempted; the recovery holds", .{ victim_key, @errorName(e) });
         unproven.* = data.len;

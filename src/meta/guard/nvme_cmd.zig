@@ -245,6 +245,11 @@ pub const Status = u16;
 pub const STATUS_SUCCESS: Status = 0;
 /// Generic: Invalid Field in Command (the register-shape probe, quirk Q11).
 pub const SC_INVALID_FIELD: Status = 0x02;
+/// Generic: Internal Error, without DNR — nvmet's answer to an I/O command
+/// whose per-controller ref a preempt-and-abort killed (decision 0004 P9b,
+/// P9c) and to the holder pointer's Replace whose `GFP_ATOMIC` copy failed
+/// (P15a).
+pub const SC_INTERNAL: Status = 0x06;
 /// Generic: Host Identifier Inconsistent Format (nvmet's answer to a
 /// short-form report on a fabrics association) — why EDS = 1 goes first.
 pub const SC_HOSTID_INCONSISTENT: Status = 0x18;

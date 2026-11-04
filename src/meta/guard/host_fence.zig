@@ -1180,7 +1180,7 @@ pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map,
 /// The report names THIS host the holder under our key (a failed report:
 /// not proven).
 pub fn holdStands(c: *pr.Client) bool {
-    return c.holdsHere() catch false;
+    return c.admittedHere() catch false;
 }
 
 /// What a process leaving the host's registration gives back (the gate's
@@ -1224,7 +1224,7 @@ pub const HoldOutcome = enum {
 /// or the report's ONE holder preempted (the superseded writer's host
 /// unregistered, its writes refused from here).
 pub fn holdReservation(c: *pr.Client, path: []const u8) error{Refused}!HoldOutcome {
-    const here = c.holdsHere() catch {
+    const here = c.admittedHere() catch {
         log.err("{s}: the reservation report failed before the hold — refusing to arbitrate blind", .{path});
         return error.Refused;
     };

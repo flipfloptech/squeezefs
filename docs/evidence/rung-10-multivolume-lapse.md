@@ -38,10 +38,10 @@ maintenance.
 
 | Run | Result |
 |---|---|
-| Before the fix (`9344bff` on the model commit) | `fidelity.zig:2899` `JoinerFailStopped`: J's volume-1 node image write got `ReservationConflict` and the volume latched FAILED after the grace |
+| Before the fix (`0d2159e`; `9344bff` before the rebase onto §DM) | `fidelity.zig:2899` `JoinerFailStopped`: J's volume-1 node image write got `ReservationConflict` and the volume latched FAILED after the grace |
 | After the fix, ×5 | Green. M: `writer_guard_lapse_beats` 2 (once 1), `writer_guard_lapse_early_ends` 1, `data_pr_lapses` 0; J: `meta_pr_lapse_reregistrations` ≥ 1 |
 
-The unit red (`6d1b55f`) was compile-red: the fence knew no other volume. It pins the re-registration
+The unit red (`b1e8f5f`) was compile-red: the fence knew no other volume. It pins the re-registration
 on volume 1, and it pins that a member recovered on volume 1 first is refused on volume 1 and on
 data.
 
@@ -67,9 +67,19 @@ Trims, with two volumes only: J's post-checks are skipped (always no-ops for a l
 re-registration on volume 1 is not modelled (nothing reads it), and a guard with no lapse ends at
 once. The one-volume state counts are unchanged.
 
-## Checks
+## Checks (kernel.org 7.3.1, `nvme_core.multipath=N`; the full list in decision 0003 §DN.8)
 
-See decision 0003 §DN.8 for the full list (kernel.org 7.3.1, `nvme_core.multipath=N`).
+| Check | Before the rebase onto §DM | At the final head |
+|---|---|---|
+| The fidelity red | Green ×5 | Failing again on `0d2159e`; green ×5 |
+| Models | Hold; every weakening fails | (in the units) |
+| Focused units | 645 / 74 skip / 0 fail | 649 / 74 / 0 |
+| nvmet tier | ×3 idle and ×1 under cpu+smoke load (≈ 47): 71 / 1 skipped (multipath-tcp) / 0 each | ×1 idle: the same |
+| 27 eviction / re-join / KILL rows | ×3: 71/71 each | ×1: 71/71 |
+| Data-plane rows | ×2: 48 / 1 skipped (FUSE_SYNCFS) / 0 each | — |
+| Full smoke | 186 / 199 (13 skipped) | — |
+| FULL `zig build test` | 23/23 steps; 3,318 / 3,512 (194 skipped), 0 failed | 23/23; 3,322 / 3,516 (194 skipped), 0 failed |
+| Rails, `zig fmt --check` | Green, clean | 34/34, clean |
 
 No hot path changes: the extra work runs at the beat cadence, as one report per joined volume, and
 pages are read only during a lapse or around a fresh registration.

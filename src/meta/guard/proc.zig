@@ -1,8 +1,10 @@
 //! The guard's host readers (Linux): the local writer identity (boot id,
 //! pid, `/proc/self/stat` start ticks, hostname), the dead-pid prover over
-//! `/proc/<pid>/stat`, and the `/etc/nvme/{hostnqn,hostid}` defaults —
-//! READ ONLY (quirk Q7: a mount never mints or writes host configuration;
-//! an absent file reads as empty).
+//! `/proc/<pid>/stat` and a pidfd (`startTicksOf`: the thread group's
+//! death; `pin`, which the umount verb shares), and the
+//! `/etc/nvme/{hostnqn,hostid}` defaults — READ ONLY (quirk Q7: a mount
+//! never mints or writes host configuration; an absent file reads as
+//! empty).
 //!
 //! ## Layer A's wait law (`flockExclusive`)
 //!
@@ -18,9 +20,10 @@
 //!   refused. Exiting is one of (`Exiting`): the lock's creator pid is
 //!   gone or a zombie while the lock stands (its supervisor's replay
 //!   holds the guard's open file description — charter §5.2 "a
-//!   successor's `flock` waits out the replay"); the pid is alive and
-//!   its mount (its argv's mountpoint) has no FUSE entry in the mount
-//!   table (its own `umount2` landed and the dismount pass runs — or it
+//!   successor's `flock` waits out the replay"; or its main thread is a
+//!   zombie while its other threads finish the teardown); the pid is
+//!   alive and its mount (its argv's mountpoint) has no FUSE entry in the
+//!   mount table (its own `umount2` landed and the dismount pass runs — or it
 //!   is still bringing up, which resolves to the next case within its
 //!   own bound); the pid is alive and attached, and a `squeezefs umount
 //!   <its mountpoint>` stands in the process table (the orderly stop's
@@ -133,21 +136,54 @@ pub fn parseUuid(text: []const u8) ?[16]u8 {
     return out;
 }
 
-/// Field 22 of `/proc/<pid>/stat` (start time, clock ticks since boot).
-/// The comm field is parenthesised and may hold spaces, so the parse
-/// resumes after the LAST ')'. Null = no such process (or unreadable —
-/// which the proof reads the same way: nothing alive answers to the pid),
-/// and a ZOMBIE or dead task (state `Z`/`X`: exited, its parent has not
-/// reaped it — a supervisor's probe interval away): it holds no fd and
-/// writes nothing, and its pid cannot be reused while it stands.
+/// THE death proof (decision 0003 §DF): the start ticks of `pid` (field
+/// 22 of `/proc/<pid>/stat`, clock ticks since boot) while its THREAD
+/// GROUP lives; null once every thread of it has exited, or for no such
+/// process (or an unreadable one — nothing alive answers to the pid). A
+/// running or stopped main thread is a live group. A main thread that
+/// exited first reads `Z` while the group's other threads still run, hold
+/// its fd table and can still issue I/O, so a stat that reads `Z` or `X`
+/// is judged on a pidfd (`pin`), readable only once no thread is left
+/// (`pidfd_poll`). A zombie whose group is empty, a task its parent is
+/// reaping (`X`) and a released pid are dead: none holds an fd (`do_exit`
+/// closes a thread's files before its `exit_notify`), and a zombie's pid
+/// cannot be reused while it stands. A pidfd refused other than by ESRCH
+/// proves nothing: the process reads alive (logged), never dead.
 pub fn startTicksOf(pid: u32) ?u64 {
-    var pb: [64]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/stat", .{pid}, 0) catch return null;
     var buf: [1024]u8 = undefined;
-    const text = readSmall(path.ptr, &buf) orelse return null;
-    return parseStartTicks(text);
+    const text = readStat(pid, &buf) orelse return null;
+    const ticks = parseStartTicks(text) orelse return null;
+    if (!statExited(text)) return ticks;
+    switch (pin(@intCast(pid), ticks)) {
+        .pinned => |p| {
+            defer p.close();
+            return if (p.exited()) null else ticks;
+        },
+        .gone => return null,
+        .refused => |e| {
+            log.warn("pid {d}: its main thread has exited and pidfd_open refused it ({t}) — no proof that its other threads are gone, so it reads ALIVE", .{ pid, e });
+            return ticks;
+        },
+    }
 }
 
+/// The start ticks of `pid` in ANY state (`parseStartTicks`): with the pid,
+/// a process's identity for this boot. Null = no such process.
+pub fn startTicksAnyState(pid: u32) ?u64 {
+    var buf: [1024]u8 = undefined;
+    return parseStartTicks(readStat(pid, &buf) orelse return null);
+}
+
+/// `/proc/<pid>/stat` whole (raw syscalls); null = no such process.
+fn readStat(pid: u32, buf: []u8) ?[]const u8 {
+    var pb: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/stat", .{pid}, 0) catch return null;
+    return readSmall(path.ptr, buf);
+}
+
+/// Field 22 of a `/proc/<pid>/stat` line (start time), in any state. The
+/// comm field is parenthesised and may hold spaces and parens, so the
+/// parse resumes after the LAST ')'.
 pub fn parseStartTicks(stat: []const u8) ?u64 {
     const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return null;
     if (close + 2 > stat.len) return null;
@@ -155,10 +191,71 @@ pub fn parseStartTicks(stat: []const u8) ?u64 {
     var it = std.mem.tokenizeScalar(u8, stat[close + 2 ..], ' ');
     var idx: usize = 3;
     while (it.next()) |tok| : (idx += 1) {
-        if (idx == 3 and (std.mem.eql(u8, tok, "Z") or std.mem.eql(u8, tok, "X"))) return null; // field 3 is the state letter (proc(5))
         if (idx == 22) return std.fmt.parseInt(u64, tok, 10) catch null;
     }
     return null;
+}
+
+/// Has the task of a `/proc/<pid>/stat` line exited: state `Z` (a zombie,
+/// its parent has not reaped it) or `X` (its parent's wait is reaping it)?
+/// Of a process that is its MAIN thread alone: the other threads of its
+/// group may still run (`startTicksOf` judges the group).
+pub fn statExited(stat: []const u8) bool {
+    const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return false;
+    const rest = std.mem.trimStart(u8, stat[close + 1 ..], " ");
+    return rest.len != 0 and (rest[0] == 'Z' or rest[0] == 'X');
+}
+
+/// A process pinned by a pidfd (`pin`): a signal through it reaches exactly
+/// that process, and its readiness is its whole thread group's exit.
+pub const Pinned = struct {
+    fd: linux.fd_t,
+
+    /// Has the whole thread group exited? A pidfd reads POLLIN once the
+    /// main thread has exited AND no thread of its group is left
+    /// (`pidfd_poll`'s `delay_group_leader`); from then on a zombie, a task
+    /// its parent is reaping and a released process all read exited, for
+    /// good. A poll that fails reads as not yet.
+    pub fn exited(self: Pinned) bool {
+        var pfd = [1]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
+        const rc = linux.poll(&pfd, 1, 0);
+        return linux.errno(rc) == .SUCCESS and rc == 1 and pfd[0].revents & linux.POLL.IN != 0;
+    }
+
+    pub fn close(self: Pinned) void {
+        _ = linux.close(self.fd);
+    }
+};
+
+pub const PinOutcome = union(enum) {
+    pinned: Pinned,
+    /// Gone already (ESRCH), or the pid now names another process (its
+    /// start ticks differ from the ones read before).
+    gone,
+    /// `pidfd_open` refused with this errno: EINVAL and ENOSYS cannot
+    /// happen on the kernel floor (≥ 7.3; pidfd_open is 5.3's), ENOENT is a
+    /// thread's id (no process's), EMFILE/ENFILE/ENOMEM/ENODEV a resource.
+    /// Never read as dead.
+    refused: linux.E,
+};
+
+/// Pin the process `pid` whose start ticks were read as `start_ticks`: a
+/// pidfd on the pid, the start ticks re-read after the open (any state)
+/// equal to them — the process then lived from that read through the open
+/// (a pid is never reissued while its process stands), so the pidfd is its.
+pub fn pin(pid: linux.pid_t, start_ticks: u64) PinOutcome {
+    const rc = linux.pidfd_open(pid, 0);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        .SRCH => return .gone,
+        else => |e| return .{ .refused = e },
+    }
+    const p: Pinned = .{ .fd = @intCast(rc) };
+    if (startTicksAnyState(@intCast(pid)) != start_ticks) {
+        p.close();
+        return .gone;
+    }
+    return .{ .pinned = p };
 }
 
 fn startTicksFn(_: ?*anyopaque, pid: u32) ?u64 {
@@ -170,8 +267,8 @@ pub const probe: claim.PidProbe = .{ .ctx = null, .startTicksOf = startTicksFn }
 
 /// The live process of this host whose incarnation is `writer_id` at
 /// `slot` — `claim.Identity.writerId` over `local`'s boot id and hostname
-/// and each process's pid and start ticks (a zombie answers none,
-/// `startTicksOf`). One `/proc` walk; null = none alive (or `/proc`
+/// and each process's pid and start ticks (a process whose every thread
+/// has exited answers none, `startTicksOf`). One `/proc` walk; null = none alive (or `/proc`
 /// unreadable: no proof).
 pub fn liveWriterPid(io: Io, local: claim.Identity, slot: u16, writer_id: u64) ?linux.pid_t {
     var proc_dir = Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return null;
@@ -184,15 +281,16 @@ pub fn liveWriterPid(io: Io, local: claim.Identity, slot: u16, writer_id: u64) ?
     return null;
 }
 
-/// The proof for ONE pid: the live (non-zombie) process `pid` of this host
-/// IS the incarnation `writer_id` at `slot` — its start ticks and this
-/// host's boot id and hostname recompute the writer id. `liveWriterPid`
-/// runs it over every pid; a registry that names the pid runs it alone
-/// (`host_fence.zig`).
+/// The proof for ONE pid: the live process `pid` of this host (a thread of
+/// its group still runs, `startTicksOf`) IS the incarnation `writer_id` at
+/// `slot` — its start ticks and this host's boot id and hostname recompute
+/// the writer id. The id is matched first, so the walk judges the life of
+/// that pid alone. `liveWriterPid` runs it over every pid; a registry that
+/// names the pid runs it alone (`host_fence.zig`).
 pub fn isWriterIncarnation(local: claim.Identity, pid: u32, slot: u16, writer_id: u64) bool {
-    const ticks = startTicksOf(pid) orelse return false;
+    const ticks = startTicksAnyState(pid) orelse return false;
     const candidate: claim.Identity = .{ .boot_id = local.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
-    return candidate.writerId(slot) == writer_id;
+    return candidate.writerId(slot) == writer_id and startTicksOf(pid) == ticks;
 }
 
 /// This process's identity: boot id, pid, its own start ticks (0 when
@@ -366,10 +464,14 @@ pub fn flockExclusive(io: Io, fd: linux.fd_t, waits: Waits, locker: *?Holder) li
 
 /// Why a holder of this binary reads as EXITING (module doc).
 pub const Exiting = enum {
-    /// The lock's creator pid is gone or a zombie while the lock stands:
-    /// an inheritor of its open file description holds it — the
+    /// The lock's creator is gone, every thread of it, while the lock
+    /// stands: an inheritor of its open file description holds it — the
     /// supervisor's replay (charter §5.2).
     replay,
+    /// The creator's main thread has exited while other threads of its
+    /// group still run and hold the description (an `exit_group`
+    /// teardown in progress): its last thread releases it.
+    teardown,
     /// Alive, a `squeezefs mount` whose mountpoint has no FUSE entry in
     /// the mount table: its own `umount2` landed and its dismount pass
     /// runs (or it is still bringing up).
@@ -381,6 +483,7 @@ pub const Exiting = enum {
     pub fn text(self: Exiting) []const u8 {
         return switch (self) {
             .replay => "its process is gone and its supervisor holds the lock through the journal tail's replay",
+            .teardown => "its main thread has exited and its other threads are finishing the teardown",
             .detached => "its mount has left the mount table and its dismount pass runs",
             .umount_in_flight => "a `squeezefs umount` of its mountpoint is in flight",
         };
@@ -388,17 +491,25 @@ pub const Exiting = enum {
 };
 
 /// The one judgement of a locker (module doc): null = not exiting (a LIVE
-/// holder of this binary, or a foreign one). A creator that is gone or a
-/// zombie while its lock stands is the replay whatever its exe read as
-/// (a dead pid's `/proc/<pid>/exe` is unreadable, so `squeezefs` is false
-/// for every dead creator); a live foreign locker is never judged.
+/// holder of this binary, or a foreign one). A creator whose main thread
+/// has exited while its lock stands is exiting whatever its exe read as (a
+/// dead main thread's `/proc/<pid>/exe` is unreadable, so `squeezefs` is
+/// false for it): its teardown while other threads of its group still
+/// run, else the replay; a live foreign locker is never judged.
 pub fn judgeExiting(io: Io, pid: linux.pid_t, squeezefs: bool) ?Exiting {
-    if (startTicksOf(@intCast(pid)) == null) return .replay;
+    if (mainThreadExited(@intCast(pid))) return if (startTicksOf(@intCast(pid)) != null) .teardown else .replay;
     if (!squeezefs) return null;
     var mp_buf: [linux.PATH_MAX]u8 = undefined;
     const mountpoint = mountpointOfPid(pid, &mp_buf) orelse return null;
     if (!fuseAttached(io, mountpoint)) return .detached;
     return if (umountInFlight(io, mountpoint)) .umount_in_flight else null;
+}
+
+/// Has the main thread of `pid` exited (no such process, or its stat reads
+/// `Z`/`X`)? The other threads of its group may still run.
+fn mainThreadExited(pid: u32) bool {
+    var buf: [1024]u8 = undefined;
+    return statExited(readStat(pid, &buf) orelse return true);
 }
 
 /// Is a FUSE mount attached at exactly `mountpoint` (the mount table, as
@@ -874,12 +985,15 @@ test "the death proof is the THREAD GROUP's: a process whose main thread exited 
     try testing.expect(!probe.provablyDead(pid, ticks));
     try testing.expect(isWriterIncarnation(me, pid, 0x0819, wid));
     try testing.expectEqual(@as(?linux.pid_t, w.pid), liveWriterPid(testing.io, me, 0x0819, wid));
+    // The writer lock's wait law: an exiting holder, its teardown.
+    try testing.expectEqual(@as(?Exiting, .teardown), judgeExiting(testing.io, w.pid, false));
     // The last thread gone: the zombie leader alone is dead, the flock free.
     try testing.expect(w.release());
     w.awaitGroupExit();
     try testing.expect(!flockHeldElsewhere(lock_path.ptr));
     try testing.expect(probe.provablyDead(pid, ticks));
     try testing.expect(!isWriterIncarnation(me, pid, 0x0819, wid));
+    try testing.expectEqual(@as(?Exiting, .replay), judgeExiting(testing.io, w.pid, false));
     w.reap();
     try testing.expect(probe.provablyDead(pid, ticks));
 }
@@ -904,9 +1018,12 @@ test "liveWriterPid: an incarnation's writer id names its live process on this h
     try testing.expectEqual(@as(?linux.pid_t, null), liveWriterPid(testing.io, me, 0x0819, theirs.writerId(0x0819)));
 }
 
-test "a ZOMBIE holder is dead: a daemon that exited under a supervisor that reaps on its 5 s probe still has /proc/<pid>/stat (state Z, its start ticks) — it holds no fd, writes nothing, and its pid cannot be reused, so the claim it left is reclaimable at once (xfstests' _flakey_drop_and_remount remounts within 50 ms)" {
-    try testing.expect(parseStartTicks("1234 (sqz) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 6559818 20 21") == null);
-    try testing.expect(parseStartTicks("1234 (sqz) X 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 6559818 20 21") == null);
+test "a ZOMBIE holder whose every thread is gone is dead: a daemon that exited under a supervisor that reaps on its 5 s probe still has /proc/<pid>/stat (state Z, its start ticks) — it holds no fd, writes nothing, and its pid cannot be reused, so the claim it left is reclaimable at once (xfstests' _flakey_drop_and_remount remounts within 50 ms); its stat keeps its identity, and Z or X says only that its main thread exited" {
+    try testing.expectEqual(@as(?u64, 6559818), parseStartTicks("1234 (sqz) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 6559818 20 21"));
+    try testing.expect(statExited("1234 (sqz) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 6559818 20 21"));
+    try testing.expect(statExited("1234 (sqz) X 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 6559818 20 21"));
+    try testing.expect(!statExited("1234 (a) Z) S 1 2 3"));
+    try testing.expect(!statExited("garbage"));
     // A real zombie: a child that exited and is not yet reaped.
     var child = try std.process.spawn(testing.io, .{ .argv = &.{"true"}, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
     const pid: u32 = @intCast(child.id.?);
@@ -922,6 +1039,7 @@ test "a ZOMBIE holder is dead: a daemon that exited under a supervisor that reap
         if (close + 2 < text.len and text[close + 2] == 'Z') break;
         try testing.io.sleep(.fromMilliseconds(1), .awake);
     }
+    try testing.expect(startTicksAnyState(pid) != null);
     try testing.expect(startTicksOf(pid) == null);
     try testing.expect(probe.provablyDead(pid, 1));
 }
@@ -1097,7 +1215,7 @@ const TornCensus = struct {
         return error.NoAffinity;
     }
 
-    fn pin(cpu: usize) !void {
+    fn pinCpu(cpu: usize) !void {
         var one: linux.cpu_set_t = @splat(0);
         one[cpu / @bitSizeOf(usize)] = @as(usize, 1) << @intCast(cpu % @bitSizeOf(usize));
         try linux.sched_setaffinity(0, &one);
@@ -1109,7 +1227,7 @@ const TornCensus = struct {
     /// page size.
     fn take(self: *TornCensus, filler: [:0]const u8, cpu: usize, mask: *const linux.cpu_set_t) !void {
         self.drop();
-        try pin(cpu);
+        try pinCpu(cpu);
         defer linux.sched_setaffinity(0, mask) catch {};
         const rc = linux.open(filler.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         if (linux.errno(rc) != .SUCCESS) return error.FillerUnopenable;
@@ -1247,7 +1365,7 @@ test "a census /proc/locks TORE (a positional seq_file read a page per read(2): 
     var rig = try TornCensus.begin(null);
     defer rig.end();
     // flock(1) inherits the pin: its lock is on `cpu`'s list.
-    try TornCensus.pin(cpu);
+    try TornCensus.pinCpu(cpu);
     const spawned = std.process.spawn(testing.io, .{ .argv = &.{ "flock", "-x", path, "cat" }, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
     try linux.sched_setaffinity(0, &mask);
     var holder = try spawned;
@@ -1312,7 +1430,7 @@ test "a LIVE lock held through a description THIS process holds is named off its
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc_own));
     const own: linux.fd_t = @intCast(rc_own);
     defer _ = linux.close(own);
-    try TornCensus.pin(cpu);
+    try TornCensus.pinCpu(cpu);
     const locked = linux.errno(linux.flock(own, std.posix.LOCK.EX | std.posix.LOCK.NB));
     try linux.sched_setaffinity(0, &mask);
     try testing.expectEqual(linux.E.SUCCESS, locked);
@@ -1350,7 +1468,7 @@ test "a DEAD creator's lock on a description THIS process holds (the replay hold
         _ = linux.close(supervisor_fd);
     };
     // The creator inherits the pin: its lock is on `cpu`'s list.
-    try TornCensus.pin(cpu);
+    try TornCensus.pinCpu(cpu);
     const rc_c = linux.fork();
     if (rc_c == 0) {
         _ = linux.flock(supervisor_fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
@@ -1561,7 +1679,7 @@ test "a census /proc/locks TORE behind an EXITING holder whose description ANOTH
     var ready: [2]linux.fd_t = undefined;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true })));
     // Both children inherit the pin: the lock is on `cpu`'s list.
-    try TornCensus.pin(cpu);
+    try TornCensus.pinCpu(cpu);
     const rc_s = linux.fork();
     if (rc_s == 0) {
         _ = linux.close(hold[1]);

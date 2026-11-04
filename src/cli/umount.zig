@@ -57,9 +57,10 @@
 //! freed externally so the dead connection does not sit there as
 //! `ENOTCONN`; a daemon alive past the exit bound is exit 1 and never
 //! detached from under. The daemon's life is its THREAD GROUP's, read on a
-//! pidfd pinned before the signal (`pin`, the located start ticks re-read
-//! on it): a leader that exited first is a zombie while its other threads
-//! still hold its files (the writer claim, the devices), and no exit.
+//! pidfd pinned before the signal (`proc.pin`, the guard's: the located
+//! start ticks re-read on it): a leader that exited first is a zombie
+//! while its other threads still hold its files (the writer claim, the
+//! devices), and no exit.
 
 const std = @import("std");
 const testkit = @import("../core/testkit.zig");
@@ -209,7 +210,7 @@ pub const Signalled = union(enum) {
     /// build cannot be proven, so no SIGUSR2 — and nothing detached from
     /// under a live daemon (the orderly stop is the way out).
     build_unknown: linux.pid_t,
-    /// No pidfd could be opened on the daemon (`pin`'s refusal): its
+    /// No pidfd could be opened on the daemon (`proc.pin`'s refusal): its
     /// thread group's exit cannot be awaited, so it was not signalled.
     unpinned: struct { pid: linux.pid_t, errno: linux.E },
     fallback: Fallback,
@@ -217,7 +218,8 @@ pub const Signalled = union(enum) {
 
 /// A located daemon: its pid and its start ticks (`/proc/<pid>/stat`
 /// field 22) read at the locate — together its identity for this boot, so
-/// a pid freed and reissued before the pin is another process (`pin`).
+/// a pid freed and reissued before the pin is another process
+/// (`proc.pin`).
 pub const Daemon = struct { pid: linux.pid_t, start_ticks: u64 };
 
 /// Where the daemon of a mountpoint was found (`locateDaemon`).
@@ -237,97 +239,17 @@ pub fn locateDaemon(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8) Loca
             gpa.free(text);
             return .{ .fallback = .no_pid };
         };
-        const ticks = startTicksOf(io, pid) orelse {
+        const ticks = proc.startTicksAnyState(@intCast(pid)) orelse {
             gpa.free(text);
             return .{ .fallback = .daemon_gone };
         };
         return .{ .stats = .{ .daemon = .{ .pid = pid, .start_ticks = ticks }, .text = text } };
     }
     if (daemonByProcess(io, mountpoint)) |pid| {
-        const ticks = startTicksOf(io, pid) orelse return .{ .fallback = .daemon_gone };
+        const ticks = proc.startTicksAnyState(@intCast(pid)) orelse return .{ .fallback = .daemon_gone };
         return .{ .process = .{ .pid = pid, .start_ticks = ticks } };
     }
     return .{ .fallback = .stats_unreadable };
-}
-
-/// The start time of `pid` (`/proc/<pid>/stat` field 22, clock ticks since
-/// boot) in ANY state: a zombie leader's still names it, and its pid cannot
-/// be reissued while it stands. Null when unreadable (no such process).
-fn startTicksOf(io: Io, pid: linux.pid_t) ?u64 {
-    var pb: [64]u8 = undefined;
-    var buf: [1024]u8 = undefined;
-    const path = std.fmt.bufPrint(&pb, "/proc/{d}/stat", .{pid}) catch return null;
-    const text = Io.Dir.cwd().readFile(io, path, &buf) catch return null;
-    return statStartTicks(text);
-}
-
-/// Field 22 of a `/proc/<pid>/stat` line. The comm (field 2) is
-/// parenthesised and may hold spaces and parens, so the count resumes
-/// after the LAST ')' at field 3.
-fn statStartTicks(text: []const u8) ?u64 {
-    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return null;
-    var it = std.mem.tokenizeAny(u8, text[close + 1 ..], " \n");
-    var field: usize = 3;
-    while (it.next()) |tok| : (field += 1) {
-        if (field == 22) return std.fmt.parseInt(u64, tok, 10) catch null; // decimal, as proc(5) prints it
-    }
-    return null;
-}
-
-/// The located daemon pinned by a pidfd: a signal through it reaches
-/// exactly that process, and its exit is its whole thread group's.
-const Pinned = struct {
-    fd: linux.fd_t,
-
-    /// Has the whole thread group exited? A pidfd reads POLLIN once the
-    /// leader has exited AND no thread of its group is left (`pidfd_poll`):
-    /// a leader that exited first is a zombie in `/proc/<pid>/stat` while
-    /// its other threads still run and hold the fd table — the writer
-    /// claim, the devices — and its pidfd is not readable until the last of
-    /// them is gone (they release the files before that: `do_exit` runs
-    /// `exit_files` before `exit_notify`). Then a zombie, a task its
-    /// parent is reaping ('X') and a released process all read exited,
-    /// for good. A poll that fails reads as not yet: the wait runs on to
-    /// its bound.
-    fn exited(self: Pinned) bool {
-        var pfd = [1]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
-        const rc = linux.poll(&pfd, 1, 0);
-        return linux.errno(rc) == .SUCCESS and rc == 1 and pfd[0].revents & linux.POLL.IN != 0;
-    }
-
-    fn close(self: Pinned) void {
-        _ = linux.close(self.fd);
-    }
-};
-
-const PinOutcome = union(enum) {
-    pinned: Pinned,
-    /// Gone already (ESRCH), or the pid now names another process (its
-    /// start ticks differ from the located ones).
-    gone,
-    /// `pidfd_open` refused with this errno: EINVAL and ENOSYS cannot
-    /// happen on the kernel floor (≥ 7.3; pidfd_open is 5.3's), ENOENT is a
-    /// thread's id (no process's), EMFILE/ENFILE/ENOMEM/ENODEV a resource.
-    refused: linux.E,
-};
-
-/// Pin the located daemon: a pidfd on its pid, the start ticks re-read
-/// after the open equal to the located ones (the process then lived from
-/// the locate through the open — a pid is never reissued while its process
-/// stands — so the pidfd is its).
-fn pin(io: Io, d: Daemon) PinOutcome {
-    const rc = linux.pidfd_open(d.pid, 0);
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        .SRCH => return .gone,
-        else => |e| return .{ .refused = e },
-    }
-    const p: Pinned = .{ .fd = @intCast(rc) };
-    if (startTicksOf(io, d.pid) != d.start_ticks) {
-        p.close();
-        return .gone;
-    }
-    return .{ .pinned = p };
 }
 
 /// A `squeezefs mount` process naming a mountpoint (`daemonByProcess`):
@@ -567,7 +489,7 @@ pub fn signalLocated(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, laz
         },
     };
     const pid = daemon.pid;
-    const pinned = switch (pin(io, daemon)) {
+    const pinned = switch (proc.pin(daemon.pid, daemon.start_ticks)) {
         .pinned => |p| p,
         .gone => return .{ .fallback = .daemon_gone },
         .refused => |e| return .{ .unpinned = .{ .pid = pid, .errno = e } },
@@ -857,20 +779,11 @@ fn standInDaemon(dir: [*:0]const u8, out_fd: linux.fd_t, in_fd: linux.fd_t) nore
     linux.exit(127);
 }
 
-/// The tests' liveness: the verdict's own observable, a pidfd's readiness
-/// (`Pinned.exited`), on a fresh pidfd — alive while any thread of the
-/// group runs. An open refused other than by ESRCH reads alive (never a
-/// false gone).
+/// The tests' liveness: the guard's death proof (`proc.startTicksOf`) —
+/// alive while any thread of the group runs, judged on a pidfd's readiness
+/// (the verdict's own observable) once the main thread has exited.
 fn alive(pid: linux.pid_t) bool {
-    const rc = linux.pidfd_open(pid, 0);
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        .SRCH => return false,
-        else => return true,
-    }
-    const p: Pinned = .{ .fd = @intCast(rc) };
-    defer p.close();
-    return !p.exited();
+    return proc.startTicksOf(@intCast(pid)) != null;
 }
 
 test "a mount serving no .stats under a LIVE daemon (a FAILED volume's EIO; a connection the kernel ended — fstests generic/475's soak loop, where the verb detached and returned with the daemon still tearing down and the next mount met its claim): the verb finds the daemon by its process — the supervisor's seat sharing the argv excluded — signals it and waits for its exit; `--lazy` refuses with the build unknown and signals nothing; a path no process names keeps the stats_unreadable fallback" {
@@ -926,7 +839,7 @@ test "a mount serving no .stats under a LIVE daemon (a FAILED volume's EIO; a co
     try testing.expect(watched.target == null);
     try testing.expectEqual(daemon, daemonByProcess(io, dir));
     try testing.expectEqual(@as(?linux.pid_t, null), daemonByProcess(io, "/build/tmp/no-process-mounts-this"));
-    try testing.expectEqual(Located{ .process = .{ .pid = daemon.?, .start_ticks = startTicksOf(io, daemon.?).? } }, locateDaemon(gpa, io, dir));
+    try testing.expectEqual(Located{ .process = .{ .pid = daemon.?, .start_ticks = proc.startTicksAnyState(@intCast(daemon.?)).? } }, locateDaemon(gpa, io, dir));
     try testing.expectEqual(Signalled{ .fallback = .stats_unreadable }, signalDaemon(gpa, io, "/build/tmp/no-process-mounts-this", false, "", &watched));
     // --lazy: no document, no proof of the build, no SIGUSR2 — the daemon lives on.
     try testing.expectEqual(Signalled{ .build_unknown = daemon.? }, signalDaemon(gpa, io, dir, true, "", &watched));
@@ -953,22 +866,19 @@ test "a mount serving no .stats under a LIVE daemon (a FAILED volume's EIO; a co
     // pure census' row above.)
 }
 
-test "the located identity and the pin: field 22 of /proc/<pid>/stat in any state (the comm may hold spaces and parens); the pin is a pidfd whose start ticks re-read after the open are the located ones — a reissued pid (other ticks) and a reaped one are gone, a thread's id is no process's and is refused by its errno with nothing signalled; a pinned live process has not exited" {
+test "the located identity and the pin (`proc.pin`, the guard's): the start ticks in any state; the pin is a pidfd whose start ticks re-read after the open are the located ones — a reissued pid (other ticks) and a reaped one are gone, a thread's id is no process's and is refused by its errno with nothing signalled; a pinned live process has not exited" {
     const io = testing.io;
     const gpa = testing.allocator;
-    try testing.expectEqual(@as(?u64, 987654), statStartTicks("42 (sqz w) x) Z 41 42 42 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 987654 0 0\n"));
-    try testing.expectEqual(@as(?u64, null), statStartTicks("42 (sqz) S 41 42\n"));
-    try testing.expectEqual(@as(?u64, null), statStartTicks("no comm"));
     const me = linux.getpid();
-    const ticks = startTicksOf(io, me).?;
-    switch (pin(io, .{ .pid = me, .start_ticks = ticks })) {
+    const ticks = proc.startTicksAnyState(@intCast(me)).?;
+    switch (proc.pin(me, ticks)) {
         .pinned => |p| {
             defer p.close();
             try testing.expect(!p.exited());
         },
         else => return error.TestUnexpectedResult,
     }
-    try testing.expect(pin(io, .{ .pid = me, .start_ticks = ticks + 1 }) == .gone);
+    try testing.expect(proc.pin(me, ticks + 1) == .gone);
     // A reaped pid: a fork's child, waited.
     const rc = linux.fork();
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
@@ -976,7 +886,7 @@ test "the located identity and the pin: field 22 of /proc/<pid>/stat in any stat
     const dead: linux.pid_t = @intCast(rc);
     var status: i32 = 0;
     _ = linux.waitpid(dead, &status, 0);
-    try testing.expect(pin(io, .{ .pid = dead, .start_ticks = 0 }) == .gone);
+    try testing.expect(proc.pin(dead, 0) == .gone);
     // A thread's id: ENOENT (`pidfd_prepare`: no thread-group linkage).
     var tp: [2]linux.fd_t = undefined;
     var hp: [2]linux.fd_t = undefined;
@@ -1001,8 +911,8 @@ test "the located identity and the pin: field 22 of /proc/<pid>/stat in any stat
     }
     var tid: linux.pid_t = 0;
     try testing.expectEqual(@as(usize, @sizeOf(linux.pid_t)), linux.read(tp[0], @ptrCast(&tid), @sizeOf(linux.pid_t)));
-    const thread: Daemon = .{ .pid = tid, .start_ticks = startTicksOf(io, tid).? };
-    try testing.expectEqual(PinOutcome{ .refused = .NOENT }, pin(io, thread));
+    const thread: Daemon = .{ .pid = tid, .start_ticks = proc.startTicksAnyState(@intCast(tid)).? };
+    try testing.expectEqual(proc.PinOutcome{ .refused = .NOENT }, proc.pin(thread.pid, thread.start_ticks));
     var watched = Watched.init(gpa, io, "/build/tmp/no-mount-here");
     defer watched.deinit();
     try testing.expectEqual(Signalled{ .unpinned = .{ .pid = tid, .errno = .NOENT } }, signalLocated(gpa, io, "/build/tmp/no-mount-here", false, "", &watched, .{ .process = thread }));

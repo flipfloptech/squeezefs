@@ -256,8 +256,9 @@ pub fn hostnameHash(name: []const u8) u64 {
 // ---------------------------------------------------------------------------
 
 /// The pid prover: `startTicksOf(pid)` = the live process's start time in
-/// ticks since boot, null when `/proc/<pid>` is absent. Linux reads
-/// `/proc/<pid>/stat`; tests inject a table.
+/// ticks since boot, null once every thread of it has exited (or no such
+/// process). Linux reads `/proc/<pid>/stat` and, for a main thread that
+/// exited first, a pidfd (`proc.startTicksOf`); tests inject a table.
 pub const PidProbe = struct {
     ctx: ?*anyopaque,
     startTicksOf: *const fn (ctx: ?*anyopaque, pid: u32) ?u64,

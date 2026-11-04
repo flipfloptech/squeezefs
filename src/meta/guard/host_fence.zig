@@ -708,20 +708,18 @@ fn proveIncarnationAlive(ctx: RuleContext, e: *const Entry) bool {
     return false;
 }
 
-/// SIGKILL through a pidfd (the start ticks re-read on it: never another
-/// process under a recycled pid) and the exit awaited on the pidfd. Null =
-/// dead; otherwise why not.
+/// SIGKILL through a pidfd pinned by the entry's start ticks (`proc.pin`:
+/// never another process under a recycled pid) and the whole thread
+/// group's exit awaited on it. Null = dead; otherwise why not.
 fn killSibling(ctx: RuleContext, e: *const Entry) ?[]const u8 {
     if (killRefusedSeam(ctx.env)) return "SQUEEZEFS_TEST_SIBLING_KILL_REFUSED denies its kill";
-    const rc = linux.pidfd_open(@intCast(e.pid), 0);
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        .SRCH => return null,
-        else => return "cannot be opened by pidfd",
-    }
-    const fd: linux.fd_t = @intCast(rc);
-    defer _ = linux.close(fd);
-    if (proc.startTicksOf(e.pid) != e.start_ticks) return null;
+    const pinned = switch (proc.pin(@intCast(e.pid), e.start_ticks)) {
+        .pinned => |p| p,
+        .gone => return null,
+        .refused => return "cannot be opened by pidfd",
+    };
+    defer pinned.close();
+    const fd = pinned.fd;
     switch (linux.errno(linux.pidfd_send_signal(fd, .KILL, null, 0))) {
         .SUCCESS => {},
         .SRCH => return null,

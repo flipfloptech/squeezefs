@@ -2524,6 +2524,117 @@ test "nvmet fidelity: a member's death fences its host on the DATA namespace bef
     try expectNoResidue(rig, set.data_nqn);
 }
 
+test "nvmet fidelity: a PTPL-less target restart under a running set (review MAJOR 2 of decision 0003 §DJ) — tcp: M (host B) manages, J (host C) a live joiner, X (host A) frozen with a held data write and recovered by M (its host preempted on data); both subsystems wiped by hand and restored (nvmet keeps no PTPL: every registration and reservation forgotten) and the controllers reconnect; once M holds the metadata namespace again J writes and syncs — never fail-stopped —, M re-reserves the data namespace WEAR with every live host registered, X resumed is refused by the device, and J's bytes read back exact" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .tcp;
+    const ports = try rig.servicePorts(transport);
+    const set = try daemonSetSized(rig, "lp", transport, ports, &.{}, &.{ "--block-size", "65536" }, data_fence_volume);
+    const cm = set.cm;
+    var tb: [16]u8 = undefined;
+    const t_owner = try std.fmt.bufPrint(&tb, "{d}", .{member_t_owner_ms});
+    const cm_b = try rig.connect(set.meta_nqn, transport, ports[0], ident_b, &.{});
+    const cm_c = try rig.connect(set.meta_nqn, transport, ports[0], ident_c, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var mu_c: [64]u8 = undefined;
+    const meta_uri_c = try std.fmt.bufPrint(&mu_c, "sqmeta://{s}", .{cm_c.dev()});
+    var fb: [128]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/x-lapse-write.fifo", .{rig.root}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    var env_m = try rig.envWith(ident_b);
+    defer env_m.deinit();
+    try env_m.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    var env_j = try rig.envWith(ident_c);
+    defer env_j.deinit();
+    try env_j.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    var env_x = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    defer env_x.deinit();
+    try env_x.put("SQUEEZEFS_TEST_DATA_WRITE_HOLD", fifo);
+    const m = try rig.spawnMountEnv("lp-m", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const j = try rig.spawnMountEnv("lp-j", meta_uri_c, &env_j, &.{});
+    try rig.awaitLog(j, "ready: ", ready_wait_ns);
+    const x = try rig.spawnMountEnv("lp-x", set.metaUri(), &env_x, &.{});
+    try rig.awaitLog(x, "ready: ", ready_wait_ns);
+    // X's first data write, held past its own gates; X frozen and recovered.
+    try testing.expect(try scriptSucceeds(rig, x, "mkdir dx && (head -c 65536 /dev/zero | tr '\\000' X > dx/x) </dev/null >/dev/null 2>&1 &"));
+    try rig.awaitLog(x, "SQUEEZEFS_TEST_DATA_WRITE_HOLD — data volume", ready_wait_ns);
+    _ = linux.kill(rig.daemons.items[x].pid, .STOP);
+    {
+        const sm = try rig.awaitStat(m, "appender_recoveries", 1, ready_wait_ns);
+        defer gpa.free(sm);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "data_pr_preempts"));
+    }
+    // The target restart: both subsystems' objects removed through configfs
+    // (marker-attested, the ledger untouched) and rebuilt by `restore` — the
+    // namespaces enabled afresh with no registrant and no reservation.
+    for ([_][]const u8{ set.meta_nqn, set.data_nqn }) |nqn| {
+        try testing.expect(configfs.isHarnessNqn(nqn));
+        var rec = (try rig.ledgerRecord(nqn)).?;
+        defer rec.deinit(gpa);
+        var ids: [ledger.MAX_LISTENERS]u16 = undefined;
+        _ = try configfs.teardown(configfs.RealFs.face(), gpa, .{ .subnqn = nqn, .port_ids = rec.portIds(&ids), .allow_hosts = &.{}, .host_named_elsewhere = struct {
+            fn f(_: *const anyopaque, _: []const u8) bool {
+                return true;
+            }
+        }.f, .ctx = @ptrCast(&rig) });
+    }
+    const ro = try rig.sqzOk(&.{ "nvmeof", "restore" });
+    defer gpa.free(ro);
+    try testing.expect(std.mem.indexOf(u8, ro, ": restored") != null);
+    // The controllers reconnect and M holds the metadata namespace again.
+    {
+        const sm = try rig.awaitStat(m, "writer_guard_pr_reacquires", 1, g2_wait_ns);
+        defer gpa.free(sm);
+        try testing.expectEqual(@as(u64, 0), try statNumber(sm, "writer_guard_fenced"));
+    }
+    // J was never fail-stopped: it writes and syncs under M's hold.
+    try testing.expect(try scriptSucceeds(rig, j, "head -c 262144 /dev/zero | tr '\\000' L > jl && sync -f . && sync jl"));
+    // M re-reserved the data namespace (every live host re-registered first).
+    {
+        const sm = try rig.awaitStat(m, "data_pr_lapse_rereservations", 1, g2_wait_ns);
+        defer gpa.free(sm);
+        try testing.expectEqual(@as(u64, 0), try statNumber(sm, "data_pr_fence_failures"));
+        const sj = try rig.stats(j);
+        defer gpa.free(sj);
+        try testing.expect(try statNumber(sj, "data_pr_lapse_reregistrations") >= 1);
+        try testing.expect(try statNumber(sj, "meta_pr_lapse_reregistrations") >= 1);
+    }
+    // X resumed: its held write reaches the device and is refused.
+    _ = linux.kill(rig.daemons.items[x].pid, .CONT);
+    try releaseFifoBounded(fifo, 30 * std.time.ns_per_s);
+    try rig.awaitLog(x, "the held write at offset", 30 * std.time.ns_per_s);
+    {
+        const text = try rig.readLog(x);
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "completed: refused") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "reservation-conflict errno class") != null);
+    }
+    // J's bytes, exact, and J writes on.
+    {
+        const out = try rig.onMount(j, "printf '%s %s\\n' \"$(wc -c < jl)\" \"$(tr -d L < jl | wc -c)\"; head -c 65536 /dev/zero | tr '\\000' K > jk && sync jk");
+        defer gpa.free(out);
+        var it = std.mem.tokenizeAny(u8, out, " \n");
+        try testing.expectEqual(@as(u64, 262144), try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10));
+        try testing.expectEqual(@as(u64, 0), try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10));
+    }
+    try rig.kill9(x);
+    try rig.umount(j);
+    try rig.umount(m);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    try rig.disconnect(&cm_c);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
 /// The manager's fencing registrant's controller of `nqn`: the one whose
 /// identity none of the rig's connects carries.
 fn fencerController(rig: *Rig, nqn: []const u8) !?initiator.Controller {

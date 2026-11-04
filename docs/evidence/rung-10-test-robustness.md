@@ -140,3 +140,14 @@ Also on `ddfa698`: the units (the seam's, the cadence's, `core.knobs`) 57/57, fm
 and the full smoke at 185 + 13 skipped of 198. Seen, not changed: under `SQUEEZEFS_META_FLUSH_INTERVAL_MS=0` the row
 fails `drains >= 2`, on `4767b45` too. The strict cadence turns off the shared-size write path, so nothing is parked
 at the close.
+
+**7. The verb's `alive` is monotone over an exit (§CO.37–CO.38; branch `test/umount-live-daemon-flake` off
+`4179803`, Linux 7.3.1-omarchy).** A full gate (shard 9/16) failed the live-daemon unit at `expect(!alive(daemon))`
+right after `signalDaemon` answered `.exited`. The verdict read the stand-in's zombie ('Z'). The test's look then
+passed `kill(pid, 0)` on that zombie, the seat (bash, its parent) reaped it, and the stat read of the released pid
+failed, which `alive` answered as alive. A task mid-reap ('X', EXIT_DEAD) was also counted alive. Now `alive` reads
+the state first, the probe answers only an unreadable stat, and 'X' is gone. Red `441a772` held the window (the seat
+SIGSTOPped through the verdict, a test seam before the stat read continuing it until the pid is released): 5/5.
+Fix `2ec0224`: the unit 20/20 beside the full smoke's 16 shards and 16 busy loops (load 74–109), 10/10 with no
+noise of this work's; `cli.umount` 50/50, the full test, the full smoke, fmt, rails green. The verb's verdicts
+were never wrong (a false alive cost one more poll).

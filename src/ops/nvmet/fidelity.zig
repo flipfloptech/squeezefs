@@ -2640,6 +2640,171 @@ test "nvmet fidelity: a PTPL-less target restart under a running set (review MAJ
     try expectNoResidue(rig, set.data_nqn);
 }
 
+/// A PTPL-less target restart of both subsystems: their configfs objects
+/// removed (marker-attested, the ledger untouched) and rebuilt by `restore`
+/// — the namespaces enabled afresh with no registrant and no reservation.
+fn restartTarget(rig: *Rig, set: anytype) !void {
+    const gpa = rig.gpa;
+    for ([_][]const u8{ set.meta_nqn, set.data_nqn }) |nqn| {
+        try testing.expect(configfs.isHarnessNqn(nqn));
+        var rec = (try rig.ledgerRecord(nqn)).?;
+        defer rec.deinit(gpa);
+        var ids: [ledger.MAX_LISTENERS]u16 = undefined;
+        _ = try configfs.teardown(configfs.RealFs.face(), gpa, .{ .subnqn = nqn, .port_ids = rec.portIds(&ids), .allow_hosts = &.{}, .host_named_elsewhere = struct {
+            fn f(_: *const anyopaque, _: []const u8) bool {
+                return true;
+            }
+        }.f, .ctx = @ptrCast(rig) });
+    }
+    const ro = try rig.sqzOk(&.{ "nvmeof", "restore" });
+    defer gpa.free(ro);
+    try testing.expect(std.mem.indexOf(u8, ro, ": restored") != null);
+}
+
+/// The beats a lapse took, read off the manager's `.stats` (the evidence's
+/// window, counted in beats, never in wall time).
+fn printLapseBeats(rig: *Rig, d: usize, what: []const u8) !void {
+    const sm = try rig.stats(d);
+    defer rig.gpa.free(sm);
+    std.debug.print("\n{s}: writer_guard_lapse_beats {?d}, writer_guard_lapse_early_ends {?d}, data_pr_lapse_beats {?d}, data_pr_lapse_early_rereservations {?d}, data_pr_lapse_kicks {?d}\n", .{ what, json_scan.number(sm, "writer_guard_lapse_beats"), json_scan.number(sm, "writer_guard_lapse_early_ends"), json_scan.number(sm, "data_pr_lapse_beats"), json_scan.number(sm, "data_pr_lapse_early_rereservations"), json_scan.number(sm, "data_pr_lapse_kicks") });
+}
+
+test "nvmet fidelity: the lapse grace ends early once every live host is back (decision 0003 §DL) — tcp: M (host B) manages under a lapse grace far past the row's bound (SQUEEZEFS_TEST_LAPSE_GRACE_S 600), J (host C) a live joiner; both subsystems wiped and restored (nvmet keeps no PTPL); J's beat re-registers its host on both namespaces, and M takes the metadata hold back as soon as every live member's host key in the census is registered there (writer_guard_lapse_early_ends 1, never the grace) and re-reserves the data namespace WEAR at once (data_pr_lapse_early_rereservations 1); J writes and syncs under both; the lapse's beats printed" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .tcp;
+    const ports = try rig.servicePorts(transport);
+    const set = try daemonSetSized(rig, "le", transport, ports, &.{}, &.{ "--block-size", "65536" }, data_fence_volume);
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, ports[0], ident_b, &.{});
+    const cm_c = try rig.connect(set.meta_nqn, transport, ports[0], ident_c, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var mu_c: [64]u8 = undefined;
+    const meta_uri_c = try std.fmt.bufPrint(&mu_c, "sqmeta://{s}", .{cm_c.dev()});
+    var env_m = try rig.envWith(ident_b);
+    defer env_m.deinit();
+    try env_m.put("SQUEEZEFS_TEST_LAPSE_GRACE_S", "600");
+    var env_j = try rig.envWith(ident_c);
+    defer env_j.deinit();
+    const m = try rig.spawnMountEnv("le-m", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const j = try rig.spawnMountEnv("le-j", meta_uri_c, &env_j, &.{});
+    try rig.awaitLog(j, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, j, "head -c 65536 /dev/zero | tr '\\000' P > jp && sync -d jp"));
+    try restartTarget(rig, set);
+    // The controllers reconnect; J's beat re-registers its host; M's hold
+    // returns long before its 600 s grace.
+    {
+        const sm = try rig.awaitStat(m, "writer_guard_pr_reacquires", 1, g2_wait_ns);
+        defer gpa.free(sm);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "writer_guard_pr_reacquires"));
+        try testing.expectEqual(@as(u64, 0), try statNumber(sm, "writer_guard_fenced"));
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "writer_guard_lapse_early_ends"));
+    }
+    {
+        const sm = try rig.awaitStat(m, "data_pr_lapse_rereservations", 1, g2_wait_ns);
+        defer gpa.free(sm);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "data_pr_lapse_rereservations"));
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "data_pr_lapse_early_rereservations"));
+        const sj = try rig.stats(j);
+        defer gpa.free(sj);
+        try testing.expect(try statNumber(sj, "meta_pr_lapse_reregistrations") >= 1);
+        try testing.expect(try statNumber(sj, "data_pr_lapse_reregistrations") >= 1);
+    }
+    try printLapseBeats(rig, m, "the lapse grace's early end (M)");
+    // J writes and syncs under the returned hold and reservation.
+    {
+        const out = try rig.onMount(j, "head -c 262144 /dev/zero | tr '\\000' L > jl && sync -d jl && printf '%s %s\\n' \"$(wc -c < jl)\" \"$(tr -d L < jl | wc -c)\"");
+        defer gpa.free(out);
+        var it = std.mem.tokenizeAny(u8, out, " \n");
+        try testing.expectEqual(@as(u64, 262144), try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10));
+        try testing.expectEqual(@as(u64, 0), try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10));
+    }
+    try rig.umount(j);
+    try rig.umount(m);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    try rig.disconnect(&cm_c);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+test "nvmet fidelity: a member slow on data past the lapse's re-reservation is re-admitted at its refused write, never fail-stopped (decision 0003 §DL) — tcp: M (host B) manages, J (host C) a live joiner whose first lapse beat parks after its metadata re-registration (SQUEEZEFS_TEST_LAPSE_BEAT_HOLD); both subsystems wiped and restored; M takes the hold back and re-reserves the data namespace once the grace passed without J; J's write and sync meet the reservation conflict, and J — registered on the metadata namespace, its page Live, inside the lapse — re-registers its host through the rule and retries (data_pr_refusal_readmissions ≥ 1, no fence latched); its bytes read back exact and it writes on after its beat resumes" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .tcp;
+    const ports = try rig.servicePorts(transport);
+    const set = try daemonSetSized(rig, "ls", transport, ports, &.{}, &.{ "--block-size", "65536" }, data_fence_volume);
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, ports[0], ident_b, &.{});
+    const cm_c = try rig.connect(set.meta_nqn, transport, ports[0], ident_c, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var mu_c: [64]u8 = undefined;
+    const meta_uri_c = try std.fmt.bufPrint(&mu_c, "sqmeta://{s}", .{cm_c.dev()});
+    var fb: [128]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/j-lapse-beat.fifo", .{rig.root}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    var env_m = try rig.envWith(ident_b);
+    defer env_m.deinit();
+    var env_j = try rig.envWith(ident_c);
+    defer env_j.deinit();
+    try env_j.put("SQUEEZEFS_TEST_LAPSE_BEAT_HOLD", fifo);
+    const m = try rig.spawnMountEnv("ls-m", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const j = try rig.spawnMountEnv("ls-j", meta_uri_c, &env_j, &.{});
+    try rig.awaitLog(j, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, j, "head -c 65536 /dev/zero | tr '\\000' P > jp && sync -d jp"));
+    try restartTarget(rig, set);
+    // J's beat re-registers its host on the metadata namespace, then parks
+    // before its data namespace; M re-reserves without it once the grace
+    // passed.
+    try rig.awaitLog(j, "SQUEEZEFS_TEST_LAPSE_BEAT_HOLD — the lapse beat parks", g2_wait_ns);
+    {
+        const sm = try rig.awaitStat(m, "data_pr_lapse_rereservations", 1, g2_wait_ns);
+        defer gpa.free(sm);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "data_pr_lapse_rereservations"));
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "writer_guard_pr_reacquires"));
+    }
+    // J writes and syncs: its first data write meets the conflict, J is
+    // re-admitted and the write retried.
+    try testing.expect(try scriptSucceeds(rig, j, "head -c 262144 /dev/zero | tr '\\000' S > js && sync -d js"));
+    {
+        const sj = try rig.stats(j);
+        defer gpa.free(sj);
+        try testing.expect(try statNumber(sj, "data_pr_write_refusals") >= 1);
+        try testing.expect(try statNumber(sj, "data_pr_refusal_readmissions") >= 1);
+        try testing.expectEqual(@as(u64, 0), try statNumber(sj, "data_dma_fence_refusals"));
+    }
+    try releaseFifoBounded(fifo, 30 * std.time.ns_per_s);
+    try rig.awaitLog(j, "SQUEEZEFS_TEST_LAPSE_BEAT_HOLD — the lapse beat resumes", 30 * std.time.ns_per_s);
+    {
+        const out = try rig.onMount(j, "printf '%s %s\\n' \"$(wc -c < js)\" \"$(tr -d S < js | wc -c)\"; head -c 65536 /dev/zero | tr '\\000' K > jk && sync -d jk");
+        defer gpa.free(out);
+        var it = std.mem.tokenizeAny(u8, out, " \n");
+        try testing.expectEqual(@as(u64, 262144), try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10));
+        try testing.expectEqual(@as(u64, 0), try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10));
+    }
+    try rig.umount(j);
+    try rig.umount(m);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    try rig.disconnect(&cm_c);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
 /// The manager's fencing registrant's controller of `nqn`: the one whose
 /// identity none of the rig's connects carries.
 fn fencerController(rig: *Rig, nqn: []const u8) !?initiator.Controller {

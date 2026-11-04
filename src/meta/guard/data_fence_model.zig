@@ -17,6 +17,15 @@
 //! (`nvmet_pr_do_abort`); a killed process's queued write still arrives (a
 //! requeue).
 //!
+//! Every configuration runs beside both metadata planes (`MetaPlane`,
+//! decision 0003 §DO): `.wero_holder` (a takeover preempts the holder's key,
+//! the code until PR-5) and `.wear_preempt_all` (a takeover is the
+//! successor's preempt-all; the lapse's early end takes the writer keys ∪ the
+//! Live pages' keys — `Lapse{.unlisted_joiner}`, W33). Under
+//! `.wear_preempt_all` a configuration declares `stuck()`, so the explorer's
+//! quiescence and cycle checks run on it; `firstError` names a schedule's
+//! error through `explorer.replayError`.
+//!
 //! `Death` — data namespaces D0 and D1; hosts A (the manager MG), B (the dead
 //! member X; S, a sibling mounting there), C (Y, a live member):
 //!   0 X0  X's in-flight write to its block on D0, frozen: issued at any point
@@ -60,6 +69,54 @@
 
 const std = @import("std");
 
+/// The metadata plane the data models run beside (decision 0003 §DO,
+/// decision 0004 §7.0).
+pub const MetaPlane = enum {
+    /// WERO held by the manager: a takeover preempts the holder's key (the
+    /// code until PR-5).
+    wero_holder,
+    /// Write Exclusive – All Registrants: a takeover is the successor's
+    /// preempt-all; the lapse re-acquire an `acquire`; the lapse's early end
+    /// takes the writer keys ∪ the Live pages' keys. Its configurations
+    /// declare `stuck()` (the explorer's quiescence and cycle checks).
+    wear_preempt_all,
+};
+
+/// `Base` with `stuck()` declared: every unfinished quiescent state is a
+/// strand (decision 0004 §7.5.1).
+fn WithStuck(comptime Base: type) type {
+    return extern struct {
+        const Self = @This();
+        pub const thread_count = Base.thread_count;
+        base: Base = .{},
+
+        pub fn init() Self {
+            return .{ .base = Base.init() };
+        }
+        pub fn done(self: *const Self, t: usize) bool {
+            return self.base.done(t);
+        }
+        pub fn step(self: *Self, t: usize) void {
+            self.base.step(t);
+        }
+        pub fn invariant(self: *const Self) !void {
+            return self.base.invariant();
+        }
+        pub fn final(self: *const Self) !void {
+            return self.base.final();
+        }
+        pub fn stuck(_: *const Self) !void {
+            return error.StrandedAtQuiescence;
+        }
+    };
+}
+
+/// The model type of a configuration: under `.wear_preempt_all` it opts
+/// into the quiescence and cycle checks.
+fn Opted(comptime meta: MetaPlane, comptime Base: type) type {
+    return if (meta == .wear_preempt_all) WithStuck(Base) else Base;
+}
+
 /// The data namespaces' reservation.
 pub const DataRtype = enum {
     /// Write Exclusive – All Registrants: every registrant preempts by key
@@ -85,6 +142,7 @@ pub const FenceOrder = enum {
 };
 
 pub const DeathConfig = struct {
+    meta: MetaPlane = .wero_holder,
     data_rtype: DataRtype = .wear,
     order: FenceOrder = .after_recovering,
     /// An unproven data fence proceeds (the metadata plane's posture, which
@@ -139,6 +197,10 @@ fn indexOf(comptime seq: []const MgStep, comptime s: MgStep) u8 {
 }
 
 pub fn Death(comptime cfg: DeathConfig) type {
+    return Opted(cfg.meta, DeathModel(cfg));
+}
+
+fn DeathModel(comptime cfg: DeathConfig) type {
     return extern struct {
         const Self = @This();
         pub const thread_count: usize = 5 + @as(usize, @intFromBool(cfg.colocated)) + @intFromBool(cfg.transient_d1);
@@ -473,6 +535,7 @@ pub const Reconcile = enum {
 };
 
 pub const SuccessionConfig = struct {
+    meta: MetaPlane = .wero_holder,
     data_rtype: enum { wear, none } = .wear,
     reconcile: Reconcile = .unregistered_on_meta,
     /// M froze inside its own data admission.
@@ -494,6 +557,10 @@ const D: u8 = 3;
 const NONE: u8 = 4;
 
 pub fn Succession(comptime cfg: SuccessionConfig) type {
+    return Opted(cfg.meta, SuccessionModel(cfg));
+}
+
+fn SuccessionModel(comptime cfg: SuccessionConfig) type {
     return extern struct {
         const Self = @This();
         pub const thread_count: usize = 3 + @as(usize, @intFromBool(cfg.leaver));
@@ -618,11 +685,28 @@ pub fn Succession(comptime cfg: SuccessionConfig) type {
         fn successor(self: *Self, s: usize, h: u8) void {
             switch (self.pc[s + 1]) {
                 0 => self.mreg[h] = true,
-                // The metadata hold: the holder's key preempted.
-                1 => if (self.holder != h) {
-                    self.victim[s] = self.holder;
-                    self.mreg[self.holder] = false;
-                    self.holder = h;
+                // The metadata takeover: WERO, the holder's key preempted;
+                // WEAR, the preempt-all — every other host unregistered (the
+                // predecessor whose page key enters the debt: the holder).
+                1 => switch (cfg.meta) {
+                    .wero_holder => if (self.holder != h) {
+                        self.victim[s] = self.holder;
+                        self.mreg[self.holder] = false;
+                        self.holder = h;
+                    },
+                    .wear_preempt_all => {
+                        // P8: a host the preempt-all of a racing successor
+                        // removed cannot preempt.
+                        if (!self.mreg[h]) {
+                            self.stopped[s] = true;
+                            return;
+                        }
+                        if (self.holder != h) self.victim[s] = self.holder;
+                        for (0..4) |k| {
+                            if (k != h) self.mreg[k] = false;
+                        }
+                        self.holder = h;
+                    },
                 },
                 // A superseded successor's admission stops at its re-check or
                 // its hold check (its acts refused from here).
@@ -716,7 +800,18 @@ pub const MetaEarly = enum {
     registrants,
 };
 
+/// Which keys the lapse's early end outside a succession requires under WEAR
+/// (§4.6, round-3 issue 4).
+pub const LapseEarly = enum {
+    /// `writerKeys` ∪ the host keys of the Live pages with no death record
+    /// (as built).
+    writer_keys_and_pages,
+    /// W33: `writerKeys` alone.
+    writer_keys_only,
+};
+
 pub const LapseConfig = struct {
+    meta: MetaPlane = .wero_holder,
     /// The metadata namespace lapses with the data namespace (one target).
     meta_too: bool = true,
     /// Members re-register after a lapse (the beat); false: the code before.
@@ -774,6 +869,10 @@ pub const LapseConfig = struct {
     /// Whose registrations end volume 1's grace early: its own namespace's
     /// (as built — each guard reads its own report); `.volume0`: volume 0's.
     early_from: EarlyFrom = .own_volume,
+    /// J's page is Live but its membership join has not landed: J is not
+    /// among the writer keys (round-3 issue 4).
+    unlisted_joiner: bool = false,
+    lapse_early: LapseEarly = .writer_keys_and_pages,
     strict: LapseStrict = .{},
 };
 
@@ -836,6 +935,10 @@ pub const Scope = enum { every_volume, volume0 };
 /// windows (`LapseStrict`). `final`: `LapseUnbounded` every namespace is
 /// reserved again; `RecoveryStuck` X's region released.
 pub fn Lapse(comptime cfg: LapseConfig) type {
+    return Opted(cfg.meta, LapseModel(cfg));
+}
+
+fn LapseModel(comptime cfg: LapseConfig) type {
     return extern struct {
         const Self = @This();
         pub const thread_count: usize = 9;
@@ -985,9 +1088,16 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
             const v: u1 = if (cfg.early_from == .volume0) 0 else v_in;
             return switch (cfg.meta_early) {
                 .grace_only => false,
-                .census => self.m_reg[v][C] and (!self.x_listed or self.m_reg[v][B]),
+                .census => (!self.jRequired() or self.m_reg[v][C]) and (!self.x_listed or self.m_reg[v][B]),
                 .registrants => true,
             };
+        }
+
+        /// The early end requires J's key: J listed among the writer keys,
+        /// or (WEAR, as built) its page Live with no death record.
+        fn jRequired(_: *const Self) bool {
+            if (!cfg.unlisted_joiner) return true;
+            return cfg.meta == .wear_preempt_all and cfg.lapse_early == .writer_keys_and_pages;
         }
 
         /// A refused member's re-admission may register: its lapse seen,
@@ -1394,170 +1504,243 @@ const explorer = @import("../../model/explorer.zig");
 const limits: explorer.Limits = .{};
 const testing = std.testing;
 
+/// Every check runs beside both metadata planes (decision 0004 §7.0).
+const metas = [_]MetaPlane{ .wero_holder, .wear_preempt_all };
+
+fn withMeta(c: LapseConfig, mp: MetaPlane) LapseConfig {
+    var out = c;
+    out.meta = mp;
+    return out;
+}
+
 fn statesOf(comptime M: type) !explorer.Report {
     var report: explorer.Report = undefined;
     try explorer.explore(M, testing.allocator, limits, &report);
     return report;
 }
 
-/// The invariant a failing schedule breaks first.
+/// The invariant a failing schedule breaks first, named by the replay that
+/// mirrors the search (`explorer.replayError`).
 fn firstError(comptime M: type) anyerror {
     var report: explorer.Report = undefined;
     explorer.explore(M, testing.allocator, limits, &report) catch |explored| {
-        if (explored != error.InvariantViolated and explored != error.FinalViolated) return explored;
-        defer testing.allocator.free(report.schedule);
-        var m = M.init();
-        for (report.schedule) |t| {
-            m.step(t);
-            m.invariant() catch |e| return e;
+        switch (explored) {
+            error.InvariantViolated, error.FinalViolated, error.StuckViolated, error.CycleViolated => {},
+            else => return explored,
         }
-        m.final() catch |e| return e;
-        return error.NoInvariantNamed;
+        defer testing.allocator.free(report.schedule);
+        return explorer.replayError(M, report.schedule);
     };
     return error.ModelHolds;
 }
 
 test "data fence model: a member's death on data namespaces as built — WEAR, every member host registered, the manager's own client preempts-and-aborts the dead host's key on every data namespace after the page went Recovering, the release only once every fence is proven (the next poll re-runs otherwise), a sibling's data registration through the rule with the data node's drain, its re-judge and the metadata re-check, the kept law at the last registrant — holds: no stale write lands on a reallocated block, no block reallocated while its dead writer can still land there, no Live member killed, the region released" {
-    try explorer.expectHolds(Death(.{}), limits);
-    const r = try statesOf(Death(.{}));
-    std.debug.print("\ndata fence model (death): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
+    inline for (metas) |mp| {
+        try explorer.expectHolds(Death(.{ .meta = mp }), limits);
+        const r = try statesOf(Death(.{ .meta = mp }));
+        std.debug.print("\ndata fence model [{t}] (death): {d} states explored, depth {d}\n", .{ mp, r.states, r.max_depth_seen });
+    }
 }
 
 test "data fence model: a co-located member's death as built — the own-key guard withholds the data preempt, the recoverer on the same host kills it by the rule and drains its queue before the release — holds" {
-    try explorer.expectHolds(Death(.{ .colocated = true }), limits);
-    const r = try statesOf(Death(.{ .colocated = true }));
-    std.debug.print("\ndata fence model (death, co-located): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
+    inline for (metas) |mp| {
+        try explorer.expectHolds(Death(.{ .meta = mp, .colocated = true }), limits);
+        const r = try statesOf(Death(.{ .meta = mp, .colocated = true }));
+        std.debug.print("\ndata fence model [{t}] (death, co-located): {d} states explored, depth {d}\n", .{ mp, r.states, r.max_depth_seen });
+    }
 }
 
 test "data fence model: a manager succession on data as built — the successor's admission preempts every data registrant volume 0's metadata namespace no longer registers (the data report first), a late admission withdrawn by its metadata re-check — holds: the superseded manager's in-place write never lands on a block the successor reallocated, through a chain of successors" {
-    try explorer.expectHolds(Succession(.{}), limits);
-    try explorer.expectHolds(Succession(.{ .late_admission = true }), limits);
-    const r = try statesOf(Succession(.{ .late_admission = true }));
-    std.debug.print("\ndata fence model (succession): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
+    inline for (metas) |mp| {
+        try explorer.expectHolds(Succession(.{ .meta = mp }), limits);
+        try explorer.expectHolds(Succession(.{ .meta = mp, .late_admission = true }), limits);
+        const r = try statesOf(Succession(.{ .meta = mp, .late_admission = true }));
+        std.debug.print("\ndata fence model [{t}] (succession): {d} states explored, depth {d}\n", .{ mp, r.states, r.max_depth_seen });
+    }
 }
 
 test "data fence model weakening: no data registration and no reservation (the code before this rung) — a dead member's resumed write lands on its reallocated block; a superseded manager's on the successor's" {
-    try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .data_rtype = .none })));
-    try explorer.expectFails(Succession(.{ .data_rtype = .none }), limits, error.InvariantViolated);
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .meta = mp, .data_rtype = .none })));
+        try explorer.expectFails(Succession(.{ .meta = mp, .data_rtype = .none }), limits, error.InvariantViolated);
+    }
 }
 
 test "data fence model weakening: the blocks reallocated before the data fence (released at Recovering) — the dead member's write lands on the live member's block" {
-    try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .order = .after_release })));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .meta = mp, .order = .after_release })));
+    }
 }
 
 test "data fence model weakening: the holder's own death preempt on nvmet 7.3 semantics (WERO held by the manager, no data fencer) fences nothing — the release waits forever; proceeding on the unproven fence (the metadata posture) reallocates under the dead member's live registration" {
-    try explorer.expectFails(Death(.{ .data_rtype = .wero_holder }), limits, error.FinalViolated);
-    try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .data_rtype = .wero_holder, .proceed_unproven = true })));
+    inline for (metas) |mp| {
+        try explorer.expectFails(Death(.{ .meta = mp, .data_rtype = .wero_holder }), limits, error.FinalViolated);
+        try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .meta = mp, .data_rtype = .wero_holder, .proceed_unproven = true })));
+    }
 }
 
 test "data fence model weakening: the data fence before the page goes Recovering (no data re-fence) — a sibling's rule judges the dead member Live and re-admits its host on data before the release" {
-    // The rule's register window (it judged the member Live) lets its write
-    // land after the reallocation.
-    try testing.expectEqual(error.StaleDataWrite, firstError(Death(.{ .order = .before_recovering })));
+    inline for (metas) |mp| {
+        // The rule's register window (it judged the member Live) lets its write
+        // land after the reallocation.
+        try testing.expectEqual(error.StaleDataWrite, firstError(Death(.{ .meta = mp, .order = .before_recovering })));
+    }
 }
 
 test "data fence model weakening: a plain preempt (no abort) — a write the target admitted before the preempt lands after the reallocation" {
-    try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .abort = false })));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .meta = mp, .abort = false })));
+    }
 }
 
 test "data fence model weakening: a sibling's data registration without the stale-sibling rule, or without the data node's drain after the kill, re-admits the dead member's writes" {
-    try explorer.expectFails(Death(.{ .data_rule = false }), limits, error.InvariantViolated);
-    try explorer.expectFails(Death(.{ .drain = false }), limits, error.InvariantViolated);
+    inline for (metas) |mp| {
+        try explorer.expectFails(Death(.{ .meta = mp, .data_rule = false }), limits, error.InvariantViolated);
+        try explorer.expectFails(Death(.{ .meta = mp, .drain = false }), limits, error.InvariantViolated);
+    }
 }
 
 test "data fence model weakening: the last registrant unregisters although it preempted (no kept law) — the namespace unreserved, the dead member's write lands on the reallocated block" {
-    try testing.expectEqual(error.StaleDataWrite, firstError(Death(.{ .keep_law = false })));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.StaleDataWrite, firstError(Death(.{ .meta = mp, .keep_law = false })));
+    }
 }
 
 test "data fence model weakening: a co-located member's death under the own-key guard alone (no kill by its recoverer) — its write lands on its reallocated block" {
-    try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .colocated = true, .colocated_kill = false })));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .meta = mp, .colocated = true, .colocated_kill = false })));
+    }
 }
 
 test "data fence model weakening: the successor fences only its own hold's victim on data (a chain of superseded managers keeps the first registered), or nothing; a late admission without its metadata re-check re-admits the superseded manager" {
-    try explorer.expectFails(Succession(.{ .reconcile = .victim_only }), limits, error.InvariantViolated);
-    try explorer.expectFails(Succession(.{ .reconcile = .none }), limits, error.InvariantViolated);
-    try explorer.expectFails(Succession(.{ .late_admission = true, .meta_recheck = false }), limits, error.InvariantViolated);
+    inline for (metas) |mp| {
+        try explorer.expectFails(Succession(.{ .meta = mp, .reconcile = .victim_only }), limits, error.InvariantViolated);
+        try explorer.expectFails(Succession(.{ .meta = mp, .reconcile = .none }), limits, error.InvariantViolated);
+        try explorer.expectFails(Succession(.{ .meta = mp, .late_admission = true, .meta_recheck = false }), limits, error.InvariantViolated);
+    }
 }
 
 test "data fence model: a member's death with a data namespace transiently absent at the manager's admission (review MAJOR 1) — step 2c holds while a non-retired set-config volume is neither fenced nor provably unfenceable, until the remedy tables it — holds" {
-    try explorer.expectHolds(Death(.{ .transient_d1 = true }), limits);
-    const r = try statesOf(Death(.{ .transient_d1 = true }));
-    std.debug.print("\ndata fence model (death, transient-absent D1): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
+    inline for (metas) |mp| {
+        try explorer.expectHolds(Death(.{ .meta = mp, .transient_d1 = true }), limits);
+        const r = try statesOf(Death(.{ .meta = mp, .transient_d1 = true }));
+        std.debug.print("\ndata fence model [{t}] (death, transient-absent D1): {d} states explored, depth {d}\n", .{ mp, r.states, r.max_depth_seen });
+    }
 }
 
 test "data fence model weakening (review MAJOR 1): step 2c fences only the manager's table — the transiently absent namespace skipped, the dead member's write lands on its reallocated block there" {
-    try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .transient_d1 = true, .complete_check = false })));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.ReallocatedUnfenced, firstError(Death(.{ .meta = mp, .transient_d1 = true, .complete_check = false })));
+    }
 }
 
 test "data fence model: a manager succession with a joiner leaving between the successor's two reports (review minor 1) — the reconcile's preempt of the already-gone key re-reads the data report and proceeds — holds" {
-    try explorer.expectHolds(Succession(.{ .leaver = true }), limits);
-    try explorer.expectHolds(Succession(.{ .leaver = true, .late_admission = true }), limits);
-    const r = try statesOf(Succession(.{ .leaver = true, .late_admission = true }));
-    std.debug.print("\ndata fence model (succession, a leaver): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
+    inline for (metas) |mp| {
+        try explorer.expectHolds(Succession(.{ .meta = mp, .leaver = true }), limits);
+        try explorer.expectHolds(Succession(.{ .meta = mp, .leaver = true, .late_admission = true }), limits);
+        const r = try statesOf(Succession(.{ .meta = mp, .leaver = true, .late_admission = true }));
+        std.debug.print("\ndata fence model [{t}] (succession, a leaver): {d} states explored, depth {d}\n", .{ mp, r.states, r.max_depth_seen });
+    }
 }
 
 test "data fence model weakening (review minor 1): a reconcile preempt the target refuses (the key already gone) refuses the successor's admission" {
-    try explorer.expectFails(Succession(.{ .leaver = true, .preempt_error = .refuse }), limits, error.FinalViolated);
-    try testing.expectEqual(error.ReconcileRefused, firstError(Succession(.{ .leaver = true, .preempt_error = .refuse })));
+    inline for (metas) |mp| {
+        try explorer.expectFails(Succession(.{ .meta = mp, .leaver = true, .preempt_error = .refuse }), limits, error.FinalViolated);
+        try testing.expectEqual(error.ReconcileRefused, firstError(Succession(.{ .meta = mp, .leaver = true, .preempt_error = .refuse })));
+    }
 }
 
-test "data fence model: a PTPL-less target restart under a running set as built (review MAJOR 2) — every member re-registers at its beat through its currency and the metadata check, the manager re-acquires and re-reserves after the grace (or once every metadata registrant is on data) and reconciles; with the metadata namespace on the same target and without — holds: no live member's write refused, no stale write outside the accepted windows, both namespaces reserved again, the dead member's region released" {
-    try explorer.expectHolds(Lapse(.{}), limits);
-    try explorer.expectHolds(Lapse(.{ .meta_too = false }), limits);
-    const r = try statesOf(Lapse(.{}));
-    std.debug.print("\ndata fence model (lapse): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
-    const r2 = try statesOf(Lapse(.{ .meta_too = false }));
-    std.debug.print("\ndata fence model (lapse, data only): {d} states explored, depth {d}\n", .{ r2.states, r2.max_depth_seen });
+/// The PTPL-less restart's as-built rows on one metadata plane.
+fn ptplLessRestart(comptime mp: MetaPlane) !void {
+    try explorer.expectHolds(Lapse(.{ .meta = mp }), limits);
+    try explorer.expectHolds(Lapse(.{ .meta = mp, .meta_too = false }), limits);
+    const r = try statesOf(Lapse(.{ .meta = mp }));
+    std.debug.print("\ndata fence model [{t}] (lapse): {d} states explored, depth {d}\n", .{ mp, r.states, r.max_depth_seen });
+    const r2 = try statesOf(Lapse(.{ .meta = mp, .meta_too = false }));
+    std.debug.print("\ndata fence model [{t}] (lapse, data only): {d} states explored, depth {d}\n", .{ mp, r2.states, r2.max_depth_seen });
+}
+
+test "data fence model: a PTPL-less target restart under a running set as built (review MAJOR 2) — every member re-registers at its beat through its currency and the metadata check, the manager re-acquires and re-reserves after the grace (or once every metadata registrant is on data) and reconciles; with the metadata namespace on the same target and without — holds: no live member's write refused, no stale write outside the accepted windows, both namespaces reserved again, the dead member's region released [wero_holder]" {
+    try ptplLessRestart(.wero_holder);
+}
+
+test "data fence model: a PTPL-less target restart under a running set as built (review MAJOR 2) — every member re-registers at its beat through its currency and the metadata check, the manager re-acquires and re-reserves after the grace (or once every metadata registrant is on data) and reconciles; with the metadata namespace on the same target and without — holds: no live member's write refused, no stale write outside the accepted windows, both namespaces reserved again, the dead member's region released [wear_preempt_all]" {
+    try ptplLessRestart(.wear_preempt_all);
 }
 
 test "data fence model weakening (review MAJOR 2): no member beat (the code before) — the live member's write is refused once the manager re-reserves (fail-stopped); no manager beat — the namespaces stay unreserved (the lapse unbounded, the recovery stuck)" {
-    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .member_beat = false })));
-    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .member_beat = false, .meta_too = false })));
-    try testing.expectEqual(error.LapseUnbounded, firstError(Lapse(.{ .manager_beat = false })));
-    try testing.expectEqual(error.LapseUnbounded, firstError(Lapse(.{ .manager_beat = false, .meta_too = false })));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .meta = mp, .member_beat = false })));
+        try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .meta = mp, .member_beat = false, .meta_too = false })));
+        try testing.expectEqual(error.LapseUnbounded, firstError(Lapse(.{ .meta = mp, .manager_beat = false })));
+        try testing.expectEqual(error.LapseUnbounded, firstError(Lapse(.{ .meta = mp, .manager_beat = false, .meta_too = false })));
+    }
 }
 
 test "data fence model weakening (review MAJOR 2): the re-acquire and the re-reservation before the grace — the live member, not yet re-registered, is refused" {
-    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .grace = false })));
-    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .grace = false, .meta_too = false })));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .meta = mp, .grace = false })));
+        try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .meta = mp, .grace = false, .meta_too = false })));
+    }
 }
 
 test "data fence model weakening (review MAJOR 2): a lapse re-registration without the member's currency re-admits the dead member's host on metadata and data — its write lands on its reallocated block" {
-    try testing.expectEqual(error.StaleDataWrite, firstError(Lapse(.{ .currency = false })));
-    try explorer.expectFails(Lapse(.{ .currency = false, .meta_check = false, .meta_too = false }), limits, error.InvariantViolated);
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.StaleDataWrite, firstError(Lapse(.{ .meta = mp, .currency = false })));
+        try explorer.expectFails(Lapse(.{ .meta = mp, .currency = false, .meta_check = false, .meta_too = false }), limits, error.InvariantViolated);
+    }
 }
 
 test "data fence model, the lapse's accepted windows are reachable: a write admitted while the namespace is unreserved after the restart; a member's own re-registration admitting its write before its post-check withdraws it" {
-    try testing.expectEqual(error.LapseWindow, firstError(Lapse(.{ .strict = .{ .lapse = true } })));
-    try testing.expectEqual(error.BeatWindow, firstError(Lapse(.{ .strict = .{ .beat_window = true } })));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.LapseWindow, firstError(Lapse(.{ .meta = mp, .strict = .{ .lapse = true } })));
+        try testing.expectEqual(error.BeatWindow, firstError(Lapse(.{ .meta = mp, .strict = .{ .beat_window = true } })));
+    }
 }
 
-test "data fence model (decision 0003 §DL): the lapse as built with the metadata grace's early end — the manager re-acquires the metadata hold as soon as every live member's host key in the census is registered there (else after the grace) and re-reserves the data namespace at once when every metadata registrant is back on data — and a slow member (its data re-registration after the re-reservation) re-admitted at its refused write through its lapse, its metadata registration and its currency, before and after the register, its write retried — holds; the code before the early end holds too (the early end is liveness)" {
-    try explorer.expectHolds(Lapse(.{ .slow_member = true, .x_second_write = false }), limits);
-    try explorer.expectHolds(Lapse(.{ .slow_member = true, .x_second_write = false, .meta_too = false }), limits);
-    try explorer.expectHolds(Lapse(.{ .meta_early = .grace_only }), limits);
-    const r = try statesOf(Lapse(.{ .slow_member = true, .x_second_write = false }));
-    std.debug.print("\ndata fence model (lapse, slow member): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
-    const r2 = try statesOf(Lapse(.{ .slow_member = true, .x_second_write = false, .meta_too = false }));
-    std.debug.print("\ndata fence model (lapse, slow member, data only): {d} states explored, depth {d}\n", .{ r2.states, r2.max_depth_seen });
+/// §DL's as-built rows on one metadata plane.
+fn lapseEarlyEnd(comptime mp: MetaPlane) !void {
+    try explorer.expectHolds(Lapse(.{ .meta = mp, .slow_member = true, .x_second_write = false }), limits);
+    try explorer.expectHolds(Lapse(.{ .meta = mp, .slow_member = true, .x_second_write = false, .meta_too = false }), limits);
+    try explorer.expectHolds(Lapse(.{ .meta = mp, .meta_early = .grace_only }), limits);
+    const r = try statesOf(Lapse(.{ .meta = mp, .slow_member = true, .x_second_write = false }));
+    std.debug.print("\ndata fence model [{t}] (lapse, slow member): {d} states explored, depth {d}\n", .{ mp, r.states, r.max_depth_seen });
+    const r2 = try statesOf(Lapse(.{ .meta = mp, .slow_member = true, .x_second_write = false, .meta_too = false }));
+    std.debug.print("\ndata fence model [{t}] (lapse, slow member, data only): {d} states explored, depth {d}\n", .{ mp, r2.states, r2.max_depth_seen });
+}
+
+test "data fence model (decision 0003 §DL): the lapse as built with the metadata grace's early end — the manager re-acquires the metadata hold as soon as every live member's host key in the census is registered there (else after the grace) and re-reserves the data namespace at once when every metadata registrant is back on data — and a slow member (its data re-registration after the re-reservation) re-admitted at its refused write through its lapse, its metadata registration and its currency, before and after the register, its write retried — holds; the code before the early end holds too (the early end is liveness) [wero_holder]" {
+    try lapseEarlyEnd(.wero_holder);
+}
+
+test "data fence model (decision 0003 §DL): the lapse as built with the metadata grace's early end — the manager re-acquires the metadata hold as soon as every live member's host key in the census is registered there (else after the grace) and re-reserves the data namespace at once when every metadata registrant is back on data — and a slow member (its data re-registration after the re-reservation) re-admitted at its refused write through its lapse, its metadata registration and its currency, before and after the register, its write retried — holds; the code before the early end holds too (the early end is liveness) [wear_preempt_all]" {
+    try lapseEarlyEnd(.wear_preempt_all);
 }
 
 test "data fence model weakening (decision 0003 §DL): the metadata grace ended by the metadata report's own registrants (no census) — the hold returns before the live member re-registered, its metadata write refused" {
-    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .meta_early = .registrants })));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .meta = mp, .meta_early = .registrants })));
+    }
 }
 
 test "data fence model weakening (decision 0003 §DL): a slow member whose refused data write latches the fence (the code before) is fail-stopped although it is live and current" {
-    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .slow_member = true, .x_second_write = false, .ebade_readmit = false })));
-    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .slow_member = true, .x_second_write = false, .ebade_readmit = false, .meta_too = false })));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .meta = mp, .slow_member = true, .x_second_write = false, .ebade_readmit = false })));
+        try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .meta = mp, .slow_member = true, .x_second_write = false, .ebade_readmit = false, .meta_too = false })));
+    }
 }
 
 test "data fence model weakening (decision 0003 §DL): the re-admission at a refused data write without its metadata and currency checks re-admits the dead member's host — its retried write lands on its reallocated block" {
-    try testing.expectEqual(error.StaleDataWrite, firstError(Lapse(.{ .ebade_checks = false })));
-    try explorer.expectFails(Lapse(.{ .ebade_checks = false, .meta_too = false }), limits, error.InvariantViolated);
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.StaleDataWrite, firstError(Lapse(.{ .meta = mp, .ebade_checks = false })));
+        try explorer.expectFails(Lapse(.{ .meta = mp, .ebade_checks = false, .meta_too = false }), limits, error.InvariantViolated);
+    }
 }
 
 test "data fence model, the re-admission's accepted window is reachable (decision 0003 §DL): a member frozen between its re-admission's checks and its register across its whole death admits another in-flight write before its post-check withdraws the registration — the beat window's class" {
-    try testing.expectEqual(error.EbadeWindow, firstError(Lapse(.{ .strict = .{ .ebade_window = true } })));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.EbadeWindow, firstError(Lapse(.{ .meta = mp, .strict = .{ .ebade_window = true } })));
+    }
 }
 
 /// Which targets of a two-metadata-volume set restart (decision 0003 §DN):
@@ -1586,31 +1769,53 @@ fn mvWeakened(comptime r: MvRestart, comptime first: u1, comptime beat: Scope, c
     return c;
 }
 
-test "data fence model (decision 0003 §DN): a two-metadata-volume set as built — every member's lapse beat re-registers its host on EVERY joined metadata volume (its currency: its page Live on every joined volume), each volume's guard re-acquires once every census key is registered on ITS namespace (else after the grace), a member's data checks read every joined volume's registration and page; volume 1's target restarted alone, both targets, volume 0's alone; X recovered on volume 0 first and on volume 1 first — holds: no live member's write refused on either volume, no stale data write, every namespace reserved again, X's region released" {
+/// §DN's as-built rows on one metadata plane.
+fn twoVolumeLapse(comptime mp: MetaPlane) !void {
     inline for (.{ MvRestart.v1_only, MvRestart.both, MvRestart.v0_only }) |r| {
         inline for (.{ 0, 1 }) |first| {
-            const M = Lapse(twoVolumes(r, first));
+            const M = Lapse(withMeta(twoVolumes(r, first), mp));
             try explorer.expectHolds(M, limits);
             const rep = try statesOf(M);
-            std.debug.print("\ndata fence model (lapse, two metadata volumes, restart {t}, volume {d} recovered first): {d} states explored, depth {d}\n", .{ r, first, rep.states, rep.max_depth_seen });
+            std.debug.print("\ndata fence model [{t}] (lapse, two metadata volumes, restart {t}, volume {d} recovered first): {d} states explored, depth {d}\n", .{ mp, r, first, rep.states, rep.max_depth_seen });
         }
     }
 }
 
+test "data fence model (decision 0003 §DN): a two-metadata-volume set as built — every member's lapse beat re-registers its host on EVERY joined metadata volume (its currency: its page Live on every joined volume), each volume's guard re-acquires once every census key is registered on ITS namespace (else after the grace), a member's data checks read every joined volume's registration and page; volume 1's target restarted alone, both targets, volume 0's alone; X recovered on volume 0 first and on volume 1 first — holds: no live member's write refused on either volume, no stale data write, every namespace reserved again, X's region released [wero_holder]" {
+    try twoVolumeLapse(.wero_holder);
+}
+
+test "data fence model (decision 0003 §DN): a two-metadata-volume set as built — every member's lapse beat re-registers its host on EVERY joined metadata volume (its currency: its page Live on every joined volume), each volume's guard re-acquires once every census key is registered on ITS namespace (else after the grace), a member's data checks read every joined volume's registration and page; volume 1's target restarted alone, both targets, volume 0's alone; X recovered on volume 0 first and on volume 1 first — holds: no live member's write refused on either volume, no stale data write, every namespace reserved again, X's region released [wear_preempt_all]" {
+    try twoVolumeLapse(.wear_preempt_all);
+}
+
 test "data fence model weakening (decision 0003 §DN): a member's lapse beat on volume 0's metadata namespace only (the code before) — after a restart of volume 1's target (alone or with volume 0's) volume 1's guard never sees the live member back, takes its hold after the grace and refuses the member's next metadata write there" {
-    try testing.expectEqual(error.LiveFenced, firstError(Lapse(mvWeakened(.v1_only, 0, .volume0, .every_volume))));
-    try testing.expectEqual(error.LiveFenced, firstError(Lapse(mvWeakened(.both, 0, .volume0, .every_volume))));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.LiveFenced, firstError(Lapse(withMeta(mvWeakened(.v1_only, 0, .volume0, .every_volume), mp))));
+        try testing.expectEqual(error.LiveFenced, firstError(Lapse(withMeta(mvWeakened(.both, 0, .volume0, .every_volume), mp))));
+    }
 }
 
 test "data fence model weakening (decision 0003 §DN): a member's currency and its data checks judged on volume 0 alone — X's death recovered on volume 1 first (its data fence proven, its block reallocated) while volume 0 still reads it Live and registered; a restart of both targets lets X re-register on volume 0 and on data, the reconcile keeps it (its key on volume 0's namespace), its write lands on its reallocated block" {
-    try testing.expectEqual(error.StaleDataWrite, firstError(Lapse(mvWeakened(.both, 1, .every_volume, .volume0))));
+    inline for (metas) |mp| {
+        try testing.expectEqual(error.StaleDataWrite, firstError(Lapse(withMeta(mvWeakened(.both, 1, .every_volume, .volume0), mp))));
+    }
 }
 
 test "data fence model weakening (decision 0003 §DN): volume 1's grace ended by volume 0's registrations — a restart of both targets; the live member back on volume 0 but not yet on volume 1, volume 1's guard takes its hold and refuses its metadata write there" {
-    const c = comptime blk: {
-        var c = twoVolumes(.both, 0);
-        c.early_from = .volume0;
-        break :blk c;
-    };
-    try testing.expectEqual(error.LiveFenced, firstError(Lapse(c)));
+    inline for (metas) |mp| {
+        const c = comptime blk: {
+            var c = twoVolumes(.both, 0);
+            c.early_from = .volume0;
+            break :blk c;
+        };
+        try testing.expectEqual(error.LiveFenced, firstError(Lapse(withMeta(c, mp))));
+    }
+}
+
+test "data fence model (decision 0003 §DO): beside WEAR metadata, a joiner whose page is Live but whose membership join has not landed when the target restarts — the lapse's early end takes the writer keys ∪ the Live pages' keys, so the hold waits for its beat — holds; the early end on the writer keys alone (W33) returns the hold before its beat re-registered, its metadata write refused" {
+    try explorer.expectHolds(Lapse(.{ .meta = .wear_preempt_all, .unlisted_joiner = true }), limits);
+    const r = try statesOf(Lapse(.{ .meta = .wear_preempt_all, .unlisted_joiner = true }));
+    std.debug.print("\ndata fence model [wear_preempt_all] (lapse, an unlisted joiner): {d} states explored, depth {d}\n", .{ r.states, r.max_depth_seen });
+    try testing.expectEqual(error.LiveFenced, firstError(Lapse(.{ .meta = .wear_preempt_all, .unlisted_joiner = true, .lapse_early = .writer_keys_only })));
 }

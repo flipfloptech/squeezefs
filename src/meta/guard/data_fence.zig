@@ -68,6 +68,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const counters = @import("../../core/counters.zig");
+const knobs = @import("../../core/knobs.zig");
 const log = @import("../../core/log.zig");
 const clock = @import("../../core/clock.zig");
 const tick = @import("../../sync/tick.zig");
@@ -231,6 +232,11 @@ pub const DataFence = struct {
     io: ?Io = null,
     beat_stop: std.atomic.Value(u32) = .init(0),
     beat_fut: ?Io.Future(void) = null,
+    /// The lapse grace (`claim.lapseGraceNs`).
+    grace_ns: u64 = claim.LAPSE_GRACE_S * std.time.ns_per_s,
+    /// `SQUEEZEFS_TEST_LAPSE_BEAT_HOLD`: the FIFO the first beat that
+    /// re-registered the host on metadata parks on (empty = disarmed).
+    beat_hold: [256:0]u8 = @splat(0),
 
     /// The alert's repeat: a held recovery polls every tick; one line per
     /// half minute keeps the log readable and the alert loud.
@@ -243,7 +249,10 @@ pub const DataFence = struct {
     pub fn create(in: Inputs) Allocator.Error!*DataFence {
         const self = try in.gpa.create(DataFence);
         errdefer in.gpa.destroy(self);
-        self.* = .{ .in = in, .meta = try metaClient(in.gpa, in.meta_face, in.meta_nsid, in.key) };
+        self.* = .{ .in = in, .meta = try metaClient(in.gpa, in.meta_face, in.meta_nsid, in.key), .grace_ns = claim.lapseGraceNs(in.env) };
+        if (knobs.parseStr(in.env.get("SQUEEZEFS_TEST_LAPSE_BEAT_HOLD"))) |fifo| {
+            if (!std.mem.eql(u8, fifo, "off") and fifo.len < self.beat_hold.len) @memcpy(self.beat_hold[0..fifo.len], fifo);
+        }
         return self;
     }
 
@@ -722,11 +731,28 @@ pub const DataFence = struct {
     /// beat. (A retired volume leaves the table at the next fence, which
     /// reads the set config under the table's lock.)
     pub fn beat(self: *DataFence) void {
+        if (!self.in.manager) {
+            self.lock.lock();
+            const fresh = self.metaLapseBeat();
+            self.lock.unlock();
+            if (fresh) self.testBeatHold();
+        }
         self.lock.lock();
         defer self.lock.unlock();
-        if (!self.in.manager) self.metaLapseBeat();
         const now = clock.monotonicNs();
         for (self.vols[0..self.n]) |*v| self.volumeBeat(v, now);
+    }
+
+    /// `SQUEEZEFS_TEST_LAPSE_BEAT_HOLD`, once: park until a writer opens the
+    /// FIFO (a member slow on data past the manager's re-reservation).
+    fn testBeatHold(self: *DataFence) void {
+        if (self.beat_hold[0] == 0) return;
+        const fifo: [:0]const u8 = std.mem.sliceTo(&self.beat_hold, 0);
+        log.warn("test seam: SQUEEZEFS_TEST_LAPSE_BEAT_HOLD — the lapse beat parks after its metadata re-registration, before its data namespaces, until a writer opens {s}", .{fifo});
+        const rc = linux.open(fifo.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) == .SUCCESS) _ = linux.close(@intCast(rc));
+        self.beat_hold[0] = 0;
+        log.warn("test seam: SQUEEZEFS_TEST_LAPSE_BEAT_HOLD — the lapse beat resumes", .{});
     }
 
     /// A data namespace after a lapse (nvmet keeps no PTPL): unreserved and
@@ -745,7 +771,7 @@ pub const DataFence = struct {
         if (self.in.manager and v.lapse_since_ns == 0) {
             v.lapse_since_ns = @max(now, 1);
             stats.data_pr_lapses.inc();
-            log.warn("data volume {s}: the namespace carries no reservation (a PTPL-less target restart? nvmet keeps none) — every live host re-registers at its beat; re-reserved once they are back or after {d} s (decision 0003 §DJ)", .{ v.path(), claim.LAPSE_GRACE_S });
+            log.warn("data volume {s}: the namespace carries no reservation (a PTPL-less target restart? nvmet keeps none) — every live host re-registers at its beat; re-reserved once they are back or after {d} s (decision 0003 §DJ)", .{ v.path(), self.grace_ns / std.time.ns_per_s });
         }
         if (!f.registered) {
             const mf = host_fence.reportFacts(self.meta) catch return;
@@ -766,7 +792,7 @@ pub const DataFence = struct {
         const held = self.meta.holdsHere() catch return;
         if (!held) return;
         const back = self.everyMetaRegistrantOnData(c) catch return;
-        if (!back and now -| v.lapse_since_ns < claim.LAPSE_GRACE_S * std.time.ns_per_s) return;
+        if (!back and now -| v.lapse_since_ns < self.grace_ns) return;
         const acquired = self.reserve(v.path(), c) catch return;
         self.reconcile(v.path(), c) catch return;
         if (acquired) v.acquired = true;
@@ -779,28 +805,30 @@ pub const DataFence = struct {
     /// unregistered ⇒ re-register through the stale-sibling rule while this
     /// incarnation is current (its page Live under its writer id), before
     /// and after. A hold standing with this host unregistered is a fence.
-    fn metaLapseBeat(self: *DataFence) void {
+    /// True = this beat re-registered the host afresh.
+    fn metaLapseBeat(self: *DataFence) bool {
         const meta = self.meta;
-        const f = host_fence.reportFacts(meta) catch return;
-        if (f.registered or f.facts.reserved) return;
-        var reg = self.in.reg orelse return;
-        if (!self.current()) return;
-        reg.lock() catch return;
+        const f = host_fence.reportFacts(meta) catch return false;
+        if (f.registered or f.facts.reserved) return false;
+        var reg = self.in.reg orelse return false;
+        if (!self.current()) return false;
+        reg.lock() catch return false;
         defer reg.unlock();
         const ctx: host_fence.RuleContext = .{ .gpa = self.in.gpa, .env = self.in.env, .path = self.in.meta_path, .local = self.in.local, .node_token = self.in.node_token, .vol_index = 0, .taking_manager = false };
         const fresh = host_fence.registerUnderRule(ctx, &reg, meta, self.in.pages, host_fence.joinRegister(self.in.env)) catch |e| {
             log.warn("meta volume {s}: the lapse re-registration of this host was refused ({s}) — the next beat tries again; once the manager's hold returns this joiner is fenced (decision 0003 §DJ)", .{ self.in.meta_path, @errorName(e) });
-            return;
+            return false;
         };
         if (!self.current()) {
             if (fresh) meta.unregister(meta.key) catch {};
             log.warn("meta volume {s}: this incarnation's page left Live during its lapse re-registration — withdrawn (decision 0003 §DJ)", .{self.in.meta_path});
-            return;
+            return false;
         }
         if (fresh) {
             stats.meta_pr_lapse_reregistrations.inc();
             log.warn("meta volume {s}: re-registered this host under key {x:0>16} after the lapse (a PTPL-less target restart) — before the manager's hold returns (decision 0003 §DJ)", .{ self.in.meta_path, meta.key });
         }
+        return fresh;
     }
 
     /// This incarnation is current: a page of volume 0 Live under its own

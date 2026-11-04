@@ -244,6 +244,7 @@ pub const Guard = struct {
         errdefer gpa.destroy(g);
         g.* = .{ .gpa = gpa, .io = io, .be = be, .mode = opts.mode, .identity = identity, .probe = probe, .posture = .{ .none = .not_nvme_namespace }, .identity_opts = opts.identity, .identity_stamp = .{ .nqn_hash = 0, .id_hash = 0 } };
         if (builtin.is_test) g.test_fencer = opts.test_fencer;
+        g.lapse_grace_ns = claim.lapseGraceNs(be.env);
         if (!identity.bootIdReadable()) log.warn("meta volume {s}: the boot id is unreadable — the same-host dead-pid proof never applies on this host (every foreign claim is judged by the TTL alone)", .{be.path});
 
         // The configured host identity (pair-or-neither).

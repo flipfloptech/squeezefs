@@ -21,6 +21,7 @@
 const std = @import("std");
 const fuzzkit = @import("../../core/fuzzkit.zig");
 const checksum = @import("../../core/checksum.zig");
+const knobs = @import("../../core/knobs.zig");
 
 // ---------------------------------------------------------------------------
 // Constants, with WHY.
@@ -50,6 +51,12 @@ pub const STALE_TTL_S: u64 = 45;
 /// member (decision 0003 §DJ, review MAJOR 2). Below the TTL: the manager's
 /// claim stays fresh across it (no takeover of a lapsed manager that beats).
 pub const LAPSE_GRACE_S: u64 = 2 * HEARTBEAT_INTERVAL_S;
+
+/// The lapse grace in force: `LAPSE_GRACE_S`, or the test seam's
+/// `SQUEEZEFS_TEST_LAPSE_GRACE_S` (a row pinning the grace's early end).
+pub fn lapseGraceNs(env: *const std.process.Environ.Map) u64 {
+    return (knobs.optIntKnob("SQUEEZEFS_TEST_LAPSE_GRACE_S", u64, env) orelse LAPSE_GRACE_S) * std.time.ns_per_s;
+}
 
 /// Quirk Q10's skew term for cross-host claim ages: the membership
 /// derivation's `2 × skew_max` is 45 ms at ±500 ppm over one TTL, floored

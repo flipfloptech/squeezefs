@@ -752,8 +752,36 @@ pub const LapseConfig = struct {
     /// A member re-registers only while its page is Live under its own
     /// writer id (before and after).
     currency: bool = true,
+    /// Decision 0003 §DN: a second metadata volume M1 — the manager holds
+    /// both (one guard each), every member joined both. M1's target lapses
+    /// with `m1_lapse`; the data namespace with `d_lapse` (with `meta_too`
+    /// volume 0's target carries it).
+    meta_volumes: u8 = 1,
+    m1_lapse: bool = false,
+    d_lapse: bool = true,
+    /// The volume whose recovery of X runs first — its metadata preempt, its
+    /// page Recovering, the data fence, the release and the reallocation —
+    /// the other volume's metadata steps after it (volume 1 first: the
+    /// order a volume-0 judgement cannot see).
+    recovery_first: u1 = 0,
+    /// A member's lapse beat re-registers its host on every joined metadata
+    /// volume (as built, §DN); `.volume0`: volume 0's only (the code before).
+    beat_scope: Scope = .every_volume,
+    /// A member's currency — and the metadata registration its data checks
+    /// read — over every joined volume (as built, §DN); `.volume0`: volume
+    /// 0's page and registration only (the code before).
+    currency_scope: Scope = .every_volume,
+    /// Whose registrations end volume 1's grace early: its own namespace's
+    /// (as built — each guard reads its own report); `.volume0`: volume 0's.
+    early_from: EarlyFrom = .own_volume,
     strict: LapseStrict = .{},
 };
+
+/// The namespace a guard's early end reads (§DN).
+pub const EarlyFrom = enum { own_volume, volume0 };
+
+/// Which joined metadata volumes a member's lapse checks reach (§DN).
+pub const Scope = enum { every_volume, volume0 };
 
 /// `Lapse` — a PTPL-less target restart (nvmet keeps no PTPL: every namespace
 /// enable starts with no registrant and no reservation, pr.c:1136) under a
@@ -792,14 +820,25 @@ pub const LapseConfig = struct {
 ///   6 XW   X's data write: issued, admitted or refused, landed; refused ⇒
 ///          the same re-admission and one retry.
 ///   7 XW2  X's second data write, in flight beside the first.
+///   8 MGB1 (`meta_volumes` 2, decision 0003 §DN) volume 1's guard after a
+///          lapse of M1: the host re-registered, the grace — ended early once
+///          every census key is registered on M1 —, the WERO re-acquire.
+/// With two metadata volumes a member's beat re-registers on M0, then on M1
+/// (`beat_scope`), then on data; its currency is its page Live on every
+/// joined volume, and its data checks read every joined volume's metadata
+/// registration (`currency_scope`); J writes metadata on both volumes; X's
+/// recovery runs `recovery_first`'s volume whole (its data fence, the
+/// release, the reallocation), then the other volume's preempt, page and
+/// re-fence. The restart takes the targets `meta_too`/`d_lapse` (volume 0's)
+/// and `m1_lapse` (volume 1's) in one step.
 /// Invariants: `LiveFenced` a live member's write is never refused;
 /// `ReallocatedUnfenced`, `StaleDataWrite` as in `Death` outside the accepted
-/// windows (`LapseStrict`). `final`: `LapseUnbounded` both namespaces are
+/// windows (`LapseStrict`). `final`: `LapseUnbounded` every namespace is
 /// reserved again; `RecoveryStuck` X's region released.
 pub fn Lapse(comptime cfg: LapseConfig) type {
     return extern struct {
         const Self = @This();
-        pub const thread_count: usize = 8;
+        pub const thread_count: usize = 9;
         const T_L = 0;
         const T_MGR = 1;
         const T_MGB = 2;
@@ -808,28 +847,46 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
         const T_XB = 5;
         const T_XW = 6;
         const T_XW2 = 7;
+        const T_MGB1 = 8;
+        const TWO = cfg.meta_volumes == 2;
+        const FIRST: u1 = cfg.recovery_first;
+        const SECOND: u1 = 1 - cfg.recovery_first;
         const ROUNDS = 4;
         const R_P = 3;
-        const R_END = 7;
+        // Volume `SECOND`'s preempt, page and re-fence after the reallocation.
+        const R_SECOND = 7;
+        const R_END = if (TWO) 10 else 7;
         const MGB_END = 10;
-        const BEAT_END = 7;
+        const MGB1_END = 3;
+        // A member's beat: M0 (pre-check, register, post-check), M1 (the
+        // same, two volumes only), data (pre-check, register, post-check).
+        const M1_PRE = 4;
+        const D_PRE = if (TWO) 7 else 4;
+        const BEAT_END = D_PRE + 3;
         // J's writes: the data write, the re-admission (pre-check, register,
-        // post-check, retry), the metadata write.
+        // post-check, retry), the metadata write (and M1's).
         const JW_PRE = 1;
         const JW_META = 5;
-        const JW_END = 6;
+        const JW_END = if (TWO) 7 else 6;
         // X's write: issue, arrival, landing; the re-admission (pre-check,
         // register, post-check), the retry's issue, arrival, landing.
         const XW_LAND = 2;
         const XW_PRE = 3;
         const XW_END = 9;
 
-        m_res: bool = true,
-        m_reg: [3]bool = @splat(true),
+        comptime {
+            if (cfg.meta_volumes != 1 and cfg.meta_volumes != 2) @compileError("Lapse models one or two metadata volumes");
+            if (!TWO and (cfg.m1_lapse or cfg.recovery_first != 0)) @compileError("M1 needs meta_volumes 2");
+        }
+
+        /// Per metadata volume: reserved (WERO by MG), the hosts registered.
+        m_res: [2]bool = @splat(true),
+        m_reg: [2][3]bool = @splat(@splat(true)),
         d_res: bool = true,
         d_reg: [3]bool = @splat(true),
         lapsed: bool = false,
-        x_page: Page = .live,
+        /// X's page on each metadata volume.
+        x_page: [2]Page = @splat(.live),
         /// X's census row (gone at its eviction, which precedes the
         /// recovery).
         x_listed: bool = true,
@@ -867,7 +924,7 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
         j_fresh: bool = false,
         /// A beat's data register found its host unregistered.
         beat_fresh: [3]bool = @splat(false),
-        pc: [8]u8 = @splat(0),
+        pc: [9]u8 = @splat(0),
         live_fenced: bool = false,
         realloc_unfenced: bool = false,
         stale_write: bool = false,
@@ -888,6 +945,7 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                 T_JW => self.pc[t] >= JW_END,
                 T_XW => self.pc[t] >= XW_END,
                 T_XW2 => self.pc[t] >= 3,
+                T_MGB1 => !TWO or self.pc[t] >= MGB1_END,
                 else => unreachable,
             };
         }
@@ -896,12 +954,23 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
             return !self.d_res or self.d_reg[h];
         }
 
-        fn admitsM(self: *const Self, h: u8) bool {
-            return !self.m_res or self.m_reg[h];
+        fn admitsM(self: *const Self, v: u1, h: u8) bool {
+            return !self.m_res[v] or self.m_reg[v][h];
         }
 
+        /// A member's currency: its page Live on every joined volume
+        /// (`currency_scope` `.volume0`: volume 0's alone).
         fn current(self: *const Self, h: u8) bool {
-            return h != B or !cfg.currency or self.x_page == .live;
+            if (h != B or !cfg.currency) return true;
+            if (self.x_page[0] != .live) return false;
+            return !TWO or cfg.currency_scope == .volume0 or self.x_page[1] == .live;
+        }
+
+        /// The metadata registration a member's data checks read: every
+        /// joined volume's (`currency_scope` `.volume0`: volume 0's alone).
+        fn metaRegistered(self: *const Self, h: u8) bool {
+            if (!self.m_reg[0][h]) return false;
+            return !TWO or cfg.currency_scope == .volume0 or self.m_reg[1][h];
         }
 
         /// The grace's timing law: J's beat (with `slow_member`, its
@@ -910,12 +979,13 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
             return if (cfg.slow_member) self.j_meta_done else self.j_beat_done;
         }
 
-        /// The metadata grace's early end: every key the census lists is
-        /// registered on the metadata namespace.
-        fn metaEarlyEnd(self: *const Self) bool {
+        /// Volume `v`'s metadata grace's early end: every key the census
+        /// lists is registered on that volume's namespace.
+        fn metaEarlyEnd(self: *const Self, v_in: u1) bool {
+            const v: u1 = if (cfg.early_from == .volume0) 0 else v_in;
             return switch (cfg.meta_early) {
                 .grace_only => false,
-                .census => self.m_reg[C] and (!self.x_listed or self.m_reg[B]),
+                .census => self.m_reg[v][C] and (!self.x_listed or self.m_reg[v][B]),
                 .registrants => true,
             };
         }
@@ -924,7 +994,7 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
         /// and (`ebade_checks`) its host registered on metadata and current.
         fn readmitPasses(self: *const Self, h: u8) bool {
             if (!self.seen[h]) return false;
-            return !cfg.ebade_checks or (self.m_reg[h] and self.current(h));
+            return !cfg.ebade_checks or (self.metaRegistered(h) and self.current(h));
         }
 
         fn anyXAdmitted(self: *const Self) bool {
@@ -939,12 +1009,18 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                     // `nvmet_ns_disable`: `disable_done`, then
                     // `nvmet_pr_exit_ns`); a power loss lands or loses them
                     // — never after the restart.
-                    if (self.anyXAdmitted()) return;
-                    self.d_res = false;
-                    self.d_reg = @splat(false);
+                    if (cfg.d_lapse and self.anyXAdmitted()) return;
+                    if (cfg.d_lapse) {
+                        self.d_res = false;
+                        self.d_reg = @splat(false);
+                    }
                     if (cfg.meta_too) {
-                        self.m_res = false;
-                        self.m_reg = @splat(false);
+                        self.m_res[0] = false;
+                        self.m_reg[0] = @splat(false);
+                    }
+                    if (cfg.m1_lapse) {
+                        self.m_res[1] = false;
+                        self.m_reg[1] = @splat(false);
                     }
                     self.lapsed = true;
                     self.pc[t] = 1;
@@ -956,6 +1032,7 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                 T_XB => self.memberBeat(T_XB, B),
                 T_XW => self.deadWrite(),
                 T_XW2 => self.deadWrite2(),
+                T_MGB1 => self.volume1Guard(),
                 else => unreachable,
             }
         }
@@ -964,12 +1041,12 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
             switch (self.pc[T_MGR]) {
                 0 => {
                     // The eviction (its census row gone), then the metadata
-                    // preempt of host B.
+                    // preempt of host B on the first volume recovered.
                     self.x_listed = false;
-                    self.m_reg[B] = false;
+                    self.m_reg[FIRST][B] = false;
                 },
-                1 => self.x_page = .recovering,
-                2 => self.m_reg[B] = false,
+                1 => self.x_page[FIRST] = .recovering,
+                2 => self.m_reg[FIRST][B] = false,
                 // MG's own data client (registered: a preempt's sender
                 // must be) preempts-and-aborts host B's key.
                 R_P => if (self.d_reg[A] and self.d_reg[B]) {
@@ -980,7 +1057,7 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                 5 => {
                     if (self.fenced) {
                         self.released = true;
-                        self.x_page = .released;
+                        self.x_page[FIRST] = .released;
                     } else if (!self.d_res and !self.done(T_MGB)) {
                         // The lapse still open: the next poll.
                         return;
@@ -997,6 +1074,11 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                     self.reallocCheck();
                     self.realloc = true;
                 },
+                // The other volume's recovery of X: its preempt, its page
+                // Recovering, its re-fence (its data fence a repeat).
+                R_SECOND => self.m_reg[SECOND][B] = false,
+                R_SECOND + 1 => self.x_page[SECOND] = .recovering,
+                R_SECOND + 2 => self.m_reg[SECOND][B] = false,
                 else => unreachable,
             }
             self.pc[T_MGR] += 1;
@@ -1028,28 +1110,32 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
             };
         }
 
+        /// Every host registered on volume 0's metadata namespace (the data
+        /// authority's) is registered on data.
         fn allMetaOnData(self: *const Self) bool {
-            for (0..3) |k| if (self.m_reg[k] and !self.d_reg[k]) return false;
+            for (0..3) |k| if (self.m_reg[0][k] and !self.d_reg[k]) return false;
             return true;
         }
 
+        /// Volume 0's guard and the data beat (MG's process); neither sees a
+        /// lapse when only volume 1's target restarted.
         fn managerBeat(self: *Self) void {
             switch (self.pc[T_MGB]) {
                 0 => {
                     if (!self.lapsed) return;
-                    if (!cfg.manager_beat) {
+                    if (!cfg.manager_beat or !(cfg.meta_too or cfg.d_lapse)) {
                         self.pc[T_MGB] = MGB_END;
                         return;
                     }
                 },
-                1 => if (cfg.meta_too and !self.m_reg[A]) {
-                    self.m_reg[A] = true;
+                1 => if (!self.m_res[0] and !self.m_reg[0][A]) {
+                    self.m_reg[0][A] = true;
                 },
-                2 => if (cfg.meta_too and !self.m_res and cfg.grace and !self.graceOver() and !self.metaEarlyEnd()) return,
-                3 => if (cfg.meta_too and !self.m_res) {
-                    self.m_res = true;
+                2 => if (!self.m_res[0] and cfg.grace and !self.graceOver() and !self.metaEarlyEnd(0)) return,
+                3 => if (!self.m_res[0]) {
+                    self.m_res[0] = true;
                 },
-                4 => if (!self.d_res and !self.d_reg[A] and self.m_reg[A]) {
+                4 => if (!self.d_res and !self.d_reg[A] and self.m_reg[0][A]) {
                     self.d_reg[A] = true;
                 },
                 5 => if (!self.d_res and cfg.grace and !self.allMetaOnData() and !self.graceOver()) return,
@@ -1057,7 +1143,7 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                     self.d_res = true;
                 },
                 7 => self.dsnap = self.d_reg,
-                8 => self.msnap = self.m_reg,
+                8 => self.msnap = self.m_reg[0],
                 9 => {
                     if (self.anyXAdmitted() and self.d_reg[B] and self.dsnap[B] and !self.msnap[B]) return;
                     for (0..3) |k| {
@@ -1069,48 +1155,82 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
             self.pc[T_MGB] += 1;
         }
 
-        /// A member's first beat after the lapse (host `h`).
-        fn memberBeat(self: *Self, t: usize, h: u8) void {
-            switch (self.pc[t]) {
+        /// Volume 1's guard (MG's process, its own heartbeat): no lapse
+        /// unless volume 1's target restarted.
+        fn volume1Guard(self: *Self) void {
+            switch (self.pc[T_MGB1]) {
                 0 => {
                     if (!self.lapsed) return;
-                    if (!cfg.member_beat) {
-                        self.endBeat(t);
-                        return;
-                    }
-                    self.seen[h] = true;
-                },
-                1 => if (!(cfg.meta_too and !self.m_res and !self.m_reg[h] and self.current(h))) {
-                    self.pc[t] = 4;
-                    return;
-                },
-                2 => self.m_reg[h] = true,
-                3 => if (!self.current(h)) {
-                    self.m_reg[h] = false;
-                },
-                4 => {
-                    if (h == C) self.j_meta_done = true;
-                    if (!(!self.d_res and !self.d_reg[h] and (!cfg.meta_check or self.m_reg[h]) and self.current(h))) {
-                        self.endBeat(t);
+                    if (!cfg.manager_beat or !cfg.m1_lapse) {
+                        self.pc[T_MGB1] = MGB1_END;
                         return;
                     }
                 },
-                5 => {
-                    // A registration that stands meanwhile (its own
-                    // re-admission's) is adopted: the post-check withdraws
-                    // only a fresh one.
-                    self.beat_fresh[h] = !self.d_reg[h];
-                    self.d_reg[h] = true;
-                    if (h == B and self.beat_fresh[h]) self.x_window = true;
-                },
-                6 => {
-                    if (h == B) self.x_window = false;
-                    if (self.beat_fresh[h] and ((cfg.meta_check and !self.m_reg[h]) or !self.current(h))) self.d_reg[h] = false;
-                    self.endBeat(t);
-                    return;
+                // (Host A's own re-registration on M1 is not modelled:
+                // nothing here reads it.)
+                1 => if (!self.m_res[1] and cfg.grace and !self.graceOver() and !self.metaEarlyEnd(1)) return,
+                2 => if (!self.m_res[1]) {
+                    self.m_res[1] = true;
                 },
                 else => unreachable,
             }
+            self.pc[T_MGB1] += 1;
+        }
+
+        /// A member's first beat after the lapse (host `h`): every joined
+        /// metadata volume, then the data namespace.
+        fn memberBeat(self: *Self, t: usize, h: u8) void {
+            const pc = self.pc[t];
+            if (pc == 0) {
+                if (!self.lapsed) return;
+                if (!cfg.member_beat) return self.endBeat(t);
+                // The data side's lapse word: volume 0's target or the data
+                // namespace's restarted (an M1 lapse is not one).
+                if (cfg.meta_too or cfg.d_lapse) self.seen[h] = true;
+            } else if (pc == 1) {
+                if (!(!self.m_res[0] and !self.m_reg[0][h] and self.current(h))) {
+                    self.pc[t] = M1_PRE;
+                    return;
+                }
+            } else if (pc == 2) {
+                self.m_reg[0][h] = true;
+                // J is current and registered throughout: with two volumes
+                // its post-checks (no-ops) are skipped.
+                if (TWO and h == C) {
+                    self.pc[t] = M1_PRE;
+                    return;
+                }
+            } else if (pc == 3) {
+                if (!self.current(h)) self.m_reg[0][h] = false;
+            } else if (TWO and pc == M1_PRE) {
+                if (cfg.beat_scope == .volume0 or !(!self.m_res[1] and !self.m_reg[1][h] and self.current(h))) {
+                    self.pc[t] = D_PRE;
+                    return;
+                }
+            } else if (TWO and pc == M1_PRE + 1) {
+                self.m_reg[1][h] = true;
+                if (h == C) {
+                    self.pc[t] = D_PRE;
+                    return;
+                }
+            } else if (TWO and pc == M1_PRE + 2) {
+                if (!self.current(h)) self.m_reg[1][h] = false;
+            } else if (pc == D_PRE) {
+                if (h == C) self.j_meta_done = true;
+                if (!(!self.d_res and !self.d_reg[h] and (!cfg.meta_check or self.metaRegistered(h)) and self.current(h))) return self.endBeat(t);
+            } else if (pc == D_PRE + 1) {
+                // A registration that stands meanwhile (its own
+                // re-admission's) is adopted: the post-check withdraws only a
+                // fresh one.
+                self.beat_fresh[h] = !self.d_reg[h];
+                self.d_reg[h] = true;
+                if (h == B and self.beat_fresh[h]) self.x_window = true;
+                if (TWO and h == C) return self.endBeat(t);
+            } else if (pc == D_PRE + 2) {
+                if (h == B) self.x_window = false;
+                if (self.beat_fresh[h] and ((cfg.meta_check and !self.metaRegistered(h)) or !self.current(h))) self.d_reg[h] = false;
+                return self.endBeat(t);
+            } else unreachable;
             self.pc[t] += 1;
         }
 
@@ -1142,7 +1262,7 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                     self.j_fresh = !self.d_reg[C];
                     self.d_reg[C] = true;
                 },
-                3 => if (cfg.ebade_checks and !(self.m_reg[C] and self.current(C))) {
+                3 => if (cfg.ebade_checks and !(self.metaRegistered(C) and self.current(C))) {
                     if (self.j_fresh) self.d_reg[C] = false;
                     self.live_fenced = true;
                     self.pc[T_JW] = JW_META;
@@ -1151,7 +1271,11 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                 4 => if (!self.admitsD(C)) {
                     self.live_fenced = true;
                 },
-                JW_META => if (!self.admitsM(C)) {
+                JW_META => if (!self.admitsM(0, C)) {
+                    self.live_fenced = true;
+                },
+                // Its metadata write on volume 1 (two volumes only).
+                JW_META + 1 => if (!self.admitsM(1, C)) {
                     self.live_fenced = true;
                 },
                 else => unreachable,
@@ -1217,7 +1341,7 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
                 },
                 5 => {
                     self.x_ewindow = false;
-                    if (cfg.ebade_checks and !(self.m_reg[B] and self.current(B))) {
+                    if (cfg.ebade_checks and !(self.metaRegistered(B) and self.current(B))) {
                         if (self.x_fresh) self.d_reg[B] = false;
                         self.pc[T_XW] = XW_END;
                         return;
@@ -1256,7 +1380,7 @@ pub fn Lapse(comptime cfg: LapseConfig) type {
         }
 
         pub fn final(self: *const Self) !void {
-            if (!self.d_res or (cfg.meta_too and !self.m_res)) return error.LapseUnbounded;
+            if (!self.d_res or !self.m_res[0] or !self.m_res[1]) return error.LapseUnbounded;
             if (!self.released) return error.RecoveryStuck;
         }
     };
@@ -1434,4 +1558,59 @@ test "data fence model weakening (decision 0003 §DL): the re-admission at a ref
 
 test "data fence model, the re-admission's accepted window is reachable (decision 0003 §DL): a member frozen between its re-admission's checks and its register across its whole death admits another in-flight write before its post-check withdraws the registration — the beat window's class" {
     try testing.expectEqual(error.EbadeWindow, firstError(Lapse(.{ .strict = .{ .ebade_window = true } })));
+}
+
+/// Which targets of a two-metadata-volume set restart (decision 0003 §DN):
+/// volume 1's alone, both (volume 0's carries the data namespace), volume
+/// 0's alone.
+const MvRestart = enum { v1_only, both, v0_only };
+
+fn twoVolumes(comptime r: MvRestart, comptime first: u1) LapseConfig {
+    var c: LapseConfig = .{ .meta_volumes = 2, .recovery_first = first, .x_second_write = false };
+    switch (r) {
+        .v1_only => {
+            c.meta_too = false;
+            c.d_lapse = false;
+            c.m1_lapse = true;
+        },
+        .both => c.m1_lapse = true,
+        .v0_only => {},
+    }
+    return c;
+}
+
+fn mvWeakened(comptime r: MvRestart, comptime first: u1, comptime beat: Scope, comptime currency: Scope) LapseConfig {
+    var c = twoVolumes(r, first);
+    c.beat_scope = beat;
+    c.currency_scope = currency;
+    return c;
+}
+
+test "data fence model (decision 0003 §DN): a two-metadata-volume set as built — every member's lapse beat re-registers its host on EVERY joined metadata volume (its currency: its page Live on every joined volume), each volume's guard re-acquires once every census key is registered on ITS namespace (else after the grace), a member's data checks read every joined volume's registration and page; volume 1's target restarted alone, both targets, volume 0's alone; X recovered on volume 0 first and on volume 1 first — holds: no live member's write refused on either volume, no stale data write, every namespace reserved again, X's region released" {
+    inline for (.{ MvRestart.v1_only, MvRestart.both, MvRestart.v0_only }) |r| {
+        inline for (.{ 0, 1 }) |first| {
+            const M = Lapse(twoVolumes(r, first));
+            try explorer.expectHolds(M, limits);
+            const rep = try statesOf(M);
+            std.debug.print("\ndata fence model (lapse, two metadata volumes, restart {t}, volume {d} recovered first): {d} states explored, depth {d}\n", .{ r, first, rep.states, rep.max_depth_seen });
+        }
+    }
+}
+
+test "data fence model weakening (decision 0003 §DN): a member's lapse beat on volume 0's metadata namespace only (the code before) — after a restart of volume 1's target (alone or with volume 0's) volume 1's guard never sees the live member back, takes its hold after the grace and refuses the member's next metadata write there" {
+    try testing.expectEqual(error.LiveFenced, firstError(Lapse(mvWeakened(.v1_only, 0, .volume0, .every_volume))));
+    try testing.expectEqual(error.LiveFenced, firstError(Lapse(mvWeakened(.both, 0, .volume0, .every_volume))));
+}
+
+test "data fence model weakening (decision 0003 §DN): a member's currency and its data checks judged on volume 0 alone — X's death recovered on volume 1 first (its data fence proven, its block reallocated) while volume 0 still reads it Live and registered; a restart of both targets lets X re-register on volume 0 and on data, the reconcile keeps it (its key on volume 0's namespace), its write lands on its reallocated block" {
+    try testing.expectEqual(error.StaleDataWrite, firstError(Lapse(mvWeakened(.both, 1, .every_volume, .volume0))));
+}
+
+test "data fence model weakening (decision 0003 §DN): volume 1's grace ended by volume 0's registrations — a restart of both targets; the live member back on volume 0 but not yet on volume 1, volume 1's guard takes its hold and refuses its metadata write there" {
+    const c = comptime blk: {
+        var c = twoVolumes(.both, 0);
+        c.early_from = .volume0;
+        break :blk c;
+    };
+    try testing.expectEqual(error.LiveFenced, firstError(Lapse(c)));
 }

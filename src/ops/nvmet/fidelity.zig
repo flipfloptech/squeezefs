@@ -2908,6 +2908,11 @@ test "nvmet fidelity: a restart of ANOTHER metadata volume's target than volume 
         defer gpa.free(sj);
         try testing.expect(try statNumber(sj, "meta_pr_lapse_reregistrations") >= 1);
         try testing.expectEqual(@as(u64, 0), try statNumber(sj, "data_pr_lapse_reregistrations"));
+        // Per volume: on volume 1, never on volume 0.
+        const v0 = std.mem.indexOf(u8, sj, "\"meta_vol_index\":0,") orelse return error.StatMissing;
+        const v1 = std.mem.indexOf(u8, sj, "\"meta_vol_index\":1,") orelse return error.StatMissing;
+        try testing.expectEqual(@as(u64, 0), try statNumber(sj[v0..], "meta_lapse_reregistrations"));
+        try testing.expect(try statNumber(sj[v1..], "meta_lapse_reregistrations") >= 1);
     }
     try printLapseBeats(rig, m, "a restart of volume 1's metadata target (M)");
     {

@@ -379,6 +379,12 @@ fn statAlive(text: []const u8) bool {
 var test_before_stat_read: if (builtin.is_test) ?AliveHook else void = if (builtin.is_test) null else {};
 const AliveHook = struct { ctx: *anyopaque, fire: *const fn (ctx: *anyopaque, pid: linux.pid_t) void };
 
+/// Test seam: fires at the top of each poll of the exit wait, before its
+/// liveness read — the threaded-exit pin holds the leader-first window
+/// across polls.
+var test_exit_poll: if (builtin.is_test) ?PollHook else void = if (builtin.is_test) null else {};
+const PollHook = struct { ctx: *anyopaque, fire: *const fn (ctx: *anyopaque, pid: linux.pid_t) void };
+
 /// `<mountpoint>/.stats` (owned); null when unreadable. The 16 MiB bound
 /// is the renderer's own document cap.
 fn readStats(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8) ?[]u8 {
@@ -497,6 +503,7 @@ pub fn signalLocated(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, laz
     var detached = false;
     var polls: u64 = 0;
     while (true) : (polls += 1) {
+        if (builtin.is_test) if (test_exit_poll) |h| h.fire(h.ctx, pid);
         const is_alive = alive(io, pid);
         // The cold reads run at the document cadence — and the census at
         // the poll that first sees the detach: the verb's "at once".
@@ -905,6 +912,147 @@ test "a .stats document naming a dead pid falls back as `daemon_gone`" {
     var watched = Watched.init(testing.allocator, testing.io, dir);
     defer watched.deinit();
     try testing.expectEqual(Signalled{ .fallback = .daemon_gone }, signalDaemon(testing.allocator, testing.io, dir, false, "", &watched));
+}
+
+/// The threaded stand-in's second thread's stack (the forked child's copy).
+var threaded_stand_in_stack: [64 << 10]u8 align(16) = undefined;
+
+/// The threaded-exit pin's stand-in, forked and never exec'd (only raw
+/// syscalls run in it): it takes `lock_path`'s flock (the writer claim's
+/// stand-in), blocks SIGTERM, starts a second thread (a raw clone sharing
+/// its fd table) parked on `park_fd`, names itself ready, and on the TERM
+/// exits its MAIN thread alone (SYS_exit): the leader a zombie while the
+/// second thread holds the fd table, the flock with it, until the park is
+/// released.
+fn threadedStandIn(lock_path: [*:0]const u8, ready_fd: linux.fd_t, park_fd: linux.fd_t) noreturn {
+    const lrc = linux.open(lock_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+    if (linux.errno(lrc) != .SUCCESS) linux.exit_group(1);
+    if (linux.errno(linux.flock(@intCast(lrc), std.posix.LOCK.EX)) != .SUCCESS) linux.exit_group(2);
+    var term = linux.sigemptyset();
+    linux.sigaddset(&term, .TERM);
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &term, null);
+    const sfd = linux.signalfd(-1, &term, linux.SFD.CLOEXEC);
+    if (linux.errno(sfd) != .SUCCESS) linux.exit_group(3);
+    const stack_top = @intFromPtr(&threaded_stand_in_stack) + threaded_stand_in_stack.len;
+    const flags = linux.CLONE.VM | linux.CLONE.FS | linux.CLONE.FILES | linux.CLONE.SIGHAND | linux.CLONE.THREAD | linux.CLONE.SYSVSEM;
+    if (linux.errno(linux.clone(&parkThread, stack_top, flags, @intCast(park_fd), null, 0, null)) != .SUCCESS) linux.exit_group(4);
+    const one: u8 = 'r';
+    _ = linux.write(ready_fd, @ptrCast(&one), 1);
+    var info: linux.signalfd_siginfo = undefined;
+    _ = linux.read(@intCast(sfd), @ptrCast(&info), @sizeOf(linux.signalfd_siginfo));
+    linux.exit(0);
+}
+
+/// The threaded stand-in's second thread: parked until a byte or EOF on
+/// its pipe; its return is the clone trampoline's SYS_exit.
+fn parkThread(arg: usize) callconv(.c) u8 {
+    var b: u8 = 0;
+    _ = linux.read(@intCast(arg), @ptrCast(&b), 1);
+    return 0;
+}
+
+/// The state letter of `/proc/<pid>/stat` (after the comm's closing
+/// paren); null when unreadable.
+fn stateLetter(io: Io, pid: linux.pid_t) ?u8 {
+    var pb: [64]u8 = undefined;
+    var buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "/proc/{d}/stat", .{pid}) catch return null;
+    const text = Io.Dir.cwd().readFile(io, path, &buf) catch return null;
+    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return null;
+    const rest = std.mem.trimStart(u8, text[close + 1 ..], " ");
+    return if (rest.len == 0) null else rest[0];
+}
+
+/// The threaded-exit pin's hold, at each poll of the exit wait: the first
+/// poll that finds the stand-in's leader a zombie records the window (the
+/// claim still held; the daemon read alive or not); the next poll releases
+/// the second thread, so only a wait for the whole group reaches the
+/// verdict after the release.
+const LeaderFirst = struct {
+    io: Io,
+    pid: linux.pid_t,
+    park_fd: linux.fd_t,
+    lock_fd: linux.fd_t,
+    seen: bool = false,
+    window_held: bool = false,
+    window_alive: bool = false,
+    released: bool = false,
+
+    fn fire(ctx: *anyopaque, pid: linux.pid_t) void {
+        const self: *LeaderFirst = @ptrCast(@alignCast(ctx));
+        if (pid != self.pid or self.released) return;
+        if (self.seen) {
+            const one: u8 = 'g';
+            self.released = linux.write(self.park_fd, @ptrCast(&one), 1) == 1;
+            return;
+        }
+        if (stateLetter(self.io, pid) != 'Z') return;
+        self.seen = true;
+        self.window_held = linux.errno(linux.flock(self.lock_fd, std.posix.LOCK.EX | std.posix.LOCK.NB)) == .AGAIN;
+        self.window_alive = alive(self.io, pid);
+    }
+};
+
+test "a daemon whose MAIN thread exits first (a teardown's exit_group: the leader a zombie while its other threads still run and hold its fds — the writer claim, the devices): the verdict waits for the whole thread group, so at `.exited` the daemon's files are released and the next mount meets no claim of its" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    _ = linux.mkdir("/build/tmp", 0o755);
+    var pb: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&pb, "/build/tmp/threaded-exit-{d}", .{linux.getpid()});
+    var zb: [64:0]u8 = undefined;
+    const dirz = try std.fmt.bufPrintSentinel(&zb, "{s}", .{dir}, 0);
+    _ = linux.mkdir(dirz.ptr, 0o755);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var lb: [96:0]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintSentinel(&lb, "{s}/claim", .{dir}, 0);
+    var ready: [2]linux.fd_t = undefined;
+    var park: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true })));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&park, .{ .CLOEXEC = true })));
+    const rc = linux.fork();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    if (rc == 0) {
+        _ = linux.close(ready[0]);
+        _ = linux.close(park[1]);
+        threadedStandIn(lock_path.ptr, ready[1], park[0]);
+    }
+    const daemon: linux.pid_t = @intCast(rc);
+    _ = linux.close(ready[1]);
+    _ = linux.close(park[0]);
+    defer {
+        // Our child: never reaped before this wait, so the pid is its own.
+        _ = linux.close(park[1]);
+        _ = linux.kill(daemon, .KILL);
+        var status: i32 = 0;
+        _ = linux.waitpid(daemon, &status, 0);
+    }
+    var byte: u8 = 0;
+    const n = linux.read(ready[0], @ptrCast(&byte), 1);
+    _ = linux.close(ready[0]);
+    try testing.expectEqual(@as(usize, 1), n);
+    // Our own open of the claim: refused while the stand-in holds it.
+    const lrc = linux.open(lock_path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(lrc));
+    const lock_fd: linux.fd_t = @intCast(lrc);
+    defer _ = linux.close(lock_fd);
+    try testing.expectEqual(linux.E.AGAIN, linux.errno(linux.flock(lock_fd, std.posix.LOCK.EX | std.posix.LOCK.NB)));
+    // The document names the stand-in: a daemon found by its `.stats`.
+    var sb: [96]u8 = undefined;
+    var doc: [64]u8 = undefined;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&sb, "{s}/.stats", .{dir}), .data = try std.fmt.bufPrint(&doc, "{{\"mount\":{{\"uid\":0,\"pid\":{d}}}}}", .{daemon}) });
+    var watched = Watched.init(gpa, io, dir);
+    defer watched.deinit();
+    var hold: LeaderFirst = .{ .io = io, .pid = daemon, .park_fd = park[1], .lock_fd = lock_fd };
+    test_exit_poll = .{ .ctx = &hold, .fire = &LeaderFirst.fire };
+    defer test_exit_poll = null;
+    try testing.expectEqual(Signalled{ .exited = daemon }, signalDaemon(gpa, io, dir, false, "", &watched));
+    // The law: at the verdict the daemon's files are released.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(lock_fd, std.posix.LOCK.EX | std.posix.LOCK.NB)));
+    // The window was held: a poll met the leader a zombie with the claim
+    // still held and read the daemon alive; the release preceded the verdict.
+    try testing.expect(hold.window_held);
+    try testing.expect(hold.window_alive);
+    try testing.expect(hold.released);
 }
 
 test "a tmpfs held by a child's cwd: the pre-signal census refuses it by name (the verb's law), the plain umount2 is EBUSY, and after the child leaves nobody holds it" {

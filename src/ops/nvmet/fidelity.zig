@@ -2644,8 +2644,13 @@ test "nvmet fidelity: a PTPL-less target restart under a running set (review MAJ
 /// removed (marker-attested, the ledger untouched) and rebuilt by `restore`
 /// — the namespaces enabled afresh with no registrant and no reservation.
 fn restartTarget(rig: *Rig, set: anytype) !void {
+    return restartSubsystems(rig, &.{ set.meta_nqn, set.data_nqn });
+}
+
+/// The same restart of the named subsystems only (one target of several).
+fn restartSubsystems(rig: *Rig, nqns: []const []const u8) !void {
     const gpa = rig.gpa;
-    for ([_][]const u8{ set.meta_nqn, set.data_nqn }) |nqn| {
+    for (nqns) |nqn| {
         try testing.expect(configfs.isHarnessNqn(nqn));
         var rec = (try rig.ledgerRecord(nqn)).?;
         defer rec.deinit(gpa);
@@ -2803,6 +2808,128 @@ test "nvmet fidelity: a member slow on data past the lapse's re-reservation is r
     try rig.unshare(set.meta_nqn);
     try expectNoResidue(rig, set.meta_nqn);
     try expectNoResidue(rig, set.data_nqn);
+}
+
+/// A symmetric set of TWO metadata volumes and one data volume on nvmet-tcp,
+/// each subsystem on a port of its own: formatted over the rig's connects
+/// (`sqmeta://<meta0>,<meta1>`), the data volume's endpoint record set (the
+/// daemon's own connect), its formatting connect released.
+const TwoMetaSet = struct {
+    meta_nqn: [2][]const u8,
+    data_nqn: []const u8,
+    ports: [3]u16,
+    cm: [2]Connected,
+    uri_buf: [160]u8 = undefined,
+    uri_len: usize = 0,
+
+    fn metaUri(self: *const TwoMetaSet) []const u8 {
+        return self.uri_buf[0..self.uri_len];
+    }
+
+    /// Both metadata subsystems connected under `ident`: the set's URI for
+    /// a mount of that host (`buf` holds it).
+    fn connectHost(self: *const TwoMetaSet, rig: *Rig, ident: initiator.HostPair, out: *[2]Connected, buf: []u8) ![]const u8 {
+        for (0..2) |v| out[v] = try rig.connect(self.meta_nqn[v], .tcp, self.ports[v], ident, &.{});
+        return std.fmt.bufPrint(buf, "sqmeta://{s},{s}", .{ out[0].dev(), out[1].dev() });
+    }
+};
+
+fn twoMetaSet(rig: *Rig, prefix: []const u8, data_size: u64) !TwoMetaSet {
+    const ports: [3]u16 = .{ try rig.tcpPort(), try rig.tcpPort(), try rig.tcpPort() };
+    var nb: [64]u8 = undefined;
+    const m0 = try rig.share(try std.fmt.bufPrint(&nb, "{s}meta0", .{prefix}), meta_len, .tcp, ports[0]);
+    const m1 = try rig.share(try std.fmt.bufPrint(&nb, "{s}meta1", .{prefix}), meta_len, .tcp, ports[1]);
+    const d = try rig.share(try std.fmt.bufPrint(&nb, "{s}data", .{prefix}), data_size, .tcp, ports[2]);
+    var out: TwoMetaSet = .{ .meta_nqn = .{ m0, m1 }, .data_nqn = d, .ports = ports, .cm = undefined };
+    out.cm[0] = try rig.connect(m0, .tcp, ports[0], null, &.{});
+    out.cm[1] = try rig.connect(m1, .tcp, ports[1], null, &.{});
+    const cd = try rig.connect(d, .tcp, ports[2], null, &.{});
+    out.uri_len = (try std.fmt.bufPrint(&out.uri_buf, "sqmeta://{s},{s}", .{ out.cm[0].dev(), out.cm[1].dev() })).len;
+    var du: [64]u8 = undefined;
+    const fmt_out = try rig.sqzOk(&.{ "format", "--block-size", "65536", out.metaUri(), try std.fmt.bufPrint(&du, "sqdata://{s}", .{cd.dev()}) });
+    defer rig.gpa.free(fmt_out);
+    try testing.expect(std.mem.indexOf(u8, fmt_out, "data volumes 1") != null);
+    try rig.setDataEndpoint(out.metaUri(), .tcp, ports[2], d);
+    try rig.disconnect(&cd);
+    return out;
+}
+
+test "nvmet fidelity: a restart of ANOTHER metadata volume's target than volume 0's never fail-stops a live joiner (decision 0003 §DN, §DL.8(b)) — tcp, a symmetric set of two metadata volumes: M (host B) manages both, J (host C) a live joiner of both, its directories spread over both members; only volume 1's metadata subsystem wiped and restored (nvmet keeps no PTPL: its registrations and its reservation forgotten, volume 0's and the data namespace's untouched); J's lapse beat re-registers its host on volume 1's namespace and volume 1's guard takes its hold back as soon as every live member's host key is registered THERE (writer_guard_lapse_early_ends 1, inside a grace of 60 s); J writes and syncs into every directory under the returned hold — never fail-stopped — and its bytes read back exact" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const set = try twoMetaSet(rig, "mv", data_fence_volume);
+    var cm_b: [2]Connected = undefined;
+    var ub: [160]u8 = undefined;
+    const meta_uri_b = try set.connectHost(rig, ident_b, &cm_b, &ub);
+    var cm_c: [2]Connected = undefined;
+    var uc: [160]u8 = undefined;
+    const meta_uri_c = try set.connectHost(rig, ident_c, &cm_c, &uc);
+    var env_m = try rig.envWith(ident_b);
+    defer env_m.deinit();
+    // A grace the row's bound covers: without the joiner's beat on volume 1
+    // the hold returns after it and the joiner's next write there is refused.
+    try env_m.put("SQUEEZEFS_TEST_LAPSE_GRACE_S", "60");
+    var env_j = try rig.envWith(ident_c);
+    defer env_j.deinit();
+    const m = try rig.spawnMountEnv("mv-m", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const j = try rig.spawnMountEnv("mv-j", meta_uri_c, &env_j, &.{});
+    try rig.awaitLog(j, "ready: ", ready_wait_ns);
+    // Root children spread round-robin over the members (§BZ): J's
+    // directories land on both volumes, their files beside them.
+    try testing.expect(try scriptSucceeds(rig, j, "for d in d0 d1 d2 d3; do mkdir $d && head -c 65536 /dev/zero | tr '\\000' P > $d/p; done && sync -f ."));
+    {
+        const sj = try rig.stats(j);
+        defer gpa.free(sj);
+        try testing.expect(try statNumber(sj, "routing_dir_place_remote") >= 1);
+    }
+    try restartSubsystems(rig, &.{set.meta_nqn[1]});
+    // The controllers reconnect; volume 1's guard holds again.
+    {
+        const sm = try rig.awaitStat(m, "writer_guard_pr_reacquires", 1, g2_wait_ns);
+        defer gpa.free(sm);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "writer_guard_pr_reacquires"));
+        try testing.expectEqual(@as(u64, 0), try statNumber(sm, "writer_guard_fenced"));
+    }
+    // J was never fail-stopped: it writes and syncs into every directory —
+    // those on volume 1 included — under the returned hold.
+    if (!try scriptSucceeds(rig, j, "for d in d0 d1 d2 d3; do head -c 262144 /dev/zero | tr '\\000' L > $d/l; done && sync -f .")) {
+        rig.printLogTail(j, 40);
+        return error.JoinerFailStopped;
+    }
+    {
+        const sm = try rig.stats(m);
+        defer gpa.free(sm);
+        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "writer_guard_lapse_early_ends"));
+        // The data namespace never lapsed.
+        try testing.expectEqual(@as(u64, 0), try statNumber(sm, "data_pr_lapses"));
+        const sj = try rig.stats(j);
+        defer gpa.free(sj);
+        try testing.expect(try statNumber(sj, "meta_pr_lapse_reregistrations") >= 1);
+        try testing.expectEqual(@as(u64, 0), try statNumber(sj, "data_pr_lapse_reregistrations"));
+    }
+    try printLapseBeats(rig, m, "a restart of volume 1's metadata target (M)");
+    {
+        const out = try rig.onMount(j, "cat d0/l d1/l d2/l d3/l | wc -c; cat d0/l d1/l d2/l d3/l | tr -d L | wc -c; head -c 65536 /dev/zero | tr '\\000' K > d1/k && sync -f .");
+        defer gpa.free(out);
+        var it = std.mem.tokenizeAny(u8, out, " \n");
+        try testing.expectEqual(@as(u64, 4 * 262144), try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10));
+        try testing.expectEqual(@as(u64, 0), try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10));
+    }
+    try rig.umount(j);
+    try rig.umount(m);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    for (0..2) |v| {
+        try rig.disconnect(&cm_c[v]);
+        try rig.disconnect(&cm_b[v]);
+        try rig.disconnect(&set.cm[v]);
+    }
+    try rig.unshare(set.data_nqn);
+    for (set.meta_nqn) |nqn| try rig.unshare(nqn);
+    try expectNoResidue(rig, set.data_nqn);
+    for (set.meta_nqn) |nqn| try expectNoResidue(rig, nqn);
 }
 
 /// The manager's fencing registrant's controller of `nqn`: the one whose

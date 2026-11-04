@@ -2265,7 +2265,7 @@ const RejoinHost = struct {
     const Marked = struct { slot: u32, unique: u64 };
 
     fn face(self: *RejoinHost) sym_wire.RejoinHost {
-        return .{ .ctx = self, .unlanded = &unlanded, .rebound = &rebound, .opsMark = &opsMark, .opsDrained = &opsDrained, .readmitData = &readmitData };
+        return .{ .ctx = self, .unlanded = &unlanded, .rebound = &rebound, .opsMark = &opsMark, .opsDrained = &opsDrained, .readmitData = &readmitData, .settleData = &settleData };
     }
 
     fn bindIpc(self: *RejoinHost, h: ?*ipc_host.IpcHost) void {
@@ -2355,6 +2355,14 @@ const RejoinHost = struct {
         const self: *RejoinHost = @ptrCast(@alignCast(ctx));
         const df = self.dfence orelse return null;
         return guard.data_fence.readmitSuccessor(df, successors);
+    }
+
+    /// The re-admission settled (decision 0003 §DN.9): committed once the
+    /// successors are published, aborted before they close.
+    fn settleData(ctx: *anyopaque, joined: bool) void {
+        const self: *RejoinHost = @ptrCast(@alignCast(ctx));
+        const df = self.dfence orelse return;
+        if (joined) df.commitReadmit() else df.abortReadmit();
     }
 
     /// The successor is published: its node caches join the budget, the

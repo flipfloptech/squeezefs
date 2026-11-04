@@ -603,6 +603,11 @@ pub const RejoinHost = struct {
     /// volume's, §DN) before anything can reach it. Null = re-admitted (or no
     /// data fence); else why not.
     readmitData: *const fn (ctx: *anyopaque, successors: []const *KvBackend, buf: []u8) ?[]const u8,
+    /// A re-admission that answered null settled (decision 0003 §DN.9):
+    /// `joined` once the member joined under the successors and they are
+    /// published; not joined BEFORE they close — the data side re-points at
+    /// the predecessor, never left on closed devices and freed backends.
+    settleData: *const fn (ctx: *anyopaque, joined: bool) void,
 };
 
 /// A volume a joiner attaches online is admitted on its data namespace
@@ -1089,7 +1094,10 @@ pub const WirePlane = struct {
         };
         // The data namespaces again, before anything reaches the successor
         // (decision 0003 §DJ): the death preempt removed this host there.
-        if (self.rejoin_host.load(.acquire)) |h| if (h.readmitData(h.ctx, fresh, &why_buf)) |why| {
+        // The host that re-admitted settles it (§DN.9): it stays valid until
+        // the wire stops (the mount unbinds it first, its fence goes last).
+        const readmitted = self.rejoin_host.load(.acquire);
+        if (readmitted) |h| if (h.readmitData(h.ctx, fresh, &why_buf)) |why| {
             for (fresh) |be| be.close();
             self.gpa.free(fresh);
             return self.refuseRejoin(j, why);
@@ -1109,6 +1117,9 @@ pub const WirePlane = struct {
         } else self.publishEndpointOn(fresh) and self.joinMember(j, t0);
         if (!joined_member) {
             pointMember(j, pred_js, self.set.volumes[0]);
+            // The data fence back on the predecessor BEFORE the successors
+            // close (§DN.9): it re-pointed at their devices and backends.
+            if (readmitted) |h| h.settleData(h.ctx, false);
             for (fresh) |be| be.close();
             self.gpa.free(fresh);
             return self.refuseRejoin(j, "the successor's membership join was refused (the successor left cleanly, never published)");
@@ -1119,10 +1130,14 @@ pub const WirePlane = struct {
         const planes = self.divert.dropAll(self.io);
         const grants = self.holder.dropAll(self.io);
         self.set.publishSuccessors(fresh) catch {
+            if (readmitted) |h| h.settleData(h.ctx, false);
             for (fresh) |be| be.close();
             self.gpa.free(fresh);
             return self.refuseRejoin(j, "out of memory publishing the successor incarnation");
         };
+        // Published: the successors stay open until the unmount — the data
+        // fence lets the predecessor's clients go.
+        if (readmitted) |h| h.settleData(h.ctx, true);
         self.pusher.identity = js.appenderId();
         self.steps.plane.rebindOwner(js.appenderId());
         const host = self.rejoin_host.load(.acquire);

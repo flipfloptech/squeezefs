@@ -317,6 +317,14 @@ pub const DataFence = struct {
     /// `SQUEEZEFS_TEST_LAPSE_BEAT_HOLD`: the FIFO the first beat that
     /// re-registered the host on metadata parks on (empty = disarmed).
     beat_hold: [256:0]u8 = @splat(0),
+    /// A re-join's re-admission not settled yet (decision 0003 §DN.9): the
+    /// predecessor's inputs and clients, kept — never freed — until the
+    /// member joined under the successor (`commitReadmit` frees them) or its
+    /// join was refused (`abortReadmit` re-points the fence at them before
+    /// the successors close; the predecessor stays open until the unmount).
+    pending: ?Pending = null,
+    /// `abortReadmit` ran: the next beat says it ran on the predecessor.
+    beat_after_abort: bool = false,
 
     /// The alert's repeat: a held recovery polls every tick; one line per
     /// half minute keeps the log readable and the alert loud.
@@ -327,6 +335,8 @@ pub const DataFence = struct {
     const AlertWhy = enum(u8) { config_unreadable, untabled, unproven };
 
     const ReadmitCell = struct { hook: nvme_dev.Readmit, fence: *DataFence, vol_tag: u64 };
+
+    const Pending = struct { in: Inputs, metas: [route_table.MAX_VOLUMES]MetaVol, n_metas: usize };
 
     pub fn create(in: Inputs) Allocator.Error!*DataFence {
         const gpa = in.gpa;
@@ -777,11 +787,14 @@ pub const DataFence = struct {
     /// clients — volume 0's and every other joined volume's (decision 0003
     /// §DN) — and registry (its admission ran), then every data volume's
     /// registration again — the death preempt removed the host's. Null = re-
-    /// admitted; else why not.
+    /// admitted, PENDING (§DN.9): the caller settles it — `commitReadmit`
+    /// once the member joined under the successor, `abortReadmit` before
+    /// the successors close; else why not (the predecessor's restored).
     pub fn readmit(self: *DataFence, s: Successor) ?[]const u8 {
         const gpa = self.in.gpa;
         self.lock.lock();
         defer self.lock.unlock();
+        if (self.pending != null) return "the previous re-join's data re-admission is not settled";
         var next: [route_table.MAX_VOLUMES]MetaVol = undefined;
         var n_next: usize = 0;
         const oom = "out of memory re-admitting the data volumes";
@@ -801,8 +814,9 @@ pub const DataFence = struct {
                 mv.lapse_reregistrations = old.lapse_reregistrations;
             };
         }
-        // The predecessor's inputs stay until every volume re-admitted (a
-        // refused re-join closes the successor's set).
+        // The predecessor's inputs stay until the re-join is settled: a
+        // refusal here, or a refused membership join after it, closes the
+        // successor's set.
         const prior = self.in;
         const prior_metas = self.metas;
         const prior_n = self.n_metas;
@@ -837,8 +851,45 @@ pub const DataFence = struct {
                 stats.data_pr_registrations.inc();
             }
         }
-        for (prior_metas[0..prior_n]) |*mv| freeClient(gpa, null, mv.client);
+        self.pending = .{ .in = prior, .metas = prior_metas, .n_metas = prior_n };
         return null;
+    }
+
+    /// The re-join's member joined under the successor and the successor is
+    /// published (decision 0003 §DN.9): the predecessor's clients go.
+    pub fn commitReadmit(self: *DataFence) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const p = self.pending orelse return;
+        for (p.metas[0..p.n_metas]) |*mv| freeClient(self.in.gpa, null, mv.client);
+        self.pending = null;
+    }
+
+    /// The re-join was refused after its re-admission (decision 0003 §DN.9),
+    /// BEFORE its successors close: the fence re-pointed at the predecessor
+    /// — its inputs, its clients, its pages — and the successor's clients
+    /// freed. Left on the successors, the beat and a refused command's
+    /// re-admission issued through their closed devices and read their
+    /// freed backends. The data registrations the re-admission made stay
+    /// (the host's; the kept law at the release).
+    pub fn abortReadmit(self: *DataFence) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var p = self.pending orelse return;
+        for (p.metas[0..p.n_metas]) |*old| {
+            for (self.metas[0..self.n_metas]) |*mv| if (mv.index == old.index) {
+                old.lapse_reregistrations = mv.lapse_reregistrations;
+            };
+        }
+        for (self.metas[0..self.n_metas]) |*mv| freeClient(self.in.gpa, null, mv.client);
+        self.in = p.in;
+        self.metas = p.metas;
+        self.n_metas = p.n_metas;
+        self.meta = p.metas[0].client;
+        for (self.vols[0..self.n]) |*v| v.client.key = p.in.key;
+        self.pending = null;
+        self.beat_after_abort = true;
+        log.warn("data fence: the re-join's membership join was refused after its data re-admission — the data fence is re-pointed at the predecessor (open until the unmount) before the successors close (decision 0003 §DN.9)", .{});
     }
 
     /// A re-join's successor's inputs (decision 0003 §BS).
@@ -935,6 +986,10 @@ pub const DataFence = struct {
         self.takeLapseFlagLocked();
         const now = clock.monotonicNs();
         for (self.vols[0..self.n]) |*v| self.volumeBeat(v, now);
+        if (self.beat_after_abort) {
+            self.beat_after_abort = false;
+            log.info("data fence: the data fence's first beat after the refused re-join ran on the predecessor — {d} metadata volume(s), {d} data volume(s) (decision 0003 §DN.9)", .{ self.n_metas, self.n });
+        }
     }
 
     /// `SQUEEZEFS_TEST_LAPSE_BEAT_HOLD`, once: park until a writer opens the
@@ -1111,7 +1166,7 @@ pub const DataFence = struct {
         if (!fresh) return true;
         v.fresh = true;
         stats.data_pr_refusal_readmissions.inc();
-        log.warn("data volume {s}: a data command was refused (reservation conflict) inside a lapse still pending for this process — this host, registered on volume 0's metadata namespace and current, re-registered under key {x:0>16} through the rule; the command goes once more (decision 0003 §DL)", .{ v.path(), c.key });
+        log.warn("data volume {s}: a data command was refused (reservation conflict) inside a lapse still pending for this process — this host, registered on every joined metadata volume's namespace and current, re-registered under key {x:0>16} through the rule; the command goes once more (decision 0003 §DL)", .{ v.path(), c.key });
         return true;
     }
 
@@ -1181,6 +1236,8 @@ pub const DataFence = struct {
         stats.data_pr_volumes.set(0);
         for (self.metas[0..self.n_metas]) |*mv| freeClient(gpa, null, mv.client);
         self.n_metas = 0;
+        if (self.pending) |*p| for (p.metas[0..p.n_metas]) |*mv| freeClient(gpa, null, mv.client);
+        self.pending = null;
     }
 
     /// Another registrant stands ⇒ unregister (WEAR keeps the reservation);
@@ -1984,4 +2041,99 @@ test "decision 0003 §DN, a joiner of two metadata volumes: a restart of volume 
     try testing.expect(!dx.readmitAfterRefusal(1));
     try testing.expect(!dns.isRegistered(0x3333));
     try testing.expectEqual(declined0 + 1, stats.data_pr_refusal_readmissions_declined.load());
+}
+
+test "decision 0003 §DN.9, a re-join's data re-admission is two-phase: re-pointed at the successors it stays pending (a second one refused); aborted — the membership join refused, BEFORE the successors close — the fence is back on the predecessor: its beat and a refused command's re-admission issue through the predecessor's devices and read its pages, never a closed successor's; committed — the successors published — the predecessor's clients go and the fence runs on the successors" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/data-fence-settle-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var probe = host_fence.Registry.at(base, .set, 0x4a);
+    probe.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    probe.unlock();
+    const m_id: [16]u8 = "manager-host-id1".*;
+    const j_id: [16]u8 = "joiner-host-id-2".*;
+    var mns: [2]fake.Namespace = .{ fake.Namespace.init(gpa), fake.Namespace.init(gpa) };
+    defer for (&mns) |*n| n.deinit();
+    var dns = fake.Namespace.init(gpa);
+    defer dns.deinit();
+    // J's predecessor and successor associations: one host, two devices
+    // per volume (the successor's joiner opened its own char node).
+    var mh: [2]fake.Host = undefined;
+    var pred: [2]fake.Host = undefined;
+    var succ: [2]fake.Host = undefined;
+    var meta_m: [2]pr.Client = undefined;
+    var meta_j: [2]pr.Client = undefined;
+    for (0..2) |v| {
+        mh[v] = .{ .ns = &mns[v], .host_id = m_id };
+        pred[v] = .{ .ns = &mns[v], .host_id = j_id };
+        succ[v] = .{ .ns = &mns[v], .host_id = j_id };
+        meta_m[v] = try pr.Client.init(gpa, mh[v].face(), 1, 0x1111);
+        try fencing.acquireManagerHold(&meta_m[v]);
+        meta_j[v] = try pr.Client.init(gpa, pred[v].face(), 1, 0x2222);
+        _ = try fencing.joinAsRegistrant(&meta_j[v], null);
+    }
+    defer for (0..2) |v| {
+        meta_m[v].deinit();
+        meta_j[v].deinit();
+    };
+    var pages0 = [_]appender_page.Page{ livePage(0, 0xA, 0xA0), livePage(1, 0xC, 0xC0) };
+    var pages1 = [_]appender_page.Page{ livePage(0, 0xA, 0xA1), livePage(1, 0xC, 0xC0) };
+    var pred0: FixturePages = .{ .pages = &pages0 };
+    var pred1: FixturePages = .{ .pages = &pages1 };
+    var succ_pages0 = [_]appender_page.Page{ livePage(0, 0xA, 0xA0), livePage(2, 0xC, 0xC0) };
+    var succ_pages1 = [_]appender_page.Page{ livePage(0, 0xA, 0xA1), livePage(2, 0xC, 0xC0) };
+    var succ0: FixturePages = .{ .pages = &succ_pages0 };
+    var succ1: FixturePages = .{ .pages = &succ_pages1 };
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var cfg: FixtureConfig = .{ .live = &.{1} };
+    const local = proc.localIdentity();
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh[0].face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = local, .node_token = 0xA, .pages = pred0.source(), .meta_path = "fake-meta0", .writer_id = 0xA0, .config = cfg.source(), .manager = true });
+    defer dm.release();
+    const reg = host_fence.Registry.at(base, .set, 0x4a);
+    const dj = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = pred[0].face(), .meta_nsid = 1, .key = 0x2222, .reg = reg, .local = local, .node_token = 0xC, .pages = pred0.source(), .meta_path = "fake-meta0", .writer_id = 0xC0, .config = cfg.source(), .manager = false, .joined_metas = &.{.{ .face = pred[1].face(), .nsid = 1, .key = 0x2222, .pages = pred1.source(), .path = "fake-meta1", .index = 1 }} });
+    defer dj.release();
+    var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
+    var djh: fake.Host = .{ .ns = &dns, .host_id = j_id };
+    try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
+    try dj.admitClient(1, "fake-data", null, try fixtureClient(gpa, djh.face()));
+    dm.beat();
+    try testing.expectEqual(nvme.RTYPE_WEAR, dns.rtype);
+    // J evicted while live: its host preempted on data; its successors
+    // joined (registered on metadata again: J's host stayed there here).
+    try dm.clients[0].preemptAndAbort(0x2222);
+    const successor: DataFence.Successor = .{ .meta_face = succ[0].face(), .meta_nsid = 1, .key = 0x2222, .reg = reg, .pages = succ0.source(), .meta_path = "fake-meta0", .writer_id = 0xC0, .node_token = 0xC, .joined = &.{.{ .face = succ[1].face(), .nsid = 1, .key = 0x2222, .pages = succ1.source(), .path = "fake-meta1", .index = 1 }} };
+    try testing.expectEqual(@as(?[]const u8, null), dj.readmit(successor));
+    try testing.expect(dns.isRegistered(0x2222));
+    try testing.expect(dj.pending != null);
+    try testing.expect(dj.readmit(successor) != null);
+    // The membership join refused: aborted BEFORE the successors close.
+    dj.abortReadmit();
+    try testing.expect(dj.pending == null);
+    for (&succ) |*h| h.closed = true;
+    const p0 = pred[0].issued;
+    const p1 = pred[1].issued;
+    dj.beat();
+    try testing.expect(pred[0].issued > p0 and pred[1].issued > p1);
+    try dm.clients[0].preemptAndAbort(0x2222);
+    dj.vols[0].lapse_pending = true;
+    const q0 = pred[0].issued;
+    const q1 = pred[1].issued;
+    try testing.expect(dj.readmitAfterRefusal(1));
+    try testing.expect(pred[0].issued > q0 and pred[1].issued > q1);
+    for (succ) |h| try testing.expectEqual(@as(u32, 0), h.after_close);
+    // A later re-join: re-pointed and committed — the predecessor's clients
+    // freed (the allocator checks), the fence on the successors.
+    for (&succ) |*h| h.closed = false;
+    try dm.clients[0].preemptAndAbort(0x2222);
+    try testing.expectEqual(@as(?[]const u8, null), dj.readmit(successor));
+    dj.commitReadmit();
+    try testing.expect(dj.pending == null);
+    for (&pred) |*h| h.closed = true;
+    const succ_issued = succ[0].issued + succ[1].issued;
+    dj.beat();
+    try testing.expect(succ[0].issued + succ[1].issued > succ_issued);
+    for (pred) |h| try testing.expectEqual(@as(u32, 0), h.after_close);
 }

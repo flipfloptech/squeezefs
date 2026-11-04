@@ -378,6 +378,11 @@ pub const CAP_STATUS: nvme.Status = 0x180;
 pub const Host = struct {
     ns: *Namespace,
     host_id: [16]u8,
+    /// Its device closed (a re-join's successor that closed unpublished):
+    /// every later command is counted and refused, as a closed fd answers.
+    closed: bool = false,
+    issued: u32 = 0,
+    after_close: u32 = 0,
 
     pub fn face(self: *Host) nvme.Namespace {
         return .{ .ctx = self, .issue = issueFn };
@@ -385,6 +390,11 @@ pub const Host = struct {
 
     fn issueFn(ctx: *anyopaque, queue: nvme.Queue, cmd: *const nvme.UringCmd) errors.Error!nvme.Completion {
         const self: *Host = @ptrCast(@alignCast(ctx));
+        if (self.closed) {
+            self.after_close += 1;
+            return error.NotADeviceOrFile;
+        }
+        self.issued += 1;
         return self.ns.issue(self.host_id, queue, cmd);
     }
 };

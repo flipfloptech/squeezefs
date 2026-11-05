@@ -15,7 +15,12 @@
 //! HOLDER's preempt of a registrant's key (a no-op under WERO on nvmet 7.3,
 //! the victim unregistered with the hold kept under rtype 5 — decision 0003
 //! §DF), `preempt_and_abort` as a plain preempt,
-//! release + unregister = zero residue, and the shared-identity probe. The verb
+//! release + unregister = zero residue, and the shared-identity probe; the
+//! successor's preempt-all (decision 0004 §2.2: P6 unreserved, P4 under
+//! WEAR, P8, P3; P7 under Write Exclusive), THE CANARY (a non-holder
+//! registrant's All Registrants acquire conflicts — KD22), the drain
+//! barrier's answers (P15) and a victim's write storm across 50
+//! preempt-alls (P9a, P9c counted). The verb
 //! `nvmeof resv-report <dev> [--json] [--pr-matrix --peer <dev> [--force]]`
 //! runs them so the fidelity tier needs no nvme-cli (quirk Q14).
 
@@ -565,6 +570,11 @@ pub fn legPreemptAllWriteStorm(p: *Pair, r: *LegResult) void {
     var done: u32 = 0;
     var failure: ?anyerror = null;
     var stalled = false;
+    // Diagnostics: each command's length is its victim's kill-to-unregister
+    // instant (the kill's confirm) plus its drain of the writer's admitted
+    // writes — the window P9c's EIOs fall in.
+    var pa_ns_sum: u64 = 0;
+    var pa_ns_max: u64 = 0;
     while (done < STORM_PREEMPT_ALLS) : (done += 1) {
         if (done != 0) _ = p.a.registerLadder() catch |e| {
             failure = e;
@@ -574,10 +584,14 @@ pub fn legPreemptAllWriteStorm(p: *Pair, r: *LegResult) void {
             stalled = true;
             break;
         }
+        const t_pa = clock.monotonicNs();
         p.b.preemptAllAndAbort() catch |e| {
             failure = e;
             break;
         };
+        const ns = clock.monotonicNs() - t_pa;
+        pa_ns_sum += ns;
+        pa_ns_max = @max(pa_ns_max, ns);
     }
     storm.stop.store(true, .release);
     t.join();
@@ -587,7 +601,7 @@ pub fn legPreemptAllWriteStorm(p: *Pair, r: *LegResult) void {
     const other = storm.other.load(.monotonic);
     if (failure) |e| return set(r, false, "preempt-all {d} of {d}: {s}", .{ done + 1, STORM_PREEMPT_ALLS, errName(e) });
     if (stalled) return set(r, false, "the re-registered victim landed no write before preempt-all {d} (landed {d}, refused {d}, EIO {d}, other {d})", .{ done + 1, landed, refused, eio, other });
-    set(r, other == 0 and refused >= 1 and landed >= STORM_PREEMPT_ALLS, "{d} preempt-alls over the victim's write storm: landed {d}, refused -EBADE {d}, P9c EIO {d}, other {d}{s}", .{ done, landed, refused, eio, other, if (storm.other_err) |e| errName(e) else "" });
+    set(r, other == 0 and refused >= 1 and landed >= STORM_PREEMPT_ALLS, "{d} preempt-alls over the victim's write storm: landed {d}, refused -EBADE {d}, P9c EIO {d}, other {d}{s}; the preempt-alls took {d} µs in all, {d} µs at most", .{ done, landed, refused, eio, other, if (storm.other_err) |e| errName(e) else "", pa_ns_sum / std.time.ns_per_us, pa_ns_max / std.time.ns_per_us });
 }
 
 pub const MatrixReport = struct {

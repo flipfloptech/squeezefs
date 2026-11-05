@@ -33,7 +33,11 @@
 //! `writer_guard_pr_reacquires` grows, `writer_guard_fenced` stays 0),
 //! `crash-window` (law 6 on the real tree), `adopt`, `pr-registrants` (64
 //! real registrants: the two-step report reads 64 + 64 × 64 B), `loudfail`
-//! and `storage-list`.
+//! and `storage-list`; the slow drain (decision 0004 §8.2): `slow-drain-
+//! {loop,tcp}` and P17's `teardown-during-drain-{loop,tcp}` on a null_blk
+//! namespace (the stock null_blk module is loaded with no default device
+//! when absent, as the smoke's dm rows load theirs), and the opt-in
+//! `keepalive-teardown-during-drain-tcp`.
 
 const std = @import("std");
 const testkit = @import("../../core/testkit.zig");
@@ -1000,8 +1004,9 @@ test "nvmet fidelity: pr-matrix-tcp — the same legs on nvmet-tcp, plus a regis
 /// The slow backend's completion delay. The drain lasts until the victim's
 /// admitted write completes, so the legs' probes (a report, a read's six
 /// attempts, a write, two barriers: each a round trip of tens of µs) run
-/// inside it with room under load; F7a's 50 ms (decision 0004 §8.2) × 5.
-const slow_completion_ns: u64 = 250 * std.time.ns_per_ms;
+/// inside it after the victim's kill-to-unregister instant (2–12 ms on the
+/// venue) with room under load; F7a's 50 ms (decision 0004 §8.2) × 20.
+const slow_completion_ns: u64 = 1000 * std.time.ns_per_ms;
 const slow_size_mib: u64 = 64;
 /// The legs' verdict bound for one observable (the write reaching the
 /// backend, the victim's unregistration in a report, the drain's end): a
@@ -1026,9 +1031,12 @@ fn nullBlkReady(rig: *Rig) bool {
 /// A null_blk-backed share connected under both identities, the PR pair
 /// over it, and a second device on B's association: B's own device carries
 /// the preempt-all for its whole drain (one command per Device), so B's
-/// barrier rides the second.
+/// barrier rides the second. The victim's admitted write rides a pool of its
+/// own: a pool worker waits in its ring for a completion before it takes
+/// the next request, so a probe behind that write would wait for it.
 const SlowPair = struct {
     nb: storage.NullBlk,
+    w_pool: *uring_fs.Pool,
     nqn: []const u8,
     a: Connected,
     b: Connected,
@@ -1066,10 +1074,12 @@ const SlowPair = struct {
         errdefer gpa.destroy(b2);
         b2.* = try pr.Client.init(gpa, dev_b2.face(), dev_b2.nsid, pr_legs.key_b1);
         for ([_]*pr.Client{ pair.a, pair.b, pair.a_twin, b2 }) |c| _ = c.probeRescap() catch {};
-        return .{ .nb = nb, .nqn = nqn, .a = a, .b = b, .a_path = a_path, .b_path = b_path, .pair = pair, .dev_b2 = dev_b2, .b2 = b2 };
+        const w_pool = try uring_fs.Pool.init(gpa, uring_fs.Config.fixed(1, uring_fs.nofileSoftAsFound()));
+        return .{ .nb = nb, .w_pool = w_pool, .nqn = nqn, .a = a, .b = b, .a_path = a_path, .b_path = b_path, .pair = pair, .dev_b2 = dev_b2, .b2 = b2 };
     }
 
     fn close(self: *SlowPair, rig: *Rig) void {
+        self.w_pool.deinit();
         if (!self.a_deleted) self.pair.reset();
         self.b2.deinit();
         rig.gpa.destroy(self.b2);
@@ -1094,7 +1104,7 @@ const SlowPair = struct {
         _ = try p.a.registerLadder();
         try p.a.acquire();
         _ = try p.b.registerLadder();
-        var w = try p.pool.submitWriteAtBatch(p.a_block, &.{.{ .offset = 0, .data = p.buf.bytes }});
+        var w = try self.w_pool.submitWriteAtBatch(p.a_block, &.{.{ .offset = 0, .data = p.buf.bytes }});
         errdefer _ = w.wait() catch {};
         const deadline = clock.monotonicNs() + drain_wait_ns;
         while ((self.nb.inflightWrites() orelse 0) == 0) {
@@ -1124,11 +1134,13 @@ const PreemptAllRun = struct {
     c: *pr.Client,
     err: ?anyerror = null,
     done: std.atomic.Value(bool) = .init(false),
+    end_ns: u64 = 0,
 
     fn run(self: *PreemptAllRun) void {
         self.c.preemptAllAndAbort() catch |e| {
             self.err = e;
         };
+        self.end_ns = clock.monotonicNs();
         self.done.store(true, .release);
     }
 };
@@ -1147,8 +1159,8 @@ const BarrierRun = struct {
 /// One slow drain: what the victim saw and what the barriers answered.
 const DrainRound = struct {
     eio_reads: u32 = 0,
-    /// EIO reads submitted while both barriers were outstanding: the
-    /// barriers were issued inside the drain (0 ⇒ the round proves nothing).
+    /// EIO reads submitted while both barriers were outstanding: both were
+    /// issued inside the drain (0 ⇒ the round proves nothing).
     eio_with_barriers_pending: u32 = 0,
     /// EIO reads submitted after the preempt-all or a barrier returned: a
     /// barrier that did not wait for the drain, or refs not resurrected.
@@ -1161,46 +1173,77 @@ const DrainRound = struct {
     admitted_write: ?anyerror = null,
     read_after: ?anyerror = null,
     write_after_refused: bool = false,
+    /// Diagnostics: from the preempt-all's issue to the report without the
+    /// victim (its unregister, after the kill's confirm), and to its return.
+    unregistered_ms: u64 = 0,
+    preempt_ms: u64 = 0,
+    ok_reads: u32 = 0,
+    slowest_read_ms: u64 = 0,
 
     fn proves(self: *const DrainRound) bool {
         return self.eio_with_barriers_pending != 0;
     }
 };
 
+/// A probe read of the victim's: EIO counted (and judged against what had
+/// returned before it was submitted), success released.
+fn probeRead(p: *pr_legs.Pair, out: *DrainRound, returned: bool, pending: bool) bool {
+    const t = clock.monotonicNs();
+    defer out.slowest_read_ms = @max(out.slowest_read_ms, (clock.monotonicNs() - t) / std.time.ns_per_ms);
+    if (p.pool.readAt(p.a_block, 0, pr_legs.PROBE_WRITE_LEN)) |res| {
+        var rr = res;
+        rr.deinit();
+        out.ok_reads += 1;
+        return false;
+    } else |e| switch (e) {
+        error.InputOutput => {
+            out.eio_reads += 1;
+            if (pending) out.eio_with_barriers_pending += 1;
+            if (returned) out.late_eio += 1;
+            return true;
+        },
+        else => {
+            out.other = e;
+            return false;
+        },
+    }
+}
+
 fn slowDrainRound(sp: *SlowPair, out: *DrainRound) !void {
     const p = &sp.pair;
     var w = try sp.arm();
     var s: PreemptAllRun = .{ .c = p.b };
-    const ts = try std.Thread.spawn(.{}, PreemptAllRun.run, .{&s});
-    sp.awaitVictimUnregistered() catch |e| {
-        ts.join();
-        _ = w.wait() catch {};
-        return e;
-    };
+    const t0 = clock.monotonicNs();
+    var ts: ?std.Thread = try std.Thread.spawn(.{}, PreemptAllRun.run, .{&s});
     var t_reg: BarrierRun = .{ .c = sp.b2 };
     var t_victim: BarrierRun = .{ .c = p.a };
-    const tr = try std.Thread.spawn(.{}, BarrierRun.run, .{&t_reg});
-    const tv = try std.Thread.spawn(.{}, BarrierRun.run, .{&t_victim});
-    const deadline = clock.monotonicNs() + drain_wait_ns;
+    var tr: ?std.Thread = null;
+    var tv: ?std.Thread = null;
+    defer for ([_]?std.Thread{ ts, tr, tv }) |t| if (t) |th| th.join();
+    // The victim's registration goes after its refs' kill is confirmed
+    // (P9), so from here its refs are dead until the drain ends; the report
+    // takes no pr_sem (P14). A probe read before this point could be
+    // admitted and wait out the backend's delay itself. The report rides
+    // A's device: before A's barrier parks there.
+    try sp.awaitVictimUnregistered();
+    out.unregistered_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+    tr = try std.Thread.spawn(.{}, BarrierRun.run, .{&t_reg});
+    tv = try std.Thread.spawn(.{}, BarrierRun.run, .{&t_victim});
+    const deadline = t0 + drain_wait_ns;
     while (!(s.done.load(.acquire) and t_reg.done.load(.acquire) and t_victim.done.load(.acquire)) and clock.monotonicNs() < deadline) {
         const returned = s.done.load(.acquire) or t_reg.done.load(.acquire) or t_victim.done.load(.acquire);
         const pending = !t_reg.done.load(.acquire) and !t_victim.done.load(.acquire);
-        if (p.pool.readAt(p.a_block, 0, pr_legs.PROBE_WRITE_LEN)) |res| {
-            var rr = res;
-            rr.deinit();
-        } else |e| switch (e) {
-            error.InputOutput => {
-                out.eio_reads += 1;
-                if (pending) out.eio_with_barriers_pending += 1;
-                if (returned) out.late_eio += 1;
-                if (out.write_refused == null) out.write_refused = if (p.pool.writeAt(p.a_block, pr_legs.PROBE_WRITE_LEN, p.buf.bytes)) false else |we| we == error.ReservationConflict;
-            },
-            else => out.other = e,
+        if (probeRead(p, out, returned, pending) and out.write_refused == null) {
+            out.write_refused = if (p.pool.writeAt(p.a_block, pr_legs.PROBE_WRITE_LEN, p.buf.bytes)) false else |we| we == error.ReservationConflict;
         }
     }
-    ts.join();
-    tr.join();
-    tv.join();
+    ts.?.join();
+    out.preempt_ms = (s.end_ns - t0) / std.time.ns_per_ms;
+    tr.?.join();
+    tv.?.join();
+    ts = null;
+    tr = null;
+    tv = null;
     out.preempt = s.err;
     out.registered_barrier = t_reg.answer;
     out.victim_barrier = t_victim.answer;
@@ -1226,9 +1269,10 @@ fn slowDrainLeg(transport: configfs.Trtype) !void {
         round = .{};
         rounds += 1;
         try slowDrainRound(&sp, &round);
+        std.debug.print("\nround {d}: EIO reads {d} ({d} pending, {d} late), ok reads {d}, slowest {d} ms, gone {d} ms, returned {d} ms\n", .{ rounds, round.eio_reads, round.eio_with_barriers_pending, round.late_eio, round.ok_reads, round.slowest_read_ms, round.unregistered_ms, round.preempt_ms });
         if (round.proves()) break;
     }
-    std.debug.print("\nslow drain ({s}, {d} round(s)): victim reads EIO {d} ({d} while both barriers were outstanding, {d} after a return), victim write refused {?}, other {?s}; preempt-all {?s}; B's barrier {s}, A's barrier {s}; the admitted write {?s}; after the drain: read {?s}, write refused {}\n", .{ transport.name(), rounds, round.eio_reads, round.eio_with_barriers_pending, round.late_eio, round.write_refused, if (round.other) |e| @errorName(e) else null, if (round.preempt) |e| @errorName(e) else null, @tagName(round.registered_barrier), @tagName(round.victim_barrier), if (round.admitted_write) |e| @errorName(e) else null, if (round.read_after) |e| @errorName(e) else null, round.write_after_refused });
+    std.debug.print("\nslow drain ({s}, {d} round(s)): victim reads EIO {d} ({d} while both barriers were outstanding, {d} after a return), victim write refused {?}, other {?s}; preempt-all {?s}; B's barrier {s}, A's barrier {s}; the admitted write {?s}; after the drain: read {?s}, write refused {}; from the preempt-all's issue: the victim gone from the report {d} ms, the preempt-all returned {d} ms\n", .{ transport.name(), rounds, round.eio_reads, round.eio_with_barriers_pending, round.late_eio, round.write_refused, if (round.other) |e| @errorName(e) else null, if (round.preempt) |e| @errorName(e) else null, @tagName(round.registered_barrier), @tagName(round.victim_barrier), if (round.admitted_write) |e| @errorName(e) else null, if (round.read_after) |e| @errorName(e) else null, round.write_after_refused, round.unregistered_ms, round.preempt_ms });
     try testing.expect(round.proves());
     try testing.expectEqual(@as(?anyerror, null), round.preempt);
     try testing.expectEqual(@as(u32, 0), round.late_eio);
@@ -1340,7 +1384,7 @@ fn teardownLeg(transport: configfs.Trtype, variant: TeardownVariant) !void {
         },
     }
     ts.join();
-    const drained_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+    const drained_ms = (s.end_ns - t0) / std.time.ns_per_ms;
     const admitted = w.wait();
     const victim_barrier = p.a.drainBarrier();
     var rep = try sp.b2.report();

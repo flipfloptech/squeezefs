@@ -970,6 +970,43 @@ test "drainBarrier (decision 0004 §4.2, §5.1; P15, P15a): the byte-exact comma
     try testing.expectEqual(@as(u32, 0), locks.n);
 }
 
+const SharedBarrier = struct {
+    c: *Client,
+    failures: std.atomic.Value(u32) = .init(0),
+
+    fn issue(_: *anyopaque, _: nvme.Queue, _: *const nvme.UringCmd) errors.Error!nvme.Completion {
+        return .{ .status = nvme.SC_INTERNAL };
+    }
+
+    fn run(self: *SharedBarrier) void {
+        for (0..2048) |_| if (self.c.drainBarrier() != .unknown) {
+            _ = self.failures.fetchAdd(1, .monotonic);
+        };
+    }
+};
+
+test "PR-2 C2: shared Client barriers leave sequence diagnostics untouched and count every concurrent answer" {
+    var marker: u8 = 0;
+    var c = try Client.init(testing.allocator, .{ .ctx = &marker, .issue = SharedBarrier.issue }, 1, 0xa);
+    defer c.deinit();
+    c.last_status = nvme.SC_INVALID_FIELD;
+    c.last_errno = error.BadFileDescriptor;
+    try testing.expectEqual(Barrier.unknown, c.drainBarrier());
+    try testing.expectEqual(nvme.SC_INVALID_FIELD, c.last_status);
+    try testing.expectEqual(@as(?errors.Error, error.BadFileDescriptor), c.last_errno);
+    var shared: SharedBarrier = .{ .c = &c };
+    var threads: [4]?std.Thread = @splat(null);
+    defer for (threads) |t| if (t) |th| th.join();
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, SharedBarrier.run, .{&shared});
+    for (&threads) |*t| {
+        t.*.?.join();
+        t.* = null;
+    }
+    try testing.expectEqual(@as(u32, 0), shared.failures.load(.monotonic));
+    try testing.expectEqual(@as(u64, 8193), c.stats.drain_barriers);
+    try testing.expectEqual(@as(u64, 8193), c.stats.drain_barrier_unknowns);
+}
+
 const BarrierRun = struct {
     c: *Client,
     answer: Barrier = .unknown,

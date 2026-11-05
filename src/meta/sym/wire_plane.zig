@@ -106,6 +106,7 @@ const service = @import("../../wire/service.zig");
 const verbs = @import("../../wire/verbs.zig");
 const frame = @import("../../wire/frame.zig");
 const screen_mod = @import("../../wire/screen.zig");
+const proc = @import("../guard/proc.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("sym/wire_plane is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -161,6 +162,10 @@ pub fn startReason(e: StartError) []const u8 {
 /// The manager's appender id — the holder every joiner's divert keys the
 /// manager's token plane by (`LocalResolver.homeOf`: identity = holder).
 const MANAGER_HOLDER: u32 = @import("../journal.zig").FIXED_RING_APPENDER;
+
+/// Test seam: the successor's §DA proof of a same-host page's writer at its
+/// arm (`priorRoster`; null = `proc.proveWriter`) — a test answers per call.
+pub var test_prove_writer: if (builtin.is_test) ?*const fn (writer_id: u64) proc.WriterProof else void = if (builtin.is_test) null else {};
 
 /// The longest `host:port` text (`[v6]:port` at full width).
 pub const ENDPOINT_TEXT_MAX: usize = 64;
@@ -1993,7 +1998,6 @@ pub const WirePlane = struct {
     /// nothing.
     fn priorRoster(self: *WirePlane, expected: *std.ArrayList(shard.Expected), pre_dead: *std.ArrayList(shard.Expected)) backend.Error!void {
         const gpa = self.gpa;
-        const proc = @import("../guard/proc.zig");
         const r = cr.rangeOf(.member);
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
         defer tree.deinitKeyValues(gpa, &kvs);
@@ -2016,7 +2020,7 @@ pub const WirePlane = struct {
             for (s.live_pages.items) |lp| {
                 const stable: cr.StableIdentity = .{ .node_token = lp.identity.node_token, .mount_slot = lp.identity.mount_slot };
                 const id = memberIdOfStable(stable);
-                const proof: proc.WriterProof = if (node == lp.identity.node_token) proc.proveWriter(self.io, local, @truncate(lp.identity.mount_slot), lp.identity.writer_id) else .unknown;
+                const proof: proc.WriterProof = if (node == lp.identity.node_token) self.proveWriter(local, @truncate(lp.identity.mount_slot), lp.identity.writer_id) else .unknown;
                 switch (proof) {
                     .alive => |pid| if (pid == local.pid) continue,
                     .dead => {
@@ -2034,6 +2038,13 @@ pub const WirePlane = struct {
                 try mergeExpected(gpa, expected, id, lp.host_key);
             }
         }
+    }
+
+    /// The §DA proof of a same-host page's writer (the seam's answer in a
+    /// test that sets it).
+    fn proveWriter(self: *WirePlane, local: claim.Identity, slot: u16, writer_id: u64) proc.WriterProof {
+        if (builtin.is_test) if (test_prove_writer) |f| return f(writer_id);
+        return proc.proveWriter(self.io, local, slot, writer_id);
     }
 
     fn memberIdOfStable(id: cr.StableIdentity) shard.MemberId {

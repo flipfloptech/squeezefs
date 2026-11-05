@@ -209,7 +209,7 @@ pub fn sample(ledger: *Ledger, gpa: std.mem.Allocator, io: Io, proc_root: []cons
                 if (try taskAbsent(io, task_dir_path, tid)) continue;
                 return err;
             };
-            break :blk parseStatCpuNs(text, 100) orelse {
+            break :blk parseStatCpuNs(text, 100) orelse { // Linux USER_HZ is 100 ticks/s.
                 if (try taskAbsent(io, task_dir_path, tid)) continue;
                 return error.InvalidCpuSample;
             };

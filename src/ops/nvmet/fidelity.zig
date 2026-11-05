@@ -140,6 +140,8 @@ const Rig = struct {
     pid: linux.pid_t,
     /// The manifest: what this leg made and must remove.
     shares: std.ArrayList([]u8) = .empty,
+    /// Shares removed during the leg: their NQN strings, freed at teardown.
+    unshared: std.ArrayList([]u8) = .empty,
     connects: std.ArrayList(Connected) = .empty,
     /// Live daemons (foreground mounts) with their log files.
     daemons: std.ArrayList(Daemon) = .empty,
@@ -230,6 +232,8 @@ const Rig = struct {
             self.gpa.free(s);
         }
         self.shares.deinit(self.gpa);
+        for (self.unshared.items) |s| self.gpa.free(s);
+        self.unshared.deinit(self.gpa);
         for (self.port_probes.items) |fd| _ = linux.close(fd);
         self.port_probes.deinit(self.gpa);
         self.pool.deinit();
@@ -396,11 +400,13 @@ const Rig = struct {
         return owned;
     }
 
+    /// The NQN string stays the rig's until its teardown: the caller still
+    /// holds it (the residue census after the unshare reads it).
     fn unshare(self: *Rig, nqn: []const u8) !void {
         const out = try self.sqzOk(&.{ "nvmeof", "unshare", nqn });
         defer self.gpa.free(out);
         for (self.shares.items, 0..) |s, i| if (std.mem.eql(u8, s, nqn)) {
-            self.gpa.free(self.shares.orderedRemove(i));
+            try self.unshared.append(self.gpa, self.shares.orderedRemove(i));
             break;
         };
     }

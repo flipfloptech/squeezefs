@@ -1002,6 +1002,38 @@ test "fake drain (nvmet 7.3, decision 0004 §2.2 P5, P9): a PRKEY k preempt-and-
     try testing.expectEqual(@as(?u16, 2), seam.drain_regctl);
 }
 
+fn preemptOom(fail_after: usize) !void {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var ns = Namespace.init(failing.allocator());
+    defer ns.deinit();
+    var a: Host = .{ .ns = &ns, .host_id = host_a };
+    var b: Host = .{ .ns = &ns, .host_id = host_b };
+    var c: Host = .{ .ns = &ns, .host_id = host_c };
+    _ = try registerKey(&a, 0xa);
+    _ = try registerKey(&b, 0xb);
+    _ = try registerKey(&c, 0xc);
+    _ = try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0);
+    const gen = ns.generation;
+    failing.fail_index = failing.alloc_index + fail_after;
+    try testing.expectError(error.OutOfMemory, acquireAs(&b, nvme.RACQA_PREEMPT_AND_ABORT, nvme.RTYPE_WEAR, 0xb, 0));
+    try testing.expect(!ns.prSemHeld());
+    try testing.expect(ns.isHolder(host_a));
+    try testing.expectEqual(gen, ns.generation);
+    try testing.expectEqual(@as(usize, 3), ns.registered.items.len);
+    try testing.expectEqual(@as(usize, 0), ns.killed.items.len);
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try replaceSame(&a, 0xa));
+    try testing.expectEqual(nvme.STATUS_SUCCESS, try acquireAs(&b, nvme.RACQA_PREEMPT_AND_ABORT, nvme.RTYPE_WEAR, 0xb, 0));
+}
+
+test "PR-2 C3: victim-bookkeeping OOM changes no holder, registration, generation or drain state" {
+    try preemptOom(0);
+}
+
+test "PR-2 C3: killed-bookkeeping OOM never strands pr_sem or the next command" {
+    try preemptOom(1);
+}
+
 const Issued = struct {
     host: *Host,
     cmd: nvme.UringCmd,

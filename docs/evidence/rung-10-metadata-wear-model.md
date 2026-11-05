@@ -466,3 +466,14 @@ reds ×5 (units 55 / 57, 2 skipped — F9 and F9b, the nvmet tier's —; F9 and 
 test` 23/23 steps, 3,384 / 3,581 passed (197 skipped), 0 failed; the nvmet tier ×1 idle and ×1
 under `cpu+smoke` load (load ≈ 78) 74 / 1 / 0 each; the 27 rows ×1 71/71; `zig build rails` 18/18,
 34/34; `zig fmt --check` clean. No hot path touched; no timing benchmark run.
+
+**Recovered review follow-up (C1/S1/S2).** One immutable enriched Live-page census now supplies
+mount counts, appender-ID membership and the successor's identities/keys. `open` owns its
+error cleanup before the census; normal teardown owns successful opens. The test-only
+`059bea1` collected appender 1 then refused a checksum-valid foreign layout at appender 2:
+41/41 assertions passed, but two allocations leaked (160 + 132 B), exit 1. With the fix, the
+failed-open and snapshot/count tests pass 42/42 with no leaks, exit 0. `joinKeyVerdict`'s
+comment is four lines; §DO.19's requester/key-binding residue and the predicates are unchanged.
+Through `scripts/venue`: affected units 259/260 (1 seam-only recovery loop skipped), F9/F9b
+42/42 (each recovery and both fences 1, page-key fallback 0), fmt + rails 34/34; all exit 0.
+No full gate was run for this follow-up.

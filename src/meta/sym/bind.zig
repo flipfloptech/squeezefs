@@ -106,19 +106,14 @@ pub const AppenderSet = struct {
     regions: std.ArrayList(*Region) = .empty,
     manager: manager.Manager,
     identity: page.Identity,
-    /// Live pages of OTHER appenders found at open: unrecovered (their
-    /// rings are the recovery wave's; their slots are refused).
-    unrecovered: std.ArrayList(u32) = .empty,
-    /// The same pages' identities and host keys: the successor's expected
-    /// set reads them (decision 0004 §4.6, KD17).
+    /// Immutable open-time Live-page snapshot: unrecovered rings and the
+    /// identities/keys for the successor's expected set (0004 §4.6, KD17).
     live_pages: std.ArrayList(LivePage) = .empty,
     /// Appender 0's identity as its page carried it when THIS open read
     /// it — the predecessor manager the D0 ladder was won over (null: a
     /// blank page, the first manager ever). The allocation leases'
     /// same-node succession proves THIS identity dead and no other.
     page0_at_open: ?page.Identity = null,
-    /// The directory's Live count at open.
-    live_at_open: u64 = 0,
     /// The ring-budget remainder as of the last census.
     budget_remaining: u64 = 0,
     /// A page-aligned zero buffer for the carve's zeroing (one per set).
@@ -144,6 +139,7 @@ pub const AppenderSet = struct {
         @memset(self.zeros, 0);
         self.manager = manager.Manager.init(gpa, be.io, self.volume());
         errdefer self.manager.deinit();
+        errdefer self.live_pages.deinit(gpa);
         if (g.prClient() != null) self.manager.key_check = .{ .ctx = self, .verify = &verifyJoinKeyFn };
         try self.census();
         try self.joinRegion0();
@@ -164,7 +160,6 @@ pub const AppenderSet = struct {
     pub fn deinit(self: *AppenderSet) void {
         for (self.regions.items) |r| self.destroyRegion(r);
         self.regions.deinit(self.gpa);
-        self.unrecovered.deinit(self.gpa);
         self.live_pages.deinit(self.gpa);
         self.manager.deinit();
         self.gpa.free(self.zeros);
@@ -210,10 +205,8 @@ pub const AppenderSet = struct {
                 }
                 const p = imgs.newest() orelse continue;
                 if (p.state != .live) continue;
-                self.live_at_open += 1;
                 rings_in_use += p.ringBytes();
                 sym.stats.appender_live_pages_at_mount.inc();
-                try self.unrecovered.append(self.gpa, p.appender_id);
                 try self.live_pages.append(self.gpa, .{ .appender_id = p.appender_id, .identity = p.identity, .host_key = p.host_key });
                 log.warn("meta volume {s}: appender {d} (node 0x{x}, mount slot {d}, term {d}) is LIVE on the directory with its ring unrecovered — its slots are refused until the recovery ladder recovers it", .{ be.path, p.appender_id, p.identity.node_token, p.identity.mount_slot, p.term });
             }
@@ -310,8 +303,8 @@ pub const AppenderSet = struct {
         try self.regions.append(self.gpa, r);
         try self.writePages(r, false);
         self.manager.holdLease(words.term);
-        self.manager.appenders_known = @max(self.live_at_open + 1, 1);
-        log.info("meta volume {s}: appender 0 Live as the manager (term {d}, node 0x{x}, mount slot {d}); {d} other appender(s) live on the directory", .{ be.path, words.term, self.identity.node_token, self.identity.mount_slot, self.live_at_open });
+        self.manager.appenders_known = self.live_pages.items.len + 1;
+        log.info("meta volume {s}: appender 0 Live as the manager (term {d}, node 0x{x}, mount slot {d}); {d} other appender(s) live on the directory", .{ be.path, words.term, self.identity.node_token, self.identity.mount_slot, self.live_pages.items.len });
     }
 
     /// The page plan executed: every slot the law names, then one barrier.
@@ -561,7 +554,7 @@ pub const AppenderSet = struct {
     /// Is `appender_id`'s ring unrecovered (a Live page of another writer
     /// found at open)? Its slots are refused until recovered.
     pub fn isUnrecovered(self: *const AppenderSet, appender_id: u32) bool {
-        for (self.unrecovered.items) |id| if (id == appender_id) return true;
+        for (self.live_pages.items) |lp| if (lp.appender_id == appender_id) return true;
         return false;
     }
 
@@ -918,7 +911,7 @@ pub const AppenderSet = struct {
     pub fn writeStatsJson(self: *AppenderSet, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll("{\"manager_lease\":\"");
         try self.manager.leaseWord(w);
-        try w.print("\",\"appenders_live\":{d},\"appenders_known\":{d},\"appenders_capacity\":{d},\"appender_ring_budget_remaining_bytes\":{d},\"appender_live_pages_at_mount\":{d},\"appender_unrecovered\":{d},\"regions\":[", .{ self.regions.items.len, self.manager.appenders_known, region.appendersCapacity(self.budget_remaining), self.budget_remaining, self.live_at_open, self.unrecovered.items.len });
+        try w.print("\",\"appenders_live\":{d},\"appenders_known\":{d},\"appenders_capacity\":{d},\"appender_ring_budget_remaining_bytes\":{d},\"appender_live_pages_at_mount\":{d},\"appender_unrecovered\":{d},\"regions\":[", .{ self.regions.items.len, self.manager.appenders_known, region.appendersCapacity(self.budget_remaining), self.budget_remaining, self.live_pages.items.len, self.live_pages.items.len });
         for (self.regions.items, 0..) |r, i| {
             if (i != 0) try w.writeByte(',');
             try w.print("{{\"appender_id\":{d},\"term\":{d},\"ring_bytes\":{d},\"ring_segments\":{d},\"seq_offset\":{d},\"grant_unclaimed\":{d},\"grant_held\":{d},\"grant_granted\":{d},\"grant_returned\":{d},\"entries\":{d}}}", .{ r.appenderId(), r.core.page.term, r.core.ringBytes(), r.core.table.len, r.core.reg.seqOffset(), r.grant.unclaimedCount(), r.grant.held(), r.grant.granted, r.grant.returned, r.entries });
@@ -1057,7 +1050,7 @@ test "symmetric default: format → mount A (the manager: region 0 Live with is_
         try testing.expect(r0.core.page.is_manager and r0.core.page.state == .live and r0.core.page.term == 1);
         try testing.expect(r0.core.page.identity.eql(set.identity));
         try testing.expectEqual(manager.Lease.held, set.manager.lease);
-        try testing.expectEqual(@as(usize, 0), set.unrecovered.items.len);
+        try testing.expectEqual(@as(usize, 0), set.live_pages.items.len);
         // The manager's page is on the device, newest-valid over the four slots.
         const p0 = (try set.manager.readPageOf(0)).?;
         try testing.expect(p0.is_manager and p0.term == 1);
@@ -1117,7 +1110,7 @@ test "symmetric default: format → mount A (the manager: region 0 Live with is_
         try testing.expect(be.replayStats().clean_unmount);
         const set = be.sym.?;
         try testing.expectEqual(@as(u64, 2), set.region0().core.page.term);
-        try testing.expectEqual(@as(usize, 0), set.unrecovered.items.len);
+        try testing.expectEqual(@as(usize, 0), set.live_pages.items.len);
         for (keys.items) |k| {
             const got = try be.lookup(gpa, key.TREE_INODES, k);
             defer if (got) |g| gpa.free(g);
@@ -1177,9 +1170,15 @@ test "kill -9 with two regions live (the image copied mid-life): the remount rec
     try testing.expectEqual(before + 1, sym.stats.appender_live_pages_at_mount.load());
     try testing.expect(set.isUnrecovered(1));
     try testing.expect(!set.isUnrecovered(0));
-    try testing.expectEqual(@as(usize, 1), set.unrecovered.items.len);
+    try testing.expectEqual(@as(usize, 1), set.live_pages.items.len);
     const p1 = (try set.manager.readPageOf(1)).?;
     try testing.expect(p1.state == .live and p1.identity.mount_slot == join.HARNESS_MOUNT_SLOT_BASE + 1);
+    try testing.expectEqual(LivePage{ .appender_id = p1.appender_id, .identity = p1.identity, .host_key = p1.host_key }, set.live_pages.items[0]);
+    try testing.expectEqual(@as(u64, 2), set.manager.appenders_known);
+    var stats_buf: [1024]u8 = undefined;
+    var stats_writer: std.Io.Writer = .fixed(&stats_buf);
+    try set.writeStatsJson(&stats_writer);
+    try testing.expect(std.mem.indexOf(u8, stats_writer.buffered(), "\"appender_live_pages_at_mount\":1,\"appender_unrecovered\":1") != null);
     // The manager's own ring replayed: every acked record of region 0.
     for (keys.items) |k| {
         const got = try copy.lookup(gpa, key.TREE_INODES, k);

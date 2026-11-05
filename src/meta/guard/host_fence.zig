@@ -93,18 +93,10 @@ pub fn hostKey(wire_host_id: []const u8, set_uuid: [16]u8) u64 {
 /// (decision 0004 §6.1, KD18).
 pub const JoinKeyVerdict = enum { ok, absent, mismatch };
 
-/// `host_keyed` (the host's registry stands): ok iff a registrant holds
-/// `claimed` under a host id `claimed` derives from — `hostKey(host id,
-/// set)` —, so a page key is the key of a host the device reports
-/// registered: a stale key (a host fenced since), another set's, or one
-/// registered only under ids it does not derive from never passes. It is
-/// SOME registered host's key, not provably the joiner's: the manager sees
-/// neither the joiner's controller nor its NVMe host id, so a joiner that
-/// claims another live host's key passes (decision 0003 §DO.19's residue —
-/// a lying member, which already holds the set's secret). Under incarnation
-/// keys (the per-mount seam, no wire host id) a registrant holding it
-/// suffices. The extended report's 16 B host ids are the FID 0x81 words
-/// `plan` derives keys from.
+/// Host-keyed: a registrant holds non-zero `claimed` under a host id that
+/// derives it via `hostKey(id, set)`. Incarnation-keyed: holding it suffices.
+/// The key belongs to some registered host, not necessarily the requester
+/// (decision 0003 §DO.19).
 pub fn joinKeyVerdict(rep: nvme.Report, claimed: u64, set_uuid: [16]u8, host_keyed: bool) JoinKeyVerdict {
     if (claimed == 0) return .absent;
     var held = false;

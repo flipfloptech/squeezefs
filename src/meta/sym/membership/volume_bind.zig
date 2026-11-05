@@ -1716,7 +1716,7 @@ test "linux: a dead in-process region recovered over the real backend by the man
     // The remount: nothing unrecovered, every record durable.
     const set = try openCopy(s, kill);
     defer set.close();
-    try testing.expectEqual(@as(usize, 0), set.volumes[0].sym.?.unrecovered.items.len);
+    try testing.expectEqual(@as(usize, 0), set.volumes[0].sym.?.live_pages.items.len);
     try expectDeadWindowRecovered(set, keys.items);
     try testing.expectEqual(lt.State.unleased, set.volumes[0].slots.table.view(DEAD_SLOT).state);
 }

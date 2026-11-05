@@ -334,15 +334,15 @@ pub const Ring128 = struct {
     pub fn enter(self: *Ring128, to_submit: u32, min_complete: u32, flags: u32, arg: ?*const linux.io_uring_getevents_arg) errors.Error!Entered {
         const argp: usize = if (arg) |a| @intFromPtr(a) else 0;
         const argsz: usize = if (arg != null) @sizeOf(linux.io_uring_getevents_arg) else 0;
-        var enter_flags: u32 = flags | (if (arg != null) @as(u32, linux.IORING_ENTER_EXT_ARG) else 0);
-        // SQPOLL (the transport's A/B lever): an idle poller must be woken
-        // to see the flushed tail; the kernel raises NEED_WAKEUP in
-        // `sq.flags` when it went to sleep.
-        if (self.flags & linux.IORING_SETUP_SQPOLL != 0 and self.sqFlags() & linux.IORING_SQ_NEED_WAKEUP != 0) enter_flags |= linux.IORING_ENTER_SQ_WAKEUP;
+        const base_flags: u32 = flags | (if (arg != null) @as(u32, linux.IORING_ENTER_EXT_ARG) else 0);
         const head = @atomicLoad(u32, self.sq.head, .acquire);
         var consumed: u32 = 0;
         var pending = to_submit;
         while (true) {
+            var enter_flags = base_flags;
+            // SQPOLL may become idle across an interrupted enter: re-read
+            // the kernel's NEED_WAKEUP flag for each attempt.
+            if (self.flags & linux.IORING_SETUP_SQPOLL != 0 and self.sqFlags() & linux.IORING_SQ_NEED_WAKEUP != 0) enter_flags |= linux.IORING_ENTER_SQ_WAKEUP;
             // The kernel reads `arg` and its timespec during this call only.
             const rc = if (builtin.is_test and self.test_enter != null)
                 self.test_enter.?.call(self.test_enter.?.ctx, self, pending, min_complete, enter_flags, argp, argsz)

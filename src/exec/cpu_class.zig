@@ -2,12 +2,12 @@
 //! part of the observability contract … attributes CPU per class";
 //! `docs/porting/knobs_and_rails.md` §5.3): per-thread
 //! `/proc/self/task/<tid>/schedstat` `sum_exec_runtime` folded by the comm
-//! prefix table of `core/thread_name.zig`, sampled at stats-read time ONLY,
-//! with the monotone retired ledger — a class never falls: a thread that
-//! exits keeps contributing its last sample (the CPU between its last sample
-//! and its exit is the one lost term). A missing directory entry is not death:
-//! only an absent task directory retires the tid. A tid whose runtime DROPPED or
-//! whose class changed is a reused tid: the old figure retires first.
+//! prefix table of `core/thread_name.zig` on the budget sampler only.
+//! Held task directories anchor PID objects; every class receives only its
+//! new runtime delta. Renames are not reuse, and a coarser/stale same-task read
+//! retains the known high-water baseline. An omitted live tid retains its
+//! anchor until absence is proved. Exited tasks keep their last observed CPU;
+//! the CPU between the last observation and exit is the lost term.
 //!
 //! `Σ by_class ≤ total_ns` by construction: the per-thread fold runs BEFORE
 //! `getrusage(RUSAGE_SELF)` is read.
@@ -59,10 +59,21 @@ pub fn parseStatCpuNs(text: []const u8, clk_tck: u64) ?u64 {
 }
 
 pub const RuntimeSource = enum { schedstat, stat };
+pub const RuntimeReading = struct { ns: u64, source: RuntimeSource };
 
 /// The monotone fold over passes.
 pub const Ledger = struct {
-    const Live = struct { class: u8, ns: u64, pass: u32 };
+    const Live = struct {
+        class: u8,
+        ns: u64,
+        /// Runtime prefix already charged to earlier classes in this incarnation.
+        base: u64,
+        incarnation: u64,
+        /// The most recent source; ns may retain an earlier, finer observation.
+        last_source: RuntimeSource,
+        pass: u32,
+        anchor: ?Io.Dir = null,
+    };
     const TestWalkHook = struct {
         after: usize,
         ctx: *anyopaque,
@@ -72,12 +83,15 @@ pub const Ledger = struct {
     const TestTaskHook = struct {
         tid: u32,
         ctx: *anyopaque,
-        call: *const fn (*anyopaque) anyerror!void,
+        call: *const fn (*anyopaque, Io.Dir) anyerror!void,
     };
 
     live: std.AutoHashMapUnmanaged(u32, Live) = .empty,
     retired: [class_count]u64 = @splat(0),
     pass: u32 = 0,
+    next_incarnation: u64 = 0,
+    /// The sampler's Io outlives every task-directory anchor.
+    io: ?Io = null,
     test_walk_hook: if (builtin.is_test) ?TestWalkHook else void = if (builtin.is_test) null else {},
     test_walk_limit: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
     test_total_ns: if (builtin.is_test) ?u64 else void = if (builtin.is_test) null else {},
@@ -85,6 +99,8 @@ pub const Ledger = struct {
     test_after_cpu: if (builtin.is_test) ?TestTaskHook else void = if (builtin.is_test) null else {},
 
     pub fn deinit(self: *Ledger, gpa: std.mem.Allocator) void {
+        var it = self.live.valueIterator();
+        while (it.next()) |v| if (v.anchor) |anchor| anchor.close(self.io.?);
         self.live.deinit(gpa);
         self.* = undefined;
     }
@@ -95,16 +111,38 @@ pub const Ledger = struct {
         self.pass +%= 1;
     }
 
-    /// One thread's sample this pass.
-    pub fn observe(self: *Ledger, gpa: std.mem.Allocator, tid: u32, class: usize, ns: u64) std.mem.Allocator.Error!void {
+    /// An incarnation is the sampler's anchored PID object, never comm or runtime.
+    pub fn observe(self: *Ledger, gpa: std.mem.Allocator, tid: u32, incarnation: u64, class: usize, reading: RuntimeReading) (std.mem.Allocator.Error || error{RuntimeRegressed})!void {
         const gop = try self.live.getOrPut(gpa, tid);
+        var ns = reading.ns;
+        var base: u64 = 0;
+        var anchor: ?Io.Dir = null;
         if (gop.found_existing) {
             const old = gop.value_ptr.*;
-            // Same thread, runtime monotone: update in place. A class change
-            // or a drop means the tid was reused: retire the old figure.
-            if (old.class != class or ns < old.ns) self.retired[old.class] +|= old.ns;
+            if (old.incarnation == incarnation) {
+                // Changed/coarse sources keep the known baseline; precise regression refuses.
+                if (ns < old.ns) {
+                    if (reading.source == .schedstat and old.last_source == .schedstat) return error.RuntimeRegressed;
+                    ns = old.ns;
+                }
+                base = old.base;
+                anchor = old.anchor;
+                if (old.class != class) {
+                    self.retired[old.class] +|= old.ns - old.base;
+                    base = old.ns;
+                }
+            } else {
+                self.retired[old.class] +|= old.ns - old.base;
+                if (old.anchor) |dir| dir.close(self.io.?);
+            }
         }
-        gop.value_ptr.* = .{ .class = @intCast(class), .ns = ns, .pass = self.pass };
+        gop.value_ptr.* = .{ .class = @intCast(class), .ns = ns, .base = base, .incarnation = incarnation, .last_source = reading.source, .pass = self.pass, .anchor = anchor };
+    }
+
+    fn newIncarnation(self: *Ledger) !u64 {
+        if (self.next_incarnation == std.math.maxInt(u64)) return error.IncarnationExhausted;
+        self.next_incarnation += 1;
+        return self.next_incarnation;
     }
 
     /// Retire tids not marked live after the caller's absence checks.
@@ -117,7 +155,8 @@ pub const Ledger = struct {
         while (true) {
             while (it.next()) |e| {
                 if (e.value_ptr.pass == self.pass) continue;
-                self.retired[e.value_ptr.class] +|= e.value_ptr.ns;
+                self.retired[e.value_ptr.class] +|= e.value_ptr.ns - e.value_ptr.base;
+                if (e.value_ptr.anchor) |anchor| anchor.close(self.io.?);
                 gone[n] = e.key_ptr.*;
                 n += 1;
                 if (n == gone.len) break;
@@ -133,7 +172,7 @@ pub const Ledger = struct {
     pub fn sums(self: *const Ledger) [class_count]u64 {
         var out = self.retired;
         var it = self.live.valueIterator();
-        while (it.next()) |v| out[v.class] +|= v.ns;
+        while (it.next()) |v| out[v.class] +|= v.ns - v.base;
         return out;
     }
 };
@@ -182,15 +221,87 @@ fn taskAbsent(io: Io, task_dir_path: []const u8, tid: u32) !bool {
     return false;
 }
 
+const TaskReading = struct { class: usize, cpu: RuntimeReading };
+
+fn statPresent(io: Io, anchor: Io.Dir) !bool {
+    const file = anchor.openFile(io, "stat", .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    file.close(io);
+    return true;
+}
+
+/// Relative reads stay on the directory inode's PID object across numeric reuse.
+fn readTask(ledger: *Ledger, io: Io, anchor: Io.Dir, tid: u32) !TaskReading {
+    var buf: [512]u8 = undefined;
+    const cpu: RuntimeReading = blk: {
+        if (!builtin.is_test or ledger.test_runtime_source != .stat) {
+            if (anchor.readFile(io, "schedstat", &buf)) |text| {
+                if (parseSchedstatNs(text)) |ns| break :blk .{ .ns = ns, .source = .schedstat };
+            } else |_| {}
+        }
+        const text = try anchor.readFile(io, "stat", &buf);
+        const ns = parseStatCpuNs(text, 100) orelse return error.InvalidCpuSample; // Linux USER_HZ is 100 ticks/s.
+        break :blk .{ .ns = ns, .source = .stat };
+    };
+    if (builtin.is_test) if (ledger.test_after_cpu) |hook| {
+        if (tid == hook.tid) try hook.call(hook.ctx, anchor);
+    };
+    var comm_buf: [64]u8 = undefined;
+    const comm = try anchor.readFile(io, "comm", &comm_buf);
+    return .{ .class = classIndex(std.mem.trim(u8, comm, " \t\r\n")), .cpu = cpu };
+}
+
+fn observeTask(ledger: *Ledger, gpa: std.mem.Allocator, io: Io, task_dir_path: []const u8, tid: u32) !void {
+    var old_anchor: ?Io.Dir = null;
+    if (ledger.live.get(tid)) |old| {
+        const anchor = old.anchor orelse return error.UnanchoredTask;
+        old_anchor = anchor;
+        if (readTask(ledger, io, anchor, tid)) |reading| {
+            try ledger.observe(gpa, tid, old.incarnation, reading.class, reading.cpu);
+            return;
+        } else |err| {
+            // stat is a fixed proc entry: a live old PID still has it.
+            if (try statPresent(io, anchor)) return err;
+        }
+    }
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{d}", .{ task_dir_path, tid });
+    const candidate = Io.Dir.cwd().openDir(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    var kept = false;
+    defer if (!kept) candidate.close(io);
+    // A present numeric directory without valid identity evidence is not death.
+    if (!try statPresent(io, candidate)) {
+        if (try taskAbsent(io, task_dir_path, tid)) return;
+        return error.FileNotFound;
+    }
+    if (old_anchor) |anchor| {
+        if (try statPresent(io, anchor)) return error.UnprovenTaskReplacement;
+    }
+    const reading = readTask(ledger, io, candidate, tid) catch |err| {
+        if (try taskAbsent(io, task_dir_path, tid)) return;
+        return err;
+    };
+    const incarnation = try ledger.newIncarnation();
+    try ledger.observe(gpa, tid, incarnation, reading.class, reading.cpu);
+    ledger.live.getPtr(tid).?.anchor = candidate;
+    kept = true;
+}
+
 fn sampleTotalNs(ledger: *const Ledger) u64 {
     if (builtin.is_test) if (ledger.test_total_ns) |ns| return ns;
     return processCpuNs();
 }
 
 /// One pass over `<proc_root>/self/task/*`, then the process total.
-/// Only task-directory absence proves an exit; live read errors refuse
-/// publication and an omitted live tid retains its last observation.
+/// Valid stat data may replace unavailable/malformed schedstat. Other live
+/// read/proof errors refuse publication; omitted live tids keep their baseline.
 pub fn sample(ledger: *Ledger, gpa: std.mem.Allocator, io: Io, proc_root: []const u8) !Sample {
+    ledger.io = io;
     ledger.beginPass();
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const task_dir_path = try std.fmt.bufPrint(&path_buf, "{s}/self/task", .{proc_root});
@@ -207,35 +318,7 @@ pub fn sample(ledger: *Ledger, gpa: std.mem.Allocator, io: Io, proc_root: []cons
             if (walked == hook.after) try hook.call(hook.ctx);
         };
         const tid = std.fmt.parseInt(u32, entry.name, 10) catch continue;
-        var file_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-        var buf: [512]u8 = undefined;
-        const ns: u64 = blk: {
-            const sched = std.fmt.bufPrint(&file_buf, "{s}/{s}/schedstat", .{ task_dir_path, entry.name }) catch continue;
-            if (!builtin.is_test or ledger.test_runtime_source != .stat) {
-                if (Io.Dir.cwd().readFile(io, sched, &buf)) |text| {
-                    if (parseSchedstatNs(text)) |v| break :blk v;
-                } else |_| {}
-            }
-            const stat = try std.fmt.bufPrint(&file_buf, "{s}/{s}/stat", .{ task_dir_path, entry.name });
-            const text = Io.Dir.cwd().readFile(io, stat, &buf) catch |err| {
-                if (try taskAbsent(io, task_dir_path, tid)) continue;
-                return err;
-            };
-            break :blk parseStatCpuNs(text, 100) orelse { // Linux USER_HZ is 100 ticks/s.
-                if (try taskAbsent(io, task_dir_path, tid)) continue;
-                return error.InvalidCpuSample;
-            };
-        };
-        if (builtin.is_test) if (ledger.test_after_cpu) |hook| {
-            if (tid == hook.tid) try hook.call(hook.ctx);
-        };
-        const comm_path = try std.fmt.bufPrint(&file_buf, "{s}/{s}/comm", .{ task_dir_path, entry.name });
-        var comm_buf: [64]u8 = undefined;
-        const comm = Io.Dir.cwd().readFile(io, comm_path, &comm_buf) catch |err| {
-            if (try taskAbsent(io, task_dir_path, tid)) continue;
-            return err;
-        };
-        try ledger.observe(gpa, tid, classIndex(std.mem.trim(u8, comm, " \t\r\n")), ns);
+        try observeTask(ledger, gpa, io, task_dir_path, tid);
     }
     // proc's directory cursor can skip live tids when its continuation exits.
     var live = ledger.live.iterator();
@@ -283,36 +366,40 @@ test "ledger: monotone retired fold — an exited thread keeps its last ns, a re
     const meta = classIndex("sqz-meta0");
     const blk = classIndex("sqz-blk0");
     l.beginPass();
-    try l.observe(testing.allocator, 10, meta, 100);
-    try l.observe(testing.allocator, 11, blk, 50);
+    try l.observe(testing.allocator, 10, 10, meta, .{ .ns = 100, .source = .schedstat });
+    try l.observe(testing.allocator, 11, 11, blk, .{ .ns = 50, .source = .schedstat });
     l.finishPass();
     try testing.expectEqual(@as(u64, 100), l.sums()[meta]);
     try testing.expectEqual(@as(u64, 50), l.sums()[blk]);
     // Pass 2: thread 11 exited (retired at 50); thread 10 advanced.
     l.beginPass();
-    try l.observe(testing.allocator, 10, meta, 160);
+    try l.observe(testing.allocator, 10, 10, meta, .{ .ns = 160, .source = .schedstat });
     l.finishPass();
     try testing.expectEqual(@as(u64, 160), l.sums()[meta]);
     try testing.expectEqual(@as(u64, 50), l.sums()[blk]);
     // Pass 3: tid 11 reappears as a blk thread with a LOWER runtime (reuse):
     // the old 50 is already retired; the new figure adds on top.
     l.beginPass();
-    try l.observe(testing.allocator, 10, meta, 200);
-    try l.observe(testing.allocator, 11, blk, 5);
+    try l.observe(testing.allocator, 10, 10, meta, .{ .ns = 200, .source = .schedstat });
+    try l.observe(testing.allocator, 11, 12, blk, .{ .ns = 5, .source = .schedstat });
     l.finishPass();
     try testing.expectEqual(@as(u64, 55), l.sums()[blk]);
-    // Pass 4: tid 10 drops (reuse within the same class): the old 200 retires, 7 is live.
+    // Pass 4: a proven new incarnation of tid 10 retires the old 200; 7 is live.
     l.beginPass();
-    try l.observe(testing.allocator, 10, meta, 7);
-    try l.observe(testing.allocator, 11, blk, 9);
+    try l.observe(testing.allocator, 10, 13, meta, .{ .ns = 7, .source = .schedstat });
+    try l.observe(testing.allocator, 11, 12, blk, .{ .ns = 9, .source = .schedstat });
     l.finishPass();
     try testing.expectEqual(@as(u64, 207), l.sums()[meta]);
-    // Pass 5: tid 10 changes class: the meta figure retires, the new class starts.
+    // Pass 5: same incarnation, new class and a coarser read: no new CPU is billed.
     l.beginPass();
-    try l.observe(testing.allocator, 10, blk, 1);
+    try l.observe(testing.allocator, 10, 13, blk, .{ .ns = 0, .source = .stat });
     l.finishPass();
     try testing.expectEqual(@as(u64, 207), l.sums()[meta]);
-    try testing.expectEqual(@as(u64, 59 + 1), l.sums()[blk]);
+    try testing.expectEqual(@as(u64, 59), l.sums()[blk]);
+    l.beginPass();
+    try l.observe(testing.allocator, 10, 13, blk, .{ .ns = 10, .source = .schedstat });
+    l.finishPass();
+    try testing.expectEqual(@as(u64, 62), l.sums()[blk]);
 }
 
 test "ledger: more than 64 departures in one pass all retire" {
@@ -320,7 +407,7 @@ test "ledger: more than 64 departures in one pass all retire" {
     defer l.deinit(testing.allocator);
     l.beginPass();
     var tid: u32 = 1;
-    while (tid <= 150) : (tid += 1) try l.observe(testing.allocator, tid, other_index, 1);
+    while (tid <= 150) : (tid += 1) try l.observe(testing.allocator, tid, tid, other_index, .{ .ns = 1, .source = .schedstat });
     l.finishPass();
     l.beginPass();
     l.finishPass();
@@ -398,8 +485,11 @@ test "B1: schedstat to stat to schedstat keeps one same-task baseline" {
     var l: Ledger = .{ .test_total_ns = 12_345_678 };
     defer l.deinit(testing.allocator);
     const precise = try sample(&l, testing.allocator, testing.io, root);
+    const incarnation = l.live.get(100).?.incarnation;
     l.test_runtime_source = .stat;
     const coarse = try sample(&l, testing.allocator, testing.io, root);
+    try testing.expectEqual(RuntimeSource.stat, l.live.get(100).?.last_source);
+    try testing.expectEqual(incarnation, l.live.get(100).?.incarnation);
     try testing.expectEqual(precise.by_class, coarse.by_class);
     try expectCpuTransition(precise, coarse);
     l.test_runtime_source = null;
@@ -408,6 +498,33 @@ test "B1: schedstat to stat to schedstat keeps one same-task baseline" {
     const resumed = try sample(&l, testing.allocator, testing.io, root);
     try testing.expectEqual(@as(u64, 13_000_001), resumed.by_class[classIndex("sqz-meta0")]);
     try expectCpuTransition(coarse, resumed);
+    try tmp.dir.deleteFile(testing.io, "self/task/100/stat");
+    l.test_runtime_source = .stat;
+    try testing.expectError(error.FileNotFound, sample(&l, testing.allocator, testing.io, root));
+    try testing.expectEqual(incarnation, l.live.get(100).?.incarnation);
+    try testing.expectEqual(resumed.by_class, l.sums());
+}
+
+test "B1: a same-source precise regression refuses without inventing an incarnation" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestTask(tmp.dir, 100, 1000, "sqz-meta0", 0);
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    var l: Ledger = .{ .test_total_ns = 1000 };
+    defer l.deinit(testing.allocator);
+    const first = try sample(&l, testing.allocator, testing.io, root);
+    const incarnation = l.live.get(100).?.incarnation;
+    try writeTestTask(tmp.dir, 100, 999, "sqz-meta0", 0);
+    try testing.expectError(error.RuntimeRegressed, sample(&l, testing.allocator, testing.io, root));
+    try testing.expectEqual(incarnation, l.live.get(100).?.incarnation);
+    try testing.expectEqual(first.by_class, l.sums());
+    l.test_total_ns = 2000;
+    try writeTestTask(tmp.dir, 100, 2000, "sqz-meta0", 0);
+    const resumed = try sample(&l, testing.allocator, testing.io, root);
+    try testing.expectEqual(@as(u64, 2000), resumed.by_class[classIndex("sqz-meta0")]);
+    try expectCpuTransition(first, resumed);
 }
 
 test "B1: a reused numeric tid with a higher runtime is a new task incarnation" {
@@ -420,10 +537,12 @@ test "B1: a reused numeric tid with a higher runtime is a new task incarnation" 
     var l: Ledger = .{ .test_total_ns = 1000 };
     defer l.deinit(testing.allocator);
     const first = try sample(&l, testing.allocator, testing.io, root);
+    const incarnation = l.live.get(100).?.incarnation;
     try tmp.dir.deleteTree(testing.io, "self/task/100");
     try writeTestTask(tmp.dir, 100, 1500, "sqz-meta0", 0);
     l.test_total_ns = 2500;
     const reused = try sample(&l, testing.allocator, testing.io, root);
+    try testing.expect(l.live.get(100).?.incarnation != incarnation);
     try testing.expectEqual(@as(u64, 2500), reused.by_class[classIndex("sqz-meta0")]);
     try expectCpuTransition(first, reused);
 }
@@ -441,7 +560,7 @@ test "B1: replacement between runtime and comm reads never blends two task incar
     const Replace = struct {
         dir: Io.Dir,
         ledger: *Ledger,
-        fn call(ctx: *anyopaque) !void {
+        fn call(ctx: *anyopaque, _: Io.Dir) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.ledger.test_after_cpu = null;
             try self.dir.deleteTree(testing.io, "self/task/100");
@@ -455,6 +574,53 @@ test "B1: replacement between runtime and comm reads never blends two task incar
     try testing.expectEqual(@as(u64, 1000), replaced.by_class[classIndex("sqz-meta0")]);
     try testing.expectEqual(@as(u64, 1500), replaced.by_class[classIndex("sqz-jrnl0")]);
     try expectCpuTransition(first, replaced);
+}
+
+test "B1: task anchors close on OOM, read refusal, retirement and ledger teardown" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "descriptor ownership is checked through Linux fcntl");
+    const linux = std.os.linux;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestTask(tmp.dir, 100, 1000, "sqz-meta0", 0);
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    const Capture = struct {
+        fd: linux.fd_t = -1,
+        refuse: bool = false,
+        fn call(ctx: *anyopaque, anchor: Io.Dir) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fd = anchor.handle;
+            if (self.refuse) return error.TestReadRefusal;
+        }
+    };
+    var capture: Capture = .{};
+    var failed: Ledger = .{ .test_after_cpu = .{ .tid = 100, .ctx = &capture, .call = Capture.call } };
+    defer failed.deinit(testing.allocator);
+    try testing.expectError(error.OutOfMemory, sample(&failed, testing.failing_allocator, testing.io, root));
+    try testing.expect(capture.fd >= 0);
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(capture.fd, linux.F.GETFD, 0)));
+    try testing.expectEqual(@as(usize, 0), failed.live.count());
+    capture = .{ .refuse = true };
+    try testing.expectError(error.TestReadRefusal, sample(&failed, testing.allocator, testing.io, root));
+    try testing.expect(capture.fd >= 0);
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(capture.fd, linux.F.GETFD, 0)));
+    try testing.expectEqual(@as(usize, 0), failed.live.count());
+    var l: Ledger = .{};
+    var owned = true;
+    defer if (owned) l.deinit(testing.allocator);
+    _ = try sample(&l, testing.allocator, testing.io, root);
+    const retired_fd = l.live.get(100).?.anchor.?.handle;
+    try tmp.dir.deleteTree(testing.io, "self/task/100");
+    _ = try sample(&l, testing.allocator, testing.io, root);
+    try testing.expectEqual(@as(usize, 0), l.live.count());
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(retired_fd, linux.F.GETFD, 0)));
+    try writeTestTask(tmp.dir, 100, 1500, "sqz-meta0", 0);
+    _ = try sample(&l, testing.allocator, testing.io, root);
+    const live_fd = l.live.get(100).?.anchor.?.handle;
+    l.deinit(testing.allocator);
+    owned = false;
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(live_fd, linux.F.GETFD, 0)));
 }
 
 test "sample: real proc directory cursor skips live tail threads when its cached continuation tid exits" {
@@ -542,9 +708,7 @@ test "sample: real proc directory cursor skips live tail threads when its cached
 test "sample: an omitted live tid is not retired and counted twice when the proc walk resumes" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(testing.io, "self/task/100");
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/schedstat", .data = "100 0 0\n" });
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/comm", .data = "sqz-meta0\n" });
+    try writeTestTask(tmp.dir, 100, 100, "sqz-meta0", 0);
     var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(testing.io, &root_buf);
     const root = root_buf[0..root_len];
@@ -565,9 +729,7 @@ test "sample: an omitted live tid is not retired and counted twice when the proc
 test "sample: an unreadable live tid is not proof of death; recovery counts its runtime once" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(testing.io, "self/task/100");
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/schedstat", .data = "100 0 0\n" });
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/comm", .data = "sqz-meta0\n" });
+    try writeTestTask(tmp.dir, 100, 100, "sqz-meta0", 0);
     var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(testing.io, &root_buf);
     const root = root_buf[0..root_len];

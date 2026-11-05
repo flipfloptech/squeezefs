@@ -45,8 +45,10 @@ comptime {
 /// law.
 const ring_entries: u16 = 8;
 const ud_cmd: u64 = 1;
-var issue_wait_failures: counters.Tripwire = .init("pr_issue_wait_failures");
-var issue_cqe_mismatches: counters.Tripwire = .init("pr_issue_cqe_mismatches");
+pub const stats = struct {
+    pub var issue_wait_failures: counters.Tripwire = .init("pr_issue_wait_failures");
+    pub var issue_cqe_mismatches: counters.Tripwire = .init("pr_issue_cqe_mismatches");
+};
 
 /// What the resolution found for a metadata path.
 pub const Resolved = union(enum) {
@@ -135,14 +137,14 @@ pub const Device = struct {
         var wait_failed = false;
         while (true) {
             const n = self.ring.copyCqes(&cqes, 1) catch {
-                if (!wait_failed) issue_wait_failures.fire("native PR wait failed: retaining the accepted command until its CQE");
+                if (!wait_failed) stats.issue_wait_failures.fire("native PR wait failed: retaining the accepted command until its CQE");
                 wait_failed = true;
                 _ = linux.sched_yield();
                 continue;
             };
             if (n == 0) continue;
             if (cqes[0].user_data != tag) {
-                issue_cqe_mismatches.fire("native PR CQE is not the command holding the issue lock");
+                stats.issue_cqe_mismatches.fire("native PR CQE is not the command holding the issue lock");
                 continue;
             }
             break;

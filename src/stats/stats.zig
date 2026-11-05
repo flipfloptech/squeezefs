@@ -349,6 +349,7 @@ pub const sources = [_]Source{
     .{ .path = "src/sync/arc_swap.zig", .family = "sync" },
     .{ .path = "src/sync/lock_order.zig", .family = "sync" },
     .{ .path = "src/io/uring_fs.zig", .family = "io" },
+    .{ .path = "src/meta/guard/pr_linux.zig", .family = "io" },
     .{ .path = "src/io/nvme_derive.zig", .family = "io" },
     .{ .path = "src/mem/budget.zig", .family = "mem_budget" },
     .{ .path = "src/wire/stats.zig", .family = "wire" },
@@ -416,6 +417,8 @@ pub const covered = [_]Covered{
     .{ .path = "src/meta/routing/stamp_cell.zig", .by = "src/meta/routing/stats.zig" },
     .{ .path = "src/meta/routing/migrate.zig", .by = "src/meta/routing/stats.zig" },
     .{ .path = "src/meta/meta_set.zig", .by = "src/meta/routing/stats.zig" },
+    // MetaSet's per-volume Guard composes Client.writeStatsJson.
+    .{ .path = "src/meta/guard/pr.zig", .by = "src/meta/backend.zig" },
     .{ .path = "src/meta/sym/manager.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/data/sym_planes/alloc_lease.zig", .by = "src/data/sym_planes.zig" },
     .{ .path = "src/data/sym_planes/data_bitmap.zig", .by = "src/data/sym_planes.zig" },
@@ -685,6 +688,8 @@ fn writeIo(_: *Sources, w: *Writer) Error!void {
     if (is_linux) try uring_fs.writeStatsJson(w) else try w.writeAll("{}");
     try w.writeAll(",\"nvme_derive\":");
     try nvme_derive.writeStatsJson(w);
+    try w.writeAll(",\"native_pr\":");
+    if (is_linux) try counters.writeNamespaceJson(guard.pr_linux.stats, w) else try w.writeAll("{}");
     try w.writeByte('}');
 }
 
@@ -1241,7 +1246,7 @@ test "every instrument declared in a generated namespace is a key of the documen
     const p = try r.render();
     defer p.deinit(testing.allocator);
     const text = p.bytes();
-    inline for (.{ node_cache.stats, tree.stats, smo.stats, leaf_merge.stats, alloc_ext, journal, ledger, record.stats, key.stats, tx.stats, economy.stats, inos.stats, dlm, heap_law.stats, node, node_snapshot.stats, node_state_core, checkpoint.stats, lifecycle, op_guard, open_table, watchdog, kv_fs, virtual_inodes.stats, codec, placement, tick, arc_swap, lock_order, transform.stats, write_seams.stats, stats, sym.stats, sym.manager.stats, sym.join.stats, sym.slots.stats, sym.slots.door.stats, sym.slots.acquire.stats, sym.slots.handover.stats, sym.slots.page_budget.stats, sym.slots.resolve.stats, sym.slots.tails_spill.stats, sym.tokens.table.stats, sym.tokens.cache.stats, sym.tokens.divert.stats, sym.tokens.ro.stats, sym.xv.intent.stats, sym.xv.applier.stats, sym.xv.guards.stats, sym.xv.dir_rename.stats, sym.xv.ops.stats, sym.xv.record_ship.stats, sym.xv.stripe.stats, kv_fs_stripes.stats, move_gate.stats }) |Ns| {
+    inline for (.{ node_cache.stats, tree.stats, smo.stats, leaf_merge.stats, alloc_ext, journal, ledger, record.stats, key.stats, tx.stats, economy.stats, inos.stats, dlm, heap_law.stats, node, node_snapshot.stats, node_state_core, checkpoint.stats, lifecycle, op_guard, open_table, watchdog, kv_fs, virtual_inodes.stats, codec, placement, tick, arc_swap, lock_order, if (is_linux) guard.pr_linux.stats else struct {}, transform.stats, write_seams.stats, stats, sym.stats, sym.manager.stats, sym.join.stats, sym.slots.stats, sym.slots.door.stats, sym.slots.acquire.stats, sym.slots.handover.stats, sym.slots.page_budget.stats, sym.slots.resolve.stats, sym.slots.tails_spill.stats, sym.tokens.table.stats, sym.tokens.cache.stats, sym.tokens.divert.stats, sym.tokens.ro.stats, sym.xv.intent.stats, sym.xv.applier.stats, sym.xv.guards.stats, sym.xv.dir_rename.stats, sym.xv.ops.stats, sym.xv.record_ship.stats, sym.xv.stripe.stats, kv_fs_stripes.stats, move_gate.stats }) |Ns| {
         inline for (comptime counters.instrumentNames(Ns)) |name| {
             const T = @TypeOf(@field(Ns, name));
             const k = if (T == counters.Tripwire) @field(Ns, name).site else name;

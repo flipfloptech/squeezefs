@@ -437,26 +437,32 @@ pub const Namespace = struct {
     fn preempt(self: *Namespace, sender: [16]u8, crkey: u64, prkey: u64, rtype: u8, abort: bool) !nvme.Status {
         var victims: std.ArrayList([16]u8) = .empty;
         defer victims.deinit(self.gpa);
+        var take_hold = false;
+        var retype = false;
         if (self.holder == null) {
             if (!try self.byKey(&victims, prkey, null)) return nvme.SC_RESERVATION_CONFLICT;
         } else if (nvme.allRegistrants(self.rtype)) {
             if (prkey == 0) {
                 // P4: the sender is made the holder first, then every other
                 // host id goes.
-                self.setHolder(crkey, sender);
-                self.rtype = rtype;
+                take_hold = true;
+                retype = true;
                 for (self.registered.items) |r| if (!std.mem.eql(u8, &r.host_id, &sender)) try victims.append(self.gpa, r.host_id);
             } else if (!try self.byKey(&victims, prkey, null)) return nvme.SC_RESERVATION_CONFLICT;
         } else if (self.holder_preempt_retypes and self.isHolder(sender)) {
-            self.rtype = rtype;
+            retype = true;
         } else if (self.holder.? == prkey) {
-            self.setHolder(crkey, sender);
-            self.rtype = rtype;
+            take_hold = true;
+            retype = true;
             _ = try self.byKey(&victims, prkey, sender);
         } else if (prkey != 0) {
             if (!try self.byKey(&victims, prkey, null)) return nvme.SC_RESERVATION_CONFLICT;
         } else return nvme.SC_INVALID_FIELD;
-        try self.unregisterVictims(victims.items, abort);
+        // No fallible bookkeeping after holder/ref/semaphore effects begin.
+        if (abort) try self.killed.ensureUnusedCapacity(self.gpa, victims.items.len);
+        if (take_hold) self.setHolder(crkey, sender);
+        if (retype) self.rtype = rtype;
+        self.unregisterVictims(victims.items, abort);
         return nvme.STATUS_SUCCESS;
     }
 
@@ -475,11 +481,11 @@ pub const Namespace = struct {
     /// killed first, and the command holds pr_sem until every admitted
     /// command of a killed host completed. The generation moves before the
     /// drain (`__nvmet_execute_pr_acquire`).
-    fn unregisterVictims(self: *Namespace, victims: []const [16]u8, abort: bool) !void {
+    fn unregisterVictims(self: *Namespace, victims: []const [16]u8, abort: bool) void {
         if (abort) self.pr_sem_held = true;
         for (victims) |v| {
             if (abort) {
-                try self.killed.append(self.gpa, v);
+                self.killed.appendAssumeCapacity(v);
                 self.fireAbort(.killed, v);
             }
             if (self.indexOf(v)) |i| self.dropAt(i);

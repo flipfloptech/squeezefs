@@ -59,4 +59,5 @@ Correctness/simplicity re-review, integration, other architecture, and the
 orchestrator gate remain owed. No full gate, benchmark, system change or target
 rig. Load workers were trap-cleaned; anchors/threads are owned and closed/joined.
 FD exhaustion refuses sampling rather than inventing death. Policy: 0003
-§CC.7–8; the named 0002 CPU-sample row still needs numeric mapping at integration.
+§CC.7–8 and decision 0002 row 570. Interim `/tmp` transcript names above identify
+verification artifacts; the committed tests, source reasoning and counts retain the evidence.

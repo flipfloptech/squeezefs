@@ -426,3 +426,43 @@ Docs-only round (revision 27): decision 0004 copied verbatim; `zig fmt --check` 
 
 Review round (the model's safety review): FULL `zig build test` 23/23 steps, 3,363 / 3,558 passed (195 skipped), 0 failed, 1 m 28 s, the cost table accepted; `zig build rails`
 (fresh) 18/18 steps, 34/34 tests; `zig fmt --check` clean.
+
+## PR-3: deaths carry the host key from the appender page (decision 0003 §DO.18–§DO.23)
+
+**What changed.** On today's WERO code a member a successor reaps at its grace deadline was shipped
+with key 0 (`wire_plane.rosterKey`), so recovery skipped the metadata preempt and the data fence and
+released the region with the member's host still registered; a member whose row was lost was never
+expected and never recovered (decision 0004 §2.4, G-b). Now the appender page (layout 2) carries the
+host's registration key (`host_key` @296, `FIXED_LEN` 304, the budget still 108), written by the
+manager at region 0's bind and at `JoinAppender` from the joiner's claim, which is verified against
+the volume's report (`JoinAppenderReq` 48 B). The successor's grace expects rows ∪ Live pages with
+the pages' keys and reaps with them; same-host pages whose writer is proven dead ship through the
+death sink at its bind; recovery takes the record's key, else the page's.
+
+**The reds**, each failing first (on `134be36`, and before the rebase on `d807a60`):
+
+| Red | On the base | At the head |
+|---|---|---|
+| F9 (loop): X reaped at M2's deadline | `appender_recoveries` 1, `appender_recovery_preempts` 0, `pr_fencer_preempts` 0, `data_pr_preempts` 0 (`fidelity.zig:2584`) | 1 / 1 / 1 / 1; host A's key gone; X's released windows refused (EBADE) |
+| F9b: X's row dropped (`SQUEEZEFS_TEST_MEMBER_ROW_DROP`) | `appender_recoveries` 0 after 30 s: X's page stays Live (`:2647`) | 1, both fences, X's acked file read back through M2 |
+| THE LOST ROW (wire plane) | no grace opens (`wire_plane.zig:2880`) | the page opens the grace; the reap's record stands; the region recovered |
+| A SAME-HOST PAGE PROVEN DEAD | no death recorded (`:2917`) | recorded once, before the listener serves |
+| 12 units (page v2/v1, 48 B, screen, `joinKeyVerdict`, `JoinAppender`, `arm`/reap/pre-dead, `deathKey`, recovery key and mismatch, region 0's key) | compile-red, 12 errors (`1d7d3b3` on `58e726a`) | green |
+
+F9 and F9b read `appender_recovery_key_from_page` 0: the reap's record already carries the page's
+key; the record-0 fallback is the recovery unit's.
+
+**The harness.** The tcp restart legs crashed in the rig, not the product: `Rig.unshare` freed the
+NQN the leg then handed to `expectNoResidue` (a fault in `Walk.find`). On `4179803` (no PR-3 code)
+3 of the 5 legs crashed in one run; fixed in `213aa1c`, the five ×2 45/45.
+
+**Checks** (kernel.org 7.3.1, multipath=N; Omarchy, the local venue; other agents' nvmet legs ran
+beside these): before the rebase onto `bb75ca8` — at `a3a28d2`, the tier and the full smoke with
+the rig fix `9665629` — the reds ×5, the 27 eviction / re-join / KILL rows ×3 (71/71 each), the
+nvmet tier ×3 idle (74 passed / 1 skipped (multipath-tcp) / 0 failed each), the full smoke 186 /
+199 (13 skipped). At the head: the
+reds ×5 (units 55 / 57, 2 skipped — F9 and F9b, the nvmet tier's —; F9 and F9b 5/5, every run
+`appender_recovery_preempts` 1, `pr_fencer_preempts` 1, `data_pr_preempts` 1); FULL `zig build
+test` 23/23 steps, 3,384 / 3,581 passed (197 skipped), 0 failed; the nvmet tier ×1 idle and ×1
+under `cpu+smoke` load (load ≈ 78) 74 / 1 / 0 each; the 27 rows ×1 71/71; `zig build rails` 18/18,
+34/34; `zig fmt --check` clean. No hot path touched; no timing benchmark run.

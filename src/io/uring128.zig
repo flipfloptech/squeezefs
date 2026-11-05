@@ -882,6 +882,31 @@ const InterruptedEnter = struct {
     }
 };
 
+test "PR-2 C1: an interrupted enter rechecks an SQ poller that became idle before retry" {
+    var ring = try Ring128.init(8, 0);
+    defer ring.deinit();
+    // Only the syscall seam sees this posture; no SQPOLL kernel is started.
+    ring.flags |= linux.IORING_SETUP_SQPOLL;
+    const Seam = struct {
+        fired: bool = false,
+        woke: bool = false,
+        fn call(ctx: *anyopaque, r: *Ring128, _: u32, _: u32, flags: u32, _: usize, _: usize) usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.fired) {
+                self.fired = true;
+                @atomicStore(u32, r.sq.flags, linux.IORING_SQ_NEED_WAKEUP, .release);
+                return @bitCast(-@as(isize, @backingInt(linux.E.INTR)));
+            }
+            self.woke = flags & linux.IORING_ENTER_SQ_WAKEUP != 0;
+            return 0;
+        }
+    };
+    var seam: Seam = .{};
+    ring.test_enter = .{ .ctx = &seam, .call = Seam.call };
+    _ = try ring.enter(0, 0, 0, null);
+    try testing.expect(seam.woke);
+}
+
 test "PR-2 C1: an interrupted native submit/wait resumes without resubmitting consumed SQEs" {
     for ([_]bool{ false, true }) |submit_first| {
         var ring = try Ring128.init(8, 0);

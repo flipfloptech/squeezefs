@@ -528,7 +528,7 @@ const Storm = struct {
     fn writer(self: *Storm) void {
         var i: u64 = 0;
         while (!self.stop.load(.acquire)) : (i += 1) {
-            if (self.p.pool.writeAt(self.p.a_block, (i % 64) * PROBE_WRITE_LEN, self.p.buf.bytes)) {
+            if (self.p.pool.writeAt(self.p.a_block, (i % STORM_BLOCKS) * PROBE_WRITE_LEN, self.p.buf.bytes)) {
                 _ = self.landed.fetchAdd(1, .release);
                 futex.wake(&self.landed, 1);
             } else |e| switch (e) {
@@ -555,6 +555,9 @@ const Storm = struct {
     }
 };
 
+/// The storm's writes cycle over this many probe-sized blocks at the
+/// namespace's head: distinct LBAs in flight, none beyond the share.
+const STORM_BLOCKS: u64 = 64;
 /// A re-registered victim's next write lands in well under a second on the
 /// venue's loop and tcp targets; 30 s is the leg's verdict, not a pace.
 const STORM_LAND_WAIT_NS: u64 = 30 * std.time.ns_per_s;

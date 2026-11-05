@@ -200,7 +200,7 @@ pub const NullBlk = struct {
         self.name_len = dev_name.len;
         var pb: [96]u8 = undefined;
         const dir = try std.fmt.bufPrintSentinel(&pb, "{s}/{s}", .{ CONFIGFS, dev_name }, 0);
-        if (linux.errno(linux.mkdir(dir.ptr, 0o755)) != .SUCCESS) return error.NullBlkMkdirFailed;
+        if (linux.errno(linux.mkdir(dir.ptr, 0o755)) != .SUCCESS) return error.NullBlkMkdirFailed; // configfs: the item's directory mode (rwxr-xr-x), as mkdir(1) makes it
         errdefer self.destroy();
         var vb: [24]u8 = undefined;
         try self.attr("size", try std.fmt.bufPrint(&vb, "{d}", .{size_mib}));

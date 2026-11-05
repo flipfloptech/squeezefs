@@ -58,11 +58,19 @@ pub fn parseStatCpuNs(text: []const u8, clk_tck: u64) ?u64 {
     return (utime + stime) * (std.time.ns_per_s / tck);
 }
 
+pub const RuntimeSource = enum { schedstat, stat };
+
 /// The monotone fold over passes.
 pub const Ledger = struct {
     const Live = struct { class: u8, ns: u64, pass: u32 };
     const TestWalkHook = struct {
         after: usize,
+        ctx: *anyopaque,
+        call: *const fn (*anyopaque) anyerror!void,
+    };
+
+    const TestTaskHook = struct {
+        tid: u32,
         ctx: *anyopaque,
         call: *const fn (*anyopaque) anyerror!void,
     };
@@ -73,6 +81,8 @@ pub const Ledger = struct {
     test_walk_hook: if (builtin.is_test) ?TestWalkHook else void = if (builtin.is_test) null else {},
     test_walk_limit: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
     test_total_ns: if (builtin.is_test) ?u64 else void = if (builtin.is_test) null else {},
+    test_runtime_source: if (builtin.is_test) ?RuntimeSource else void = if (builtin.is_test) null else {},
+    test_after_cpu: if (builtin.is_test) ?TestTaskHook else void = if (builtin.is_test) null else {},
 
     pub fn deinit(self: *Ledger, gpa: std.mem.Allocator) void {
         self.live.deinit(gpa);
@@ -201,9 +211,11 @@ pub fn sample(ledger: *Ledger, gpa: std.mem.Allocator, io: Io, proc_root: []cons
         var buf: [512]u8 = undefined;
         const ns: u64 = blk: {
             const sched = std.fmt.bufPrint(&file_buf, "{s}/{s}/schedstat", .{ task_dir_path, entry.name }) catch continue;
-            if (Io.Dir.cwd().readFile(io, sched, &buf)) |text| {
-                if (parseSchedstatNs(text)) |v| break :blk v;
-            } else |_| {}
+            if (!builtin.is_test or ledger.test_runtime_source != .stat) {
+                if (Io.Dir.cwd().readFile(io, sched, &buf)) |text| {
+                    if (parseSchedstatNs(text)) |v| break :blk v;
+                } else |_| {}
+            }
             const stat = try std.fmt.bufPrint(&file_buf, "{s}/{s}/stat", .{ task_dir_path, entry.name });
             const text = Io.Dir.cwd().readFile(io, stat, &buf) catch |err| {
                 if (try taskAbsent(io, task_dir_path, tid)) continue;
@@ -213,6 +225,9 @@ pub fn sample(ledger: *Ledger, gpa: std.mem.Allocator, io: Io, proc_root: []cons
                 if (try taskAbsent(io, task_dir_path, tid)) continue;
                 return error.InvalidCpuSample;
             };
+        };
+        if (builtin.is_test) if (ledger.test_after_cpu) |hook| {
+            if (tid == hook.tid) try hook.call(hook.ctx);
         };
         const comm_path = try std.fmt.bufPrint(&file_buf, "{s}/{s}/comm", .{ task_dir_path, entry.name });
         var comm_buf: [64]u8 = undefined;
@@ -313,13 +328,38 @@ test "ledger: more than 64 departures in one pass all retire" {
     try testing.expectEqual(@as(usize, 0), l.live.count());
 }
 
+/// Synthetic task fields; start-time ticks deliberately coincide across reuse.
+fn writeTestTask(dir: Io.Dir, tid: u32, ns: u64, comm: []const u8, ticks: u64) !void {
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const task_path = try std.fmt.bufPrint(&path_buf, "self/task/{d}", .{tid});
+    try dir.createDirPath(testing.io, task_path);
+    var file_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    var data_buf: [512]u8 = undefined;
+    const sched_path = try std.fmt.bufPrint(&file_buf, "{s}/schedstat", .{task_path});
+    const sched = try std.fmt.bufPrint(&data_buf, "{d} 0 0\n", .{ns});
+    try dir.writeFile(testing.io, .{ .sub_path = sched_path, .data = sched });
+    const comm_path = try std.fmt.bufPrint(&file_buf, "{s}/comm", .{task_path});
+    try dir.writeFile(testing.io, .{ .sub_path = comm_path, .data = comm });
+    const stat_path = try std.fmt.bufPrint(&file_buf, "{s}/stat", .{task_path});
+    const stat = try std.fmt.bufPrint(&data_buf, "{d} ({s}) S 1 1 1 0 -1 0 0 0 0 0 {d} 0 0 0 20 0 1 0 42 0 0 0\n", .{ tid, comm, ticks });
+    try dir.writeFile(testing.io, .{ .sub_path = stat_path, .data = stat });
+}
+
+fn expectCpuTransition(before: Sample, after: Sample) !void {
+    var sum: u64 = 0;
+    for (before.by_class, after.by_class) |old, new| {
+        try testing.expect(new >= old);
+        sum += new;
+    }
+    try testing.expect(sum <= after.total_ns);
+}
+
 test "sample over a synthetic proc tree: classes fold, a renamed thread moves class on the next sample, JSON shape" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(testing.io, "self/task/100");
     try tmp.dir.createDirPath(testing.io, "self/task/101");
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/schedstat", .data = "1000 0 0\n" });
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/comm", .data = "sqz-meta0\n" });
+    try writeTestTask(tmp.dir, 100, 1000, "sqz-meta0", 0);
     // Thread 101 has no schedstat: the stat fallback (3 + 2 ticks = 50 ms).
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/101/stat", .data = "101 (sqz-blk3) S 1 1 1 0 -1 0 0 0 0 0 3 2 0 0 20 0 1 0 5 0 0 0" });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/101/comm", .data = "sqz-blk3\n" });
@@ -327,24 +367,94 @@ test "sample over a synthetic proc tree: classes fold, a renamed thread moves cl
     const root_len = try tmp.dir.realPath(testing.io, &root_buf);
     const root = root_buf[0..root_len];
 
-    var l: Ledger = .{};
+    var l: Ledger = .{ .test_total_ns = 50 * std.time.ns_per_ms + 1000 };
     defer l.deinit(testing.allocator);
     const s1 = try sample(&l, testing.allocator, testing.io, root);
     try testing.expectEqual(@as(u64, 1000), s1.by_class[classIndex("sqz-meta0")]);
     try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), s1.by_class[classIndex("sqz-blk3")]);
-    // Thread 100 renames itself: the next sample retires its meta figure
-    // and starts the new class with its full (monotone) runtime.
+    // The renamed task's old prefix stays in meta; only its new CPU is journal.
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/comm", .data = "sqz-jrnl0\n" });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/schedstat", .data = "1500 0 0\n" });
+    l.test_total_ns = 50 * std.time.ns_per_ms + 1500;
     const s2 = try sample(&l, testing.allocator, testing.io, root);
     try testing.expectEqual(@as(u64, 1000), s2.by_class[classIndex("sqz-meta0")]);
-    try testing.expectEqual(@as(u64, 1500), s2.by_class[classIndex("sqz-jrnl0")]);
+    try testing.expectEqual(@as(u64, 500), s2.by_class[classIndex("sqz-jrnl0")]);
+    try expectCpuTransition(s1, s2);
     var buf: [1024]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     try s2.writeJson(&w);
     try testing.expect(std.mem.startsWith(u8, w.buffered(), "{\"daemon_cpu_ns\":"));
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"sqz-jrnl\":1500") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"sqz-jrnl\":500") != null);
     try testing.expect(std.mem.endsWith(u8, w.buffered(), "\"other\":0}}"));
+}
+
+test "B1: schedstat to stat to schedstat keeps one same-task baseline" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestTask(tmp.dir, 100, 12_345_678, "sqz-meta0", 1);
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    var l: Ledger = .{ .test_total_ns = 12_345_678 };
+    defer l.deinit(testing.allocator);
+    const precise = try sample(&l, testing.allocator, testing.io, root);
+    l.test_runtime_source = .stat;
+    const coarse = try sample(&l, testing.allocator, testing.io, root);
+    try testing.expectEqual(precise.by_class, coarse.by_class);
+    try expectCpuTransition(precise, coarse);
+    l.test_runtime_source = null;
+    l.test_total_ns = 13_000_001;
+    try writeTestTask(tmp.dir, 100, 13_000_001, "sqz-meta0", 1);
+    const resumed = try sample(&l, testing.allocator, testing.io, root);
+    try testing.expectEqual(@as(u64, 13_000_001), resumed.by_class[classIndex("sqz-meta0")]);
+    try expectCpuTransition(coarse, resumed);
+}
+
+test "B1: a reused numeric tid with a higher runtime is a new task incarnation" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestTask(tmp.dir, 100, 1000, "sqz-meta0", 0);
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    var l: Ledger = .{ .test_total_ns = 1000 };
+    defer l.deinit(testing.allocator);
+    const first = try sample(&l, testing.allocator, testing.io, root);
+    try tmp.dir.deleteTree(testing.io, "self/task/100");
+    try writeTestTask(tmp.dir, 100, 1500, "sqz-meta0", 0);
+    l.test_total_ns = 2500;
+    const reused = try sample(&l, testing.allocator, testing.io, root);
+    try testing.expectEqual(@as(u64, 2500), reused.by_class[classIndex("sqz-meta0")]);
+    try expectCpuTransition(first, reused);
+}
+
+test "B1: replacement between runtime and comm reads never blends two task incarnations" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestTask(tmp.dir, 100, 1000, "sqz-meta0", 0);
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    var l: Ledger = .{ .test_total_ns = 1000 };
+    defer l.deinit(testing.allocator);
+    const first = try sample(&l, testing.allocator, testing.io, root);
+    const Replace = struct {
+        dir: Io.Dir,
+        ledger: *Ledger,
+        fn call(ctx: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ledger.test_after_cpu = null;
+            try self.dir.deleteTree(testing.io, "self/task/100");
+            try writeTestTask(self.dir, 100, 1500, "sqz-jrnl0", 0);
+        }
+    };
+    var replace: Replace = .{ .dir = tmp.dir, .ledger = &l };
+    l.test_after_cpu = .{ .tid = 100, .ctx = &replace, .call = Replace.call };
+    l.test_total_ns = 2500;
+    const replaced = try sample(&l, testing.allocator, testing.io, root);
+    try testing.expectEqual(@as(u64, 1000), replaced.by_class[classIndex("sqz-meta0")]);
+    try testing.expectEqual(@as(u64, 1500), replaced.by_class[classIndex("sqz-jrnl0")]);
+    try expectCpuTransition(first, replaced);
 }
 
 test "sample: real proc directory cursor skips live tail threads when its cached continuation tid exits" {

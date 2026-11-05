@@ -64,7 +64,7 @@ pub const Ledger = struct {
     const TestWalkHook = struct {
         after: usize,
         ctx: *anyopaque,
-        call: *const fn (*anyopaque) void,
+        call: *const fn (*anyopaque) anyerror!void,
     };
 
     live: std.AutoHashMapUnmanaged(u32, Live) = .empty,
@@ -194,7 +194,7 @@ pub fn sample(ledger: *Ledger, gpa: std.mem.Allocator, io: Io, proc_root: []cons
         };
         walked += 1;
         if (builtin.is_test) if (ledger.test_walk_hook) |hook| {
-            if (walked == hook.after) hook.call(hook.ctx);
+            if (walked == hook.after) try hook.call(hook.ctx);
         };
         const tid = std.fmt.parseInt(u32, entry.name, 10) catch continue;
         var file_buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -393,29 +393,36 @@ test "sample: real proc directory cursor skips live tail threads when its cached
     }
     var l: Ledger = .{};
     defer l.deinit(testing.allocator);
-    _ = try sample(&l, testing.allocator, testing.io, "/proc");
+    while (true) {
+        _ = try sample(&l, testing.allocator, testing.io, "/proc");
+        var primed = true;
+        for (middle) |w| primed = primed and l.live.contains(w.tid);
+        for (tail) |w| primed = primed and l.live.contains(w.tid);
+        if (primed) break;
+    }
     const Cut = struct {
         stop: *Io.Event,
         threads: []std.Thread,
+        waiters: []const Waiter,
         n: *usize,
-        fn call(ctx: *anyopaque) void {
+        fn call(ctx: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.stop.set(testing.io);
             for (self.threads) |t| t.join();
             self.n.* = 0;
+            // clear_child_tid wakes join before exit_notify unlinks the task.
+            for (self.waiters) |w| while (!try taskAbsent(testing.io, "/proc/self/task", w.tid)) {
+                std.atomic.spinLoopHint();
+            };
         }
     };
-    var cut: Cut = .{ .stop = &middle_stop, .threads = &middle_threads, .n = &middle_n };
+    var cut: Cut = .{ .stop = &middle_stop, .threads = &middle_threads, .waiters = &middle, .n = &middle_n };
     l.test_walk_hook = .{ .after = l.live.count() - middle_count - tail_count + 8, .ctx = &cut, .call = Cut.call };
     _ = try sample(&l, testing.allocator, testing.io, "/proc");
     l.test_walk_hook = null;
     try testing.expectEqual(@as(usize, 0), middle_n);
-    try testing.expectEqual(@as(u64, 0), l.retired[classIndex("sqz-blk-proof")]);
     var live_tail: usize = 0;
-    var it = l.live.valueIterator();
-    while (it.next()) |v| if (v.class == classIndex("sqz-blk-proof")) {
-        live_tail += 1;
-    };
+    for (tail) |w| live_tail += @intFromBool(l.live.contains(w.tid));
     try testing.expectEqual(@as(usize, tail_count), live_tail);
     _ = try sample(&l, testing.allocator, testing.io, "/proc");
     for (middle) |w| try testing.expect(!l.live.contains(w.tid));

@@ -1991,11 +1991,12 @@ pub const WirePlane = struct {
     /// set, so never expected) ∪ every Live directory page the open's census
     /// found on every managed volume, each keyed by its page's host key (a
     /// row with no page: 0, no region). A row lost with its manager is
-    /// expected — and reaped with its key — by its page alone. A same-host
-    /// page whose writer the §DA writer-id proof shows dead goes to
-    /// `pre_dead` instead; a page this process writes (an in-process region)
-    /// and one whose death record stands (its recovery is the ledger's) add
-    /// nothing.
+    /// expected — and reaped with its key — by its page alone. Each identity
+    /// is judged ONCE over all its pages: a same-host identity whose every
+    /// writer the §DA writer-id proof shows dead goes to `pre_dead` instead
+    /// (never expected beside it); one this process writes (an in-process
+    /// region) and one whose death record stands (its recovery is the
+    /// ledger's) add nothing.
     fn priorRoster(self: *WirePlane, expected: *std.ArrayList(shard.Expected), pre_dead: *std.ArrayList(shard.Expected)) backend.Error!void {
         const gpa = self.gpa;
         const r = cr.rangeOf(.member);
@@ -2015,29 +2016,73 @@ pub const WirePlane = struct {
         // The same-host proof needs this host's words: a boot id and its own
         // start ticks (`/proc` readable), else no page is judged here.
         const node: ?u64 = if (local.bootIdReadable() and local.start_ticks != 0) @import("join.zig").nodeToken(local) else null;
+        var idents: std.ArrayList(PageIdentity) = .empty;
+        defer {
+            for (idents.items) |*pi| pi.writers.deinit(gpa);
+            idents.deinit(gpa);
+        }
         for (self.set.volumes) |be| {
             const s = be.sym orelse continue;
-            for (s.live_pages.items) |lp| {
-                const stable: cr.StableIdentity = .{ .node_token = lp.identity.node_token, .mount_slot = lp.identity.mount_slot };
-                const id = memberIdOfStable(stable);
-                const proof: proc.WriterProof = if (node == lp.identity.node_token) self.proveWriter(local, @truncate(lp.identity.mount_slot), lp.identity.writer_id) else .unknown;
-                switch (proof) {
-                    .alive => |pid| if (pid == local.pid) continue,
-                    .dead => {
-                        dropExpected(expected, id);
-                        if (try deathStands(be0, gpa, stable)) continue;
-                        if (indexOfExpected(pre_dead.items, id) == null) {
-                            try pre_dead.append(gpa, .{ .id = id, .key = lp.host_key });
-                            log.warn("cluster wire: appender {d} on volume {d} (node 0x{x}, mount slot 0x{x}) is Live under a writer of THIS host proven dead (the §DA writer-id proof) — its death is recorded before the listener serves, for its recovery", .{ lp.appender_id, be.index, stable.node_token, stable.mount_slot });
-                        }
-                        continue;
-                    },
-                    .unknown => {},
-                }
-                if (try deathStands(be0, gpa, stable)) continue;
-                try mergeExpected(gpa, expected, id, lp.host_key);
+            for (s.live_pages.items) |lp| try PageIdentity.add(gpa, &idents, lp);
+        }
+        for (idents.items) |*pi| {
+            const id = memberIdOfStable(pi.stable);
+            switch (self.judgeIdentity(local, node, pi)) {
+                .own => continue,
+                .dead => {
+                    dropExpected(expected, id);
+                    if (try deathStands(be0, gpa, pi.stable)) continue;
+                    try pre_dead.append(gpa, .{ .id = id, .key = pi.key });
+                    log.warn("cluster wire: appender {d} (node 0x{x}, mount slot 0x{x}) is Live under a writer of THIS host proven dead (the §DA writer-id proof) — its death is recorded before the listener serves, for its recovery", .{ pi.appender_id, pi.stable.node_token, pi.stable.mount_slot });
+                },
+                .expected => {
+                    if (try deathStands(be0, gpa, pi.stable)) continue;
+                    try mergeExpected(gpa, expected, id, pi.key);
+                },
             }
         }
+    }
+
+    /// One identity's Live pages across the managed volumes: the first
+    /// non-zero host key, every distinct writer id (one, but for a
+    /// successor incarnation's page beside its predecessor's).
+    const PageIdentity = struct {
+        stable: cr.StableIdentity,
+        key: u64,
+        appender_id: u32,
+        writers: std.ArrayList(u64) = .empty,
+
+        fn add(gpa: Allocator, set: *std.ArrayList(PageIdentity), lp: @import("bind.zig").LivePage) Allocator.Error!void {
+            const stable: cr.StableIdentity = .{ .node_token = lp.identity.node_token, .mount_slot = lp.identity.mount_slot };
+            const pi = for (set.items) |*e| {
+                if (e.stable.node_token == stable.node_token and e.stable.mount_slot == stable.mount_slot) break e;
+            } else blk: {
+                try set.append(gpa, .{ .stable = stable, .key = 0, .appender_id = lp.appender_id });
+                break :blk &set.items[set.items.len - 1];
+            };
+            if (pi.key == 0) pi.key = lp.host_key;
+            for (pi.writers.items) |w| if (w == lp.identity.writer_id) return;
+            try pi.writers.append(gpa, lp.identity.writer_id);
+        }
+    };
+
+    const IdentityVerdict = enum { own, dead, expected };
+
+    /// The identity's one verdict: each distinct writer proven once — any
+    /// this process's ⇒ `own`; any alive elsewhere or unproven ⇒ `expected`;
+    /// `dead` only when every one is proven dead. Another host's identity
+    /// is never proven here: `expected`.
+    fn judgeIdentity(self: *WirePlane, local: claim.Identity, node: ?u64, pi: *const PageIdentity) IdentityVerdict {
+        if (node != pi.stable.node_token) return .expected;
+        var verdict: IdentityVerdict = .dead;
+        for (pi.writers.items) |w| switch (self.proveWriter(local, @truncate(pi.stable.mount_slot), w)) {
+            .alive => |pid| if (pid == local.pid) return .own else {
+                verdict = .expected;
+            },
+            .unknown => verdict = .expected,
+            .dead => {},
+        };
+        return verdict;
     }
 
     /// The §DA proof of a same-host page's writer (the seam's answer in a

@@ -1228,11 +1228,26 @@ const PreemptAllRun = struct {
 
 const BarrierRun = struct {
     c: *pr.Client,
+    dev: *pr_linux.Device,
+    nb: *const storage.NullBlk,
+    preempt: *const PreemptAllRun,
     answer: pr.Barrier = .unknown,
+    issued: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
+    overlapped: bool = false,
+    write_complete_at_return: bool = false,
+
+    fn submitted(ctx: *anyopaque) void {
+        const self: *BarrierRun = @ptrCast(@alignCast(ctx));
+        // This hook follows native SQ consumption, not thread creation.
+        self.overlapped = self.dev.ring.sqReady() == 0 and self.dev.ring.cqReady() == 0 and
+            !self.preempt.done.load(.acquire) and (self.nb.inflightWrites() orelse 0) != 0;
+        self.issued.store(true, .release);
+    }
 
     fn run(self: *BarrierRun) void {
         self.answer = self.c.drainBarrier();
+        self.write_complete_at_return = if (self.nb.inflightWrites()) |n| n == 0 else false;
         self.done.store(true, .release);
     }
 };
@@ -1240,9 +1255,12 @@ const BarrierRun = struct {
 /// One slow drain: what the victim saw and what the barriers answered.
 const DrainRound = struct {
     eio_reads: u32 = 0,
-    /// EIO reads submitted while the barriers were outstanding: they were
-    /// issued inside the drain (0 ⇒ the round proves nothing).
+    /// EIO reads after both native submissions, while both are unreaped.
+    /// TCP may park these probes behind its PR command instead of refusing.
     eio_with_barriers_pending: u32 = 0,
+    registered_barrier_overlap: bool = false,
+    victim_barrier_overlap: bool = false,
+    barriers_after_write: bool = false,
     /// EIO reads submitted after the preempt-all or a barrier returned: a
     /// barrier that did not wait for the drain, or refs not resurrected.
     late_eio: u32 = 0,
@@ -1262,13 +1280,19 @@ const DrainRound = struct {
     slowest_read_ms: u64 = 0,
 
     fn proves(self: *const DrainRound) bool {
-        return self.eio_with_barriers_pending != 0;
+        return self.eio_reads != 0 and self.registered_barrier_overlap and self.victim_barrier_overlap;
     }
 };
 
 test "PR-2 C5: false done flags and an EIO read before barrier issue prove no barrier overlap" {
     const unissued: DrainRound = .{ .eio_reads = 1, .eio_with_barriers_pending = 1 };
     try testing.expect(!unissued.proves());
+    var issued = unissued;
+    issued.registered_barrier_overlap = true;
+    try testing.expect(!issued.proves());
+    issued.victim_barrier_overlap = true;
+    issued.eio_with_barriers_pending = 0;
+    try testing.expect(issued.proves());
 }
 
 /// A probe read of the victim's: EIO counted (and judged against what had
@@ -1302,11 +1326,15 @@ fn slowDrainRound(sp: *SlowPair, out: *DrainRound) !void {
     var s: PreemptAllRun = .{ .c = p.b };
     const t0 = clock.monotonicNs();
     var ts: ?std.Thread = try std.Thread.spawn(.{}, PreemptAllRun.run, .{&s});
-    var t_reg: BarrierRun = .{ .c = sp.b2 };
-    var t_victim: BarrierRun = .{ .c = p.a };
+    var t_reg: BarrierRun = .{ .c = sp.b2, .dev = sp.dev_b2, .nb = &sp.nb, .preempt = &s };
+    var t_victim: BarrierRun = .{ .c = p.a, .dev = p.dev_a, .nb = &sp.nb, .preempt = &s };
     var tr: ?std.Thread = null;
     var tv: ?std.Thread = null;
-    defer for ([_]?std.Thread{ ts, tr, tv }) |t| if (t) |th| th.join();
+    defer {
+        for ([_]?std.Thread{ ts, tr, tv }) |t| if (t) |th| th.join();
+        sp.dev_b2.test_after_submit = null;
+        p.dev_a.test_after_submit = null;
+    }
     // The victim's registration goes after its refs' kill is confirmed
     // (P9), so from here its refs are dead until the drain ends; the report
     // takes no pr_sem (P14). A probe read before this point could be
@@ -1314,6 +1342,8 @@ fn slowDrainRound(sp: *SlowPair, out: *DrainRound) !void {
     // A's device: before A's barrier parks there.
     try sp.awaitVictimUnregistered();
     out.unregistered_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+    sp.dev_b2.test_after_submit = .{ .ctx = &t_reg, .fire = BarrierRun.submitted };
+    p.dev_a.test_after_submit = .{ .ctx = &t_victim, .fire = BarrierRun.submitted };
     tr = try std.Thread.spawn(.{}, BarrierRun.run, .{&t_reg});
     const deadline = t0 + drain_wait_ns;
     // The victim's barrier follows its first EIO read: on nvmet-tcp a PR
@@ -1322,7 +1352,8 @@ fn slowDrainRound(sp: *SlowPair, out: *DrainRound) !void {
     // until the drain ends instead of answering EIO.
     while (!(s.done.load(.acquire) and t_reg.done.load(.acquire) and (tv == null or t_victim.done.load(.acquire))) and clock.monotonicNs() < deadline) {
         const returned = s.done.load(.acquire) or t_reg.done.load(.acquire) or t_victim.done.load(.acquire);
-        const pending = !t_reg.done.load(.acquire) and !t_victim.done.load(.acquire);
+        const pending = t_reg.issued.load(.acquire) and t_victim.issued.load(.acquire) and
+            !t_reg.done.load(.acquire) and !t_victim.done.load(.acquire);
         if (probeRead(p, out, returned, pending) and out.write_refused == null) {
             out.write_refused = if (p.pool.writeAt(p.a_block, pr_legs.PROBE_WRITE_LEN, p.buf.bytes)) false else |we| we == error.ReservationConflict;
         }
@@ -1339,6 +1370,9 @@ fn slowDrainRound(sp: *SlowPair, out: *DrainRound) !void {
     out.preempt = s.err;
     out.registered_barrier = t_reg.answer;
     out.victim_barrier = t_victim.answer;
+    out.registered_barrier_overlap = t_reg.overlapped;
+    out.victim_barrier_overlap = t_victim.overlapped;
+    out.barriers_after_write = t_reg.write_complete_at_return and t_victim.write_complete_at_return;
     out.admitted_write = if (w.wait()) null else |e| e;
     if (p.pool.readAt(p.a_block, 0, pr_legs.PROBE_WRITE_LEN)) |res| {
         var rr = res;
@@ -1362,10 +1396,12 @@ fn slowDrainLeg(transport: configfs.Trtype) !void {
         rounds += 1;
         try slowDrainRound(&sp, &round);
         std.debug.print("\nround {d}: EIO reads {d} ({d} pending, {d} late), ok reads {d}, slowest {d} ms, gone {d} ms, returned {d} ms\n", .{ rounds, round.eio_reads, round.eio_with_barriers_pending, round.late_eio, round.ok_reads, round.slowest_read_ms, round.unregistered_ms, round.preempt_ms });
+        std.debug.print("native barrier overlap: B {}, A {}, both returned after the retained write {}\n", .{ round.registered_barrier_overlap, round.victim_barrier_overlap, round.barriers_after_write });
         if (round.proves()) break;
     }
     std.debug.print("\nslow drain ({s}, {d} round(s)): victim reads EIO {d} ({d} while the barriers were outstanding, {d} after a return), victim write refused {?}, other {?s}; preempt-all {?s}; B's barrier {s}, A's barrier {s}; the admitted write {?s}; after the drain: read {?s}, write refused {}; from the preempt-all's issue: the victim gone from the report {d} ms, the preempt-all returned {d} ms\n", .{ transport.name(), rounds, round.eio_reads, round.eio_with_barriers_pending, round.late_eio, round.write_refused, if (round.other) |e| @errorName(e) else null, if (round.preempt) |e| @errorName(e) else null, @tagName(round.registered_barrier), @tagName(round.victim_barrier), if (round.admitted_write) |e| @errorName(e) else null, if (round.read_after) |e| @errorName(e) else null, round.write_after_refused, round.unregistered_ms, round.preempt_ms });
     try testing.expect(round.proves());
+    try testing.expect(round.barriers_after_write);
     try testing.expectEqual(@as(?anyerror, null), round.preempt);
     try testing.expectEqual(@as(u32, 0), round.late_eio);
     try testing.expectEqual(@as(?bool, true), round.write_refused);
@@ -1377,7 +1413,7 @@ fn slowDrainLeg(transport: configfs.Trtype) !void {
     try testing.expect(round.write_after_refused);
 }
 
-test "nvmet fidelity: slow-drain-loop — on a null_blk namespace completing every command 250 ms late, a preempt-all's victim with a write admitted: its reads end EIO for the whole drain (P9b), its write ends -EBADE (P9a), the admitted write lands (the drain waits for it, P9); the registered host's drain barrier and the victim's, issued inside the drain, answer registered and unregistered only once it ended — no read submitted after a return sees the drain (P15)" {
+test "nvmet fidelity: slow-drain-loop — on a null_blk namespace completing every command 1 s late, a preempt-all's victim with a write admitted: its reads end EIO for the whole drain (P9b), its write ends -EBADE (P9a), the admitted write lands (the drain waits for it, P9); the registered host's drain barrier and the victim's, issued inside the drain, answer registered and unregistered only once it ended — no read submitted after a return sees the drain (P15)" {
     try slowDrainLeg(.loop);
 }
 
@@ -1534,7 +1570,7 @@ fn teardownLeg(transport: configfs.Trtype, variant: TeardownVariant) !void {
     }
 }
 
-test "nvmet fidelity: teardown-during-drain-loop — P17: the victim host deletes its controller while a preempt-all drains its admitted write; the host's delete waits for the write, so the drain ends before the target frees the controller's per-namespace ref: the preempt-all succeeds, the write lands, the victim's barrier on its deleted controller answers unknown, and the kernel log carries no nvmet splat" {
+test "nvmet fidelity: teardown-during-drain-loop — P17: the victim host deletes its controller while a preempt-all drains its admitted write; the graceful host delete waits for its I/O (not a resurrection-before-free proof): the preempt-all succeeds, the write lands, the victim's barrier on its deleted controller answers unknown, and the kernel log carries no nvmet splat" {
     try teardownLeg(.loop, .disconnect);
 }
 

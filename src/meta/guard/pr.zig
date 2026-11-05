@@ -25,6 +25,7 @@ const errors = @import("../../core/errors.zig");
 const knobs = @import("../../core/knobs.zig");
 const log = @import("../../core/log.zig");
 const checksum = @import("../../core/checksum.zig");
+const counters = @import("../../core/counters.zig");
 
 pub const Status = nvme.Status;
 
@@ -68,14 +69,14 @@ pub const Stats = struct {
     /// A register ladder that recovered a crashed incarnation's registration.
     own_stale_recoveries: u64 = 0,
     /// Drain barriers issued, and those answered `unknown` (P15a).
-    drain_barriers: u64 = 0,
-    drain_barrier_unknowns: u64 = 0,
+    drain_barriers: counters.ShardedCounter = .{},
+    drain_barrier_unknowns: counters.ShardedCounter = .{},
 };
 
 /// The drain barrier's three answers (decision 0004 P15, P15a): this host
 /// is registered under our key, it is not, or the command gave no answer —
 /// a status other than success or a conflict, or a transport error (a
-/// cancelled passthrough's EINTR, a dead node). The caller re-issues an
+/// completed command's errno, a dead node). The caller re-issues an
 /// `unknown`, never reading it as either answer.
 pub const Barrier = enum { registered, unregistered, unknown };
 
@@ -330,12 +331,15 @@ pub const Client = struct {
     /// the client's sequence lock (DC18).
     pub fn drainBarrier(self: *Client) Barrier {
         var payload: [16]u8 = undefined;
-        self.stats.drain_barriers += 1;
-        const answer: Barrier = if (self.issue(.io, &nvme.reservationRegister(self.nsid, nvme.RREGA_REPLACE, self.key, self.key, &payload))) .registered else |e| switch (e) {
-            error.ReservationConflict => .unregistered,
-            else => .unknown,
-        };
-        if (answer == .unknown) self.stats.drain_barrier_unknowns += 1;
+        self.stats.drain_barriers.inc();
+        // A barrier's answer is local: shared sequence diagnostics belong
+        // to the operation holding the sequence lock, never this callback.
+        const cmd = nvme.reservationRegister(self.nsid, nvme.RREGA_REPLACE, self.key, self.key, &payload);
+        const answer: Barrier = if (self.ns.issue(self.ns.ctx, .io, &cmd)) |c|
+            if (c.status == nvme.STATUS_SUCCESS) .registered else if (nvme.isConflict(c.status)) .unregistered else .unknown
+        else |_|
+            .unknown;
+        if (answer == .unknown) self.stats.drain_barrier_unknowns.inc();
         return answer;
     }
 
@@ -452,7 +456,7 @@ pub const Client = struct {
     }
 
     pub fn writeStatsJson(self: *const Client, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("{{\"pr_key\":\"{x:0>16}\",\"pr_rtype\":{d},\"pr_rescap\":{d},\"pr_ptpl_requested\":{},\"pr_registrants_per_namespace\":{d},\"pr_report_bytes\":{d},\"pr_registrant_cap\":{d},\"pr_registrant_cap_refusals\":{d},\"pr_registers\":{d},\"pr_unregisters\":{d},\"pr_acquires\":{d},\"pr_preempts\":{d},\"pr_releases\":{d},\"pr_reports\":{d},\"pr_own_stale_recoveries\":{d},\"pr_preempt_alls\":{d},\"pr_drain_barriers\":{d},\"pr_drain_barrier_unknowns\":{d}}}", .{ self.key, self.rtype, self.rescap, self.ptpl_requested, self.regctl, self.report_bytes, self.cap.effective(null), self.cap.refusals, self.stats.registers, self.stats.unregisters, self.stats.acquires, self.stats.preempts, self.stats.releases, self.stats.reports, self.stats.own_stale_recoveries, self.stats.preempt_alls, self.stats.drain_barriers, self.stats.drain_barrier_unknowns });
+        try w.print("{{\"pr_key\":\"{x:0>16}\",\"pr_rtype\":{d},\"pr_rescap\":{d},\"pr_ptpl_requested\":{},\"pr_registrants_per_namespace\":{d},\"pr_report_bytes\":{d},\"pr_registrant_cap\":{d},\"pr_registrant_cap_refusals\":{d},\"pr_registers\":{d},\"pr_unregisters\":{d},\"pr_acquires\":{d},\"pr_preempts\":{d},\"pr_releases\":{d},\"pr_reports\":{d},\"pr_own_stale_recoveries\":{d},\"pr_preempt_alls\":{d},\"pr_drain_barriers\":{d},\"pr_drain_barrier_unknowns\":{d}}}", .{ self.key, self.rtype, self.rescap, self.ptpl_requested, self.regctl, self.report_bytes, self.cap.effective(null), self.cap.refusals, self.stats.registers, self.stats.unregisters, self.stats.acquires, self.stats.preempts, self.stats.releases, self.stats.reports, self.stats.own_stale_recoveries, self.stats.preempt_alls, self.stats.drain_barriers.load(), self.stats.drain_barrier_unknowns.load() });
     }
 
     /// The error's detail for a log line.
@@ -957,16 +961,16 @@ test "drainBarrier (decision 0004 §4.2, §5.1; P15, P15a): the byte-exact comma
     try testing.expectEqual(Barrier.registered, b.drainBarrier());
     rig.ns.replace_holder_internal = 1;
     try testing.expectEqual(Barrier.unknown, a.drainBarrier());
-    try testing.expectEqual(nvme.SC_INTERNAL, a.last_status);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, a.last_status);
     rig.ns.fail_next = error.Interrupted;
     try testing.expectEqual(Barrier.unknown, b.drainBarrier());
-    try testing.expectEqual(@as(?errors.Error, error.Interrupted), b.last_errno);
+    try testing.expectEqual(@as(?errors.Error, null), b.last_errno);
     try b.unregister(0xb);
     try testing.expectEqual(Barrier.unregistered, b.drainBarrier());
-    try testing.expectEqual(@as(u64, 2), a.stats.drain_barriers);
-    try testing.expectEqual(@as(u64, 1), a.stats.drain_barrier_unknowns);
-    try testing.expectEqual(@as(u64, 3), b.stats.drain_barriers);
-    try testing.expectEqual(@as(u64, 1), b.stats.drain_barrier_unknowns);
+    try testing.expectEqual(@as(u64, 2), a.stats.drain_barriers.load());
+    try testing.expectEqual(@as(u64, 1), a.stats.drain_barrier_unknowns.load());
+    try testing.expectEqual(@as(u64, 3), b.stats.drain_barriers.load());
+    try testing.expectEqual(@as(u64, 1), b.stats.drain_barrier_unknowns.load());
     try testing.expectEqual(@as(u32, 0), locks.n);
 }
 
@@ -1003,8 +1007,8 @@ test "PR-2 C2: shared Client barriers leave sequence diagnostics untouched and c
         t.* = null;
     }
     try testing.expectEqual(@as(u32, 0), shared.failures.load(.monotonic));
-    try testing.expectEqual(@as(u64, 8193), c.stats.drain_barriers);
-    try testing.expectEqual(@as(u64, 8193), c.stats.drain_barrier_unknowns);
+    try testing.expectEqual(@as(u64, 8193), c.stats.drain_barriers.load());
+    try testing.expectEqual(@as(u64, 8193), c.stats.drain_barrier_unknowns.load());
 }
 
 const BarrierRun = struct {

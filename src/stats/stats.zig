@@ -1462,26 +1462,33 @@ test "render: eight threads rendering ONE renderer concurrently beside a sampler
     if (!is_linux) return testkit.skip(@src(), .other_step, "the CPU ledger walks /proc/self/task");
     const Shared = struct {
         r: *Renderer,
-        failed: std.atomic.Value(u32) = .init(0),
+        render_errors: std.atomic.Value(u32) = .init(0),
+        json_errors: std.atomic.Value(u32) = .init(0),
+        cpu_errors: std.atomic.Value(u32) = .init(0),
         stop: std.atomic.Value(bool) = .init(false),
         fn render(s: *@This()) void {
             var i: usize = 0;
             while (i < 40) : (i += 1) {
-                const p = s.r.render() catch {
-                    _ = s.failed.fetchAdd(1, .monotonic);
+                const p = s.r.render() catch |err| {
+                    std.debug.print("CPU STRESS render error: {s}\n", .{@errorName(err)});
+                    _ = s.render_errors.fetchAdd(1, .monotonic);
                     return;
                 };
                 defer p.deinit(s.r.gpa);
                 var keys: std.ArrayList([]const u8) = .empty;
                 defer keys.deinit(s.r.gpa);
-                scanJson(s.r.gpa, p.bytes()[0 .. p.len - 1], &keys) catch {
-                    _ = s.failed.fetchAdd(1, .monotonic);
+                scanJson(s.r.gpa, p.bytes()[0 .. p.len - 1], &keys) catch |err| {
+                    std.debug.print("CPU STRESS JSON error: {s}\n", .{@errorName(err)});
+                    _ = s.json_errors.fetchAdd(1, .monotonic);
                     return;
                 };
                 const sample = s.r.cpu_sample.read();
                 var sum: u64 = 0;
                 for (sample.by_class) |n| sum += n;
-                if (sum > sample.total_ns) _ = s.failed.fetchAdd(1, .monotonic);
+                if (sum > sample.total_ns) {
+                    if (s.cpu_errors.fetchAdd(1, .monotonic) == 0)
+                        std.debug.print("CPU STRESS overflow: total={d} sum={d} classes={any}\n", .{ sample.total_ns, sum, sample.by_class });
+                }
             }
         }
         fn sampleLoop(s: *@This()) void {
@@ -1497,7 +1504,9 @@ test "render: eight threads rendering ONE renderer concurrently beside a sampler
     for (threads) |t| t.join();
     s.stop.store(true, .release);
     sampler.join();
-    try testing.expectEqual(@as(u32, 0), s.failed.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), s.render_errors.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), s.json_errors.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), s.cpu_errors.load(.monotonic));
     // The ledger is whole after the storm, and the document carries it.
     r.sample();
     const p = try r.render();

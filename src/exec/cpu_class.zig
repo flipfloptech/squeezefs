@@ -60,10 +60,18 @@ pub fn parseStatCpuNs(text: []const u8, clk_tck: u64) ?u64 {
 /// The monotone fold over passes.
 pub const Ledger = struct {
     const Live = struct { class: u8, ns: u64, pass: u32 };
+    const TestWalkHook = struct {
+        after: usize,
+        ctx: *anyopaque,
+        call: *const fn (*anyopaque) void,
+    };
 
     live: std.AutoHashMapUnmanaged(u32, Live) = .empty,
     retired: [class_count]u64 = @splat(0),
     pass: u32 = 0,
+    test_walk_hook: if (builtin.is_test) ?TestWalkHook else void = if (builtin.is_test) null else {},
+    test_walk_limit: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+    test_total_ns: if (builtin.is_test) ?u64 else void = if (builtin.is_test) null else {},
 
     pub fn deinit(self: *Ledger, gpa: std.mem.Allocator) void {
         self.live.deinit(gpa);
@@ -156,6 +164,11 @@ pub fn processCpuNs() u64 {
 /// One pass over `<proc_root>/self/task/*` (Linux; pure over `proc_root` so
 /// a synthetic tree tests it), then the process total. Threads whose files
 /// vanish mid-walk (exited) are skipped and retire at `finishPass`.
+fn sampleTotalNs(ledger: *const Ledger) u64 {
+    if (builtin.is_test) if (ledger.test_total_ns) |ns| return ns;
+    return processCpuNs();
+}
+
 pub fn sample(ledger: *Ledger, gpa: std.mem.Allocator, io: Io, proc_root: []const u8) !Sample {
     ledger.beginPass();
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -163,13 +176,21 @@ pub fn sample(ledger: *Ledger, gpa: std.mem.Allocator, io: Io, proc_root: []cons
     var dir = Io.Dir.cwd().openDir(io, task_dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
             ledger.finishPass();
-            return .{ .total_ns = processCpuNs(), .by_class = ledger.sums() };
+            return .{ .total_ns = sampleTotalNs(ledger), .by_class = ledger.sums() };
         },
         else => |e| return e,
     };
     defer dir.close(io);
     var it = dir.iterate();
+    var walked: usize = 0;
     while (try it.next(io)) |entry| {
+        if (builtin.is_test) if (ledger.test_walk_limit) |limit| {
+            if (walked == limit) break;
+        };
+        walked += 1;
+        if (builtin.is_test) if (ledger.test_walk_hook) |hook| {
+            if (walked == hook.after) hook.call(hook.ctx);
+        };
         const tid = std.fmt.parseInt(u32, entry.name, 10) catch continue;
         var file_buf: [Io.Dir.max_path_bytes]u8 = undefined;
         var buf: [512]u8 = undefined;
@@ -190,7 +211,7 @@ pub fn sample(ledger: *Ledger, gpa: std.mem.Allocator, io: Io, proc_root: []cons
     ledger.finishPass();
     const by_class = ledger.sums();
     // The total is read AFTER the fold so Σ by_class ≤ total holds.
-    return .{ .total_ns = processCpuNs(), .by_class = by_class };
+    return .{ .total_ns = sampleTotalNs(ledger), .by_class = by_class };
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +325,118 @@ test "sample over a synthetic proc tree: classes fold, a renamed thread moves cl
     try testing.expect(std.mem.startsWith(u8, w.buffered(), "{\"daemon_cpu_ns\":"));
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"sqz-jrnl\":1500") != null);
     try testing.expect(std.mem.endsWith(u8, w.buffered(), "\"other\":0}}"));
+}
+
+test "sample: real proc directory cursor skips live tail threads when its cached continuation tid exits" {
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "the proc task directory cursor is Linux only");
+    const Waiter = struct {
+        ready: Io.Event = .unset,
+        stop: *Io.Event,
+        named: bool = false,
+        fn run(self: *@This()) void {
+            var comm_buf: thread_name.CommBuf = undefined;
+            if (self.named) _ = thread_name.nameCurrentThread(&comm_buf, "sqz-blk-proof");
+            self.ready.set(testing.io);
+            self.stop.waitUncancelable(testing.io);
+        }
+    };
+    // More than one 2048-byte getdents buffer of numeric tid entries.
+    const middle_count = Io.Dir.Iterator.reader_buffer_len / 24 + 8;
+    const tail_count = 4;
+    var middle_stop: Io.Event = .unset;
+    var tail_stop: Io.Event = .unset;
+    var middle: [middle_count]Waiter = undefined;
+    var tail: [tail_count]Waiter = undefined;
+    var middle_threads: [middle_count]std.Thread = undefined;
+    var tail_threads: [tail_count]std.Thread = undefined;
+    var middle_n: usize = 0;
+    var tail_n: usize = 0;
+    defer {
+        middle_stop.set(testing.io);
+        tail_stop.set(testing.io);
+        for (middle_threads[0..middle_n]) |t| t.join();
+        for (tail_threads[0..tail_n]) |t| t.join();
+    }
+    for (&middle, &middle_threads) |*w, *t| {
+        w.* = .{ .stop = &middle_stop };
+        t.* = try std.Thread.spawn(.{}, Waiter.run, .{w});
+        middle_n += 1;
+        w.ready.waitUncancelable(testing.io);
+    }
+    for (&tail, &tail_threads) |*w, *t| {
+        w.* = .{ .stop = &tail_stop, .named = true };
+        t.* = try std.Thread.spawn(.{}, Waiter.run, .{w});
+        tail_n += 1;
+        w.ready.waitUncancelable(testing.io);
+    }
+    var l: Ledger = .{};
+    defer l.deinit(testing.allocator);
+    _ = try sample(&l, testing.allocator, testing.io, "/proc");
+    const Cut = struct {
+        stop: *Io.Event,
+        threads: []std.Thread,
+        n: *usize,
+        fn call(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.stop.set(testing.io);
+            for (self.threads) |t| t.join();
+            self.n.* = 0;
+        }
+    };
+    var cut: Cut = .{ .stop = &middle_stop, .threads = &middle_threads, .n = &middle_n };
+    l.test_walk_hook = .{ .after = l.live.count() - middle_count - tail_count + 8, .ctx = &cut, .call = Cut.call };
+    _ = try sample(&l, testing.allocator, testing.io, "/proc");
+    l.test_walk_hook = null;
+    try testing.expectEqual(@as(usize, 0), middle_n);
+    try testing.expectEqual(@as(u64, 0), l.retired[classIndex("sqz-blk-proof")]);
+    var live_tail: usize = 0;
+    var it = l.live.valueIterator();
+    while (it.next()) |v| if (v.class == classIndex("sqz-blk-proof")) {
+        live_tail += 1;
+    };
+    try testing.expectEqual(@as(usize, tail_count), live_tail);
+}
+
+test "sample: an omitted live tid is not retired and counted twice when the proc walk resumes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "self/task/100");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/schedstat", .data = "100 0 0\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/comm", .data = "sqz-meta0\n" });
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    var l: Ledger = .{ .test_total_ns = 100 };
+    defer l.deinit(testing.allocator);
+    const first = try sample(&l, testing.allocator, testing.io, root);
+    try testing.expectEqual(@as(u64, 100), first.by_class[classIndex("sqz-meta0")]);
+    // proc's next_tid can end the walk when its current task exits.
+    l.test_walk_limit = 0;
+    const omitted = try sample(&l, testing.allocator, testing.io, root);
+    l.test_walk_limit = null;
+    const resumed = try sample(&l, testing.allocator, testing.io, root);
+    try testing.expectEqual(first.by_class, omitted.by_class);
+    try testing.expectEqual(first.by_class, resumed.by_class);
+    try testing.expect(resumed.by_class[classIndex("sqz-meta0")] <= resumed.total_ns);
+}
+
+test "sample: an unreadable live tid is not proof of death; recovery counts its runtime once" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "self/task/100");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/schedstat", .data = "100 0 0\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/comm", .data = "sqz-meta0\n" });
+    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    var l: Ledger = .{ .test_total_ns = 100 };
+    defer l.deinit(testing.allocator);
+    const first = try sample(&l, testing.allocator, testing.io, root);
+    try tmp.dir.deleteFile(testing.io, "self/task/100/comm");
+    try testing.expectError(error.FileNotFound, sample(&l, testing.allocator, testing.io, root));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/comm", .data = "sqz-meta0\n" });
+    const resumed = try sample(&l, testing.allocator, testing.io, root);
+    try testing.expectEqual(first.by_class, resumed.by_class);
 }
 
 test "the live process: Σ by_class ≤ total on Linux" {

@@ -1917,3 +1917,43 @@ test "a co-located member whose MAIN thread exited first (a zombie in /proc/<pid
     // The whole group is gone: the claim's flock is free.
     try testing.expect(!proc.flockHeldElsewhere(claim_path.ptr));
 }
+
+test "a co-located member whose /proc/<pid>/stat the kernel refuses to open (EMFILE under fd exhaustion) is never pruned as dead: the registry keeps it, the §DA proof cannot rule it out, its pin cannot be proven, so the recovery HOLDS (loud) and nothing is killed" {
+    const gpa = testing.allocator;
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-unreadable-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var probe = Registry.at(base, .set, 0xd4);
+    probe.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    probe.unlock();
+    const local = proc.localIdentity();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const ctx: RuleContext = .{ .gpa = gpa, .env = &env, .path = "unreadable", .local = local, .node_token = 0xA, .vol_index = 0, .taking_manager = false, .label = "data volume" };
+    var w = try std.process.spawn(testing.io, .{ .argv = &.{"cat"}, .stdin = .pipe, .stdout = .ignore, .stderr = .ignore });
+    defer {
+        _ = linux.kill(w.id.?, .KILL);
+        _ = w.wait(testing.io) catch {};
+    }
+    const pid: u32 = @intCast(w.id.?);
+    const ticks = proc.startTicksOf(pid).?;
+    const id: claim.Identity = .{ .boot_id = local.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
+    const reg = Registry.at(base, .set, 0xd4);
+    var lb: [96]u8 = undefined;
+    try reg.append(pid, ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = id.writerId(9), .joined = .{ .appender_id = 3, .term = 2, .vol = 0 } }));
+    var fault: proc.TestSeams.StatFault = .{ .pid = pid, .errno = .MFILE };
+    proc.test_seams.stat_fault.store(&fault, .release);
+    defer proc.test_seams.stat_fault.store(null, .release);
+    const dead = pgTerm(3, .recovering, 0xA, id.writerId(9), 2);
+    const kills0 = guard.stats.pr_stale_sibling_kills.load();
+    log.testing.expectErrorLogs(1);
+    try testing.expect(!killColocatedMember(ctx, reg, &dead, &.{}));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(kills0, guard.stats.pr_stale_sibling_kills.load());
+    proc.test_seams.stat_fault.store(null, .release);
+    // Still registered, still alive: nothing pruned it, nothing killed it.
+    try testing.expect(proc.isWriterIncarnation(local, pid, 9, id.writerId(9)));
+    const es = try reg.entries(gpa);
+    defer gpa.free(es);
+    try testing.expectEqual(@as(usize, 1), es.len);
+}

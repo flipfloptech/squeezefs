@@ -95,6 +95,12 @@ pub const TestSeams = struct {
     /// Runs in a census's `/proc/locks` read between its first page and the
     /// next `read(2)` — the instant the seq_file has released the lock table.
     between_locks_pages: std.atomic.Value(?*const Hook) = .init(null),
+    /// Refuses the open of `/proc/<pid>/stat` for one pid with an errno —
+    /// what fd exhaustion (EMFILE, ENFILE), ENOMEM or hidepid (EACCES)
+    /// answer for a process that lives.
+    stat_fault: std.atomic.Value(?*const StatFault) = .init(null),
+
+    pub const StatFault = struct { pid: u32, errno: linux.E };
 
     pub const Hook = struct {
         ctx: *anyopaque,
@@ -178,6 +184,7 @@ pub fn startTicksAnyState(pid: u32) ?u64 {
 fn readStat(pid: u32, buf: []u8) ?[]const u8 {
     var pb: [64]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/stat", .{pid}, 0) catch return null;
+    if (builtin.is_test) if (test_seams.stat_fault.load(.acquire)) |f| if (f.pid == pid) return null;
     return readSmall(path.ptr, buf);
 }
 
@@ -1016,6 +1023,21 @@ test "liveWriterPid: an incarnation's writer id names its live process on this h
     _ = try child.wait(testing.io);
     reaped = true;
     try testing.expectEqual(@as(?linux.pid_t, null), liveWriterPid(testing.io, me, 0x0819, theirs.writerId(0x0819)));
+}
+
+test "an UNREADABLE stat proves nothing: a /proc/<pid>/stat whose open the kernel refuses other than ENOENT (EMFILE under fd exhaustion, ENFILE, ENOMEM, EACCES under hidepid) reads ALIVE to every judgement — the claim prover, the §DA proof, the pin's re-check after pidfd_open (which can take the last free fd) — never dead; ENOENT is gone" {
+    const me = localIdentity();
+    var fault: TestSeams.StatFault = .{ .pid = me.pid, .errno = .MFILE };
+    test_seams.stat_fault.store(&fault, .release);
+    defer test_seams.stat_fault.store(null, .release);
+    try testing.expect(!probe.provablyDead(me.pid, me.start_ticks));
+    try testing.expect(isWriterIncarnation(me, me.pid, 7, me.writerId(7)));
+    try testing.expectEqual(PinOutcome{ .refused = .MFILE }, pin(@intCast(me.pid), me.start_ticks));
+    fault.errno = .ACCES;
+    try testing.expect(!probe.provablyDead(me.pid, me.start_ticks));
+    fault.errno = .NOENT;
+    try testing.expect(probe.provablyDead(me.pid, me.start_ticks));
+    try testing.expect(pin(@intCast(me.pid), me.start_ticks) == .gone);
 }
 
 test "a ZOMBIE holder whose every thread is gone is dead: a daemon that exited under a supervisor that reaps on its 5 s probe still has /proc/<pid>/stat (state Z, its start ticks) — it holds no fd, writes nothing, and its pid cannot be reused, so the claim it left is reclaimable at once (xfstests' _flakey_drop_and_remount remounts within 50 ms); its stat keeps its identity, and Z or X says only that its main thread exited" {

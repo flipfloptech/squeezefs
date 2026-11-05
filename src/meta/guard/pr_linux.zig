@@ -596,10 +596,15 @@ const IssueRace = struct {
 
 test "review M2 (decision 0003 §DG): two threads issuing on ONE Device each reap their OWN completion — A's command (a uring_cmd on a regular file: the file system's refusal) submitted and parked before its reap, B's (no controller node: -EBADF) issued meanwhile; never one thread returning the other's answer (a stolen completion parsed as a report, its owner waiting on, or the kernel writing into a returned frame)" {
     const gpa = testing.allocator;
-    const rc = linux.open("/proc/self/exe", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
-    const dev = try gpa.create(Device);
-    dev.* = .{ .gpa = gpa, .fd = @intCast(rc), .ctrl_fd = -1, .ring = try uring128.Ring128.init(ring_entries, 0), .nsid = 1, .node = undefined, .node_len = 0 };
+    const dev = blk: {
+        const rc = linux.open("/proc/self/exe", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        errdefer _ = linux.close(@intCast(rc));
+        const d = try gpa.create(Device);
+        errdefer gpa.destroy(d);
+        d.* = .{ .gpa = gpa, .fd = @intCast(rc), .ctrl_fd = -1, .ring = try uring128.Ring128.init(ring_entries, 0), .nsid = 1, .node = undefined, .node_len = 0 };
+        break :blk d;
+    };
     defer dev.deinit();
     // Each command's own answer, one at a time (a file system with no
     // uring_cmd answers -EOPNOTSUPP, btrfs -EINVAL): never -EBADF.
@@ -612,9 +617,11 @@ test "review M2 (decision 0003 §DG): two threads issuing on ONE Device each rea
     try testing.expect(alone.a != null and alone.a.? != error.BadFileDescriptor);
     var race: IssueRace = .{};
     dev.test_after_submit = .{ .ctx = &race, .fire = IssueRace.park };
-    const ta = try std.Thread.spawn(.{}, IssueRace.runA, .{ dev, &race });
+    var ta: ?std.Thread = try std.Thread.spawn(.{}, IssueRace.runA, .{ dev, &race });
+    defer if (ta) |t| t.join();
     const tb = try std.Thread.spawn(.{}, IssueRace.runB, .{ dev, &race });
-    ta.join();
+    ta.?.join();
+    ta = null;
     tb.join();
     try testing.expectEqual(alone.a, race.a);
     try testing.expectEqual(@as(?errors.Error, error.BadFileDescriptor), race.b);

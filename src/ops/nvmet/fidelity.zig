@@ -1283,6 +1283,7 @@ fn probeRead(p: *pr_legs.Pair, out: *DrainRound, returned: bool, pending: bool) 
 fn slowDrainRound(sp: *SlowPair, out: *DrainRound) !void {
     const p = &sp.pair;
     var w = try sp.arm();
+    defer w.deinit();
     var s: PreemptAllRun = .{ .c = p.b };
     const t0 = clock.monotonicNs();
     var ts: ?std.Thread = try std.Thread.spawn(.{}, PreemptAllRun.run, .{&s});
@@ -1384,14 +1385,16 @@ const KmsgWatch = struct {
         return .{ .fd = fd };
     }
 
+    fn deinit(self: *KmsgWatch) void {
+        if (self.fd) |fd| _ = linux.close(fd);
+        self.fd = null;
+    }
+
     /// Every record since `start` when one carries a splat marker and one
     /// names nvmet or a per-cpu ref; empty otherwise.
     fn splat(self: *KmsgWatch, gpa: Allocator) ![]u8 {
         const fd = self.fd orelse return gpa.alloc(u8, 0);
-        defer {
-            _ = linux.close(fd);
-            self.fd = null;
-        }
+        defer self.deinit();
         var all: Io.Writer.Allocating = .init(gpa);
         defer all.deinit();
         var rec: [8192]u8 = undefined;
@@ -1448,14 +1451,13 @@ fn teardownLeg(transport: configfs.Trtype, variant: TeardownVariant) !void {
     defer sp.close(rig);
     const p = &sp.pair;
     var kmsg = KmsgWatch.start();
+    defer kmsg.deinit();
     var w = try sp.arm();
+    defer w.deinit();
     var s: PreemptAllRun = .{ .c = p.b };
-    const ts = try std.Thread.spawn(.{}, PreemptAllRun.run, .{&s});
-    sp.awaitVictimUnregistered() catch |e| {
-        ts.join();
-        _ = w.wait() catch {};
-        return e;
-    };
+    var ts: ?std.Thread = try std.Thread.spawn(.{}, PreemptAllRun.run, .{&s});
+    defer if (ts) |t| t.join();
+    try sp.awaitVictimUnregistered();
     const t0 = clock.monotonicNs();
     switch (variant) {
         .disconnect => {
@@ -1475,8 +1477,9 @@ fn teardownLeg(transport: configfs.Trtype, variant: TeardownVariant) !void {
             if (linux.errno(linux.write(@intCast(rc), "fatal", 5)) != .SUCCESS) return error.FatalWriteRefused;
         },
     }
-    ts.join();
-    const drained_ms = (s.end_ns - t0) / std.time.ns_per_ms;
+    ts.?.join();
+    ts = null;
+    const drained_ms = (s.end_ns -| t0) / std.time.ns_per_ms;
     const admitted = w.wait();
     const victim_barrier = p.a.drainBarrier();
     var rep = try sp.b2.report();

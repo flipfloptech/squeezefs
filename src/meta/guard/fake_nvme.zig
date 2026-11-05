@@ -599,6 +599,29 @@ pub const Namespace = struct {
     }
 };
 
+/// A test's held ticket and two workers (abort and barrier): release the
+/// admitted command before joining anything that waits for its completion.
+pub const DrainCleanup = struct {
+    ns: *Namespace,
+    ticket: ?u32,
+    threads: [2]?std.Thread = @splat(null),
+
+    pub fn complete(self: *DrainCleanup) void {
+        if (self.ticket) |t| {
+            self.ticket = null;
+            self.ns.complete(t);
+        }
+    }
+
+    pub fn deinit(self: *DrainCleanup) void {
+        self.complete();
+        for (&self.threads) |*t| if (t.*) |th| {
+            th.join();
+            t.* = null;
+        };
+    }
+};
+
 /// The synthetic foreign host of `seedHolder`.
 pub const foreign_host: [16]u8 = "FOREIGN-HOST-ID!".*;
 
@@ -1102,12 +1125,14 @@ test "fake drain (nvmet 7.3, decision 0004 §2.2 P9, P9d, P14, P15): the preempt
     const gen = ns.generation;
     var pa: Issued = .{ .host = &b, .cmd = undefined };
     pa.cmd = nvme.reservationAcquire(1, nvme.RACQA_PREEMPT_AND_ABORT, nvme.RTYPE_WEAR, 0xb, 0, &pa.payload);
-    const ts = try std.Thread.spawn(.{}, Issued.run, .{&pa});
+    var cleanup: DrainCleanup = .{ .ns = &ns, .ticket = w.admitted };
+    defer cleanup.deinit();
+    cleanup.threads[0] = try std.Thread.spawn(.{}, Issued.run, .{&pa});
     ns.awaitDrainWaiting();
     try testing.expect(!pa.done.load(.acquire));
     var bar: Issued = .{ .host = &b2, .cmd = undefined };
     bar.cmd = nvme.reservationRegister(1, nvme.RREGA_REPLACE, 0xb, 0xb, &bar.payload);
-    const tb = try std.Thread.spawn(.{}, Issued.run, .{&bar});
+    cleanup.threads[1] = try std.Thread.spawn(.{}, Issued.run, .{&bar});
     ns.awaitPrWaiters(1);
     try testing.expect(!bar.done.load(.acquire));
     // P14: a Report answers during the drain.
@@ -1117,9 +1142,7 @@ test "fake drain (nvmet 7.3, decision 0004 §2.2 P9, P9d, P14, P15): the preempt
     try testing.expectEqual(nvme.STATUS_SUCCESS, rc.status);
     try testing.expectEqual(@as(?u16, 1), nvme.reportRegctl(&rep, true));
     try testing.expect(!pa.done.load(.acquire) and !bar.done.load(.acquire));
-    ns.complete(w.admitted);
-    ts.join();
-    tb.join();
+    cleanup.deinit();
     try testing.expectEqual(nvme.STATUS_SUCCESS, pa.status);
     try testing.expectEqual(nvme.STATUS_SUCCESS, bar.status);
     try testing.expectEqual(gen + 2, ns.generation);

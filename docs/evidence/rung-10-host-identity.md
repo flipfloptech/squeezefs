@@ -119,3 +119,11 @@ shrinks, so decision 0004's rules need no design change.
 Seen, not changed: the nvmet tier's `expectNoResidue` reads an NQN that `Rig.unshare` already freed. It
 segfaults only beside another tier's share with an NQN of the same length: a first run beside two other
 agents' tiers crashed 4 rows at `configfs.zig:621`.
+
+**A refusal proves nothing, at the stat read too (§DF.19; the safety review's MAJOR on `e4896d8`).** `readSmall`
+answered null for any errno, so a `/proc/<pid>/stat` open the kernel refused (EMFILE or ENFILE under fd exhaustion,
+ENOMEM, hidepid's EACCES) read as "no such process". `pin`'s re-check after `pidfd_open` copied it: that open can
+take the last free fd. Now ENOENT and ESRCH are gone and every other errno is `unproven`: never dead, logged at most
+once a second, and bounded by each caller's own retry. Red `8280ea0` (a seam refuses one pid's stat open): under
+EMFILE a live process read dead, and the co-located kill pruned a live member as dead, 5/5 each. Fix `cb38913`:
+both reds green; the filters 217 + 7 skipped of 224; the full test 3,369 + 195 skipped of 3,564; fmt; rails 34/34.

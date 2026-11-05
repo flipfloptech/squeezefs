@@ -445,6 +445,84 @@ test "PR-2 C1: native PR issue keeps its lock through interrupted wait, reaps it
     try testing.expectEqual(@as(u32, 0), dev.issue_lock.word.load(.acquire));
 }
 
+const IssueError = struct {
+    value: u64 = 0,
+    fd: linux.fd_t = -1,
+    phase: u8 = 0,
+    fail_submit: bool,
+
+    fn enter(ctx: *anyopaque, ring: *uring128.Ring128, submit_n: u32, wait_n: u32, flags: u32, argp: usize, argsz: usize) usize {
+        const self: *IssueError = @ptrCast(@alignCast(ctx));
+        if (self.phase == 0) {
+            self.phase = 1;
+            if (self.fail_submit) return @bitCast(-@as(isize, @backingInt(linux.E.NOMEM)));
+            const sqe = &ring.sq.sqes[ring.sq.head.* & ring.sq.mask];
+            const ud = sqe.user_data;
+            uring128.prepRead(sqe, .{ .raw = self.fd }, std.mem.asBytes(&self.value), 0);
+            sqe.user_data = ud;
+            return linux.syscall6(.io_uring_enter, @intCast(ring.fd), submit_n, 0, 0, 0, 0);
+        }
+        if (self.phase == 1) {
+            self.phase = 2;
+            const one: u64 = 1;
+            _ = linux.write(self.fd, @ptrCast(&one), @sizeOf(u64));
+            return @bitCast(-@as(isize, @backingInt(linux.E.NOMEM)));
+        }
+        return linux.syscall6(.io_uring_enter, @intCast(ring.fd), submit_n, wait_n, flags, argp, argsz);
+    }
+};
+
+fn testDevice() !*Device {
+    const gpa = testing.allocator;
+    const dev = try gpa.create(Device);
+    errdefer gpa.destroy(dev);
+    dev.* = .{ .gpa = gpa, .fd = -1, .ctrl_fd = -1, .ring = try uring128.Ring128.init(ring_entries, 0), .nsid = 1, .node = undefined, .node_len = 0 };
+    return dev;
+}
+
+test "PR-2 C1: rejected native submission leaves no SQE retaining the caller's payload" {
+    const dev = try testDevice();
+    defer dev.deinit();
+    var seam: IssueError = .{ .fail_submit = true };
+    dev.ring.test_enter = .{ .ctx = &seam, .call = IssueError.enter };
+    const cmd = nvme.UringCmd.zeroed();
+    try testing.expectError(error.OutOfMemory, dev.face().issue(dev, .io, &cmd));
+    try testing.expectEqual(@as(u32, 0), dev.ring.sqReady());
+}
+
+test "PR-2 C1: a native CQ wait failure retains the accepted request until its own CQE" {
+    const dev = try testDevice();
+    defer dev.deinit();
+    const rc = linux.eventfd(0, linux.EFD.CLOEXEC);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var seam: IssueError = .{ .fail_submit = false, .fd = fd };
+    dev.ring.test_enter = .{ .ctx = &seam, .call = IssueError.enter };
+    const cmd = nvme.UringCmd.zeroed();
+    log.testing.expectErrorLogs(1);
+    const c = try dev.face().issue(dev, .io, &cmd);
+    try testing.expectEqual(@as(nvme.Status, 8), c.status);
+    try testing.expectEqual(@as(u64, 1), seam.value);
+    try testing.expectEqual(@as(u32, 0), dev.ring.cqReady());
+    try log.testing.expectAllFired();
+}
+
+test "PR-2 C1: an old native CQE is never accepted as the next command's answer" {
+    const dev = try testDevice();
+    defer dev.deinit();
+    const cmd = nvme.UringCmd.zeroed();
+    try testing.expectError(error.BadFileDescriptor, dev.face().issue(dev, .io, &cmd));
+    const sqe = dev.ring.getSqe().?;
+    uring128.prepNop(sqe);
+    sqe.user_data = ud_cmd;
+    _ = try dev.ring.submitAndWait(1);
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.BadFileDescriptor, dev.face().issue(dev, .io, &cmd));
+    try testing.expectEqual(@as(u32, 0), dev.ring.cqReady());
+    try log.testing.expectAllFired();
+}
+
 /// Two issuers on one Device (review M2 of decision 0003 §DG): A parks
 /// after its submit until B is done — or, B shut out, for a bound.
 const IssueRace = struct {

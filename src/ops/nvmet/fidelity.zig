@@ -405,6 +405,10 @@ const Rig = struct {
     fn unshare(self: *Rig, nqn: []const u8) !void {
         const out = try self.sqzOk(&.{ "nvmeof", "unshare", nqn });
         defer self.gpa.free(out);
+        try self.rememberUnshared(nqn);
+    }
+
+    fn rememberUnshared(self: *Rig, nqn: []const u8) !void {
         for (self.shares.items, 0..) |s, i| if (std.mem.eql(u8, s, nqn)) {
             try self.unshared.append(self.gpa, self.shares.orderedRemove(i));
             break;
@@ -1093,12 +1097,17 @@ const SlowPair = struct {
             .none => return error.NotAnNvmeNamespace,
         };
         errdefer dev_b2.deinit();
+        const extra = try openExtra(gpa, dev_b2.face(), dev_b2.nsid);
+        for ([_]*pr.Client{ pair.a, pair.b, pair.a_twin, extra.b2 }) |c| _ = c.probeRescap() catch {};
+        return .{ .nb = nb, .w_pool = extra.w_pool, .nqn = nqn, .a = a, .b = b, .a_path = a_path, .b_path = b_path, .pair = pair, .dev_b2 = dev_b2, .b2 = extra.b2 };
+    }
+
+    fn openExtra(gpa: Allocator, ns: nvme.Namespace, nsid: u32) !struct { b2: *pr.Client, w_pool: *uring_fs.Pool } {
         const b2 = try gpa.create(pr.Client);
         errdefer gpa.destroy(b2);
-        b2.* = try pr.Client.init(gpa, dev_b2.face(), dev_b2.nsid, pr_legs.key_b1);
-        for ([_]*pr.Client{ pair.a, pair.b, pair.a_twin, b2 }) |c| _ = c.probeRescap() catch {};
+        b2.* = try pr.Client.init(gpa, ns, nsid, pr_legs.key_b1);
         const w_pool = try uring_fs.Pool.init(gpa, uring_fs.Config.fixed(1, uring_fs.nofileSoftAsFound()));
-        return .{ .nb = nb, .w_pool = w_pool, .nqn = nqn, .a = a, .b = b, .a_path = a_path, .b_path = b_path, .pair = pair, .dev_b2 = dev_b2, .b2 = b2 };
+        return .{ .b2 = b2, .w_pool = w_pool };
     }
 
     fn close(self: *SlowPair, rig: *Rig) void {
@@ -1152,6 +1161,40 @@ const SlowPair = struct {
         }
     }
 };
+
+test "PR-2 C6: unshare bookkeeping OOM keeps the NQN owned until an allocation-safe transfer" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var rig: Rig = undefined;
+    rig.gpa = gpa;
+    rig.shares = .empty;
+    rig.unshared = .empty;
+    defer rig.shares.deinit(gpa);
+    defer rig.unshared.deinit(gpa);
+    const nqn = try gpa.dupe(u8, "nqn.test:owned");
+    defer gpa.free(nqn);
+    try rig.shares.append(gpa, nqn);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, rig.rememberUnshared(nqn));
+    try testing.expectEqual(@as(usize, 1), rig.shares.items.len);
+    try testing.expectEqual(@as(usize, 0), rig.unshared.items.len);
+    failing.fail_index = std.math.maxInt(usize);
+    try rig.rememberUnshared(nqn);
+    try testing.expectEqual(@as(usize, 0), rig.shares.items.len);
+    try testing.expectEqualStrings(nqn, rig.unshared.items[0]);
+}
+
+test "PR-2 C6: a failed write-pool allocation releases the initialized barrier Client arena" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+    var marker: u8 = 0;
+    const Unused = struct {
+        fn issue(_: *anyopaque, _: nvme.Queue, _: *const nvme.UringCmd) @import("../../core/errors.zig").Error!nvme.Completion {
+            return .{ .status = nvme.STATUS_SUCCESS };
+        }
+    };
+    try testing.expectError(error.OutOfMemory, SlowPair.openExtra(failing.allocator(), .{ .ctx = &marker, .issue = Unused.issue }, 1));
+    try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
 
 const PreemptAllRun = struct {
     c: *pr.Client,
@@ -1207,6 +1250,11 @@ const DrainRound = struct {
         return self.eio_with_barriers_pending != 0;
     }
 };
+
+test "PR-2 C5: false done flags and an EIO read before barrier issue prove no barrier overlap" {
+    const unissued: DrainRound = .{ .eio_reads = 1, .eio_with_barriers_pending = 1 };
+    try testing.expect(!unissued.proves());
+}
 
 /// A probe read of the victim's: EIO counted (and judged against what had
 /// returned before it was submitted), success released.
@@ -1364,6 +1412,22 @@ const KmsgWatch = struct {
         return gpa.dupe(u8, text);
     }
 };
+
+test "PR-2 C7: unavailable kernel-log observation is not a clean no-splat result" {
+    var watch: KmsgWatch = .{ .fd = null };
+    if (watch.splat(testing.allocator)) |text| {
+        defer testing.allocator.free(text);
+        return error.TestExpectedError;
+    } else |e| try testing.expectEqual(@as(anyerror, error.KernelLogUnavailable), e);
+}
+
+test "PR-2 C7: a real kernel-log read error is not the EAGAIN end of the current stream" {
+    var watch: KmsgWatch = .{ .fd = -1 };
+    if (watch.splat(testing.allocator)) |text| {
+        defer testing.allocator.free(text);
+        return error.TestExpectedError;
+    } else |e| try testing.expectEqual(@as(anyerror, error.KernelLogReadFailed), e);
+}
 
 const TeardownVariant = enum {
     /// The victim host deletes its controller mid-drain (`nvme disconnect`).

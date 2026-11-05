@@ -96,7 +96,7 @@ pub const JoinKeyVerdict = enum { ok, absent, mismatch };
 /// Host-keyed: a registrant holds non-zero `claimed` under a host id that
 /// derives it via `hostKey(id, set)`. Incarnation-keyed: holding it suffices.
 /// The key belongs to some registered host, not necessarily the requester
-/// (decision 0003 §DO.19).
+/// (decision 0003 §DO.28).
 pub fn joinKeyVerdict(rep: nvme.Report, claimed: u64, set_uuid: [16]u8, host_keyed: bool) JoinKeyVerdict {
     if (claimed == 0) return .absent;
     var held = false;
@@ -1482,7 +1482,7 @@ test "the host key and the registry keys: one per (host identity, set), stable, 
     try testing.expect(fabricRegistryKey("nqn.s", "nqn.h", "id") != fabricRegistryKey("nqn.s", "nqn.h", "id2"));
 }
 
-test "a joiner's claimed page key against the joined volume's report (decision 0004 §6.1, KD18): ok only when a registrant holds it under the host id it derives from (hostKey(registrant's wire host id, set)); a key held by no registrant (stale, another set's) is absent; one held only under host ids it does not derive from is a mismatch; under incarnation keys (the per-mount seam) any registrant holding it suffices — and another live host's key passes: the check binds the key to SOME registered host, not to the joiner's (decision 0003 §DO.19's residue)" {
+test "a joiner's claimed page key against the joined volume's report (decision 0004 §6.1, KD18): ok only when a registrant holds it under the host id it derives from (hostKey(registrant's wire host id, set)); a key held by no registrant (stale, another set's) is absent; one held only under host ids it does not derive from is a mismatch; under incarnation keys (the per-mount seam) any registrant holding it suffices — and another live host's key passes: the check binds the key to SOME registered host, not to the joiner's (decision 0003 §DO.28's residue)" {
     const set: [16]u8 = @splat(7);
     const host_a: [16]u8 = "host-a-wire-id01".*;
     const host_b: [16]u8 = "host-b-wire-id02".*;

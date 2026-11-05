@@ -427,7 +427,7 @@ Docs-only round (revision 27): decision 0004 copied verbatim; `zig fmt --check` 
 Review round (the model's safety review): FULL `zig build test` 23/23 steps, 3,363 / 3,558 passed (195 skipped), 0 failed, 1 m 28 s, the cost table accepted; `zig build rails`
 (fresh) 18/18 steps, 34/34 tests; `zig fmt --check` clean.
 
-## PR-3: deaths carry the host key from the appender page (decision 0003 §DO.18–§DO.23)
+## PR-3: deaths carry the host key from the appender page (decision 0003 §DO.27–§DO.32)
 
 **What changed.** On today's WERO code a member a successor reaps at its grace deadline was shipped
 with key 0 (`wire_plane.rosterKey`), so recovery skipped the metadata preempt and the data fence and
@@ -473,7 +473,7 @@ error cleanup before the census; normal teardown owns successful opens. The test
 `059bea1` collected appender 1 then refused a checksum-valid foreign layout at appender 2:
 41/41 assertions passed, but two allocations leaked (160 + 132 B), exit 1. With the fix, the
 failed-open and snapshot/count tests pass 42/42 with no leaks, exit 0. `joinKeyVerdict`'s
-comment is four lines; §DO.19's requester/key-binding residue and the predicates are unchanged.
+comment is four lines; §DO.28's requester/key-binding residue and the predicates are unchanged.
 Through `scripts/venue`: affected units 259/260 (1 seam-only recovery loop skipped), F9/F9b
 42/42 (each recovery and both fences 1, page-key fallback 0), fmt + rails 34/34; all exit 0.
 No full gate was run for this follow-up.

@@ -5,7 +5,8 @@
 //! prefix table of `core/thread_name.zig`, sampled at stats-read time ONLY,
 //! with the monotone retired ledger — a class never falls: a thread that
 //! exits keeps contributing its last sample (the CPU between its last sample
-//! and its exit is the one lost term), and a tid whose runtime DROPPED or
+//! and its exit is the one lost term). A missing directory entry is not death:
+//! only an absent task directory retires the tid. A tid whose runtime DROPPED or
 //! whose class changed is a reused tid: the old figure retires first.
 //!
 //! `Σ by_class ≤ total_ns` by construction: the per-thread fold runs BEFORE
@@ -96,7 +97,7 @@ pub const Ledger = struct {
         gop.value_ptr.* = .{ .class = @intCast(class), .ns = ns, .pass = self.pass };
     }
 
-    /// Retire every tid not seen this pass (an exited thread keeps its last ns).
+    /// Retire tids not marked live after the caller's absence checks.
     pub fn finishPass(self: *Ledger) void {
         var it = self.live.iterator();
         var gone: [64]u32 = undefined;
@@ -161,25 +162,29 @@ pub fn processCpuNs() u64 {
     return u + s;
 }
 
-/// One pass over `<proc_root>/self/task/*` (Linux; pure over `proc_root` so
-/// a synthetic tree tests it), then the process total. Threads whose files
-/// vanish mid-walk (exited) are skipped and retire at `finishPass`.
+fn taskAbsent(io: Io, task_dir_path: []const u8, tid: u32) !bool {
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{d}", .{ task_dir_path, tid });
+    _ = Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        else => return err,
+    };
+    return false;
+}
+
 fn sampleTotalNs(ledger: *const Ledger) u64 {
     if (builtin.is_test) if (ledger.test_total_ns) |ns| return ns;
     return processCpuNs();
 }
 
+/// One pass over `<proc_root>/self/task/*`, then the process total.
+/// Only task-directory absence proves an exit; live read errors refuse
+/// publication and an omitted live tid retains its last observation.
 pub fn sample(ledger: *Ledger, gpa: std.mem.Allocator, io: Io, proc_root: []const u8) !Sample {
     ledger.beginPass();
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const task_dir_path = try std.fmt.bufPrint(&path_buf, "{s}/self/task", .{proc_root});
-    var dir = Io.Dir.cwd().openDir(io, task_dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => {
-            ledger.finishPass();
-            return .{ .total_ns = sampleTotalNs(ledger), .by_class = ledger.sums() };
-        },
-        else => |e| return e,
-    };
+    var dir = try Io.Dir.cwd().openDir(io, task_dir_path, .{ .iterate = true });
     defer dir.close(io);
     var it = dir.iterate();
     var walked: usize = 0;
@@ -199,14 +204,29 @@ pub fn sample(ledger: *Ledger, gpa: std.mem.Allocator, io: Io, proc_root: []cons
             if (Io.Dir.cwd().readFile(io, sched, &buf)) |text| {
                 if (parseSchedstatNs(text)) |v| break :blk v;
             } else |_| {}
-            const stat = std.fmt.bufPrint(&file_buf, "{s}/{s}/stat", .{ task_dir_path, entry.name }) catch continue;
-            const text = Io.Dir.cwd().readFile(io, stat, &buf) catch continue;
-            break :blk parseStatCpuNs(text, 100) orelse continue;
+            const stat = try std.fmt.bufPrint(&file_buf, "{s}/{s}/stat", .{ task_dir_path, entry.name });
+            const text = Io.Dir.cwd().readFile(io, stat, &buf) catch |err| {
+                if (try taskAbsent(io, task_dir_path, tid)) continue;
+                return err;
+            };
+            break :blk parseStatCpuNs(text, 100) orelse {
+                if (try taskAbsent(io, task_dir_path, tid)) continue;
+                return error.InvalidCpuSample;
+            };
         };
-        const comm_path = std.fmt.bufPrint(&file_buf, "{s}/{s}/comm", .{ task_dir_path, entry.name }) catch continue;
+        const comm_path = try std.fmt.bufPrint(&file_buf, "{s}/{s}/comm", .{ task_dir_path, entry.name });
         var comm_buf: [64]u8 = undefined;
-        const comm = Io.Dir.cwd().readFile(io, comm_path, &comm_buf) catch continue;
+        const comm = Io.Dir.cwd().readFile(io, comm_path, &comm_buf) catch |err| {
+            if (try taskAbsent(io, task_dir_path, tid)) continue;
+            return err;
+        };
         try ledger.observe(gpa, tid, classIndex(std.mem.trim(u8, comm, " \t\r\n")), ns);
+    }
+    // proc's directory cursor can skip live tids when its continuation exits.
+    var live = ledger.live.iterator();
+    while (live.next()) |e| {
+        if (e.value_ptr.pass != ledger.pass and !try taskAbsent(io, task_dir_path, e.key_ptr.*))
+            e.value_ptr.pass = ledger.pass;
     }
     ledger.finishPass();
     const by_class = ledger.sums();
@@ -333,7 +353,9 @@ test "sample: real proc directory cursor skips live tail threads when its cached
         ready: Io.Event = .unset,
         stop: *Io.Event,
         named: bool = false,
+        tid: u32 = 0,
         fn run(self: *@This()) void {
+            self.tid = @intCast(std.os.linux.gettid());
             var comm_buf: thread_name.CommBuf = undefined;
             if (self.named) _ = thread_name.nameCurrentThread(&comm_buf, "sqz-blk-proof");
             self.ready.set(testing.io);
@@ -395,6 +417,9 @@ test "sample: real proc directory cursor skips live tail threads when its cached
         live_tail += 1;
     };
     try testing.expectEqual(@as(usize, tail_count), live_tail);
+    _ = try sample(&l, testing.allocator, testing.io, "/proc");
+    for (middle) |w| try testing.expect(!l.live.contains(w.tid));
+    for (tail) |w| try testing.expect(l.live.contains(w.tid));
 }
 
 test "sample: an omitted live tid is not retired and counted twice when the proc walk resumes" {
@@ -434,9 +459,15 @@ test "sample: an unreadable live tid is not proof of death; recovery counts its 
     const first = try sample(&l, testing.allocator, testing.io, root);
     try tmp.dir.deleteFile(testing.io, "self/task/100/comm");
     try testing.expectError(error.FileNotFound, sample(&l, testing.allocator, testing.io, root));
+    try testing.expectEqual(@as(u64, 0), l.retired[classIndex("sqz-meta0")]);
+    try testing.expect(l.live.contains(100));
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "self/task/100/comm", .data = "sqz-meta0\n" });
     const resumed = try sample(&l, testing.allocator, testing.io, root);
     try testing.expectEqual(first.by_class, resumed.by_class);
+    try tmp.dir.deleteTree(testing.io, "self/task");
+    try testing.expectError(error.FileNotFound, sample(&l, testing.allocator, testing.io, root));
+    try testing.expectEqual(first.by_class, l.sums());
+    try testing.expect(l.live.contains(100));
 }
 
 test "the live process: Σ by_class ≤ total on Linux" {

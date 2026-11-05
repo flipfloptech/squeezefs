@@ -1465,8 +1465,21 @@ test "render: eight threads rendering ONE renderer concurrently beside a sampler
         render_errors: std.atomic.Value(u32) = .init(0),
         json_errors: std.atomic.Value(u32) = .init(0),
         cpu_errors: std.atomic.Value(u32) = .init(0),
+        monotonic_errors: std.atomic.Value(u32) = .init(0),
         stop: std.atomic.Value(bool) = .init(false),
+        fn checkCpu(s: *@This(), sample: cpu_class.Sample, previous: *[cpu_class.class_count]u64) void {
+            var sum: u64 = 0;
+            for (sample.by_class, 0..) |n, c| {
+                sum += n;
+                if (n < previous[c]) _ = s.monotonic_errors.fetchAdd(1, .monotonic);
+                previous[c] = n;
+            }
+            if (sum > sample.total_ns and s.cpu_errors.fetchAdd(1, .monotonic) == 0)
+                std.debug.print("CPU STRESS overflow: total={d} sum={d} classes={any}\n", .{ sample.total_ns, sum, sample.by_class });
+        }
         fn render(s: *@This()) void {
+            var previous_document: [cpu_class.class_count]u64 = @splat(0);
+            var previous_read: [cpu_class.class_count]u64 = @splat(0);
             var i: usize = 0;
             while (i < 40) : (i += 1) {
                 const p = s.r.render() catch |err| {
@@ -1475,20 +1488,18 @@ test "render: eight threads rendering ONE renderer concurrently beside a sampler
                     return;
                 };
                 defer p.deinit(s.r.gpa);
-                var keys: std.ArrayList([]const u8) = .empty;
-                defer keys.deinit(s.r.gpa);
-                scanJson(s.r.gpa, p.bytes()[0 .. p.len - 1], &keys) catch |err| {
+                var parsed = std.json.parseFromSlice(std.json.Value, s.r.gpa, p.bytes(), .{ .duplicate_field_behavior = .@"error" }) catch |err| {
                     std.debug.print("CPU STRESS JSON error: {s}\n", .{@errorName(err)});
                     _ = s.json_errors.fetchAdd(1, .monotonic);
                     return;
                 };
-                const sample = s.r.cpu_sample.read();
-                var sum: u64 = 0;
-                for (sample.by_class) |n| sum += n;
-                if (sum > sample.total_ns) {
-                    if (s.cpu_errors.fetchAdd(1, .monotonic) == 0)
-                        std.debug.print("CPU STRESS overflow: total={d} sum={d} classes={any}\n", .{ sample.total_ns, sum, sample.by_class });
-                }
+                defer parsed.deinit();
+                const cpu = parsed.value.object.get("cpu").?.object;
+                const classes = cpu.get("daemon_cpu_ns_by_class").?.object;
+                var document: cpu_class.Sample = .{ .total_ns = @intCast(cpu.get("daemon_cpu_ns").?.integer), .by_class = undefined };
+                for (&document.by_class, 0..) |*n, c| n.* = @intCast(classes.get(cpu_class.className(c)).?.integer);
+                s.checkCpu(document, &previous_document);
+                s.checkCpu(s.r.cpu_sample.read(), &previous_read);
             }
         }
         fn sampleLoop(s: *@This()) void {
@@ -1507,6 +1518,7 @@ test "render: eight threads rendering ONE renderer concurrently beside a sampler
     try testing.expectEqual(@as(u32, 0), s.render_errors.load(.monotonic));
     try testing.expectEqual(@as(u32, 0), s.json_errors.load(.monotonic));
     try testing.expectEqual(@as(u32, 0), s.cpu_errors.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), s.monotonic_errors.load(.monotonic));
     // The ledger is whole after the storm, and the document carries it.
     r.sample();
     const p = try r.render();

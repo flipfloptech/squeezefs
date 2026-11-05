@@ -2931,6 +2931,68 @@ fn liveJoinerThroughRemount(s: *meta_set.TestSet, who: verbs.WireIdentity, membe
     try testing.expect((try be0.lookup(gpa, key.TREE_CONTROL, cr.memberKey(.{ .node_token = who.node_token, .mount_slot = who.mount_slot }).slice())) == null);
 }
 
+/// Incarnation 1 of a two-volume set: one TCP joiner under `who` puts its
+/// page Live on BOTH volumes (no membership join), then the manager stops
+/// and closes with the joiner never leaving.
+fn liveJoinerOnBothVolumes(s: *meta_set.TestSet, who: verbs.WireIdentity) !void {
+    const gpa = testing.allocator;
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    try testing.expectEqual(@as(usize, 2), set.volumes.len);
+    var client = dialer.Client.init(gpa, s.io(), plane.advertised, meta_set.TestSet.secret, who);
+    defer client.deinit();
+    var tl: join_ladder.TcpLink = .{ .client = &client };
+    const ident: page.Identity = .{ .node_token = who.node_token, .mount_slot = who.mount_slot, .writer_id = who.writer_id };
+    for (set.volumes, 0..) |be, v| {
+        var pages: DevicePages = .{ .be = be };
+        var wire: join_ladder.ManagerWire = .{ .gpa = gpa, .link = tl.link(), .volume = @intCast(v), .identity = who, .pages = pages.reader() };
+        var joiner = join_ladder.Joiner.init(gpa, &wire);
+        defer joiner.deinit();
+        try joiner.joinRegion(.{ .identity = ident, .home_volume = 0, .volume_base = node_seq.nodeSeqBase(be.sb.uuid), .grain = be.dev.mode.grain(), .ring0_head = be.core.headPos() });
+        try testing.expectEqual(page.State.live, (try be.sym.?.manager.readPageOf(joiner.appenderId())).?.state);
+    }
+}
+
+/// The seam's answers for `ONE PROOF PER IDENTITY`: dead first, then unknown
+/// (a stat refused between two walks); the calls counted.
+const SplitProof = struct {
+    var calls: std.atomic.Value(u32) = .init(0);
+    fn prove(_: u64) proc.WriterProof {
+        return if (calls.fetchAdd(1, .monotonic) == 0) .dead else .unknown;
+    }
+};
+
+test "linux: ONE PROOF PER IDENTITY (decision 0004 §4.6; the PR-3 review's minor 3) — a same-host joiner's Live pages on TWO volumes, its writer proven dead at the first walk and unknown at a second (a stat refused in between: the seam): the successor judges the identity once — its death ships at the sink's bind and it is never expected, so no grace opens (red: proven per page — dead at volume 0's, then re-added as expected at volume 1's: the death shipped AND the fresh half held to the deadline)" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "one-proof", 2);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    const local = proc.localIdentity();
+    try testing.expect(local.start_ticks != 0);
+    const who: verbs.WireIdentity = .{ .node_token = join.nodeToken(local), .writer_id = 0x5EAD_0000_0000_0002, .mount_slot = 0x5006, .reserved = 0 };
+    try liveJoinerOnBothVolumes(s, who);
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    SplitProof.calls.store(0, .monotonic);
+    test_prove_writer = &SplitProof.prove;
+    defer test_prove_writer = null;
+    const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    try testing.expect(try deathRecordOf(set.volumes[0], who) != null);
+    try testing.expectEqual(@as(u64, 0), plane.mgr.?.owner.graceRemainingMs(WirePlane.nowMs()));
+    try testing.expectEqual(@as(u32, 1), SplitProof.calls.load(.monotonic));
+}
+
 /// The death record of `who` on volume 0's tree 0, decoded (null = none).
 fn deathRecordOf(be0: *KvBackend, who: verbs.WireIdentity) !?cr.DeadMember {
     const v = (try be0.lookup(testing.allocator, key.TREE_CONTROL, cr.deadMemberKey(.{ .node_token = who.node_token, .mount_slot = who.mount_slot }).slice())) orelse return null;

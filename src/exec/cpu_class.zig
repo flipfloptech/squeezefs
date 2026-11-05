@@ -444,7 +444,6 @@ fn expectCpuTransition(before: Sample, after: Sample) !void {
 test "sample over a synthetic proc tree: classes fold, a renamed thread moves class on the next sample, JSON shape" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(testing.io, "self/task/100");
     try tmp.dir.createDirPath(testing.io, "self/task/101");
     try writeTestTask(tmp.dir, 100, 1000, "sqz-meta0", 0);
     // Thread 101 has no schedstat: the stat fallback (3 + 2 ticks = 50 ms).

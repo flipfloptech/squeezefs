@@ -28,6 +28,7 @@ const Allocator = std.mem.Allocator;
 
 const errors = @import("../../core/errors.zig");
 const log = @import("../../core/log.zig");
+const counters = @import("../../core/counters.zig");
 const align_probe = @import("../../io/align_probe.zig");
 const uring128 = @import("../../io/uring128.zig");
 const futex = @import("../../sync/futex.zig");
@@ -44,6 +45,8 @@ comptime {
 /// law.
 const ring_entries: u16 = 8;
 const ud_cmd: u64 = 1;
+var issue_wait_failures: counters.Tripwire = .init("pr_issue_wait_failures");
+var issue_cqe_mismatches: counters.Tripwire = .init("pr_issue_cqe_mismatches");
 
 /// What the resolution found for a metadata path.
 pub const Resolved = union(enum) {
@@ -66,10 +69,11 @@ pub const Device = struct {
     node_len: usize,
     /// One command on the ring at a time: the guard's heartbeat, recovery's
     /// preempts and reports and a lapse's re-register share a Device, and
-    /// every command rides one user_data — an issuer that reaped another's
+    /// each command rides its own tag — an issuer that reaped another's
     /// completion would return before the kernel filled its buffer (review
     /// M2 of decision 0003 §DG).
     issue_lock: IssueLock = .{},
+    next_cmd: u64 = ud_cmd,
     /// Test seam: fired after a command's submit, before its completion is
     /// reaped (the window two issuers on one ring meet in).
     test_after_submit: if (builtin.is_test) ?TestHook else void = if (builtin.is_test) null else {},
@@ -109,14 +113,38 @@ pub const Device = struct {
             .io => self.fd,
         };
         uring128.prepUringCmd(sqe, .{ .raw = fd }, cmd_op, &cmd.toCmdArea());
-        sqe.user_data = ud_cmd;
-        _ = try self.ring.submitAndWait(1);
+        const tag = self.next_cmd;
+        self.next_cmd +%= 1;
+        sqe.user_data = tag;
+        _ = self.ring.submit() catch |e| blk: {
+            if (self.ring.sqReady() != 0) {
+                // Device has no SQPOLL: after a rejected enter no kernel
+                // reader can take this unconsumed payload-bearing SQE.
+                const head = @atomicLoad(u32, self.ring.sq.head, .acquire);
+                self.ring.sq.sqe_head = head;
+                self.ring.sq.sqe_tail = head;
+                @atomicStore(u32, self.ring.sq.tail, head, .release);
+                return e;
+            }
+            // A consumed SQE retains its payload until its CQE, even when
+            // the syscall supplied no submission answer.
+            break :blk 0;
+        };
         if (builtin.is_test) if (self.test_after_submit) |h| h.fire(h.ctx);
         var cqes: [1]uring128.Cqe32 = undefined;
+        var wait_failed = false;
         while (true) {
-            const n = try self.ring.copyCqes(&cqes, 1);
+            const n = self.ring.copyCqes(&cqes, 1) catch {
+                if (!wait_failed) issue_wait_failures.fire("native PR wait failed: retaining the accepted command until its CQE");
+                wait_failed = true;
+                _ = linux.sched_yield();
+                continue;
+            };
             if (n == 0) continue;
-            if (cqes[0].user_data != ud_cmd) continue;
+            if (cqes[0].user_data != tag) {
+                issue_cqe_mismatches.fire("native PR CQE is not the command holding the issue lock");
+                continue;
+            }
             break;
         }
         const cqe = cqes[0];

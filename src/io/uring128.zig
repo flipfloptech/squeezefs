@@ -339,16 +339,29 @@ pub const Ring128 = struct {
         // to see the flushed tail; the kernel raises NEED_WAKEUP in
         // `sq.flags` when it went to sleep.
         if (self.flags & linux.IORING_SETUP_SQPOLL != 0 and self.sqFlags() & linux.IORING_SQ_NEED_WAKEUP != 0) enter_flags |= linux.IORING_ENTER_SQ_WAKEUP;
-        // The kernel reads `arg` and its timespec during this call only.
-        const rc = if (builtin.is_test and self.test_enter != null)
-            self.test_enter.?.call(self.test_enter.?.ctx, self, to_submit, min_complete, enter_flags, argp, argsz)
-        else
-            linux.syscall6(.io_uring_enter, @as(usize, @intCast(self.fd)), to_submit, min_complete, enter_flags, argp, argsz);
-        return switch (linux.errno(rc)) {
-            .SUCCESS => .{ .submitted = @intCast(rc), .timed_out = false },
-            .TIME => .{ .submitted = 0, .timed_out = true },
-            else => |e| errors.fromErrno(e),
-        };
+        const head = @atomicLoad(u32, self.sq.head, .acquire);
+        var consumed: u32 = 0;
+        var pending = to_submit;
+        while (true) {
+            // The kernel reads `arg` and its timespec during this call only.
+            const rc = if (builtin.is_test and self.test_enter != null)
+                self.test_enter.?.call(self.test_enter.?.ctx, self, pending, min_complete, enter_flags, argp, argsz)
+            else
+                linux.syscall6(.io_uring_enter, @as(usize, @intCast(self.fd)), pending, min_complete, enter_flags, argp, argsz);
+            switch (linux.errno(rc)) {
+                .SUCCESS => return .{ .submitted = consumed + @as(u32, @intCast(rc)), .timed_out = false },
+                .TIME => return .{ .submitted = consumed, .timed_out = true },
+                .INTR => {
+                    // An interrupted wait does not cancel its submitted I/O.
+                    // Acquire pairs with the kernel's consumed-SQE head release.
+                    // Timed callers retain their deadline/retry policy.
+                    if (arg != null) return error.Interrupted;
+                    consumed = @min(to_submit, @atomicLoad(u32, self.sq.head, .acquire) -% head);
+                    pending = to_submit - consumed;
+                },
+                else => |e| return errors.fromErrno(e),
+            }
+        }
     }
 
     /// Flush and submit, no wait. On a `DEFER_TASKRUN` ring this runs no

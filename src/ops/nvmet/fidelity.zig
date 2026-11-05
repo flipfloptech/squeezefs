@@ -846,6 +846,23 @@ fn roundtripLeg(transport: configfs.Trtype) !void {
     try expectPortLastOut(rig, rec.listeners[0].port_id);
 }
 
+test "nvmet fidelity: rig-unshare-keeps-nqn — the residue census after an unshare reads the share's NQN, so the rig keeps the string until its teardown; with another live share whose NQN has the same length, the census compares every byte of it (a freed NQN reads 0x55 under the test allocator, or faults once its page is unmapped: the segfault at configfs.zig:621 in the PTPL-less restart and lapse early-end rows)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const port = (try rig.servicePorts(.loop))[0];
+    const nqn = try rig.share("nqkeep1", 1 << 20, .loop, port);
+    const other = try rig.share("nqkeep2", 1 << 20, .loop, port);
+    try testing.expectEqual(nqn.len, other.len);
+    const before = try gpa.dupe(u8, nqn);
+    defer gpa.free(before);
+    try rig.unshare(nqn);
+    try testing.expectEqualStrings(before, nqn);
+    try expectNoResidue(rig, nqn);
+    try rig.unshare(other);
+    try expectNoResidue(rig, other);
+}
+
 test "nvmet fidelity: roundtrip-loop — share → list managed+live → connect → the namespace carries the ledger's uuid → 64 MiB O_DIRECT round trip → resv-report → disconnect → unshare → zero residue" {
     try roundtripLeg(.loop);
 }

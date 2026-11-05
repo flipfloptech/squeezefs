@@ -95,3 +95,27 @@ See the final report for the counts at the final head (nvmet tier ×3, the 27 ev
 rows ×3, the unit filters, fmt, rails). Not run: the full gate (the orchestrator's); anything under
 `nvme_core.multipath=Y`. Limits: §DF.13. Owed: a fence-triggered retire-and-rejoin of a
 non-evicted sibling (§DF.8); the data namespaces' registrants (`data_pr`, owed since rung 6).
+
+## The death proof (2026-11-04; decision 0003 §DF.17–DF.18; branch `fix/guard-proc-thread-group` off `96c0b2a`)
+
+The guard's dead-pid proof (`proc.startTicksOf`, under every caller: the claim prover, the §DA writer-id
+proof, the registry's live entries, the stale-sibling rule, the co-located kill, the joined census, the
+membership rows) read a stat whose state is Z or X as dead: "a zombie holds no fd". A main thread can exit
+before the rest of its group, though, and the other threads still hold the fd table and can still issue
+I/O. The proof is now the thread group's. A running or stopped main thread is a live group. A Z or X stat
+is judged on a pidfd pinned by the start ticks (`proc.pin`, shared with the umount verb), which is readable
+only once no thread is left. A pidfd refused other than by ESRCH reads alive, never dead. The dead set only
+shrinks, so decision 0004's rules need no design change.
+
+| check | result |
+|---|---|
+| red `457207c`: main thread a zombie, a second thread holding the claim's flock | `probe.provablyDead` read it dead (`proc.zig:874`); `killColocatedMember` killed nothing (`host_fence.zig:1918`), 5/5 each |
+| fix `80f7c72`: both tests, no noise of this work's (load 2) / beside the full smoke's 16 shards + 16 busy loops | 10/10 / 40/40 (load 30–35) |
+| proc, host_fence, claim, membership, joined, cli.umount filters | 215 + 7 skipped of 222 |
+| the 27 eviction/re-join/KILL rows ×1 | 71/71 |
+| the nvmet tier ×1, alone | 72 + 1 skipped of 73 |
+| full `zig build test`; fmt; rails | 3,367 + 195 skipped of 3,562 (23/23 steps); clean; 34/34 |
+
+Seen, not changed: the nvmet tier's `expectNoResidue` reads an NQN that `Rig.unshare` already freed. It
+segfaults only beside another tier's share with an NQN of the same length: a first run beside two other
+agents' tiers crashed 4 rows at `configfs.zig:621`.

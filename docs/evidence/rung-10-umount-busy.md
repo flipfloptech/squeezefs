@@ -197,3 +197,4 @@ signalled, exit 1.
 
 Seen, not changed: `meta/guard/proc.zig`'s dead-pid prover reads a 'Z' leader as dead ("it holds no fd")
 though its live threads may still hold the claim's fds; the layer-A flock stands until they go.
+Closed by decision 0003 §DF.17 (`rung-10-host-identity.md` § The death proof).

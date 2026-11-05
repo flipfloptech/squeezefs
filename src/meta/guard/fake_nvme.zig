@@ -1053,6 +1053,40 @@ const Issued = struct {
     }
 };
 
+fn heldDrainFailure(ns: *Namespace, a: *Host, b: *Host, stage: u8) !void {
+    const w = a.submit(.write);
+    try testing.expect(w == .admitted);
+    var b2: Host = .{ .ns = ns, .host_id = host_b };
+    var pa: Issued = .{ .host = b, .cmd = undefined };
+    pa.cmd = nvme.reservationAcquire(1, nvme.RACQA_PREEMPT_AND_ABORT, nvme.RTYPE_WEAR, 0xb, 0, &pa.payload);
+    var bar: Issued = .{ .host = &b2, .cmd = undefined };
+    bar.cmd = nvme.reservationRegister(1, nvme.RREGA_REPLACE, 0xb, 0xb, &bar.payload);
+    var cleanup: DrainCleanup = .{ .ns = ns, .ticket = w.admitted };
+    defer cleanup.deinit();
+    cleanup.threads[0] = try std.Thread.spawn(.{}, Issued.run, .{&pa});
+    ns.awaitDrainWaiting();
+    if (stage == 0) return error.InjectedSpawnFailure;
+    cleanup.threads[1] = try std.Thread.spawn(.{}, Issued.run, .{&bar});
+    ns.awaitPrWaiters(1);
+    return error.InjectedReportFailure;
+}
+
+test "PR-2 C4: failure after either fake worker starts releases its ticket before joining all workers" {
+    for (0..2) |stage| {
+        var ns = Namespace.init(testing.allocator);
+        defer ns.deinit();
+        var a: Host = .{ .ns = &ns, .host_id = host_a };
+        var b: Host = .{ .ns = &ns, .host_id = host_b };
+        _ = try registerKey(&a, 0xa);
+        _ = try registerKey(&b, 0xb);
+        _ = try acquireAs(&a, nvme.RACQA_ACQUIRE, nvme.RTYPE_WEAR, 0xa, 0);
+        try testing.expectError(if (stage == 0) error.InjectedSpawnFailure else error.InjectedReportFailure, heldDrainFailure(&ns, &a, &b, @intCast(stage)));
+        try testing.expectEqual(@as(usize, 0), ns.in_flight_n);
+        try testing.expect(!ns.prSemHeld());
+        try testing.expectEqual(nvme.STATUS_SUCCESS, try replaceSame(&b, 0xb));
+    }
+}
+
 test "fake drain (nvmet 7.3, decision 0004 §2.2 P9, P9d, P14, P15): the preempt-all's issuer waits for the victim's admitted write; a Register-Replace (the drain barrier) issued meanwhile parks on pr_sem until the drain ends; a Report does not wait; both complete once the write completes" {
     var ns = Namespace.init(testing.allocator);
     defer ns.deinit();

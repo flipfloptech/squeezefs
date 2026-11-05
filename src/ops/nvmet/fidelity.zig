@@ -410,7 +410,8 @@ const Rig = struct {
 
     fn rememberUnshared(self: *Rig, nqn: []const u8) !void {
         for (self.shares.items, 0..) |s, i| if (std.mem.eql(u8, s, nqn)) {
-            try self.unshared.append(self.gpa, self.shares.orderedRemove(i));
+            try self.unshared.ensureUnusedCapacity(self.gpa, 1);
+            self.unshared.appendAssumeCapacity(self.shares.orderedRemove(i));
             break;
         };
     }
@@ -483,10 +484,7 @@ const Rig = struct {
             std.debug.print("\n--- disconnect {s} failed ({f}) ---\n{s}\n", .{ c.nqn(), r.term, r.stderr });
             return error.DisconnectFailed;
         }
-        for (self.connects.items, 0..) |cc, i| if (cc.instance == c.instance) {
-            _ = self.connects.orderedRemove(i);
-            break;
-        };
+        self.forget(c);
     }
 
     /// Drop a controller the leg removed by hand from the manifest: its
@@ -1106,6 +1104,7 @@ const SlowPair = struct {
         const b2 = try gpa.create(pr.Client);
         errdefer gpa.destroy(b2);
         b2.* = try pr.Client.init(gpa, ns, nsid, pr_legs.key_b1);
+        errdefer b2.deinit();
         const w_pool = try uring_fs.Pool.init(gpa, uring_fs.Config.fixed(1, uring_fs.nofileSoftAsFound()));
         return .{ .b2 = b2, .w_pool = w_pool };
     }
@@ -1161,6 +1160,22 @@ const SlowPair = struct {
         }
     }
 };
+
+test "PR-2 S1: controller manifest removal uses the instance helper and leaves other controllers owned" {
+    var rig: Rig = undefined;
+    rig.gpa = testing.allocator;
+    rig.connects = .empty;
+    defer rig.connects.deinit(rig.gpa);
+    const a: Connected = .{ .instance = 7 };
+    const b: Connected = .{ .instance = 8 };
+    try rig.connects.append(rig.gpa, a);
+    try rig.connects.append(rig.gpa, b);
+    rig.forget(&a);
+    try testing.expectEqual(@as(usize, 1), rig.connects.items.len);
+    try testing.expectEqual(b.instance, rig.connects.items[0].instance);
+    rig.forget(&a);
+    try testing.expectEqual(@as(usize, 1), rig.connects.items.len);
+}
 
 test "PR-2 C6: unshare bookkeeping OOM keeps the NQN owned until an allocation-safe transfer" {
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{});

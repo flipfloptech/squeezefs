@@ -1224,6 +1224,17 @@ test "render: the document parses, names every family in the schema's order with
     try testing.expectEqual(p.len, text.len);
 }
 
+test "PR-2 accounting: native PR tripwires have an explicit generated JSON family" {
+    var r = Renderer.init(testing.allocator, .{});
+    defer r.deinit();
+    const p = try r.render();
+    defer p.deinit(testing.allocator);
+    if (is_linux) {
+        try testing.expect(std.mem.indexOf(u8, p.bytes(), "\"native_pr\":{\"pr_issue_wait_failures\":") != null);
+        try testing.expect(std.mem.indexOf(u8, p.bytes(), "\"pr_issue_cqe_mismatches\":") != null);
+    }
+}
+
 test "every instrument declared in a generated namespace is a key of the document (declared ⇒ exported)" {
     var r = Renderer.init(testing.allocator, .{});
     defer r.deinit();

@@ -1009,6 +1009,11 @@ test "PR-2 C2: shared Client barriers leave sequence diagnostics untouched and c
     try testing.expectEqual(@as(u32, 0), shared.failures.load(.monotonic));
     try testing.expectEqual(@as(u64, 8193), c.stats.drain_barriers.load());
     try testing.expectEqual(@as(u64, 8193), c.stats.drain_barrier_unknowns.load());
+    var buf: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try c.writeStatsJson(&writer);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"pr_drain_barriers\":8193") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"pr_drain_barrier_unknowns\":8193") != null);
 }
 
 const BarrierRun = struct {

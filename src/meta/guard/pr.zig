@@ -10,8 +10,10 @@
 //! device-answered Invalid Field, never on an errno); the REGISTER LADDER
 //! (plain register → on conflict read the wire host id (FID 0x81) and the
 //! report → unregister only OWN stale keys → register fresh; every other
-//! arm fails CLOSED); `acquire` WE rtype 1; `preempt`; `release` +
-//! `unregister` (zero residue); `report` in two steps sized by REGCTL
+//! arm fails CLOSED); `acquire` WE rtype 1; `preempt`; the successor's
+//! `preemptAllAndAbort` and the side-effect-free `drainBarrier` (decision
+//! 0004 §4.2); `release` + `unregister` (zero residue); `report` in two
+//! steps sized by REGCTL
 //! (EDS = 1 first, the short form on any non-conflict error); the registrant
 //! cap learned ONLY from a repeated device-answered command-/vendor-specific
 //! status.

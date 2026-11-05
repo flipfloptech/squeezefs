@@ -1182,7 +1182,7 @@ const BarrierRun = struct {
 /// One slow drain: what the victim saw and what the barriers answered.
 const DrainRound = struct {
     eio_reads: u32 = 0,
-    /// EIO reads submitted while both barriers were outstanding: both were
+    /// EIO reads submitted while the barriers were outstanding: they were
     /// issued inside the drain (0 ⇒ the round proves nothing).
     eio_with_barriers_pending: u32 = 0,
     /// EIO reads submitted after the preempt-all or a barrier returned: a
@@ -1251,15 +1251,20 @@ fn slowDrainRound(sp: *SlowPair, out: *DrainRound) !void {
     try sp.awaitVictimUnregistered();
     out.unregistered_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
     tr = try std.Thread.spawn(.{}, BarrierRun.run, .{&t_reg});
-    tv = try std.Thread.spawn(.{}, BarrierRun.run, .{&t_victim});
     const deadline = t0 + drain_wait_ns;
-    while (!(s.done.load(.acquire) and t_reg.done.load(.acquire) and t_victim.done.load(.acquire)) and clock.monotonicNs() < deadline) {
+    // The victim's barrier follows its first EIO read: on nvmet-tcp a PR
+    // command waiting on pr_sem holds its whole I/O queue (it executes in
+    // the queue's io_work), so a probe read behind it on that queue parks
+    // until the drain ends instead of answering EIO.
+    while (!(s.done.load(.acquire) and t_reg.done.load(.acquire) and (tv == null or t_victim.done.load(.acquire))) and clock.monotonicNs() < deadline) {
         const returned = s.done.load(.acquire) or t_reg.done.load(.acquire) or t_victim.done.load(.acquire);
         const pending = !t_reg.done.load(.acquire) and !t_victim.done.load(.acquire);
         if (probeRead(p, out, returned, pending) and out.write_refused == null) {
             out.write_refused = if (p.pool.writeAt(p.a_block, pr_legs.PROBE_WRITE_LEN, p.buf.bytes)) false else |we| we == error.ReservationConflict;
         }
+        if (tv == null and out.eio_reads != 0) tv = try std.Thread.spawn(.{}, BarrierRun.run, .{&t_victim});
     }
+    if (tv == null) tv = try std.Thread.spawn(.{}, BarrierRun.run, .{&t_victim});
     ts.?.join();
     out.preempt_ms = (s.end_ns - t0) / std.time.ns_per_ms;
     tr.?.join();
@@ -1295,7 +1300,7 @@ fn slowDrainLeg(transport: configfs.Trtype) !void {
         std.debug.print("\nround {d}: EIO reads {d} ({d} pending, {d} late), ok reads {d}, slowest {d} ms, gone {d} ms, returned {d} ms\n", .{ rounds, round.eio_reads, round.eio_with_barriers_pending, round.late_eio, round.ok_reads, round.slowest_read_ms, round.unregistered_ms, round.preempt_ms });
         if (round.proves()) break;
     }
-    std.debug.print("\nslow drain ({s}, {d} round(s)): victim reads EIO {d} ({d} while both barriers were outstanding, {d} after a return), victim write refused {?}, other {?s}; preempt-all {?s}; B's barrier {s}, A's barrier {s}; the admitted write {?s}; after the drain: read {?s}, write refused {}; from the preempt-all's issue: the victim gone from the report {d} ms, the preempt-all returned {d} ms\n", .{ transport.name(), rounds, round.eio_reads, round.eio_with_barriers_pending, round.late_eio, round.write_refused, if (round.other) |e| @errorName(e) else null, if (round.preempt) |e| @errorName(e) else null, @tagName(round.registered_barrier), @tagName(round.victim_barrier), if (round.admitted_write) |e| @errorName(e) else null, if (round.read_after) |e| @errorName(e) else null, round.write_after_refused, round.unregistered_ms, round.preempt_ms });
+    std.debug.print("\nslow drain ({s}, {d} round(s)): victim reads EIO {d} ({d} while the barriers were outstanding, {d} after a return), victim write refused {?}, other {?s}; preempt-all {?s}; B's barrier {s}, A's barrier {s}; the admitted write {?s}; after the drain: read {?s}, write refused {}; from the preempt-all's issue: the victim gone from the report {d} ms, the preempt-all returned {d} ms\n", .{ transport.name(), rounds, round.eio_reads, round.eio_with_barriers_pending, round.late_eio, round.write_refused, if (round.other) |e| @errorName(e) else null, if (round.preempt) |e| @errorName(e) else null, @tagName(round.registered_barrier), @tagName(round.victim_barrier), if (round.admitted_write) |e| @errorName(e) else null, if (round.read_after) |e| @errorName(e) else null, round.write_after_refused, round.unregistered_ms, round.preempt_ms });
     try testing.expect(round.proves());
     try testing.expectEqual(@as(?anyerror, null), round.preempt);
     try testing.expectEqual(@as(u32, 0), round.late_eio);

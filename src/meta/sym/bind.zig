@@ -1190,6 +1190,37 @@ test "kill -9 with two regions live (the image copied mid-life): the remount rec
     try testing.expectEqual(manager.Lease.held, set.manager.lease);
 }
 
+test "failed symmetric open after collecting a Live page: a later foreign directory layout refuses the mount without leaking its census snapshot" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "census-fail", .symmetric);
+    defer v.destroy();
+    var dst_buf: [160]u8 = undefined;
+    const dst = try std.fmt.bufPrint(&dst_buf, "{s}.cut", .{v.path()});
+    defer unlinkPath(dst);
+    {
+        const be = try v.open();
+        defer be.close();
+        const r1 = try be.sym.?.joinInProcess(join.HARNESS_MOUNT_SLOT_BASE + 1);
+        try testing.expectEqual(@as(u32, 1), r1.appenderId());
+        try testing.expectEqual(page.State.live, (try be.sym.?.manager.readPageOf(1)).?.state);
+        try be.fsync();
+        try snapshotImage(v.path(), dst);
+        // Pair 1's foreign layout follows the Live page at pair 0.
+        var foreign: [page.PAGE_LEN]u8 = undefined;
+        try page.Page.free(2, 0, .{}).encode(&foreign);
+        std.mem.writeInt(u16, foreign[4..6], page.LAYOUT_VERSION + 1, .little);
+        std.mem.writeInt(u64, foreign[page.CHECKSUM_OFF..][0..8], @import("../../core/checksum.zig").hash64(foreign[0..page.CHECKSUM_OFF]), .little);
+        const off = dir.pairOffsets(.{ .start = be.sb.appender_dir.start, .len = be.sb.appender_dir.len }, 1)[0];
+        try be.pool.writeAt(dst, off, &foreign);
+        try be.pool.fdatasync(dst);
+    }
+    const before = sym.stats.appender_live_pages_at_mount.load();
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.UnsupportedFormat, v.openAt(dst, 1));
+    try testing.expectEqual(before + 1, sym.stats.appender_live_pages_at_mount.load());
+    try log.testing.expectAllFired();
+}
+
 test "the single-writer class still mounts: no appender set, no lease, a flat ring" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "flat", .single_writer);

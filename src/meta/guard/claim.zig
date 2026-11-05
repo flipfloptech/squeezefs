@@ -257,19 +257,26 @@ pub fn hostnameHash(name: []const u8) u64 {
 
 /// The pid prover: `startTicksOf(pid)` = the live process's start time in
 /// ticks since boot, null once every thread of it has exited (or no such
-/// process). Linux reads `/proc/<pid>/stat` and, for a main thread that
-/// exited first, a pidfd (`proc.startTicksOf`); tests inject a table.
+/// process), `TICKS_UNPROVEN` when the prover cannot read it. Linux reads
+/// `/proc/<pid>/stat` and, for a main thread that exited first, a pidfd
+/// (`proc.startTicksOf`); tests inject a table.
 pub const PidProbe = struct {
     ctx: ?*anyopaque,
     startTicksOf: *const fn (ctx: ?*anyopaque, pid: u32) ?u64,
 
     /// The ONE dead-holder law (module doc): absent, or another
-    /// incarnation of the pid.
+    /// incarnation of the pid — never an unproven read.
     pub fn provablyDead(self: PidProbe, pid: u32, start_ticks: u64) bool {
         const live = self.startTicksOf(self.ctx, pid) orelse return true;
-        return live != start_ticks;
+        return live != TICKS_UNPROVEN and live != start_ticks;
     }
 };
+
+/// A prover's answer for a pid the kernel refused to let it read other
+/// than "no such process" (fd exhaustion, ENOMEM, hidepid's EACCES): no
+/// proof either way, so no judgement reads it as dead. No process's start
+/// time (clock ticks since boot) reaches it.
+pub const TICKS_UNPROVEN: u64 = std.math.maxInt(u64);
 
 pub const ReclaimReason = enum { absent, own_residue, dead_pid };
 

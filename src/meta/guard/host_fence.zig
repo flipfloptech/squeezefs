@@ -468,7 +468,8 @@ pub const Registry = struct {
         _ = linux.unlink(self.entryPath(&pb, pid).ptr);
     }
 
-    /// The LIVE entries (a process whose start ticks still match; a dead
+    /// The LIVE entries (`proc.incarnationAlive`: a thread of the process
+    /// under its start ticks still runs, or its stat cannot be read; a dead
     /// one's file is removed here), this process's included. Raw
     /// `getdents64` (no `Io`: the D0 gate judges on the blocking pool).
     pub fn entries(self: *const Registry, gpa: Allocator) (RegistryError || Allocator.Error)![]Entry {
@@ -484,7 +485,7 @@ pub const Registry = struct {
             var tb: [4096]u8 = undefined;
             const text = self.readEntry(pid, &tb) orelse continue;
             const e = Entry.parse(pid, text) orelse continue;
-            if (proc.startTicksOf(pid) != e.start_ticks) {
+            if (!proc.incarnationAlive(pid, e.start_ticks)) {
                 self.remove(pid);
                 continue;
             }
@@ -716,7 +717,7 @@ fn killSibling(ctx: RuleContext, e: *const Entry) ?[]const u8 {
     const pinned = switch (proc.pin(@intCast(e.pid), e.start_ticks)) {
         .pinned => |p| p,
         .gone => return null,
-        .refused => return "cannot be opened by pidfd",
+        .refused => return "cannot be pinned (its pidfd_open or its start ticks' read refused)",
     };
     defer pinned.close();
     const fd = pinned.fd;

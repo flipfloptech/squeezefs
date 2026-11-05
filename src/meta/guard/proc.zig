@@ -75,19 +75,30 @@ pub fn readSmall(path: [*:0]const u8, buf: []u8) ?[]const u8 {
 /// `readSmall`, running `between` after the first `read(2)` (a seq_file
 /// serves one page per call).
 fn readPaged(path: [*:0]const u8, buf: []u8, between: ?*const TestSeams.Hook) ?[]const u8 {
+    return switch (readErrno(path, buf, between)) {
+        .text => |t| t,
+        .errno => null,
+    };
+}
+
+/// A read's text, or the errno of the `open(2)` or `read(2)` that failed.
+const ReadResult = union(enum) { text: []const u8, errno: linux.E };
+
+/// `readPaged` naming the errno that failed it.
+fn readErrno(path: [*:0]const u8, buf: []u8, between: ?*const TestSeams.Hook) ReadResult {
     const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return null;
+    if (linux.errno(rc) != .SUCCESS) return .{ .errno = linux.errno(rc) };
     const fd: linux.fd_t = @intCast(rc);
     defer _ = linux.close(fd);
     var total: usize = 0;
     while (total < buf.len) {
         const n = linux.read(fd, buf.ptr + total, buf.len - total);
-        if (linux.errno(n) != .SUCCESS) return null;
+        if (linux.errno(n) != .SUCCESS) return .{ .errno = linux.errno(n) };
         if (n == 0) break;
         if (total == 0) if (between) |h| h.call(h.ctx);
         total += n;
     }
-    return buf[0..total];
+    return .{ .text = buf[0..total] };
 }
 
 /// Test seams (compiled out of the product; one load when unarmed).
@@ -142,50 +153,118 @@ pub fn parseUuid(text: []const u8) ?[16]u8 {
     return out;
 }
 
-/// THE death proof (decision 0003 §DF): the start ticks of `pid` (field
-/// 22 of `/proc/<pid>/stat`, clock ticks since boot) while its THREAD
-/// GROUP lives; null once every thread of it has exited, or for no such
-/// process (or an unreadable one — nothing alive answers to the pid). A
-/// running or stopped main thread is a live group. A main thread that
-/// exited first reads `Z` while the group's other threads still run, hold
-/// its fd table and can still issue I/O, so a stat that reads `Z` or `X`
-/// is judged on a pidfd (`pin`), readable only once no thread is left
-/// (`pidfd_poll`). A zombie whose group is empty, a task its parent is
-/// reaping (`X`) and a released pid are dead: none holds an fd (`do_exit`
-/// closes a thread's files before its `exit_notify`), and a zombie's pid
-/// cannot be reused while it stands. A pidfd refused other than by ESRCH
-/// proves nothing: the process reads alive (logged), never dead.
-pub fn startTicksOf(pid: u32) ?u64 {
+/// THE death proof (decision 0003 §DF.17, §DF.19): what the kernel says
+/// of the process `pid`.
+pub const Life = union(enum) {
+    /// A thread of its THREAD GROUP runs: its start ticks (field 22 of
+    /// `/proc/<pid>/stat`, clock ticks since boot). A running or stopped
+    /// main thread is a live group; so is a main thread that exited first
+    /// (it reads `Z` while the group's other threads still run, hold its
+    /// fd table and can still issue I/O), judged on a pidfd (`pin`),
+    /// readable only once no thread is left (`pidfd_poll`).
+    alive: u64,
+    /// Every thread of it has exited — a zombie whose group is empty, a
+    /// task its parent is reaping (`X`), a released pid: none holds an fd
+    /// (`do_exit` closes a thread's files before its `exit_notify`) — or
+    /// no such process (ENOENT, ESRCH).
+    dead,
+    /// The kernel refused a read other than "no such process": the stat's
+    /// open or read (EMFILE, ENFILE under fd exhaustion; ENOMEM; EACCES
+    /// under hidepid), or the pidfd a `Z`/`X` stat is judged on. It proves
+    /// nothing, so it is never read as dead (`unproven`: logged).
+    unproven: linux.E,
+};
+
+pub fn lifeOf(pid: u32) Life {
     var buf: [1024]u8 = undefined;
-    const text = readStat(pid, &buf) orelse return null;
-    const ticks = parseStartTicks(text) orelse return null;
-    if (!statExited(text)) return ticks;
+    const text = switch (readStat(pid, &buf)) {
+        .text => |t| t,
+        .gone => return .dead,
+        .unreadable => |e| return unproven(pid, e),
+    };
+    const ticks = parseStartTicks(text) orelse return unproven(pid, .INVAL);
+    if (!statExited(text)) return .{ .alive = ticks };
     switch (pin(@intCast(pid), ticks)) {
         .pinned => |p| {
             defer p.close();
-            return if (p.exited()) null else ticks;
+            return if (p.exited()) .dead else .{ .alive = ticks };
         },
-        .gone => return null,
-        .refused => |e| {
-            log.warn("pid {d}: its main thread has exited and pidfd_open refused it ({t}) — no proof that its other threads are gone, so it reads ALIVE", .{ pid, e });
-            return ticks;
-        },
+        .gone => return .dead,
+        .refused => |e| return unproven(pid, e),
     }
 }
 
-/// The start ticks of `pid` in ANY state (`parseStartTicks`): with the pid,
-/// a process's identity for this boot. Null = no such process.
-pub fn startTicksAnyState(pid: u32) ?u64 {
-    var buf: [1024]u8 = undefined;
-    return parseStartTicks(readStat(pid, &buf) orelse return null);
+/// Is the incarnation (`pid`, `start_ticks`) alive (`lifeOf`)? Another
+/// process under a reissued pid is not it; an unproven read is.
+pub fn incarnationAlive(pid: u32, start_ticks: u64) bool {
+    return switch (lifeOf(pid)) {
+        .alive => |t| t == start_ticks,
+        .dead => false,
+        .unproven => true,
+    };
 }
 
-/// `/proc/<pid>/stat` whole (raw syscalls); null = no such process.
-fn readStat(pid: u32, buf: []u8) ?[]const u8 {
+/// The claim prover's view of `lifeOf` (`claim.PidProbe.startTicksOf`):
+/// the start ticks while the group lives, null once it is dead, and
+/// `claim.TICKS_UNPROVEN` for an unproven read, which no judgement reads
+/// as dead.
+pub fn startTicksOf(pid: u32) ?u64 {
+    return switch (lifeOf(pid)) {
+        .alive => |t| t,
+        .dead => null,
+        .unproven => claim.TICKS_UNPROVEN,
+    };
+}
+
+/// One line a second at most: a host out of fds would log every probe.
+var unproven_last_log_s: std.atomic.Value(u64) = .init(0);
+
+fn unproven(pid: u32, e: linux.E) Life {
+    const now = clock.realtimeCoarseS();
+    if (unproven_last_log_s.swap(now, .monotonic) != now) log.warn("pid {d}: the kernel refused to read its life ({t}) — no proof that it is dead, so it reads ALIVE (one line a second at most)", .{ pid, e });
+    return .{ .unproven = e };
+}
+
+/// `/proc/<pid>/stat`'s start ticks in ANY state (`parseStartTicks`): with
+/// the pid, a process's identity for this boot.
+pub const StatTicks = union(enum) {
+    ticks: u64,
+    /// No such process (ENOENT, ESRCH).
+    gone,
+    /// Any other refusal (`Life.unproven`'s), or a stat with no field 22.
+    unreadable: linux.E,
+};
+
+pub fn startTicksAnyState(pid: u32) StatTicks {
+    var buf: [1024]u8 = undefined;
+    return switch (readStat(pid, &buf)) {
+        .text => |t| if (parseStartTicks(t)) |ticks| .{ .ticks = ticks } else .{ .unreadable = .INVAL },
+        .gone => .gone,
+        .unreadable => |e| .{ .unreadable = e },
+    };
+}
+
+/// `/proc/<pid>/stat` whole (raw syscalls): ENOENT (the pid's directory is
+/// gone) and ESRCH (its task exited between the open and the read) are no
+/// such process; every other errno is unreadable, never gone.
+fn readStat(pid: u32, buf: []u8) union(enum) { text: []const u8, gone, unreadable: linux.E } {
     var pb: [64]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/stat", .{pid}, 0) catch return null;
-    if (builtin.is_test) if (test_seams.stat_fault.load(.acquire)) |f| if (f.pid == pid) return null;
-    return readSmall(path.ptr, buf);
+    const path = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/stat", .{pid}, 0) catch unreachable; // "/proc/" + a u32 + "/stat" fits 64
+    const fault: ?linux.E = if (builtin.is_test) faulted(pid) else null;
+    const got: ReadResult = if (fault) |e| .{ .errno = e } else readErrno(path.ptr, buf, null);
+    return switch (got) {
+        .text => |t| .{ .text = t },
+        .errno => |e| switch (e) {
+            .NOENT, .SRCH => .gone,
+            else => .{ .unreadable = e },
+        },
+    };
+}
+
+/// The seam's errno for `pid`'s stat open (`TestSeams.stat_fault`).
+fn faulted(pid: u32) ?linux.E {
+    const f = test_seams.stat_fault.load(.acquire) orelse return null;
+    return if (f.pid == pid) f.errno else null;
 }
 
 /// Field 22 of a `/proc/<pid>/stat` line (start time), in any state. The
@@ -239,10 +318,11 @@ pub const PinOutcome = union(enum) {
     /// Gone already (ESRCH), or the pid now names another process (its
     /// start ticks differ from the ones read before).
     gone,
-    /// `pidfd_open` refused with this errno: EINVAL and ENOSYS cannot
-    /// happen on the kernel floor (≥ 7.3; pidfd_open is 5.3's), ENOENT is a
-    /// thread's id (no process's), EMFILE/ENFILE/ENOMEM/ENODEV a resource.
-    /// Never read as dead.
+    /// `pidfd_open` refused with this errno — EINVAL and ENOSYS cannot
+    /// happen on the kernel floor (≥ 7.3; pidfd_open is 5.3's), ENOENT is
+    /// a thread's id (no process's), EMFILE/ENFILE/ENOMEM/ENODEV a
+    /// resource — or the start ticks' re-read did (`StatTicks.unreadable`:
+    /// the open can take the last free fd). Never read as dead.
     refused: linux.E,
 };
 
@@ -258,11 +338,16 @@ pub fn pin(pid: linux.pid_t, start_ticks: u64) PinOutcome {
         else => |e| return .{ .refused = e },
     }
     const p: Pinned = .{ .fd = @intCast(rc) };
-    if (startTicksAnyState(@intCast(pid)) != start_ticks) {
-        p.close();
-        return .gone;
+    switch (startTicksAnyState(@intCast(pid))) {
+        .ticks => |t| if (t == start_ticks) return .{ .pinned = p },
+        .gone => {},
+        .unreadable => |e| {
+            p.close();
+            return .{ .refused = e };
+        },
     }
-    return .{ .pinned = p };
+    p.close();
+    return .gone;
 }
 
 fn startTicksFn(_: ?*anyopaque, pid: u32) ?u64 {
@@ -275,29 +360,48 @@ pub const probe: claim.PidProbe = .{ .ctx = null, .startTicksOf = startTicksFn }
 /// The live process of this host whose incarnation is `writer_id` at
 /// `slot` — `claim.Identity.writerId` over `local`'s boot id and hostname
 /// and each process's pid and start ticks (a process whose every thread
-/// has exited answers none, `startTicksOf`). One `/proc` walk; null = none alive (or `/proc`
-/// unreadable: no proof).
+/// has exited answers none, `lifeOf`). One `/proc` walk; null = none alive
+/// (or `/proc` unreadable: no proof). The walk names only a pid it can
+/// read: one whose stat is refused (hidepid's EACCES on another user's
+/// process) is skipped, and a wrong "none" costs no safety — the joined
+/// census then finds the page crashed, and the manager's join replays only
+/// the whole identity's page (decision 0003 §DA.3), never a live one.
 pub fn liveWriterPid(io: Io, local: claim.Identity, slot: u16, writer_id: u64) ?linux.pid_t {
     var proc_dir = Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return null;
     defer proc_dir.close(io);
     var it = proc_dir.iterate();
     while (it.next(io) catch null) |ent| {
         const pid = std.fmt.parseInt(u32, ent.name, 10) catch continue; // a pid directory, decimal
-        if (isWriterIncarnation(local, pid, slot, writer_id)) return @intCast(pid);
+        if (matchIncarnation(local, pid, slot, writer_id) == .yes) return @intCast(pid);
     }
     return null;
 }
 
-/// The proof for ONE pid: the live process `pid` of this host (a thread of
-/// its group still runs, `startTicksOf`) IS the incarnation `writer_id` at
-/// `slot` — its start ticks and this host's boot id and hostname recompute
-/// the writer id. The id is matched first, so the walk judges the life of
-/// that pid alone. `liveWriterPid` runs it over every pid; a registry that
-/// names the pid runs it alone (`host_fence.zig`).
+/// The proof for ONE pid a registry names (`host_fence.zig`): the live
+/// process `pid` of this host (a thread of its group still runs,
+/// `lifeOf`) IS the incarnation `writer_id` at `slot` — its start ticks
+/// and this host's boot id and hostname recompute the writer id. A pid
+/// whose stat the kernel refuses to read cannot be ruled out: true, so the
+/// rule kills it or refuses, never prunes it as dead.
 pub fn isWriterIncarnation(local: claim.Identity, pid: u32, slot: u16, writer_id: u64) bool {
-    const ticks = startTicksAnyState(pid) orelse return false;
+    return matchIncarnation(local, pid, slot, writer_id) != .no;
+}
+
+/// The writer id is matched first, so a walk judges the life of that pid
+/// alone (its pidfd, for a `Z`/`X` stat).
+fn matchIncarnation(local: claim.Identity, pid: u32, slot: u16, writer_id: u64) enum { yes, no, unproven } {
+    const ticks = switch (startTicksAnyState(pid)) {
+        .ticks => |t| t,
+        .gone => return .no,
+        .unreadable => return .unproven,
+    };
     const candidate: claim.Identity = .{ .boot_id = local.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
-    return candidate.writerId(slot) == writer_id and startTicksOf(pid) == ticks;
+    if (candidate.writerId(slot) != writer_id) return .no;
+    return switch (lifeOf(pid)) {
+        .alive => |t| if (t == ticks) .yes else .no,
+        .dead => .no,
+        .unproven => .unproven,
+    };
 }
 
 /// This process's identity: boot id, pid, its own start ticks (0 when
@@ -309,7 +413,10 @@ pub fn localIdentity() claim.Identity {
     return .{
         .boot_id = bootId(),
         .pid = @intCast(linux.getpid()),
-        .start_ticks = startTicksOf(@intCast(linux.getpid())) orelse 0,
+        .start_ticks = switch (startTicksAnyState(@intCast(linux.getpid()))) {
+            .ticks => |t| t,
+            .gone, .unreadable => 0,
+        },
         .hostname_hash = claim.hostnameHash(host),
     };
 }
@@ -513,10 +620,15 @@ pub fn judgeExiting(io: Io, pid: linux.pid_t, squeezefs: bool) ?Exiting {
 }
 
 /// Has the main thread of `pid` exited (no such process, or its stat reads
-/// `Z`/`X`)? The other threads of its group may still run.
+/// `Z`/`X`)? The other threads of its group may still run. An unreadable
+/// stat proves nothing: not exited.
 fn mainThreadExited(pid: u32) bool {
     var buf: [1024]u8 = undefined;
-    return statExited(readStat(pid, &buf) orelse return true);
+    return switch (readStat(pid, &buf)) {
+        .text => |t| statExited(t),
+        .gone => true,
+        .unreadable => false,
+    };
 }
 
 /// Is a FUSE mount attached at exactly `mountpoint` (the mount table, as
@@ -1061,7 +1173,7 @@ test "a ZOMBIE holder whose every thread is gone is dead: a daemon that exited u
         if (close + 2 < text.len and text[close + 2] == 'Z') break;
         try testing.io.sleep(.fromMilliseconds(1), .awake);
     }
-    try testing.expect(startTicksAnyState(pid) != null);
+    try testing.expect(startTicksAnyState(pid) == .ticks);
     try testing.expect(startTicksOf(pid) == null);
     try testing.expect(probe.provablyDead(pid, 1));
 }

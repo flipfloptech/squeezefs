@@ -210,8 +210,9 @@ pub const Signalled = union(enum) {
     /// build cannot be proven, so no SIGUSR2 — and nothing detached from
     /// under a live daemon (the orderly stop is the way out).
     build_unknown: linux.pid_t,
-    /// No pidfd could be opened on the daemon (`proc.pin`'s refusal): its
-    /// thread group's exit cannot be awaited, so it was not signalled.
+    /// The daemon could not be pinned — `pidfd_open` or a read of its
+    /// start ticks refused (the errno; `proc.pin`): its thread group's exit
+    /// cannot be awaited, so it was not signalled.
     unpinned: struct { pid: linux.pid_t, errno: linux.E },
     fallback: Fallback,
 };
@@ -228,6 +229,10 @@ pub const Located = union(enum) {
     stats: struct { daemon: Daemon, text: []u8 },
     /// No document; the daemon by its process (`daemonByProcess`).
     process: Daemon,
+    /// A daemon whose start ticks the kernel refused to read other than
+    /// "no such process" (`proc.StatTicks.unreadable`): never taken for
+    /// gone (which would detach from under it), never signalled unpinned.
+    unreadable: struct { pid: linux.pid_t, errno: linux.E },
     fallback: Fallback,
 };
 
@@ -239,16 +244,23 @@ pub fn locateDaemon(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8) Loca
             gpa.free(text);
             return .{ .fallback = .no_pid };
         };
-        const ticks = proc.startTicksAnyState(@intCast(pid)) orelse {
-            gpa.free(text);
-            return .{ .fallback = .daemon_gone };
-        };
-        return .{ .stats = .{ .daemon = .{ .pid = pid, .start_ticks = ticks }, .text = text } };
+        switch (proc.startTicksAnyState(@intCast(pid))) {
+            .ticks => |t| return .{ .stats = .{ .daemon = .{ .pid = pid, .start_ticks = t }, .text = text } },
+            .gone => {
+                gpa.free(text);
+                return .{ .fallback = .daemon_gone };
+            },
+            .unreadable => |e| {
+                gpa.free(text);
+                return .{ .unreadable = .{ .pid = pid, .errno = e } };
+            },
+        }
     }
-    if (daemonByProcess(io, mountpoint)) |pid| {
-        const ticks = proc.startTicksAnyState(@intCast(pid)) orelse return .{ .fallback = .daemon_gone };
-        return .{ .process = .{ .pid = pid, .start_ticks = ticks } };
-    }
+    if (daemonByProcess(io, mountpoint)) |pid| return switch (proc.startTicksAnyState(@intCast(pid))) {
+        .ticks => |t| .{ .process = .{ .pid = pid, .start_ticks = t } },
+        .gone => .{ .fallback = .daemon_gone },
+        .unreadable => |e| .{ .unreadable = .{ .pid = pid, .errno = e } },
+    };
     return .{ .fallback = .stats_unreadable };
 }
 
@@ -480,6 +492,7 @@ pub fn signalLocated(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, laz
     var refusals_before: ?u64 = null;
     const daemon: Daemon = switch (located) {
         .fallback => |why| return .{ .fallback = why },
+        .unreadable => |u| return .{ .unpinned = .{ .pid = u.pid, .errno = u.errno } },
         .process => |d| if (lazy) return .{ .build_unknown = d.pid } else d,
         .stats => |s| blk: {
             defer gpa.free(s.text);
@@ -648,7 +661,7 @@ pub fn run(p: cli.Process, u: args.Umount) u8 {
             return cli.exit_failed;
         },
         .unpinned => |d| {
-            p.stderr.print("squeezefs umount: daemon {d} at {s}: pidfd_open refused it ({t}, {s}) — the exit of its every thread cannot be awaited, so it was NOT signalled and nothing is unmounted\n", .{ d.pid, path, d.errno, @errorName(errors.fromErrno(d.errno)) }) catch {};
+            p.stderr.print("squeezefs umount: daemon {d} at {s} cannot be pinned: pidfd_open or the read of its start ticks refused ({t}, {s}) — the exit of its every thread cannot be awaited, so it was NOT signalled and nothing is unmounted\n", .{ d.pid, path, d.errno, @errorName(errors.fromErrno(d.errno)) }) catch {};
             return cli.exit_failed;
         },
         .fallback => |why| {
@@ -839,7 +852,7 @@ test "a mount serving no .stats under a LIVE daemon (a FAILED volume's EIO; a co
     try testing.expect(watched.target == null);
     try testing.expectEqual(daemon, daemonByProcess(io, dir));
     try testing.expectEqual(@as(?linux.pid_t, null), daemonByProcess(io, "/build/tmp/no-process-mounts-this"));
-    try testing.expectEqual(Located{ .process = .{ .pid = daemon.?, .start_ticks = proc.startTicksAnyState(@intCast(daemon.?)).? } }, locateDaemon(gpa, io, dir));
+    try testing.expectEqual(Located{ .process = .{ .pid = daemon.?, .start_ticks = proc.startTicksAnyState(@intCast(daemon.?)).ticks } }, locateDaemon(gpa, io, dir));
     try testing.expectEqual(Signalled{ .fallback = .stats_unreadable }, signalDaemon(gpa, io, "/build/tmp/no-process-mounts-this", false, "", &watched));
     // --lazy: no document, no proof of the build, no SIGUSR2 — the daemon lives on.
     try testing.expectEqual(Signalled{ .build_unknown = daemon.? }, signalDaemon(gpa, io, dir, true, "", &watched));
@@ -870,7 +883,7 @@ test "the located identity and the pin (`proc.pin`, the guard's): the start tick
     const io = testing.io;
     const gpa = testing.allocator;
     const me = linux.getpid();
-    const ticks = proc.startTicksAnyState(@intCast(me)).?;
+    const ticks = proc.startTicksAnyState(@intCast(me)).ticks;
     switch (proc.pin(me, ticks)) {
         .pinned => |p| {
             defer p.close();
@@ -911,7 +924,7 @@ test "the located identity and the pin (`proc.pin`, the guard's): the start tick
     }
     var tid: linux.pid_t = 0;
     try testing.expectEqual(@as(usize, @sizeOf(linux.pid_t)), linux.read(tp[0], @ptrCast(&tid), @sizeOf(linux.pid_t)));
-    const thread: Daemon = .{ .pid = tid, .start_ticks = proc.startTicksAnyState(@intCast(tid)).? };
+    const thread: Daemon = .{ .pid = tid, .start_ticks = proc.startTicksAnyState(@intCast(tid)).ticks };
     try testing.expectEqual(proc.PinOutcome{ .refused = .NOENT }, proc.pin(thread.pid, thread.start_ticks));
     var watched = Watched.init(gpa, io, "/build/tmp/no-mount-here");
     defer watched.deinit();

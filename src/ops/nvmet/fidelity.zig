@@ -1392,11 +1392,16 @@ const KmsgWatch = struct {
 
     const markers = [_][]const u8{ "BUG:", "Oops", "WARNING:", "KASAN", "KFENCE", "general protection fault", "list_del corruption", "refcount_t:" };
 
-    fn start() KmsgWatch {
-        const rc = linux.open("/dev/kmsg", .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
-        if (linux.errno(rc) != .SUCCESS) return .{ .fd = null };
+    fn start() !KmsgWatch {
+        return startAt("/dev/kmsg");
+    }
+
+    fn startAt(path: [:0]const u8) !KmsgWatch {
+        const rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.KernelLogUnavailable;
         const fd: linux.fd_t = @intCast(rc);
-        _ = linux.lseek(fd, 0, linux.SEEK.END);
+        errdefer _ = linux.close(fd);
+        if (linux.errno(linux.lseek(fd, 0, linux.SEEK.END)) != .SUCCESS) return error.KernelLogSeekFailed;
         return .{ .fd = fd };
     }
 
@@ -1408,7 +1413,7 @@ const KmsgWatch = struct {
     /// Every record since `start` when one carries a splat marker and one
     /// names nvmet or a per-cpu ref; empty otherwise.
     fn splat(self: *KmsgWatch, gpa: Allocator) ![]u8 {
-        const fd = self.fd orelse return gpa.alloc(u8, 0);
+        const fd = self.fd orelse return error.KernelLogUnavailable;
         defer self.deinit();
         var all: Io.Writer.Allocating = .init(gpa);
         defer all.deinit();
@@ -1416,9 +1421,14 @@ const KmsgWatch = struct {
         while (true) {
             const n = linux.read(fd, &rec, rec.len);
             switch (linux.errno(n)) {
-                .SUCCESS => try all.writer.writeAll(rec[0..n]),
-                .PIPE => continue,
-                else => break,
+                .SUCCESS => {
+                    if (n == 0) return error.KernelLogReadFailed;
+                    try all.writer.writeAll(rec[0..n]);
+                },
+                .AGAIN => break,
+                .INTR => continue,
+                .PIPE => return error.KernelLogOverrun,
+                else => return error.KernelLogReadFailed,
             }
         }
         const text = all.written();
@@ -1447,6 +1457,19 @@ test "PR-2 C7: a real kernel-log read error is not the EAGAIN end of the current
     } else |e| try testing.expectEqual(@as(anyerror, error.KernelLogReadFailed), e);
 }
 
+test "PR-2 C7: kernel-log open failure is explicit and EAGAIN is a successfully observed empty stream" {
+    try testing.expectError(error.KernelLogUnavailable, KmsgWatch.startAt("/proc/self/sqz-no-kmsg"));
+    var fds: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(fds[1]);
+    var watch: KmsgWatch = .{ .fd = fds[0] };
+    defer watch.deinit();
+    const text = try watch.splat(testing.allocator);
+    defer testing.allocator.free(text);
+    try testing.expectEqual(@as(usize, 0), text.len);
+    try testing.expect(watch.fd == null);
+}
+
 const TeardownVariant = enum {
     /// The victim host deletes its controller mid-drain (`nvme disconnect`).
     disconnect,
@@ -1465,7 +1488,7 @@ fn teardownLeg(transport: configfs.Trtype, variant: TeardownVariant) !void {
     var sp = try SlowPair.open(rig, transport, if (transport == .tcp) "t" else "l");
     defer sp.close(rig);
     const p = &sp.pair;
-    var kmsg = KmsgWatch.start();
+    var kmsg = try KmsgWatch.start();
     defer kmsg.deinit();
     var w = try sp.arm();
     defer w.deinit();

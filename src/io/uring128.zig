@@ -138,6 +138,13 @@ pub const Ring128 = struct {
     features: u32,
     sq: Sq,
     cq: Cq,
+    /// Test-only syscall replacement: preserves native SQ/CQ ownership.
+    test_enter: if (builtin.is_test) ?TestEnter else void = if (builtin.is_test) null else {},
+
+    pub const TestEnter = struct {
+        ctx: *anyopaque,
+        call: *const fn (*anyopaque, *Ring128, u32, u32, u32, usize, usize) usize,
+    };
 
     pub const Sq = struct {
         head: *u32,
@@ -333,7 +340,10 @@ pub const Ring128 = struct {
         // `sq.flags` when it went to sleep.
         if (self.flags & linux.IORING_SETUP_SQPOLL != 0 and self.sqFlags() & linux.IORING_SQ_NEED_WAKEUP != 0) enter_flags |= linux.IORING_ENTER_SQ_WAKEUP;
         // The kernel reads `arg` and its timespec during this call only.
-        const rc = linux.syscall6(.io_uring_enter, @as(usize, @intCast(self.fd)), to_submit, min_complete, enter_flags, argp, argsz);
+        const rc = if (builtin.is_test and self.test_enter != null)
+            self.test_enter.?.call(self.test_enter.?.ctx, self, to_submit, min_complete, enter_flags, argp, argsz)
+        else
+            linux.syscall6(.io_uring_enter, @as(usize, @intCast(self.fd)), to_submit, min_complete, enter_flags, argp, argsz);
         return switch (linux.errno(rc)) {
             .SUCCESS => .{ .submitted = @intCast(rc), .timed_out = false },
             .TIME => .{ .submitted = 0, .timed_out = true },
@@ -838,6 +848,64 @@ fn reap(ring: *Ring128, out: []Cqe32) !void {
         const k = try ring.copyCqes(out[got..], 1);
         got += k;
     }
+}
+
+const InterruptedEnter = struct {
+    fired: bool = false,
+    submit_first: bool,
+    eventfd: ?linux.fd_t = null,
+    retried_submit: ?u32 = null,
+
+    fn call(ctx: *anyopaque, ring: *Ring128, submit_n: u32, wait_n: u32, flags: u32, argp: usize, argsz: usize) usize {
+        const self: *InterruptedEnter = @ptrCast(@alignCast(ctx));
+        if (!self.fired) {
+            self.fired = true;
+            if (self.submit_first) _ = linux.syscall6(.io_uring_enter, @intCast(ring.fd), submit_n, 0, 0, 0, 0);
+            if (self.eventfd) |fd| writeEventfd(fd);
+            return @bitCast(-@as(isize, @backingInt(linux.E.INTR)));
+        }
+        self.retried_submit = submit_n;
+        return linux.syscall6(.io_uring_enter, @intCast(ring.fd), submit_n, wait_n, flags, argp, argsz);
+    }
+};
+
+test "PR-2 C1: an interrupted native submit/wait resumes without resubmitting consumed SQEs" {
+    for ([_]bool{ false, true }) |submit_first| {
+        var ring = try Ring128.init(8, 0);
+        defer ring.deinit();
+        var seam: InterruptedEnter = .{ .submit_first = submit_first };
+        ring.test_enter = .{ .ctx = &seam, .call = InterruptedEnter.call };
+        const sqe = ring.getSqe().?;
+        prepNop(sqe);
+        sqe.user_data = 81;
+        try testing.expectEqual(@as(u32, 1), try ring.submitAndWait(1));
+        try testing.expectEqual(@as(?u32, if (submit_first) 0 else 1), seam.retried_submit);
+        var cqes: [1]Cqe32 = undefined;
+        try reap(&ring, &cqes);
+        try testing.expectEqual(@as(u64, 81), cqes[0].user_data);
+        try testing.expectEqual(@as(u32, 0), ring.cqReady());
+    }
+}
+
+test "PR-2 C1: an interrupted zero-submit CQ wait retains a native eventfd read until its own completion" {
+    var ring = try Ring128.init(8, 0);
+    defer ring.deinit();
+    const fd = try newEventfd();
+    defer _ = linux.close(fd);
+    var value: u64 = 0;
+    const sqe = ring.getSqe().?;
+    prepRead(sqe, .{ .raw = fd }, std.mem.asBytes(&value), 0);
+    sqe.user_data = 82;
+    _ = try ring.submit();
+    var seam: InterruptedEnter = .{ .submit_first = false, .eventfd = fd };
+    ring.test_enter = .{ .ctx = &seam, .call = InterruptedEnter.call };
+    var cqes: [1]Cqe32 = undefined;
+    try testing.expectEqual(@as(u32, 1), try ring.copyCqes(&cqes, 1));
+    try testing.expectEqual(@as(?u32, 0), seam.retried_submit);
+    try testing.expectEqual(@as(u64, 82), cqes[0].user_data);
+    try testing.expectEqual(@as(i32, 8), cqes[0].res);
+    try testing.expectEqual(@as(u64, 1), value);
+    try testing.expectEqual(@as(u32, 0), ring.cqReady());
 }
 
 test "setup with SQE128|CQE32 succeeds; the CQ is twice the SQ; getSqe hands out 128 B-strided slots and a byte written in the cmd area lands at index × 128 + 48 in the raw mmap" {

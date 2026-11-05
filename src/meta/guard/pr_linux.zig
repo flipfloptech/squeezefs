@@ -395,6 +395,56 @@ test "the char twin and the controller node derive by name; a regular file resol
     std.debug.print("report: rtype {d}, regctl {d}, ptpls {d}\n", .{ rep.rtype, rep.regctl, rep.ptpls });
 }
 
+const InterruptedIssue = struct {
+    dev: *Device,
+    interrupted: bool = false,
+    lock_retained: bool = false,
+    cqe_errno: ?linux.E = null,
+
+    fn enter(ctx: *anyopaque, ring: *uring128.Ring128, submit_n: u32, wait_n: u32, flags: u32, argp: usize, argsz: usize) usize {
+        const self: *InterruptedIssue = @ptrCast(@alignCast(ctx));
+        if (submit_n != 0) {
+            const sqe = &ring.sq.sqes[ring.sq.head.* & ring.sq.mask];
+            const ud = sqe.user_data;
+            uring128.prepNop(sqe);
+            sqe.user_data = ud;
+        }
+        if (!self.interrupted) {
+            self.interrupted = true;
+            self.lock_retained = self.dev.issue_lock.word.load(.acquire) != 0;
+            _ = linux.syscall6(.io_uring_enter, @intCast(ring.fd), submit_n, 0, 0, 0, 0);
+            return @bitCast(-@as(isize, @backingInt(linux.E.INTR)));
+        }
+        const rc = linux.syscall6(.io_uring_enter, @intCast(ring.fd), submit_n, wait_n, flags, argp, argsz);
+        if (linux.errno(rc) == .SUCCESS and ring.cqReady() != 0) if (self.cqe_errno) |e| {
+            ring.cq.cqes[ring.cq.head.* & ring.cq.mask].res = -@as(i32, @backingInt(e));
+        };
+        return rc;
+    }
+};
+
+test "PR-2 C1: native PR issue keeps its lock through interrupted wait, reaps its own CQE, and distinguishes completed EINTR" {
+    const gpa = testing.allocator;
+    const dev = blk: {
+        const d = try gpa.create(Device);
+        errdefer gpa.destroy(d);
+        d.* = .{ .gpa = gpa, .fd = -1, .ctrl_fd = -1, .ring = try uring128.Ring128.init(ring_entries, 0), .nsid = 1, .node = undefined, .node_len = 0 };
+        break :blk d;
+    };
+    defer dev.deinit();
+    var seam: InterruptedIssue = .{ .dev = dev };
+    dev.ring.test_enter = .{ .ctx = &seam, .call = InterruptedIssue.enter };
+    var cmd = nvme.UringCmd.zeroed();
+    const answer = try dev.face().issue(dev, .io, &cmd);
+    try testing.expectEqual(nvme.STATUS_SUCCESS, answer.status);
+    try testing.expect(seam.lock_retained);
+    try testing.expectEqual(@as(u32, 0), dev.ring.cqReady());
+    seam.cqe_errno = .INTR;
+    try testing.expectError(error.Interrupted, dev.face().issue(dev, .io, &cmd));
+    try testing.expectEqual(@as(u32, 0), dev.ring.cqReady());
+    try testing.expectEqual(@as(u32, 0), dev.issue_lock.word.load(.acquire));
+}
+
 /// Two issuers on one Device (review M2 of decision 0003 §DG): A parks
 /// after its submit until B is done — or, B shut out, for a bound.
 const IssueRace = struct {

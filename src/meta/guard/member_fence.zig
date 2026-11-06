@@ -12,7 +12,8 @@
 //! (DO.33); a fresh registration whose page is no longer Live is withdrawn.
 //! A completion hook captures the resolution generation before it classifies.
 //! A held journal write or barrier waits on that generation and is re-issued
-//! once a later `clear` advances it. A dismount waits for a pending
+//! once a later `clear` advances it. A `.retry` answer spends one credit
+//! and the lane re-issues the write or barrier once. A dismount waits for a pending
 //! succession (KD20) and stores `terminal` at the park deadline; lane
 //! shutdown stores `terminal` so a waiter cannot hang.
 
@@ -160,6 +161,7 @@ pub const Readmit = struct {
         if (self.obs.manages) return .{ .verdict = .latch, .gen = gen };
         if (!self.obs.own_page_live) return .{ .verdict = .latch, .gen = gen };
         const verdict = classify(self.obs).verdict;
+        if (verdict == .retry) self.obs.retry_credits -|= 1;
         if (verdict == .held) if (self.on_held) |f| f(self.on_held_ctx);
         return .{ .verdict = verdict, .gen = gen };
     }
@@ -694,6 +696,15 @@ test "member fence: a joiner's undecided conflict is held and notifies the park 
     try testing.expectEqual(@as(u32, 1), n);
     r.obs.manages = false;
     try testing.expectEqual(Verdict.retry, r.answer(.read, .eio).verdict);
+}
+
+test "member fence: a retry answer spends one credit so a second refusal latches" {
+    var r = Readmit.joiner();
+    r.obs.host_registered = true;
+    r.obs.rtype = 3;
+    try testing.expectEqual(Verdict.retry, r.answer(.write, .conflict).verdict);
+    try testing.expectEqual(@as(u32, 0), r.obs.retry_credits);
+    try testing.expectEqual(Verdict.latch, r.answer(.write, .conflict).verdict);
 }
 
 test "member fence: a collapsed write keeps Held and maps every other class to Io" {

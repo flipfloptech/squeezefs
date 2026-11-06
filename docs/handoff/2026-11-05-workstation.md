@@ -253,6 +253,8 @@ patched module or upstream message was sent or run.
    classifies. A held journal-lane write or barrier waits on that
    generation (`awaitPast`) and is re-issued once a later `clear`
    advances it; a terminal word returns `error.Held` without fencing.
+   A `.retry` answer spends one credit and the lane re-issues the write
+   or barrier once; a second refusal with no credit left latches.
    A hook without a word still returns `error.Held` immediately.
    KD20: a joined dismount waits for a pending succession (only while
    the park is up) up to `T_park_max`, then stores `terminal`; lane

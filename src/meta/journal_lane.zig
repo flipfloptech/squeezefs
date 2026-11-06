@@ -467,6 +467,7 @@ pub const Hooks = struct {
     /// Decision 0004 §4.5. Consulted at a write or barrier refusal, before
     /// the fence rung and the failure count. Null keeps today's path.
     /// A `.held` write waits on `word` and is re-issued once it clears.
+    /// A `.retry` write or barrier is re-issued once (the hook spends a credit).
     readmit: ?journal_guard.member_fence.Hook = null,
     /// The member-fence resolution word a held write waits on. Null: a
     /// `.held` answer returns `error.Held` without waiting (today's tests).
@@ -1635,6 +1636,22 @@ pub const JournalLane = struct {
                         continue;
                     }
                 }
+                if (answer.verdict == .retry) {
+                    self.reissueHeldWindow(w.group.items[k]);
+                    if (!c.landed) {
+                        w.held_retry_idx = w.group.items[k];
+                        w.phase = .held_retry;
+                        return;
+                    }
+                    if (c.first_err) |_| {} else {
+                        self.latch.noteSuccess(.journal_write);
+                        self.ring_stats.noteWritten(c.acct, c.entries);
+                        if (c.apply_holes) hole_end = @max(hole_end orelse 0, c.window.paddedEnd());
+                        any_ok = true;
+                        c.verdict = {};
+                        continue;
+                    }
+                }
                 const fail = c.first_err.?;
                 stats.write_failures.inc();
                 if (self.latch.admitsLine(.window_write)) log.warn("journal lane {d}: window [{d}, {d}) write failed: {s} — rolling back {d} entries", .{ self.index, c.window.start, c.window.end(), @errorName(fail), c.entries });
@@ -1905,6 +1922,14 @@ pub const JournalLane = struct {
     fn barrierDone(self: *JournalLane, result_in: Error!void, now: u64) void {
         const result: Error!void = if (result_in) |_| result_in else |e| blk: {
             const answer = journal_guard.member_fence.afterError(self.hooks.readmit, self.hooks.ctx, e, .write);
+            if (answer.verdict == .retry) {
+                const kind = self.w.barrier_in_flight.?;
+                self.w.barrier_in_flight = null;
+                self.w.barrier_landed = false;
+                self.startBarrier(kind);
+                if (self.w.barrier_in_flight != null) return;
+                return;
+            }
             if (answer.verdict != .held) break :blk result_in;
             const word = self.hooks.word orelse break :blk error.Held;
             switch (word.awaitPast(answer.gen)) {
@@ -2914,6 +2939,78 @@ test "member fence: a held window write is re-issued once the word clears" {
     try testing.expectEqual(journal.FailureLatch.Verdict.healthy, lane.latch.verdict());
     try testing.expectEqual(@as(u32, 0), lane.latch.journal_failures.load(.acquire));
     try testing.expectEqual(@as(usize, 0), rl.calls.items.len);
+    lane.shutdown();
+}
+
+test "member fence: a retry answer is re-issued once" {
+    const h = try Harness.init(testing.allocator, "retry-resume");
+    defer h.deinit();
+    var rl: RollbackLog = .{ .gpa = testing.allocator };
+    defer rl.deinit();
+    var readmit = journal_guard.member_fence.Readmit.joiner();
+    readmit.obs.host_registered = true;
+    readmit.obs.rtype = 3;
+    var hooks = rl.hooks();
+    hooks.readmit = journal_guard.member_fence.Readmit.hook;
+    hooks.ctx = &readmit;
+    try h.spawnLane(hooks, "600000", 0);
+    const lane = h.lane.?;
+    const fenced0 = journal_guard.stats.fenced.load();
+    test_seams.fail_errno.store(@backingInt(linux.E.BADE), .release);
+    defer test_seams.fail_errno.store(0, .release);
+    test_seams.fail_windows.store(1, .release);
+    const a = try h.append(1, page_entry, 0xA1);
+    try a.ticket.wait().result;
+    try testing.expectEqual(fenced0, journal_guard.stats.fenced.load());
+    try testing.expectEqual(journal.FailureLatch.Verdict.healthy, lane.latch.verdict());
+    try testing.expectEqual(@as(u32, 0), lane.latch.journal_failures.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), rl.calls.items.len);
+    try testing.expectEqual(@as(u32, 0), readmit.obs.retry_credits);
+    lane.shutdown();
+}
+
+test "member fence: a retry without remaining credits latches" {
+    const h = try Harness.init(testing.allocator, "retry-exhausted");
+    defer h.deinit();
+    var readmit = journal_guard.member_fence.Readmit.joiner();
+    readmit.obs.host_registered = true;
+    readmit.obs.rtype = 3;
+    const hooks: Hooks = .{ .ctx = &readmit, .readmit = journal_guard.member_fence.Readmit.hook };
+    try h.spawnLane(hooks, "600000", 1);
+    const lane = h.lane.?;
+    const fenced0 = journal_guard.stats.fenced.load();
+    test_seams.fail_errno.store(@backingInt(linux.E.BADE), .release);
+    defer test_seams.fail_errno.store(0, .release);
+    test_seams.fail_windows.store(2, .release);
+    const a = try h.append(1, page_entry, 0xA1);
+    try testing.expectError(error.ReservationConflict, a.ticket.wait().result);
+    try testing.expectEqual(fenced0 + 1, journal_guard.stats.fenced.load());
+    try testing.expectEqual(journal.FailureLatch.Verdict.fenced, lane.latch.verdict());
+    lane.shutdown();
+}
+
+test "member fence: a retry barrier is re-issued once" {
+    const h = try Harness.init(testing.allocator, "retry-barrier");
+    defer h.deinit();
+    var rl: RollbackLog = .{ .gpa = testing.allocator };
+    defer rl.deinit();
+    var readmit = journal_guard.member_fence.Readmit.joiner();
+    readmit.obs.host_registered = true;
+    readmit.obs.rtype = 3;
+    var hooks = rl.hooks();
+    hooks.readmit = journal_guard.member_fence.Readmit.hook;
+    hooks.ctx = &readmit;
+    try h.spawnLane(hooks, "0", 0);
+    const lane = h.lane.?;
+    const fenced0 = journal_guard.stats.fenced.load();
+    test_seams.fail_errno.store(@backingInt(linux.E.BADE), .release);
+    defer test_seams.fail_errno.store(0, .release);
+    test_seams.fail_barriers.store(1, .release);
+    const a = try h.append(1, page_entry, 0xA1);
+    try a.ticket.wait().result;
+    try testing.expectEqual(fenced0, journal_guard.stats.fenced.load());
+    try testing.expectEqual(journal.FailureLatch.Verdict.healthy, lane.latch.verdict());
+    try testing.expectEqual(@as(u32, 0), lane.latch.barrier_failures.load(.acquire));
     lane.shutdown();
 }
 

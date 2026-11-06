@@ -1490,7 +1490,25 @@ pub const Node = struct {
             n.fabric.registerBody(.defrag_meta, n.meta_body.body());
         }
         n.admin_ = .{ .node = n, .world_ = n.world_, .arm = in.data_arm, .fence_waive = in.fence_waive };
-        n.admin_svc = .{ .io = io, .fabric = &n.fabric, .world = n.admin_.world() };
+        n.admin_svc = .{
+            .io = io,
+            .fabric = &n.fabric,
+            .world = n.admin_.world(),
+            .force_dismount = if (in.meta_set) |s| .{ .ctx = s, .run = &terminatePendingWords } else null,
+        };
+        return n;
+    }
+
+    /// KD20: store `terminal` on every pending joined resolution word.
+    fn terminatePendingWords(ctx: *anyopaque) u32 {
+        const set: *meta_set.MetaSet = @ptrCast(@alignCast(ctx));
+        var n: u32 = 0;
+        for (set.volumes) |be| {
+            const js = be.joined orelse continue;
+            if (js.resolution.snapshot().state != .pending) continue;
+            js.resolution.terminate();
+            n += 1;
+        }
         return n;
     }
 

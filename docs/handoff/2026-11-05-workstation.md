@@ -256,8 +256,12 @@ patched module or upstream message was sent or run.
    A hook without a word still returns `error.Held` immediately.
    KD20: a joined dismount waits for a pending succession (only while
    the park is up) up to `T_park_max`, then stores `terminal`; lane
-   shutdown stores `terminal` first so a waiter cannot hang. `squeezefs
-   umount --force` is not wired yet.
+   shutdown stores `terminal` first so a waiter cannot hang.
+   `squeezefs umount --force` asks the admin lane (`admin_dismount_force`,
+   0x0707) to store `terminal` on every pending joined resolution word,
+   then unmounts as today. `--lazy --force` is accepted. A mount with no
+   admin lane (no wire, no `.stats`) has nothing to force. If the admin
+   call fails, umount continues and the succession wait still applies.
    Pages
    already seen while registered are not a later sibling death. A manager
    mount installs no hook. Do not build

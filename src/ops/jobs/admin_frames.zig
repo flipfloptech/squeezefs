@@ -379,8 +379,17 @@ pub const AdminFsckReq = extern struct {
     }
 };
 
+// ---- admin_dismount_force (KD20) ----
+
+/// `squeezefs umount --force`: store `terminal` on every pending
+/// resolution word so a succession wait does not block dismount.
+pub const AdminDismountForceReq = extern struct {
+    reserved: u64,
+};
+
 comptime {
     std.debug.assert(codec.wireSize(AdminFsckReq) == 16);
+    std.debug.assert(codec.wireSize(AdminDismountForceReq) == 8);
     std.debug.assert(codec.wireSize(AdminRekeyReq) == 48);
     std.debug.assert(codec.wireSize(AdminRekeyReply) == 24);
     std.debug.assert(codec.wireSize(AdminJobListReq) == 8);

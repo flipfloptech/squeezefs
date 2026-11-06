@@ -169,6 +169,9 @@ pub const Umount = struct {
     /// its holders until the kernel ends the connection (decision 0003
     /// §S shape b); without it a held mount is refused `EBUSY` by name.
     lazy: bool = false,
+    /// `--force` (KD20): store `terminal` on every pending resolution
+    /// word so a succession wait does not block dismount. Not `umount(8) -f`.
+    force: bool = false,
 };
 
 /// A `sqmeta://` URI or a mountpoint (resolved through the mount's
@@ -519,7 +522,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\usage: squeezefs <verb> [flags] …
         \\  squeezefs format [--single-writer] [--meta-node-kib N] [--meta-journal-mb N] [--dir-spread-depth N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--force] sqmeta://<path> [sqdata://<path>…]
         \\  squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] [--encrypt-key PATH|-] sqmeta://<path> <mountpoint>
-        \\  squeezefs umount [--lazy|-l] <mountpoint>
+        \\  squeezefs umount [--lazy|-l] [--force] <mountpoint>
         \\  squeezefs status sqmeta://<path>|<mountpoint>
         \\  squeezefs clients [--json] sqmeta://<path>|<mountpoint>
         \\  squeezefs df [--json] sqmeta://<path>|<mountpoint>
@@ -580,7 +583,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .storage => "usage: squeezefs storage list [--json]\n       squeezefs storage validate <path>\n",
         .key => "usage: squeezefs key install [--force] sqmeta://<path> <keyfile|->\n       squeezefs key show sqmeta://<path>\n       squeezefs key check [--encrypt-key PATH|-] sqmeta://<path>\n       squeezefs key tls-init [--name CA-NAME] [--force] <dir>\n       squeezefs key tls-issue --node NAME [--out DIR] [--force] <ca-dir>\n",
 
-        .umount => "usage: squeezefs umount [--lazy|-l] <mountpoint>\n",
+        .umount => "usage: squeezefs umount [--lazy|-l] [--force] <mountpoint>\n",
         .status => "usage: squeezefs status sqmeta://<path>|<mountpoint>\n",
         .clients => "usage: squeezefs clients [--json] sqmeta://<path>|<mountpoint>\n",
         .df => "usage: squeezefs df [--json] sqmeta://<path>|<mountpoint>\n",
@@ -2007,8 +2010,9 @@ fn parseMount(words: []const []const u8, diag: *Refusal) Error!Verb {
 fn parseUmount(words: []const []const u8, diag: *Refusal) Error!Verb {
     var c: Cursor = .{ .verb = "umount", .words = words, .diag = diag };
     var lazy = false;
+    var force = false;
     while (try c.step()) |f| {
-        if (std.mem.eql(u8, f.name, "--lazy") or std.mem.eql(u8, f.name, "-l")) lazy = true else return c.unknown(f);
+        if (std.mem.eql(u8, f.name, "--lazy") or std.mem.eql(u8, f.name, "-l")) lazy = true else if (std.mem.eql(u8, f.name, "--force")) force = true else return c.unknown(f);
     }
     const pos = c.pos();
     if (pos.len < 1) {
@@ -2019,7 +2023,7 @@ fn parseUmount(words: []const []const u8, diag: *Refusal) Error!Verb {
         diag.* = .{ .extra_positional = .{ .verb = "umount", .word = pos[1] } };
         return error.Refused;
     }
-    return .{ .umount = .{ .mountpoint = pos[0], .lazy = lazy } };
+    return .{ .umount = .{ .mountpoint = pos[0], .lazy = lazy, .force = force } };
 }
 
 fn parseStatus(words: []const []const u8, diag: *Refusal) Error!Verb {
@@ -2215,6 +2219,10 @@ test "umount and status take exactly one positional; umount's --lazy/-l is the e
     try testing.expect(!(try parse(av(&.{ "umount", "/mnt/x" }), &d)).umount.lazy);
     try testing.expect((try parse(av(&.{ "umount", "--lazy", "/mnt/x" }), &d)).umount.lazy);
     try testing.expect((try parse(av(&.{ "umount", "-l", "/mnt/x" }), &d)).umount.lazy);
+    try testing.expect(!(try parse(av(&.{ "umount", "/mnt/x" }), &d)).umount.force);
+    try testing.expect((try parse(av(&.{ "umount", "--force", "/mnt/x" }), &d)).umount.force);
+    try testing.expect((try parse(av(&.{ "umount", "--lazy", "--force", "/mnt/x" }), &d)).umount.lazy);
+    try testing.expect((try parse(av(&.{ "umount", "--lazy", "--force", "/mnt/x" }), &d)).umount.force);
     try testing.expectEqualStrings("/mnt/x", (try parse(av(&.{ "umount", "/mnt/x", "-l" }), &d)).umount.mountpoint);
     try testing.expectEqualStrings("sqmeta:///v", (try parse(av(&.{ "status", "sqmeta:///v" }), &d)).status.target);
     try testing.expectEqualStrings("/mnt/sqz", (try parse(av(&.{ "status", "/mnt/sqz" }), &d)).status.target);
@@ -2222,7 +2230,6 @@ test "umount and status take exactly one positional; umount's --lazy/-l is the e
     try testing.expect((try refusal(av(&.{ "status", "relative" }))) == .bad_target);
     try testing.expect((try refusal(av(&.{"umount"}))) == .missing_positional);
     try testing.expect((try refusal(av(&.{ "umount", "/a", "/b" }))) == .extra_positional);
-    try testing.expect((try refusal(av(&.{ "umount", "--force", "/a" }))) == .unknown_flag);
     try testing.expect((try refusal(av(&.{"status"}))) == .missing_positional);
 }
 

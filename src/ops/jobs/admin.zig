@@ -73,12 +73,19 @@ pub const AdminWorld = struct {
 pub const RekeyError = error{ OutOfMemory, Io, NotCoordinator, Plaintext, WindowOpen, KeyUnresolved, SameKey, Plane, TableFull };
 pub const RekeyOutcome = struct { job_id: u64, config_generation: u64 };
 
+pub const ForceDismount = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque) u32,
+};
+
 pub const AdminService = struct {
     io: Io,
     fabric: *Fabric,
     world: ?AdminWorld,
+    /// KD20: store `terminal` on every pending resolution word. Null = none.
+    force_dismount: ?ForceDismount = null,
 
-    const all_verbs = .{ .admin_job_list, .admin_job_control, .admin_job_submit, .admin_fsck_report, .admin_volume, .admin_rekey, .admin_fsck };
+    const all_verbs = .{ .admin_job_list, .admin_job_control, .admin_job_submit, .admin_fsck_report, .admin_volume, .admin_rekey, .admin_fsck, .admin_dismount_force };
 
     pub fn register(self: *AdminService, svc: *service.Service) void {
         const h: service.Handler = .{ .ctx = self, .serve = &serve };
@@ -101,6 +108,7 @@ pub const AdminService = struct {
             .admin_volume => |p| self.volume(p),
             .admin_rekey => |p| self.rekey(p),
             .admin_fsck => |p| self.fsckSubmit(p),
+            .admin_dismount_force => self.dismountForce(),
             else => unreachable,
         };
         return answer;
@@ -247,6 +255,12 @@ pub const AdminService = struct {
         log.info("admin lane: rekey job-{x:0>16} submitted (next key id {x}, throttle {d} %, config generation {d})", .{ out.job_id, &p.key_id, p.throttle_pct, out.config_generation });
         return .{ .ok = .{ .admin_rekey = .{ .verdict = @backingInt(Verdict.ok), .reason = 0, .reserved = @splat(0), .job_id = out.job_id, .config_generation = out.config_generation } } };
     }
+
+    fn dismountForce(self: *AdminService) service.Answer {
+        const n = if (self.force_dismount) |h| h.run(h.ctx) else 0;
+        if (n != 0) log.warn("admin lane: umount --force stored terminal on {d} pending resolution word(s) (KD20)", .{n});
+        return .{ .ok = .{ .admin_dismount_force = frames.AdminVerdictAck.of(.ok) } };
+    }
 };
 
 /// The caller side (the CLI's `admin_lane.zig`, the tests): typed calls
@@ -299,6 +313,12 @@ pub const Client = struct {
     pub fn fsck(self: Client, flags: u32, throttle_pct: u8, shard_k: u32, shard_n: u32) Error!Submitted {
         const rep = try self.call(self.ctx, .{ .admin_fsck = .{ .flags = flags, .throttle_pct = throttle_pct, .reserved = @splat(0), .shard_k = shard_k, .shard_n = shard_n } });
         return .{ .job_id = rep.admin_fsck.job_id, .verdict = rep.admin_fsck.get() };
+    }
+
+    /// KD20: store `terminal` on every pending resolution word.
+    pub fn dismountForce(self: Client) Error!Verdict {
+        const rep = try self.call(self.ctx, .{ .admin_dismount_force = .{ .reserved = 0 } });
+        return rep.admin_dismount_force.get();
     }
 };
 
@@ -423,6 +443,7 @@ test "the admin lane over the loopback: list is the live table; submit is coordi
     defer list.deinit(gpa);
     try c.list(gpa, &list);
     try testing.expectEqual(@as(usize, 0), list.items.len);
+    try testing.expectEqual(Verdict.ok, try c.dismountForce());
     // Not the coordinator (a joiner's fabric): submit refuses by verdict,
     // nothing written.
     r.fabric.setCoordinator(false);

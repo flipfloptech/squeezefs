@@ -46,7 +46,10 @@
 //! daemon detaches the mountpoint now (`MNT_DETACH`) and serves every
 //! holder until the kernel ends the connection, then tears down; the verb
 //! names the holders it leaves behind and waits for the exit only when
-//! there are none.
+//! there are none. `--force` (KD20) first asks the daemon's admin lane to
+//! store `terminal` on every pending resolution word so a succession wait
+//! does not block teardown; it is not `umount(8) -f`. `--lazy --force`
+//! detaches now and stores `terminal`.
 //!
 //! THE VERDICT IS ORDER-BASED, on kernel facts alone (never 0 after a
 //! kill): the mount's entry gone from the table while the daemon lived (or
@@ -79,6 +82,7 @@ const mountinfo = @import("../core/mountinfo.zig");
 const tick_law = @import("../sync/tick.zig");
 const transport = @import("../fuse/transport.zig");
 const proc = @import("../meta/guard/proc.zig");
+const admin_lane = @import("admin_lane.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("cli/umount is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -598,6 +602,41 @@ fn refuseBusy(p: cli.Process, path: []const u8, c: holders.Census) u8 {
     return cli.exit_failed;
 }
 
+/// KD20: ask the daemon to store `terminal` on pending resolution words.
+/// A mount with no admin lane (no wire, no `.stats`) has nothing to force.
+fn storeTerminal(p: cli.Process, mountpoint: []const u8) void {
+    const resolved = admin_lane.resolve(p.gpa, p.io, mountpoint) catch {
+        p.stderr.writeAll("squeezefs umount: --force: out of memory resolving the admin lane — continuing with the ordinary unmount\n") catch {};
+        return;
+    };
+    switch (resolved) {
+        .refused => |why| switch (why) {
+            .no_endpoint, .stats_unreadable => {},
+            else => p.stderr.print("squeezefs umount: --force: could not reach the admin lane ({s}) — continuing; the succession wait still applies\n", .{why.text()}) catch {},
+        },
+        .ok => |r| {
+            var resolved_ok = r;
+            defer resolved_ok.deinit(p.gpa);
+            var body = struct {
+                p: cli.Process,
+                fn run(ctx: *anyopaque, lane: *admin_lane.Lane) u8 {
+                    const self: *@This() = @ptrCast(@alignCast(ctx));
+                    const v = lane.admin().dismountForce() catch |e| {
+                        self.p.stderr.print("squeezefs umount: --force: the admin call failed ({s}) — continuing; the succession wait still applies\n", .{@errorName(e)}) catch {};
+                        return cli.exit_failed;
+                    };
+                    if (v != .ok) {
+                        self.p.stderr.print("squeezefs umount: --force: refused ({s}) — continuing; the succession wait still applies\n", .{admin_lane.verdictText(v)}) catch {};
+                        return cli.exit_failed;
+                    }
+                    return cli.exit_ok;
+                }
+            }{ .p = p };
+            _ = admin_lane.withLane(p, "umount --force", mountpoint, .{ .ctx = &body, .run = &@TypeOf(body).run });
+        },
+    }
+}
+
 pub fn run(p: cli.Process, u: args.Umount) u8 {
     var zbuf: [linux.PATH_MAX:0]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{u.mountpoint}, 0) catch {
@@ -630,6 +669,7 @@ pub fn run(p: cli.Process, u: args.Umount) u8 {
         p.stderr.print("squeezefs umount: {s} is a bind or a moved mountpoint of daemon {d}'s mount at {s}, not the mount it made — detached {s} without signalling the daemon, which serves the mounts of its superblock that remain and exits when the last goes\n", .{ path, located.stats.daemon.pid, json_scan.string(located.stats.text, "mountpoint") orelse "?", if (u.lazy) "lazily" else "plainly" }) catch {};
         return detachOther(p, path, u.lazy);
     };
+    if (u.force) storeTerminal(p, path);
     switch (signalLocated(p.gpa, p.io, path, u.lazy, p.build.commit, &watched, located)) {
         .exited => |pid| {
             if (!isFuseMount(p.io, p.gpa, path)) return cli.exit_ok;

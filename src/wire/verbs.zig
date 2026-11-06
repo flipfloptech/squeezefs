@@ -148,6 +148,7 @@ pub const Verb = enum(u16) {
     admin_volume = 0x0704,
     admin_rekey = 0x0705,
     admin_fsck = 0x0706,
+    admin_dismount_force = 0x0707,
     // ---- the handshake 0xFFF0 (MAC-less, the handshake class cap) ----
     challenge = 0xFFF0,
     prove = 0xFFF1,
@@ -1916,6 +1917,7 @@ pub fn ReqType(comptime v: Verb) type {
         .admin_volume => admin_frames.AdminVolumeReq,
         .admin_rekey => admin_frames.AdminRekeyReq,
         .admin_fsck => admin_frames.AdminFsckReq,
+        .admin_dismount_force => admin_frames.AdminDismountForceReq,
         .challenge => Challenge,
         .prove => Prove,
         .admitted => Admitted,
@@ -1972,6 +1974,7 @@ pub fn RepType(comptime v: Verb) type {
         .admin_volume => admin_frames.AdminVolumeReply,
         .admin_rekey => admin_frames.AdminRekeyReply,
         .admin_fsck => admin_frames.AdminJobSubmitted,
+        .admin_dismount_force => admin_frames.AdminVerdictAck,
         // The handshake frames are not calls: no reply type.
         .challenge, .prove, .admitted, .refused => Empty,
     };

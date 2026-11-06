@@ -1218,7 +1218,7 @@ pub const KvBackend = struct {
             .core = &be.core,
             .registry = &be.reg,
             .ring_stats = &be.ring_stats,
-            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook, .barrier_started = laneBarrierStartedHook, .barrier_landed = laneBarrierLandedHook, .cover_upto = laneCoverHook, .readmit = joinedReadmit },
+            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook, .barrier_started = laneBarrierStartedHook, .barrier_landed = laneBarrierLandedHook, .cover_upto = laneCoverHook, .readmit = joinedReadmit, .word = &js.resolution },
             .test_error_logs = opts.test_error_logs,
         }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1613,9 +1613,9 @@ pub const KvBackend = struct {
 
     /// The joined posture's `RecordSource.appenderPages`: the page IS the
     /// record (`sym/joined.zig`).
-    fn joinedReadmit(ctx: ?*anyopaque, op: member_fence.Op, class: member_fence.Class) member_fence.Verdict {
+    fn joinedReadmit(ctx: ?*anyopaque, op: member_fence.Op, class: member_fence.Class) member_fence.Answer {
         const be: *KvBackend = @ptrCast(@alignCast(ctx.?));
-        const js = be.joined orelse return .latch;
+        const js = be.joined orelse return .{ .verdict = .latch };
         return js.readmit.answer(op, class);
     }
 
@@ -3459,6 +3459,7 @@ pub const KvBackend = struct {
             be.slots.quiesce();
             // The leave refuses over the retired (or expired) gate and
             // says so: the crash shape, nothing written.
+            if (be.joined) |js| js.awaitDismount();
             if (be.joined) |js| js.leave();
             be.task.stop();
             if (be.ckpt_thread) |th| {
@@ -3491,6 +3492,9 @@ pub const KvBackend = struct {
             // control entries ride ring 0 and the tick covers them), each
             // drained at a fixpoint cycle first.
             if (be.sym) |set| set.leaveAll();
+            // KD20: wait for a pending succession while the checkpoint
+            // task and the lane can still clear the word and land held writes.
+            if (be.joined) |js| js.awaitDismount();
             // A joiner: every lease released over the wire, the page naming
             // no slot, the ring drained, `LeaveAppender` (the page Free) —
             // while the task and the lane still serve the cycles it needs.

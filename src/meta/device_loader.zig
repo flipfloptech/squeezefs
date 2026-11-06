@@ -201,7 +201,7 @@ pub const DeviceLoader = struct {
     /// Decision 0004 §4.5. Consulted at a device refusal, before the fence
     /// rung. Null keeps today's path. `.held` is the only answer this
     /// slice honours.
-    readmit: ?*const fn (ctx: ?*anyopaque, op: member_fence.Op, class: member_fence.Class) member_fence.Verdict = null,
+    readmit: ?member_fence.Hook = null,
     readmit_ctx: ?*anyopaque = null,
     reads: ReadEpisode = .{},
 
@@ -448,8 +448,8 @@ const TestDevice = struct {
     }
 };
 
-fn holdConflict(_: ?*anyopaque, _: member_fence.Op, class: member_fence.Class) member_fence.Verdict {
-    return if (class == .conflict) .held else .latch;
+fn holdConflict(_: ?*anyopaque, _: member_fence.Op, class: member_fence.Class) member_fence.Answer {
+    return .{ .verdict = if (class == .conflict) .held else .latch };
 }
 
 test "member fence: a held reservation conflict at the device loader does not latch and is not counted" {

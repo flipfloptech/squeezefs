@@ -622,6 +622,20 @@ pub const JoinedSet = struct {
         }
     }
 
+    /// KD20: a dismount waits for a pending succession so held writes can
+    /// land, then stores `terminal` at the park deadline.
+    pub fn awaitDismount(self: *JoinedSet) void {
+        if (self.resolution.snapshot().state != .pending) return;
+        if (!self.park_gate.isParked()) return;
+        const budget_ns = self.park_gate.t_park_max_ms * std.time.ns_per_ms;
+        log.warn("meta volume {s}: dismount waiting up to {d} ms for a pending succession (KD20)", .{ self.be.path, self.park_gate.t_park_max_ms });
+        const outcome = self.resolution.awaitResolved(budget_ns);
+        if (outcome == .timed_out or self.resolution.snapshot().state == .pending) {
+            self.resolution.terminate();
+            log.warn("meta volume {s}: dismount stored terminal after the succession wait (KD20)", .{self.be.path});
+        }
+    }
+
     pub fn deinit(self: *JoinedSet) void {
         if (self.fence) |f| f.deinit();
         self.refill.cancel(self.be.io);

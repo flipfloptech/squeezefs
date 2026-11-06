@@ -10,8 +10,15 @@
 //! unregistered current member re-registers through the stale-sibling
 //! rule once writes already submitted on that controller have completions
 //! (DO.33); a fresh registration whose page is no longer Live is withdrawn.
+//! A completion hook captures the resolution generation before it classifies.
+//! A held journal write or barrier waits on that generation and is re-issued
+//! once a later `clear` advances it. A dismount waits for a pending
+//! succession (KD20) and stores `terminal` at the park deadline; lane
+//! shutdown stores `terminal` so a waiter cannot hang.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const clock = @import("../../core/clock.zig");
 
 pub const Verdict = enum { retry, latch, held };
 
@@ -21,18 +28,26 @@ pub const Op = enum { read, write };
 /// refusal and stays on today's path.
 pub const Class = enum { conflict, eio };
 
-pub const Hook = *const fn (ctx: ?*anyopaque, op: Op, class: Class) Verdict;
+pub const Answer = struct { verdict: Verdict, gen: Gen = 0 };
 
-/// True when a completion hook answers `.held` for this device error.
-pub fn isHeld(hook: ?Hook, ctx: ?*anyopaque, err: anyerror, op: Op) bool {
+pub const Hook = *const fn (ctx: ?*anyopaque, op: Op, class: Class) Answer;
+
+/// The completion hook's answer for this device error. Anything else is
+/// not a refusal: `.latch` so today's path runs.
+pub fn afterError(hook: ?Hook, ctx: ?*anyopaque, err: anyerror, op: Op) Answer {
     const class: Class = if (err == error.ReservationConflict)
         .conflict
     else if (err == error.InputOutput)
         .eio
     else
-        return false;
-    const f = hook orelse return false;
-    return f(ctx, op, class) == .held;
+        return .{ .verdict = .latch };
+    const f = hook orelse return .{ .verdict = .latch };
+    return f(ctx, op, class);
+}
+
+/// True when a completion hook answers `.held` for this device error.
+pub fn isHeld(hook: ?Hook, ctx: ?*anyopaque, err: anyerror, op: Op) bool {
+    return afterError(hook, ctx, err, op).verdict == .held;
 }
 
 /// A metadata write that used to collapse every device class into `Io`
@@ -139,16 +154,17 @@ pub const Readmit = struct {
         return .{};
     }
 
-    pub fn answer(self: *Readmit, op: Op, class: Class) Verdict {
-        if (op == .read and class == .eio) return .retry;
-        if (self.obs.manages) return .latch;
-        if (!self.obs.own_page_live) return .latch;
+    pub fn answer(self: *Readmit, op: Op, class: Class) Answer {
+        const gen = if (self.word) |w| w.snapshot().gen else 0;
+        if (op == .read and class == .eio) return .{ .verdict = .retry, .gen = gen };
+        if (self.obs.manages) return .{ .verdict = .latch, .gen = gen };
+        if (!self.obs.own_page_live) return .{ .verdict = .latch, .gen = gen };
         const verdict = classify(self.obs).verdict;
         if (verdict == .held) if (self.on_held) |f| f(self.on_held_ctx);
-        return verdict;
+        return .{ .verdict = verdict, .gen = gen };
     }
 
-    pub fn hook(ctx: ?*anyopaque, op: Op, class: Class) Verdict {
+    pub fn hook(ctx: ?*anyopaque, op: Op, class: Class) Answer {
         const self: *Readmit = @ptrCast(@alignCast(ctx.?));
         return self.answer(op, class);
     }
@@ -276,9 +292,12 @@ pub const Gen = u62;
 
 pub const Resolution = struct {
     word: std.atomic.Value(u64) = .init(0),
+    wake: std.atomic.Value(u32) = .init(0),
 
     pub const State = enum(u2) { pending, cleared, terminal };
     pub const Snapshot = struct { state: State, gen: Gen };
+    pub const Wait = enum { cleared, terminal };
+    pub const Resolved = enum { cleared, terminal, timed_out };
 
     const gen_mask: u64 = (@as(u64, 1) << 62) - 1;
 
@@ -297,7 +316,10 @@ pub const Resolution = struct {
             const next_gen, const overflow = @addWithOverflow(s.gen, 1);
             if (overflow == 1) return false;
             const next = pack(.cleared, next_gen);
-            if (self.word.cmpxchgWeak(cur, next, .release, .acquire) == null) return true;
+            if (self.word.cmpxchgWeak(cur, next, .release, .acquire) == null) {
+                self.poke();
+                return true;
+            }
         }
     }
 
@@ -308,7 +330,10 @@ pub const Resolution = struct {
             const s = unpack(cur);
             if (s.state == .terminal) return;
             const next = pack(.terminal, s.gen);
-            if (self.word.cmpxchgWeak(cur, next, .release, .acquire) == null) return;
+            if (self.word.cmpxchgWeak(cur, next, .release, .acquire) == null) {
+                self.poke();
+                return;
+            }
         }
     }
 
@@ -321,7 +346,69 @@ pub const Resolution = struct {
             if (s.state == .terminal) return false;
             if (s.state == .pending) return true;
             const next = pack(.pending, s.gen);
-            if (self.word.cmpxchgWeak(cur, next, .release, .acquire) == null) return true;
+            if (self.word.cmpxchgWeak(cur, next, .release, .acquire) == null) {
+                self.poke();
+                return true;
+            }
+        }
+    }
+
+    /// Wait until `terminal` or a `clear` that advanced `gen` past
+    /// `captured_gen` (decision 0004 §4.5: the generation is captured
+    /// before classification, so a clear between the verdict and this
+    /// wait is still observed).
+    pub fn awaitPast(self: *Resolution, captured_gen: Gen) Wait {
+        while (true) {
+            const s = self.snapshot();
+            if (s.state == .terminal) return .terminal;
+            if (s.gen > captured_gen) return .cleared;
+            const expect = self.wake.load(.acquire);
+            const again = self.snapshot();
+            if (again.state == .terminal) return .terminal;
+            if (again.gen > captured_gen) return .cleared;
+            if (builtin.os.tag == .linux) {
+                const futex = @import("../../sync/futex.zig");
+                futex.wait(&self.wake, expect);
+            } else {
+                std.Thread.yield() catch {};
+            }
+        }
+    }
+
+    /// Wait until the word is no longer `pending`, or `timeout_ns` elapses
+    /// (KD20: a dismount waits for a pending succession, then stores
+    /// `terminal` at the deadline).
+    pub fn awaitResolved(self: *Resolution, timeout_ns: u64) Resolved {
+        const start = clock.monotonicNs();
+        while (true) {
+            const s = self.snapshot();
+            if (s.state == .terminal) return .terminal;
+            if (s.state == .cleared) return .cleared;
+            const expect = self.wake.load(.acquire);
+            const again = self.snapshot();
+            if (again.state == .terminal) return .terminal;
+            if (again.state == .cleared) return .cleared;
+            const left = timeout_ns -| (clock.monotonicNs() - start);
+            if (left == 0) return .timed_out;
+            if (builtin.os.tag == .linux) {
+                const futex = @import("../../sync/futex.zig");
+                if (futex.waitTimeout(&self.wake, expect, left) == .timed_out) {
+                    const last = self.snapshot();
+                    if (last.state == .terminal) return .terminal;
+                    if (last.state == .cleared) return .cleared;
+                    return .timed_out;
+                }
+            } else {
+                std.Thread.yield() catch {};
+            }
+        }
+    }
+
+    fn poke(self: *Resolution) void {
+        _ = self.wake.fetchAdd(1, .release);
+        if (builtin.os.tag == .linux) {
+            const futex = @import("../../sync/futex.zig");
+            futex.wakeAll(&self.wake);
         }
     }
 
@@ -526,8 +613,8 @@ test "member fence: a fresh registration is withdrawn when the page leaves Live 
     try testing.expect(!shouldWithdraw(true, &w, false));
 }
 
-fn holdConflict(_: ?*anyopaque, _: Op, class: Class) Verdict {
-    return if (class == .conflict) .held else .latch;
+fn holdConflict(_: ?*anyopaque, _: Op, class: Class) Answer {
+    return .{ .verdict = if (class == .conflict) .held else .latch };
 }
 
 const me = SelfView{ .appender_id = 2, .writer_id = 9, .node_token = 4, .term = 1, .mgr_writer = 1 };
@@ -600,13 +687,13 @@ test "member fence: a joiner's undecided conflict is held and notifies the park 
         }
     }.bump;
     r.on_held_ctx = &n;
-    try testing.expectEqual(Verdict.held, r.answer(.write, .conflict));
+    try testing.expectEqual(Verdict.held, r.answer(.write, .conflict).verdict);
     try testing.expectEqual(@as(u32, 1), n);
     r.obs.manages = true;
-    try testing.expectEqual(Verdict.latch, r.answer(.write, .conflict));
+    try testing.expectEqual(Verdict.latch, r.answer(.write, .conflict).verdict);
     try testing.expectEqual(@as(u32, 1), n);
     r.obs.manages = false;
-    try testing.expectEqual(Verdict.retry, r.answer(.read, .eio));
+    try testing.expectEqual(Verdict.retry, r.answer(.read, .eio).verdict);
 }
 
 test "member fence: a collapsed write keeps Held and maps every other class to Io" {
@@ -616,4 +703,61 @@ test "member fence: a collapsed write keeps Held and maps every other class to I
     try testing.expect(isHeld(holdConflict, null, error.ReservationConflict, .write));
     try testing.expect(!isHeld(null, null, error.ReservationConflict, .write));
     try testing.expect(!isHeld(holdConflict, null, error.InputOutput, .write));
+}
+
+test "member fence: awaitPast returns cleared when gen advances, and terminal when the word is absorbed" {
+    var w: Resolution = .{};
+    const g0 = w.snapshot().gen;
+    try testing.expect(w.clear());
+    try testing.expectEqual(Resolution.Wait.cleared, w.awaitPast(g0));
+    var t: Resolution = .{};
+    const gt = t.snapshot().gen;
+    t.terminate();
+    try testing.expectEqual(Resolution.Wait.terminal, t.awaitPast(gt));
+}
+
+test "member fence: awaitPast waits until another thread clears the word" {
+    var w: Resolution = .{};
+    const g = w.snapshot().gen;
+    const Run = struct {
+        fn go(word: *Resolution, captured: Gen, out: *Resolution.Wait) void {
+            out.* = word.awaitPast(captured);
+        }
+    };
+    var out: Resolution.Wait = .terminal;
+    const th = try std.Thread.spawn(.{}, Run.go, .{ &w, g, &out });
+    _ = w.clear();
+    th.join();
+    try testing.expectEqual(Resolution.Wait.cleared, out);
+}
+
+test "member fence: awaitResolved returns once the word is no longer pending, or at its deadline" {
+    var cleared: Resolution = .{};
+    try testing.expect(cleared.clear());
+    try testing.expectEqual(Resolution.Resolved.cleared, cleared.awaitResolved(1));
+    var term: Resolution = .{};
+    term.terminate();
+    try testing.expectEqual(Resolution.Resolved.terminal, term.awaitResolved(1));
+    var pending: Resolution = .{};
+    try testing.expectEqual(Resolution.Resolved.timed_out, pending.awaitResolved(1));
+    try testing.expectEqual(Resolution.State.pending, pending.snapshot().state);
+}
+
+test "member fence: a clear between the capture and the wait is still observed" {
+    var word: Resolution = .{};
+    var r = Readmit.joiner();
+    r.word = &word;
+    r.on_held_ctx = &word;
+    r.on_held = struct {
+        fn clearIt(ctx: ?*anyopaque) void {
+            const w: *Resolution = @ptrCast(@alignCast(ctx.?));
+            _ = w.clear();
+        }
+    }.clearIt;
+    const a = r.answer(.write, .conflict);
+    try testing.expectEqual(Verdict.held, a.verdict);
+    try testing.expectEqual(@as(Gen, 0), a.gen);
+    try testing.expectEqual(Resolution.State.cleared, word.snapshot().state);
+    try testing.expectEqual(@as(Gen, 1), word.snapshot().gen);
+    try testing.expectEqual(Resolution.Wait.cleared, word.awaitPast(a.gen));
 }

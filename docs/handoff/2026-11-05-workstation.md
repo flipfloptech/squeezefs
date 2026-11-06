@@ -249,6 +249,15 @@ patched module or upstream message was sent or run.
    `registerUnderRule` once the succession park is up and
    `pool.writesOutstanding()` is 0 (DO.33). A fresh registration whose
    page left Live, or whose word is already terminal, is withdrawn.
+   A completion hook captures the resolution generation before it
+   classifies. A held journal-lane write or barrier waits on that
+   generation (`awaitPast`) and is re-issued once a later `clear`
+   advances it; a terminal word returns `error.Held` without fencing.
+   A hook without a word still returns `error.Held` immediately.
+   KD20: a joined dismount waits for a pending succession (only while
+   the park is up) up to `T_park_max`, then stores `terminal`; lane
+   shutdown stores `terminal` first so a waiter cannot hang. `squeezefs
+   umount --force` is not wired yet.
    Pages
    already seen while registered are not a later sibling death. A manager
    mount installs no hook. Do not build

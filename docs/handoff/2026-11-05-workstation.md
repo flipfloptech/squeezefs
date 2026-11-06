@@ -18,8 +18,8 @@ sections before changing core code. PR-N denotes the planned deliveries in decis
 was fast-forwarded onto `dev`; the live GitHub `ls-remote` check and local head
 matched, and the hook logged a successful push. Its full gate passed **75/75 steps,
 3,813/4,031 tests, 218 skipped, exit 0**, with **zero integration safety findings**.
-All implementation, review, build and monitor tasks have completed. PR-4/5 remain
-blocked on kernel premises.
+All implementation, review, build and monitor tasks have completed. DO.33 re-admits
+PR-4 on this host. PR-5 remains behind PR-4. The fatal teardown leg stays unrun.
 
 **Approval and documentation:** the owner approved “yes, land them on dev” on
 2026-11-05. This handoff accompanies that landing. Documentation-only commits may
@@ -172,7 +172,7 @@ in the repository evidence/decisions; all original branches/caches were preserve
 The complete final gate transcript is retained in the CLI session tool log:
 `/home/justin/.grok/sessions/%2Fhome%2Fjustin%2FSource%2Fsqueezefs-zig/01a185b4-a2e4-7703-baae-439f1f684edc/terminal/call_lzYPlF7mZnVrBEM5IZoyS9Qh.log`.
 
-## Kernel premises block PR-4/5
+## Kernel premises: DO.33 re-admits PR-4
 
 Both hazards survived independent, two-sided investigation of NVMe/blk-mq sources
 matching the cached pristine kernel.org 7.3.1 archive. Fatal manifestations and
@@ -193,12 +193,20 @@ controller destruction erases/exits/frees it under a different lock. Graceful ho
 I/O drain and a successful disconnect do not order resurrection before free.
 Keyed data fences already exercise the common abort mechanism.
 
-**Resolve these premises before PR-4/5.** Report/read probes do not prove universal
-victim drain completion. Plain preempt/unregister loses the admitted-write law.
-No alternative was approved or implemented. Fatal validation needs an explicitly
-approved, disposable, externally resettable target guest with retained console/
-traces and KASAN; guests using this laptop's target do not contain the hazard.
-No fatal leg, patched module, disposable venue or upstream message was sent/run.
+**DO.33 (2026-11-05) resolves the gate.** The owner rejected a multi-guest KASAN
+laboratory. The TCP cycle is real in the source and was not reproduced: preempt-and-abort
+returns to its queue worker after queueing the abort, and the wedge is a later
+reservation command blocked in `down(pr_sem)` on the same TCP queue as a write whose
+data has not arrived. PR-4 may proceed on the fake and on this host's existing loop
+and TCP legs. Its own commands avoid that schedule: no `pr_sem` command on a
+controller until that controller's already-submitted writes have completions, and the
+park has stopped new submissions. P17 stays unreproduced. PR-4 does not disconnect a
+controller and does not run the fatal teardown leg here; R12 stands. linux-nvme 09/19
+and 19/19 name the two defects and were unmerged in the snapshots checked on this
+date. The private proposal `test/disposable-nvmet-validation` at `bab3b80` built no
+guest. A fatal teardown leg still needs its own approval and one disposable target.
+That leg is not part of PR-4. Report/read remains not a drain barrier. No fatal leg,
+patched module or upstream message was sent or run.
 
 ## Resume and approvals
 
@@ -212,10 +220,42 @@ No fatal leg, patched module, disposable venue or upstream message was sent/run.
    approval for future publications; never push a feature branch or force-push.
    Verify remote SHAs after hooks publish; SSH has failed intermittently.
    No unmerged worktree/branch cleanup is authorized here.
-4. Resolve the stock-target premises with a reviewed consequence and approved
-   contained evidence before PR-4 re-admission. PR-5 depends on PR-2/3/4 and adds
-   WEAR, manager-page currency, windows/debt, fencer retirement and `claim convert-pr`.
-   PR-6 is load/soak; PR-7 is multipath-Y/disposable-guest coverage; PR-8 cleanup
+4. PR-4 is re-admitted by DO.33, pending owner objection. On
+   `feat/member-readmit`: the pure contract in `member_fence.zig`, and the
+   journal lane's `Hooks.readmit` and the checkpoint binding's
+   `DeviceLoader.readmit`. A `.held` answer on a write or barrier refusal
+   returns `error.Held` and skips the fence latch, the failure count, the
+   rollback and the hole checkpoint. The checkpointer does not count a held
+   barrier toward the generic latch. Null hook is today's path (the
+   acked-window fence test and the loader conflict without a hook still
+   latch). `error.Held` is retryable and replies EAGAIN.
+   `LoaderError` and the cycle's `IoError` include `Held`.
+   `JoinedSet.writePages` and `AppenderSet.writePages` name `Held` and keep
+   it distinct from `Io`. A held page write during a slot handover becomes
+   `HandoverDeferred`. The volume vtable, tails spill, and the KVDA page
+   writer name `Held` (a spill or a manager verb maps it to `Deferred`).
+   `CycleError` includes `Held`, so a held checkpoint is "not this tick".
+   A joined mount installs `Readmit` on the journal lane and the device
+   loader. A reservation conflict is held and `ParkGate.parkFor(.succession)`
+   runs. `extendTo` grants one longer deadline per observed bind. The
+   checkpoint tick's `censusBeat` reads the appender pages into `Readmit.obs`:
+   a successor page holds, a new recovering sibling or this incarnation's
+   page leaving Live latches (`noteFence`), and a readable registered report
+   clears the resolution word. The tick reads that report from the joiner's
+   own metadata client (`JoinedSet.fence.client` via `host_fence.reportFacts`,
+   which also returns `rtype`). A joined mount has no guard. No fence, or a
+   failed report, stays unreadable. An unregistered current member
+   (successor page, own page Live) re-registers through
+   `registerUnderRule` once the succession park is up and
+   `pool.writesOutstanding()` is 0 (DO.33). A fresh registration whose
+   page left Live, or whose word is already terminal, is withdrawn.
+   Pages
+   already seen while registered are not a later sibling death. A manager
+   mount installs no hook. Do not build
+   the KASAN fleet and do not run the fatal teardown leg on this host. PR-5
+   depends on
+   PR-2/3/4 and adds WEAR, manager-page currency, windows/debt, fencer retirement and
+   `claim convert-pr`. PR-6 is load/soak; PR-7 is multipath-Y coverage; PR-8 cleanup
    requires explicit later owner go-ahead.
 
 ```sh

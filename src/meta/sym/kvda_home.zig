@@ -26,6 +26,7 @@ const checkpoint = @import("../checkpoint.zig");
 const manager = @import("manager.zig");
 const bind = @import("bind.zig");
 const data_bitmap = @import("../../data/sym_planes/data_bitmap.zig");
+const member_fence = @import("../guard/member_fence.zig");
 const alloc_lease = @import("../../data/sym_planes/alloc_lease.zig");
 const plane_arm = @import("../../data/sym_planes/plane_arm.zig");
 const records = @import("../../data/sym_planes/records.zig");
@@ -63,9 +64,12 @@ pub const KvdaHome = struct {
 
     // ---- the device face ----
 
-    fn regionWrite(ctx: *anyopaque, off: u64, bytes: []const u8) error{Io}!void {
+    fn regionWrite(ctx: *anyopaque, off: u64, bytes: []const u8) error{ Io, Held }!void {
         const self = self_(ctx);
-        self.be.pool.writeAt(self.be.path, off, bytes) catch return error.Io;
+        self.be.pool.writeAt(self.be.path, off, bytes) catch |e| return switch (e) {
+            error.Held => error.Held,
+            else => if (member_fence.isHeld(self.be.dev.readmit, self.be.dev.readmit_ctx, e, .write)) error.Held else error.Io,
+        };
     }
 
     fn regionRead(ctx: *anyopaque, off: u64, out: []u8) error{Io}!void {
@@ -75,9 +79,12 @@ pub const KvdaHome = struct {
         @memcpy(out, img[0..out.len]);
     }
 
-    fn regionBarrier(ctx: *anyopaque) error{Io}!void {
+    fn regionBarrier(ctx: *anyopaque) error{ Io, Held }!void {
         const self = self_(ctx);
-        self.be.dev.barrier() catch return error.Io;
+        self.be.dev.barrier() catch |e| return switch (e) {
+            error.Held => error.Held,
+            else => error.Io,
+        };
     }
 
     // ---- the ring-0 delta journal ----
@@ -126,10 +133,16 @@ pub const KvdaHome = struct {
         for (claims.items) |c| {
             if (off >= image.len) break;
             const n: usize = @intCast(@min(image.len - off, node));
-            be.pool.writeAt(be.path, be.sb.heap.start + c * node, image[off .. off + n]) catch return error.Io;
+            be.pool.writeAt(be.path, be.sb.heap.start + c * node, image[off .. off + n]) catch |e| return switch (e) {
+                error.Held => error.Held,
+                else => if (member_fence.isHeld(be.dev.readmit, be.dev.readmit_ctx, e, .write)) error.Held else error.Io,
+            };
             off += n;
         }
-        be.dev.barrier() catch return error.Io;
+        be.dev.barrier() catch |e| return switch (e) {
+            error.Held => error.Held,
+            else => error.Io,
+        };
         const recs = try gpa.alloc(manager.ControlRecord, claims.items.len);
         defer gpa.free(recs);
         for (claims.items, recs) |c, *r| r.* = .{ .alloc = c };

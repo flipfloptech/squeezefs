@@ -51,9 +51,11 @@ const ledger = @import("../ledger.zig");
 const node_seq = @import("../node_seq.zig");
 const smo = @import("../smo.zig");
 const checkpoint_cycle = @import("../checkpoint_cycle.zig");
+const member_fence = @import("../guard/member_fence.zig");
 const claim = @import("../guard/claim.zig");
 const proc = @import("../guard/proc.zig");
 const host_fence = @import("../guard/host_fence.zig");
+const pr = @import("../guard/pr.zig");
 const sym = @import("../sym.zig");
 const page = @import("appender_page.zig");
 const dir = @import("appender_dir.zig");
@@ -394,6 +396,11 @@ pub const JoinedSet = struct {
     /// `T_park_max` expires it. Armed here with the env-derived clocks; the
     /// membership grant's `T_owner` refines `t_park_max_ms`.
     park_gate: park.ParkGate,
+    readmit: member_fence.Readmit = .{},
+    resolution: member_fence.Resolution = .{},
+    /// Appender 0's writer at the last registration. A different Live
+    /// writer is a successor.
+    mgr_writer: u64 = 0,
     /// The ring-growth gate (`ring_growth.zig`): the conveyor's passes
     /// enter it; `growRingIfDue` closes it to drain and swap the ring.
     gate: ring_growth.Gate,
@@ -483,6 +490,8 @@ pub const JoinedSet = struct {
             .predecessor = predecessor,
             .granted_bits = .{},
             .park_gate = park.ParkGate.arm(be.io, be.stamp.member_position, park.tParkMaxMs(grant.failoverBoundMs(0, 0), park.graceMs(shard.tOwnerMsFromEnv(be.env)))),
+            .readmit = member_fence.Readmit.joiner(),
+            .mgr_writer = page0.identity.writer_id,
             .gate = ring_growth.Gate.init(be.io),
             .fence = fence,
         };
@@ -496,6 +505,9 @@ pub const JoinedSet = struct {
         errdefer self.granted_bits.deinit(gpa);
         self.wire = .{ .gpa = gpa, .link = self.link.link(), .volume = be.index, .identity = wire_identity, .pages = .{ .ctx = self, .read = &readPageFn } };
         self.joiner = join_ladder.Joiner.init(gpa, &self.wire);
+        self.readmit.on_held = parkForSuccession;
+        self.readmit.on_held_ctx = self;
+        self.readmit.word = &self.resolution;
         errdefer self.joiner.deinit();
         try self.awaitManagerListener(page0);
         // 3. Rung 5: the region over the wire. A Deferred join — the
@@ -993,16 +1005,26 @@ pub const JoinedSet = struct {
     /// The page plan executed: the shadow registry carries the backend's
     /// seq offset, every slot the directory-first law names, one barrier
     /// unless the cycle's own covers it.
-    pub fn writePages(self: *JoinedSet, from_cycle: bool) error{ Io, Corrupt, OutOfMemory }!void {
+    pub fn writePages(self: *JoinedSet, from_cycle: bool) error{ Io, Held, Corrupt, OutOfMemory }!void {
         const r = self.core();
         r.reg.recoverSeqOffset(self.be.reg.seqOffset());
         var plan = r.planPageWrite() catch return error.Corrupt;
         for (plan.slice()) |w| {
-            self.be.pool.writeAt(self.be.path, w.offset, &w.image) catch return error.Io;
+            self.be.pool.writeAt(self.be.path, w.offset, &w.image) catch |e| return self.mapWrite(e);
             sym.stats.appender_page_writes.inc();
         }
-        if (!from_cycle) self.be.dev.barrier() catch return error.Io;
+        if (!from_cycle) self.be.dev.barrier() catch |e| return self.mapWrite(e);
         r.pageWritten(&plan);
+    }
+
+    fn parkForSuccession(ctx: ?*anyopaque) void {
+        const self: *JoinedSet = @ptrCast(@alignCast(ctx.?));
+        _ = self.park_gate.parkFor(.succession, clock.monotonicNs());
+    }
+
+    fn mapWrite(self: *JoinedSet, e: anyerror) error{ Io, Held } {
+        if (member_fence.isHeld(self.be.dev.readmit, self.be.dev.readmit_ctx, e, .write)) return error.Held;
+        return member_fence.mapDeviceWrite(e);
     }
 
     /// `RecordSource.appenderPages` on a joiner — the record's ONE durable
@@ -1019,7 +1041,10 @@ pub const JoinedSet = struct {
         self.unclaimedRuns(&runs) catch return error.Io;
         r.page.grants = grant.pageRunsOf(runs.items);
         self.be.slots.planPage(self.appenderId(), r) catch return error.Io;
-        self.writePages(true) catch return error.Io;
+        self.writePages(true) catch |e| return switch (e) {
+            error.Held => error.Held,
+            else => error.Io,
+        };
         self.tail_written = rec.journal_tail_seq;
         self.be.slots.pageLanded(r);
         // The rates fold on the checkpoint clock alone (a kicked cadence
@@ -1071,7 +1096,134 @@ pub const JoinedSet = struct {
         const seq = self.be.cp.checkpointSeq();
         if (seq == self.grow_judged_at_seq) return;
         self.grow_judged_at_seq = seq;
+        self.censusBeat();
         self.growRingIfDue();
+    }
+
+    /// The member-fence beat: every appender page as the device holds it,
+    /// and one reservation report from this joiner's metadata client. A
+    /// failed report stays unreadable and does not invent a registration.
+    /// A latch is the fence rung; a hold is the succession park, from
+    /// `Readmit.beat`. An unregistered current member then re-registers
+    /// through the rule once already-submitted writes have completions.
+    fn censusBeat(self: *JoinedSet) void {
+        const pages = devicePages(self.be.gpa, self.be) catch return;
+        defer self.be.gpa.free(pages);
+        var views: [64]member_fence.PageView = undefined;
+        const mapped = fillPageViews(pages, &views);
+        const r = self.core();
+        const who = member_fence.SelfView{
+            .appender_id = self.appenderId(),
+            .writer_id = r.page.identity.writer_id,
+            .node_token = r.page.identity.node_token,
+            .term = r.page.term,
+            .mgr_writer = self.mgr_writer,
+        };
+        const report = self.reservationReport();
+        const verdict = self.readmit.beat(who, mapped, report);
+        if (self.readmit.obs.host_registered) if (page0Writer(mapped)) |w| {
+            self.mgr_writer = w;
+        };
+        if (verdict == .latch) _ = self.be.lane.latch.noteFence("the member-fence beat");
+        if (member_fence.wantsRegister(self.readmit.obs, report.readable, self.be.pool.writesOutstanding() == 0, self.readmit.word)) {
+            self.successionReregister(who);
+        }
+    }
+
+    /// Register through the stale-sibling rule (C3) after the park has
+    /// stopped new submissions and already-submitted writes have
+    /// completions (DO.33). A failed post-check withdraws a fresh
+    /// registration (C2). shortcut: C2 is this volume's page; upgrade when
+    /// the beat reads every joined volume.
+    fn successionReregister(self: *JoinedSet, who: member_fence.SelfView) void {
+        const f = self.fence orelse return;
+        if (!self.park_gate.isParked()) return;
+        if (self.be.pool.writesOutstanding() != 0) return;
+        f.reg.lock() catch return;
+        defer f.reg.unlock();
+        const ctx: host_fence.RuleContext = .{
+            .gpa = self.be.gpa,
+            .env = self.be.env,
+            .path = self.be.path,
+            .local = proc.localIdentity(),
+            .node_token = who.node_token,
+            .vol_index = self.be.index,
+            .taking_manager = false,
+        };
+        runSuccessionRegister(ctx, &f.reg, f.client, .{ .ctx = self.be, .read = &devicePagesFn }, who, self.readmit.seen, self.readmit.word, host_fence.joinRegister(self.be.env));
+        const pages = devicePages(self.be.gpa, self.be) catch return;
+        defer self.be.gpa.free(pages);
+        var views: [64]member_fence.PageView = undefined;
+        const mapped = fillPageViews(pages, &views);
+        const report = self.reservationReport();
+        const verdict = self.readmit.beat(who, mapped, report);
+        if (self.readmit.obs.host_registered) {
+            if (page0Writer(mapped)) |w| self.mgr_writer = w;
+            if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
+            log.warn("meta volume {s}: re-registered this host under key {x:0>16} after a succession", .{ self.be.path, f.client.key });
+        }
+        if (verdict == .latch) _ = self.be.lane.latch.noteFence("the member-fence beat");
+    }
+
+    fn runSuccessionRegister(
+        ctx: host_fence.RuleContext,
+        reg: *const host_fence.Registry,
+        client: *pr.Client,
+        pages: host_fence.PageSource,
+        who: member_fence.SelfView,
+        seen: member_fence.Seen,
+        word: ?*member_fence.Resolution,
+        register: host_fence.Register,
+    ) void {
+        const fresh = host_fence.registerUnderRule(ctx, reg, client, pages, register) catch |e| {
+            log.warn("meta volume {s}: succession re-registration refused ({s}) — the next beat tries again", .{ ctx.path, @errorName(e) });
+            return;
+        };
+        const raw = pages.read(pages.ctx, ctx.gpa) catch {
+            if (member_fence.shouldWithdraw(false, word, fresh)) client.unregister(client.key) catch {};
+            return;
+        };
+        defer ctx.gpa.free(raw);
+        var views: [64]member_fence.PageView = undefined;
+        const facts = member_fence.pageFacts(who, fillPageViews(raw, &views), seen);
+        if (member_fence.shouldWithdraw(facts.own_page_live, word, fresh)) {
+            client.unregister(client.key) catch {};
+            log.warn("meta volume {s}: succession re-registration withdrawn — this incarnation's page is not Live", .{ctx.path});
+        }
+    }
+
+    fn fillPageViews(pages: []const page.Page, views: []member_fence.PageView) []member_fence.PageView {
+        const n = @min(pages.len, views.len);
+        for (pages[0..n], 0..) |p, i| {
+            views[i] = .{
+                .appender_id = p.appender_id,
+                .state = switch (p.state) {
+                    .free => .free,
+                    .live => .live,
+                    .recovering => .recovering,
+                    .recovered => .recovered,
+                },
+                .writer_id = p.identity.writer_id,
+                .node_token = p.identity.node_token,
+                .term = p.term,
+            };
+        }
+        return views[0..n];
+    }
+
+    /// One metadata reservation report from this joiner's own client
+    /// (`fence`). A joined mount has no guard. No fence (a file, a loop
+    /// device, RESCAP 0, the seam), or a failed report, stays unreadable.
+    /// Report does not take `pr_sem`.
+    fn reservationReport(self: *JoinedSet) member_fence.ReportView {
+        const f = self.fence orelse return .{};
+        const facts = host_fence.reportFacts(f.client) catch return .{};
+        return .{ .readable = true, .rtype = facts.rtype, .host_registered = facts.registered };
+    }
+
+    fn page0Writer(pages: []const member_fence.PageView) ?u64 {
+        for (pages) |p| if (p.appender_id == 0 and p.state == .live) return p.writer_id;
+        return null;
     }
 
     /// The pass count FIRST, then the window count: a pass tracks its
@@ -1682,6 +1834,107 @@ fn mapReopen(e: backend.OpenError) OpenError {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "member fence: JoinedSet.writePages names Held" {
+    try testing.expect(member_fence.fnErrorSetHas(JoinedSet.writePages, "Held"));
+}
+
+test "member fence: the census report is the joiner's client" {
+    var js: JoinedSet = undefined;
+    js.fence = null;
+    try testing.expect(!js.reservationReport().readable);
+
+    const fake = @import("../guard/fake_nvme.zig");
+    const fencing = @import("membership/fencing.zig");
+    const nvme = @import("../guard/nvme_cmd.zig");
+    var ns = fake.Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var h: fake.Host = .{ .ns = &ns, .host_id = "this-host-id-001".* };
+    var c = try pr.Client.init(testing.allocator, h.face(), 1, 0x4242);
+    defer c.deinit();
+    try fencing.acquireManagerHold(&c);
+    var joiner: host_fence.Joiner = undefined;
+    joiner.client = &c;
+    js.fence = &joiner;
+    const view = js.reservationReport();
+    try testing.expect(view.readable);
+    try testing.expect(view.host_registered);
+    try testing.expectEqual(nvme.RTYPE_WERO, view.rtype);
+}
+
+test "member fence: a succession re-registers a current joiner and withdraws if its page left Live" {
+    const fake = @import("../guard/fake_nvme.zig");
+    const fencing = @import("membership/fencing.zig");
+    const linux = std.os.linux;
+    const gpa = testing.allocator;
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/member-fence-rereg-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var probe = host_fence.Registry.at(base, .set, 0x51);
+    probe.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    probe.unlock();
+
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var mh: fake.Host = .{ .ns = &ns, .host_id = "manager-host-id1".* };
+    var jh: fake.Host = .{ .ns = &ns, .host_id = "joiner-host-id-2".* };
+    var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer m.deinit();
+    try fencing.acquireManagerHold(&m);
+    var j = try pr.Client.init(gpa, jh.face(), 1, 0x2222);
+    defer j.deinit();
+    _ = try fencing.joinAsRegistrant(&j, null);
+    try m.preempt(j.key);
+    try testing.expect(!try host_fence.hostRegistered(&j));
+
+    const who = member_fence.SelfView{ .appender_id = 2, .writer_id = 0xC0, .node_token = 0xC, .term = 1, .mgr_writer = 0xA0 };
+    var live_pages = [_]page.Page{ succLivePage(0, 0xA, 0xA0), succLivePage(2, 0xC, 0xC0) };
+    var src: SuccPages = .{ .live = &live_pages, .dead = &live_pages, .flip_after = 100 };
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var reg = host_fence.Registry.at(base, .set, 0x51);
+    try reg.lock();
+    defer reg.unlock();
+    const ctx: host_fence.RuleContext = .{ .gpa = gpa, .env = &env, .path = "fake-meta", .local = proc.localIdentity(), .node_token = who.node_token, .vol_index = 0, .taking_manager = false };
+    var word: member_fence.Resolution = .{};
+    JoinedSet.runSuccessionRegister(ctx, &reg, &j, src.source(), who, .{}, &word, host_fence.joinRegister(&env));
+    try testing.expect(try host_fence.hostRegistered(&j));
+
+    try m.preempt(j.key);
+    try testing.expect(!try host_fence.hostRegistered(&j));
+    var dead_pages = live_pages;
+    dead_pages[1].state = .recovering;
+    src = .{ .live = &live_pages, .dead = &dead_pages, .flip_after = 2 };
+    var word2: member_fence.Resolution = .{};
+    JoinedSet.runSuccessionRegister(ctx, &reg, &j, src.source(), who, .{}, &word2, host_fence.joinRegister(&env));
+    try testing.expect(!try host_fence.hostRegistered(&j));
+}
+
+fn succLivePage(aid: u32, node: u64, wid: u64) page.Page {
+    var p = page.Page.free(aid, 1, .{});
+    p.state = .live;
+    p.term = 1;
+    p.identity = .{ .node_token = node, .mount_slot = 7, .writer_id = wid };
+    return p;
+}
+
+const SuccPages = struct {
+    live: []const page.Page,
+    dead: []const page.Page,
+    flip_after: u32,
+    reads: u32 = 0,
+
+    fn source(self: *SuccPages) host_fence.PageSource {
+        return .{ .ctx = self, .read = &read };
+    }
+
+    fn read(ctx: *anyopaque, gpa: Allocator) error{ Io, Corrupt, OutOfMemory }![]page.Page {
+        const self: *SuccPages = @ptrCast(@alignCast(ctx));
+        self.reads += 1;
+        const src = if (self.reads <= self.flip_after) self.live else self.dead;
+        return gpa.dupe(page.Page, src);
+    }
+};
 
 test "a joiner's mount slot derives from the mount point with bit 31 set: never a manager's lane index, distinct across mount points, stable" {
     const a = joinerMountSlot("/mnt-b");

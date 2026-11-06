@@ -129,6 +129,7 @@ const routing = @import("routing.zig");
 const slot_state = routing.slot_state;
 const stamp_cell = routing.stamp_cell;
 const sym = @import("sym.zig");
+const member_fence = @import("guard/member_fence.zig");
 const data_bitmap = @import("../data/sym_planes/data_bitmap.zig");
 const sym_records = @import("../data/sym_planes/records.zig");
 const slots_plane = @import("sym/slots/plane.zig");
@@ -371,7 +372,7 @@ pub const FormatOptions = struct {
 
 /// The image plan's own classes as themselves (`format.FormatError`;
 /// decision 0003 §CS), the device's and the registration's.
-pub const FormatError = format.FormatError || error{ DeviceRefused, Io, OutOfMemory, Corrupt, CannotStat, NotADeviceOrFile, Unexpected };
+pub const FormatError = format.FormatError || error{ DeviceRefused, Io, Held, OutOfMemory, Corrupt, CannotStat, NotADeviceOrFile, Unexpected };
 
 /// `squeezefs format`: register the device (O_DIRECT from the first byte),
 /// plan the image, write the steps with their barriers in the plan's
@@ -1181,9 +1182,13 @@ pub const KvBackend = struct {
             error.OutOfMemory => error.OutOfMemory,
         };
         be.joined = js;
+        be.dev.readmit = joinedReadmit;
+        be.dev.readmit_ctx = be;
         errdefer {
             js.deinit();
             be.joined = null;
+            be.dev.readmit = null;
+            be.dev.readmit_ctx = null;
         }
         be.slots = try slots_plane.Plane.init(gpa, io, be, opts.env);
         errdefer be.slots.deinit();
@@ -1213,7 +1218,7 @@ pub const KvBackend = struct {
             .core = &be.core,
             .registry = &be.reg,
             .ring_stats = &be.ring_stats,
-            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook, .barrier_started = laneBarrierStartedHook, .barrier_landed = laneBarrierLandedHook, .cover_upto = laneCoverHook },
+            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook, .barrier_started = laneBarrierStartedHook, .barrier_landed = laneBarrierLandedHook, .cover_upto = laneCoverHook, .readmit = joinedReadmit },
             .test_error_logs = opts.test_error_logs,
         }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1608,6 +1613,12 @@ pub const KvBackend = struct {
 
     /// The joined posture's `RecordSource.appenderPages`: the page IS the
     /// record (`sym/joined.zig`).
+    fn joinedReadmit(ctx: ?*anyopaque, op: member_fence.Op, class: member_fence.Class) member_fence.Verdict {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx.?));
+        const js = be.joined orelse return .latch;
+        return js.readmit.answer(op, class);
+    }
+
     fn joinedPagesHook(ctx: *anyopaque, rec: *const ledger.LedgerRecord, _: bool) checkpoint_cycle.IoError!void {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
         return be.joined.?.onCheckpoint(rec);

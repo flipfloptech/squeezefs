@@ -44,6 +44,7 @@ const alloc_ext = @import("../alloc_ext.zig");
 const ledger = @import("../ledger.zig");
 const geometry = @import("../geometry.zig");
 const checkpoint_cycle = @import("../checkpoint_cycle.zig");
+const member_fence = @import("../guard/member_fence.zig");
 const record = @import("../record.zig");
 const sym = @import("../sym.zig");
 const page = @import("appender_page.zig");
@@ -308,14 +309,19 @@ pub const AppenderSet = struct {
     }
 
     /// The page plan executed: every slot the law names, then one barrier.
-    pub fn writePages(self: *AppenderSet, r: *Region, from_cycle: bool) error{ Io, Corrupt, OutOfMemory }!void {
+    pub fn writePages(self: *AppenderSet, r: *Region, from_cycle: bool) error{ Io, Held, Corrupt, OutOfMemory }!void {
         var plan = r.core.planPageWrite() catch return error.Corrupt;
         for (plan.slice()) |w| {
-            self.be.pool.writeAt(self.be.path, w.offset, &w.image) catch return error.Io;
+            self.be.pool.writeAt(self.be.path, w.offset, &w.image) catch |e| return self.mapWrite(e);
             sym.stats.appender_page_writes.inc();
         }
-        if (!from_cycle) self.be.dev.barrier() catch return error.Io;
+        if (!from_cycle) self.be.dev.barrier() catch |e| return self.mapWrite(e);
         r.core.pageWritten(&plan);
+    }
+
+    fn mapWrite(self: *AppenderSet, e: anyerror) error{ Io, Held } {
+        if (member_fence.isHeld(self.be.dev.readmit, self.be.dev.readmit_ctx, e, .write)) return error.Held;
+        return member_fence.mapDeviceWrite(e);
     }
 
     /// `RecordSource.appenderPages` (the cycle's C11): every region's page
@@ -354,7 +360,10 @@ pub const AppenderSet = struct {
             // The ONE page writer's plan: the leased slots ranked by what
             // each loses if dropped, publish-before-drop into tree 0.
             self.be.slots.planPage(r.appenderId(), &r.core) catch return error.Io;
-            self.writePages(r, true) catch return error.Io;
+            self.writePages(r, true) catch |e| return switch (e) {
+                error.Held => error.Held,
+                else => error.Io,
+            };
             self.be.slots.pageLanded(&r.core);
         }
         // The cadence: its own flight after the tick, never inline.
@@ -825,24 +834,24 @@ pub const AppenderSet = struct {
         @memcpy(out, img[0..page.PAGE_LEN]);
     }
 
-    fn writePagesFn(ctx: *anyopaque, writes: []const manager.PageWriteOp) error{Io}!void {
+    fn writePagesFn(ctx: *anyopaque, writes: []const manager.PageWriteOp) error{ Io, Held }!void {
         const self = self_(ctx);
-        for (writes) |w| self.be.pool.writeAt(self.be.path, w.offset, w.image) catch return error.Io;
-        self.be.dev.barrier() catch return error.Io;
+        for (writes) |w| self.be.pool.writeAt(self.be.path, w.offset, w.image) catch |e| return self.mapWrite(e);
+        self.be.dev.barrier() catch |e| return self.mapWrite(e);
     }
 
-    fn zeroFn(ctx: *anyopaque, chunks: []const region.ZeroChunk) error{Io}!void {
+    fn zeroFn(ctx: *anyopaque, chunks: []const region.ZeroChunk) error{ Io, Held }!void {
         const self = self_(ctx);
         for (chunks) |c| {
             var off = c.offset;
             const end = c.offset + c.len;
             while (off < end) {
                 const n: usize = @intCast(@min(end - off, self.zeros.len));
-                self.be.pool.writeAt(self.be.path, off, self.zeros[0..n]) catch return error.Io;
+                self.be.pool.writeAt(self.be.path, off, self.zeros[0..n]) catch |e| return self.mapWrite(e);
                 off += n;
             }
         }
-        self.be.dev.barrier() catch return error.Io;
+        self.be.dev.barrier() catch |e| return self.mapWrite(e);
     }
 
     fn claimInternalFn(ctx: *anyopaque) error{NoSpace}!u64 {
@@ -927,6 +936,10 @@ pub const AppenderSet = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "member fence: AppenderSet.writePages names Held" {
+    try testing.expect(member_fence.fnErrorSetHas(AppenderSet.writePages, "Held"));
+}
 const linux = std.os.linux;
 const exec = @import("../../exec/exec.zig");
 const align_probe = @import("../../io/align_probe.zig");

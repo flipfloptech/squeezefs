@@ -82,7 +82,7 @@ pub const CycleTape = ckpt.CycleTape;
 
 const ns_per_ms: u64 = std.time.ns_per_ms;
 
-pub const IoError = error{Io};
+pub const IoError = error{ Io, Held };
 
 /// What a failed flush step carries: the freeze's, the append's and the
 /// structural seam's classes (`smo.Error` coerces into it), each AS ITSELF
@@ -97,7 +97,7 @@ pub const PublishError = error{ ForestKeyRefused, VolumeClosed, HoleCheckpointFa
 /// The cycle's classes: the device (`Io`, latched per the lattice), a record
 /// that cannot encode or a protocol inconsistency (`Corrupt`), allocation,
 /// the wedge terminal, and a flush step's or a publish's failure as itself.
-pub const CycleError = error{ Io, Corrupt, OutOfMemory, VolumeFailed } || FlushError || PublishError;
+pub const CycleError = error{ Io, Held, Corrupt, OutOfMemory, VolumeFailed } || FlushError || PublishError;
 
 // ---------------------------------------------------------------------------
 // The seams: device effects and the structural task, as typed function-
@@ -654,16 +654,17 @@ pub const Checkpointer = struct {
     /// in a row latch) and covers nothing. The FENCE rung (a
     /// reservation-conflict errno at ANY barrier latches FAILED at once,
     /// charter §5.7) is classified by the device sink's typed outcome
-    /// BEFORE it narrows to `IoError` (`device_loader.DeviceLoader.latch`,
-    /// the one funnel of every checkpoint-side write and barrier); a
-    /// fenced latch reads FAILED here already, so the generic count below
-    /// never undoes it.
+    /// BEFORE it returns (`device_loader.DeviceLoader.latch`, the one
+    /// funnel of every checkpoint-side write and barrier). A `.held`
+    /// answer (decision 0004 §4.5) is preserved as `error.Held` and is
+    /// not a failure count. A fenced latch reads FAILED here already, so
+    /// the generic count below never undoes it.
     pub fn syncDevice(self: *Checkpointer) IoError!void {
         ckpt.stats.meta_device_syncs.inc();
         const started_at = self.barrierStarted();
         const t0 = clock.monotonicNs();
         self.deps.barrier.barrier(self.deps.barrier.ctx) catch |e| {
-            _ = self.deps.latch.noteFailure(.barrier);
+            if (e != error.Held) _ = self.deps.latch.noteFailure(.barrier);
             return e;
         };
         self.deps.latch.noteSuccess(.barrier);

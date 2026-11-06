@@ -61,6 +61,10 @@ pub const Retryable = error{
     /// a re-point in progress): the serve is refused, never answered from
     /// the bounded-staleness projection (decision 0002 row 261).
     TokenChannelStale,
+    /// A metadata refusal while re-registration is pending (decision 0004
+    /// §4.5). The caller drops its locks and retries at its own point.
+    /// Never a fence, never counted toward a failure latch, never EIO.
+    Held,
 };
 
 /// The device, the kernel or the lane answered, and the answer is final
@@ -220,7 +224,7 @@ pub fn isMoveClass(err: Error) bool {
 
 pub fn classOf(err: Error) Class {
     return switch (err) {
-        error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted, error.TokenChannelStale => .retryable,
+        error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted, error.TokenChannelStale, error.Held => .retryable,
         error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.FencerNode, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported, error.VolumeFailed, error.LaneStopped, error.Busy, error.UnsupportedVolume, error.MalformedKey, error.ValueTooLarge, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused, error.UnknownLease, error.ReaderFailStopped => .refusal,
         else => .terminal,
     };
@@ -323,7 +327,7 @@ pub fn toErrno(err: Error) linux.E {
     return switch (err) {
         // Backpressure and the wire's typed retryable classes: retry, never
         // "bad argument" (charter §5.5).
-        error.QueueFull, error.LaneQueueFull, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted, error.TokenChannelStale => .AGAIN,
+        error.QueueFull, error.LaneQueueFull, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted, error.TokenChannelStale, error.Held => .AGAIN,
         // Refusals: the caller's shape or the device's admissibility; a
         // wire word the screen refused; a foreign vocabulary.
         error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.FencerNode, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.DirectIoUnsupported, error.UnsupportedVolume, error.MalformedKey, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused => .INVAL,
@@ -401,6 +405,9 @@ test "classes: backpressure is retryable and replies EAGAIN, never EINVAL; refus
     try testing.expectEqual(Class.retryable, classOf(error.LaneQueueFull));
     try testing.expectEqual(linux.E.AGAIN, toErrno(error.QueueFull));
     try testing.expectEqual(linux.E.AGAIN, toErrno(error.LaneQueueFull));
+    try testing.expectEqual(Class.retryable, classOf(error.Held));
+    try testing.expectEqual(linux.E.AGAIN, toErrno(error.Held));
+    try testing.expect(!isMoveClass(error.Held));
     try testing.expectEqual(Class.refusal, classOf(error.UnalignedDirectWrite));
     try testing.expectEqual(linux.E.INVAL, toErrno(error.UnalignedDirectWrite));
     try testing.expectEqual(linux.E.INVAL, toErrno(error.ReadSizeExceedsPool));

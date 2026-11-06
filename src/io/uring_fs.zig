@@ -354,6 +354,13 @@ const Request = union(enum) {
     fdatasync: struct { path: []const u8, direct: bool },
 };
 
+fn isPositionalWrite(req: Request) bool {
+    return switch (req) {
+        .write_at, .write_at_batch => true,
+        else => false,
+    };
+}
+
 /// One preallocated request cell: the request, and the ONE completion the
 /// caller parks on (`sync/completion.zig`). The queue carries its index.
 const Cell = struct {
@@ -1052,6 +1059,9 @@ pub const Pool = struct {
     reactors: []Reactor,
     threads: []std.Thread,
     stopped: bool = false,
+    /// Positional writes queued or in the ring and not yet completed
+    /// (DO.33: a reservation command waits until this is zero).
+    writes_outstanding: std.atomic.Value(u64) = .init(0),
 
     /// Rings are created HERE, on the caller, so a box that cannot do io_uring
     /// refuses at startup rather than degrading a worker later.
@@ -1151,7 +1161,10 @@ pub const Pool = struct {
     /// Worker side: publish the outcome; when the caller abandoned its
     /// handle, release what the outcome still owns and free the cell here.
     fn completeCell(self: *Pool, idx: u32, outcome: Outcome) void {
-        if (self.cells[idx].done.complete(outcome)) return;
+        const write = isPositionalWrite(self.cells[idx].req);
+        const waiting = self.cells[idx].done.complete(outcome);
+        if (write) _ = self.writes_outstanding.fetchSub(1, .acq_rel);
+        if (waiting) return;
         switch (outcome) {
             .read => |r| if (r) |res| {
                 var rr = res;
@@ -1177,7 +1190,13 @@ pub const Pool = struct {
                 error.Closed => error.WorkerClosed,
             };
         };
+        if (isPositionalWrite(req)) _ = self.writes_outstanding.fetchAdd(1, .acq_rel);
         return idx;
+    }
+
+    /// Writes already submitted on this pool that have no completion yet.
+    pub fn writesOutstanding(self: *const Pool) u64 {
+        return self.writes_outstanding.load(.acquire);
     }
 
     /// Park on a cell's completion and give the cell back.
@@ -1984,6 +2003,26 @@ test "write_at_batch propagates an open failure as the batch's error" {
     const ops = [_]WriteOp{.{ .offset = 0, .data = "x" }};
     try testing.expectError(Error.FileNotFound, pool.writeAtBatch("/proc/definitely/not/here/file", &ops));
     try testing.expectError(Error.FileNotFound, pool.fdatasync("/proc/definitely/not/here/file"));
+}
+
+test "member fence: a submitted write is outstanding until its completion" {
+    var tp = try TmpPath.init();
+    defer tp.deinit();
+    const pool = try testPool(1);
+    defer pool.deinit();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = tp.join(&pbuf, "drain.dat");
+    try pool.writeAll(path, "seed");
+    try testing.expectEqual(@as(u64, 0), pool.writesOutstanding());
+    var handle = try pool.submitWriteAt(path, 0, "abcd");
+    if (!handle.pollDone()) try testing.expectEqual(@as(u64, 1), pool.writesOutstanding());
+    try handle.wait();
+    try testing.expectEqual(@as(u64, 0), pool.writesOutstanding());
+    try pool.writeAt(path, 0, "efgh");
+    try testing.expectEqual(@as(u64, 0), pool.writesOutstanding());
+    var empty = try pool.submitWriteAt(path, 0, "");
+    try testing.expectEqual(@as(u64, 0), pool.writesOutstanding());
+    try empty.wait();
 }
 
 /// Counts the frees of the allocations of exactly `len` bytes (a test's

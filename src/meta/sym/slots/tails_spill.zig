@@ -40,7 +40,7 @@ pub const stats = struct {
     pub var slot_tails_spill_refused: counters.ShardedCounter = .{};
 };
 
-pub const Error = error{ NoSpace, Io, OutOfMemory };
+pub const Error = error{ NoSpace, Io, Held, OutOfMemory };
 
 /// A spilled set as written: the record's runs and hash, and the extents
 /// (indices) the entry must carry as `alloc` deltas.
@@ -116,7 +116,10 @@ pub fn spill(gpa: Allocator, vol: manager.Volume, tails: []const cr.TailEntry) E
         while (off < img.len) : (off += page.PAGE_LEN) try writes.append(gpa, .{ .offset = addr + off, .image = img[@intCast(off)..][0..page.PAGE_LEN] });
         at += count;
     }
-    vol.vt.writePages(vol.ctx, writes.items) catch return error.Io;
+    vol.vt.writePages(vol.ctx, writes.items) catch |e| return switch (e) {
+        error.Held => error.Held,
+        else => error.Io,
+    };
     stats.slot_tails_spills.inc();
     stats.slot_tails_spill_extents.add(n_ext);
     return .{ .gpa = gpa, .runs = runs, .extents = try extents.toOwnedSlice(gpa), .csum = hasher.finalLow64() };

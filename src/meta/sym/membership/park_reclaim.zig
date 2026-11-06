@@ -66,6 +66,11 @@ pub const Phase = enum(u8) {
 
 pub const Word = enum(u32) { running = 0, parked = 1, expired = 2, retired = 3 };
 
+/// Why the gate is parked. `t_self` is a manager the member cannot reach.
+/// `succession` is a metadata refusal while re-registration is pending
+/// (decision 0004 §4.5.3). The gate's waits are the same either way.
+pub const Reason = enum { t_self, succession };
+
 /// `T_park_max = manager_failover_bound_ms + grace_ms`: the longest a live
 /// successor can take to arm (the TTL the D0 ladder waits out + its ladder
 /// + the ring replay) and then admit reclaims (its grace window).
@@ -106,6 +111,9 @@ pub const ParkGate = struct {
     inflight: std.atomic.Value(u32) = .init(0),
     parked_at_mono_ns: std.atomic.Value(u64) = .init(0),
     t_park_max_ms: u64,
+    reason: Reason = .t_self,
+    /// The observed bind `extendTo` already granted. Zero means none.
+    extended_for: std.atomic.Value(u64) = .init(0),
     home_volume: u16,
     admission_wake: notify.Notify = .init,
     ack_wake: notify.Notify = .init,
@@ -211,13 +219,35 @@ pub const ParkGate = struct {
     /// already parked or expired (a second park is idempotent — the CAS is
     /// the one latch between the beat and the committers judging `T_self`).
     pub fn park(self: *ParkGate, now_mono_ns: u64) ?u32 {
+        return self.parkFor(.t_self, now_mono_ns);
+    }
+
+    /// Park for `reason`. Null when this call did not park (already parked,
+    /// expired or retired).
+    pub fn parkFor(self: *ParkGate, reason: Reason, now_mono_ns: u64) ?u32 {
         if (self.state.cmpxchgStrong(@backingInt(Word.running), @backingInt(Word.parked), .seq_cst, .seq_cst) != null) return null;
+        self.reason = reason;
+        self.extended_for.store(0, .release);
         self.parked_at_mono_ns.store(now_mono_ns, .release);
         const inflight = self.inflight.load(.seq_cst);
         stats.appender_parks.inc();
         stats.appender_parked.set(@backingInt(Word.parked));
-        log.warn("appender park: T_self reached with the home volume {d}'s manager unreachable — parked with {d} commit(s) in flight (acks held), reclaiming against the successor for up to {d} ms", .{ self.home_volume, inflight, self.t_park_max_ms });
+        switch (reason) {
+            .t_self => log.warn("appender park: T_self reached with the home volume {d}'s manager unreachable — parked with {d} commit(s) in flight (acks held), reclaiming against the successor for up to {d} ms", .{ self.home_volume, inflight, self.t_park_max_ms }),
+            .succession => log.warn("appender park: a metadata succession is pending on home volume {d} — parked with {d} commit(s) in flight (acks held) for up to {d} ms", .{ self.home_volume, inflight, self.t_park_max_ms }),
+        }
         return inflight;
+    }
+
+    /// Raise the park deadline to `deadline_ms`, once for this observed
+    /// `bind`. A repeat of the same bind does nothing. Not parked: false.
+    pub fn extendTo(self: *ParkGate, bind: u64, deadline_ms: u64) bool {
+        if (bind == 0 or !self.isParked()) return false;
+        const prev = self.extended_for.load(.acquire);
+        if (prev == bind) return false;
+        if (self.extended_for.cmpxchgStrong(prev, bind, .acq_rel, .acquire) != null) return false;
+        if (deadline_ms > self.t_park_max_ms) self.t_park_max_ms = deadline_ms;
+        return true;
     }
 
     /// `hold_acks`: an entry that landed under a park holds its ack on the
@@ -258,6 +288,8 @@ pub const ParkGate = struct {
     /// `expire*`), every parker woken, the phases recorded exact-sum.
     pub fn release(self: *ParkGate, wait_successor_ns: u64, reclaim_rtt_ns: u64) bool {
         if (self.state.cmpxchgStrong(@backingInt(Word.parked), @backingInt(Word.running), .seq_cst, .seq_cst) != null) return false;
+        self.extended_for.store(0, .release);
+        self.reason = .t_self;
         stats.appender_parked.set(@backingInt(Word.running));
         stats.slot_lease_reclaims.inc();
         stats.appender_park_ns[@backingInt(Phase.wait_successor)].record(wait_successor_ns);
@@ -393,6 +425,25 @@ const Poison = struct {
         return .{ .ctx = self, .poison = &poison };
     }
 };
+
+test "member fence: a succession park reuses the gate, and extendTo grants one deadline per observed bind" {
+    var g = ParkGate.arm(testing.io, 3, 1000);
+    try testing.expectEqual(Reason.t_self, g.reason);
+    try testing.expect(!g.extendTo(1, 5000));
+    try testing.expectEqual(@as(?u32, 0), g.parkFor(.succession, 10));
+    try testing.expect(g.isParked());
+    try testing.expectEqual(Reason.succession, g.reason);
+    try testing.expectEqual(@as(?u32, null), g.parkFor(.succession, 11));
+    try testing.expect(g.extendTo(7, 5000));
+    try testing.expectEqual(@as(u64, 5000), g.t_park_max_ms);
+    try testing.expect(!g.extendTo(7, 9000));
+    try testing.expectEqual(@as(u64, 5000), g.t_park_max_ms);
+    try testing.expect(g.extendTo(8, 2000));
+    try testing.expectEqual(@as(u64, 5000), g.t_park_max_ms);
+    try testing.expect(g.release(0, 0));
+    try testing.expectEqual(Reason.t_self, g.reason);
+    try testing.expect(!g.extendTo(8, 9000));
+}
 
 test "ties: T_park_max = failover_bound + grace (≈ 91.5 s at the design's row); grace = T_owner" {
     try testing.expectEqual(@as(u64, 46_500 + 45_000), tParkMaxMs(46_500, graceMs(lease_clock.T_OWNER_MS)));

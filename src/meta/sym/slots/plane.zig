@@ -1282,6 +1282,7 @@ pub const Plane = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.Corrupt => error.Corrupt,
             error.Io => error.Io,
+            error.Held => error.HandoverDeferred,
         };
     }
 

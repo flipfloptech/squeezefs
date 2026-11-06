@@ -206,7 +206,7 @@ pub var test_freeze_encode_fail: std.atomic.Value(u64) = .init(0);
 // The loader: byte images in and out.
 // ---------------------------------------------------------------------------
 
-pub const LoaderError = error{Io};
+pub const LoaderError = error{ Io, Held };
 
 /// The device binding: one extent read, one tail-page append, one whole
 /// fresh-image write. All are synchronous from the caller's view (the

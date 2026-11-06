@@ -479,6 +479,7 @@ pub const VolumeBinding = struct {
         const self = self_(ctx);
         return tails_spill.spill(gpa, self.set().volume(), tails) catch |e| switch (e) {
             error.NoSpace => error.Corrupt,
+            error.Held => error.Deferred,
             error.Io => error.Io,
             error.OutOfMemory => error.OutOfMemory,
         };
@@ -741,9 +742,12 @@ pub const VolumeBinding = struct {
             return .{ .ctx = self, .vtable = &vt };
         }
 
-        fn write(ctx: *anyopaque, off: u64, bytes: []const u8) error{Io}!void {
+        fn write(ctx: *anyopaque, off: u64, bytes: []const u8) error{ Io, Held }!void {
             const self: *DeviceRegion = @ptrCast(@alignCast(ctx));
-            self.be.pool.writeAt(self.be.path, off, bytes) catch return error.Io;
+            self.be.pool.writeAt(self.be.path, off, bytes) catch |e| return switch (e) {
+                error.Held => error.Held,
+                else => error.Io,
+            };
         }
 
         fn read(ctx: *anyopaque, off: u64, out: []u8) error{Io}!void {
@@ -753,9 +757,12 @@ pub const VolumeBinding = struct {
             @memcpy(out, img[0..out.len]);
         }
 
-        fn barrier(ctx: *anyopaque) error{Io}!void {
+        fn barrier(ctx: *anyopaque) error{ Io, Held }!void {
             const self: *DeviceRegion = @ptrCast(@alignCast(ctx));
-            self.be.dev.barrier() catch return error.Io;
+            self.be.dev.barrier() catch |e| return switch (e) {
+                error.Held => error.Held,
+                else => error.Io,
+            };
         }
     };
 

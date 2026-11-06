@@ -26,6 +26,7 @@ pub const lease_clock_model = @import("guard/lease_clock_model.zig");
 pub const nvme_cmd = @import("guard/nvme_cmd.zig");
 pub const fake_nvme = @import("guard/fake_nvme.zig");
 pub const pr = @import("guard/pr.zig");
+pub const member_fence = @import("guard/member_fence.zig");
 pub const host_fence_model = @import("guard/host_fence_model.zig");
 pub const data_fence_model = @import("guard/data_fence_model.zig");
 pub const meta_fence_model = @import("guard/meta_fence_model.zig");
@@ -143,6 +144,7 @@ test {
     _ = nvme_cmd;
     _ = fake_nvme;
     _ = pr;
+    _ = member_fence;
     _ = host_fence_model;
     _ = data_fence_model;
     _ = meta_fence_model;

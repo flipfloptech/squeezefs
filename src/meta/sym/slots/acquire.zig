@@ -885,6 +885,7 @@ pub const Verbs = struct {
                     log.warn("slot leases: slot {d}'s {d} leaf tails exceed the inline cap and the heap refused the spill — released WITHOUT its tails (its leaves screen by the lease alone)", .{ req.slot, req.tails.len });
                     tails_rec = null;
                 },
+                error.Held => return error.Deferred,
                 error.Io => return error.Io,
                 error.OutOfMemory => return error.OutOfMemory,
             }

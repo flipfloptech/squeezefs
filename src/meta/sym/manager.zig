@@ -391,6 +391,8 @@ pub const VerbError = error{
     NoSpace,
     Capacity,
     Io,
+    /// A metadata refusal while re-registration is pending. The verb retries.
+    Held,
     Corrupt,
     OutOfMemory,
 };
@@ -419,6 +421,10 @@ pub fn classify(e: VerbError, kick: ?*const fn (ctx: *anyopaque) void, kick_ctx:
         error.NoSpace => .{ .status = .refused, .reason = .no_space },
         error.Refused => .{ .status = .refused, .reason = .durable_witness },
         error.Io => .{ .status = .refused, .reason = .io },
+        error.Held => blk: {
+            stats.manager_verb_deferrals.inc();
+            break :blk .{ .status = .deferred, .reason = .door_moving_tail };
+        },
         error.Corrupt => .{ .status = .refused, .reason = .corrupt },
         error.OutOfMemory => .{ .status = .refused, .reason = .io },
     };
@@ -497,8 +503,8 @@ pub const Volume = struct {
         controlEntry: *const fn (ctx: *anyopaque, recs: []const ControlRecord) ControlError!void,
         readPage: *const fn (ctx: *anyopaque, offset: u64, out: *[page.PAGE_LEN]u8) error{Io}!void,
         /// The writes land, then ONE barrier.
-        writePages: *const fn (ctx: *anyopaque, writes: []const PageWriteOp) error{Io}!void,
-        zero: *const fn (ctx: *anyopaque, chunks: []const region.ZeroChunk) error{Io}!void,
+        writePages: *const fn (ctx: *anyopaque, writes: []const PageWriteOp) error{ Io, Held }!void,
+        zero: *const fn (ctx: *anyopaque, chunks: []const region.ZeroChunk) error{ Io, Held }!void,
         /// The internal class (the manager's structural claims).
         claimInternal: *const fn (ctx: *anyopaque) error{NoSpace}!u64,
         /// An extent no durable record ever named goes back at once.
@@ -1029,7 +1035,10 @@ pub const Manager = struct {
             p.encode(&imgs[i]) catch return error.Corrupt;
             ops[i] = .{ .offset = dir_slots[i], .image = &imgs[i] };
         }
-        self.vol.vt.writePages(self.vol.ctx, &ops) catch return error.Io;
+        self.vol.vt.writePages(self.vol.ctx, &ops) catch |e| return switch (e) {
+            error.Held => error.Held,
+            else => error.Io,
+        };
     }
 
     /// Grow the chain by one extent: zero, header + barrier, relink + barrier.
@@ -1039,11 +1048,17 @@ pub const Manager = struct {
         const link: Extent = .{ .start = g.heap.start + ext_idx * g.node_size, .len = g.node_size };
         const chunks = try region.zeroPlan(self.gpa, &.{link});
         defer self.gpa.free(chunks);
-        self.vol.vt.zero(self.vol.ctx, chunks) catch return error.Io;
+        self.vol.vt.zero(self.vol.ctx, chunks) catch |e| return switch (e) {
+            error.Held => error.Held,
+            else => error.Io,
+        };
         const last = d.links.items[d.links.items.len - 1];
         const steps = dir.growPlan(last, link);
         for (steps) |s| {
-            self.vol.vt.writePages(self.vol.ctx, &.{.{ .offset = s.offset, .image = &s.image }}) catch return error.Io;
+            self.vol.vt.writePages(self.vol.ctx, &.{.{ .offset = s.offset, .image = &s.image }}) catch |e| return switch (e) {
+                error.Held => error.Held,
+                else => error.Io,
+            };
         }
         try self.control(&.{.{ .alloc = ext_idx }});
         try d.links.append(self.gpa, .{ .extent = link, .header = dir.Header.decode(&steps[0].image) catch unreachable });
@@ -1740,7 +1755,10 @@ pub const Manager = struct {
         const seg = region.runExtent(g.heap.start, g.node_size, best);
         const chunks = try region.zeroPlan(self.gpa, &.{seg});
         defer self.gpa.free(chunks);
-        self.vol.vt.zero(self.vol.ctx, chunks) catch return error.Io;
+        self.vol.vt.zero(self.vol.ctx, chunks) catch |ze| return switch (ze) {
+            error.Held => error.Held,
+            else => error.Io,
+        };
         // 6. The alloc deltas + the hint put with the pending witness.
         var h = hint;
         h.ring_bytes = @max(p.ringBytes() + seg.len, hint.ring_bytes);
@@ -2156,13 +2174,13 @@ pub const TestVolume = struct {
         @memcpy(out, self.at(offset)[0..page.PAGE_LEN]);
     }
 
-    fn writePagesFn(ctx: *anyopaque, writes: []const PageWriteOp) error{Io}!void {
+    fn writePagesFn(ctx: *anyopaque, writes: []const PageWriteOp) error{ Io, Held }!void {
         const self = self_(ctx);
         for (writes) |w| @memcpy(self.at(w.offset)[0..page.PAGE_LEN], w.image);
         self.barriers += 1;
     }
 
-    fn zeroFn(ctx: *anyopaque, chunks: []const region.ZeroChunk) error{Io}!void {
+    fn zeroFn(ctx: *anyopaque, chunks: []const region.ZeroChunk) error{ Io, Held }!void {
         const self = self_(ctx);
         for (chunks) |c| {
             @memset(self.at(c.offset)[0..@intCast(c.len)], 0);

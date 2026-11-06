@@ -126,7 +126,7 @@ pub fn join(gpa: Allocator, door: Door, in: JoinInputs) JoinError!JoinedRegion {
             break :blk error.Capacity;
         },
         error.Rejected => error.Rejected,
-        error.Deferred, error.JournalReserveExhausted => error.Deferred,
+        error.Deferred, error.JournalReserveExhausted, error.Held => error.Deferred,
         error.NoSpace => error.Io,
         error.Refused => error.Corrupt,
         error.Io => error.Io,
@@ -192,7 +192,7 @@ pub fn leave(gpa: Allocator, door: Door, jr: *JoinedRegion) JoinError!manager.Le
     defer runs.deinit(gpa);
     try jr.grant.unclaimedRuns(gpa, &runs);
     return door.leave(door.ctx, .{ .identity = jr.identity, .appender_id = jr.appenderId(), .unclaimed = runs.items, .in_process = door.in_process }) catch |e| switch (e) {
-        error.Deferred, error.JournalReserveExhausted => error.Deferred,
+        error.Deferred, error.JournalReserveExhausted, error.Held => error.Deferred,
         error.Rejected => error.Rejected,
         error.OutOfMemory => error.OutOfMemory,
         error.Io, error.NoSpace => error.Io,

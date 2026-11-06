@@ -1011,13 +1011,13 @@ pub const RegionIo = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
     pub const VTable = struct {
-        write: *const fn (*anyopaque, off: u64, bytes: []const u8) error{Io}!void,
+        write: *const fn (*anyopaque, off: u64, bytes: []const u8) error{ Io, Held }!void,
         read: *const fn (*anyopaque, off: u64, out: []u8) error{Io}!void,
-        barrier: *const fn (*anyopaque) error{Io}!void,
+        barrier: *const fn (*anyopaque) error{ Io, Held }!void,
     };
 };
 
-pub const HoldError = error{ GrantExhausted, Io, OutOfMemory, TooManyRefs };
+pub const HoldError = error{ GrantExhausted, Io, Held, OutOfMemory, TooManyRefs };
 
 /// `extents_needed = max(1, ceil(region_len / node_size))` claimed from
 /// the pool; the image written across the claims in claim order and
@@ -1093,7 +1093,7 @@ pub fn regionToDevice(refs: []const records.BitmapRef, offset: u64) ?u64 {
 /// written through the refs; the cycle's own barrier #1 covers them. A
 /// write that fails re-dirties the set (law 1) — the next cycle rewrites.
 /// Returns the pages written.
-pub fn writeDirtyPagesThroughRefs(bm: *DataBitmap, io: RegionIo, refs: []const records.BitmapRef, generation: u64) error{ Io, OutOfMemory, Corrupt }!usize {
+pub fn writeDirtyPagesThroughRefs(bm: *DataBitmap, io: RegionIo, refs: []const records.BitmapRef, generation: u64) error{ Io, Held, OutOfMemory, Corrupt }!usize {
     var set = try bm.takeDirtyPlan(generation);
     defer set.deinit();
     if (set.writes.len == 0) return 0;
@@ -1102,9 +1102,12 @@ pub fn writeDirtyPagesThroughRefs(bm: *DataBitmap, io: RegionIo, refs: []const r
             set.abort(bm);
             return error.Corrupt;
         };
-        io.vtable.write(io.ctx, dev_off, &w.image) catch {
+        io.vtable.write(io.ctx, dev_off, &w.image) catch |e| {
             set.abort(bm);
-            return error.Io;
+            return switch (e) {
+                error.Held => error.Held,
+                else => error.Io,
+            };
         };
     }
     const n = set.writes.len;
@@ -1202,7 +1205,7 @@ pub const RamHome = struct {
         const h: *RamHome = @ptrCast(@alignCast(ctx));
         return h.node_size;
     }
-    fn write(ctx: *anyopaque, off: u64, bytes: []const u8) error{Io}!void {
+    fn write(ctx: *anyopaque, off: u64, bytes: []const u8) error{ Io, Held }!void {
         const h: *RamHome = @ptrCast(@alignCast(ctx));
         if (h.fail_writes) return error.Io;
         @memcpy(h.bytes[@intCast(off)..][0..bytes.len], bytes);
@@ -1212,7 +1215,7 @@ pub const RamHome = struct {
         if (off + out.len > h.bytes.len) return error.Io;
         @memcpy(out, h.bytes[@intCast(off)..][0..out.len]);
     }
-    fn barrier(_: *anyopaque) error{Io}!void {}
+    fn barrier(_: *anyopaque) error{ Io, Held }!void {}
 
     const pool_vtable: ExtentPool.VTable = .{ .claim = &claim, .release = &release, .node_size = &nodeSize };
     const io_vtable: RegionIo.VTable = .{ .write = &write, .read = &read, .barrier = &barrier };

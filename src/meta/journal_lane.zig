@@ -464,6 +464,10 @@ pub const Hooks = struct {
     /// whose members are still applying it is reserved and acked before the
     /// lane sees it. Null = the lane's own pending windows.
     cover_upto: ?*const fn (ctx: ?*anyopaque) u64 = null,
+    /// Decision 0004 §4.5. Consulted at a write or barrier refusal, before
+    /// the fence rung and the failure count. Null keeps today's path.
+    /// `.held` is the only answer this slice honours.
+    readmit: ?*const fn (ctx: ?*anyopaque, op: journal_guard.member_fence.Op, class: journal_guard.member_fence.Class) journal_guard.member_fence.Verdict = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -1567,6 +1571,10 @@ pub const JournalLane = struct {
         while (k < w.group.items.len) : (k += 1) {
             const c = &self.cells[w.group.items[k]];
             if (c.first_err) |e| {
+                if (self.heldRefusal(e, .write)) {
+                    c.verdict = error.Held;
+                    continue;
+                }
                 stats.write_failures.inc();
                 if (self.latch.admitsLine(.window_write)) log.warn("journal lane {d}: window [{d}, {d}) write failed: {s} — rolling back {d} entries", .{ self.index, c.window.start, c.window.end(), @errorName(e), c.entries });
                 // The fence rung FIRST — before the rollback hook, whose
@@ -1622,6 +1630,13 @@ pub const JournalLane = struct {
 
     fn noteJournalFailure(self: *JournalLane) void {
         if (self.latch.noteFailure(.journal_write)) stats.volumes_failed.inc();
+    }
+
+    /// A readmit hook answering `.held` (decision 0004 §4.5). The refusal is
+    /// not a fence and not a failure count: no rollback, no hole checkpoint.
+    /// `.retry` and `.latch` stay on today's path until re-issue lands.
+    fn heldRefusal(self: *JournalLane, e: Error, op: journal_guard.member_fence.Op) bool {
+        return journal_guard.member_fence.isHeld(self.hooks.readmit, self.hooks.ctx, e, op);
     }
 
     /// Acks in journal order: a member's own write error, else the hole
@@ -1817,7 +1832,8 @@ pub const JournalLane = struct {
     /// The barrier's outcome: the latch's barrier class, DUR-3 coverage (so
     /// an fsync caller returns with `reusable_upto` advanced), the strict
     /// group's ack gate, and every fsync request whose ticket it satisfies.
-    fn barrierDone(self: *JournalLane, result: Error!void, now: u64) void {
+    fn barrierDone(self: *JournalLane, result_in: Error!void, now: u64) void {
+        const result: Error!void = if (result_in) |_| result_in else |e| if (self.heldRefusal(e, .write)) error.Held else result_in;
         const w = &self.w;
         const kind = w.barrier_in_flight.?;
         w.barrier_in_flight = null;
@@ -1831,13 +1847,15 @@ pub const JournalLane = struct {
             _ = self.durable_floor.fetchMax(w.barrier_floor, .release);
             if (self.hooks.barrier_landed) |f| f(self.hooks.ctx, w.barrier_ticket);
         } else |e| {
-            log.warn("journal lane {d}: barrier failed: {s}", .{ self.index, @errorName(e) });
-            stats.barrier_failures.inc();
-            LaneStats.bump(&self.stats.barrier_failures);
-            // The fence rung first (charter §5.7: a reservation-conflict
-            // errno at ANY barrier latches FAILED), then the 3-count.
-            if (self.latch.classifyFence(e, "a durability barrier") == .latched) stats.volumes_failed.inc();
-            if (self.latch.noteFailure(.barrier)) stats.volumes_failed.inc();
+            if (e != error.Held) {
+                log.warn("journal lane {d}: barrier failed: {s}", .{ self.index, @errorName(e) });
+                stats.barrier_failures.inc();
+                LaneStats.bump(&self.stats.barrier_failures);
+                // The fence rung first (charter §5.7: a reservation-conflict
+                // errno at ANY barrier latches FAILED), then the 3-count.
+                if (self.latch.classifyFence(e, "a durability barrier") == .latched) stats.volumes_failed.inc();
+                if (self.latch.noteFailure(.barrier)) stats.volumes_failed.inc();
+            }
         }
         if (kind == .strict_group) {
             w.group_barrier_out = result;
@@ -2745,6 +2763,58 @@ test "a torn window: the rollback hook runs with the stamped span, the hole is c
     try testing.expectEqualSlices(u64, &.{ 1, 3 }, recoveredInos(&rec, &inos));
     try testing.expectEqual(@as(u64, 1), rec.dropped_torn);
     try testing.expectEqual(c.res.paddedEnd(), rec.head_pos);
+}
+
+fn holdConflict(_: ?*anyopaque, _: journal_guard.member_fence.Op, class: journal_guard.member_fence.Class) journal_guard.member_fence.Verdict {
+    return if (class == .conflict) .held else .latch;
+}
+
+test "member fence: a held reservation conflict does not latch, is not counted, and does not roll back" {
+    const h = try Harness.init(testing.allocator, "held-conflict");
+    defer h.deinit();
+    var rl: RollbackLog = .{ .gpa = testing.allocator };
+    defer rl.deinit();
+    var hooks = rl.hooks();
+    hooks.readmit = holdConflict;
+    try h.spawnLane(hooks, "600000", 0);
+    const lane = h.lane.?;
+    const fenced0 = journal_guard.stats.fenced.load();
+    const failed0 = stats.volumes_failed.load();
+    test_seams.fail_errno.store(@backingInt(linux.E.BADE), .release);
+    defer test_seams.fail_errno.store(0, .release);
+    test_seams.fail_windows.store(1, .release);
+    const a = try h.append(1, page_entry, 0xA1);
+    try testing.expectError(error.Held, a.ticket.wait().result);
+    try testing.expectEqual(fenced0, journal_guard.stats.fenced.load());
+    try testing.expectEqual(failed0, stats.volumes_failed.load());
+    try testing.expectEqual(journal.FailureLatch.Verdict.healthy, lane.latch.verdict());
+    try testing.expectEqual(@as(u32, 0), lane.latch.journal_failures.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), rl.calls.items.len);
+    try testing.expectEqual(@as(usize, 0), rl.checkpoints.items.len);
+    const b = try h.append(2, page_entry, 0xB2);
+    try b.ticket.wait().result;
+    lane.shutdown();
+}
+
+test "member fence: a held barrier conflict does not latch" {
+    const h = try Harness.init(testing.allocator, "held-barrier");
+    defer h.deinit();
+    var rl: RollbackLog = .{ .gpa = testing.allocator };
+    defer rl.deinit();
+    var hooks = rl.hooks();
+    hooks.readmit = holdConflict;
+    try h.spawnLane(hooks, "0", 0);
+    const lane = h.lane.?;
+    const fenced0 = journal_guard.stats.fenced.load();
+    test_seams.fail_errno.store(@backingInt(linux.E.BADE), .release);
+    defer test_seams.fail_errno.store(0, .release);
+    test_seams.fail_barriers.store(1, .release);
+    const a = try h.append(1, page_entry, 0xA1);
+    try testing.expectError(error.Held, a.ticket.wait().result);
+    try testing.expectEqual(fenced0, journal_guard.stats.fenced.load());
+    try testing.expectEqual(journal.FailureLatch.Verdict.healthy, lane.latch.verdict());
+    try testing.expectEqual(@as(u32, 0), lane.latch.barrier_failures.load(.acquire));
+    lane.shutdown();
 }
 
 test "a reservation conflict on an ACKED window's write latches the FENCE class (the gate's sigstop-preempt row): the conveyor's acked rollback fail-stops after the fence — writer_guard_fenced counts once, the verdict reads fenced" {

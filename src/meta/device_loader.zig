@@ -40,6 +40,7 @@ const ledger = @import("ledger.zig");
 const alloc_ext = @import("alloc_ext.zig");
 const journal = @import("journal.zig");
 const format = @import("format.zig");
+const member_fence = @import("guard/member_fence.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("device_loader is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -197,6 +198,11 @@ pub const DeviceLoader = struct {
     /// writes are fence sites too, DMT:173). Null before the lane spawns
     /// (the mount's reads) and in offline tools.
     latch: ?*journal.FailureLatch = null,
+    /// Decision 0004 §4.5. Consulted at a device refusal, before the fence
+    /// rung. Null keeps today's path. `.held` is the only answer this
+    /// slice honours.
+    readmit: ?*const fn (ctx: ?*anyopaque, op: member_fence.Op, class: member_fence.Class) member_fence.Verdict = null,
+    readmit_ctx: ?*anyopaque = null,
     reads: ReadEpisode = .{},
 
     pub fn loader(self: *DeviceLoader) node_cache.NodeLoader {
@@ -215,12 +221,21 @@ pub const DeviceLoader = struct {
         return .{ .ctx = self, .writePage = writePageFn };
     }
 
-    fn ioFailed(self: *DeviceLoader, site: Site, offset: u64, len: usize, e: uring_fs.Error) LoaderError {
+    fn ioFailed(self: *DeviceLoader, site: Site, offset: u64, len: usize, e: uring_fs.Error) error{ Io, Held } {
+        if (self.heldRefusal(e, site)) return error.Held;
         stats.io_errors.inc();
         stats.failures(site).inc();
         if (self.failureLine(site)) |clause| log.err("metadata device {s}: {s} at offset {d} ({d} B) failed: {s} ({s}){s}", .{ self.path, site.label(), offset, len, @errorName(e), @tagName(uring_fs.classOf(e)), clause });
         if (self.latch) |l| _ = l.classifyFence(e, site.label());
         return error.Io;
+    }
+
+    fn heldRefusal(self: *const DeviceLoader, e: uring_fs.Error, site: Site) bool {
+        const op: member_fence.Op = switch (site) {
+            .node_read, .range_read => .read,
+            else => .write,
+        };
+        return member_fence.isHeld(self.readmit, self.readmit_ctx, e, op);
     }
 
     /// The one-line law of a FAILED volume over this site (no latch yet:
@@ -292,7 +307,7 @@ pub const DeviceLoader = struct {
 
     // ---- the checkpoint sinks ----
 
-    pub fn barrier(self: *DeviceLoader) error{Io}!void {
+    pub fn barrier(self: *DeviceLoader) error{ Io, Held }!void {
         if (takeInjectedBarrierFailure()) |e| return self.ioFailed(.fdatasync, 0, 0, e);
         self.pool.fdatasync(self.path) catch |e| return self.ioFailed(.fdatasync, 0, 0, e);
         stats.barriers.inc();
@@ -325,7 +340,7 @@ pub const DeviceLoader = struct {
 
     /// A batch of journal ops (an SMO entry's aligned runs) as ONE pool
     /// submission.
-    pub fn writeOps(self: *DeviceLoader, ops: []const journal.WriteOp) error{Io}!void {
+    pub fn writeOps(self: *DeviceLoader, ops: []const journal.WriteOp) error{ Io, Held }!void {
         var buf: [16]uring_fs.WriteOp = undefined;
         const converted: []uring_fs.WriteOp = if (ops.len <= buf.len) buf[0..ops.len] else self.gpa.alloc(uring_fs.WriteOp, ops.len) catch {
             stats.io_errors.inc();
@@ -356,7 +371,7 @@ pub const DeviceLoader = struct {
     /// Execute a format plan in its order: every step a direct write, every
     /// `barrier_after` an `fdatasync` (the ledger, the tail superblock copy,
     /// sector 0 — three on a flat plan).
-    pub fn writeSteps(self: *DeviceLoader, steps: []const format.Step) error{Io}!void {
+    pub fn writeSteps(self: *DeviceLoader, steps: []const format.Step) error{ Io, Held }!void {
         for (steps) |s| {
             self.pool.writeAt(self.path, s.offset, s.bytes) catch |e| return self.ioFailed(.format_step, s.offset, s.bytes.len, e);
             if (s.barrier_after) try self.barrier();
@@ -432,6 +447,55 @@ const TestDevice = struct {
         self.gpa.destroy(self);
     }
 };
+
+fn holdConflict(_: ?*anyopaque, _: member_fence.Op, class: member_fence.Class) member_fence.Verdict {
+    return if (class == .conflict) .held else .latch;
+}
+
+test "member fence: a held reservation conflict at the device loader does not latch and is not counted" {
+    const gpa = testing.allocator;
+    const d = try TestDevice.create(gpa, "held-loader", 1 << 20);
+    defer d.destroy();
+    var latch: journal.FailureLatch = .{};
+    d.dev.latch = &latch;
+    d.dev.readmit = holdConflict;
+    const errors0 = stats.io_errors.load();
+    const appends0 = stats.bset_append_failures.load();
+    try testing.expectEqual(error.Held, d.dev.ioFailed(.bset_append, 1 << 19, 4096, error.ReservationConflict));
+    try testing.expect(!latch.isFailed());
+    try testing.expectEqual(journal.FailureLatch.Verdict.healthy, latch.verdict());
+    try testing.expectEqual(errors0, stats.io_errors.load());
+    try testing.expectEqual(appends0, stats.bset_append_failures.load());
+}
+
+test "member fence: a reservation conflict at the device loader still latches without a readmit hook" {
+    const gpa = testing.allocator;
+    const d = try TestDevice.create(gpa, "loader-conflict-latch", 1 << 20);
+    defer d.destroy();
+    var latch: journal.FailureLatch = .{};
+    d.dev.latch = &latch;
+    log.testing.expectErrorLogs(2);
+    try testing.expectEqual(error.Io, d.dev.ioFailed(.bset_append, 1 << 19, 4096, error.ReservationConflict));
+    try log.testing.expectAllFired();
+    try testing.expect(latch.isFenced());
+    try testing.expectEqual(journal.FailureLatch.Verdict.fenced, latch.verdict());
+}
+
+test "member fence: a held reservation conflict on the loader barrier does not latch" {
+    const gpa = testing.allocator;
+    const d = try TestDevice.create(gpa, "held-loader-barrier", 1 << 20);
+    defer d.destroy();
+    var latch: journal.FailureLatch = .{};
+    d.dev.latch = &latch;
+    d.dev.readmit = holdConflict;
+    test_seams.fail_errno.store(@backingInt(linux.E.BADE), .release);
+    defer test_seams.fail_errno.store(0, .release);
+    test_seams.fail_barriers.store(1, .release);
+    try testing.expectError(error.Held, d.dev.barrier());
+    try testing.expect(!latch.isFailed());
+    try testing.expectEqual(journal.FailureLatch.Verdict.healthy, latch.verdict());
+    try testing.expectEqual(@as(u32, 0), latch.barrier_failures.load(.acquire));
+}
 
 test "the loader round-trips a node image and an appended bset through O_DIRECT; a misaligned product write is REFUSED and counted; the sinks land at their bases; the volume length is the file's" {
     const gpa = testing.allocator;

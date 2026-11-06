@@ -51,7 +51,9 @@ controller free. Keep-alive/fatal teardown was not run (DO.21).
 cannot deliver a victim's non-inline R2T/data; teardown waits on it before dropping refs.
 Linux permits W/PR/W-data ordering. Separate userspace rings are not transport isolation;
 Report/read is not an equivalent global-drain barrier (DO.22; durable two-sided audit).
-Resolve these premises on a separately approved disposable target before PR-4/5 proceed.
+DO.33 resolves the gate without a crash venue: PR-4 submits no `pr_sem` command on a
+controller until that controller's already-submitted writes have completions, and it
+does not run the fatal teardown leg on this host. P17 stays R12's kernel defect.
 
 Integration owes one allocation-safe NQN implementation shared with PR-3 and retained reds;
 DO.18–DO.23 overlap PR-3 and must be renumbered together, not overwritten.

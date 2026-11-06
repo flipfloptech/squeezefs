@@ -499,7 +499,7 @@ pub const KvTree = struct {
 
     fn openVerified(gpa: Allocator, cache: *NodeCache, identity: TreeIdentity, root: RootPtr, seq: *NodeSeqHandle, who: enum { writer, reader }, why: ?*?Stale) (Error || error{RootStale})!*KvTree {
         const loaded = if (cache.tryGet(root.addr)) |hit| hit else cache.loadForSlot(root.addr, identity.forestSlot()) catch |e| switch (e) {
-            error.OutOfMemory, error.Io, error.Canceled, error.WouldBlock, error.FlightTableFull => |x| return x,
+            error.OutOfMemory, error.Io, error.Held, error.Canceled, error.WouldBlock, error.FlightTableFull => |x| return x,
             // A reader reads the image a writer is appending to in place:
             // a page mid-rewrite decodes torn or foreign — its race, re-read.
             else => |x| if (who == .reader) return stale(why, .{ .load = x }) else return x,

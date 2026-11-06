@@ -819,7 +819,7 @@ pub fn hostRegistered(c: *pr.Client) pr.Error!bool {
     return (try reportFacts(c)).registered;
 }
 
-pub const ReportFacts = struct { registered: bool, facts: Facts };
+pub const ReportFacts = struct { registered: bool, rtype: u8, facts: Facts };
 
 /// One report: our host's registration and the reservation's word.
 pub fn reportFacts(c: *pr.Client) pr.Error!ReportFacts {
@@ -830,7 +830,7 @@ pub fn reportFacts(c: *pr.Client) pr.Error!ReportFacts {
     for (rep.registrants) |r| if (std.mem.eql(u8, &r.host_id, &me) and r.rkey == c.key) {
         registered = true;
     };
-    return .{ .registered = registered, .facts = .{ .reserved = rep.rtype != 0, .holder_ours = rep.heldByHost(c.key, me) } };
+    return .{ .registered = registered, .rtype = rep.rtype, .facts = .{ .reserved = rep.rtype != 0, .holder_ours = rep.heldByHost(c.key, me) } };
 }
 
 /// One volume's appender pages, read under the registry's lock (the

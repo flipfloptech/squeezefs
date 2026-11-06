@@ -480,7 +480,7 @@ pub const Ctx = struct {
     staged_segment: ?*staging.Segment = null,
 };
 
-pub const Error = error{ InputOutput, NoSpaceLeft, WriterGuardFenced, VolumeFailed, OutOfMemory, IntentBarrierFailed, MetaBarrierFailed };
+pub const Error = error{ InputOutput, NoSpaceLeft, WriterGuardFenced, Held, VolumeFailed, OutOfMemory, IntentBarrierFailed, MetaBarrierFailed };
 
 /// DUR-1: the WHOLE data barrier step completes — every leg Ok — strictly
 /// before the meta legs that name the blocks; a failed leg fails the fsync
@@ -671,7 +671,10 @@ fn flushParkedKeys(ctx: Ctx, io: Io, keys: []const accumulate.Key) Error!void {
     stats.fsync_flush_enospc_retries.inc();
     var vb: [256]u32 = undefined;
     for (planBarriers(TouchedTable.ALL_BIT, ctx.vols, &vb)) |ord| {
-        if (ctx.vols.byOrdinal(ord)) |v| ctx.device.flush(v.vol_tag) catch {};
+        if (ctx.vols.byOrdinal(ord)) |v| ctx.device.flush(v.vol_tag) catch |e| switch (e) {
+            error.Held => {},
+            else => {},
+        };
     }
     _ = ctx.epochs.closeAllForSpace(io, ctx.close_seams);
     for (keys) |k| {
@@ -699,7 +702,10 @@ fn flushParked(ctx: Ctx, io: Io, ino: u64, since_ns: ?u64) Error!void {
     stats.fsync_flush_enospc_retries.inc();
     var vb: [256]u32 = undefined;
     for (planBarriers(TouchedTable.ALL_BIT, ctx.vols, &vb)) |ord| {
-        if (ctx.vols.byOrdinal(ord)) |v| ctx.device.flush(v.vol_tag) catch {};
+        if (ctx.vols.byOrdinal(ord)) |v| ctx.device.flush(v.vol_tag) catch |e| switch (e) {
+            error.Held => {},
+            else => {},
+        };
     }
     _ = ctx.epochs.close(io, ino, ctx.close_seams);
     _ = ctx.epochs.closeAllForSpace(io, ctx.close_seams);
@@ -713,6 +719,7 @@ fn barrierLeg(ctx: Ctx, ord: u32, out: *LegResult) void {
     ctx.device.flush(v.vol_tag) catch |e| {
         out.err = switch (e) {
             error.WriterGuardFenced => error.WriterGuardFenced,
+            error.Held => error.Held,
             error.VolumeFailed => error.VolumeFailed,
             error.NoSpaceLeft => error.NoSpaceLeft,
             error.OutOfMemory => error.OutOfMemory,

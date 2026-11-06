@@ -203,7 +203,7 @@ pub const Deps = struct {
     touched: ?TouchedStamp = null,
 };
 
-pub const PatchError = error{ InputOutput, VolumeFailed, WriterGuardFenced, OutOfMemory, WorkerShutdown, NoSpaceLeft };
+pub const PatchError = error{ InputOutput, VolumeFailed, WriterGuardFenced, Held, OutOfMemory, WorkerShutdown, NoSpaceLeft };
 
 /// A patch whose fence pair passed: the destination the ONE DMA lands at
 /// and what the postlude re-stabilizes. Travels with the held (3) guard;
@@ -303,6 +303,7 @@ pub fn finishInPlace(deps: Deps, b: Begun, len: u64, dma: seams.DmaError!void, a
             error.WorkerShutdown => error.WorkerShutdown,
             error.VolumeFailed => error.VolumeFailed,
             error.WriterGuardFenced => error.WriterGuardFenced,
+            error.Held => error.Held,
             error.OutOfMemory => error.OutOfMemory,
         };
     };

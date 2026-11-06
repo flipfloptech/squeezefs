@@ -5270,6 +5270,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 error.InputOutput => error.InputOutput,
                 error.VolumeFailed => error.VolumeFailed,
                 error.WriterGuardFenced => error.WriterGuardFenced,
+                error.Held => error.Held,
                 error.OutOfMemory => error.OutOfMemory,
                 error.WorkerShutdown => error.WorkerShutdown,
                 error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,

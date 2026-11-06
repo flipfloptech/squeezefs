@@ -1765,6 +1765,7 @@ pub const DataPlane = struct {
     pub fn barrierData(self: *DataPlane, io: Io, claimants: []const u64) Error!void {
         fsync_mod.barrierInos(self.wp.fsyncCtx(), io, claimants) catch |e| return switch (e) {
             error.WriterGuardFenced => error.WriterGuardFenced,
+            error.Held => error.Held,
             error.VolumeFailed => error.VolumeFailed,
             error.OutOfMemory => error.OutOfMemory,
             error.NoSpaceLeft, error.InputOutput, error.IntentBarrierFailed, error.MetaBarrierFailed => error.InputOutput,
@@ -2202,6 +2203,7 @@ pub const DataPlane = struct {
                 break :blk error.InputOutput;
             },
             error.WriterGuardFenced => error.WriterGuardFenced,
+            error.Held => error.Held,
             error.VolumeFailed => error.VolumeFailed,
             error.OutOfMemory => error.OutOfMemory,
         };
@@ -2224,6 +2226,7 @@ pub const DataPlane = struct {
                 break :blk error.InputOutput;
             },
             error.WriterGuardFenced => error.WriterGuardFenced,
+            error.Held => error.Held,
             error.VolumeFailed => error.VolumeFailed,
             error.OutOfMemory => error.OutOfMemory,
         };
@@ -3063,9 +3066,21 @@ pub const DataPlane = struct {
             error.WorkerShutdown, error.WorkerClosed, error.LaneStopped => error.WorkerShutdown,
             error.VolumeFailed => error.VolumeFailed,
             error.WriterGuardFenced, error.ReservationConflict, error.DismountRefused => error.WriterGuardFenced,
+            error.Held => error.Held,
             error.OutOfMemory => error.OutOfMemory,
             else => error.InputOutput,
         };
+    }
+
+    comptime {
+        const device_names = @typeInfo(nvme_dev.DeviceError).error_set.error_names orelse @compileError("DeviceError has no names");
+        const dma_names = @typeInfo(seams.DmaError).error_set.error_names orelse @compileError("DmaError has no names");
+        var device_has_held = false;
+        var dma_has_held = false;
+        for (device_names) |n| device_has_held = device_has_held or std.mem.eql(u8, n, "Held");
+        for (dma_names) |n| dma_has_held = dma_has_held or std.mem.eql(u8, n, "Held");
+        if (!device_has_held) @compileError("DeviceError must contain Held (decision 0004 §4.16b)");
+        if (!dma_has_held) @compileError("DmaError must contain Held (decision 0004 §4.16b)");
     }
 
     fn deviceWrite(self: *DataPlane, vol_tag: u64, offset: u64, data: []const u8) nvme_dev.DeviceError!void {

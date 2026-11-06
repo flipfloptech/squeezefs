@@ -1519,7 +1519,7 @@ pub const DmaProof = struct {
     }
 };
 
-pub const DmaError = error{ InputOutput, NoSpaceLeft, WorkerShutdown, VolumeFailed, WriterGuardFenced, OutOfMemory };
+pub const DmaError = error{ InputOutput, NoSpaceLeft, WorkerShutdown, VolumeFailed, WriterGuardFenced, Held, OutOfMemory };
 
 /// ONE DMA at `offset` on `vol_tag` of `data` padded to the LBA grain — the
 /// device's unaligned arm WRITES the zero tail `[data.len, ceil(data.len))`

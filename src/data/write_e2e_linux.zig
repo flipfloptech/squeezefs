@@ -61,6 +61,7 @@ const NvmeSeam = struct {
             error.WorkerShutdown, error.WorkerClosed, error.LaneStopped => error.WorkerShutdown,
             error.VolumeFailed => error.VolumeFailed,
             error.WriterGuardFenced, error.ReservationConflict, error.DismountRefused => error.WriterGuardFenced,
+            error.Held => error.Held,
             error.OutOfMemory => error.OutOfMemory,
             else => error.InputOutput,
         };

@@ -1125,55 +1125,59 @@ pub const DataFence = struct {
 
     /// The device's call (a data command's thread): the PR work on the
     /// blocking pool, as the beat's.
-    fn readmitFn(ctx: *anyopaque) bool {
+    fn readmitFn(ctx: *anyopaque) nvme_dev.ReadmitVerdict {
         const cell: *ReadmitCell = @ptrCast(@alignCast(ctx));
         const self = cell.fence;
         const io = self.io orelse return self.readmitAfterRefusal(cell.vol_tag);
-        return exec.SqzIo.fromIo(io).runBlocking(readmitAfterRefusal, .{ self, cell.vol_tag }) catch false;
+        return exec.SqzIo.fromIo(io).runBlocking(readmitAfterRefusal, .{ self, cell.vol_tag }) catch .decline;
     }
 
     /// A data write-class command the device refused with the reservation
-    /// conflict on `vol_tag`. A member slow after a lapse — the lapse still
-    /// pending here, this host registered on volume 0's metadata namespace
-    /// and this incarnation current, before and after a register through the
-    /// stale-sibling rule (the beat's checks; a host registered again
-    /// meanwhile — another refused command's re-admission, the beat, a
-    /// sibling's rule — adopted between the same checks) — is re-admitted:
-    /// true, the command goes once more. The namespace unreserved (another
-    /// lapse): true, the lapse's window. Anything else: false, the fence
-    /// latches.
-    pub fn readmitAfterRefusal(self: *DataFence, vol_tag: u64) bool {
+    /// conflict on `vol_tag` (decision 0004 §4.5.5). Order: own death
+    /// declines; an unreserved data namespace retries (a lapse); this host
+    /// unregistered on a joined metadata volume, or an unreadable report,
+    /// holds; a member slow after a lapse — the lapse still pending here,
+    /// this host registered on every joined metadata namespace and this
+    /// incarnation current, before and after a register through the
+    /// stale-sibling rule — retries, and the command goes once more.
+    /// Anything else declines, and the fence latches.
+    pub fn readmitAfterRefusal(self: *DataFence, vol_tag: u64) nvme_dev.ReadmitVerdict {
         self.lock.lock();
         defer self.lock.unlock();
         self.takeLapseFlagLocked();
-        const i = self.tabledIndex(vol_tag) orelse return false;
+        const i = self.tabledIndex(vol_tag) orelse return .decline;
         const v = &self.vols[i];
         const c = v.client;
-        const f = host_fence.reportFacts(c) catch return declined(v, "the data namespace's report failed");
+        if (!self.current()) return declined(v, "this incarnation's page is not Live under its writer id on every joined metadata volume");
+        const f = host_fence.reportFacts(c) catch return answerHeld(v, "the data namespace's report failed");
         if (!f.facts.reserved) {
             v.lapse_pending = true;
-            return true;
+            return .retry;
         }
+        const registered = self.everyMetaRegistered() catch return answerHeld(v, "a metadata namespace's report failed");
+        if (!registered) return answerHeld(v, "this host is not registered on every joined metadata volume — a succession is pending");
         if (!v.lapse_pending) return declined(v, "no lapse is pending for this process here — the refusal is a fence");
-        const registered = self.everyMetaRegistered() catch return declined(v, "a metadata namespace's report failed");
-        if (!registered) return declined(v, "this host is not registered on every joined metadata volume's namespace (fenced)");
-        if (!self.current()) return declined(v, "this incarnation's page is not Live under its writer id on every joined metadata volume");
         const fresh = self.register(v.path(), c) catch return declined(v, "its registration through the rule was refused");
         if (!self.current()) {
             if (fresh) c.unregister(c.key) catch {};
             return declined(v, "this incarnation's page left Live during the re-admission — withdrawn");
         }
-        if (!fresh) return true;
+        if (!fresh) return .retry;
         v.fresh = true;
         stats.data_pr_refusal_readmissions.inc();
         log.warn("data volume {s}: a data command was refused (reservation conflict) inside a lapse still pending for this process — this host, registered on every joined metadata volume's namespace and current, re-registered under key {x:0>16} through the rule; the command goes once more (decision 0003 §DL)", .{ v.path(), c.key });
-        return true;
+        return .retry;
     }
 
-    fn declined(v: *const Volume, why: []const u8) bool {
+    fn declined(v: *const Volume, why: []const u8) nvme_dev.ReadmitVerdict {
         stats.data_pr_refusal_readmissions_declined.inc();
         log.warn("data volume {s}: a refused data command is not re-admitted: {s} (decision 0003 §DL)", .{ v.path(), why });
-        return false;
+        return .decline;
+    }
+
+    fn answerHeld(v: *const Volume, why: []const u8) nvme_dev.ReadmitVerdict {
+        log.warn("data volume {s}: a refused data command is held: {s} (decision 0004 §4.5.5)", .{ v.path(), why });
+        return .held;
     }
 
     /// This incarnation is current: on every metadata volume the fence
@@ -1918,16 +1922,16 @@ test "decision 0003 §DL, a member slow on data: after a PTPL-less restart the j
     try testing.expect(!dns.writeAllowed(j_id));
     // J's refused write: re-admitted.
     const re0 = stats.data_pr_refusal_readmissions.load();
-    try testing.expect(dj.readmitAfterRefusal(1));
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.retry, dj.readmitAfterRefusal(1));
     try testing.expect(dns.writeAllowed(j_id));
     try testing.expectEqual(re0 + 1, stats.data_pr_refusal_readmissions.load());
     // X: its host not registered on metadata — never re-admitted; registered
     // there again (a sibling's rule) but its page Recovering — never
     // re-admitted.
     const declined0 = stats.data_pr_refusal_readmissions_declined.load();
-    try testing.expect(!dx.readmitAfterRefusal(1));
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dx.readmitAfterRefusal(1));
     _ = try fencing.joinAsRegistrant(&meta_x, null);
-    try testing.expect(!dx.readmitAfterRefusal(1));
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dx.readmitAfterRefusal(1));
     try testing.expect(!dns.isRegistered(0x3333));
     try testing.expectEqual(declined0 + 2, stats.data_pr_refusal_readmissions_declined.load());
     // J's beat sees itself registered under the reservation: the lapse is
@@ -1935,8 +1939,55 @@ test "decision 0003 §DL, a member slow on data: after a PTPL-less restart the j
     dj.beat();
     try testing.expect(!dj.vols[0].lapse_pending);
     try dm.clients[0].preemptAndAbort(0x2222);
-    try testing.expect(!dj.readmitAfterRefusal(1));
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dj.readmitAfterRefusal(1));
     try testing.expect(!dns.isRegistered(0x2222));
+}
+
+test "decision 0004 §4.5.5: a current joiner unregistered on metadata answers held for a data refusal, and the decline counter does not move" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/data-fence-held-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var probe = host_fence.Registry.at(base, .set, 0x5a);
+    probe.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    probe.unlock();
+    const m_id: [16]u8 = "manager-host-id1".*;
+    const j_id: [16]u8 = "joiner-host-id-2".*;
+    var mns = fake.Namespace.init(gpa);
+    defer mns.deinit();
+    var dns = fake.Namespace.init(gpa);
+    defer dns.deinit();
+    var mh: fake.Host = .{ .ns = &mns, .host_id = m_id };
+    var jh: fake.Host = .{ .ns = &mns, .host_id = j_id };
+    var meta_m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer meta_m.deinit();
+    try fencing.acquireManagerHold(&meta_m);
+    var meta_j = try pr.Client.init(gpa, jh.face(), 1, 0x2222);
+    defer meta_j.deinit();
+    _ = try fencing.joinAsRegistrant(&meta_j, null);
+    var pages = [_]appender_page.Page{ livePage(0, 0xA, 0xA0), livePage(1, 0xC, 0xC0) };
+    var src: FixturePages = .{ .pages = &pages };
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var cfg: FixtureConfig = .{ .live = &.{1} };
+    const local = proc.localIdentity();
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = local, .node_token = 0xA, .pages = src.source(), .meta_path = "fake-meta", .writer_id = 0xA0, .config = cfg.source(), .manager = true });
+    defer dm.release();
+    const dj = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = jh.face(), .meta_nsid = 1, .key = 0x2222, .reg = host_fence.Registry.at(base, .set, 0x5a), .local = local, .node_token = 0xC, .pages = src.source(), .meta_path = "fake-meta", .writer_id = 0xC0, .config = cfg.source(), .manager = false });
+    defer dj.release();
+    var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
+    var djh: fake.Host = .{ .ns = &dns, .host_id = j_id };
+    try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
+    try dj.admitClient(1, "fake-data", null, try fixtureClient(gpa, djh.face()));
+    dm.beat();
+    try testing.expectEqual(nvme.RTYPE_WEAR, dns.rtype);
+    try testing.expect(dj.current());
+    try meta_m.preemptAndAbort(0x2222);
+    try testing.expect(!mns.isRegistered(0x2222));
+    const declined0 = stats.data_pr_refusal_readmissions_declined.load();
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.held, dj.readmitAfterRefusal(1));
+    try testing.expectEqual(declined0, stats.data_pr_refusal_readmissions_declined.load());
 }
 
 test "decision 0003 §DN, a joiner of two metadata volumes: a restart of volume 1's target alone — its beat re-registers its host on VOLUME 1's namespace (its page Live on every joined volume, the stale-sibling rule judged by volume 1's pages), volume 0's and the data namespace's untouched; a member whose page on volume 1 left Live (its death recovered there first) re-registers nothing there, and after a data restart nothing on data either although volume 0 still reads it Live and registered — nor is its refused write re-admitted" {
@@ -2040,7 +2091,7 @@ test "decision 0003 §DN, a joiner of two metadata volumes: a restart of volume 
     try testing.expectEqual(nvme.RTYPE_WEAR, dns.rtype);
     try testing.expect(dx.vols[0].lapse_pending);
     const declined0 = stats.data_pr_refusal_readmissions_declined.load();
-    try testing.expect(!dx.readmitAfterRefusal(1));
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dx.readmitAfterRefusal(1));
     try testing.expect(!dns.isRegistered(0x3333));
     try testing.expectEqual(declined0 + 1, stats.data_pr_refusal_readmissions_declined.load());
 }
@@ -2123,7 +2174,7 @@ test "decision 0003 §DN.9, a re-join's data re-admission is two-phase: re-point
     dj.vols[0].lapse_pending = true;
     const q0 = pred[0].issued;
     const q1 = pred[1].issued;
-    try testing.expect(dj.readmitAfterRefusal(1));
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.retry, dj.readmitAfterRefusal(1));
     try testing.expect(pred[0].issued > q0 and pred[1].issued > q1);
     for (succ) |h| try testing.expectEqual(@as(u32, 0), h.after_close);
     // A later re-join: re-pointed and committed — the predecessor's clients

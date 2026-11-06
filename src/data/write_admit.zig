@@ -451,7 +451,7 @@ pub const Outcome = struct {
     }
 };
 
-pub const Error = error{ NoSpaceLeft, InputOutput, VolumeFailed, WriterGuardFenced, OutOfMemory, WorkerShutdown, ReadOnlyFileSystem, FileTooBig };
+pub const Error = error{ NoSpaceLeft, InputOutput, VolumeFailed, WriterGuardFenced, Held, OutOfMemory, WorkerShutdown, ReadOnlyFileSystem, FileTooBig };
 
 /// The data volumes' allocators as a picker: STRIPE-UNIT placement
 /// (`router.stripeUnitChoice`) over the active volumes with supply — a

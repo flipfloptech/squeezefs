@@ -393,7 +393,7 @@ pub const HolderPlane = struct {
             for (words, before) |*w, *b| b.* = w.load(.acquire);
             const image = data_bitmap.readRegionImage(gpa, home.io, hold.refs, blocks) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
-                error.Io => error.Io,
+                error.Io, error.Held => error.Io,
                 error.GrantExhausted, error.TooManyRefs => error.Corrupt,
             };
             defer gpa.free(image);
@@ -424,7 +424,7 @@ pub const HolderPlane = struct {
             v.bitmap.regionImage(home.vt.generation(home.ctx), image);
             home.vt.hold(home.ctx, image, &v.refs) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
-                error.Io => error.Io,
+                error.Io, error.Held => error.Io,
                 error.GrantExhausted, error.TooManyRefs => error.Corrupt,
             };
             switch (home.vt.publish(home.ctx, v.vol_tag, v.term, v.refs.items)) {
@@ -501,13 +501,14 @@ pub const HolderPlane = struct {
     /// The checkpoint cycle's C6 (`KvBackend.KvdaSink`): every held
     /// bitmap's dirty pages through its refs at the cycle's generation;
     /// the cycle's barrier #1 covers them.
-    pub fn writeKvdaPages(ctx: *anyopaque, generation: u64) error{Io}!void {
+    pub fn writeKvdaPages(ctx: *anyopaque, generation: u64) error{ Io, Held }!void {
         const self: *HolderPlane = @ptrCast(@alignCast(ctx));
         const home = self.home orelse return;
         for (self.armedVols()) |*v| {
             if (v.refs.items.len == 0) continue;
             _ = data_bitmap.writeDirtyPagesThroughRefs(v.bitmap, home.io, v.refs.items, generation) catch |e| switch (e) {
                 error.Io => return error.Io,
+                error.Held => return error.Held,
                 // The set re-dirtied itself: the next cycle rewrites.
                 error.OutOfMemory, error.Corrupt => return error.Io,
             };

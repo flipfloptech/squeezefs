@@ -573,6 +573,7 @@ pub fn coreError(e: Error) errors.Error {
         error.SlotBusy => error.SlotMoved,
         error.Deferred => error.Deferred,
         error.GrantExhausted => error.GrantExhausted,
+        error.Held => error.Held,
         error.JournalWriteFailed, error.Io, error.Corrupt, error.RetryBudgetExhausted => error.InputOutput,
         error.WouldBlock => error.WouldBlock,
         // The tree's own classes, carried as themselves (decision 0003 §CS):

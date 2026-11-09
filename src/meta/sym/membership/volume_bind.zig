@@ -250,6 +250,7 @@ pub const VolumeBinding = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
             error.Deferred, error.JournalReserveExhausted => error.Deferred,
+            error.Held => error.Deferred,
             error.Rejected, error.Refused, error.NoSpace, error.Capacity => error.Refused,
             error.Corrupt => error.Corrupt,
         };

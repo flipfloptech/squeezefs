@@ -1136,7 +1136,7 @@ pub fn foldOntoRegion(gpa: Allocator, io: RegionIo, refs: []const records.Bitmap
     defer bm.deinit();
     const image = readRegionImage(gpa, io, refs, blocks) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
-        error.Io => error.Io,
+        error.Io, error.Held => error.Io,
         error.GrantExhausted, error.TooManyRefs => error.Corrupt,
     };
     defer gpa.free(image);
@@ -1146,8 +1146,16 @@ pub fn foldOntoRegion(gpa: Allocator, io: RegionIo, refs: []const records.Bitmap
     };
     const changed = try bm.replay(deltas, term);
     if (changed == 0) return .{ .bits_changed = 0, .pages_written = 0 };
-    const written = try writeDirtyPagesThroughRefs(bm, io, refs, generation);
-    try io.vtable.barrier(io.ctx);
+    const written = writeDirtyPagesThroughRefs(bm, io, refs, generation) catch |e| return switch (e) {
+        error.Held => error.Io,
+        error.Io => error.Io,
+        error.OutOfMemory => error.OutOfMemory,
+        error.Corrupt => error.Corrupt,
+    };
+    io.vtable.barrier(io.ctx) catch |e| return switch (e) {
+        error.Held => error.Io,
+        error.Io => error.Io,
+    };
     return .{ .bits_changed = changed, .pages_written = written };
 }
 

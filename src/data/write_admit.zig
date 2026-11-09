@@ -3233,7 +3233,8 @@ fn recycledEofBlock(w: *World, ino: u64, eof: u64, shared: bool, transformed: bo
     const b = if (transformed) blk: {
         const m = try w.f.alloc_b.allocateBlock();
         var buf: [wt.BS]u8 = @splat(STALE);
-        try w.f.dev.seam().vtable.write(&w.f.dev, wt.VOL_B, m.offset, &buf);
+        var held_gen: u62 = 0;
+        try w.f.dev.seam().vtable.write(&w.f.dev, wt.VOL_B, m.offset, &buf, &held_gen);
         w.f.alloc_b.publishBlock(m.idx);
         const tb = Binding.wholeBlock(wt.VOL_B, m.offset, m.stamp);
         try w.f.map.create(ino, .striped, eof);
@@ -3242,7 +3243,8 @@ fn recycledEofBlock(w: *World, ino: u64, eof: u64, shared: bool, transformed: bo
     } else try w.f.publishBlock(ino, 0, STALE);
     var image: [PAGE]u8 align(PAGE) = @splat(0);
     fill(image[0..@intCast(eof)], 0x31);
-    try w.f.dev.seam().vtable.write(&w.f.dev, b.vol_tag, b.offset, &image);
+    var held_gen: u62 = 0;
+    try w.f.dev.seam().vtable.write(&w.f.dev, b.vol_tag, b.offset, &image, &held_gen);
     w.f.map.files.getPtr(ino).?.size = eof;
     if (shared) w.f.alloc_a.markShared(w.f.alloc_a.idxOf(b.offset));
     w.f.dev.resetLedger();
@@ -3351,7 +3353,8 @@ test "decision 0003 §AL.7 — a shrink's leftover is the extension law's: a blo
         // The file's own bytes fill the block; the shrink clips the size to
         // 100 and writes nothing.
         const b = try w.f.publishBlock(ino, 0, 0x51);
-        try w.f.dev.seam().vtable.write(&w.f.dev, b.vol_tag, b.offset, &own);
+        var held_gen: u62 = 0;
+        try w.f.dev.seam().vtable.write(&w.f.dev, b.vol_tag, b.offset, &own, &held_gen);
         const clip: u64 = 100;
         w.f.map.files.getPtr(ino).?.size = clip;
         const z0 = stats.write_gap_zero_bytes.load();
@@ -3509,7 +3512,8 @@ test "W2 amplification law, CoW bases land ONCE per parked episode: a cloned (pi
     // buffer, one landing at release.
     const mb = try w.f.alloc_b.allocateBlock();
     var img: [wt.BS]u8 = @splat(0xB0);
-    try w.f.dev.seam().vtable.write(&w.f.dev, wt.VOL_B, mb.offset, &img);
+    var held_gen: u62 = 0;
+    try w.f.dev.seam().vtable.write(&w.f.dev, wt.VOL_B, mb.offset, &img, &held_gen);
     w.f.alloc_b.publishBlock(mb.idx);
     const bb = Binding.wholeBlock(wt.VOL_B, mb.offset, mb.stamp);
     try w.f.map.create(43, .striped, wt.BS);

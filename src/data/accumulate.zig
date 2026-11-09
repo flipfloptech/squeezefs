@@ -2958,12 +2958,11 @@ const InFlightDevice = struct {
     const vtable: seams.DeviceSeam.VTable = .{ .write = &write, .write_fixed = null, .read = &read, .flush = &flush };
 
     fn write(ctx: *anyopaque, vol: u64, off: u64, data: []const u8, held_gen: *u62) seams.DmaError!void {
-        _ = held_gen;
         const self: *InFlightDevice = @ptrCast(@alignCast(ctx));
         if (self.entered.fetchAdd(1, .acq_rel) == 0) {
             while (self.entered.load(.acquire) < 2) std.Thread.yield() catch {};
         }
-        return self.inner.vtable.write(self.inner.ctx, vol, off, data);
+        return self.inner.vtable.write(self.inner.ctx, vol, off, data, held_gen);
     }
 
     fn read(ctx: *anyopaque, vol: u64, off: u64, out: []u8) seams.ReadError!void {
@@ -2972,9 +2971,8 @@ const InFlightDevice = struct {
     }
 
     fn flush(ctx: *anyopaque, vol: u64, held_gen: *u62) seams.DmaError!void {
-        _ = held_gen;
         const self: *InFlightDevice = @ptrCast(@alignCast(ctx));
-        return self.inner.vtable.flush(self.inner.ctx, vol);
+        return self.inner.vtable.flush(self.inner.ctx, vol, held_gen);
     }
 };
 

@@ -20,6 +20,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const clock = @import("../../core/clock.zig");
+const nvme = @import("nvme_cmd.zig");
 
 pub const Verdict = enum { retry, latch, held };
 
@@ -143,8 +144,8 @@ pub const Readmit = struct {
         .manages = false,
         .host_registered = false,
         .own_page_live = true,
-        .rtype = 3,
-        .meta_rtype = 3,
+        .rtype = nvme.RTYPE_WERO,
+        .meta_rtype = nvme.RTYPE_WERO,
     },
     seen: Seen = .{},
     word: ?*Resolution = null,
@@ -324,7 +325,7 @@ pub const Resolution = struct {
     pub const Wait = enum { cleared, terminal };
     pub const Resolved = enum { cleared, terminal, timed_out };
 
-    const gen_mask: u64 = (@as(u64, 1) << 62) - 1;
+    const gen_mask: u64 = (@as(u64, 1) << 62) - 1; // word layout: state in bits 63..62, generation in 61..0
 
     pub fn snapshot(self: *const Resolution) Snapshot {
         return unpack(self.word.load(.acquire));
@@ -438,12 +439,12 @@ pub const Resolution = struct {
     }
 
     fn pack(state: State, gen: Gen) u64 {
-        return (@as(u64, @backingInt(state)) << 62) | @as(u64, gen);
+        return (@as(u64, @backingInt(state)) << 62) | @as(u64, gen); // state in the top two bits, generation below
     }
 
     fn unpack(w: u64) Snapshot {
         return .{
-            .state = @fromBackingInt(@intCast(@as(u2, @truncate(w >> 62)))),
+            .state = @fromBackingInt(@intCast(@as(u2, @truncate(w >> 62)))), // top two bits
             .gen = @intCast(w & gen_mask),
         };
     }

@@ -201,7 +201,10 @@ pub fn enableSymmetric(gpa: Allocator, io: Io, path: []const u8, opts: Options, 
         return e;
     };
     defer p.deinit();
-    try dev.writeSteps(p.steps);
+    dev.writeSteps(p.steps) catch |e| return switch (e) {
+        error.Held => error.Io,
+        error.Io => error.Io,
+    };
     const ring_proper = geometry.fixedRingExtent(p.superblock);
     log.info("{s}: SYMMETRIC_PLANE enabled — appender directory at heap extent {d} ({s}), appender 0's page slots at the fixed ring's first {d} B, ring proper {d} B of a {d} B journal, ledger seq {d} ({s})", .{ path, (p.link.start - sb.heap.start) / sb.node_size, if (p.resumed) "a crashed run's link resumed" else "claimed", geometry.appender0_reserved_bytes, ring_proper.len, sb.journal.len, p.ledger_seq orelse mounted.seq, if (p.ledger_seq != null) "restated at the claim's generation" else "unchanged" });
     return .{ .link = p.link, .resumed = p.resumed, .ledger_seq = p.ledger_seq, .ring_bytes = ring_proper.len, .journal_len = sb.journal.len };

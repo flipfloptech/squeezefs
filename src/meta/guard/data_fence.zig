@@ -1394,7 +1394,7 @@ pub const DataFence = struct {
         return .{ .classified = member_fence.classifyForData(.{
             .own_page_live = facts.own_page_live,
             .rtype = report.rtype,
-            .meta_rtype = 3,
+            .meta_rtype = nvme.RTYPE_WERO,
             .host_registered = report.registered,
             .successor_page = facts.successor_page,
             .sibling_death = facts.sibling_death,
@@ -1436,7 +1436,7 @@ pub const DataFence = struct {
             .node_token = self.in.node_token,
             .term = term,
             .mgr_writer = mgr_writer,
-            .meta_rtype = 3,
+            .meta_rtype = nvme.RTYPE_WERO,
         };
     }
 

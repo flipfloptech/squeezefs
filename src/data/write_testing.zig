@@ -649,7 +649,8 @@ pub const Fixture = struct {
     pub fn publishBlock(self: *Fixture, ino: u64, block: u32, fill: u8) !Binding {
         const m = try self.alloc_a.allocateBlock();
         var buf: [BS]u8 = @splat(fill);
-        try self.dev.seam().vtable.write(&self.dev, VOL_A, m.offset, &buf);
+        var held_gen: u62 = 0;
+        try self.dev.seam().vtable.write(&self.dev, VOL_A, m.offset, &buf, &held_gen);
         self.alloc_a.publishBlock(m.idx);
         const b = Binding.wholeBlock(VOL_A, m.offset, m.stamp);
         if (self.map.files.get(ino) == null) try self.map.create(ino, .striped, 0);

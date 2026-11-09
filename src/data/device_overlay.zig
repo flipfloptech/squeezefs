@@ -1032,7 +1032,7 @@ pub const Overlay = struct {
     fn dmaVehicle(self: *Overlay, io: Io, rec: *Record, dest_off: u64, v: Vehicle) StoreError!void {
         switch (v) {
             .slot => |sv| {
-                if (self.deps.device.writeFixed(rec.dest.vol_tag, dest_off, sv.src)) |_| {
+                if (self.deps.device.writeFixedWaiting(rec.dest.vol_tag, dest_off, sv.src)) |_| {
                     return;
                 } else |_| {
                     stats.overlay_short_stores.inc();
@@ -1052,7 +1052,7 @@ pub const Overlay = struct {
         } else {
             stats.overlay_dma_pool_copy_bytes.add(b.len);
         }
-        _ = self.deps.device.write(rec.dest.vol_tag, dest_off, b) catch |e| return mapDma(e);
+        _ = self.deps.device.writeWaiting(rec.dest.vol_tag, dest_off, b) catch |e| return mapDma(e);
     }
 
     fn mapDma(e: seams.DmaError) StoreError {
@@ -1489,7 +1489,7 @@ pub const Overlay = struct {
         }
         if (gaps.len != 0) self.seedGaps(rec, gaps) catch |e| return self.deviceLegFailed(rec, e, "gap seed");
         // FLUSH (fsync class only).
-        if (barrier) self.deps.device.flush(rec.dest.vol_tag) catch |e| return self.deviceLegFailed(rec, e, "flush");
+        if (barrier) self.deps.device.flushWaiting(rec.dest.vol_tag) catch |e| return self.deviceLegFailed(rec, e, "flush");
         // PUBLISH.
         rec.alloc.publishBlock(rec.dest_idx);
         const new_key = rec.dest;
@@ -1638,7 +1638,7 @@ pub const Overlay = struct {
             } else {
                 @memset(buf, 0);
             }
-            _ = try self.deps.device.write(rec.dest.vol_tag, rec.dest.offset + g.start, buf);
+            _ = try self.deps.device.writeWaiting(rec.dest.vol_tag, rec.dest.offset + g.start, buf);
             stats.overlay_gap_seeds.inc();
             stats.overlay_gap_seed_bytes.add(n);
         }

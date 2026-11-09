@@ -1238,7 +1238,22 @@ pub const DataFence = struct {
 
     /// The devices' re-admission hooks (`DataPlane.bindReadmit`).
     pub fn readmitSource(self: *DataFence) nvme_dev.ReadmitSource {
-        return .{ .ctx = self, .hookFor = &hookForFn };
+        return .{ .ctx = self, .hookFor = &hookForFn, .awaitHeld = &awaitHeldFn };
+    }
+
+    fn awaitHeldFn(ctx: *anyopaque, vol_tag: u64, gen: u62) nvme_dev.HeldWait {
+        const self: *DataFence = @ptrCast(@alignCast(ctx));
+        self.lock.lock();
+        const i = self.tabledIndex(vol_tag) orelse {
+            self.lock.unlock();
+            return .terminal;
+        };
+        const word = &self.vols[i].resolution;
+        self.lock.unlock();
+        return switch (word.awaitPast(gen)) {
+            .cleared => .cleared,
+            .terminal => .terminal,
+        };
     }
 
     /// A tabled volume's hook (null: no device fence there).
@@ -2370,6 +2385,37 @@ test "decision 0004 §4.5.5: the data-fence beat stores terminal on a pending wo
     dj.beat();
     try testing.expectEqual(member_fence.Resolution.State.terminal, dj.vols[0].resolution.snapshot().state);
     try testing.expectEqual(@as(u64, 0), dj.vols[0].pending_since_ns);
+}
+
+test "decision 0004 §4.16b: awaitHeld returns cleared after the word advances, and terminal after terminate" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    const m_id: [16]u8 = "manager-host-id1".*;
+    var mns = fake.Namespace.init(gpa);
+    defer mns.deinit();
+    var dns = fake.Namespace.init(gpa);
+    defer dns.deinit();
+    var mh: fake.Host = .{ .ns = &mns, .host_id = m_id };
+    var meta_m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer meta_m.deinit();
+    try fencing.acquireManagerHold(&meta_m);
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var cfg: FixtureConfig = .{ .live = &.{1} };
+    var no_pages: u8 = 0;
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = true });
+    defer dm.release();
+    var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
+    try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
+    const src = dm.readmitSource();
+    dm.notePending(&dm.vols[0]);
+    const gen = dm.vols[0].resolution.snapshot().gen;
+    dm.noteCleared(&dm.vols[0]);
+    try testing.expectEqual(nvme_dev.HeldWait.cleared, src.awaitHeld(src.ctx, 1, gen));
+    dm.notePending(&dm.vols[0]);
+    const gen2 = dm.vols[0].resolution.snapshot().gen;
+    dm.noteTerminal(&dm.vols[0]);
+    try testing.expectEqual(nvme_dev.HeldWait.terminal, src.awaitHeld(src.ctx, 1, gen2));
 }
 
 test "decision 0003 §DN, a joiner of two metadata volumes: a restart of volume 1's target alone — its beat re-registers its host on VOLUME 1's namespace (its page Live on every joined volume, the stale-sibling rule judged by volume 1's pages), volume 0's and the data namespace's untouched; a member whose page on volume 1 left Live (its death recovered there first) re-registers nothing there, and after a data restart nothing on data either although volume 0 still reads it Live and registered — nor is its refused write re-admitted" {

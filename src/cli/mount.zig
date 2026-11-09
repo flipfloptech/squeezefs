@@ -522,6 +522,11 @@ fn mountMain(ctx: *Ctx) u8 {
     // The lapse beat (review MAJOR 2 of decision 0003 §DJ): a target restart
     // forgets every registration — re-registered at the heartbeat cadence.
     if (dfence) |df| df.startBeat(ctx.sqz.io()) catch return ctx.failed("the data fence's lapse beat could not start", .{});
+    if (dfence) |df| {
+        for (be.volumes) |vol| {
+            if (vol.joined) |js| js.onResolutionCleared(&kickDataFence, df);
+        }
+    }
 
     // 2. The handler tables, the data plane, the filesystem, the binding.
     var registry = watchdog.Registry.init(gpa, watchdog.derivedShards(facts.possible_cpus)) catch return ctx.failed("out of memory (watchdog registry)", .{});
@@ -1421,6 +1426,11 @@ fn admitDataFence(ctx: *Ctx, be: *meta_set.MetaSet, cfg: *const set_config.Confi
         };
         return error.Refused;
     };
+}
+
+fn kickDataFence(ctx: ?*anyopaque) void {
+    const df: *guard.data_fence.DataFence = @ptrCast(@alignCast(ctx orelse return));
+    df.kick();
 }
 
 /// `volume waive-data-fence` (decision 0003 §DJ): the operator's escape for

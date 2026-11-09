@@ -329,8 +329,8 @@ pub fn tryPatch(deps: Deps, io: Io, req: Request) PatchError!bool {
     _ = io;
     const b = (try beginPatch(deps, req.ino, req.block, req.rel)) orelse return false;
     const result: seams.DmaError!void = switch (req.vehicle) {
-        .slot => |src| if (deps.device.writeFixed(b.vol_tag, b.dest, src)) |_| {} else |e| e,
-        .bytes => |bytes| if (deps.device.write(b.vol_tag, b.dest, bytes)) |_| {} else |e| e,
+        .slot => |src| if (deps.device.writeFixedWaiting(b.vol_tag, b.dest, src)) |_| {} else |e| e,
+        .bytes => |bytes| if (deps.device.writeWaiting(b.vol_tag, b.dest, bytes)) |_| {} else |e| e,
     };
     try finishPatch(deps, b, req.vehicle.len(), result);
     return true;

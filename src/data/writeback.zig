@@ -129,10 +129,10 @@ pub const StagedDmaSource = struct {
 /// `write_block_from_staging`: passthrough DMAs straight off the mmap (the
 /// record value sits on the grain); a transform severs the guard pre-DMA
 /// (the image is in the scratch). The source is CONSUMED here.
-pub fn dmaFromStaging(device: seams.DeviceSeam, transform: accumulate.TransformSeam, scratch: []u8, vol_tag: u64, offset: u64, source: StagedDmaSource) anyerror!seams.DmaProof {
+pub fn dmaFromStaging(device: seams.DeviceSeam, transform: accumulate.TransformSeam, scratch: []u8, vol_tag: u64, offset: u64, source: StagedDmaSource, held_gen: *u62) anyerror!seams.DmaProof {
     defer source.consume();
     const image = try transform.process_write(transform.ctx, vol_tag, source.bytes(), scratch);
-    return device.write(vol_tag, offset, image);
+    return device.writeCapture(vol_tag, offset, image, held_gen);
 }
 
 // ---------------------------------------------------------------------------
@@ -219,108 +219,131 @@ pub fn flushOne(deps: Deps, io: Io, unit: *Unit) Disposition {
     const key = unit.key;
     var attempt: u32 = 0;
     while (attempt < FLUSH_ATTEMPTS) : (attempt += 1) {
-        const g = deps.locks.acquire(io, unit.ino, unit.block, .writeback_flush);
-        defer g.release(io);
-        // 1. Ownership re-validated per attempt.
-        const staged_gen = deps.seg.residentGeneration(key) orelse return .nothing;
-        if (staged_gen != unit.owner_generation) {
-            stats.writeback_superseded_noops.inc();
-            return .superseded_noop;
-        }
-        // 2. The placed mint (no shard guard across it) + the owners.
-        const pm = enospc.allocatePlacedMint(deps.picker, .{ .ino = unit.ino, .block = unit.block }, io, deps.valve, null, true, .none) catch return .retry;
-        var mint = block_alloc.MintedBlockGuard.init(pm.alloc, pm.minted);
-        var fsck_guard = block_alloc.InflightAllocGuard.register(pm.alloc, pm.minted.idx);
-        const vol_tag = pm.alloc.volTag();
-        const vol = deps.vols.byTag(vol_tag) orelse {
-            fsck_guard.deinit();
-            mint.abandon();
-            return .retry;
-        };
-        // 3. The write-only source; gone ⇒ abandon, nothing.
-        const lease = deps.seg.get(key) orelse {
-            fsck_guard.deinit();
-            mint.abandon();
-            return .nothing;
-        };
-        const source: StagedDmaSource = .{ .lease = lease, .generation = staged_gen };
-        // 4. The DMA straight off the mmap (the source is consumed inside).
-        const proof = dmaFromStaging(deps.device, deps.transform, deps.scratch, vol_tag, pm.minted.offset, source) catch {
-            fsck_guard.deinit();
-            mint.abandon();
-            if (deps.dismounted) |d| if (d()) {
-                log.info("writeback ino {d} block {d}: dismount in progress — left staged for the next mount", .{ unit.ino, unit.block });
+        var pending_held: ?struct { vol_tag: u64, gen: u62 } = null;
+        const early: ?Disposition = inner: {
+            const g = deps.locks.acquire(io, unit.ino, unit.block, .writeback_flush);
+            defer g.release(io);
+            // 1. Ownership re-validated per attempt.
+            const staged_gen = deps.seg.residentGeneration(key) orelse return .nothing;
+            if (staged_gen != unit.owner_generation) {
+                stats.writeback_superseded_noops.inc();
+                return .superseded_noop;
+            }
+            // 2. The placed mint (no shard guard across it) + the owners.
+            const pm = enospc.allocatePlacedMint(deps.picker, .{ .ino = unit.ino, .block = unit.block }, io, deps.valve, null, true, .none) catch return .retry;
+            var mint = block_alloc.MintedBlockGuard.init(pm.alloc, pm.minted);
+            var fsck_guard = block_alloc.InflightAllocGuard.register(pm.alloc, pm.minted.idx);
+            const vol_tag = pm.alloc.volTag();
+            const vol = deps.vols.byTag(vol_tag) orelse {
+                fsck_guard.deinit();
+                mint.abandon();
                 return .retry;
             };
-            return .retry;
-        };
-        // 5. Publish; the merge credential is the CURRENT generation; the
-        //    size epoch is the unit's own (a truncate since ⇒ clipped).
-        pm.alloc.publishBlock(pm.minted.idx);
-        const new_key = Binding.wholeBlock(vol_tag, pm.minted.offset, pm.minted.stamp);
-        stats.durable_upload_bytes_writeback.add(proof.len);
-        var displaced: seams.MergeOutcome = .{};
-        {
-            const sg = deps.stripes.acquire(io, unit.ino);
-            defer sg.release(io);
-            while (true) {
-                displaced = deps.map.merge(.{ .ino = unit.ino, .inserts = &.{.{ .block = unit.block, .binding = new_key }}, .min_size = unit.min_size, .proofs = &.{proof}, .fencing = deps.map.currentFencing(unit.ino), .size_epoch = unit.size_epoch }) catch |e| switch (e) {
-                    error.FencingTokenExpired => {
-                        stats.writeback_stale_token_retries.inc();
-                        continue;
-                    },
-                    error.NotFound => {
-                        // 6. Verified-NotFound: never resurrect a dead inode.
-                        stats.writeback_orphan_discards.inc();
-                        fsck_guard.deinit();
-                        mint.abandon();
-                        _ = staging.releaseStaged(deps.pool, deps.seg, deps.cache, key, staged_gen);
-                        return .orphan_discarded;
-                    },
-                    error.WriterGuardFenced => {
-                        fsck_guard.deinit();
-                        mint.disarm(); // W5: free nothing
-                        const poisoned = if (deps.custody_poisoned) |p| p() else false;
-                        if (poisoned) {
-                            stats.writeback_fence_noops.inc();
-                            return .fence_noop;
-                        }
-                        stats.writeback_errors_reported.inc();
-                        return .retry;
-                    },
-                    error.Transient, error.OutOfMemory => {
-                        fsck_guard.deinit();
-                        mint.abandon();
-                        return .retry;
-                    },
+            // 3. The write-only source; gone ⇒ abandon, nothing.
+            const lease = deps.seg.get(key) orelse {
+                fsck_guard.deinit();
+                mint.abandon();
+                return .nothing;
+            };
+            const source: StagedDmaSource = .{ .lease = lease, .generation = staged_gen };
+            // 4. The DMA straight off the mmap (the source is consumed inside).
+            var gen: u62 = 0;
+            const proof = dmaFromStaging(deps.device, deps.transform, deps.scratch, vol_tag, pm.minted.offset, source, &gen) catch |e| {
+                fsck_guard.deinit();
+                mint.abandon();
+                if (deps.dismounted) |d| if (d()) {
+                    log.info("writeback ino {d} block {d}: dismount in progress — left staged for the next mount", .{ unit.ino, unit.block });
+                    break :inner .retry;
                 };
-                break;
+                if (e == error.Held) {
+                    pending_held = .{ .vol_tag = vol_tag, .gen = gen };
+                    break :inner null;
+                }
+                break :inner .retry;
+            };
+            // 5. Publish; the merge credential is the CURRENT generation; the
+            //    size epoch is the unit's own (a truncate since ⇒ clipped).
+            pm.alloc.publishBlock(pm.minted.idx);
+            const new_key = Binding.wholeBlock(vol_tag, pm.minted.offset, pm.minted.stamp);
+            stats.durable_upload_bytes_writeback.add(proof.len);
+            var displaced: seams.MergeOutcome = .{};
+            {
+                const sg = deps.stripes.acquire(io, unit.ino);
+                defer sg.release(io);
+                while (true) {
+                    displaced = deps.map.merge(.{ .ino = unit.ino, .inserts = &.{.{ .block = unit.block, .binding = new_key }}, .min_size = unit.min_size, .proofs = &.{proof}, .fencing = deps.map.currentFencing(unit.ino), .size_epoch = unit.size_epoch }) catch |e| switch (e) {
+                        error.FencingTokenExpired => {
+                            stats.writeback_stale_token_retries.inc();
+                            continue;
+                        },
+                        error.NotFound => {
+                            // 6. Verified-NotFound: never resurrect a dead inode.
+                            stats.writeback_orphan_discards.inc();
+                            fsck_guard.deinit();
+                            mint.abandon();
+                            _ = staging.releaseStaged(deps.pool, deps.seg, deps.cache, key, staged_gen);
+                            return .orphan_discarded;
+                        },
+                        error.WriterGuardFenced => {
+                            fsck_guard.deinit();
+                            mint.disarm(); // W5: free nothing
+                            const poisoned = if (deps.custody_poisoned) |p| p() else false;
+                            if (poisoned) {
+                                stats.writeback_fence_noops.inc();
+                                return .fence_noop;
+                            }
+                            stats.writeback_errors_reported.inc();
+                            return .retry;
+                        },
+                        error.Transient, error.OutOfMemory => {
+                            fsck_guard.deinit();
+                            mint.abandon();
+                            return .retry;
+                        },
+                    };
+                    break;
+                }
+            }
+            // 6b. The unit predates a truncate and its block lies at or past the
+            //     new EOF: nothing names the mint — returned; the dead bytes
+            //     leave the ring (the never-lossy law covered no byte below EOF).
+            if (displaced.clipped != 0) {
+                stats.writeback_eof_discards.inc();
+                fsck_guard.deinit();
+                mint.abandon();
+                _ = staging.releaseStaged(deps.pool, deps.seg, deps.cache, key, staged_gen);
+                return .eof_discarded;
+            }
+            // 7. Disarm, purge the recycled key, free displaced, release the
+            //    ring entry iff the generation still matches.
+            fsck_guard.deinit();
+            mint.disarm();
+            deps.purge.purge(new_key);
+            if (deps.touched) |t| t(deps.touched_ctx, unit.ino, vol.ordinal);
+            for (displaced.slice()) |d| {
+                deps.purge.purge(d);
+                _ = deps.free.free(io, d);
+            }
+            displaced.dropHolds();
+            _ = staging.releaseStaged(deps.pool, deps.seg, deps.cache, key, staged_gen);
+            stats.writeback_flushed.inc();
+            return .flushed;
+        };
+        if (pending_held) |h| {
+            switch (deps.device.awaitHeld(h.vol_tag, h.gen)) {
+                .cleared => continue,
+                .terminal => {
+                    const poisoned = if (deps.custody_poisoned) |p| p() else false;
+                    if (poisoned) {
+                        stats.writeback_fence_noops.inc();
+                        return .fence_noop;
+                    }
+                    stats.writeback_errors_reported.inc();
+                    return .retry;
+                },
             }
         }
-        // 6b. The unit predates a truncate and its block lies at or past the
-        //     new EOF: nothing names the mint — returned; the dead bytes
-        //     leave the ring (the never-lossy law covered no byte below EOF).
-        if (displaced.clipped != 0) {
-            stats.writeback_eof_discards.inc();
-            fsck_guard.deinit();
-            mint.abandon();
-            _ = staging.releaseStaged(deps.pool, deps.seg, deps.cache, key, staged_gen);
-            return .eof_discarded;
-        }
-        // 7. Disarm, purge the recycled key, free displaced, release the
-        //    ring entry iff the generation still matches.
-        fsck_guard.deinit();
-        mint.disarm();
-        deps.purge.purge(new_key);
-        if (deps.touched) |t| t(deps.touched_ctx, unit.ino, vol.ordinal);
-        for (displaced.slice()) |d| {
-            deps.purge.purge(d);
-            _ = deps.free.free(io, d);
-        }
-        displaced.dropHolds();
-        _ = staging.releaseStaged(deps.pool, deps.seg, deps.cache, key, staged_gen);
-        stats.writeback_flushed.inc();
-        return .flushed;
+        if (early) |d| return d;
     }
     return .retry;
 }

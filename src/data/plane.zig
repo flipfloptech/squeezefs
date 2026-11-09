@@ -1842,7 +1842,8 @@ pub const DataPlane = struct {
         var guard = block_alloc.MintedBlockGuard.init(v.alloc, minted);
         errdefer guard.abandon();
         if (self.test_own_block_poison) try self.poisonMint(tag, minted.offset);
-        self.deviceWrite(tag, minted.offset, stored) catch |e| return mapDma(e);
+        var held_gen: u62 = 0;
+        self.deviceWrite(tag, minted.offset, stored, &held_gen) catch |e| return mapDma(e);
         try self.promotionBarrier(io, v);
         v.alloc.publishBlock(minted.idx);
         guard.disarm();
@@ -1882,7 +1883,8 @@ pub const DataPlane = struct {
         const buf = self.gpa.alignedAlloc(u8, .fromByteUnits(layout.GRAIN), @intCast(self.block_size)) catch return error.OutOfMemory;
         defer self.gpa.free(buf);
         @memset(buf, 0xAA);
-        self.deviceWrite(tag, offset, buf) catch |e| return mapDma(e);
+        var held_gen: u62 = 0;
+        self.deviceWrite(tag, offset, buf, &held_gen) catch |e| return mapDma(e);
     }
 
     /// A FIFO-hold seam's path (`SQUEEZEFS_TEST_PROMOTION_HOLD`,
@@ -3058,7 +3060,7 @@ pub const DataPlane = struct {
         return .{ .ctx = self, .vtable = &device_vtable };
     }
 
-    const device_vtable: seams.DeviceSeam.VTable = .{ .write = &devWrite, .write_fixed = &devWriteFixed, .read = &devRead, .flush = &devFlush };
+    const device_vtable: seams.DeviceSeam.VTable = .{ .write = &devWrite, .write_fixed = &devWriteFixed, .read = &devRead, .flush = &devFlush, .await_held = &devAwaitHeld };
 
     fn mapDma(e: nvme_dev.DeviceError) seams.DmaError {
         return switch (e) {
@@ -3083,19 +3085,20 @@ pub const DataPlane = struct {
         if (!dma_has_held) @compileError("DmaError must contain Held (decision 0004 §4.16b)");
     }
 
-    fn deviceWrite(self: *DataPlane, vol_tag: u64, offset: u64, data: []const u8) nvme_dev.DeviceError!void {
+    fn deviceWrite(self: *DataPlane, vol_tag: u64, offset: u64, data: []const u8, held_gen: *u62) nvme_dev.DeviceError!void {
         const dev = self.deviceOf(vol_tag) orelse return error.VolumeFailed;
-        try dev.writeBlock(offset, data);
+        try dev.writeBlockCapture(offset, data, held_gen);
     }
 
-    fn devWrite(ctx: *anyopaque, vol_tag: u64, offset: u64, data: []const u8) seams.DmaError!void {
+    fn devWrite(ctx: *anyopaque, vol_tag: u64, offset: u64, data: []const u8, held_gen: *u62) seams.DmaError!void {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        self.deviceWrite(vol_tag, offset, data) catch |e| return mapDma(e);
+        self.deviceWrite(vol_tag, offset, data, held_gen) catch |e| return mapDma(e);
     }
 
     /// `WRITE_FIXED(device ← slot)` through the session's face: the held
     /// payload lands from the app's pages with zero daemon passes.
-    fn devWriteFixed(ctx: *anyopaque, vol_tag: u64, offset: u64, src: seams.HeldSource) seams.DmaError!void {
+    fn devWriteFixed(ctx: *anyopaque, vol_tag: u64, offset: u64, src: seams.HeldSource, held_gen: *u62) seams.DmaError!void {
+        _ = held_gen;
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         const face = self.held_store orelse return error.WorkerShutdown;
         const dev = self.deviceOf(vol_tag) orelse return error.VolumeFailed;
@@ -3163,10 +3166,19 @@ pub const DataPlane = struct {
         };
     }
 
-    fn devFlush(ctx: *anyopaque, vol_tag: u64) seams.DmaError!void {
+    fn devFlush(ctx: *anyopaque, vol_tag: u64, held_gen: *u62) seams.DmaError!void {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         const dev = self.deviceOf(vol_tag) orelse return error.VolumeFailed;
-        dev.flush() catch |e| return mapDma(e);
+        dev.flushCapture(held_gen) catch |e| return mapDma(e);
+    }
+
+    fn devAwaitHeld(ctx: *anyopaque, vol_tag: u64, gen: u62) seams.DeviceSeam.HeldWait {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        const src = self.readmit orelse return .cleared;
+        return switch (src.awaitHeld(src.ctx, vol_tag, gen)) {
+            .cleared => .cleared,
+            .terminal => .terminal,
+        };
     }
 
     /// The pack's DMA seam (the same device write; the proof minted by the
@@ -3177,7 +3189,8 @@ pub const DataPlane = struct {
 
     fn dmaWrite(ctx: *anyopaque, vol_tag: u64, offset: u64, data: []const u8) layout.DmaError!void {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        self.deviceWrite(vol_tag, offset, data) catch |e| return mapDma(e);
+        var gen: u62 = 0;
+        self.deviceWrite(vol_tag, offset, data, &gen) catch |e| return mapDma(e);
     }
 
     // ---- the transform seams ----

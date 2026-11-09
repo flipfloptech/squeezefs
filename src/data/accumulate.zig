@@ -1595,10 +1595,19 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             };
             prof.mark(.crypto);
             prof.mark(.allocate);
-            break :blk deps.device.write(vol_tag, dest.offset, image) catch |e| {
+            var gen: u62 = 0;
+            break :blk deps.device.writeCapture(vol_tag, dest.offset, image, &gen) catch |e| {
                 fsck_guard.deinit();
                 dest.abandon();
                 stats.write_through_fallbacks.inc();
+                if (e == error.Held) {
+                    deps.device.afterHeld(vol_tag, gen) catch |te| {
+                        table.noteDmaRefusal(te);
+                        return .fence_drop;
+                    };
+                    table.noteDmaRefusal(e);
+                    return .stay_parked;
+                }
                 table.noteDmaRefusal(e);
                 fenced = e == error.WriterGuardFenced or e == error.VolumeFailed;
                 return if (fenced) .fence_drop else .stay_parked;
@@ -1980,7 +1989,7 @@ fn foldInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
     var written: u64 = 0;
     var dma: seams.DmaError!void = {};
     for (runs) |r| {
-        dma = if (deps.device.write(begun.vol_tag, begun.dest + r.start, scratch[r.start..r.end])) |_| {} else |err| err;
+        dma = if (deps.device.writeWaiting(begun.vol_tag, begun.dest + r.start, scratch[r.start..r.end])) |_| {} else |err| err;
         if (dma) |_| {
             written += r.end - r.start;
             extent.stats.fold_inplace_dmas.inc();
@@ -2082,7 +2091,7 @@ fn drainInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
     var written: u64 = 0;
     var dma: seams.DmaError!void = {};
     for (page_runs[0..n_runs]) |pr| {
-        dma = if (deps.device.write(begun.vol_tag, begun.dest + pr.start, cell.data[pr.start..pr.end])) |_| {} else |err| err;
+        dma = if (deps.device.writeWaiting(begun.vol_tag, begun.dest + pr.start, cell.data[pr.start..pr.end])) |_| {} else |err| err;
         if (dma) |_| {
             written += pr.len();
             stats.drain_inplace_dmas.inc();
@@ -2150,7 +2159,7 @@ fn drainDirtyInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposit
         while (q < pages and e.dirty.isSet(q)) q += 1;
         const s: u32 = @intCast(p * PAGE);
         const t: u32 = @intCast(q * PAGE);
-        dma = if (deps.device.write(begun.vol_tag, begun.dest + s, cell.data[s..t])) |_| {} else |err| err;
+        dma = if (deps.device.writeWaiting(begun.vol_tag, begun.dest + s, cell.data[s..t])) |_| {} else |err| err;
         if (dma) |_| {
             written += t - s;
             stats.drain_inplace_dmas.inc();
@@ -2948,7 +2957,8 @@ const InFlightDevice = struct {
 
     const vtable: seams.DeviceSeam.VTable = .{ .write = &write, .write_fixed = null, .read = &read, .flush = &flush };
 
-    fn write(ctx: *anyopaque, vol: u64, off: u64, data: []const u8) seams.DmaError!void {
+    fn write(ctx: *anyopaque, vol: u64, off: u64, data: []const u8, held_gen: *u62) seams.DmaError!void {
+        _ = held_gen;
         const self: *InFlightDevice = @ptrCast(@alignCast(ctx));
         if (self.entered.fetchAdd(1, .acq_rel) == 0) {
             while (self.entered.load(.acquire) < 2) std.Thread.yield() catch {};
@@ -2961,7 +2971,8 @@ const InFlightDevice = struct {
         return self.inner.vtable.read(self.inner.ctx, vol, off, out);
     }
 
-    fn flush(ctx: *anyopaque, vol: u64) seams.DmaError!void {
+    fn flush(ctx: *anyopaque, vol: u64, held_gen: *u62) seams.DmaError!void {
+        _ = held_gen;
         const self: *InFlightDevice = @ptrCast(@alignCast(ctx));
         return self.inner.vtable.flush(self.inner.ctx, vol);
     }

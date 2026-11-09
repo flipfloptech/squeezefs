@@ -494,10 +494,20 @@ pub const Readmit = struct {
 
 /// Where a data plane finds each data volume's `Readmit` (null = none: the
 /// volume carries no device fence).
+/// A held writer's wait on `data_resolution[d]` (decision 0004 §4.16b).
+pub const HeldWait = enum { cleared, terminal };
+
 pub const ReadmitSource = struct {
     ctx: *anyopaque,
     hookFor: *const fn (ctx: *anyopaque, vol_tag: u64) ?*const Readmit,
+    /// Wait on the volume's data word past `gen`. Absent: a caller without
+    /// a fence treats a Held as already cleared (tests; no hang).
+    awaitHeld: *const fn (ctx: *anyopaque, vol_tag: u64, gen: u62) HeldWait = awaitHeldAbsent,
 };
+
+fn awaitHeldAbsent(_: *anyopaque, _: u64, _: u62) HeldWait {
+    return .cleared;
+}
 
 /// Custody hooks the data plane installs later (`data_custody`): `poison`
 /// is told why the process-wide custody latch fell; `authorize` may add the

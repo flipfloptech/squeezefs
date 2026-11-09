@@ -59,21 +59,36 @@ pub const DeviceSeam = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
 
+    pub const HeldWait = enum { cleared, terminal };
+
     pub const VTable = struct {
-        write: *const fn (ctx: *anyopaque, vol_tag: u64, offset: u64, data: []const u8) DmaError!void,
-        write_fixed: ?*const fn (ctx: *anyopaque, vol_tag: u64, offset: u64, src: HeldSource) DmaError!void,
+        write: *const fn (ctx: *anyopaque, vol_tag: u64, offset: u64, data: []const u8, held_gen: *u62) DmaError!void,
+        write_fixed: ?*const fn (ctx: *anyopaque, vol_tag: u64, offset: u64, src: HeldSource, held_gen: *u62) DmaError!void,
         read: *const fn (ctx: *anyopaque, vol_tag: u64, offset: u64, out: []u8) ReadError!void,
-        flush: *const fn (ctx: *anyopaque, vol_tag: u64) DmaError!void,
+        flush: *const fn (ctx: *anyopaque, vol_tag: u64, held_gen: *u62) DmaError!void,
+        /// Wait on `data_resolution[d]` past `gen`. Null: a Held is treated
+        /// as already cleared (portable tests without a data fence).
+        await_held: ?*const fn (ctx: *anyopaque, vol_tag: u64, gen: u62) HeldWait = null,
     };
 
     pub fn write(self: DeviceSeam, vol_tag: u64, offset: u64, data: []const u8) DmaError!DmaProof {
-        try self.vtable.write(self.ctx, vol_tag, offset, data);
+        var gen: u62 = 0;
+        return self.writeCapture(vol_tag, offset, data, &gen);
+    }
+
+    pub fn writeCapture(self: DeviceSeam, vol_tag: u64, offset: u64, data: []const u8, held_gen: *u62) DmaError!DmaProof {
+        try self.vtable.write(self.ctx, vol_tag, offset, data, held_gen);
         return .{ .vol_tag = vol_tag, .offset = offset, .len = layout.ceilGrain(data.len), .completed_ns = clock.monotonicNs() };
     }
 
     pub fn writeFixed(self: DeviceSeam, vol_tag: u64, offset: u64, src: HeldSource) DmaError!DmaProof {
+        var gen: u62 = 0;
+        return self.writeFixedCapture(vol_tag, offset, src, &gen);
+    }
+
+    pub fn writeFixedCapture(self: DeviceSeam, vol_tag: u64, offset: u64, src: HeldSource, held_gen: *u62) DmaError!DmaProof {
         const f = self.vtable.write_fixed orelse return error.WorkerShutdown;
-        try f(self.ctx, vol_tag, offset, src);
+        try f(self.ctx, vol_tag, offset, src, held_gen);
         return .{ .vol_tag = vol_tag, .offset = offset, .len = layout.ceilGrain(src.len), .completed_ns = clock.monotonicNs() };
     }
 
@@ -86,7 +101,63 @@ pub const DeviceSeam = struct {
     }
 
     pub fn flush(self: DeviceSeam, vol_tag: u64) DmaError!void {
-        return self.vtable.flush(self.ctx, vol_tag);
+        var gen: u62 = 0;
+        return self.flushCapture(vol_tag, &gen);
+    }
+
+    pub fn flushCapture(self: DeviceSeam, vol_tag: u64, held_gen: *u62) DmaError!void {
+        return self.vtable.flush(self.ctx, vol_tag, held_gen);
+    }
+
+    /// After catching `error.Held` and releasing data-plane locks: wait for
+    /// the word past `gen`. `cleared` = the caller retries; `terminal` =
+    /// `WriterGuardFenced` (decision 0004 §4.16b).
+    pub fn awaitHeld(self: DeviceSeam, vol_tag: u64, gen: u62) HeldWait {
+        const f = self.vtable.await_held orelse return .cleared;
+        return f(self.ctx, vol_tag, gen);
+    }
+
+    pub fn afterHeld(self: DeviceSeam, vol_tag: u64, gen: u62) DmaError!void {
+        return switch (self.awaitHeld(vol_tag, gen)) {
+            .cleared => {},
+            .terminal => error.WriterGuardFenced,
+        };
+    }
+
+    /// Write, waiting out a Held and retrying once the word clears. Terminal
+    /// becomes `WriterGuardFenced`. Callers that still hold a data-plane lock
+    /// should use `writeCapture` and wait after releasing it.
+    pub fn writeWaiting(self: DeviceSeam, vol_tag: u64, offset: u64, data: []const u8) DmaError!DmaProof {
+        while (true) {
+            var gen: u62 = 0;
+            return self.writeCapture(vol_tag, offset, data, &gen) catch |e| {
+                if (e != error.Held) return e;
+                try self.afterHeld(vol_tag, gen);
+                continue;
+            };
+        }
+    }
+
+    pub fn writeFixedWaiting(self: DeviceSeam, vol_tag: u64, offset: u64, src: HeldSource) DmaError!DmaProof {
+        while (true) {
+            var gen: u62 = 0;
+            return self.writeFixedCapture(vol_tag, offset, src, &gen) catch |e| {
+                if (e != error.Held) return e;
+                try self.afterHeld(vol_tag, gen);
+                continue;
+            };
+        }
+    }
+
+    pub fn flushWaiting(self: DeviceSeam, vol_tag: u64) DmaError!void {
+        while (true) {
+            var gen: u62 = 0;
+            return self.flushCapture(vol_tag, &gen) catch |e| {
+                if (e != error.Held) return e;
+                try self.afterHeld(vol_tag, gen);
+                continue;
+            };
+        }
     }
 };
 

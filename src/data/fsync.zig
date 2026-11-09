@@ -490,43 +490,52 @@ pub fn fsync(ctx: Ctx, io: Io, ino: u64, prof: *Prof) Error!void {
     // INTENT BARRIER.
     if (ctx.intent) |it| it.barrier(it.ctx, io, ino) catch return error.IntentBarrierFailed;
     prof.mark(.intent_barrier);
-    // DATA FLUSH: the overlay drain (barrier = true) first; then every
-    // parked block of the ino escalates to one durable upload (DUR-1); the
-    // ENOSPC retry: flush the data devices → close THIS ino's epoch → once
-    // more; a second wall is the honest ENOSPC.
-    const left = ctx.overlay.drainForIno(io, ctx.locks, ino, std.math.maxInt(u64), true, ctx.close_seams);
-    if (left != 0) device_overlay.stats.overlay_unpublished_at_fsync.fire("overlay records left open after the fsync drain");
-    try flushParked(ctx, io, ino, null);
-    if (ctx.worker) |w| if (ctx.wb_deps) |d| {
-        _ = w.drainOnce(io, d);
-    };
-    prof.mark(.data_flush);
-    // STAGED PROMOTE: the write cache's law (a RAM record cannot be made
-    // durable where it lies: it leaves for the data volumes BEFORE the data
-    // barrier, so the barrier covers its block; one still resident after
-    // the attempt is an fsync that cannot be acked — EIO, or ENOSPC when
-    // the store had no block for it: the terminal law's word at the sync
-    // point, the bytes stay resident and dirty and the next point retries).
-    if (ctx.staged_key) |k| if (ctx.staged_segment) |seg| switch (staging.promoteAtFsync(seg, ctx.promotion, k)) {
-        .kept => {
-            stats.fsync_promote_refusals.inc();
-            return error.InputOutput;
-        },
-        .kept_no_space => {
-            stats.fsync_promote_enospc.inc();
-            return error.NoSpaceLeft;
-        },
-        .promoted, .absent => {},
-    };
-    prof.mark(.staged_promote);
-    // DATA BARRIER: observe → plan → legs joined and ALL awaited → clear.
-    const observed = ctx.touched.observe(ino);
-    const bits: u64 = if (ctx.levers.touched_namespaces) TouchedTable.bitsOf(observed) else TouchedTable.ALL_BIT;
-    var plan_buf: [256]u32 = undefined;
-    const plan = planBarriers(bits, ctx.vols, &plan_buf);
-    if (plan.len == 0) stats.fsync_noop_clean.inc();
-    try runBarrierLegs(ctx, io, plan);
-    stats.fsync_data_namespaces_flushed.add(plan.len);
+    // A held barrier restarts from custody after the word clears
+    // (decision 0004 §4.16b).
+    var observed: u64 = 0;
+    while (true) {
+        // DATA FLUSH: the overlay drain (barrier = true) first; then every
+        // parked block of the ino escalates to one durable upload (DUR-1); the
+        // ENOSPC retry: flush the data devices → close THIS ino's epoch → once
+        // more; a second wall is the honest ENOSPC.
+        const left = ctx.overlay.drainForIno(io, ctx.locks, ino, std.math.maxInt(u64), true, ctx.close_seams);
+        if (left != 0) device_overlay.stats.overlay_unpublished_at_fsync.fire("overlay records left open after the fsync drain");
+        try flushParked(ctx, io, ino, null);
+        if (ctx.worker) |w| if (ctx.wb_deps) |d| {
+            _ = w.drainOnce(io, d);
+        };
+        prof.mark(.data_flush);
+        // STAGED PROMOTE: the write cache's law (a RAM record cannot be made
+        // durable where it lies: it leaves for the data volumes BEFORE the data
+        // barrier, so the barrier covers its block; one still resident after
+        // the attempt is an fsync that cannot be acked — EIO, or ENOSPC when
+        // the store had no block for it: the terminal law's word at the sync
+        // point, the bytes stay resident and dirty and the next point retries).
+        if (ctx.staged_key) |k| if (ctx.staged_segment) |seg| switch (staging.promoteAtFsync(seg, ctx.promotion, k)) {
+            .kept => {
+                stats.fsync_promote_refusals.inc();
+                return error.InputOutput;
+            },
+            .kept_no_space => {
+                stats.fsync_promote_enospc.inc();
+                return error.NoSpaceLeft;
+            },
+            .promoted, .absent => {},
+        };
+        prof.mark(.staged_promote);
+        // DATA BARRIER: observe → plan → legs joined and ALL awaited → clear.
+        observed = ctx.touched.observe(ino);
+        const bits: u64 = if (ctx.levers.touched_namespaces) TouchedTable.bitsOf(observed) else TouchedTable.ALL_BIT;
+        var plan_buf: [256]u32 = undefined;
+        const plan = planBarriers(bits, ctx.vols, &plan_buf);
+        if (plan.len == 0) stats.fsync_noop_clean.inc();
+        runBarrierLegs(ctx, io, plan) catch |e| switch (e) {
+            error.Held => continue,
+            else => return e,
+        };
+        stats.fsync_data_namespaces_flushed.add(plan.len);
+        break;
+    }
     _ = ctx.touched.clearObserved(ino, observed);
     prof.mark(.data_barrier);
     // META PUBLISH: the rewrite epoch's ONE save.
@@ -560,7 +569,13 @@ pub fn barrierInos(ctx: Ctx, io: Io, inos: []const u64) Error!void {
     if (!ctx.levers.touched_namespaces) bits = TouchedTable.ALL_BIT;
     var plan_buf: [256]u32 = undefined;
     const plan = planBarriers(bits, ctx.vols, &plan_buf);
-    try runBarrierLegs(ctx, io, plan);
+    while (true) {
+        runBarrierLegs(ctx, io, plan) catch |e| switch (e) {
+            error.Held => continue,
+            else => return e,
+        };
+        break;
+    }
     stats.fsync_data_namespaces_flushed.add(plan.len);
     for (inos, observed[0..inos.len]) |ino, o| _ = ctx.touched.clearObserved(ino, o);
 }
@@ -716,10 +731,14 @@ const LegResult = struct { err: ?Error = null };
 
 fn barrierLeg(ctx: Ctx, ord: u32, out: *LegResult) void {
     const v = ctx.vols.byOrdinal(ord) orelse return;
-    ctx.device.flush(v.vol_tag) catch |e| {
+    var gen: u62 = 0;
+    ctx.device.flushCapture(v.vol_tag, &gen) catch |e| {
         out.err = switch (e) {
             error.WriterGuardFenced => error.WriterGuardFenced,
-            error.Held => error.Held,
+            error.Held => blk: {
+                ctx.device.afterHeld(v.vol_tag, gen) catch break :blk error.WriterGuardFenced;
+                break :blk error.Held;
+            },
             error.VolumeFailed => error.VolumeFailed,
             error.NoSpaceLeft => error.NoSpaceLeft,
             error.OutOfMemory => error.OutOfMemory,

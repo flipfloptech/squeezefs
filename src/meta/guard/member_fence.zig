@@ -150,6 +150,9 @@ pub const Readmit = struct {
     word: ?*Resolution = null,
     on_held: ?*const fn (ctx: ?*anyopaque) void = null,
     on_held_ctx: ?*anyopaque = null,
+    /// A metadata `cleared` kicks the data-fence beat (decision 0004 §4.5.5).
+    on_cleared: ?*const fn (ctx: ?*anyopaque) void = null,
+    on_cleared_ctx: ?*anyopaque = null,
 
     pub fn joiner() Readmit {
         return .{};
@@ -192,7 +195,9 @@ pub const Readmit = struct {
         if (self.word) |w| {
             if (fence) w.terminate();
             if (park) _ = w.reopen();
-            if (verdict == .retry and report.readable and report.host_registered and facts.own_page_live) _ = w.clear();
+            if (verdict == .retry and report.readable and report.host_registered and facts.own_page_live) {
+                if (w.clear()) if (self.on_cleared) |f| f(self.on_cleared_ctx);
+            }
         }
         if (park) if (self.on_held) |f| f(self.on_held_ctx);
         if (fence) return .latch;
@@ -710,10 +715,19 @@ test "member fence: the beat holds a successor, latches a new recovering sibling
 
     var back = Readmit.joiner();
     var cleared: Resolution = .{};
+    var kicks: u32 = 0;
     _ = cleared.reopen();
     back.word = &cleared;
+    back.on_cleared_ctx = &kicks;
+    back.on_cleared = struct {
+        fn bump(ctx: ?*anyopaque) void {
+            const p: *u32 = @ptrCast(@alignCast(ctx.?));
+            p.* += 1;
+        }
+    }.bump;
     try testing.expectEqual(Verdict.retry, back.beat(me, &.{ mgr, ours }, .{ .readable = true, .rtype = 3, .host_registered = true }));
     try testing.expectEqual(Resolution.State.cleared, cleared.snapshot().state);
+    try testing.expectEqual(@as(u32, 1), kicks);
 
     var dead = Readmit.joiner();
     var recovering_self = ours;

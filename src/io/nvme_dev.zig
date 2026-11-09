@@ -58,6 +58,7 @@ pub const FenceSignal = nd.FenceSignal;
 pub const Readmit = nd.Readmit;
 pub const ReadmitVerdict = nd.ReadmitVerdict;
 pub const ReadmitAnswer = nd.ReadmitAnswer;
+pub const HeldWait = nd.HeldWait;
 pub const ReadmitSource = nd.ReadmitSource;
 pub const CustodyHooks = nd.CustodyHooks;
 pub const installCustodyHooks = nd.installCustodyHooks;
@@ -1464,8 +1465,10 @@ pub const Device = struct {
     /// once more (counted as a write refusal). Otherwise the error to return:
     /// `Held` with no latch and no `data_pr_write_refusals` count, or the
     /// latched class (decision 0004 §4.5.5).
-    fn tryReadmit(self: *Device, err: DeviceError) ?DeviceError {
-        return switch (self.refusalVerdict(err).verdict) {
+    fn tryReadmit(self: *Device, err: DeviceError, held_gen: *u62) ?DeviceError {
+        const a = self.refusalVerdict(err);
+        held_gen.* = a.gen;
+        return switch (a.verdict) {
             .retry => blk: {
                 stats.data_pr_write_refusals.inc();
                 break :blk null;
@@ -1486,8 +1489,10 @@ pub const Device = struct {
 
     /// A second failure after one re-issue, or any refusal that is not retried:
     /// `held` returns `Held` without latching; `retry` and `decline` latch.
-    fn finishRefusal(self: *Device, err: DeviceError) DeviceError {
-        return switch (self.refusalVerdict(err).verdict) {
+    fn finishRefusal(self: *Device, err: DeviceError, held_gen: *u62) DeviceError {
+        const a = self.refusalVerdict(err);
+        held_gen.* = a.gen;
+        return switch (a.verdict) {
             .held => blk: {
                 stats.data_pr_refusals_held.inc();
                 break :blk error.Held;
@@ -1590,27 +1595,34 @@ pub const Device = struct {
     /// the keep-alive — it is parked for the DMA); anything else bounces
     /// through a pooled 4 KiB-padded copy whose zero tail is WRITTEN.
     pub fn writeBlock(self: *Device, offset: u64, data: []const u8) DeviceError!void {
+        var gen: u62 = 0;
+        return self.writeBlockCapture(offset, data, &gen);
+    }
+
+    /// Like `writeBlock`, and on `error.Held` writes the generation captured
+    /// before classification into `held_gen` (decision 0004 §4.5.5).
+    pub fn writeBlockCapture(self: *Device, offset: u64, data: []const u8, held_gen: *u62) DeviceError!void {
         // Injected failure, through the funnel (so an EBADE injection
         // latches the fence exactly like a device verdict).
         if (takeArmed(&self.seams.fail_next_writes)) {
             const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(self.seams.fail_errno.load(.seq_cst)))));
             if (e == .SUCCESS) return error.InputOutput;
             const err = nd.errnoToError(e);
-            if (self.tryReadmit(err)) |e_out| return e_out;
+            if (self.tryReadmit(err, held_gen)) |e_out| return e_out;
         }
         try self.fenceGate();
-        if (takeArmed(&self.seams.hold_next_write)) return self.heldWrite(offset, data);
-        return self.submitWrite(offset, data);
+        if (takeArmed(&self.seams.hold_next_write)) return self.heldWrite(offset, data, held_gen);
+        return self.submitWrite(offset, data, held_gen);
     }
 
     /// The armed hold: past every gate of this process, the write waits for
     /// the FIFO's writer, then reaches the device — whatever fenced it since.
-    fn heldWrite(self: *Device, offset: u64, data: []const u8) DeviceError!void {
+    fn heldWrite(self: *Device, offset: u64, data: []const u8, held_gen: *u62) DeviceError!void {
         const fifo = std.mem.sliceTo(&self.write_hold_fifo, 0);
         log.warn("test seam: SQUEEZEFS_TEST_DATA_WRITE_HOLD — data volume {s}: the write at offset {d} ({d} B) parks past its fence gate until a writer opens {s}", .{ self.path, offset, data.len, fifo });
         const rc = linux.open(&self.write_hold_fifo, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         if (linux.errno(rc) == .SUCCESS) _ = linux.close(@intCast(rc));
-        const r = self.submitWrite(offset, data);
+        const r = self.submitWrite(offset, data, held_gen);
         if (r) |_| {
             log.warn("test seam: SQUEEZEFS_TEST_DATA_WRITE_HOLD — data volume {s}: the held write at offset {d} completed: landed", .{ self.path, offset });
         } else |e| log.warn("test seam: SQUEEZEFS_TEST_DATA_WRITE_HOLD — data volume {s}: the held write at offset {d} completed: refused ({s})", .{ self.path, offset, @errorName(e) });
@@ -1620,10 +1632,10 @@ pub const Device = struct {
     /// One write, issued once more when the data fence retried the host
     /// after the device refused it (decision 0003 §DL): the refused command
     /// never executed, so the second is the first to land.
-    fn submitWrite(self: *Device, offset: u64, data: []const u8) DeviceError!void {
+    fn submitWrite(self: *Device, offset: u64, data: []const u8, held_gen: *u62) DeviceError!void {
         self.submitWriteOnce(offset, data) catch |err| {
-            if (self.tryReadmit(err)) |e| return e;
-            self.submitWriteOnce(offset, data) catch |again| return self.finishRefusal(again);
+            if (self.tryReadmit(err, held_gen)) |e| return e;
+            self.submitWriteOnce(offset, data) catch |again| return self.finishRefusal(again, held_gen);
         };
     }
 
@@ -1829,9 +1841,14 @@ pub const Device = struct {
     /// (the metadata plane's `SyncCoalescer` wraps this later), so
     /// `data_device_sync_requests == data_device_syncs` for now.
     pub fn flush(self: *Device) DeviceError!void {
+        var gen: u62 = 0;
+        return self.flushCapture(&gen);
+    }
+
+    pub fn flushCapture(self: *Device, held_gen: *u62) DeviceError!void {
         self.flushOnce() catch |err| {
-            if (self.tryReadmit(err)) |e| return e;
-            self.flushOnce() catch |again| return self.finishRefusal(again);
+            if (self.tryReadmit(err, held_gen)) |e| return e;
+            self.flushOnce() catch |again| return self.finishRefusal(again, held_gen);
         };
     }
 
@@ -1886,9 +1903,10 @@ pub const Device = struct {
     /// The device's logical-block alignment of the range is the caller's
     /// (blocks are whole multiples of it).
     pub fn discardRange(self: *Device, offset: u64, len: u64) DeviceError!void {
+        var gen: u62 = 0;
         self.discardOnce(offset, len) catch |err| {
-            if (self.tryReadmit(err)) |e| return e;
-            self.discardOnce(offset, len) catch |again| return self.finishRefusal(again);
+            if (self.tryReadmit(err, &gen)) |e| return e;
+            self.discardOnce(offset, len) catch |again| return self.finishRefusal(again, &gen);
         };
     }
 

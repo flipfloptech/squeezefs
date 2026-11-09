@@ -67,7 +67,8 @@ const NvmeSeam = struct {
         };
     }
 
-    fn write(ctx: *anyopaque, _: u64, offset: u64, data: []const u8) seams.DmaError!void {
+    fn write(ctx: *anyopaque, _: u64, offset: u64, data: []const u8, held_gen: *u62) seams.DmaError!void {
+        _ = held_gen;
         const self: *NvmeSeam = @ptrCast(@alignCast(ctx));
         self.dev.writeBlock(offset, data) catch |e| return mapErr(e);
     }
@@ -85,7 +86,8 @@ const NvmeSeam = struct {
         @memcpy(out, buf.bytes()[0..out.len]);
     }
 
-    fn flush(ctx: *anyopaque, _: u64) seams.DmaError!void {
+    fn flush(ctx: *anyopaque, _: u64, held_gen: *u62) seams.DmaError!void {
+        _ = held_gen;
         const self: *NvmeSeam = @ptrCast(@alignCast(ctx));
         self.dev.flush() catch |e| return mapErr(e);
     }

@@ -622,6 +622,12 @@ pub const JoinedSet = struct {
         }
     }
 
+    /// A metadata `cleared` kicks the data-fence beat (decision 0004 §4.5.5).
+    pub fn onResolutionCleared(self: *JoinedSet, f: *const fn (ctx: ?*anyopaque) void, ctx: ?*anyopaque) void {
+        self.readmit.on_cleared = f;
+        self.readmit.on_cleared_ctx = ctx;
+    }
+
     /// KD20: a dismount waits for a pending succession so held writes can
     /// land, then stores `terminal` at the park deadline.
     pub fn awaitDismount(self: *JoinedSet) void {

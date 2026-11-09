@@ -141,12 +141,14 @@ pub const FakeDevice = struct {
         if (hook) |h| h.call(h.ctx, self, vol, off, data.len);
     }
 
-    fn write(ctx: *anyopaque, vol: u64, off: u64, data: []const u8) seams.DmaError!void {
+    fn write(ctx: *anyopaque, vol: u64, off: u64, data: []const u8, held_gen: *u62) seams.DmaError!void {
+        _ = held_gen;
         const self: *FakeDevice = @ptrCast(@alignCast(ctx));
         return self.writeInner(vol, off, data, false);
     }
 
-    fn writeFixed(ctx: *anyopaque, vol: u64, off: u64, src: seams.HeldSource) seams.DmaError!void {
+    fn writeFixed(ctx: *anyopaque, vol: u64, off: u64, src: seams.HeldSource, held_gen: *u62) seams.DmaError!void {
+        _ = held_gen;
         const self: *FakeDevice = @ptrCast(@alignCast(ctx));
         const bytes = self.slots.get(src.buf_index) orelse return error.InputOutput;
         return self.writeInner(vol, off, bytes[0..src.len], true);
@@ -176,7 +178,8 @@ pub const FakeDevice = struct {
         }
     }
 
-    fn flush(ctx: *anyopaque, vol: u64) seams.DmaError!void {
+    fn flush(ctx: *anyopaque, vol: u64, held_gen: *u62) seams.DmaError!void {
+        _ = held_gen;
         const self: *FakeDevice = @ptrCast(@alignCast(ctx));
         self.lock.lockUncancelable(std.testing.io);
         self.trace.append(self.gpa, .flush) catch {

@@ -401,6 +401,10 @@ pub const JoinedSet = struct {
     /// Appender 0's writer at the last registration. A different Live
     /// writer is a successor.
     mgr_writer: u64 = 0,
+    /// Set while `SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD` blocks the member
+    /// beat: the census beat and the succession park stay down so
+    /// committers keep serving until they park at `T_self`.
+    member_beat_held: std.atomic.Value(bool) = .init(false),
     /// The ring-growth gate (`ring_growth.zig`): the conveyor's passes
     /// enter it; `growRingIfDue` closes it to drain and swap the ring.
     gate: ring_growth.Gate,
@@ -1052,6 +1056,7 @@ pub const JoinedSet = struct {
 
     fn parkForSuccession(ctx: ?*anyopaque) void {
         const self: *JoinedSet = @ptrCast(@alignCast(ctx.?));
+        if (self.member_beat_held.load(.acquire)) return;
         _ = self.park_gate.parkFor(.succession, clock.monotonicNs());
     }
 
@@ -1129,7 +1134,7 @@ pub const JoinedSet = struct {
         const seq = self.be.cp.checkpointSeq();
         if (seq == self.grow_judged_at_seq) return;
         self.grow_judged_at_seq = seq;
-        self.censusBeat();
+        if (!self.member_beat_held.load(.acquire)) self.censusBeat();
         self.growRingIfDue();
     }
 
@@ -1870,6 +1875,17 @@ const testing = std.testing;
 
 test "member fence: JoinedSet.writePages names Held" {
     try testing.expect(member_fence.fnErrorSetHas(JoinedSet.writePages, "Held"));
+}
+
+test "member fence: a held membership beat does not park for succession" {
+    var js: JoinedSet = undefined;
+    js.member_beat_held = .init(true);
+    js.park_gate = park.ParkGate.arm(testing.io, 0, 48_000);
+    JoinedSet.parkForSuccession(@ptrCast(&js));
+    try testing.expect(!js.park_gate.isParked());
+    js.member_beat_held.store(false, .release);
+    JoinedSet.parkForSuccession(@ptrCast(&js));
+    try testing.expect(js.park_gate.isParked());
 }
 
 test "KD20: a dismount does not wait when no held write is in flight" {

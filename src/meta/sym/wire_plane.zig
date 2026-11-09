@@ -471,6 +471,8 @@ const JoinedHalf = struct {
         Io.Dir.cwd().access(self.plane.io, path, .{}) catch return;
         self.beat_held = true;
         log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD — the member's beat holds (no renewal) until a writer opens {s}", .{path});
+        self.js.member_beat_held.store(true, .release);
+        defer self.js.member_beat_held.store(false, .release);
         const f = Io.Dir.cwd().openFile(self.plane.io, path, .{}) catch |e| {
             log.warn("cluster wire: the beat hold could not open {s} ({t}); not holding", .{ path, e });
             return;

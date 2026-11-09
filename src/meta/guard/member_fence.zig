@@ -319,6 +319,7 @@ pub const Gen = u62;
 pub const Resolution = struct {
     word: std.atomic.Value(u64) = .init(0),
     wake: std.atomic.Value(u32) = .init(0),
+    waiters: std.atomic.Value(u32) = .init(0),
 
     pub const State = enum(u2) { pending, cleared, terminal };
     pub const Snapshot = struct { state: State, gen: Gen };
@@ -379,11 +380,19 @@ pub const Resolution = struct {
         }
     }
 
+    /// Held writers currently in `awaitPast`. A dismount waits only when
+    /// this is non-zero or the park still has a commit in flight (KD20).
+    pub fn waiterCount(self: *const Resolution) u32 {
+        return self.waiters.load(.acquire);
+    }
+
     /// Wait until `terminal` or a `clear` that advanced `gen` past
     /// `captured_gen` (decision 0004 §4.5: the generation is captured
     /// before classification, so a clear between the verdict and this
     /// wait is still observed).
     pub fn awaitPast(self: *Resolution, captured_gen: Gen) Wait {
+        _ = self.waiters.fetchAdd(1, .seq_cst);
+        defer _ = self.waiters.fetchSub(1, .seq_cst);
         while (true) {
             const s = self.snapshot();
             if (s.state == .terminal) return .terminal;
@@ -797,6 +806,25 @@ test "member fence: awaitPast waits until another thread clears the word" {
     const th = try std.Thread.spawn(.{}, Run.go, .{ &w, g, &out });
     _ = w.clear();
     th.join();
+    try testing.expectEqual(Resolution.Wait.cleared, out);
+}
+
+test "member fence: awaitPast counts a waiter while it is blocked" {
+    var w: Resolution = .{};
+    const g = w.snapshot().gen;
+    const Run = struct {
+        fn go(word: *Resolution, captured: Gen, out: *Resolution.Wait) void {
+            out.* = word.awaitPast(captured);
+        }
+    };
+    var out: Resolution.Wait = .terminal;
+    const th = try std.Thread.spawn(.{}, Run.go, .{ &w, g, &out });
+    var spins: u32 = 0;
+    while (w.waiterCount() == 0 and spins < 1_000_000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expectEqual(@as(u32, 1), w.waiterCount());
+    _ = w.clear();
+    th.join();
+    try testing.expectEqual(@as(u32, 0), w.waiterCount());
     try testing.expectEqual(Resolution.Wait.cleared, out);
 }
 

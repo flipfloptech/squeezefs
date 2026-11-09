@@ -629,10 +629,17 @@ pub const JoinedSet = struct {
     }
 
     /// KD20: a dismount waits for a pending succession so held writes can
-    /// land, then stores `terminal` at the park deadline.
+    /// land, then stores `terminal` at the park deadline. With nothing in
+    /// flight it stores `terminal` at once — a 48 s wait would overrun
+    /// `umount`'s 32 s daemon-exit budget.
     pub fn awaitDismount(self: *JoinedSet) void {
         if (self.resolution.snapshot().state != .pending) return;
         if (!self.park_gate.isParked()) return;
+        if (!dismountHasWork(&self.park_gate, &self.resolution)) {
+            self.resolution.terminate();
+            log.warn("meta volume {s}: dismount stored terminal — no held write in flight (KD20)", .{self.be.path});
+            return;
+        }
         const budget_ns = self.park_gate.t_park_max_ms * std.time.ns_per_ms;
         log.warn("meta volume {s}: dismount waiting up to {d} ms for a pending succession (KD20)", .{ self.be.path, self.park_gate.t_park_max_ms });
         const outcome = self.resolution.awaitResolved(budget_ns);
@@ -640,6 +647,12 @@ pub const JoinedSet = struct {
             self.resolution.terminate();
             log.warn("meta volume {s}: dismount stored terminal after the succession wait (KD20)", .{self.be.path});
         }
+    }
+
+    /// A held journal waiter, a park commit, or a held ack still needs the
+    /// word to stay pending so it can land.
+    fn dismountHasWork(gate: *const park.ParkGate, word: *const member_fence.Resolution) bool {
+        return gate.inflight.load(.seq_cst) != 0 or gate.acks_held.load(.acquire) != 0 or word.waiterCount() != 0;
     }
 
     pub fn deinit(self: *JoinedSet) void {
@@ -1857,6 +1870,20 @@ const testing = std.testing;
 
 test "member fence: JoinedSet.writePages names Held" {
     try testing.expect(member_fence.fnErrorSetHas(JoinedSet.writePages, "Held"));
+}
+
+test "KD20: a dismount does not wait when no held write is in flight" {
+    var gate = park.ParkGate.arm(testing.io, 0, 48_000);
+    _ = gate.parkFor(.succession, 1);
+    var word: member_fence.Resolution = .{};
+    try testing.expect(!JoinedSet.dismountHasWork(&gate, &word));
+    _ = gate.inflight.fetchAdd(1, .seq_cst);
+    try testing.expect(JoinedSet.dismountHasWork(&gate, &word));
+    _ = gate.inflight.fetchSub(1, .seq_cst);
+    _ = gate.acks_held.fetchAdd(1, .seq_cst);
+    try testing.expect(JoinedSet.dismountHasWork(&gate, &word));
+    _ = gate.acks_held.fetchSub(1, .seq_cst);
+    try testing.expect(!JoinedSet.dismountHasWork(&gate, &word));
 }
 
 test "member fence: the census report is the joiner's client" {

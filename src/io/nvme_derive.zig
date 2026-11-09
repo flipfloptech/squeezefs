@@ -479,9 +479,17 @@ pub const FenceSignal = struct {
 /// fence class latches.
 pub const ReadmitVerdict = enum { retry, held, decline };
 
+/// A reservation conflict's second opinion, with the data word's generation
+/// snapshotted when the refusal arrived, before classification (decision
+/// 0004 §4.5.5). A held waiter awaits a `cleared` past `gen`.
+pub const ReadmitAnswer = struct {
+    verdict: ReadmitVerdict,
+    gen: u62 = 0,
+};
+
 pub const Readmit = struct {
     ctx: *anyopaque,
-    readmit: *const fn (ctx: *anyopaque) ReadmitVerdict,
+    readmit: *const fn (ctx: *anyopaque) ReadmitAnswer,
 };
 
 /// Where a data plane finds each data volume's `Readmit` (null = none: the

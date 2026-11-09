@@ -57,6 +57,7 @@ pub const writeStatsJson = nd.writeStatsJson;
 pub const FenceSignal = nd.FenceSignal;
 pub const Readmit = nd.Readmit;
 pub const ReadmitVerdict = nd.ReadmitVerdict;
+pub const ReadmitAnswer = nd.ReadmitAnswer;
 pub const ReadmitSource = nd.ReadmitSource;
 pub const CustodyHooks = nd.CustodyHooks;
 pub const installCustodyHooks = nd.installCustodyHooks;
@@ -1451,10 +1452,11 @@ pub const Device = struct {
     /// command goes once more; `held` = a metadata succession is pending
     /// (`DeviceError.Held`, no latch); `decline` = the fence class latches.
     /// Never after the latch, never without a bound re-admission.
-    fn refusalVerdict(self: *Device, err: DeviceError) nd.ReadmitVerdict {
-        if (err != error.ReservationConflict) return .decline;
-        if (self.fence.halted.load(.acquire)) return .decline;
-        const r = self.fence.readmit.load(.acquire) orelse return .decline;
+    fn refusalVerdict(self: *Device, err: DeviceError) nd.ReadmitAnswer {
+        const declined: nd.ReadmitAnswer = .{ .verdict = .decline };
+        if (err != error.ReservationConflict) return declined;
+        if (self.fence.halted.load(.acquire)) return declined;
+        const r = self.fence.readmit.load(.acquire) orelse return declined;
         return r.readmit(r.ctx);
     }
 
@@ -1463,7 +1465,7 @@ pub const Device = struct {
     /// `Held` with no latch and no `data_pr_write_refusals` count, or the
     /// latched class (decision 0004 §4.5.5).
     fn tryReadmit(self: *Device, err: DeviceError) ?DeviceError {
-        return switch (self.refusalVerdict(err)) {
+        return switch (self.refusalVerdict(err).verdict) {
             .retry => blk: {
                 stats.data_pr_write_refusals.inc();
                 break :blk null;
@@ -1485,7 +1487,7 @@ pub const Device = struct {
     /// A second failure after one re-issue, or any refusal that is not retried:
     /// `held` returns `Held` without latching; `retry` and `decline` latch.
     fn finishRefusal(self: *Device, err: DeviceError) DeviceError {
-        return switch (self.refusalVerdict(err)) {
+        return switch (self.refusalVerdict(err).verdict) {
             .held => blk: {
                 stats.data_pr_refusals_held.inc();
                 break :blk error.Held;
@@ -3025,10 +3027,10 @@ test "decision 0003 §DL: a reservation conflict on a write asks the data fence'
     const DataFenceStub = struct {
         answer: nd.ReadmitVerdict,
         asked: u32 = 0,
-        fn readmit(ctx: *anyopaque) nd.ReadmitVerdict {
+        fn readmit(ctx: *anyopaque) nd.ReadmitAnswer {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.asked += 1;
-            return self.answer;
+            return .{ .verdict = self.answer };
         }
     };
     var fence: DataFenceStub = .{ .answer = .retry };
@@ -3070,10 +3072,10 @@ test "decision 0004 §4.5.5: a held reservation conflict returns Held, does not 
     defer clearCustodyPoisonForTest();
     const DataFenceStub = struct {
         asked: u32 = 0,
-        fn readmit(ctx: *anyopaque) nd.ReadmitVerdict {
+        fn readmit(ctx: *anyopaque) nd.ReadmitAnswer {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.asked += 1;
-            return .held;
+            return .{ .verdict = .held };
         }
     };
     var fence: DataFenceStub = .{};

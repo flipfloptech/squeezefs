@@ -104,6 +104,9 @@ const set_config = @import("../../data/set_config.zig");
 const nvme_dev = @import("../../io/nvme_dev.zig");
 const gate = @import("gate.zig");
 const member_fence = @import("member_fence.zig");
+const park = @import("../sym/membership/park_reclaim.zig");
+const grant = @import("../sym/extent_grant.zig");
+const shard = @import("../sym/membership/shard.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("guard/data_fence is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -280,6 +283,11 @@ pub const Volume = struct {
     /// finding the host registered / the namespace unreserved; `terminal`
     /// on a fence.
     resolution: member_fence.Resolution = .{},
+    /// First `pending` of this generation (0 = the word is not a live hold).
+    pending_since_ns: u64 = 0,
+    /// `pending_since + T_park_max`, extended at most once.
+    deadline_ns: u64 = 0,
+    deadline_extended: bool = false,
 
     pub fn path(self: *const Volume) []const u8 {
         return self.node;
@@ -326,6 +334,10 @@ pub const DataFence = struct {
     n_cells: usize = 0,
     /// The lapse grace (`claim.lapseGraceNs`).
     grace_ns: u64 = claim.LAPSE_GRACE_S * std.time.ns_per_s,
+    /// `T_park_max` for a data word's own deadline (decision 0004 §4.5.6).
+    t_park_max_ns: u64 = 0,
+    /// `T_owner` for the one deadline extension when a successor has bound.
+    t_owner_ns: u64 = 0,
     /// `SQUEEZEFS_TEST_LAPSE_BEAT_HOLD`: the FIFO the first beat that
     /// re-registered the host on metadata parks on (empty = disarmed).
     beat_hold: [256:0]u8 = @splat(0),
@@ -354,7 +366,15 @@ pub const DataFence = struct {
         const gpa = in.gpa;
         const self = try gpa.create(DataFence);
         errdefer gpa.destroy(self);
-        self.* = .{ .in = in, .meta = try metaClient(gpa, in.meta_face, in.meta_nsid, in.key), .grace_ns = claim.lapseGraceNs(in.env) };
+        const t_owner_ms = shard.tOwnerMsFromEnv(in.env);
+        const t_park_max_ms = park.tParkMaxMs(grant.failoverBoundMs(0, 0), park.graceMs(t_owner_ms));
+        self.* = .{
+            .in = in,
+            .meta = try metaClient(gpa, in.meta_face, in.meta_nsid, in.key),
+            .grace_ns = claim.lapseGraceNs(in.env),
+            .t_owner_ns = t_owner_ms * std.time.ns_per_ms,
+            .t_park_max_ns = t_park_max_ms * std.time.ns_per_ms,
+        };
         self.in.joined_metas = &.{};
         self.metas[0] = .{ .client = self.meta, .pages = in.pages, .path = in.meta_path, .index = 0 };
         self.n_metas = 1;
@@ -997,7 +1017,10 @@ pub const DataFence = struct {
         defer self.lock.unlock();
         self.takeLapseFlagLocked();
         const now = clock.monotonicNs();
-        for (self.vols[0..self.n]) |*v| self.volumeBeat(v, now);
+        for (self.vols[0..self.n]) |*v| {
+            self.volumeBeat(v, now);
+            self.resolvePendingWord(v, now);
+        }
         if (self.beat_after_abort) {
             self.beat_after_abort = false;
             log.info("data fence: the data fence's first beat after the refused re-join ran on the predecessor — {d} metadata volume(s), {d} data volume(s) (decision 0003 §DN.9)", .{ self.n_metas, self.n });
@@ -1066,6 +1089,103 @@ pub const DataFence = struct {
         stats.data_pr_lapse_rereservations.inc();
         if (back and in_grace) stats.data_pr_lapse_early_rereservations.inc();
         log.warn("data volume {s}: re-reserved Write Exclusive – All Registrants after the lapse ({s}); every data registrant the metadata namespace lacks preempted (decision 0003 §DJ)", .{ v.path(), if (back) "every live host back" else "the grace elapsed" });
+    }
+
+    /// Re-examine a live pending `data_resolution[d]` (decision 0004 §4.5.5
+    /// L(a)–(b)). Registered or unreserved clears the word. Metadata settled
+    /// and current, unregistered on a reserved namespace, re-registers
+    /// through the rule and clears on success. Past the word's own deadline,
+    /// the beat stores `terminal`.
+    fn resolvePendingWord(self: *DataFence, v: *Volume, now: u64) void {
+        if (v.resolution.snapshot().state != .pending or v.pending_since_ns == 0) return;
+        const c = v.client;
+        const f = host_fence.reportFacts(c) catch {
+            self.maybeExpirePending(v, now);
+            return;
+        };
+        if (!f.facts.reserved) {
+            v.lapse_pending = true;
+            self.noteCleared(v);
+            return;
+        }
+        if (f.registered) {
+            v.lapse_pending = false;
+            self.noteCleared(v);
+            return;
+        }
+        switch (self.currentStatus()) {
+            .dead => {
+                self.noteTerminal(v);
+                log.warn("data volume {s}: a pending data resolution stored terminal — this incarnation's page is not Live (decision 0004 §4.5.5)", .{v.path()});
+                return;
+            },
+            .unreadable => {
+                self.maybeExpirePending(v, now);
+                return;
+            },
+            .live => {},
+        }
+        var fenced = false;
+        var settled = true;
+        for (self.metas[0..self.n_metas]) |*mv| switch (self.observeMeta(mv)) {
+            .unreadable => settled = false,
+            .classified => |cl| switch (cl) {
+                .fenced => fenced = true,
+                .metadata_pending => settled = false,
+                .metadata_settled => {},
+            },
+        };
+        if (fenced) {
+            self.noteTerminal(v);
+            log.warn("data volume {s}: a pending data resolution stored terminal — the member fence classified a fence (decision 0004 §4.5.5)", .{v.path()});
+            return;
+        }
+        if (settled) {
+            const fresh = self.register(v.path(), c) catch {
+                self.maybeExpirePending(v, now);
+                return;
+            };
+            if (self.currentStatus() == .dead) {
+                if (fresh) c.unregister(c.key) catch {};
+                self.noteTerminal(v);
+                log.warn("data volume {s}: a pending data resolution stored terminal — this incarnation's page left Live during re-registration (decision 0004 §4.5.5)", .{v.path()});
+                return;
+            }
+            self.noteCleared(v);
+            if (fresh) {
+                v.fresh = true;
+                log.warn("data volume {s}: re-registered this host under key {x:0>16} while a data resolution was pending (decision 0004 §4.5.5)", .{ v.path(), c.key });
+            }
+            return;
+        }
+        self.maybeExtendDeadline(v, now);
+        self.maybeExpirePending(v, now);
+    }
+
+    fn maybeExtendDeadline(self: *DataFence, v: *Volume, now: u64) void {
+        if (v.deadline_extended or !self.successorBound()) return;
+        const extended = now +| self.t_owner_ns +| self.grace_ns;
+        if (extended > v.deadline_ns) v.deadline_ns = extended;
+        v.deadline_extended = true;
+        log.warn("data volume {s}: a pending data resolution's deadline extended once — a successor has bound (decision 0004 §4.5.6)", .{v.path()});
+    }
+
+    fn successorBound(self: *DataFence) bool {
+        if (self.n_metas == 0) return false;
+        const mv = &self.metas[0];
+        if (mv.mgr_writer == 0) return false;
+        const gpa = self.in.gpa;
+        const pages = mv.pages.read(mv.pages.ctx, gpa) catch return false;
+        defer gpa.free(pages);
+        var views: [64]member_fence.PageView = undefined;
+        const w = page0Writer(fillPageViews(pages, &views)) orelse return false;
+        return w != mv.mgr_writer;
+    }
+
+    fn maybeExpirePending(self: *DataFence, v: *Volume, now: u64) void {
+        if (v.pending_since_ns == 0 or now < v.deadline_ns) return;
+        self.noteTerminal(v);
+        log.warn("data volume {s}: a pending data resolution stored terminal at its deadline (decision 0004 §4.5.5 L(b))", .{v.path()});
     }
 
     /// A joiner's metadata namespaces after a lapse — EVERY joined volume's
@@ -1137,11 +1257,11 @@ pub const DataFence = struct {
 
     /// The device's call (a data command's thread): the PR work on the
     /// blocking pool, as the beat's.
-    fn readmitFn(ctx: *anyopaque) nvme_dev.ReadmitVerdict {
+    fn readmitFn(ctx: *anyopaque) nvme_dev.ReadmitAnswer {
         const cell: *ReadmitCell = @ptrCast(@alignCast(ctx));
         const self = cell.fence;
         const io = self.io orelse return self.readmitAfterRefusal(cell.vol_tag);
-        return exec.SqzIo.fromIo(io).runBlocking(readmitAfterRefusal, .{ self, cell.vol_tag }) catch .decline;
+        return exec.SqzIo.fromIo(io).runBlocking(readmitAfterRefusal, .{ self, cell.vol_tag }) catch .{ .verdict = .decline };
     }
 
     /// A data write-class command the device refused with the reservation
@@ -1154,24 +1274,24 @@ pub const DataFence = struct {
     /// after a register through the stale-sibling rule — retries, stores
     /// `cleared`, and the command goes once more. Anything else declines,
     /// and the fence latches.
-    pub fn readmitAfterRefusal(self: *DataFence, vol_tag: u64) nvme_dev.ReadmitVerdict {
+    pub fn readmitAfterRefusal(self: *DataFence, vol_tag: u64) nvme_dev.ReadmitAnswer {
         self.lock.lock();
         defer self.lock.unlock();
         self.takeLapseFlagLocked();
-        const i = self.tabledIndex(vol_tag) orelse return .decline;
+        const i = self.tabledIndex(vol_tag) orelse return .{ .verdict = .decline };
         const v = &self.vols[i];
         const c = v.client;
-        _ = v.resolution.snapshot().gen;
+        const gen = v.resolution.snapshot().gen;
         switch (self.currentStatus()) {
-            .dead => return declined(v, "this incarnation's page is not Live under its writer id on every joined metadata volume"),
-            .unreadable => return answerHeld(v, "a metadata page read failed"),
+            .dead => return self.declined(v, gen, "this incarnation's page is not Live under its writer id on every joined metadata volume"),
+            .unreadable => return self.answerHeld(v, gen, "a metadata page read failed"),
             .live => {},
         }
-        const f = host_fence.reportFacts(c) catch return answerHeld(v, "the data namespace's report failed");
+        const f = host_fence.reportFacts(c) catch return self.answerHeld(v, gen, "the data namespace's report failed");
         if (!f.facts.reserved) {
             v.lapse_pending = true;
-            _ = v.resolution.clear();
-            return .retry;
+            self.noteCleared(v);
+            return .{ .verdict = .retry, .gen = gen };
         }
         var pending = false;
         var fenced = false;
@@ -1183,23 +1303,23 @@ pub const DataFence = struct {
                 .metadata_settled => {},
             },
         };
-        if (fenced) return declined(v, "the member fence classified a fence on a joined metadata volume");
+        if (fenced) return self.declined(v, gen, "the member fence classified a fence on a joined metadata volume");
         if (pending) {
-            _ = v.resolution.reopen();
-            return self.recheckAfterPending(v, c);
+            self.notePending(v);
+            return self.recheckAfterPending(v, c, gen);
         }
-        if (!v.lapse_pending) return declined(v, "no lapse is pending for this process here — the refusal is a fence");
-        const fresh = self.register(v.path(), c) catch return declined(v, "its registration through the rule was refused");
+        if (!v.lapse_pending) return self.declined(v, gen, "no lapse is pending for this process here — the refusal is a fence");
+        const fresh = self.register(v.path(), c) catch return self.declined(v, gen, "its registration through the rule was refused");
         if (self.currentStatus() == .dead) {
             if (fresh) c.unregister(c.key) catch {};
-            return declined(v, "this incarnation's page left Live during the re-admission — withdrawn");
+            return self.declined(v, gen, "this incarnation's page left Live during the re-admission — withdrawn");
         }
-        _ = v.resolution.clear();
-        if (!fresh) return .retry;
+        self.noteCleared(v);
+        if (!fresh) return .{ .verdict = .retry, .gen = gen };
         v.fresh = true;
         stats.data_pr_refusal_readmissions.inc();
         log.warn("data volume {s}: a data command was refused (reservation conflict) inside a lapse still pending for this process — this host, registered on every joined metadata volume's namespace and current, re-registered under key {x:0>16} through the rule; the command goes once more (decision 0003 §DL)", .{ v.path(), c.key });
-        return .retry;
+        return .{ .verdict = .retry, .gen = gen };
     }
 
     /// After storing `pending` on `data_resolution[d]`, re-read once
@@ -1207,16 +1327,16 @@ pub const DataFence = struct {
     /// on d clears the word and retries. Metadata settled with this host
     /// still off d kicks the data beat and stays held. An unreadable
     /// re-read stays pending.
-    fn recheckAfterPending(self: *DataFence, v: *Volume, c: *pr.Client) nvme_dev.ReadmitVerdict {
-        const df = host_fence.reportFacts(c) catch return answerHeld(v, "the data namespace's report failed");
+    fn recheckAfterPending(self: *DataFence, v: *Volume, c: *pr.Client, gen: member_fence.Gen) nvme_dev.ReadmitAnswer {
+        const df = host_fence.reportFacts(c) catch return self.answerHeld(v, gen, "the data namespace's report failed");
         if (!df.facts.reserved) {
             v.lapse_pending = true;
-            _ = v.resolution.clear();
-            return .retry;
+            self.noteCleared(v);
+            return .{ .verdict = .retry, .gen = gen };
         }
         if (df.registered) {
-            _ = v.resolution.clear();
-            return .retry;
+            self.noteCleared(v);
+            return .{ .verdict = .retry, .gen = gen };
         }
         var fenced = false;
         var settled = true;
@@ -1228,12 +1348,15 @@ pub const DataFence = struct {
                 .metadata_settled => {},
             },
         };
-        if (fenced) return declined(v, "the member fence classified a fence on a joined metadata volume");
-        if (settled) self.kickDataBeat();
-        return answerHeld(v, "this host is not registered on every joined metadata volume — a succession is pending");
+        if (fenced) return self.declined(v, gen, "the member fence classified a fence on a joined metadata volume");
+        if (settled) self.kick();
+        return self.answerHeld(v, gen, "this host is not registered on every joined metadata volume — a succession is pending");
     }
 
-    fn kickDataBeat(self: *DataFence) void {
+    /// A metadata `cleared`, or store-then-recheck finding metadata settled
+    /// with this host still off data, shortens the wait; the periodic tick
+    /// is the guarantee (decision 0004 §4.5.5 L(a)).
+    pub fn kick(self: *DataFence) void {
         const io = self.io orelse return;
         tick.wake(io, &self.beat_wake);
     }
@@ -1307,17 +1430,42 @@ pub const DataFence = struct {
         return null;
     }
 
-    fn declined(v: *Volume, why: []const u8) nvme_dev.ReadmitVerdict {
-        v.resolution.terminate();
+    fn declined(self: *DataFence, v: *Volume, gen: member_fence.Gen, why: []const u8) nvme_dev.ReadmitAnswer {
+        self.noteTerminal(v);
         stats.data_pr_refusal_readmissions_declined.inc();
         log.warn("data volume {s}: a refused data command is not re-admitted: {s} (decision 0003 §DL)", .{ v.path(), why });
-        return .decline;
+        return .{ .verdict = .decline, .gen = gen };
     }
 
-    fn answerHeld(v: *Volume, why: []const u8) nvme_dev.ReadmitVerdict {
-        _ = v.resolution.reopen();
+    fn answerHeld(self: *DataFence, v: *Volume, gen: member_fence.Gen, why: []const u8) nvme_dev.ReadmitAnswer {
+        self.notePending(v);
         log.warn("data volume {s}: a refused data command is held: {s} (decision 0004 §4.5.5)", .{ v.path(), why });
-        return .held;
+        return .{ .verdict = .held, .gen = gen };
+    }
+
+    fn notePending(self: *DataFence, v: *Volume) void {
+        _ = v.resolution.reopen();
+        if (v.pending_since_ns != 0) return;
+        const now = @max(clock.monotonicNs(), 1);
+        v.pending_since_ns = now;
+        v.deadline_ns = now +| self.t_park_max_ns;
+        v.deadline_extended = false;
+    }
+
+    fn noteCleared(self: *DataFence, v: *Volume) void {
+        _ = self;
+        if (!v.resolution.clear()) return;
+        v.pending_since_ns = 0;
+        v.deadline_ns = 0;
+        v.deadline_extended = false;
+    }
+
+    fn noteTerminal(self: *DataFence, v: *Volume) void {
+        _ = self;
+        v.resolution.terminate();
+        v.pending_since_ns = 0;
+        v.deadline_ns = 0;
+        v.deadline_extended = false;
     }
 
     const Currency = enum { live, dead, unreadable };
@@ -2074,7 +2222,7 @@ test "decision 0003 §DL, a member slow on data: after a PTPL-less restart the j
     try testing.expect(!dns.writeAllowed(j_id));
     // J's refused write: re-admitted.
     const re0 = stats.data_pr_refusal_readmissions.load();
-    try testing.expectEqual(nvme_dev.ReadmitVerdict.retry, dj.readmitAfterRefusal(1));
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.retry, dj.readmitAfterRefusal(1).verdict);
     try testing.expect(dns.writeAllowed(j_id));
     try testing.expectEqual(member_fence.Resolution.State.cleared, dj.vols[0].resolution.snapshot().state);
     try testing.expectEqual(re0 + 1, stats.data_pr_refusal_readmissions.load());
@@ -2082,10 +2230,10 @@ test "decision 0003 §DL, a member slow on data: after a PTPL-less restart the j
     // there again (a sibling's rule) but its page Recovering — never
     // re-admitted.
     const declined0 = stats.data_pr_refusal_readmissions_declined.load();
-    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dx.readmitAfterRefusal(1));
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dx.readmitAfterRefusal(1).verdict);
     try testing.expectEqual(member_fence.Resolution.State.terminal, dx.vols[0].resolution.snapshot().state);
     _ = try fencing.joinAsRegistrant(&meta_x, null);
-    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dx.readmitAfterRefusal(1));
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dx.readmitAfterRefusal(1).verdict);
     try testing.expect(!dns.isRegistered(0x3333));
     try testing.expectEqual(declined0 + 2, stats.data_pr_refusal_readmissions_declined.load());
     // J's beat sees itself registered under the reservation: the lapse is
@@ -2093,7 +2241,7 @@ test "decision 0003 §DL, a member slow on data: after a PTPL-less restart the j
     dj.beat();
     try testing.expect(!dj.vols[0].lapse_pending);
     try dm.clients[0].preemptAndAbort(0x2222);
-    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dj.readmitAfterRefusal(1));
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dj.readmitAfterRefusal(1).verdict);
     try testing.expect(!dns.isRegistered(0x2222));
 }
 
@@ -2137,21 +2285,91 @@ test "decision 0004 §4.5.5: a current joiner unregistered on metadata answers h
     dm.beat();
     try testing.expectEqual(nvme.RTYPE_WEAR, dns.rtype);
     try testing.expect(dj.current());
+    // A live pending word whose host is already registered on data clears
+    // on the beat (decision 0004 §4.5.5 L(a)).
+    dj.notePending(&dj.vols[0]);
+    try testing.expectEqual(member_fence.Resolution.State.pending, dj.vols[0].resolution.snapshot().state);
+    dj.beat();
+    try testing.expectEqual(member_fence.Resolution.State.cleared, dj.vols[0].resolution.snapshot().state);
     // Unregistered on metadata, still registered on data: store-then-recheck
     // sees the data registration, clears the word, and retries.
     try meta_m.preemptAndAbort(0x2222);
     try testing.expect(!mns.isRegistered(0x2222));
     const declined0 = stats.data_pr_refusal_readmissions_declined.load();
-    try testing.expectEqual(nvme_dev.ReadmitVerdict.retry, dj.readmitAfterRefusal(1));
+    const retry_gen = dj.vols[0].resolution.snapshot().gen;
+    const retried = dj.readmitAfterRefusal(1);
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.retry, retried.verdict);
+    try testing.expectEqual(retry_gen, retried.gen);
     try testing.expectEqual(member_fence.Resolution.State.cleared, dj.vols[0].resolution.snapshot().state);
     try testing.expectEqual(declined0, stats.data_pr_refusal_readmissions_declined.load());
     // The debt's data fence too: unregistered on both, the word pends and
-    // the refusal is held.
+    // the refusal is held. The hook returns the generation captured before
+    // classification.
     try dm.clients[0].preemptAndAbort(0x2222);
     try testing.expect(!dns.isRegistered(0x2222));
-    try testing.expectEqual(nvme_dev.ReadmitVerdict.held, dj.readmitAfterRefusal(1));
+    const held_gen = dj.vols[0].resolution.snapshot().gen;
+    const held = dj.readmitAfterRefusal(1);
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.held, held.verdict);
+    try testing.expectEqual(held_gen, held.gen);
     try testing.expectEqual(member_fence.Resolution.State.pending, dj.vols[0].resolution.snapshot().state);
     try testing.expectEqual(declined0, stats.data_pr_refusal_readmissions_declined.load());
+    // Still unregistered on metadata: the beat leaves the word pending.
+    dj.beat();
+    try testing.expectEqual(member_fence.Resolution.State.pending, dj.vols[0].resolution.snapshot().state);
+    try testing.expect(!dns.isRegistered(0x2222));
+    // Metadata settled again: the beat re-registers on data and clears.
+    _ = try fencing.joinAsRegistrant(&meta_j, null);
+    dj.beat();
+    try testing.expect(dns.isRegistered(0x2222));
+    try testing.expectEqual(member_fence.Resolution.State.cleared, dj.vols[0].resolution.snapshot().state);
+}
+
+test "decision 0004 §4.5.5: the data-fence beat stores terminal on a pending word whose deadline has passed" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/data-fence-deadline-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var probe = host_fence.Registry.at(base, .set, 0x5b);
+    probe.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    probe.unlock();
+    const m_id: [16]u8 = "manager-host-id1".*;
+    const j_id: [16]u8 = "joiner-host-id-2".*;
+    var mns = fake.Namespace.init(gpa);
+    defer mns.deinit();
+    var dns = fake.Namespace.init(gpa);
+    defer dns.deinit();
+    var mh: fake.Host = .{ .ns = &mns, .host_id = m_id };
+    var jh: fake.Host = .{ .ns = &mns, .host_id = j_id };
+    var meta_m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer meta_m.deinit();
+    try fencing.acquireManagerHold(&meta_m);
+    var meta_j = try pr.Client.init(gpa, jh.face(), 1, 0x2222);
+    defer meta_j.deinit();
+    _ = try fencing.joinAsRegistrant(&meta_j, null);
+    var pages = [_]appender_page.Page{ livePage(0, 0xA, 0xA0), livePage(1, 0xC, 0xC0) };
+    var src: FixturePages = .{ .pages = &pages };
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var cfg: FixtureConfig = .{ .live = &.{1} };
+    const local = proc.localIdentity();
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = local, .node_token = 0xA, .pages = src.source(), .meta_path = "fake-meta", .writer_id = 0xA0, .config = cfg.source(), .manager = true });
+    defer dm.release();
+    const dj = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = jh.face(), .meta_nsid = 1, .key = 0x2222, .reg = host_fence.Registry.at(base, .set, 0x5b), .local = local, .node_token = 0xC, .pages = src.source(), .meta_path = "fake-meta", .writer_id = 0xC0, .config = cfg.source(), .manager = false });
+    defer dj.release();
+    var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
+    var djh: fake.Host = .{ .ns = &dns, .host_id = j_id };
+    try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
+    try dj.admitClient(1, "fake-data", null, try fixtureClient(gpa, djh.face()));
+    dm.beat();
+    try meta_m.preemptAndAbort(0x2222);
+    try dm.clients[0].preemptAndAbort(0x2222);
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.held, dj.readmitAfterRefusal(1).verdict);
+    try testing.expectEqual(member_fence.Resolution.State.pending, dj.vols[0].resolution.snapshot().state);
+    dj.vols[0].deadline_ns = 1;
+    dj.beat();
+    try testing.expectEqual(member_fence.Resolution.State.terminal, dj.vols[0].resolution.snapshot().state);
+    try testing.expectEqual(@as(u64, 0), dj.vols[0].pending_since_ns);
 }
 
 test "decision 0003 §DN, a joiner of two metadata volumes: a restart of volume 1's target alone — its beat re-registers its host on VOLUME 1's namespace (its page Live on every joined volume, the stale-sibling rule judged by volume 1's pages), volume 0's and the data namespace's untouched; a member whose page on volume 1 left Live (its death recovered there first) re-registers nothing there, and after a data restart nothing on data either although volume 0 still reads it Live and registered — nor is its refused write re-admitted" {
@@ -2255,7 +2473,7 @@ test "decision 0003 §DN, a joiner of two metadata volumes: a restart of volume 
     try testing.expectEqual(nvme.RTYPE_WEAR, dns.rtype);
     try testing.expect(dx.vols[0].lapse_pending);
     const declined0 = stats.data_pr_refusal_readmissions_declined.load();
-    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dx.readmitAfterRefusal(1));
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dx.readmitAfterRefusal(1).verdict);
     try testing.expect(!dns.isRegistered(0x3333));
     try testing.expectEqual(declined0 + 1, stats.data_pr_refusal_readmissions_declined.load());
 }
@@ -2338,7 +2556,7 @@ test "decision 0003 §DN.9, a re-join's data re-admission is two-phase: re-point
     dj.vols[0].lapse_pending = true;
     const q0 = pred[0].issued;
     const q1 = pred[1].issued;
-    try testing.expectEqual(nvme_dev.ReadmitVerdict.retry, dj.readmitAfterRefusal(1));
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.retry, dj.readmitAfterRefusal(1).verdict);
     try testing.expect(pred[0].issued > q0 and pred[1].issued > q1);
     for (succ) |h| try testing.expectEqual(@as(u32, 0), h.after_close);
     // A later re-join: re-pointed and committed — the predecessor's clients

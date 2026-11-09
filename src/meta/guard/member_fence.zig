@@ -492,12 +492,32 @@ pub fn wantsRegister(o: Observation, report_readable: bool, pr_sem_allowed: bool
 }
 
 /// Withdrawal applies only to this beat's fresh registration (decision
-/// 0004 §4.5.4). An adopted registration is left standing.
+/// 0004 §4.5.4). An adopted registration is left standing. An unreadable
+/// page is not a death: pass `own_page_live` true and let the next beat
+/// retry.
 pub fn shouldWithdraw(own_page_live: bool, word: ?*const Resolution, fresh: bool) bool {
     if (!fresh) return false;
     if (!own_page_live) return true;
     if (word) |w| return w.snapshot().state == .terminal;
     return false;
+}
+
+/// C2 currency across already-read volume page sets (decision 0004 §4.5.4,
+/// §DN.2). A null set is unreadable, never a death. A positive not-Live
+/// proof on any volume is death.
+pub const Currency = enum { live, dead, unreadable };
+
+pub fn currencyOnVolumes(who: SelfView, volumes: []const ?[]const PageView, seen: Seen) Currency {
+    var unreadable = false;
+    if (volumes.len == 0) return .unreadable;
+    for (volumes) |maybe| {
+        const pages = maybe orelse {
+            unreadable = true;
+            continue;
+        };
+        if (!pageFacts(who, pages, seen).own_page_live) return .dead;
+    }
+    return if (unreadable) .unreadable else .live;
 }
 
 const testing = std.testing;
@@ -671,6 +691,28 @@ test "member fence: a fresh registration is withdrawn when the page leaves Live 
     w.terminate();
     try testing.expect(shouldWithdraw(true, &w, true));
     try testing.expect(!shouldWithdraw(true, &w, false));
+}
+
+test "member fence: C2 currency is Live only on every joined volume, and an unreadable volume is not a death" {
+    const who = SelfView{ .appender_id = 1, .writer_id = 0xC0, .node_token = 0xC, .term = 1, .mgr_writer = 0xA0 };
+    const live0 = [_]PageView{
+        .{ .appender_id = 0, .state = .live, .writer_id = 0xA0, .node_token = 0xA, .term = 1 },
+        .{ .appender_id = 1, .state = .live, .writer_id = 0xC0, .node_token = 0xC, .term = 1 },
+    };
+    const live1 = [_]PageView{
+        .{ .appender_id = 0, .state = .live, .writer_id = 0xA0, .node_token = 0xA, .term = 1 },
+        .{ .appender_id = 1, .state = .live, .writer_id = 0xC0, .node_token = 0xC, .term = 1 },
+    };
+    const dead1 = [_]PageView{
+        .{ .appender_id = 0, .state = .live, .writer_id = 0xA0, .node_token = 0xA, .term = 1 },
+        .{ .appender_id = 1, .state = .recovering, .writer_id = 0xC0, .node_token = 0xC, .term = 1 },
+    };
+    const seen: Seen = .{};
+    try testing.expectEqual(Currency.live, currencyOnVolumes(who, &.{ @as(?[]const PageView, &live0), &live1 }, seen));
+    try testing.expectEqual(Currency.dead, currencyOnVolumes(who, &.{ @as(?[]const PageView, &live0), &dead1 }, seen));
+    try testing.expectEqual(Currency.unreadable, currencyOnVolumes(who, &.{ @as(?[]const PageView, &live0), null }, seen));
+    try testing.expectEqual(Currency.dead, currencyOnVolumes(who, &.{ @as(?[]const PageView, &dead1), null }, seen));
+    try testing.expect(!shouldWithdraw(true, null, true));
 }
 
 fn holdConflict(_: ?*anyopaque, _: Op, class: Class) Answer {

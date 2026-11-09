@@ -332,6 +332,9 @@ pub const Standing = struct {
 pub const JoinedSet = struct {
     gpa: Allocator,
     be: *KvBackend,
+    /// Every metadata volume in this set, including `be`. Installed by
+    /// MetaSet after every volume is open. Empty: C2 reads only `be`.
+    peers: []*KvBackend = &.{},
     identity: page.Identity,
     wire_identity: verbs.WireIdentity,
     /// The manager's identity as appender 0's page carried it at the join
@@ -1179,14 +1182,16 @@ pub const JoinedSet = struct {
         };
         const report = self.reservationReport();
         const verdict = self.readmit.beat(who, mapped, report);
+        const currency = self.liveOnEveryJoined(who);
+        if (currency == .dead) self.readmit.obs.own_page_live = false;
         if (self.readmit.obs.host_registered) if (page0Writer(mapped)) |w| {
             self.mgr_writer = w;
         };
-        if (verdict == .latch) {
+        if (verdict == .latch or currency == .dead) {
             if (self.left.load(.acquire)) return;
             _ = self.be.lane.latch.noteFence("the member-fence beat");
         }
-        if (member_fence.wantsRegister(self.readmit.obs, report.readable, self.be.pool.writesOutstanding() == 0, self.readmit.word)) {
+        if (currency != .dead and member_fence.wantsRegister(self.readmit.obs, report.readable, self.be.pool.writesOutstanding() == 0, self.readmit.word)) {
             self.successionReregister(who);
         }
     }
@@ -1194,8 +1199,8 @@ pub const JoinedSet = struct {
     /// Register through the stale-sibling rule (C3) after the park has
     /// stopped new submissions and already-submitted writes have
     /// completions (DO.33). A failed post-check withdraws a fresh
-    /// registration (C2). shortcut: C2 is this volume's page; upgrade when
-    /// the beat reads every joined volume.
+    /// registration (C2): this incarnation's page must be Live under its
+    /// writer id, node token and term on every joined volume (§DN.2).
     fn successionReregister(self: *JoinedSet, who: member_fence.SelfView) void {
         const f = self.fence orelse return;
         if (!self.park_gate.isParked()) return;
@@ -1211,23 +1216,55 @@ pub const JoinedSet = struct {
             .vol_index = self.be.index,
             .taking_manager = false,
         };
-        runSuccessionRegister(ctx, &f.reg, f.client, .{ .ctx = self.be, .read = &devicePagesFn }, who, self.readmit.seen, self.readmit.word, host_fence.joinRegister(self.be.env));
-        const pages = devicePages(self.be.gpa, self.be) catch return;
-        defer self.be.gpa.free(pages);
-        var views: [64]member_fence.PageView = undefined;
-        const mapped = fillPageViews(pages, &views);
-        const report = self.reservationReport();
-        const verdict = self.readmit.beat(who, mapped, report);
-        if (self.readmit.obs.host_registered) {
-            if (page0Writer(mapped)) |w| self.mgr_writer = w;
-            if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
-            log.warn("meta volume {s}: re-registered this host under key {x:0>16} after a succession", .{ self.be.path, f.client.key });
-        }
-        if (verdict == .latch) {
-            if (self.left.load(.acquire)) return;
-            _ = self.be.lane.latch.noteFence("the member-fence beat");
+        const outcome = runSuccessionRegister(ctx, &f.reg, f.client, .{ .ctx = self.be, .read = &devicePagesFn }, who, self.readmit.seen, self.readmit.word, host_fence.joinRegister(self.be.env));
+        if (outcome == .fresh or outcome == .adopted) {
+            switch (self.liveOnEveryJoined(who)) {
+                .dead => {
+                    if (outcome == .fresh) {
+                        f.client.unregister(f.client.key) catch {};
+                        log.warn("meta volume {s}: succession re-registration withdrawn — this incarnation's page is not Live on every joined volume (C2)", .{self.be.path});
+                    }
+                },
+                .unreadable => {},
+                .live => {
+                    const pages = devicePages(self.be.gpa, self.be) catch return;
+                    defer self.be.gpa.free(pages);
+                    var views: [64]member_fence.PageView = undefined;
+                    const mapped = fillPageViews(pages, &views);
+                    const report = self.reservationReport();
+                    const verdict = self.readmit.beat(who, mapped, report);
+                    if (self.readmit.obs.host_registered) {
+                        if (page0Writer(mapped)) |w| self.mgr_writer = w;
+                        if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
+                        log.warn("meta volume {s}: re-registered this host under key {x:0>16} after a succession", .{ self.be.path, f.client.key });
+                    }
+                    if (verdict == .latch) {
+                        if (self.left.load(.acquire)) return;
+                        _ = self.be.lane.latch.noteFence("the member-fence beat");
+                    }
+                },
+            }
         }
     }
+
+    /// C2: this incarnation is Live under its writer id, node token and
+    /// term on every joined volume. An unreadable volume is not a death.
+    fn liveOnEveryJoined(self: *JoinedSet, who: member_fence.SelfView) member_fence.Currency {
+        const backends: []const *KvBackend = if (self.peers.len > 0) self.peers else (&[_]*KvBackend{self.be})[0..];
+        var unreadable = false;
+        for (backends) |be| {
+            const raw = devicePages(self.be.gpa, be) catch {
+                unreadable = true;
+                continue;
+            };
+            defer self.be.gpa.free(raw);
+            var views: [64]member_fence.PageView = undefined;
+            if (!member_fence.pageFacts(who, fillPageViews(raw, &views), self.readmit.seen).own_page_live) return .dead;
+        }
+        return if (unreadable) .unreadable else .live;
+    }
+
+    const RegisterOutcome = enum { refused, adopted, fresh, withdrawn };
 
     fn runSuccessionRegister(
         ctx: host_fence.RuleContext,
@@ -1238,14 +1275,14 @@ pub const JoinedSet = struct {
         seen: member_fence.Seen,
         word: ?*member_fence.Resolution,
         register: host_fence.Register,
-    ) void {
+    ) RegisterOutcome {
         const fresh = host_fence.registerUnderRule(ctx, reg, client, pages, register) catch |e| {
             log.warn("meta volume {s}: succession re-registration refused ({s}) — the next beat tries again", .{ ctx.path, @errorName(e) });
-            return;
+            return .refused;
         };
         const raw = pages.read(pages.ctx, ctx.gpa) catch {
-            if (member_fence.shouldWithdraw(false, word, fresh)) client.unregister(client.key) catch {};
-            return;
+            // An unreadable page is not a death (C2 is three-valued).
+            return if (fresh) .fresh else .adopted;
         };
         defer ctx.gpa.free(raw);
         var views: [64]member_fence.PageView = undefined;
@@ -1253,7 +1290,9 @@ pub const JoinedSet = struct {
         if (member_fence.shouldWithdraw(facts.own_page_live, word, fresh)) {
             client.unregister(client.key) catch {};
             log.warn("meta volume {s}: succession re-registration withdrawn — this incarnation's page is not Live", .{ctx.path});
+            return .withdrawn;
         }
+        return if (fresh) .fresh else .adopted;
     }
 
     fn fillPageViews(pages: []const page.Page, views: []member_fence.PageView) []member_fence.PageView {

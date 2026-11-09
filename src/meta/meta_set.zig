@@ -327,6 +327,7 @@ pub const MetaSet = struct {
             .node_size = disc.node_size,
             .posture = posture,
         };
+        bindJoinedPeers(volumes);
         errdefer self.route.deinit();
         // A joiner converges nothing: the stamps are the manager's.
         if (!opts.read_only and posture == .manager) try self.convergeDualClaims(disc.dual_claims);
@@ -1077,7 +1078,15 @@ pub const MetaSet = struct {
             @atomicStore(*KvBackend, &self.volumes[i], be, .release);
             self.retired.appendAssumeCapacity(old);
         }
+        bindJoinedPeers(self.volumes);
         self.rejoins += 1;
+    }
+
+    fn bindJoinedPeers(volumes: []*backend.KvBackend) void {
+        for (volumes) |be| {
+            const js = be.joined orelse continue;
+            js.peers = volumes;
+        }
     }
 
     /// The one closed cutover slot across the members, if any.

@@ -2043,7 +2043,8 @@ test "verb numbers: block-coded, unique, the handshake frames at 0xFFF0, every b
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0508));
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0200));
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0606));
-    try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0707));
+    try testing.expectEqual(Verb.admin_dismount_force, Verb.fromWire(0x0707).?);
+    try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0708));
     try testing.expectEqual(Block.admin, Verb.admin_job_list.block());
     try testing.expectEqual(ADMIN_SCHEMA, Verb.admin_volume.schema());
     try testing.expectEqual(frame.Class.control, Verb.admin_job_list.class());

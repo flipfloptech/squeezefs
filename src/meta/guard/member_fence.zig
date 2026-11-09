@@ -127,7 +127,7 @@ pub fn pageFacts(who: SelfView, pages: []const PageView, seen: Seen) PageFacts {
     return .{ .own_page_live = own_live, .successor_page = successor, .sibling_death = sibling };
 }
 
-fn noteRecovering(seen: *Seen, who: SelfView, pages: []const PageView) void {
+pub fn noteRecovering(seen: *Seen, who: SelfView, pages: []const PageView) void {
     for (pages) |p| {
         if (p.state == .recovering and p.node_token == who.node_token) seen.note(p.appender_id, p.term);
     }
@@ -270,6 +270,24 @@ pub fn classify(o: Observation) Classified {
 fn budgeted(o: Observation, arm: Arm) Classified {
     if (o.retry_credits == 0) return .{ .verdict = .latch, .arm = .budget };
     return .{ .verdict = .retry, .arm = arm };
+}
+
+/// A data refusal's metadata verdict for one joined volume (decision 0004
+/// §4.5.5). Runs §4.5.3's R-2/R-3; the caller already ran R-1 (own death)
+/// and the data namespace's reserved check. `manages` is ignored: R-0 is a
+/// metadata-volume manager refusal.
+pub const DataClass = enum { metadata_pending, metadata_settled, fenced };
+
+pub fn classifyForData(o: Observation) DataClass {
+    var meta = o;
+    meta.manages = false;
+    if (!meta.own_page_live) return .fenced;
+    return switch (classify(meta).arm) {
+        .manager, .own_death, .foreign_rtype, .sibling_death, .budget => .fenced,
+        .lapse => if (meta.host_registered) .metadata_settled else .metadata_pending,
+        .registered => .metadata_settled,
+        .succession, .undecided => .metadata_pending,
+    };
 }
 
 pub fn readAfterEio(answer: BarrierAnswer, unknowns_already: u32, within_claim_ttl: bool) ReadStep {
@@ -527,6 +545,31 @@ test "member fence: an unregistered host holds for a successor before it latches
     const waiting = classify(.{ .rtype = 5, .meta_rtype = 5, .host_registered = false });
     try testing.expectEqual(Arm.undecided, waiting.arm);
     try testing.expectEqual(Verdict.held, waiting.verdict);
+}
+
+test "member fence: classifyForData answers settled when this host is registered under the metadata rtype" {
+    try testing.expectEqual(DataClass.metadata_settled, classifyForData(.{ .rtype = 3, .meta_rtype = 3, .host_registered = true }));
+    try testing.expectEqual(DataClass.metadata_settled, classifyForData(.{ .rtype = 5, .meta_rtype = 5, .host_registered = true, .manages = true }));
+}
+
+test "member fence: classifyForData answers metadata_pending for a succession, an undecided unregistration, or a lapse this host has not rejoined" {
+    try testing.expectEqual(DataClass.metadata_pending, classifyForData(.{ .rtype = 3, .host_registered = false, .successor_page = true }));
+    try testing.expectEqual(DataClass.metadata_pending, classifyForData(.{ .rtype = 3, .host_registered = false }));
+    try testing.expectEqual(DataClass.metadata_pending, classifyForData(.{ .rtype = 0, .host_registered = false }));
+    try testing.expectEqual(DataClass.metadata_settled, classifyForData(.{ .rtype = 0, .host_registered = true }));
+}
+
+test "member fence: classifyForData prefers a successor over a sibling death, and fences a sibling death, a foreign rtype, or an exhausted budget" {
+    try testing.expectEqual(DataClass.metadata_pending, classifyForData(.{
+        .rtype = 3,
+        .host_registered = false,
+        .successor_page = true,
+        .sibling_death = true,
+    }));
+    try testing.expectEqual(DataClass.fenced, classifyForData(.{ .rtype = 3, .host_registered = false, .sibling_death = true }));
+    try testing.expectEqual(DataClass.fenced, classifyForData(.{ .meta_rtype = 3, .rtype = 5, .host_registered = false, .successor_page = true }));
+    try testing.expectEqual(DataClass.fenced, classifyForData(.{ .rtype = 3, .host_registered = true, .retry_credits = 0 }));
+    try testing.expectEqual(DataClass.fenced, classifyForData(.{ .own_page_live = false, .host_registered = false, .successor_page = true }));
 }
 
 test "member fence: read EIO retries after a finished barrier and surfaces at the bound" {

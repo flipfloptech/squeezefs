@@ -162,6 +162,19 @@ pub fn configInForce() Config {
 
 pub const Error = errors.Error;
 pub const ErrorClass = errors.Class;
+
+/// Consulted on the waiter side for a PR-fenced metadata path (decision
+/// 0004 §4.16). NEVER waits for member progress (DC18). `held` and `retry`
+/// become `error.Held` (retryable, never counted as a fence).
+pub const ReadmitVerdict = enum { retry, latch, held };
+pub const ReadmitClass = enum { conflict, eio };
+pub const ReadmitOp = enum { read, write };
+pub const ReadmitAnswer = struct { verdict: ReadmitVerdict, gen: u62 = 0 };
+pub const MetaReadmit = struct {
+    ctx: *anyopaque,
+    vol: u16 = 0,
+    afterError: *const fn (ctx: *anyopaque, vol: u16, op: ReadmitOp, class: ReadmitClass) ReadmitAnswer,
+};
 pub const classOf = errors.classOf;
 pub const fromErrno = errors.fromErrno;
 pub const toErrno = errors.toErrno;
@@ -1237,6 +1250,23 @@ pub const Pool = struct {
             buf.deinit();
             return e;
         };
+        const r = self.waitCell(idx).read;
+        return r catch |e| return applyReadmitErr(path, .read, e);
+    }
+
+    /// A read that bypasses `MetaReadmit` (decision 0004 §4.16): the
+    /// classifier and the member-fence beat, so the hook never re-enters
+    /// from inside a running hook.
+    pub fn readAtRaw(self: *Pool, path: []const u8, offset: u64, size: usize) Error!ReadResult {
+        const mode = metaIoMode(path) orelse @as(MetaIoMode, .buffered);
+        const span = align_probe.readSpan(offset, size, mode.grain());
+        if (span.widened) stats.read_widened.inc();
+        var buf = try AlignedBuf.zeroed(self.gpa, @intCast(span.len), mode.memAlign());
+        if (size == 0) return .{ .buf = buf, .lo = 0, .hi = 0 };
+        const idx = self.send(.{ .read_at = .{ .path = path, .start = span.start, .skip = span.skip, .want = size, .grain = mode.grain(), .direct = mode.isDirect(), .buf = buf } }) catch |e| {
+            buf.deinit();
+            return e;
+        };
         return self.waitCell(idx).read;
     }
 
@@ -1244,7 +1274,7 @@ pub const Pool = struct {
     /// must stay alive until this returns.
     pub fn writeAt(self: *Pool, path: []const u8, offset: u64, data: []const u8) Error!void {
         var handle = try self.submitWriteAt(path, offset, data);
-        return handle.wait();
+        return applyReadmit(path, .write, handle.wait());
     }
 
     fn submitWriteAt(self: *Pool, path: []const u8, offset: u64, data: []const u8) Error!WriteCompletion {
@@ -1290,16 +1320,35 @@ pub const Pool = struct {
 
     pub fn writeAtBatch(self: *Pool, path: []const u8, ops: []const WriteOp) Error!void {
         var handle = try self.submitWriteAtBatch(path, ops);
-        return handle.wait();
+        return applyReadmit(path, .write, handle.wait());
     }
 
     /// `IORING_FSYNC_DATASYNC` on the cached O_RDWR fd.
     pub fn fdatasync(self: *Pool, path: []const u8) Error!void {
         const mode = metaIoMode(path) orelse @as(MetaIoMode, .buffered);
         const idx = try self.send(.{ .fdatasync = .{ .path = path, .direct = mode.isDirect() } });
-        return self.waitCell(idx).sync;
+        return applyReadmit(path, .write, self.waitCell(idx).sync);
     }
 };
+
+threadlocal var readmit_depth: u32 = 0;
+
+fn applyReadmit(path: []const u8, op: ReadmitOp, result: Error!void) Error!void {
+    return result catch |e| applyReadmitErr(path, op, e);
+}
+
+fn applyReadmitErr(path: []const u8, op: ReadmitOp, err: Error) Error {
+    if (err != error.ReservationConflict and err != error.InputOutput) return err;
+    if (readmit_depth != 0) return err;
+    const hook = lookupMetaReadmit(path) orelse return err;
+    readmit_depth += 1;
+    defer readmit_depth -= 1;
+    const class: ReadmitClass = if (err == error.ReservationConflict) .conflict else .eio;
+    return switch (hook.afterError(hook.ctx, hook.vol, op, class).verdict) {
+        .held, .retry => error.Held,
+        .latch => err,
+    };
+}
 
 /// The worker loop (`docs/porting/uring_fs.md` §1.9): park in the queue when
 /// nothing is in flight, else burst-admit up to `admit_cap`, one
@@ -1591,6 +1640,32 @@ pub fn clearMetaDevices() void {
 /// Idempotent. The ONE product fallback: EINVAL from the trial open on a
 /// REGULAR FILE ⇒ BUFFERED, loud, counted. A block device refusing O_DIRECT
 /// for any reason, or a regular file failing with any other errno, REFUSES.
+var readmit_mu: FutexMutex = .{};
+var readmit_map: std.StringHashMapUnmanaged(MetaReadmit) = .empty;
+
+/// Bind a completion hook for a registered PR-fenced metadata path.
+pub fn bindMetaReadmit(path: []const u8, hook: MetaReadmit) error{OutOfMemory}!void {
+    readmit_mu.lock();
+    defer readmit_mu.unlock();
+    if (readmit_map.getPtr(path)) |slot| {
+        slot.* = hook;
+        return;
+    }
+    try readmit_map.put(registry_gpa, try registry_gpa.dupe(u8, path), hook);
+}
+
+pub fn unbindMetaReadmit(path: []const u8) void {
+    readmit_mu.lock();
+    defer readmit_mu.unlock();
+    if (readmit_map.fetchRemove(path)) |kv| registry_gpa.free(kv.key);
+}
+
+fn lookupMetaReadmit(path: []const u8) ?MetaReadmit {
+    readmit_mu.lock();
+    defer readmit_mu.unlock();
+    return readmit_map.get(path);
+}
+
 pub fn registerMetaDevice(gpa: Allocator, env: *const std.process.Environ.Map, path: []const u8) RegisterError!MetaIoMode {
     // The door every metadata user passes (open, join, format, fsck,
     // `appender clear`, the shim): a node of a fencing registrant's
@@ -1738,6 +1813,43 @@ test "worker count derives from process cores: clamp(cpus/4, 4, 64); the env ove
     log.testing.expectErrorLogs(1);
     try testing.expectEqual(@as(u32, 8), Config.resolve(&env, derive.Facts.synthetic(32, 0)).workers);
     try log.testing.expectAllFired();
+}
+
+test "decision 0004 §4.16: a pool-waiter reservation conflict is held or latched by MetaReadmit, and a nested consult is bypassed" {
+    const Hold = struct {
+        asked: u32 = 0,
+        answer: ReadmitVerdict = .held,
+        fn after(ctx: *anyopaque, _: u16, _: ReadmitOp, class: ReadmitClass) ReadmitAnswer {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.asked += 1;
+            _ = class;
+            return .{ .verdict = self.answer, .gen = 7 };
+        }
+    };
+    var hook_state: Hold = .{};
+    const path = "/build/tmp/uring-fs-readmit-hook";
+    try bindMetaReadmit(path, .{ .ctx = &hook_state, .afterError = &Hold.after });
+    defer unbindMetaReadmit(path);
+
+    try testing.expectEqual(Error.Held, applyReadmitErr(path, .write, error.ReservationConflict));
+    try testing.expectEqual(@as(u32, 1), hook_state.asked);
+
+    hook_state.answer = .retry;
+    try testing.expectEqual(Error.Held, applyReadmitErr(path, .write, error.ReservationConflict));
+    try testing.expectEqual(@as(u32, 2), hook_state.asked);
+
+    hook_state.answer = .latch;
+    try testing.expectEqual(Error.ReservationConflict, applyReadmitErr(path, .write, error.ReservationConflict));
+    try testing.expectEqual(@as(u32, 3), hook_state.asked);
+
+    try testing.expectEqual(Error.FileNotFound, applyReadmitErr(path, .write, error.FileNotFound));
+    try testing.expectEqual(@as(u32, 3), hook_state.asked);
+
+    readmit_depth = 1;
+    defer readmit_depth = 0;
+    hook_state.answer = .held;
+    try testing.expectEqual(Error.ReservationConflict, applyReadmitErr(path, .write, error.ReservationConflict));
+    try testing.expectEqual(@as(u32, 3), hook_state.asked);
 }
 
 test "fd cache cap derives from RLIMIT_NOFILE as found: clamp(soft/4/workers, 16, 1024)" {

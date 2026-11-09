@@ -209,6 +209,39 @@ pub const DeviceLoader = struct {
         return .{ .ctx = self, .readExtent = readExtent, .appendBset = appendBset, .writeImage = writeImage };
     }
 
+    /// Install this loader's member-fence hook on the pool waiter for `path`.
+    pub fn bindPoolReadmit(self: *DeviceLoader) void {
+        if (self.readmit == null) return;
+        uring_fs.bindMetaReadmit(self.path, .{ .ctx = self, .afterError = &poolAfterError }) catch {};
+    }
+
+    pub fn unbindPoolReadmit(self: *const DeviceLoader) void {
+        uring_fs.unbindMetaReadmit(self.path);
+    }
+
+    fn poolAfterError(ctx: *anyopaque, vol: u16, op: uring_fs.ReadmitOp, class: uring_fs.ReadmitClass) uring_fs.ReadmitAnswer {
+        _ = vol;
+        const self: *DeviceLoader = @ptrCast(@alignCast(ctx));
+        const hook = self.readmit orelse return .{ .verdict = .latch };
+        const mop: member_fence.Op = switch (op) {
+            .read => .read,
+            .write => .write,
+        };
+        const mclass: member_fence.Class = switch (class) {
+            .conflict => .conflict,
+            .eio => .eio,
+        };
+        const a = hook(self.readmit_ctx, mop, mclass);
+        return .{
+            .verdict = switch (a.verdict) {
+                .retry => .retry,
+                .latch => .latch,
+                .held => .held,
+            },
+            .gen = a.gen,
+        };
+    }
+
     pub fn barrierSink(self: *DeviceLoader) checkpoint_cycle.BarrierSink {
         return .{ .ctx = self, .barrier = barrierFn };
     }
@@ -222,6 +255,7 @@ pub const DeviceLoader = struct {
     }
 
     fn ioFailed(self: *DeviceLoader, site: Site, offset: u64, len: usize, e: uring_fs.Error) error{ Io, Held } {
+        if (e == error.Held) return error.Held;
         if (self.heldRefusal(e, site)) return error.Held;
         stats.io_errors.inc();
         stats.failures(site).inc();

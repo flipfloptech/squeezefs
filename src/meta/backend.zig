@@ -1184,9 +1184,11 @@ pub const KvBackend = struct {
         be.joined = js;
         be.dev.readmit = joinedReadmit;
         be.dev.readmit_ctx = be;
+        be.dev.bindPoolReadmit();
         errdefer {
             js.deinit();
             be.joined = null;
+            be.dev.unbindPoolReadmit();
             be.dev.readmit = null;
             be.dev.readmit_ctx = null;
         }
@@ -3430,6 +3432,7 @@ pub const KvBackend = struct {
     /// retired incarnation and a second close answer true — they owe no
     /// durability point).
     pub fn closeJudged(be: *KvBackend) bool {
+        be.dev.unbindPoolReadmit();
         const gpa = be.gpa;
         var clean = true;
         if (be.posture == .reader) {

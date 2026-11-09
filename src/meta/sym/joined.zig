@@ -389,7 +389,7 @@ pub const JoinedSet = struct {
     /// The last page write's words (for `.stats`).
     tail_written: u64 = 0,
     entries: u64 = 0,
-    left: bool = false,
+    left: std.atomic.Value(bool) = .init(false),
     /// The park-and-reclaim gate (charter §5.5 "A manager's death is its
     /// home shard's outage"): the conveyor's pre-admission gate; the
     /// member's `T_self` action parks it, the reclaim releases it,
@@ -403,8 +403,12 @@ pub const JoinedSet = struct {
     mgr_writer: u64 = 0,
     /// Set while `SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD` blocks the member
     /// beat: the census beat and the succession park stay down so
-    /// committers keep serving until they park at `T_self`.
+    /// committers keep serving until they park at `T_self`. Also set as
+    /// soon as the hold FIFO appears, so a census tick cannot park before
+    /// the membership thread enters the hold.
     member_beat_held: std.atomic.Value(bool) = .init(false),
+    member_beat_hold_done: std.atomic.Value(bool) = .init(false),
+    member_beat_hold_path: ?[]const u8 = null,
     /// The ring-growth gate (`ring_growth.zig`): the conveyor's passes
     /// enter it; `growRingIfDue` closes it to drain and swap the ring.
     gate: ring_growth.Gate,
@@ -512,6 +516,9 @@ pub const JoinedSet = struct {
         self.readmit.on_held = parkForSuccession;
         self.readmit.on_held_ctx = self;
         self.readmit.word = &self.resolution;
+        if (knobs.parseStr(be.env.get("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD"))) |p| {
+            if (!std.mem.eql(u8, p, "off")) self.member_beat_hold_path = p;
+        }
         errdefer self.joiner.deinit();
         try self.awaitManagerListener(page0);
         // 3. Rung 5: the region over the wire. A Deferred join — the
@@ -939,7 +946,7 @@ pub const JoinedSet = struct {
 
     fn lowWaterRun(ctx: *anyopaque) void {
         const self: *JoinedSet = @ptrCast(@alignCast(ctx));
-        if (self.left or self.refill_busy.swap(true, .acq_rel)) return;
+        if (self.left.load(.acquire) or self.refill_busy.swap(true, .acq_rel)) return;
         self.refill.spawn(self.be.io, refillRun, .{self}) catch self.refill_busy.store(false, .release);
     }
 
@@ -1056,8 +1063,19 @@ pub const JoinedSet = struct {
 
     fn parkForSuccession(ctx: ?*anyopaque) void {
         const self: *JoinedSet = @ptrCast(@alignCast(ctx.?));
-        if (self.member_beat_held.load(.acquire)) return;
+        if (self.membershipHoldActive()) return;
         _ = self.park_gate.parkFor(.succession, clock.monotonicNs());
+    }
+
+    /// The hold FIFO is present and the one-shot hold has not finished, or
+    /// the membership thread is already blocked in it.
+    fn membershipHoldActive(self: *JoinedSet) bool {
+        if (self.member_beat_held.load(.acquire)) return true;
+        if (self.member_beat_hold_done.load(.acquire)) return false;
+        const path = self.member_beat_hold_path orelse return false;
+        Io.Dir.cwd().access(self.be.io, path, .{}) catch return false;
+        self.member_beat_held.store(true, .release);
+        return true;
     }
 
     fn mapWrite(self: *JoinedSet, e: anyerror) error{ Io, Held } {
@@ -1132,9 +1150,10 @@ pub const JoinedSet = struct {
     pub fn afterTick(ctx: *anyopaque) void {
         const self: *JoinedSet = @ptrCast(@alignCast(ctx));
         const seq = self.be.cp.checkpointSeq();
+        if (self.left.load(.acquire)) return;
         if (seq == self.grow_judged_at_seq) return;
         self.grow_judged_at_seq = seq;
-        if (!self.member_beat_held.load(.acquire)) self.censusBeat();
+        if (!self.membershipHoldActive()) self.censusBeat();
         self.growRingIfDue();
     }
 
@@ -1145,6 +1164,7 @@ pub const JoinedSet = struct {
     /// `Readmit.beat`. An unregistered current member then re-registers
     /// through the rule once already-submitted writes have completions.
     fn censusBeat(self: *JoinedSet) void {
+        if (self.left.load(.acquire) or self.membershipHoldActive()) return;
         const pages = devicePages(self.be.gpa, self.be) catch return;
         defer self.be.gpa.free(pages);
         var views: [64]member_fence.PageView = undefined;
@@ -1162,7 +1182,10 @@ pub const JoinedSet = struct {
         if (self.readmit.obs.host_registered) if (page0Writer(mapped)) |w| {
             self.mgr_writer = w;
         };
-        if (verdict == .latch) _ = self.be.lane.latch.noteFence("the member-fence beat");
+        if (verdict == .latch) {
+            if (self.left.load(.acquire)) return;
+            _ = self.be.lane.latch.noteFence("the member-fence beat");
+        }
         if (member_fence.wantsRegister(self.readmit.obs, report.readable, self.be.pool.writesOutstanding() == 0, self.readmit.word)) {
             self.successionReregister(who);
         }
@@ -1200,7 +1223,10 @@ pub const JoinedSet = struct {
             if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
             log.warn("meta volume {s}: re-registered this host under key {x:0>16} after a succession", .{ self.be.path, f.client.key });
         }
-        if (verdict == .latch) _ = self.be.lane.latch.noteFence("the member-fence beat");
+        if (verdict == .latch) {
+            if (self.left.load(.acquire)) return;
+            _ = self.be.lane.latch.noteFence("the member-fence beat");
+        }
     }
 
     fn runSuccessionRegister(
@@ -1468,7 +1494,7 @@ pub const JoinedSet = struct {
     /// cycle's error: the tick landed before growth was decided.
     pub fn growRingIfDue(self: *JoinedSet) void {
         const be = self.be;
-        if (self.left or be.cv.isClosing() or be.lane.latch.isFailed() or self.park_gate.word() != .running) return;
+        if (self.left.load(.acquire) or be.cv.isClosing() or be.lane.latch.isFailed() or self.park_gate.word() != .running) return;
         const r = self.core();
         const current = r.ringBytes();
         const stalls = be.cv.stats.full_stalls.load();
@@ -1638,8 +1664,7 @@ pub const JoinedSet = struct {
     /// `LeaveAppender` with the pool's unclaimed runs — the page goes Free
     /// under the manager's pen.
     pub fn leave(self: *JoinedSet) void {
-        if (self.left) return;
-        self.left = true;
+        if (self.left.swap(true, .acq_rel)) return;
         const be = self.be;
         if (self.fence) |f| f.depart();
         // A FENCED member's dismount is the CRASH shape (charter §5.5: a
@@ -1880,6 +1905,8 @@ test "member fence: JoinedSet.writePages names Held" {
 test "member fence: a held membership beat does not park for succession" {
     var js: JoinedSet = undefined;
     js.member_beat_held = .init(true);
+    js.member_beat_hold_done = .init(false);
+    js.member_beat_hold_path = null;
     js.park_gate = park.ParkGate.arm(testing.io, 0, 48_000);
     JoinedSet.parkForSuccession(@ptrCast(&js));
     try testing.expect(!js.park_gate.isParked());

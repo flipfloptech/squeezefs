@@ -861,7 +861,12 @@ pub const JournalLane = struct {
     pub fn shutdown(self: *JournalLane) void {
         // KD20: `terminal` before the fiber is joined, so a waiter in
         // `awaitPast` wakes and takes its failure path instead of hanging.
-        if (self.hooks.word) |w| w.terminate();
+        // Clear the pointer: `closeJudged` destroys the JoinedSet (and
+        // this word) before `lane.deinit` calls `shutdown` again.
+        if (self.hooks.word) |w| {
+            self.hooks.word = null;
+            w.terminate();
+        }
         // SeqCst pairs with `publish`'s SeqCst census RMW + closing load:
         // exactly one of {closer, submitter} sees the other.
         self.closing.store(true, .seq_cst);
@@ -3075,6 +3080,22 @@ test "member fence: shutdown terminates a pending word so a held waiter does not
     th.join();
     try testing.expectEqual(journal_guard.member_fence.Resolution.State.terminal, word.snapshot().state);
     try testing.expectEqual(journal.FailureLatch.Verdict.healthy, lane.latch.verdict());
+}
+
+test "member fence: a second shutdown after the resolution word is gone does not fault" {
+    const h = try Harness.init(testing.allocator, "held-kd20-word-gone");
+    defer h.deinit();
+    const word = try testing.allocator.create(journal_guard.member_fence.Resolution);
+    word.* = .{};
+    var hooks: Hooks = .{};
+    hooks.word = word;
+    try h.spawnLane(hooks, "0", 0);
+    const lane = h.lane.?;
+    lane.shutdown();
+    try testing.expectEqual(journal_guard.member_fence.Resolution.State.terminal, word.snapshot().state);
+    try testing.expectEqual(@as(?*journal_guard.member_fence.Resolution, null), lane.hooks.word);
+    testing.allocator.destroy(word);
+    lane.shutdown();
 }
 
 test "member fence: a held barrier conflict does not latch" {

@@ -28,7 +28,8 @@
 //! answers the device's `-EBADE` — FAILED), the member-death rows (the
 //! manager's fencing registrant preempts the dead member's host, decision
 //! 0003 §DG; a frozen member's released windows refused), F9/F9b (a grace
-//! reap carries the page's host key) and F10 (a busy co-located joiner
+//! reap carries the page's host key), F1 (a successor's preempt-all, decision
+//! 0004 §8.2; red while metadata is WERO) and F10 (a busy co-located joiner
 //! survives the superseded manager's takeover, decision 0004 §8.2),
 //! `g2-restore-tcp` (the PTPL
 //! lapse: the subsystem wiped by hand under a live mount, `restore`
@@ -3544,6 +3545,89 @@ const f10_writer =
     \\  sleep 0.05
     \\done
 ;
+
+test "nvmet fidelity: F1 — succession re-registration (decision 0004 §8.2) — M (host A) manages, J (host C) writes and fsyncs; M is SIGSTOPped past the claim TTL; S (host B) mounts: one preempt-all (writer_guard_preempt_alls 1) removes every other registrant (writer_guard_preempt_all_victims >= 2) and the namespace stays WEAR (rtype 5); J parks, re-registers once, is readmitted and is not fenced; S settles the window early and pays the data debt once; J's bytes are back and fsck is clean (red on WERO: the takeover preempts the holder key only, rtype stays 3, and the preempt-all counters are absent)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "f1", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    const cm_c = try rig.connect(set.meta_nqn, transport, 0, ident_c, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var mu_c: [64]u8 = undefined;
+    const meta_uri_c = try std.fmt.bufPrint(&mu_c, "sqmeta://{s}", .{cm_c.dev()});
+    const m = try rig.spawnMount("f1-m", set.metaUri(), null, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const j = try rig.spawnMount("f1-j", meta_uri_c, ident_c, &.{});
+    try rig.awaitLog(j, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, j, "mkdir dj && echo j > dj/j && sync -d dj/j"));
+    const pid_m = rig.daemons.items[m].pid;
+    _ = linux.kill(pid_m, .STOP);
+    sleepMs(lease_clock.T_OWNER_MS + 5_000);
+    const s = try rig.spawnMount("f1-s", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(s, "ready: ", ready_wait_ns);
+    {
+        const seen = try rig.onMount(s, "cat dj/j");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("j\n", seen);
+    }
+    const rr = try rig.resvReportJson(cm.dev());
+    defer gpa.free(rr);
+    const ss = try rig.stats(s);
+    defer gpa.free(ss);
+    std.debug.print("\n--- F1 after S binds: rtype {?d} regctl {?d}; writer_guard_preempts {?d} writer_guard_preempt_alls {?d} writer_guard_preempt_all_victims {?d} ---\n", .{
+        json_scan.number(rr, "rtype"),
+        json_scan.number(rr, "regctl"),
+        json_scan.number(ss, "writer_guard_preempts"),
+        json_scan.number(ss, "writer_guard_preempt_alls"),
+        json_scan.number(ss, "writer_guard_preempt_all_victims"),
+    });
+    try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
+    try testing.expectEqual(@as(u64, 1), try statNumber(ss, "writer_guard_preempt_alls"));
+    try testing.expect(try statNumber(ss, "writer_guard_preempt_all_victims") >= 2);
+    try testing.expectEqual(@as(u64, 1), try statNumber(ss, "writer_guard_succession_early_settles"));
+    try testing.expectEqual(@as(u64, 1), try statNumber(ss, "data_pr_debt_preempts"));
+    const sj = try rig.stats(j);
+    defer gpa.free(sj);
+    try testing.expect(try statNumber(sj, "meta_pr_succession_parks") >= 1);
+    try testing.expectEqual(@as(u64, 1), try statNumber(sj, "meta_pr_succession_reregistrations"));
+    try testing.expect(try statNumber(sj, "meta_pr_refusal_readmissions") >= 1);
+    try testing.expectEqual(@as(u64, 0), try statNumber(sj, "writer_guard_fenced"));
+    {
+        const back = try rig.onMount(j, "cat dj/j");
+        defer gpa.free(back);
+        try testing.expectEqualStrings("j\n", back);
+    }
+    try rig.kill9(m);
+    try rig.umount(j);
+    try rig.umount(s);
+    const bound = try bindDataForFsck(rig, &set, transport);
+    defer if (bound) {
+        var stored_buf: [64]u8 = undefined;
+        if (std.fmt.bufPrintSentinel(&stored_buf, "{s}", .{set.dataDev()}, 0)) |stored_z| {
+            _ = linux.umount2(stored_z.ptr, linux.MNT.DETACH);
+        } else |_| {}
+    };
+    const fsck = try rig.sqz(&.{ "fsck", "--offline", "--scrub", set.metaUri() });
+    defer rig.freeRun(fsck);
+    if (!fsck.term.success() or std.mem.indexOf(u8, fsck.stdout, "findings: 0 (clean)") == null) {
+        std.debug.print("\n--- fsck --offline --scrub ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ fsck.term, fsck.stdout, fsck.stderr });
+        return error.FsckNotClean;
+    }
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    try rig.disconnect(&cm_c);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
 
 test "nvmet fidelity: F10 — a busy co-located joiner of the superseded manager survives the takeover (decision 0004 §8.2, G-c, round-4 issue 1) — M (host A) manages, JA (host A, supervised, the write cache) keeps writing and fsyncing one 64 KiB block across the takeover; M is SIGSTOPped past the claim TTL and S (host B) mounts: S's admission reconcile fences host A on data while JA is mid-flight — a refused data write is re-admitted (held while metadata is pending, or one synchronous retry once metadata has settled; data_dma_fence_refusals 0, no data fence latch), JA kills M at its metadata re-registration (pr_stale_sibling_kills ≥ 1), data re-registers (data_pr_succession_reregistrations ≥ 1), a later fsync lands, every fsynced block is whole on JA and on S, and fsck --offline --scrub is clean (red on dev: JA's data device latches, its fsyncs answer EIO)" {
     const gpa = testing.allocator;

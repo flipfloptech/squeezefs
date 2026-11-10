@@ -606,12 +606,10 @@ pub const Guard = struct {
     }
 
     fn arbitrateBlocking(g: *Guard, c: *pr.Client, evidence: claim.Evidence) backend.OpenError!void {
-        // A symmetric set's manager holds WERO: every member's host is a
-        // registrant that may write and the device keeps ONE holder — a
-        // successor's acquire conflicts and preempts it, which unregisters
-        // the superseded manager's host (charter §5.5, decision 0003 §DF); a
-        // flat volume's single writer holds Write Exclusive.
-        c.rtype = if (g.be.sb.symmetricPlaneStamped()) nvme.RTYPE_WERO else nvme.RTYPE_WRITE_EXCLUSIVE;
+        // A symmetric set's manager holds WEAR. Single-manager exclusion is
+        // the successor's preempt-all (decision 0004 §4.4): it unregisters
+        // every other host. A flat volume's single writer holds Write Exclusive.
+        c.rtype = if (g.be.sb.symmetricPlaneStamped()) nvme.RTYPE_WEAR else nvme.RTYPE_WRITE_EXCLUSIVE;
         if (g.early_fresh) |f| {
             // Registered and holding before the first device write (the
             // backend's step 3b): only the counters here.
@@ -668,10 +666,14 @@ pub const Guard = struct {
         }
     }
 
-    /// The hold (WERO or Write Exclusive under `c.rtype`): acquired, or the
-    /// report's ONE holder preempted — the superseded writer's host
-    /// unregistered, its writes refused from here.
+    /// The hold. Symmetric volumes take the preempt-all (`c.rtype` is WEAR).
+    /// A flat volume acquires Write Exclusive, or preempts the one holder.
     fn hold(g: *Guard, c: *pr.Client, evidence: claim.Evidence) backend.OpenError!void {
+        if (c.rtype == nvme.RTYPE_WEAR) {
+            const outcome = host_fence.takeSuccession(c, g.be.path) catch return error.Busy;
+            g.keep_hold = outcome.kept();
+            return;
+        }
         c.acquire() catch |e| switch (e) {
             error.ReservationConflict => {
                 const victim = (c.holder() catch |re| return g.prErrorLog(c, "report", re)) orelse {
@@ -1664,7 +1666,7 @@ test "a heartbeat rewrites ts and heartbeat_seq through the conveyor (coalesced 
     try testing.expectEqual(c1.heartbeat_seq + 2, (try v.probe()).?.heartbeat_seq);
 }
 
-test "B1 on a PR substrate (the fake): the symmetric volume's manager holds WERO at mount under our derived key (the device keeps ONE holder) (every member host a registrant may write; an unregistered host may not), its clean unmount leaves zero residue; writer_guard_mode is flock+pr; RESCAP 0 degrades to flock+claim" {
+test "B1 on a PR substrate (the fake): the symmetric volume's manager holds WEAR at mount under our derived key (a preempt-all removes nobody on a fresh namespace) (every registered host may write; an unregistered host may not), its clean unmount leaves zero residue; writer_guard_mode is flock+pr; RESCAP 0 degrades to flock+claim" {
     const gpa = testing.allocator;
     const v = try Vol.create(gpa, "pr", null);
     defer v.destroy();
@@ -1677,7 +1679,7 @@ test "B1 on a PR substrate (the fake): the symmetric volume's manager holds WERO
         try testing.expectEqualStrings("flock+pr", be.guard.?.modeName());
         try testing.expectEqual(@as(?u64, claim.prKey(me.writerId(0), boot_a)), ns.holder);
         try testing.expect(be.sb.symmetricPlaneStamped());
-        try testing.expectEqual(nvme.RTYPE_WERO, ns.rtype);
+        try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
         try testing.expect(ns.writeAllowed(host_a_id));
         try testing.expect(!ns.writeAllowed(host_b_id));
         var buf: [2048]u8 = undefined;

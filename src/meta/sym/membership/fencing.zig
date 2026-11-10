@@ -185,9 +185,10 @@ pub const Registered = struct {
 
 /// A joiner host: register under ONE key, read the report, feed the
 /// learner, run the gate against the cap in force. The manager's hold must
-/// be WERO (a flat mount's rtype 1 refuses the join).
+/// be WEAR, or WERO while a set from before the switch is still mounted
+/// (a flat mount's rtype 1 refuses the join).
 pub fn joinAsRegistrant(client: *pr.Client, declared_cap: ?u16) JoinError!Registered {
-    client.rtype = nvme.RTYPE_WERO;
+    client.rtype = nvme.RTYPE_WEAR;
     const outcome = client.registerLadder() catch |e| switch (e) {
         error.DeviceStatus => {
             // The ladder fed the learner from this status; the gate reads
@@ -207,7 +208,7 @@ pub fn joinAsRegistrant(client: *pr.Client, declared_cap: ?u16) JoinError!Regist
     var rep = client.report() catch return error.Device;
     defer rep.deinit(client.gpa);
     noteReport(client);
-    if (rep.rtype != 0 and rep.rtype != nvme.RTYPE_WERO) {
+    if (rep.rtype != 0 and rep.rtype != nvme.RTYPE_WEAR and rep.rtype != nvme.RTYPE_WERO) {
         client.unregister(client.key) catch {};
         return error.NotWero;
     }
@@ -232,7 +233,7 @@ pub fn adoptColocated(client: *pr.Client, enrolled: []const u64) JoinError!u64 {
     defer rep.deinit(client.gpa);
     noteReport(client);
     if (rep.rtype == 0) return error.NoHolder;
-    if (rep.rtype != nvme.RTYPE_WERO) return error.NotWero;
+    if (rep.rtype != nvme.RTYPE_WEAR and rep.rtype != nvme.RTYPE_WERO) return error.NotWero;
     for (enrolled) |k| if (rep.heldBy(k)) {
         stats.pr_colocated_adoptions.inc();
         return k;

@@ -55,6 +55,7 @@ const member_fence = @import("../guard/member_fence.zig");
 const claim = @import("../guard/claim.zig");
 const proc = @import("../guard/proc.zig");
 const host_fence = @import("../guard/host_fence.zig");
+const nvme = @import("../guard/nvme_cmd.zig");
 const pr = @import("../guard/pr.zig");
 const sym = @import("../sym.zig");
 const page = @import("appender_page.zig");
@@ -1217,6 +1218,7 @@ pub const JoinedSet = struct {
             .mgr_writer = self.mgr_writer,
             .mgr_term = self.mgr_term,
             .grant_term = self.grant_term.load(.acquire),
+            .meta_rtype = nvme.RTYPE_WEAR,
         };
         const currency = self.liveOnEveryJoined(who);
         if (currency == .dead) {
@@ -1270,6 +1272,7 @@ pub const JoinedSet = struct {
             .mgr_writer = self.mgr_writer,
             .mgr_term = self.mgr_term,
             .grant_term = self.grant_term.load(.acquire),
+            .meta_rtype = nvme.RTYPE_WEAR,
         };
         return switch (self.liveOnEveryJoined(who)) {
             .dead => .dead,
@@ -2125,7 +2128,6 @@ test "member fence: the census report is the joiner's client" {
 
     const fake = @import("../guard/fake_nvme.zig");
     const fencing = @import("membership/fencing.zig");
-    const nvme = @import("../guard/nvme_cmd.zig");
     var ns = fake.Namespace.init(testing.allocator);
     defer ns.deinit();
     var h: fake.Host = .{ .ns = &ns, .host_id = "this-host-id-001".* };

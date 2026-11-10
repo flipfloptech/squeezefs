@@ -1083,13 +1083,14 @@ pub const Early = struct {
     /// by this open's preempt (the gate takes it over).
     fenced_writer: ?u64 = null,
 
-    /// The hold under the early registration (WERO on a symmetric volume,
+    /// The hold under the early registration (WEAR on a symmetric volume,
     /// Write Exclusive on a flat one) — the caller read the claim right
-    /// before it (review 5 major 1).
+    /// before it (review 5 major 1). A symmetric hold is a preempt-all
+    /// (decision 0004 §4.4).
     pub fn takeHold(self: *Early, symmetric: bool, path: []const u8) error{Refused}!void {
         const c = self.posture.active;
-        c.rtype = if (symmetric) nvme.RTYPE_WERO else nvme.RTYPE_WRITE_EXCLUSIVE;
-        self.hold = try holdReservation(c, path);
+        c.rtype = if (symmetric) nvme.RTYPE_WEAR else nvme.RTYPE_WRITE_EXCLUSIVE;
+        self.hold = if (symmetric) try takeSuccession(c, path) else try holdReservation(c, path);
         self.keep_hold = self.hold.kept();
     }
 
@@ -1239,9 +1240,108 @@ pub const HoldOutcome = enum {
     }
 };
 
+/// Other host ids named in `rep` (a preempt-all's victims, decision 0004
+/// §4.4 step 6). The caller's own host id is not one.
+fn otherHostIds(rep: nvme.Report, me: [16]u8) u64 {
+    var n: u64 = 0;
+    for (rep.registrants, 0..) |r, i| {
+        if (std.mem.eql(u8, &r.host_id, &me)) continue;
+        var earlier = false;
+        for (rep.registrants[0..i]) |p| {
+            if (std.mem.eql(u8, &p.host_id, &r.host_id)) {
+                earlier = true;
+                break;
+            }
+        }
+        if (!earlier) n += 1;
+    }
+    return n;
+}
+
+fn registrantHost(rep: nvme.Report, key: u64, host: [16]u8) bool {
+    for (rep.registrants) |r| if (r.rkey == key and std.mem.eql(u8, &r.host_id, &host)) return true;
+    return false;
+}
+
+/// A symmetric volume's hold (decision 0004 §4.4 step 6). Report, acquire
+/// only while the namespace is unreserved, then one preempt-all. The
+/// namespace stays WEAR. `acquired` only when the report before the
+/// preempt-all listed no other host and the generation moved by exactly
+/// that command; anything else keeps the hold.
+pub fn takeSuccession(c: *pr.Client, path: []const u8) error{Refused}!HoldOutcome {
+    const me = c.wireHostId() catch {
+        log.err("{s}: the host identifier could not be read before the preempt-all — refusing the mount", .{path});
+        return error.Refused;
+    };
+    var r0 = c.report() catch {
+        log.err("{s}: the reservation report failed before the preempt-all — refusing to arbitrate blind", .{path});
+        return error.Refused;
+    };
+    defer r0.deinit(c.gpa);
+    switch (r0.rtype) {
+        0 => c.acquire() catch |e| switch (e) {
+            error.ReservationConflict => {
+                var again = c.report() catch {
+                    log.err("{s}: the reservation report failed after an acquire conflict — refusing the mount", .{path});
+                    return error.Refused;
+                };
+                defer again.deinit(c.gpa);
+                if (again.rtype != nvme.RTYPE_WEAR) {
+                    log.err("{s}: reservation acquire conflicted and the report's type is {d}, not WEAR — refusing the mount (decision 0004 §4.4)", .{ path, again.rtype });
+                    return error.Refused;
+                }
+            },
+            else => {
+                log.err("{s}: reservation acquire failed on the PR-capable namespace — refusing the mount", .{path});
+                return error.Refused;
+            },
+        },
+        nvme.RTYPE_WEAR => if (!registrantHost(r0, c.key, me)) {
+            log.err("{s}: this host is not registered under the standing WEAR reservation — a racing successor's preempt-all already removed it; refusing the mount (decision 0004 §4.4)", .{path});
+            return error.Refused;
+        },
+        else => {
+            log.err("{s}: metadata reservation type {d} is not WEAR — refusing the mount (decision 0004 §6.4)", .{ path, r0.rtype });
+            return error.Refused;
+        },
+    }
+    const others = otherHostIds(r0, me);
+    const gen0 = r0.generation;
+    c.preemptAllAndAbort() catch |e| switch (e) {
+        error.ReservationConflict => {
+            log.err("{s}: the preempt-all conflicted — a racing successor unregistered this host; refusing the mount (decision 0004 §4.4)", .{path});
+            return error.Refused;
+        },
+        else => {
+            log.err("{s}: the preempt-all failed — refusing the mount", .{path});
+            return error.Refused;
+        },
+    };
+    var r1 = c.report() catch {
+        log.err("{s}: the reservation report failed after the preempt-all — refusing the mount", .{path});
+        return error.Refused;
+    };
+    defer r1.deinit(c.gpa);
+    if (r1.rtype != nvme.RTYPE_WEAR or !registrantHost(r1, c.key, me)) {
+        log.err("{s}: the preempt-all did not leave this host registered under WEAR — refusing the mount", .{path});
+        return error.Refused;
+    }
+    const gap = r1.generation -% gen0;
+    const unseen: u64 = if (gap > 1) gap - 1 else 0;
+    guard.stats.preempt_alls.inc();
+    guard.stats.preempt_all_victims.add(others);
+    guard.stats.preempt_all_unseen_events.add(unseen);
+    if (others > 0) log.warn("{s}: preempt-all removed {d} other host id(s) under WEAR (decision 0004 §4.4)", .{ path, others });
+    // Unreserved before, no other host, and the preempt-all was the only
+    // generation bump (a plain acquire bumps nothing, P16).
+    if (r0.rtype == 0 and others == 0 and gap == 1) return .acquired;
+    return .preempted;
+}
+
 /// The hold under `c.rtype`: inherited (the report names our key), acquired,
 /// or the report's ONE holder preempted (the superseded writer's host
-/// unregistered, its writes refused from here).
+/// unregistered, its writes refused from here). Symmetric volumes use
+/// `takeSuccession` instead.
 pub fn holdReservation(c: *pr.Client, path: []const u8) error{Refused}!HoldOutcome {
     const here = c.admittedHere() catch {
         log.err("{s}: the reservation report failed before the hold — refusing to arbitrate blind", .{path});
@@ -2006,4 +2106,42 @@ test "a co-located member whose /proc/<pid>/stat the kernel refuses to open (EMF
     const es = try reg.entries(gpa);
     defer gpa.free(es);
     try testing.expectEqual(@as(usize, 1), es.len);
+}
+
+test "decision 0004 §4.4 step 6: a symmetric takeover is one preempt-all — the successor is the only registrant under WEAR, and every other host id counts; a fresh namespace's preempt-all removes nobody and the hold may be released" {
+    const gpa = testing.allocator;
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    const id_a: [16]u8 = "manager-host-id1".*;
+    const id_b: [16]u8 = "joiner-host-id-2".*;
+    const id_c: [16]u8 = "successor-host-3".*;
+    var ha: fake.Host = .{ .ns = &ns, .host_id = id_a };
+    var hb: fake.Host = .{ .ns = &ns, .host_id = id_b };
+    var hc: fake.Host = .{ .ns = &ns, .host_id = id_c };
+    var a = try pr.Client.init(gpa, ha.face(), 1, 0x1111);
+    defer a.deinit();
+    a.rtype = nvme.RTYPE_WEAR;
+    _ = try a.registerLadder();
+    const fresh0 = guard.stats.preempt_alls.load();
+    const fresh = try takeSuccession(&a, "fake-meta");
+    try testing.expectEqual(HoldOutcome.acquired, fresh);
+    try testing.expectEqual(fresh0 + 1, guard.stats.preempt_alls.load());
+    try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
+    var b = try pr.Client.init(gpa, hb.face(), 1, 0x2222);
+    defer b.deinit();
+    _ = try b.registerLadder();
+    var c = try pr.Client.init(gpa, hc.face(), 1, 0x3333);
+    defer c.deinit();
+    c.rtype = nvme.RTYPE_WEAR;
+    _ = try c.registerLadder();
+    const all0 = guard.stats.preempt_alls.load();
+    const vic0 = guard.stats.preempt_all_victims.load();
+    const took = try takeSuccession(&c, "fake-meta");
+    try testing.expectEqual(HoldOutcome.preempted, took);
+    try testing.expectEqual(all0 + 1, guard.stats.preempt_alls.load());
+    try testing.expect(guard.stats.preempt_all_victims.load() >= vic0 + 2);
+    try testing.expect(ns.isRegistered(0x3333));
+    try testing.expect(!ns.isRegistered(0x1111));
+    try testing.expect(!ns.isRegistered(0x2222));
+    try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
 }

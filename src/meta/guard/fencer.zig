@@ -364,7 +364,7 @@ fn standOrRefuse(gpa: Allocator, env: *const std.process.Environ.Map, in: Input)
     errdefer gpa.destroy(c);
     c.* = try pr.Client.init(gpa, dev.face(), dev.nsid, in.key);
     errdefer c.deinit();
-    c.rtype = nvme.RTYPE_WERO;
+    c.rtype = nvme.RTYPE_WEAR;
     registerUnder(c) catch |e| {
         var eb: [128]u8 = undefined;
         var ew: Io.Writer = .fixed(&eb);

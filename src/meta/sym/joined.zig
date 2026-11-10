@@ -521,6 +521,8 @@ pub const JoinedSet = struct {
         self.readmit.on_held = parkForSuccession;
         self.readmit.on_held_ctx = self;
         self.readmit.word = &self.resolution;
+        self.resolution.recheck_ctx = self;
+        self.resolution.recheck_fn = &recheckResolution;
         if (knobs.parseStr(be.env.get("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD"))) |p| {
             if (!std.mem.eql(u8, p, "off")) self.member_beat_hold_path = p;
         }
@@ -1150,15 +1152,20 @@ pub const JoinedSet = struct {
         g.noteWindowLeft();
     }
 
-    /// The checkpoint task's `after_tick` seam: the growth is judged once
-    /// per cycle that landed (an idle tick judges nothing).
+    /// The checkpoint task's `after_tick` seam: the member-fence beat runs
+    /// while a succession is pending and on each cycle that landed; ring
+    /// growth is judged once per cycle that landed.
     pub fn afterTick(ctx: *anyopaque) void {
         const self: *JoinedSet = @ptrCast(@alignCast(ctx));
         const seq = self.be.cp.checkpointSeq();
         if (self.left.load(.acquire)) return;
-        if (seq == self.grow_judged_at_seq) return;
+        const cycle_landed = seq != self.grow_judged_at_seq;
+        const succession_pending = self.park_gate.isParked() or self.resolution.snapshot().state == .pending;
+        if (cycle_landed or succession_pending) {
+            if (!self.membershipHoldActive()) self.censusBeat();
+        }
+        if (!cycle_landed) return;
         self.grow_judged_at_seq = seq;
-        if (!self.membershipHoldActive()) self.censusBeat();
         self.growRingIfDue();
     }
 
@@ -1169,6 +1176,7 @@ pub const JoinedSet = struct {
     /// `Readmit.beat`. An unregistered current member then re-registers
     /// through the rule once already-submitted writes have completions.
     fn censusBeat(self: *JoinedSet) void {
+        self.resolution.noteTick();
         if (self.left.load(.acquire) or self.membershipHoldActive()) return;
         const pages = devicePages(self.be.gpa, self.be) catch return;
         defer self.be.gpa.free(pages);
@@ -1182,21 +1190,58 @@ pub const JoinedSet = struct {
             .term = r.page.term,
             .mgr_writer = self.mgr_writer,
         };
+        const currency = self.liveOnEveryJoined(who);
+        if (currency == .dead) {
+            self.readmit.obs.own_page_live = false;
+            self.resolution.terminate();
+            if (self.left.load(.acquire)) return;
+            _ = self.be.lane.latch.noteFence("the member-fence beat");
+            return;
+        }
+        if (currency == .unreadable) return;
         const report = self.reservationReport();
         const verdict = self.readmit.beat(who, mapped, report);
-        const currency = self.liveOnEveryJoined(who);
-        if (currency == .dead) self.readmit.obs.own_page_live = false;
-        if (self.readmit.obs.host_registered) if (page0Writer(mapped)) |w| {
-            self.mgr_writer = w;
-        };
-        if (verdict == .latch or currency == .dead) {
-            if (currency == .dead) self.resolution.terminate();
+        if (self.readmit.obs.host_registered) {
+            if (page0Writer(mapped)) |w| self.mgr_writer = w;
+            if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
+        }
+        if (verdict == .latch) {
             if (self.left.load(.acquire)) return;
             _ = self.be.lane.latch.noteFence("the member-fence beat");
         }
-        if (currency != .dead and member_fence.wantsRegister(self.readmit.obs, report.readable, self.be.pool.writesOutstanding() == 0, self.readmit.word)) {
+        if (member_fence.wantsRegister(self.readmit.obs, report.readable, self.be.pool.writesOutstanding() == 0, self.readmit.word)) {
             self.successionReregister(who);
         }
+    }
+
+    /// Pre-sleep re-check callback for `self.resolution` (decision 0004
+    /// §4.5.3, §4.5.7): three-valued R-1 across every joined volume, then
+    /// the metadata reservation report.
+    fn recheckResolution(ctx: ?*anyopaque) member_fence.RecheckVerdict {
+        const self: *JoinedSet = @ptrCast(@alignCast(ctx.?));
+        if (self.left.load(.acquire)) return .dead;
+        const r = self.core();
+        const who = member_fence.SelfView{
+            .appender_id = self.appenderId(),
+            .writer_id = r.page.identity.writer_id,
+            .node_token = r.page.identity.node_token,
+            .term = r.page.term,
+            .mgr_writer = self.mgr_writer,
+        };
+        return switch (self.liveOnEveryJoined(who)) {
+            .dead => .dead,
+            .unreadable => .unreadable,
+            .live => blk: {
+                const report = self.reservationReport();
+                if (!report.readable) break :blk .unreadable;
+                if (report.rtype == 0 or (report.rtype == who.meta_rtype and report.host_registered)) {
+                    if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
+                    if (self.readmit.on_cleared) |f| f(self.readmit.on_cleared_ctx);
+                    break :blk .registered;
+                }
+                break :blk .unregistered;
+            },
+        };
     }
 
     /// Register through the stale-sibling rule (C3) after the park has

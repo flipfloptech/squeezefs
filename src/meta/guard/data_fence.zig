@@ -1097,22 +1097,13 @@ pub const DataFence = struct {
     /// through the rule and clears on success. Past the word's own deadline,
     /// the beat stores `terminal`.
     fn resolvePendingWord(self: *DataFence, v: *Volume, now: u64) void {
+        v.resolution.noteTick();
         if (v.resolution.snapshot().state != .pending or v.pending_since_ns == 0) return;
         const c = v.client;
         const f = host_fence.reportFacts(c) catch {
             self.maybeExpirePending(v, now);
             return;
         };
-        if (!f.facts.reserved) {
-            v.lapse_pending = true;
-            self.noteCleared(v);
-            return;
-        }
-        if (f.registered) {
-            v.lapse_pending = false;
-            self.noteCleared(v);
-            return;
-        }
         switch (self.currentStatus()) {
             .dead => {
                 self.noteTerminal(v);
@@ -1124,6 +1115,16 @@ pub const DataFence = struct {
                 return;
             },
             .live => {},
+        }
+        if (!f.facts.reserved) {
+            v.lapse_pending = true;
+            self.noteCleared(v);
+            return;
+        }
+        if (f.registered) {
+            v.lapse_pending = false;
+            self.noteCleared(v);
+            return;
         }
         var fenced = false;
         var settled = true;
@@ -1344,12 +1345,13 @@ pub const DataFence = struct {
     /// re-read stays pending.
     fn recheckAfterPending(self: *DataFence, v: *Volume, c: *pr.Client, gen: member_fence.Gen) nvme_dev.ReadmitAnswer {
         const df = host_fence.reportFacts(c) catch return self.answerHeld(v, gen, "the data namespace's report failed");
-        if (!df.facts.reserved) {
-            v.lapse_pending = true;
-            self.noteCleared(v);
-            return .{ .verdict = .retry, .gen = gen };
-        }
-        if (df.registered) {
+        if (!df.facts.reserved or df.registered) {
+            switch (self.currentStatus()) {
+                .dead => return self.declined(v, gen, "this incarnation's page is not Live under its writer id on every joined metadata volume"),
+                .unreadable => return self.answerHeld(v, gen, "a metadata page read failed"),
+                .live => {},
+            }
+            if (!df.facts.reserved) v.lapse_pending = true;
             self.noteCleared(v);
             return .{ .verdict = .retry, .gen = gen };
         }

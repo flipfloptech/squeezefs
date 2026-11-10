@@ -172,7 +172,10 @@ pub const Readmit = struct {
         if (!self.obs.own_page_live) return .{ .verdict = .latch, .gen = gen };
         const verdict = classify(self.obs).verdict;
         if (verdict == .retry) self.obs.retry_credits -|= 1;
-        if (verdict == .held) if (self.on_held) |f| f(self.on_held_ctx);
+        if (verdict == .held) {
+            if (self.word) |w| _ = w.reopen();
+            if (self.on_held) |f| f(self.on_held_ctx);
+        }
         return .{ .verdict = verdict, .gen = gen };
     }
 
@@ -374,20 +377,140 @@ pub fn writeAfterEio(answer: BarrierAnswer) WriteEio {
 
 pub const Gen = u62;
 
+/// Three-valued R-1 + reservation report verdict for a pre-sleep re-check
+/// (decision 0004 §4.5.3, §4.5.7).
+pub const RecheckVerdict = enum {
+    registered,
+    unregistered,
+    dead,
+    unreadable,
+};
+
+pub const RecheckFn = *const fn (ctx: ?*anyopaque) RecheckVerdict;
+
 pub const Resolution = struct {
     word: std.atomic.Value(u64) = .init(0),
     wake: std.atomic.Value(u32) = .init(0),
     waiters: std.atomic.Value(u32) = .init(0),
+    /// Coalesced pre-sleep re-check cache per `(word, generation)` (decision
+    /// 0004 §4.5.3, §4.5.7): packs `{tag: u3, tick: u29, gen: u32}`.
+    recheck_cache: std.atomic.Value(u64) = .init(0),
+    /// Re-examiner tick counter; advancing it expires `unreadable@(g, tick)`
+    /// negative entries without clearing `registered@g` or `unregistered@g`.
+    tick_epoch: std.atomic.Value(u32) = .init(0),
+    /// Pre-sleep re-checks that coalesced behind an existing or in-flight
+    /// probe for the same generation (`meta_pr_recheck_coalesced`).
+    recheck_coalesced: std.atomic.Value(u64) = .init(0),
+    /// Pre-sleep re-checks that hit a same-tick `unreadable@(g, tick)` entry
+    /// and slept without re-reading (`meta_pr_recheck_negative_hits`).
+    recheck_negative_hits: std.atomic.Value(u64) = .init(0),
+    recheck_fn: ?RecheckFn = null,
+    recheck_ctx: ?*anyopaque = null,
 
     pub const State = enum(u2) { pending, cleared, terminal };
     pub const Snapshot = struct { state: State, gen: Gen };
     pub const Wait = enum { cleared, terminal };
     pub const Resolved = enum { cleared, terminal, timed_out };
 
+    const CacheTag = enum(u3) {
+        empty = 0,
+        in_flight = 1,
+        registered = 2,
+        unregistered = 3,
+        dead = 4,
+        unreadable = 5,
+    };
+
+    const CacheEntry = struct {
+        tag: CacheTag,
+        tick: u29,
+        gen: u32,
+    };
+
     const gen_mask: u64 = (@as(u64, 1) << 62) - 1; // word layout: state in bits 63..62, generation in 61..0
 
     pub fn snapshot(self: *const Resolution) Snapshot {
         return unpack(self.word.load(.acquire));
+    }
+
+    /// Advance the re-examiner tick epoch so any `unreadable@(g, t)` negative
+    /// entry expires at this tick (decision 0004 §4.5.3, §4.5.7).
+    pub fn noteTick(self: *Resolution) void {
+        _ = self.tick_epoch.fetchAdd(1, .release);
+        self.poke();
+    }
+
+    /// Coalesced pre-sleep re-check per `(word, generation)` (decision 0004
+    /// §4.5.3, §4.5.7). Only the first held operation of `(generation, tick)`
+    /// issues `recheck_fn` (report + three-valued R-1 page reads); concurrent
+    /// and subsequent callers at generation `g` coalesce behind it.
+    pub fn recheck(self: *Resolution, captured_gen: Gen) RecheckVerdict {
+        const g32: u32 = @truncate(captured_gen);
+        while (true) {
+            const t29: u29 = @truncate(self.tick_epoch.load(.acquire));
+            const raw = self.recheck_cache.load(.acquire);
+            const entry = unpackCache(raw);
+            if (entry.gen == g32) {
+                switch (entry.tag) {
+                    .empty => {},
+                    .registered => {
+                        _ = self.recheck_coalesced.fetchAdd(1, .monotonic);
+                        _ = self.clear();
+                        return .registered;
+                    },
+                    .dead => {
+                        _ = self.recheck_coalesced.fetchAdd(1, .monotonic);
+                        self.terminate();
+                        return .dead;
+                    },
+                    .unregistered => {
+                        _ = self.recheck_coalesced.fetchAdd(1, .monotonic);
+                        return .unregistered;
+                    },
+                    .unreadable => {
+                        if (entry.tick == t29) {
+                            _ = self.recheck_negative_hits.fetchAdd(1, .monotonic);
+                            _ = self.recheck_coalesced.fetchAdd(1, .monotonic);
+                            return .unreadable;
+                        }
+                    },
+                    .in_flight => {
+                        if (entry.tick == t29) {
+                            const expect = self.wake.load(.acquire);
+                            if (self.recheck_cache.load(.acquire) == raw and @as(u29, @truncate(self.tick_epoch.load(.acquire))) == t29) {
+                                if (builtin.os.tag == .linux) {
+                                    const futex = @import("../../sync/futex.zig");
+                                    futex.wait(&self.wake, expect);
+                                } else {
+                                    std.Thread.yield() catch {};
+                                }
+                            }
+                            continue;
+                        }
+                    },
+                }
+            }
+            const s = self.snapshot();
+            if (s.state == .terminal) return .dead;
+            if (s.gen > captured_gen) return .registered;
+            const probe = self.recheck_fn orelse return .unregistered;
+            const claim_val = packCache(.in_flight, t29, g32);
+            if (self.recheck_cache.cmpxchgWeak(raw, claim_val, .acq_rel, .acquire) != null) continue;
+            const verdict = probe(self.recheck_ctx);
+            const result_tag: CacheTag = switch (verdict) {
+                .registered => .registered,
+                .unregistered => .unregistered,
+                .dead => .dead,
+                .unreadable => .unreadable,
+            };
+            self.recheck_cache.store(packCache(result_tag, t29, g32), .release);
+            switch (verdict) {
+                .registered => _ = self.clear(),
+                .dead => self.terminate(),
+                .unregistered, .unreadable => self.poke(),
+            }
+            return verdict;
+        }
     }
 
     /// Publish `cleared` and bump the generation. False when `terminal`
@@ -447,14 +570,41 @@ pub const Resolution = struct {
     /// Wait until `terminal` or a `clear` that advanced `gen` past
     /// `captured_gen` (decision 0004 §4.5: the generation is captured
     /// before classification, so a clear between the verdict and this
-    /// wait is still observed).
+    /// wait is still observed; before its first futex wait, a held caller
+    /// consults the coalesced per-(word, generation) re-check cache).
     pub fn awaitPast(self: *Resolution, captured_gen: Gen) Wait {
         _ = self.waiters.fetchAdd(1, .seq_cst);
         defer _ = self.waiters.fetchSub(1, .seq_cst);
+        var rechecked = false;
         while (true) {
             const s = self.snapshot();
-            if (s.state == .terminal) return .terminal;
-            if (s.gen > captured_gen) return .cleared;
+            if (s.state == .terminal) {
+                if (!rechecked and self.recheck_fn != null) {
+                    const entry = unpackCache(self.recheck_cache.load(.acquire));
+                    if (entry.gen == @as(u32, @truncate(captured_gen)) and entry.tag == .dead) {
+                        _ = self.recheck_coalesced.fetchAdd(1, .monotonic);
+                    }
+                }
+                return .terminal;
+            }
+            if (s.gen > captured_gen) {
+                if (!rechecked and self.recheck_fn != null) {
+                    const entry = unpackCache(self.recheck_cache.load(.acquire));
+                    if (entry.gen == @as(u32, @truncate(captured_gen)) and entry.tag == .registered) {
+                        _ = self.recheck_coalesced.fetchAdd(1, .monotonic);
+                    }
+                }
+                return .cleared;
+            }
+            if (!rechecked) {
+                rechecked = true;
+                switch (self.recheck(captured_gen)) {
+                    .registered => return .cleared,
+                    .dead => return .terminal,
+                    .unregistered, .unreadable => {},
+                }
+                continue;
+            }
             const expect = self.wake.load(.acquire);
             const again = self.snapshot();
             if (again.state == .terminal) return .terminal;
@@ -513,6 +663,18 @@ pub const Resolution = struct {
         return .{
             .state = @fromBackingInt(@intCast(@as(u2, @truncate(w >> 62)))), // top two bits
             .gen = @intCast(w & gen_mask),
+        };
+    }
+
+    fn packCache(tag: CacheTag, tick: u29, gen: u32) u64 {
+        return (@as(u64, @backingInt(tag)) << 61) | (@as(u64, tick) << 32) | @as(u64, gen); // 3-bit tag at bit 61, 29-bit tick at bit 32, 32-bit gen below
+    }
+
+    fn unpackCache(raw: u64) CacheEntry {
+        return .{
+            .tag = @fromBackingInt(@intCast(@as(u3, @truncate(raw >> 61)))), // top three bits
+            .tick = @truncate(raw >> 32), // bits 32..60
+            .gen = @truncate(raw),
         };
     }
 };
@@ -1255,4 +1417,101 @@ test "member fence: a late cleared after terminal refuses the CAS, withdraws a f
     try testing.expectEqual(@as(u64, 1), drain.drain_waits.load(.acquire));
     try testing.expectEqual(Resolution.State.terminal, word.snapshot().state);
     try testing.expectEqual(Resolution.Wait.terminal, word.awaitPast(held_ans.gen));
+}
+
+test "member fence: pre-sleep recheck coalesces per (word, generation), clears on registered, and terminates on positive not-Live (R-1)" {
+    const Probe = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+        verdict: RecheckVerdict = .registered,
+
+        fn run(ctx: ?*anyopaque) RecheckVerdict {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return self.verdict;
+        }
+    };
+
+    // 1. Registered + R-1 Live: first caller probes and clears (gen++), subsequent callers coalesce.
+    var probe: Probe = .{ .verdict = .registered };
+    var w: Resolution = .{ .recheck_fn = &Probe.run, .recheck_ctx = &probe };
+    const g0 = w.snapshot().gen;
+    try testing.expectEqual(Resolution.Wait.cleared, w.awaitPast(g0));
+    try testing.expectEqual(Resolution.State.cleared, w.snapshot().state);
+    try testing.expectEqual(@as(Gen, 1), w.snapshot().gen);
+    try testing.expectEqual(@as(u32, 1), probe.calls.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), w.recheck_coalesced.load(.acquire));
+
+    try testing.expectEqual(Resolution.Wait.cleared, w.awaitPast(g0));
+    try testing.expectEqual(Resolution.Wait.cleared, w.awaitPast(g0));
+    try testing.expectEqual(@as(u32, 1), probe.calls.load(.acquire));
+    try testing.expectEqual(@as(u64, 2), w.recheck_coalesced.load(.acquire));
+
+    // 2. Next succession reopens the word at gen 1; unregistered probe caches `unregistered@1`.
+    var r = Readmit.joiner();
+    r.word = &w;
+    r.obs.host_registered = false;
+    r.obs.successor_page = true;
+    const held = r.answer(.write, .conflict);
+    try testing.expectEqual(Verdict.held, held.verdict);
+    try testing.expectEqual(@as(Gen, 1), held.gen);
+    try testing.expectEqual(Resolution.State.pending, w.snapshot().state);
+
+    probe.verdict = .unregistered;
+    try testing.expectEqual(RecheckVerdict.unregistered, w.recheck(held.gen));
+    try testing.expectEqual(@as(u32, 2), probe.calls.load(.acquire));
+    try testing.expectEqual(RecheckVerdict.unregistered, w.recheck(held.gen));
+    try testing.expectEqual(RecheckVerdict.unregistered, w.recheck(held.gen));
+    try testing.expectEqual(@as(u32, 2), probe.calls.load(.acquire));
+    try testing.expectEqual(@as(u64, 4), w.recheck_coalesced.load(.acquire));
+
+    // 3. Positive not-Live R-1 (`dead`) terminates the word and coalesces subsequent callers.
+    var dead_probe: Probe = .{ .verdict = .dead };
+    var w_dead: Resolution = .{ .recheck_fn = &Probe.run, .recheck_ctx = &dead_probe };
+    const gd = w_dead.snapshot().gen;
+    try testing.expectEqual(Resolution.Wait.terminal, w_dead.awaitPast(gd));
+    try testing.expectEqual(Resolution.State.terminal, w_dead.snapshot().state);
+    try testing.expectEqual(@as(u32, 1), dead_probe.calls.load(.acquire));
+    try testing.expectEqual(Resolution.Wait.terminal, w_dead.awaitPast(gd));
+    try testing.expectEqual(@as(u32, 1), dead_probe.calls.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), w_dead.recheck_coalesced.load(.acquire));
+}
+
+test "member fence: unreadable recheck caches a negative entry for the current tick only and never fail-stops a live member" {
+    const Probe = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+        verdict: RecheckVerdict = .unreadable,
+
+        fn run(ctx: ?*anyopaque) RecheckVerdict {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return self.verdict;
+        }
+    };
+
+    var probe: Probe = .{ .verdict = .unreadable };
+    var w: Resolution = .{ .recheck_fn = &Probe.run, .recheck_ctx = &probe };
+    const g0 = w.snapshot().gen;
+
+    // First call at tick 0 sees unreadable: word stays pending (never terminal).
+    try testing.expectEqual(RecheckVerdict.unreadable, w.recheck(g0));
+    try testing.expectEqual(Resolution.State.pending, w.snapshot().state);
+    try testing.expectEqual(@as(u32, 1), probe.calls.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), w.recheck_negative_hits.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), w.recheck_coalesced.load(.acquire));
+
+    // Same-tick callers hit `unreadable@(g0, tick 0)` and sleep without re-reading.
+    try testing.expectEqual(RecheckVerdict.unreadable, w.recheck(g0));
+    try testing.expectEqual(RecheckVerdict.unreadable, w.recheck(g0));
+    try testing.expectEqual(@as(u32, 1), probe.calls.load(.acquire));
+    try testing.expectEqual(@as(u64, 2), w.recheck_negative_hits.load(.acquire));
+    try testing.expectEqual(@as(u64, 2), w.recheck_coalesced.load(.acquire));
+    try testing.expectEqual(Resolution.State.pending, w.snapshot().state);
+
+    // Next re-examiner tick expires `unreadable@(g0, tick 0)`; re-check re-probes and clears.
+    probe.verdict = .registered;
+    w.noteTick();
+    try testing.expectEqual(Resolution.Wait.cleared, w.awaitPast(g0));
+    try testing.expectEqual(Resolution.State.cleared, w.snapshot().state);
+    try testing.expectEqual(@as(Gen, 1), w.snapshot().gen);
+    try testing.expectEqual(@as(u32, 2), probe.calls.load(.acquire));
 }

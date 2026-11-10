@@ -22,6 +22,7 @@ const builtin = @import("builtin");
 const clock = @import("../../core/clock.zig");
 const nvme = @import("nvme_cmd.zig");
 const pr = @import("pr.zig");
+const nvme_derive = @import("../../io/nvme_derive.zig");
 
 pub const Verdict = enum { retry, latch, held };
 
@@ -327,15 +328,15 @@ pub const Observation = struct {
     sibling_death: bool = false,
 };
 
-pub const BarrierAnswer = enum { registered, unregistered, unknown };
-
-pub const ReadStep = enum { retry_read, reissue_barrier, surface_eio };
+/// The read-EIO barrier classifier is the data plane's, one definition for
+/// both planes (decision 0004 §4.5.3: 5 attempts, and one claim TTL,
+/// whichever first).
+pub const BarrierAnswer = nvme_derive.BarrierAnswer;
+pub const ReadStep = nvme_derive.ReadStep;
+pub const READ_BARRIER_ATTEMPTS = nvme_derive.READ_BARRIER_ATTEMPTS;
+pub const readAfterEio = nvme_derive.readAfterEio;
 
 pub const WriteEio = enum { retry_once, refused, held };
-
-/// Read-EIO barrier attempts before the original EIO surfaces
-/// (decision 0004 §4.5.3: 5 attempts, and one claim TTL, whichever first).
-pub const READ_BARRIER_ATTEMPTS: u32 = 5;
 
 pub fn classify(o: Observation) Classified {
     if (o.manages) return .{ .verdict = .latch, .arm = .manager };
@@ -368,16 +369,6 @@ pub fn classifyForData(o: Observation) DataClass {
         .lapse => if (meta.host_registered) .metadata_settled else .metadata_pending,
         .registered => .metadata_settled,
         .succession, .undecided => .metadata_pending,
-    };
-}
-
-pub fn readAfterEio(answer: BarrierAnswer, unknowns_already: u32, within_claim_ttl: bool) ReadStep {
-    return switch (answer) {
-        .registered, .unregistered => .retry_read,
-        .unknown => if (!within_claim_ttl or unknowns_already >= READ_BARRIER_ATTEMPTS - 1)
-            .surface_eio
-        else
-            .reissue_barrier,
     };
 }
 
@@ -936,15 +927,6 @@ test "member fence: classifyForData prefers a successor over a sibling death, an
     try testing.expectEqual(DataClass.fenced, classifyForData(.{ .meta_rtype = 3, .rtype = 5, .host_registered = false, .successor_page = true }));
     try testing.expectEqual(DataClass.fenced, classifyForData(.{ .rtype = 3, .host_registered = true, .retry_credits = 0 }));
     try testing.expectEqual(DataClass.fenced, classifyForData(.{ .own_page_live = false, .host_registered = false, .successor_page = true }));
-}
-
-test "member fence: read EIO retries after a finished barrier and surfaces at the bound" {
-    try testing.expectEqual(ReadStep.retry_read, readAfterEio(.registered, 0, true));
-    try testing.expectEqual(ReadStep.retry_read, readAfterEio(.unregistered, 0, true));
-    try testing.expectEqual(ReadStep.reissue_barrier, readAfterEio(.unknown, 0, true));
-    try testing.expectEqual(ReadStep.reissue_barrier, readAfterEio(.unknown, READ_BARRIER_ATTEMPTS - 2, true));
-    try testing.expectEqual(ReadStep.surface_eio, readAfterEio(.unknown, READ_BARRIER_ATTEMPTS - 1, true));
-    try testing.expectEqual(ReadStep.surface_eio, readAfterEio(.unknown, 0, false));
 }
 
 test "member fence: write EIO retries once, refuses when unregistered, and holds when unknown" {

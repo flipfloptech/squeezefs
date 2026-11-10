@@ -395,6 +395,9 @@ pub const stats = struct {
     /// pending; decision 0004 §4.5.5). Not a fence, not counted as a
     /// write refusal.
     pub var data_pr_refusals_held: counters.ShardedCounter = .{};
+    /// A data read that hit `EIO`, issued the data `drainBarrier` and
+    /// retried once after it (decision 0004 §4.5.3, §4.5.5, §9).
+    pub var data_pr_read_retries_after_drain: counters.ShardedCounter = .{};
     /// Whole-block pool reuse vs fresh mappings (moved by bounce allocs).
     pub var aligned_pool_hits: counters.ShardedCounter = .{};
     pub var aligned_pool_misses: counters.ShardedCounter = .{};
@@ -452,7 +455,7 @@ fn writeHistJson(w: *std.Io.Writer, name: []const u8, queue: *const counters.Sha
 /// Process-wide families (every device shares them).
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "get_obj", "put_obj", "dev_cell_waits", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "data_pr_write_refusals", "data_pr_refusals_held", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes", "dev_wait_fiber_parks", "dev_wait_raw_parks" }) |name| {
+    inline for (.{ "get_obj", "put_obj", "dev_cell_waits", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "data_pr_write_refusals", "data_pr_refusals_held", "data_pr_read_retries_after_drain", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes", "dev_wait_fiber_parks", "dev_wait_raw_parks" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"device_lock_waiters\":{d},\"dev_ring_dead_held_ops\":{d},\"dev_dma_inflight\":{d},", .{ stats.device_lock_waiters.load(), stats.dev_ring_dead_held_ops.load(), stats.dev_dma_inflight.load() });
@@ -487,9 +490,40 @@ pub const ReadmitAnswer = struct {
     gen: u62 = 0,
 };
 
+/// A data drain barrier's answer after a read hit `EIO` (`error.InputOutput`)
+/// during a preempt-and-abort drain (decision 0004 §4.5.3, §4.5.5).
+pub const BarrierAnswer = enum { registered, unregistered, unknown };
+
+/// What a data read does after a `drainBarrier` completes following an `EIO`
+/// (decision 0004 §4.5.3, §4.5.5).
+pub const ReadStep = enum { retry_read, reissue_barrier, surface_eio };
+
+/// Read-EIO barrier attempts before the original EIO surfaces
+/// (decision 0004 §4.5.3, §4.5.5: 5 attempts, and one claim TTL = 45 s, whichever first).
+pub const READ_BARRIER_ATTEMPTS: u32 = 5; // decision 0004 §4.5.3: at most 5 drain-barrier attempts
+pub const READ_BARRIER_BASE_MS: u64 = 10; // decision 0004 §4.5.3: 10 ms initial backoff
+pub const READ_BARRIER_CAP_MS: u64 = 1000; // decision 0004 §4.5.3: 1 s backoff cap
+pub const READ_BARRIER_TTL_NS: u64 = 45 * std.time.ns_per_s; // decision 0004 §4.5.3: one claim TTL (45 s)
+
+/// Pure step classifier for a data read that hit `EIO` and issued a
+/// `drainBarrier` (decision 0004 §4.5.3, §4.5.5): `.registered` or
+/// `.unregistered` means the target's abort drain on the controller is past
+/// and the read retries once; `.unknown` re-issues up to `READ_BARRIER_ATTEMPTS`
+/// (5) and within one claim TTL (45 s), else surfaces the original `EIO`.
+pub fn readAfterEio(answer: BarrierAnswer, unknowns_already: u32, within_claim_ttl: bool) ReadStep {
+    return switch (answer) {
+        .registered, .unregistered => .retry_read,
+        .unknown => if (!within_claim_ttl or unknowns_already >= READ_BARRIER_ATTEMPTS - 1)
+            .surface_eio
+        else
+            .reissue_barrier,
+    };
+}
+
 pub const Readmit = struct {
     ctx: *anyopaque,
     readmit: *const fn (ctx: *anyopaque) ReadmitAnswer,
+    drainBarrier: ?*const fn (ctx: *anyopaque) BarrierAnswer = null,
 };
 
 /// Where a data plane finds each data volume's `Readmit` (null = none: the
@@ -581,6 +615,7 @@ pub const Fence = struct {
 
 pub const Seams = struct {
     fail_next_writes: std.atomic.Value(u32) = .init(0),
+    fail_next_reads: std.atomic.Value(u32) = .init(0),
     /// `.SUCCESS` = classless injected failure (passes through untouched).
     fail_errno: std.atomic.Value(u32) = .init(0),
     stall_reads: std.atomic.Value(u32) = .init(0),
@@ -909,7 +944,7 @@ test "stats JSON names every family the spec lists" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const json = w.buffered();
-    for ([_][]const u8{ "get_obj", "put_obj", "dev_cell_waits", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "data_pr_write_refusals", "data_pr_refusals_held", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes", "dev_wait_fiber_parks", "dev_wait_raw_parks", "device_lock_waiters", "dev_dma_inflight", "read_fill_phase_ns", "write_pipeline_phase_ns", "dev_queue", "dev_service" }) |key| {
+    for ([_][]const u8{ "get_obj", "put_obj", "dev_cell_waits", "nvme_unaligned_write_fallbacks", "dev_fills", "dev_enters", "dev_submit_enters", "dev_wake_batches", "dev_wake_writes", "dev_wakes_elided", "dev_fixed_buf_fills", "data_device_sync_requests", "data_device_syncs", "data_dma_fence_refusals", "data_dma_dismount_refusals", "data_pr_write_refusals", "data_pr_refusals_held", "data_pr_read_retries_after_drain", "aligned_pool_hits", "aligned_pool_misses", "aligned_pool_trimmed_bytes", "dev_wait_fiber_parks", "dev_wait_raw_parks", "device_lock_waiters", "dev_dma_inflight", "read_fill_phase_ns", "write_pipeline_phase_ns", "dev_queue", "dev_service" }) |key| {
         if (std.mem.indexOf(u8, json, key) == null) {
             std.debug.print("missing stats key {s}\n", .{key});
             return error.TestExpectedEqual;
@@ -942,4 +977,20 @@ fn writeCacheFuzz(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: the write-cache sysfs classifier is total on arbitrary text" {
     try fuzzkit.fuzz({}, writeCacheFuzz, .{ .corpus = &.{ fuzzkit.slice("write back\n"), fuzzkit.slice("write through\n") } });
+}
+
+test "readAfterEio: a data read hitting EIO retries after a registered or unregistered drainBarrier and caps unknown at 5 attempts or one claim TTL (decision 0004 §4.5.3)" {
+    try testing.expectEqual(@as(u32, 5), READ_BARRIER_ATTEMPTS);
+    try testing.expectEqual(@as(u64, 10), READ_BARRIER_BASE_MS);
+    try testing.expectEqual(@as(u64, 1000), READ_BARRIER_CAP_MS);
+    try testing.expectEqual(@as(u64, 45 * std.time.ns_per_s), READ_BARRIER_TTL_NS);
+
+    try testing.expectEqual(ReadStep.retry_read, readAfterEio(.registered, 0, true));
+    try testing.expectEqual(ReadStep.retry_read, readAfterEio(.unregistered, 0, true));
+    try testing.expectEqual(ReadStep.retry_read, readAfterEio(.unregistered, 4, false));
+
+    try testing.expectEqual(ReadStep.reissue_barrier, readAfterEio(.unknown, 0, true));
+    try testing.expectEqual(ReadStep.reissue_barrier, readAfterEio(.unknown, 3, true));
+    try testing.expectEqual(ReadStep.surface_eio, readAfterEio(.unknown, 4, true));
+    try testing.expectEqual(ReadStep.surface_eio, readAfterEio(.unknown, 0, false));
 }

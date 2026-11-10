@@ -58,6 +58,7 @@ pub const FenceSignal = nd.FenceSignal;
 pub const Readmit = nd.Readmit;
 pub const ReadmitVerdict = nd.ReadmitVerdict;
 pub const ReadmitAnswer = nd.ReadmitAnswer;
+pub const BarrierAnswer = nd.BarrierAnswer;
 pub const HeldWait = nd.HeldWait;
 pub const ReadmitSource = nd.ReadmitSource;
 pub const CustodyHooks = nd.CustodyHooks;
@@ -1510,6 +1511,37 @@ pub const Device = struct {
         poisonCustody("device reservation conflict on data volume");
     }
 
+    /// A data read that hit `EIO` (`error.InputOutput`) may have raced a
+    /// preempt-and-abort drain on this controller (`NVME_SC_INTERNAL` → `EIO`,
+    /// decision 0004 §4.5.3, §4.5.5, P9b). When a `drainBarrier` is bound on
+    /// `self.fence.readmit`, issue it (re-issuing on `.unknown` up to
+    /// `READ_BARRIER_ATTEMPTS` and one claim TTL) and return `true` when the
+    /// drain is past so the caller retries the read once.
+    fn awaitReadDrainBarrier(self: *Device, err: DeviceError) bool {
+        if (err != error.InputOutput) return false;
+        const r = self.fence.readmit.load(.acquire) orelse return false;
+        const barrierFn = r.drainBarrier orelse return false;
+        const start_ns = clock.monotonicNs();
+        var unknowns: u32 = 0;
+        var delay_ms: u64 = nd.READ_BARRIER_BASE_MS;
+        while (true) {
+            const ans = barrierFn(r.ctx);
+            const within_ttl = (clock.monotonicNs() -| start_ns) < nd.READ_BARRIER_TTL_NS;
+            switch (nd.readAfterEio(ans, unknowns, within_ttl)) {
+                .retry_read => {
+                    stats.data_pr_read_retries_after_drain.inc();
+                    return true;
+                },
+                .surface_eio => return false,
+                .reissue_barrier => {
+                    unknowns += 1;
+                    sleepMs(delay_ms);
+                    delay_ms = @min(delay_ms *| 2, nd.READ_BARRIER_CAP_MS);
+                },
+            }
+        }
+    }
+
     // ---- probes ----
 
     pub fn writeCache(self: *const Device) nd.WriteCacheClass {
@@ -1561,6 +1593,11 @@ pub const Device = struct {
     pub fn setFailNextWritesErrno(self: *Device, n: u32, errno: linux.E) void {
         self.seams.fail_errno.store(@backingInt(errno), .seq_cst);
         self.seams.fail_next_writes.store(n, .seq_cst);
+    }
+
+    pub fn setFailNextReadsErrno(self: *Device, n: u32, errno: linux.E) void {
+        self.seams.fail_errno.store(@backingInt(errno), .seq_cst);
+        self.seams.fail_next_reads.store(n, .seq_cst);
     }
 
     pub fn setTestReadStall(self: *Device, count: u32, ms: u64) void {
@@ -1721,13 +1758,28 @@ pub const Device = struct {
 
     /// The read with its exact-length verdict exposed: the ONE sanctioned
     /// prefix-tolerant consumer (the router's old-image read) needs `got`.
+    /// On `EIO` (`error.InputOutput`), issues the data `drainBarrier` if bound
+    /// and retries the read once (decision 0004 §4.5.3, §4.5.5).
     pub fn readBlockOutcome(self: *Device, offset: u64, size: usize, count_in_get_obj: bool) DeviceError!ReadOutcome {
+        return self.readBlockOutcomeOnce(offset, size, count_in_get_obj) catch |err| {
+            if (self.awaitReadDrainBarrier(err)) return self.readBlockOutcomeOnce(offset, size, count_in_get_obj);
+            return err;
+        };
+    }
+
+    fn readBlockOutcomeOnce(self: *Device, offset: u64, size: usize, count_in_get_obj: bool) DeviceError!ReadOutcome {
         // Zero-length guard: on sqz kernel 7.1.8 a 0-len ReadFixed against
         // the registered slab oopsed (`iov_iter_alignment_bvec` NULL deref
         // via `io_read_fixed` → `btrfs_direct_read`), SIGKILLing the worker
         // thread alone and stranding the lane. Never submit it.
         if (size == 0) return .{ .full = Buf.empty };
         if (size > nd.block_buf_size) return error.ReadSizeExceedsPool;
+        if (takeArmed(&self.seams.fail_next_reads)) {
+            const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(self.seams.fail_errno.load(.seq_cst)))));
+            if (e == .SUCCESS) return error.InputOutput;
+            self.classifyDmaOutcome(e);
+            return nd.errnoToError(e);
+        }
         // Reads are NOT fence-gated: a fenced holder reading its own device
         // corrupts nothing.
         var buf = try acquireReadBuf(size);
@@ -1796,9 +1848,24 @@ pub const Device = struct {
     /// pointer, length and offset (the O_DIRECT grain; refused otherwise).
     /// No bounce, no pool buffer (`Buf.Kind.none`): the caller's slice is
     /// the keep-alive, parked for the whole op. Counted in `get_obj`.
+    /// On `EIO` (`error.InputOutput`), issues the data `drainBarrier` if bound
+    /// and retries the read once (decision 0004 §4.5.3, §4.5.5).
     pub fn readInto(self: *Device, offset: u64, dest: []u8) DeviceError!void {
+        return self.readIntoOnce(offset, dest) catch |err| {
+            if (self.awaitReadDrainBarrier(err)) return self.readIntoOnce(offset, dest);
+            return err;
+        };
+    }
+
+    fn readIntoOnce(self: *Device, offset: u64, dest: []u8) DeviceError!void {
         if (dest.len == 0) return;
         if (!nd.isDmaAligned(dest) or !derive.isAligned(offset, nd.dma_align)) return error.UnalignedDirectWrite;
+        if (takeArmed(&self.seams.fail_next_reads)) {
+            const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(self.seams.fail_errno.load(.seq_cst)))));
+            if (e == .SUCCESS) return error.InputOutput;
+            self.classifyDmaOutcome(e);
+            return nd.errnoToError(e);
+        }
         const lane = self.readLanePick();
         const idx = lane.acquireCell() orelse return error.WorkerShutdown;
         const c = &lane.cells[idx];
@@ -3199,6 +3266,82 @@ test "fence signal: the installed per-volume latch halts the device on first pol
     try testing.expect(dev2.dismounted());
     try testing.expectError(error.DismountRefused, dev2.writeBlock(0, &payload));
     try testing.expectEqual(d0 + 1, stats.data_dma_dismount_refusals.load());
+}
+
+test "read EIO drainBarrier: a data read hitting EIO issues drainBarrier (re-issuing on unknown up to 5 attempts) and retries the read once (decision 0004 §4.5.3, §4.5.5)" {
+    clearCustodyPoisonForTest();
+    defer clearCustodyPoisonForTest();
+    var tf: TestFile = .{};
+    try tf.create(1 * derive.MiB);
+    defer tf.destroy();
+    const dev = try Device.open(testing.allocator, tf.path);
+    defer dev.deinit();
+
+    var payload: [4096]u8 align(4096) = undefined;
+    fillPattern(&payload, 99);
+    try dev.writeBlock(0, &payload);
+
+    const BarrierState = struct {
+        calls: u32 = 0,
+        unknowns_to_return: u32 = 0,
+        final_answer: BarrierAnswer = .unregistered,
+
+        fn readmit(_: *anyopaque) ReadmitAnswer {
+            return .{ .verdict = .decline };
+        }
+
+        fn drainBarrier(ctx: *anyopaque) BarrierAnswer {
+            const st: *@This() = @ptrCast(@alignCast(ctx));
+            st.calls += 1;
+            if (st.unknowns_to_return > 0) {
+                st.unknowns_to_return -= 1;
+                return .unknown;
+            }
+            return st.final_answer;
+        }
+    };
+
+    var st: BarrierState = .{ .unknowns_to_return = 1, .final_answer = .unregistered };
+    const hook: Readmit = .{
+        .ctx = &st,
+        .readmit = BarrierState.readmit,
+        .drainBarrier = BarrierState.drainBarrier,
+    };
+    dev.setReadmit(&hook);
+    const retries0 = stats.data_pr_read_retries_after_drain.load();
+
+    // 1. readBlock hits EIO once; drainBarrier returns .unknown then .unregistered;
+    // the single retry succeeds and reads back the payload.
+    dev.setFailNextReadsErrno(1, .IO);
+    const buf = try dev.readBlock(0, 4096);
+    defer buf.release();
+    try expectPattern(buf.bytes(), 99);
+    try testing.expectEqual(@as(u32, 2), st.calls);
+    try testing.expectEqual(retries0 + 1, stats.data_pr_read_retries_after_drain.load());
+
+    // 2. readInto hits EIO once; drainBarrier returns .registered; retry succeeds.
+    st = .{ .unknowns_to_return = 0, .final_answer = .registered };
+    dev.setFailNextReadsErrno(1, .IO);
+    var dest: [4096]u8 align(4096) = @splat(0);
+    try dev.readInto(0, &dest);
+    try expectPattern(&dest, 99);
+    try testing.expectEqual(@as(u32, 1), st.calls);
+
+    // 3. Only ONE read retry is issued after drainBarrier: if the retry also
+    // hits EIO, the second EIO surfaces immediately.
+    st = .{ .unknowns_to_return = 0, .final_answer = .unregistered };
+    dev.setFailNextReadsErrno(2, .IO);
+    try testing.expectError(error.InputOutput, dev.readBlock(0, 4096));
+    try testing.expectEqual(@as(u32, 1), st.calls);
+
+    // 4. If drainBarrier returns .unknown on all READ_BARRIER_ATTEMPTS (5),
+    // the original EIO surfaces without retrying the read.
+    st = .{ .unknowns_to_return = 10, .final_answer = .unregistered };
+    dev.setFailNextReadsErrno(1, .IO);
+    try testing.expectError(error.InputOutput, dev.readBlock(0, 4096));
+    try testing.expectEqual(nd.READ_BARRIER_ATTEMPTS, st.calls);
+    // Cases 1–3 retried after a drain; case 4 surfaced without a retry.
+    try testing.expectEqual(retries0 + 3, stats.data_pr_read_retries_after_drain.load());
 }
 
 test "thread names: lanes are numbered process-wide as sqz-nvme<N>; the write phase histograms moved" {

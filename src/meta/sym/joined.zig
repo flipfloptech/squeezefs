@@ -401,6 +401,8 @@ pub const JoinedSet = struct {
     park_gate: park.ParkGate,
     readmit: member_fence.Readmit = .{},
     resolution: member_fence.Resolution = .{},
+    withdraw_drain: member_fence.WithdrawDrain = .{},
+    withdraw_timeout_ns: u64 = member_fence.T_WITHDRAW_NS,
     /// Appender 0's writer at the last registration. A different Live
     /// writer is a successor.
     mgr_writer: u64 = 0,
@@ -1188,6 +1190,7 @@ pub const JoinedSet = struct {
             self.mgr_writer = w;
         };
         if (verdict == .latch or currency == .dead) {
+            if (currency == .dead) self.resolution.terminate();
             if (self.left.load(.acquire)) return;
             _ = self.be.lane.latch.noteFence("the member-fence beat");
         }
@@ -1216,34 +1219,58 @@ pub const JoinedSet = struct {
             .vol_index = self.be.index,
             .taking_manager = false,
         };
-        const outcome = runSuccessionRegister(ctx, &f.reg, f.client, .{ .ctx = self.be, .read = &devicePagesFn }, who, self.readmit.seen, self.readmit.word, host_fence.joinRegister(self.be.env));
-        if (outcome == .fresh or outcome == .adopted) {
-            switch (self.liveOnEveryJoined(who)) {
-                .dead => {
-                    if (outcome == .fresh) {
-                        f.client.unregister(f.client.key) catch {};
+        const outcome = runSuccessionRegister(
+            ctx,
+            &f.reg,
+            f.client,
+            .{ .ctx = self.be, .read = &devicePagesFn },
+            who,
+            self.readmit.seen,
+            self.readmit.word,
+            &self.withdraw_drain,
+            self.withdraw_timeout_ns,
+            host_fence.joinRegister(self.be.env),
+        );
+        switch (outcome) {
+            .refused => return,
+            .withdrawn => {
+                self.readmit.obs.host_registered = false;
+                self.resolution.terminate();
+                if (self.left.load(.acquire)) return;
+                _ = self.be.lane.latch.noteFence("the member-fence beat");
+            },
+            .fresh, .adopted => {
+                const currency = self.liveOnEveryJoined(who);
+                if (currency == .unreadable) return;
+                const pages = if (currency == .live) (devicePages(self.be.gpa, self.be) catch return) else &[_]page.Page{};
+                defer if (currency == .live) self.be.gpa.free(pages);
+                var views: [64]member_fence.PageView = undefined;
+                const mapped = fillPageViews(pages, &views);
+                const report = if (currency == .live) self.reservationReport() else member_fence.ReportView{};
+                const verdict = self.readmit.finishReregister(
+                    who,
+                    mapped,
+                    currency,
+                    report,
+                    f.client,
+                    &self.withdraw_drain,
+                    self.withdraw_timeout_ns,
+                    outcome == .fresh,
+                );
+                if (verdict == .latch) {
+                    if (currency == .dead and outcome == .fresh) {
                         log.warn("meta volume {s}: succession re-registration withdrawn — this incarnation's page is not Live on every joined volume (C2)", .{self.be.path});
                     }
-                },
-                .unreadable => {},
-                .live => {
-                    const pages = devicePages(self.be.gpa, self.be) catch return;
-                    defer self.be.gpa.free(pages);
-                    var views: [64]member_fence.PageView = undefined;
-                    const mapped = fillPageViews(pages, &views);
-                    const report = self.reservationReport();
-                    const verdict = self.readmit.beat(who, mapped, report);
-                    if (self.readmit.obs.host_registered) {
-                        if (page0Writer(mapped)) |w| self.mgr_writer = w;
-                        if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
-                        log.warn("meta volume {s}: re-registered this host under key {x:0>16} after a succession", .{ self.be.path, f.client.key });
-                    }
-                    if (verdict == .latch) {
-                        if (self.left.load(.acquire)) return;
-                        _ = self.be.lane.latch.noteFence("the member-fence beat");
-                    }
-                },
-            }
+                    if (self.left.load(.acquire)) return;
+                    _ = self.be.lane.latch.noteFence("the member-fence beat");
+                    return;
+                }
+                if (self.readmit.obs.host_registered) {
+                    if (page0Writer(mapped)) |w| self.mgr_writer = w;
+                    if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
+                    log.warn("meta volume {s}: re-registered this host under key {x:0>16} after a succession", .{ self.be.path, f.client.key });
+                }
+            },
         }
     }
 
@@ -1274,6 +1301,8 @@ pub const JoinedSet = struct {
         who: member_fence.SelfView,
         seen: member_fence.Seen,
         word: ?*member_fence.Resolution,
+        drain: *member_fence.WithdrawDrain,
+        timeout_ns: u64,
         register: host_fence.Register,
     ) RegisterOutcome {
         const fresh = host_fence.registerUnderRule(ctx, reg, client, pages, register) catch |e| {
@@ -1287,11 +1316,18 @@ pub const JoinedSet = struct {
         defer ctx.gpa.free(raw);
         var views: [64]member_fence.PageView = undefined;
         const facts = member_fence.pageFacts(who, fillPageViews(raw, &views), seen);
+        if (!facts.own_page_live) {
+            if (word) |w| w.terminate();
+        }
         if (member_fence.shouldWithdraw(facts.own_page_live, word, fresh)) {
-            client.unregister(client.key) catch {};
-            log.warn("meta volume {s}: succession re-registration withdrawn — this incarnation's page is not Live", .{ctx.path});
+            if (member_fence.withdrawRegistration(client, drain, timeout_ns, fresh) == .drained) {
+                log.warn("meta volume {s}: succession re-registration withdrawn — this incarnation's page is not Live", .{ctx.path});
+            } else {
+                log.warn("meta volume {s}: succession re-registration drain timed out — leaving registration standing for target fence (DC22)", .{ctx.path});
+            }
             return .withdrawn;
         }
+        if (!facts.own_page_live) return .withdrawn;
         return if (fresh) .fresh else .adopted;
     }
 
@@ -2026,7 +2062,11 @@ test "member fence: a succession re-registers a current joiner and withdraws if 
     defer reg.unlock();
     const ctx: host_fence.RuleContext = .{ .gpa = gpa, .env = &env, .path = "fake-meta", .local = proc.localIdentity(), .node_token = who.node_token, .vol_index = 0, .taking_manager = false };
     var word: member_fence.Resolution = .{};
-    JoinedSet.runSuccessionRegister(ctx, &reg, &j, src.source(), who, .{}, &word, host_fence.joinRegister(&env));
+    var drain: member_fence.WithdrawDrain = .{};
+    try testing.expectEqual(
+        JoinedSet.RegisterOutcome.fresh,
+        JoinedSet.runSuccessionRegister(ctx, &reg, &j, src.source(), who, .{}, &word, &drain, member_fence.T_WITHDRAW_NS, host_fence.joinRegister(&env)),
+    );
     try testing.expect(try host_fence.hostRegistered(&j));
 
     try m.preempt(j.key);
@@ -2035,8 +2075,25 @@ test "member fence: a succession re-registers a current joiner and withdraws if 
     dead_pages[1].state = .recovering;
     src = .{ .live = &live_pages, .dead = &dead_pages, .flip_after = 2 };
     var word2: member_fence.Resolution = .{};
-    JoinedSet.runSuccessionRegister(ctx, &reg, &j, src.source(), who, .{}, &word2, host_fence.joinRegister(&env));
+    try testing.expectEqual(
+        JoinedSet.RegisterOutcome.withdrawn,
+        JoinedSet.runSuccessionRegister(ctx, &reg, &j, src.source(), who, .{}, &word2, &drain, member_fence.T_WITHDRAW_NS, host_fence.joinRegister(&env)),
+    );
     try testing.expect(!try host_fence.hostRegistered(&j));
+    try testing.expectEqual(member_fence.Resolution.State.terminal, word2.snapshot().state);
+
+    // DC22: when an in-flight command does not drain before the bound, do not unregister.
+    src = .{ .live = &live_pages, .dead = &dead_pages, .flip_after = 2 };
+    var word3: member_fence.Resolution = .{};
+    drain.noteSubmitted();
+    try testing.expectEqual(
+        JoinedSet.RegisterOutcome.withdrawn,
+        JoinedSet.runSuccessionRegister(ctx, &reg, &j, src.source(), who, .{}, &word3, &drain, 1, host_fence.joinRegister(&env)),
+    );
+    try testing.expect(try host_fence.hostRegistered(&j));
+    try testing.expectEqual(member_fence.Resolution.State.terminal, word3.snapshot().state);
+    try testing.expectEqual(@as(u64, 1), drain.timeouts.load(.acquire));
+    drain.noteCompleted();
 }
 
 fn succLivePage(aid: u32, node: u64, wid: u64) page.Page {

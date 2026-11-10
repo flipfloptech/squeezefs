@@ -174,6 +174,8 @@ pub const MetaReadmit = struct {
     ctx: *anyopaque,
     vol: u16 = 0,
     afterError: *const fn (ctx: *anyopaque, vol: u16, op: ReadmitOp, class: ReadmitClass) ReadmitAnswer,
+    noteSubmitted: ?*const fn (ctx: *anyopaque) void = null,
+    noteCompleted: ?*const fn (ctx: *anyopaque) void = null,
 };
 pub const classOf = errors.classOf;
 pub const fromErrno = errors.fromErrno;
@@ -374,11 +376,19 @@ fn isPositionalWrite(req: Request) bool {
     };
 }
 
+fn reqPath(req: Request) []const u8 {
+    return switch (req) {
+        inline else => |r| r.path,
+    };
+}
+
 /// One preallocated request cell: the request, and the ONE completion the
 /// caller parks on (`sync/completion.zig`). The queue carries its index.
 const Cell = struct {
     req: Request = .{ .fdatasync = .{ .path = &.{}, .direct = false } },
     done: completion.Completion(Outcome) = .{},
+    on_complete_ctx: ?*anyopaque = null,
+    on_complete: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 /// Release what a request that never reached a reactor still owns (queue
@@ -1158,6 +1168,8 @@ pub const Pool = struct {
         const c = &self.cells[idx];
         c.req = req;
         c.done.reset();
+        c.on_complete_ctx = null;
+        c.on_complete = null;
         return idx;
     }
 
@@ -1175,8 +1187,14 @@ pub const Pool = struct {
     /// handle, release what the outcome still owns and free the cell here.
     fn completeCell(self: *Pool, idx: u32, outcome: Outcome) void {
         const write = isPositionalWrite(self.cells[idx].req);
-        const waiting = self.cells[idx].done.complete(outcome);
         if (write) _ = self.writes_outstanding.fetchSub(1, .acq_rel);
+        if (self.cells[idx].on_complete) |done_fn| {
+            const ctx = self.cells[idx].on_complete_ctx.?;
+            self.cells[idx].on_complete = null;
+            self.cells[idx].on_complete_ctx = null;
+            done_fn(ctx);
+        }
+        const waiting = self.cells[idx].done.complete(outcome);
         if (waiting) return;
         switch (outcome) {
             .read => |r| if (r) |res| {
@@ -1193,7 +1211,23 @@ pub const Pool = struct {
     /// caller's resources inside `req` can be freed by the caller.
     fn send(self: *Pool, req: Request) Error!u32 {
         const idx = try self.acquireCell(req);
+        const write = isPositionalWrite(req);
+        if (write) _ = self.writes_outstanding.fetchAdd(1, .acq_rel);
+        if (lookupMetaReadmit(reqPath(req))) |hook| {
+            if (hook.noteSubmitted) |sub| {
+                sub(hook.ctx);
+                self.cells[idx].on_complete_ctx = hook.ctx;
+                self.cells[idx].on_complete = hook.noteCompleted;
+            }
+        }
         self.queue.trySend(idx) catch |e| {
+            if (write) _ = self.writes_outstanding.fetchSub(1, .acq_rel);
+            if (self.cells[idx].on_complete) |done_fn| {
+                const ctx = self.cells[idx].on_complete_ctx.?;
+                self.cells[idx].on_complete = null;
+                self.cells[idx].on_complete_ctx = null;
+                done_fn(ctx);
+            }
             self.freeCell(idx);
             return switch (e) {
                 error.Full => blk: {
@@ -1203,7 +1237,6 @@ pub const Pool = struct {
                 error.Closed => error.WorkerClosed,
             };
         };
-        if (isPositionalWrite(req)) _ = self.writes_outstanding.fetchAdd(1, .acq_rel);
         return idx;
     }
 
@@ -1642,6 +1675,7 @@ pub fn clearMetaDevices() void {
 /// for any reason, or a regular file failing with any other errno, REFUSES.
 var readmit_mu: FutexMutex = .{};
 var readmit_map: std.StringHashMapUnmanaged(MetaReadmit) = .empty;
+var readmit_bound: std.atomic.Value(u32) = .init(0);
 
 /// Bind a completion hook for a registered PR-fenced metadata path.
 pub fn bindMetaReadmit(path: []const u8, hook: MetaReadmit) error{OutOfMemory}!void {
@@ -1652,15 +1686,21 @@ pub fn bindMetaReadmit(path: []const u8, hook: MetaReadmit) error{OutOfMemory}!v
         return;
     }
     try readmit_map.put(registry_gpa, try registry_gpa.dupe(u8, path), hook);
+    // Release pairs with `lookupMetaReadmit`'s acquire fast-path check.
+    _ = readmit_bound.fetchAdd(1, .release);
 }
 
 pub fn unbindMetaReadmit(path: []const u8) void {
     readmit_mu.lock();
     defer readmit_mu.unlock();
-    if (readmit_map.fetchRemove(path)) |kv| registry_gpa.free(kv.key);
+    if (readmit_map.fetchRemove(path)) |kv| {
+        _ = readmit_bound.fetchSub(1, .release);
+        registry_gpa.free(kv.key);
+    }
 }
 
 fn lookupMetaReadmit(path: []const u8) ?MetaReadmit {
+    if (readmit_bound.load(.acquire) == 0) return null;
     readmit_mu.lock();
     defer readmit_mu.unlock();
     return readmit_map.get(path);

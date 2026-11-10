@@ -1184,11 +1184,13 @@ pub const KvBackend = struct {
         be.joined = js;
         be.dev.readmit = joinedReadmit;
         be.dev.readmit_ctx = be;
+        be.dev.withdraw_drain = &js.withdraw_drain;
         be.dev.bindPoolReadmit();
         errdefer {
             js.deinit();
             be.joined = null;
             be.dev.unbindPoolReadmit();
+            be.dev.withdraw_drain = null;
             be.dev.readmit = null;
             be.dev.readmit_ctx = null;
         }
@@ -1220,7 +1222,7 @@ pub const KvBackend = struct {
             .core = &be.core,
             .registry = &be.reg,
             .ring_stats = &be.ring_stats,
-            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook, .barrier_started = laneBarrierStartedHook, .barrier_landed = laneBarrierLandedHook, .cover_upto = laneCoverHook, .readmit = joinedReadmit, .word = &js.resolution },
+            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook, .barrier_started = laneBarrierStartedHook, .barrier_landed = laneBarrierLandedHook, .cover_upto = laneCoverHook, .readmit = joinedReadmit, .word = &js.resolution, .withdraw_drain = &js.withdraw_drain },
             .test_error_logs = opts.test_error_logs,
         }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -3432,7 +3434,6 @@ pub const KvBackend = struct {
     /// retired incarnation and a second close answer true — they owe no
     /// durability point).
     pub fn closeJudged(be: *KvBackend) bool {
-        be.dev.unbindPoolReadmit();
         const gpa = be.gpa;
         var clean = true;
         if (be.posture == .reader) {
@@ -3552,6 +3553,8 @@ pub const KvBackend = struct {
             be.sym = null;
         }
         if (be.joined) |js| {
+            be.dev.unbindPoolReadmit();
+            be.dev.withdraw_drain = null;
             js.deinit();
             be.joined = null;
         }

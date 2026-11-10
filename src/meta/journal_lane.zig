@@ -472,6 +472,8 @@ pub const Hooks = struct {
     /// The member-fence resolution word a held write waits on. Null: a
     /// `.held` answer returns `error.Held` without waiting (today's tests).
     word: ?*journal_guard.member_fence.Resolution = null,
+    /// DC22 in-flight command tracker for a joined volume (`member_fence.WithdrawDrain`).
+    withdraw_drain: ?*journal_guard.member_fence.WithdrawDrain = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -1200,6 +1202,7 @@ pub const JournalLane = struct {
             if (w.barrier_in_flight != null and !w.barrier_landed) {
                 w.barrier_landed = true;
                 w.barrier_outcome = if (cqe.res < 0) cqeError(cqe.res) else {};
+                if (self.hooks.withdraw_drain) |d| d.noteCompleted();
             } else stats.cqe_orphan.fire("a barrier CQE with no barrier in flight");
             self.wakeFiber();
             return;
@@ -1304,6 +1307,7 @@ pub const JournalLane = struct {
             }
             c.runs_in_flight += 1;
             w.runs_in_flight += 1;
+            if (self.hooks.withdraw_drain) |d| d.noteSubmitted();
         }
         if (c.runs_in_flight == 0) self.markLanded(c, clock.monotonicNs());
     }
@@ -1372,6 +1376,7 @@ pub const JournalLane = struct {
         result catch |e| noteRunError(c, e);
         c.runs_in_flight -= 1;
         w.runs_in_flight -= 1;
+        if (self.hooks.withdraw_drain) |d| d.noteCompleted();
         if (c.runs_in_flight == 0) self.markLanded(c, now);
     }
 
@@ -1405,11 +1410,13 @@ pub const JournalLane = struct {
             noteRunError(c, err);
             c.runs_in_flight -= 1;
             w.runs_in_flight -= 1;
+            if (self.hooks.withdraw_drain) |d| d.noteCompleted();
             if (c.runs_in_flight == 0) self.markLanded(c, now);
         }
         if (w.barrier_in_flight != null and !w.barrier_landed) {
             w.barrier_landed = true;
             w.barrier_outcome = err;
+            if (self.hooks.withdraw_drain) |d| d.noteCompleted();
         }
     }
 
@@ -1918,7 +1925,11 @@ pub const JournalLane = struct {
             _ = test_seams.fail_barriers.fetchSub(1, .acq_rel);
             return self.barrierDone(injectedError(), clock.monotonicNs());
         }
-        if (self.lane.ring.prepFdatasync(self.sqeFd(), self.fixed_file, ud_barrier) == null) self.barrierDone(error.SubmissionQueueOverflow, clock.monotonicNs());
+        if (self.lane.ring.prepFdatasync(self.sqeFd(), self.fixed_file, ud_barrier) == null) {
+            self.barrierDone(error.SubmissionQueueOverflow, clock.monotonicNs());
+        } else if (self.hooks.withdraw_drain) |d| {
+            d.noteSubmitted();
+        }
     }
 
     /// The barrier's outcome: the latch's barrier class, DUR-3 coverage (so

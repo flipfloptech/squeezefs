@@ -203,6 +203,7 @@ pub const DeviceLoader = struct {
     /// slice honours.
     readmit: ?member_fence.Hook = null,
     readmit_ctx: ?*anyopaque = null,
+    withdraw_drain: ?*member_fence.WithdrawDrain = null,
     reads: ReadEpisode = .{},
 
     pub fn loader(self: *DeviceLoader) node_cache.NodeLoader {
@@ -211,12 +212,27 @@ pub const DeviceLoader = struct {
 
     /// Install this loader's member-fence hook on the pool waiter for `path`.
     pub fn bindPoolReadmit(self: *DeviceLoader) void {
-        if (self.readmit == null) return;
-        uring_fs.bindMetaReadmit(self.path, .{ .ctx = self, .afterError = &poolAfterError }) catch {};
+        if (self.readmit == null and self.withdraw_drain == null) return;
+        uring_fs.bindMetaReadmit(self.path, .{
+            .ctx = self,
+            .afterError = &poolAfterError,
+            .noteSubmitted = if (self.withdraw_drain != null) &poolNoteSubmitted else null,
+            .noteCompleted = if (self.withdraw_drain != null) &poolNoteCompleted else null,
+        }) catch {};
     }
 
     pub fn unbindPoolReadmit(self: *const DeviceLoader) void {
         uring_fs.unbindMetaReadmit(self.path);
+    }
+
+    fn poolNoteSubmitted(ctx: *anyopaque) void {
+        const self: *DeviceLoader = @ptrCast(@alignCast(ctx));
+        if (self.withdraw_drain) |d| d.noteSubmitted();
+    }
+
+    fn poolNoteCompleted(ctx: *anyopaque) void {
+        const self: *DeviceLoader = @ptrCast(@alignCast(ctx));
+        if (self.withdraw_drain) |d| d.noteCompleted();
     }
 
     fn poolAfterError(ctx: *anyopaque, vol: u16, op: uring_fs.ReadmitOp, class: uring_fs.ReadmitClass) uring_fs.ReadmitAnswer {
@@ -529,6 +545,29 @@ test "member fence: a held reservation conflict on the loader barrier does not l
     try testing.expect(!latch.isFailed());
     try testing.expectEqual(journal.FailureLatch.Verdict.healthy, latch.verdict());
     try testing.expectEqual(@as(u32, 0), latch.barrier_failures.load(.acquire));
+}
+
+test "member fence: pool readmit tracks in-flight commands on WithdrawDrain and drains to zero on completion" {
+    const gpa = testing.allocator;
+    const d = try TestDevice.create(gpa, "withdraw-drain-loader", 1 << 20);
+    defer d.destroy();
+    var drain: member_fence.WithdrawDrain = .{};
+    d.dev.readmit = holdConflict;
+    d.dev.withdraw_drain = &drain;
+    d.dev.bindPoolReadmit();
+    defer d.dev.unbindPoolReadmit();
+
+    var slot: [ledger.ROOT_LEDGER_SLOT_LEN]u8 = @splat(0x33);
+    const ls = d.dev.ledgerSink();
+    try ls.writeSlot(ls.ctx, 0, &slot);
+    try testing.expectEqual(@as(u32, 0), drain.inFlight());
+    const got = try d.dev.readRange(gpa, journal.ROOT_LEDGER_START, 4096);
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u8, &slot, got);
+    try testing.expectEqual(@as(u32, 0), drain.inFlight());
+    try d.dev.barrier();
+    try testing.expectEqual(@as(u32, 0), drain.inFlight());
+    try testing.expectEqual(member_fence.WithdrawDrain.Outcome.drained, drain.awaitZero(member_fence.T_WITHDRAW_NS));
 }
 
 test "the loader round-trips a node image and an appended bset through O_DIRECT; a misaligned product write is REFUSED and counted; the sinks land at their bases; the volume length is the file's" {

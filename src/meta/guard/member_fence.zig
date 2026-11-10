@@ -21,6 +21,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const clock = @import("../../core/clock.zig");
 const nvme = @import("nvme_cmd.zig");
+const pr = @import("pr.zig");
 
 pub const Verdict = enum { retry, latch, held };
 
@@ -154,6 +155,11 @@ pub const Readmit = struct {
     /// A metadata `cleared` kicks the data-fence beat (decision 0004 §4.5.5).
     on_cleared: ?*const fn (ctx: ?*anyopaque) void = null,
     on_cleared_ctx: ?*anyopaque = null,
+    /// Re-registration beats whose `clear` CAS failed because `word` was
+    /// already `terminal` (`meta_pr_late_cleared_refused`, §4.5.3).
+    late_cleared_refused: u64 = 0,
+    /// Set once a readable report observes this host unregistered (D2).
+    unregistered_seen: bool = false,
 
     pub fn joiner() Readmit {
         return .{};
@@ -188,16 +194,30 @@ pub const Readmit = struct {
         if (report.readable) {
             self.obs.rtype = report.rtype;
             self.obs.host_registered = report.host_registered;
-            if (report.host_registered) noteRecovering(&self.seen, who, pages);
+            if (report.host_registered) {
+                if (self.unregistered_seen) {
+                    self.unregistered_seen = false;
+                    self.obs.retry_credits +|= 1;
+                }
+                noteRecovering(&self.seen, who, pages);
+            } else {
+                self.unregistered_seen = true;
+            }
         }
         const verdict = classify(self.obs).verdict;
-        const fence = verdict == .latch and (report.readable or !facts.own_page_live or facts.sibling_death or facts.successor_page);
+        var fence = verdict == .latch and (report.readable or !facts.own_page_live or facts.sibling_death or facts.successor_page);
         const park = verdict == .held and (report.readable or facts.successor_page);
         if (self.word) |w| {
             if (fence) w.terminate();
             if (park) _ = w.reopen();
             if (verdict == .retry and report.readable and report.host_registered and facts.own_page_live) {
-                if (w.clear()) if (self.on_cleared) |f| f(self.on_cleared_ctx);
+                if (w.clear()) {
+                    if (self.on_cleared) |f| f(self.on_cleared_ctx);
+                } else {
+                    self.late_cleared_refused += 1;
+                    self.obs.host_registered = false;
+                    fence = true;
+                }
             }
         }
         if (park) if (self.on_held) |f| f(self.on_held_ctx);
@@ -205,6 +225,44 @@ pub const Readmit = struct {
         if (park) return .held;
         if (report.readable and verdict == .retry) return .retry;
         return .retry;
+    }
+
+    /// Complete a succession re-registration beat after `registerUnderRule`
+    /// (decision 0004 §4.5.3, §4.5.4, DC22). If this incarnation failed C2
+    /// (`currency == .dead` or `!own_page_live`) or `clear` is refused because
+    /// `word` is already `terminal`, a fresh registration is withdrawn after
+    /// draining in-flight commands up to `timeout_ns` (leaving the key
+    /// standing on timeout so C4/death fencing drains it at the target) and
+    /// `.latch` is returned.
+    pub fn finishReregister(
+        self: *Readmit,
+        who: SelfView,
+        pages: []const PageView,
+        currency: Currency,
+        report: ReportView,
+        client: *pr.Client,
+        drain: *WithdrawDrain,
+        timeout_ns: u64,
+        fresh: bool,
+    ) Verdict {
+        if (currency == .dead) {
+            self.obs.own_page_live = false;
+            self.obs.host_registered = false;
+            if (self.word) |w| w.terminate();
+            _ = withdrawRegistration(client, drain, timeout_ns, fresh);
+            return .latch;
+        }
+        if (currency == .unreadable) return .held;
+        const verdict = self.beat(who, pages, report);
+        if (verdict == .latch or shouldWithdraw(self.obs.own_page_live, self.word, fresh)) {
+            if (self.word) |w| w.terminate();
+            if (!self.obs.own_page_live or (self.word != null and self.word.?.snapshot().state == .terminal)) {
+                _ = withdrawRegistration(client, drain, timeout_ns, fresh);
+                self.obs.host_registered = false;
+            }
+            return .latch;
+        }
+        return verdict;
     }
 };
 
@@ -500,6 +558,102 @@ pub fn shouldWithdraw(own_page_live: bool, word: ?*const Resolution, fresh: bool
     if (!own_page_live) return true;
     if (word) |w| return w.snapshot().state == .terminal;
     return false;
+}
+
+/// DC22 (decision 0004 §4.5.4). Bound on draining in-flight commands on `v`
+/// before withdrawing a fresh registration: 10 s.
+pub const WITHDRAW_DRAIN_MS: u64 = 10_000;
+pub const T_WITHDRAW_NS: u64 = WITHDRAW_DRAIN_MS * std.time.ns_per_ms;
+
+/// DC22 (decision 0004 §4.5.4, §7.6). Per-(process, volume) in-flight command
+/// counter with a futex wake on 0. A withdrawal waits up to `T_withdraw` for
+/// the count to reach 0 before issuing `unregister`; on timeout it leaves the
+/// fresh registration standing so a later C4 re-fence or death fence sees the
+/// key and drains any wedged command at the target.
+pub const WithdrawDrain = struct {
+    /// Commands currently in flight on the volume. Release on decrement pairs
+    /// with acquire in `awaitZero`.
+    inflight: std.atomic.Value(u32) = .init(0),
+    /// Futex wake epoch bumped (release) whenever `inflight` transitions to 0,
+    /// paired with acquire in `awaitZero`.
+    wake: std.atomic.Value(u32) = .init(0),
+    /// Withdrawals that waited because `inflight` was non-zero on entry
+    /// (`member_withdraw_drain_waits`).
+    drain_waits: std.atomic.Value(u64) = .init(0),
+    /// Withdrawals whose drain timed out and left the fresh registration
+    /// standing (`member_withdraw_timeouts`).
+    timeouts: std.atomic.Value(u64) = .init(0),
+
+    pub const Outcome = enum { drained, timed_out };
+
+    pub fn noteSubmitted(self: *WithdrawDrain) void {
+        // Release/acquire orders submission before a concurrent drain check.
+        _ = self.inflight.fetchAdd(1, .acq_rel);
+    }
+
+    pub fn noteCompleted(self: *WithdrawDrain) void {
+        // Release pairs with `awaitZero`'s acquire load: every completion
+        // precedes the 0 observation.
+        const prev = self.inflight.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+        if (prev == 1) {
+            _ = self.wake.fetchAdd(1, .release);
+            if (builtin.os.tag == .linux) {
+                const futex = @import("../../sync/futex.zig");
+                futex.wakeAll(&self.wake);
+            }
+        }
+    }
+
+    pub fn inFlight(self: *const WithdrawDrain) u32 {
+        return self.inflight.load(.acquire);
+    }
+
+    pub fn awaitZero(self: *WithdrawDrain, timeout_ns: u64) Outcome {
+        if (self.inflight.load(.acquire) == 0) return .drained;
+        _ = self.drain_waits.fetchAdd(1, .monotonic);
+        const start = clock.monotonicNs();
+        while (true) {
+            if (self.inflight.load(.acquire) == 0) return .drained;
+            const expect = self.wake.load(.acquire);
+            if (self.inflight.load(.acquire) == 0) return .drained;
+            const left = timeout_ns -| (clock.monotonicNs() - start);
+            if (left == 0) {
+                _ = self.timeouts.fetchAdd(1, .monotonic);
+                return .timed_out;
+            }
+            if (builtin.os.tag == .linux) {
+                const futex = @import("../../sync/futex.zig");
+                if (futex.waitTimeout(&self.wake, expect, left) == .timed_out) {
+                    if (self.inflight.load(.acquire) == 0) return .drained;
+                    _ = self.timeouts.fetchAdd(1, .monotonic);
+                    return .timed_out;
+                }
+            } else {
+                std.Thread.yield() catch {};
+            }
+        }
+    }
+};
+
+/// DC22 (decision 0004 §4.5.4). Withdraw a fresh registration on `client`
+/// after draining in-flight commands on `drain` up to `timeout_ns`
+/// (`T_WITHDRAW_NS`). At 0, issues `client.unregister(client.key)`; on
+/// timeout, leaves the fresh registration standing so a subsequent C4
+/// re-fence or death fence sees the key and drains any wedged command at
+/// the target. An adopted registration (`!fresh`) is never unregistered.
+pub fn withdrawRegistration(
+    client: *pr.Client,
+    drain: *WithdrawDrain,
+    timeout_ns: u64,
+    fresh: bool,
+) WithdrawDrain.Outcome {
+    if (!fresh) return .drained;
+    const outcome = drain.awaitZero(timeout_ns);
+    if (outcome == .drained) {
+        client.unregister(client.key) catch {};
+    }
+    return outcome;
 }
 
 /// C2 currency across already-read volume page sets (decision 0004 §4.5.4,
@@ -899,4 +1053,206 @@ test "member fence: a clear between the capture and the wait is still observed" 
     try testing.expectEqual(Resolution.State.cleared, word.snapshot().state);
     try testing.expectEqual(@as(Gen, 1), word.snapshot().gen);
     try testing.expectEqual(Resolution.Wait.cleared, word.awaitPast(a.gen));
+}
+
+test "member fence: WithdrawDrain drains at zero, waits for in-flight completion, and times out when held" {
+    var drain: WithdrawDrain = .{};
+    try testing.expectEqual(@as(u64, 10_000), WITHDRAW_DRAIN_MS);
+    try testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), T_WITHDRAW_NS);
+    try testing.expectEqual(@as(u32, 0), drain.inFlight());
+    try testing.expectEqual(WithdrawDrain.Outcome.drained, drain.awaitZero(T_WITHDRAW_NS));
+    try testing.expectEqual(@as(u64, 0), drain.drain_waits.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), drain.timeouts.load(.acquire));
+
+    drain.noteSubmitted();
+    drain.noteSubmitted();
+    try testing.expectEqual(@as(u32, 2), drain.inFlight());
+    const Reap = struct {
+        fn go(d: *WithdrawDrain) void {
+            var spins: u32 = 0;
+            while (d.drain_waits.load(.acquire) == 0 and spins < 1_000_000) : (spins += 1) {
+                std.Thread.yield() catch {};
+            }
+            d.noteCompleted();
+            d.noteCompleted();
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Reap.go, .{&drain});
+    try testing.expectEqual(WithdrawDrain.Outcome.drained, drain.awaitZero(T_WITHDRAW_NS));
+    th.join();
+    try testing.expectEqual(@as(u32, 0), drain.inFlight());
+    try testing.expectEqual(@as(u64, 1), drain.drain_waits.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), drain.timeouts.load(.acquire));
+
+    drain.noteSubmitted();
+    try testing.expectEqual(WithdrawDrain.Outcome.timed_out, drain.awaitZero(1));
+    try testing.expectEqual(@as(u32, 1), drain.inFlight());
+    try testing.expectEqual(@as(u64, 2), drain.drain_waits.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), drain.timeouts.load(.acquire));
+    drain.noteCompleted();
+    try testing.expectEqual(@as(u32, 0), drain.inFlight());
+}
+
+test "member fence: DC22 withdrawal waits for in-flight completion before unregistering and leaves the key standing on timeout" {
+    const fake = @import("fake_nvme.zig");
+    var ns = fake.Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var mh: fake.Host = .{ .ns = &ns, .host_id = "manager-host-id1".* };
+    var jh: fake.Host = .{ .ns = &ns, .host_id = "joiner-host-id-2".* };
+    var m = try pr.Client.init(testing.allocator, mh.face(), 1, 0x1111);
+    defer m.deinit();
+    try m.register();
+    try m.acquire();
+    var j = try pr.Client.init(testing.allocator, jh.face(), 1, 0x2222);
+    defer j.deinit();
+    try j.register();
+    try testing.expect(ns.isRegistered(j.key));
+
+    const mgr = live(0, 1);
+    var dead_self = live(2, 9);
+    dead_self.state = .recovering;
+
+    // 1. In-flight command completes within the bound: waits for 0 before unregistering.
+    var drain: WithdrawDrain = .{};
+    drain.noteSubmitted();
+    var word: Resolution = .{};
+    var r = Readmit.joiner();
+    r.word = &word;
+    const Complete = struct {
+        fn go(d: *WithdrawDrain, n: *const fake.Namespace, key: u64, still_registered_while_waiting: *bool) void {
+            var spins: u32 = 0;
+            while (d.drain_waits.load(.acquire) == 0 and spins < 1_000_000) : (spins += 1) {
+                std.Thread.yield() catch {};
+            }
+            still_registered_while_waiting.* = n.isRegistered(key);
+            d.noteCompleted();
+        }
+    };
+    var still_reg = false;
+    const th = try std.Thread.spawn(.{}, Complete.go, .{ &drain, &ns, j.key, &still_reg });
+    const v1 = r.finishReregister(
+        me,
+        &.{ mgr, dead_self },
+        .live,
+        .{ .readable = true, .rtype = 3, .host_registered = true },
+        &j,
+        &drain,
+        T_WITHDRAW_NS,
+        true,
+    );
+    th.join();
+    try testing.expectEqual(Verdict.latch, v1);
+    try testing.expect(still_reg);
+    try testing.expect(!ns.isRegistered(j.key));
+    try testing.expectEqual(Resolution.State.terminal, word.snapshot().state);
+    try testing.expectEqual(@as(u64, 1), drain.drain_waits.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), drain.timeouts.load(.acquire));
+
+    // 2. In-flight command exceeds the bound: does NOT unregister (key stays standing for C4/death fence).
+    try j.register();
+    try testing.expect(ns.isRegistered(j.key));
+    drain.noteSubmitted();
+    var word2: Resolution = .{};
+    var r2 = Readmit.joiner();
+    r2.word = &word2;
+    const v2 = r2.finishReregister(
+        me,
+        &.{ mgr, dead_self },
+        .dead,
+        .{ .readable = true, .rtype = 3, .host_registered = true },
+        &j,
+        &drain,
+        1,
+        true,
+    );
+    try testing.expectEqual(Verdict.latch, v2);
+    try testing.expect(ns.isRegistered(j.key));
+    try testing.expect(!r2.obs.host_registered);
+    try testing.expectEqual(Resolution.State.terminal, word2.snapshot().state);
+    try testing.expectEqual(@as(u64, 2), drain.drain_waits.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), drain.timeouts.load(.acquire));
+    drain.noteCompleted();
+
+    // 3. Adopted registration (`!fresh`): never unregistered even when drained.
+    var word3: Resolution = .{};
+    var r3 = Readmit.joiner();
+    r3.word = &word3;
+    const v3 = r3.finishReregister(
+        me,
+        &.{ mgr, dead_self },
+        .dead,
+        .{ .readable = true, .rtype = 3, .host_registered = true },
+        &j,
+        &drain,
+        T_WITHDRAW_NS,
+        false,
+    );
+    try testing.expectEqual(Verdict.latch, v3);
+    try testing.expect(ns.isRegistered(j.key));
+    try testing.expectEqual(Resolution.State.terminal, word3.snapshot().state);
+}
+
+test "member fence: a late cleared after terminal refuses the CAS, withdraws a fresh registration after draining, and does not let a held caller retry" {
+    const fake = @import("fake_nvme.zig");
+    var ns = fake.Namespace.init(testing.allocator);
+    defer ns.deinit();
+    var mh: fake.Host = .{ .ns = &ns, .host_id = "manager-host-id1".* };
+    var jh: fake.Host = .{ .ns = &ns, .host_id = "joiner-host-id-2".* };
+    var m = try pr.Client.init(testing.allocator, mh.face(), 1, 0x1111);
+    defer m.deinit();
+    try m.register();
+    try m.acquire();
+    var j = try pr.Client.init(testing.allocator, jh.face(), 1, 0x2222);
+    defer j.deinit();
+    try j.register();
+    try testing.expect(ns.isRegistered(j.key));
+
+    var word: Resolution = .{};
+    var kicks: u32 = 0;
+    var r = Readmit.joiner();
+    r.word = &word;
+    r.on_cleared_ctx = &kicks;
+    r.on_cleared = struct {
+        fn bump(ctx: ?*anyopaque) void {
+            const p: *u32 = @ptrCast(@alignCast(ctx.?));
+            p.* += 1;
+        }
+    }.bump;
+    const held_ans = r.answer(.write, .conflict);
+    try testing.expectEqual(Verdict.held, held_ans.verdict);
+    word.terminate();
+
+    var drain: WithdrawDrain = .{};
+    drain.noteSubmitted();
+    const Complete = struct {
+        fn go(d: *WithdrawDrain) void {
+            var spins: u32 = 0;
+            while (d.drain_waits.load(.acquire) == 0 and spins < 1_000_000) : (spins += 1) {
+                std.Thread.yield() catch {};
+            }
+            d.noteCompleted();
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Complete.go, .{&drain});
+    const mgr = live(0, 1);
+    const ours = live(2, 9);
+    const verdict = r.finishReregister(
+        me,
+        &.{ mgr, ours },
+        .live,
+        .{ .readable = true, .rtype = 3, .host_registered = true },
+        &j,
+        &drain,
+        T_WITHDRAW_NS,
+        true,
+    );
+    th.join();
+    try testing.expectEqual(Verdict.latch, verdict);
+    try testing.expectEqual(@as(u64, 1), r.late_cleared_refused);
+    try testing.expectEqual(@as(u32, 0), kicks);
+    try testing.expect(!r.obs.host_registered);
+    try testing.expect(!ns.isRegistered(j.key));
+    try testing.expectEqual(@as(u64, 1), drain.drain_waits.load(.acquire));
+    try testing.expectEqual(Resolution.State.terminal, word.snapshot().state);
+    try testing.expectEqual(Resolution.Wait.terminal, word.awaitPast(held_ans.gen));
 }

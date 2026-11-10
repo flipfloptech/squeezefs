@@ -175,6 +175,27 @@ pub const Readmit = struct {
         return .{};
     }
 
+    /// Apply one reservation report before `answer` classifies a refusal
+    /// (decision 0004 §4.5.3). The last beat can still say this host is
+    /// registered after a preempt-all removed it; classifying that stale
+    /// word spends the retry credit and latches a live member. An
+    /// unreadable report (the drain's EIO) is not a registration.
+    pub fn observeReport(self: *Readmit, report: ReportView) void {
+        if (!report.readable) {
+            self.obs.host_registered = false;
+            return;
+        }
+        if (report.rtype == nvme.RTYPE_WEAR or report.rtype == nvme.RTYPE_WERO) self.obs.meta_rtype = report.rtype;
+        self.obs.rtype = report.rtype;
+        self.obs.host_registered = report.host_registered;
+        if (report.host_registered) {
+            if (self.unregistered_seen) {
+                self.unregistered_seen = false;
+                self.obs.retry_credits +|= 1;
+            }
+        } else self.unregistered_seen = true;
+    }
+
     pub fn answer(self: *Readmit, op: Op, class: Class) Answer {
         const gen = if (self.word) |w| w.snapshot().gen else 0;
         if (op == .read and class == .eio) return .{ .verdict = .retry, .gen = gen };
@@ -1127,6 +1148,40 @@ test "member fence: a retry answer spends one credit so a second refusal latches
     try testing.expectEqual(Verdict.retry, r.answer(.write, .conflict).verdict);
     try testing.expectEqual(@as(u32, 0), r.obs.retry_credits);
     try testing.expectEqual(Verdict.latch, r.answer(.write, .conflict).verdict);
+}
+
+test "member fence: a refusal re-read that finds this host unregistered under WEAR is held (decision 0004 §4.5.3)" {
+    var n: u32 = 0;
+    var r = Readmit.joiner();
+    r.obs.host_registered = true;
+    r.obs.rtype = nvme.RTYPE_WEAR;
+    r.obs.meta_rtype = nvme.RTYPE_WEAR;
+    r.obs.retry_credits = 0;
+    r.on_held = struct {
+        fn bump(ctx: ?*anyopaque) void {
+            const p: *u32 = @ptrCast(@alignCast(ctx.?));
+            p.* += 1;
+        }
+    }.bump;
+    r.on_held_ctx = &n;
+    r.observeReport(.{ .readable = true, .rtype = nvme.RTYPE_WEAR, .host_registered = false });
+    try testing.expectEqual(Verdict.held, r.answer(.write, .conflict).verdict);
+    try testing.expectEqual(@as(u32, 1), n);
+    // The report still names this host and the credit is spent: a fence.
+    var still = Readmit.joiner();
+    still.obs.host_registered = true;
+    still.obs.rtype = nvme.RTYPE_WEAR;
+    still.obs.meta_rtype = nvme.RTYPE_WEAR;
+    still.obs.retry_credits = 0;
+    still.observeReport(.{ .readable = true, .rtype = nvme.RTYPE_WEAR, .host_registered = true });
+    try testing.expectEqual(Verdict.latch, still.answer(.write, .conflict).verdict);
+    // An unreadable report during the drain is not a registration.
+    var drained = Readmit.joiner();
+    drained.obs.host_registered = true;
+    drained.obs.rtype = nvme.RTYPE_WEAR;
+    drained.obs.meta_rtype = nvme.RTYPE_WEAR;
+    drained.observeReport(.{});
+    try testing.expectEqual(Verdict.held, drained.answer(.write, .conflict).verdict);
 }
 
 test "member fence: a collapsed write keeps Held and maps every other class to Io" {

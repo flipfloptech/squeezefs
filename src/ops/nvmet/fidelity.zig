@@ -3606,8 +3606,9 @@ test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2
     try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
     try testing.expectEqual(@as(u64, 1), try statNumber(ss, "writer_guard_preempt_alls"));
     try testing.expect(try statNumber(ss, "writer_guard_preempt_all_victims") >= 2);
-    // J's host was removed by the preempt-all. Keeping J's mount readable
-    // is the re-admission pin, not this one: its .stats answers EIO.
+    // J's getattr wedges on the superseded manager's token channel
+    // (TokenChannelStale, then EIO at the move gate). Re-admission is the
+    // next pin: this row does not require J's mount to answer.
     try rig.kill9(j);
     try rig.kill9(m);
     try rig.umount(s);

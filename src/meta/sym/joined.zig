@@ -1444,6 +1444,13 @@ pub const JoinedSet = struct {
         return views[0..n];
     }
 
+    /// A device refusal classifies from a fresh report, not the last beat
+    /// (decision 0004 §4.5.3). The beat can still say this host is registered
+    /// after a preempt-all removed it.
+    pub fn noteDeviceRefusal(self: *JoinedSet) void {
+        self.readmit.observeReport(self.reservationReport());
+    }
+
     /// One metadata reservation report from this joiner's own client
     /// (`fence`). A joined mount has no guard. No fence (a file, a loop
     /// device, RESCAP 0, the seam), or a failed report, stays unreadable.

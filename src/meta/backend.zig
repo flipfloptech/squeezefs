@@ -1620,6 +1620,7 @@ pub const KvBackend = struct {
     fn joinedReadmit(ctx: ?*anyopaque, op: member_fence.Op, class: member_fence.Class) member_fence.Answer {
         const be: *KvBackend = @ptrCast(@alignCast(ctx.?));
         const js = be.joined orelse return .{ .verdict = .latch };
+        if (class == .conflict or (op == .write and class == .eio)) js.noteDeviceRefusal();
         return js.readmit.answer(op, class);
     }
 

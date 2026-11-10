@@ -159,6 +159,8 @@ pub const stats = struct {
     pub var data_pr_lapse_kicks: counters.ShardedCounter = .{};
     pub var data_pr_refusal_readmissions: counters.ShardedCounter = .{};
     pub var data_pr_refusal_readmissions_declined: counters.ShardedCounter = .{};
+    /// Data re-registrations after a succession (decision 0004 §4.5.5, §9).
+    pub var data_pr_succession_reregistrations: counters.ShardedCounter = .{};
 };
 
 /// Why a data volume carries no device fence — stable facts only (review
@@ -1156,6 +1158,7 @@ pub const DataFence = struct {
             self.noteCleared(v);
             if (fresh) {
                 v.fresh = true;
+                stats.data_pr_succession_reregistrations.inc();
                 log.warn("data volume {s}: re-registered this host under key {x:0>16} while a data resolution was pending (decision 0004 §4.5.5)", .{ v.path(), c.key });
             }
             return;
@@ -1267,7 +1270,7 @@ pub const DataFence = struct {
         for (self.readmit_cells[0..self.n_cells]) |*cell| if (cell.vol_tag == vol_tag) return &cell.hook;
         if (self.n_cells == self.readmit_cells.len) return null;
         const cell = &self.readmit_cells[self.n_cells];
-        cell.* = .{ .hook = .{ .ctx = cell, .readmit = &readmitFn }, .fence = self, .vol_tag = vol_tag };
+        cell.* = .{ .hook = .{ .ctx = cell, .readmit = &readmitFn, .drainBarrier = &drainBarrierFn }, .fence = self, .vol_tag = vol_tag };
         self.n_cells += 1;
         return &cell.hook;
     }
@@ -1279,6 +1282,29 @@ pub const DataFence = struct {
         const self = cell.fence;
         const io = self.io orelse return self.readmitAfterRefusal(cell.vol_tag);
         return exec.SqzIo.fromIo(io).runBlocking(readmitAfterRefusal, .{ self, cell.vol_tag }) catch .{ .verdict = .decline };
+    }
+
+    fn drainBarrierFn(ctx: *anyopaque) nvme_dev.BarrierAnswer {
+        const cell: *ReadmitCell = @ptrCast(@alignCast(ctx));
+        const self = cell.fence;
+        const io = self.io orelse return self.drainBarrierAfterReadEio(cell.vol_tag);
+        return exec.SqzIo.fromIo(io).runBlocking(drainBarrierAfterReadEio, .{ self, cell.vol_tag }) catch .unknown;
+    }
+
+    /// Issue a non-mutating `drainBarrier` on `vol_tag`'s data namespace after
+    /// a data read hit `EIO` (`error.InputOutput`) (decision 0004 §4.5.3,
+    /// §4.5.5, P9b): orders behind any active preempt-and-abort drain on this
+    /// controller so the caller's single read retry runs after the drain.
+    pub fn drainBarrierAfterReadEio(self: *DataFence, vol_tag: u64) nvme_dev.BarrierAnswer {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const i = self.tabledIndex(vol_tag) orelse return .unknown;
+        const c = self.vols[i].client;
+        return switch (c.drainBarrier()) {
+            .registered => .registered,
+            .unregistered => .unregistered,
+            .unknown => .unknown,
+        };
     }
 
     /// A data write-class command the device refused with the reservation
@@ -1325,17 +1351,25 @@ pub const DataFence = struct {
             self.notePending(v);
             return self.recheckAfterPending(v, c, gen);
         }
-        if (!v.lapse_pending) return self.declined(v, gen, "no lapse is pending for this process here — the refusal is a fence");
+        // Metadata is settled: §DL.3's synchronous data re-admission
+        // (decision 0004 §4.5.5).
+        const was_pending = v.pending_since_ns != 0 or v.resolution.snapshot().state == .pending;
         const fresh = self.register(v.path(), c) catch return self.declined(v, gen, "its registration through the rule was refused");
         if (self.currentStatus() == .dead) {
             if (fresh) c.unregister(c.key) catch {};
             return self.declined(v, gen, "this incarnation's page left Live during the re-admission — withdrawn");
         }
         self.noteCleared(v);
-        if (!fresh) return .{ .verdict = .retry, .gen = gen };
-        v.fresh = true;
-        stats.data_pr_refusal_readmissions.inc();
-        log.warn("data volume {s}: a data command was refused (reservation conflict) inside a lapse still pending for this process — this host, registered on every joined metadata volume's namespace and current, re-registered under key {x:0>16} through the rule; the command goes once more (decision 0003 §DL)", .{ v.path(), c.key });
+        if (fresh) {
+            v.fresh = true;
+            if (was_pending) {
+                stats.data_pr_succession_reregistrations.inc();
+                log.warn("data volume {s}: re-registered this host under key {x:0>16} while a data resolution was pending (decision 0004 §4.5.5)", .{ v.path(), c.key });
+            } else {
+                stats.data_pr_refusal_readmissions.inc();
+                log.warn("data volume {s}: a data command was refused (reservation conflict) — this host, registered on every joined metadata volume's namespace and current, re-registered under key {x:0>16} through the rule; the command goes once more (decision 0003 §DL, decision 0004 §4.5.5)", .{ v.path(), c.key });
+            }
+        }
         return .{ .verdict = .retry, .gen = gen };
     }
 
@@ -2353,6 +2387,79 @@ test "decision 0004 §4.5.5: a current joiner unregistered on metadata answers h
     try testing.expectEqual(member_fence.Resolution.State.cleared, dj.vols[0].resolution.snapshot().state);
 }
 
+test "decision 0004 §4.5.5 (round-4 issue 1, the busy F10): a busy joiner's data refusal that arrives after its metadata re-registration but before its data beat — metadata settled, its data word still pending — is re-admitted by the synchronous arm (retry, the word cleared, counted as a succession re-registration), never declined; a data-only fence with metadata settled (a stray preempt, §DJ.12(b)) re-admits too" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/data-fence-busy-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var probe = host_fence.Registry.at(base, .set, 0x5c);
+    probe.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    probe.unlock();
+    const m_id: [16]u8 = "manager-host-id1".*;
+    const j_id: [16]u8 = "joiner-host-id-2".*;
+    var mns = fake.Namespace.init(gpa);
+    defer mns.deinit();
+    var dns = fake.Namespace.init(gpa);
+    defer dns.deinit();
+    var mh: fake.Host = .{ .ns = &mns, .host_id = m_id };
+    var jh: fake.Host = .{ .ns = &mns, .host_id = j_id };
+    var meta_m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer meta_m.deinit();
+    try fencing.acquireManagerHold(&meta_m);
+    var meta_j = try pr.Client.init(gpa, jh.face(), 1, 0x2222);
+    defer meta_j.deinit();
+    _ = try fencing.joinAsRegistrant(&meta_j, null);
+    var pages = [_]appender_page.Page{ livePage(0, 0xA, 0xA0), livePage(1, 0xC, 0xC0) };
+    var src: FixturePages = .{ .pages = &pages };
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var cfg: FixtureConfig = .{ .live = &.{1} };
+    const local = proc.localIdentity();
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = local, .node_token = 0xA, .pages = src.source(), .meta_path = "fake-meta", .writer_id = 0xA0, .config = cfg.source(), .manager = true });
+    defer dm.release();
+    const dj = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = jh.face(), .meta_nsid = 1, .key = 0x2222, .reg = host_fence.Registry.at(base, .set, 0x5c), .local = local, .node_token = 0xC, .pages = src.source(), .meta_path = "fake-meta", .writer_id = 0xC0, .config = cfg.source(), .manager = false });
+    defer dj.release();
+    var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
+    var djh: fake.Host = .{ .ns = &dns, .host_id = j_id };
+    try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
+    try dj.admitClient(1, "fake-data", null, try fixtureClient(gpa, djh.face()));
+    dm.beat();
+    try testing.expectEqual(nvme.RTYPE_WEAR, dns.rtype);
+    const declined0 = stats.data_pr_refusal_readmissions_declined.load();
+    const succ0 = stats.data_pr_succession_reregistrations.load();
+    const re0 = stats.data_pr_refusal_readmissions.load();
+    // The takeover's preempt on metadata, then the reconcile's on data: J's
+    // first refused write is held, its word pending.
+    try meta_m.preemptAndAbort(0x2222);
+    try dm.clients[0].preemptAndAbort(0x2222);
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.held, dj.readmitAfterRefusal(1).verdict);
+    try testing.expectEqual(member_fence.Resolution.State.pending, dj.vols[0].resolution.snapshot().state);
+    // J's member fence re-registers it on metadata; its data beat has not
+    // run. A second write refused now meets metadata settled: the arm
+    // re-registers on data, clears the word (the held writer wakes) and
+    // retries — no latch.
+    _ = try fencing.joinAsRegistrant(&meta_j, null);
+    const gen = dj.vols[0].resolution.snapshot().gen;
+    const second = dj.readmitAfterRefusal(1);
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.retry, second.verdict);
+    try testing.expectEqual(gen, second.gen);
+    try testing.expect(dns.isRegistered(0x2222));
+    try testing.expectEqual(member_fence.Resolution.State.cleared, dj.vols[0].resolution.snapshot().state);
+    try testing.expect(dj.vols[0].resolution.snapshot().gen > gen);
+    try testing.expectEqual(succ0 + 1, stats.data_pr_succession_reregistrations.load());
+    try testing.expectEqual(re0 + 1, stats.data_pr_refusal_readmissions.load());
+    try testing.expectEqual(declined0, stats.data_pr_refusal_readmissions_declined.load());
+    // A data-only fence with metadata settled and no word pending (a stray
+    // preempt): re-admitted through the rule, not a succession's.
+    try dm.clients[0].preemptAndAbort(0x2222);
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.retry, dj.readmitAfterRefusal(1).verdict);
+    try testing.expect(dns.isRegistered(0x2222));
+    try testing.expectEqual(succ0 + 1, stats.data_pr_succession_reregistrations.load());
+    try testing.expectEqual(re0 + 2, stats.data_pr_refusal_readmissions.load());
+    try testing.expectEqual(declined0, stats.data_pr_refusal_readmissions_declined.load());
+}
+
 test "decision 0004 §4.5.5: the data-fence beat stores terminal on a pending word whose deadline has passed" {
     const gpa = testing.allocator;
     const fake = @import("fake_nvme.zig");
@@ -2631,4 +2738,48 @@ test "decision 0003 §DN.9, a re-join's data re-admission is two-phase: re-point
     dj.beat();
     try testing.expect(succ[0].issued + succ[1].issued > succ_issued);
     for (pred) |h| try testing.expectEqual(@as(u32, 0), h.after_close);
+}
+
+test "data fence: hookFor wires drainBarrier and drainBarrierAfterReadEio reports registered or unregistered (decision 0004 §4.5.3)" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    const m_id: [16]u8 = "manager-host-id1".*;
+    const j_id: [16]u8 = "joiner-host-id-2".*;
+    var mns = fake.Namespace.init(gpa);
+    defer mns.deinit();
+    var dns = fake.Namespace.init(gpa);
+    defer dns.deinit();
+    var mh: fake.Host = .{ .ns = &mns, .host_id = m_id };
+    var jh: fake.Host = .{ .ns = &mns, .host_id = j_id };
+    var meta_m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer meta_m.deinit();
+    try fencing.acquireManagerHold(&meta_m);
+    var meta_j = try pr.Client.init(gpa, jh.face(), 1, 0x2222);
+    defer meta_j.deinit();
+    _ = try fencing.joinAsRegistrant(&meta_j, null);
+
+    var pages = [_]appender_page.Page{ livePage(0, 0xA, 0xA0), livePage(1, 0xC, 0xC0) };
+    var fp: FixturePages = .{ .pages = &pages };
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var cfg: FixtureConfig = .{ .live = &.{1} };
+    const local = proc.localIdentity();
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = local, .node_token = 0xA, .pages = fp.source(), .meta_path = "fake-meta", .writer_id = 0xA0, .config = cfg.source(), .manager = true });
+    defer dm.release();
+    const dj = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = jh.face(), .meta_nsid = 1, .key = 0x2222, .reg = null, .local = local, .node_token = 0xC, .pages = fp.source(), .meta_path = "fake-meta", .writer_id = 0xC0, .config = cfg.source(), .manager = false });
+    defer dj.release();
+
+    var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
+    var djh: fake.Host = .{ .ns = &dns, .host_id = j_id };
+    try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
+    try dj.admitClient(1, "fake-data", null, try fixtureClient(gpa, djh.face()));
+
+    const src = dj.readmitSource();
+    const hook = src.hookFor(src.ctx, 1).?;
+    try testing.expect(hook.drainBarrier != null);
+    try testing.expectEqual(nvme_dev.BarrierAnswer.registered, hook.drainBarrier.?(hook.ctx));
+
+    try dm.clients[0].preemptAndAbort(0x2222);
+    try testing.expectEqual(nvme_dev.BarrierAnswer.unregistered, hook.drainBarrier.?(hook.ctx));
+    try testing.expectEqual(nvme_dev.BarrierAnswer.unknown, dj.drainBarrierAfterReadEio(99));
 }

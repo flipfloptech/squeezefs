@@ -1362,11 +1362,14 @@ pub const DataFence = struct {
         self.noteCleared(v);
         if (fresh) {
             v.fresh = true;
+            // Every fresh re-registration of a refused command is a
+            // readmission. One that lands while the data word is still
+            // pending is also the succession's (the busy F10): both counts.
+            stats.data_pr_refusal_readmissions.inc();
             if (was_pending) {
                 stats.data_pr_succession_reregistrations.inc();
                 log.warn("data volume {s}: re-registered this host under key {x:0>16} while a data resolution was pending (decision 0004 §4.5.5)", .{ v.path(), c.key });
             } else {
-                stats.data_pr_refusal_readmissions.inc();
                 log.warn("data volume {s}: a data command was refused (reservation conflict) — this host, registered on every joined metadata volume's namespace and current, re-registered under key {x:0>16} through the rule; the command goes once more (decision 0003 §DL, decision 0004 §4.5.5)", .{ v.path(), c.key });
             }
         }

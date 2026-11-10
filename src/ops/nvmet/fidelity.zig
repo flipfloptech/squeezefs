@@ -27,7 +27,10 @@
 //! `T_owner`; resumed, its next beat reads the usurpation and its barrier
 //! answers the device's `-EBADE` — FAILED), the member-death rows (the
 //! manager's fencing registrant preempts the dead member's host, decision
-//! 0003 §DG; a frozen member's released windows refused), `g2-restore-tcp` (the PTPL
+//! 0003 §DG; a frozen member's released windows refused), F9/F9b (a grace
+//! reap carries the page's host key) and F10 (a busy co-located joiner
+//! survives the superseded manager's takeover, decision 0004 §8.2),
+//! `g2-restore-tcp` (the PTPL
 //! lapse: the subsystem wiped by hand under a live mount, `restore`
 //! rebuilds it with the recorded uuid, the heartbeat re-acquires:
 //! `writer_guard_pr_reacquires` grows, `writer_guard_fenced` stays 0),
@@ -1711,9 +1714,16 @@ const DaemonSet = struct {
     cm: Connected,
     meta_uri_buf: [64]u8 = undefined,
     meta_uri_len: usize = 0,
+    /// The data device path `format` wrote into the set config.
+    data_dev: [40]u8 = undefined,
+    data_dev_len: usize = 0,
 
     fn metaUri(self: *const DaemonSet) []const u8 {
         return self.meta_uri_buf[0..self.meta_uri_len];
+    }
+
+    fn dataDev(self: *const DaemonSet) []const u8 {
+        return self.data_dev[0..self.data_dev_len];
     }
 };
 
@@ -1732,6 +1742,12 @@ fn daemonSetFormat(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, po
 }
 
 fn daemonSetSized(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [2]u16, mode: []const []const u8, format_extra: []const []const u8, data_size: u64) !DaemonSet {
+    return daemonSetKeepingData(rig, prefix, transport, ports, mode, format_extra, data_size, false);
+}
+
+/// `keep_data` leaves the formatting connect up, so the device path stored
+/// in the set config still names that namespace (fsck opens it by path).
+fn daemonSetKeepingData(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [2]u16, mode: []const []const u8, format_extra: []const []const u8, data_size: u64, keep_data: bool) !DaemonSet {
     var mb: [64]u8 = undefined;
     var db: [64]u8 = undefined;
     const meta_nqn = try rig.share(try std.fmt.bufPrint(&mb, "{s}meta", .{prefix}), meta_len, transport, ports[0]);
@@ -1760,9 +1776,28 @@ fn daemonSetSized(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, por
     const fmt_out = try rig.sqzOk(argv[0..n]);
     defer rig.gpa.free(fmt_out);
     try testing.expect(std.mem.indexOf(u8, fmt_out, "data volumes 1") != null);
+    const dev = cd.dev();
+    @memcpy(out.data_dev[0..dev.len], dev);
+    out.data_dev_len = dev.len;
     try rig.setDataEndpoint(out.metaUri(), transport, ports[1], data_nqn);
-    try rig.disconnect(&cd);
+    if (!keep_data) try rig.disconnect(&cd);
     return out;
+}
+
+/// fsck opens the data path recorded at format. The kernel reuses nvme
+/// instance numbers after a disconnect, so bind the live namespace over
+/// that path when they differ. Returns whether a bind is mounted.
+fn bindDataForFsck(rig: *Rig, set: *const DaemonSet, transport: configfs.Trtype) !bool {
+    const live = try rig.connect(set.data_nqn, transport, 0, null, &.{});
+    if (std.mem.eql(u8, live.dev(), set.dataDev())) return false;
+    var live_buf: [64]u8 = undefined;
+    const live_z = try std.fmt.bufPrintSentinel(&live_buf, "{s}", .{live.dev()}, 0);
+    var stored_buf: [64]u8 = undefined;
+    const stored_z = try std.fmt.bufPrintSentinel(&stored_buf, "{s}", .{set.dataDev()}, 0);
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, stored_z.ptr, 0, .{ .TYPE = true }, &st)) != .SUCCESS) try touchPath(stored_z);
+    if (linux.errno(linux.mount(live_z.ptr, stored_z.ptr, null, linux.MS.BIND, 0)) != .SUCCESS) return error.BindFailed;
+    return true;
 }
 
 /// THE row (charter §8): meta + data shares → connect both → format on
@@ -3287,6 +3322,373 @@ test "nvmet fidelity: F9b — a member whose row was LOST is still expected, rea
     }
     try rig.kill9(x);
     try rig.umount(m2);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+/// A `--daemon --supervise` mount: the write cache's posture (no write
+/// cache without a supervisor). The daemon pid is the one in the ready
+/// line; the supervisor is its parent. `deinit` kills whatever is left.
+const SupervisedMount = struct {
+    pid: linux.pid_t,
+    parent: linux.pid_t = 0,
+    mp: [:0]u8,
+    log_path: [:0]u8,
+
+    fn deinit(self: *SupervisedMount, rig: *Rig) void {
+        if (self.pid != 0) _ = linux.kill(self.pid, .KILL);
+        if (self.parent > 1) _ = linux.kill(self.parent, .KILL);
+        if (self.mp.len != 0) _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
+        rig.gpa.free(self.mp);
+        rig.gpa.free(self.log_path);
+        self.pid = 0;
+        self.parent = 0;
+    }
+
+    /// `squeezefs umount`, then the daemon and its supervisor are gone.
+    fn umount(self: *SupervisedMount, rig: *Rig) !void {
+        const out = try rig.sqzOk(&.{ "umount", self.mp });
+        rig.gpa.free(out);
+        const deadline = clock.monotonicNs() + exit_wait_ns;
+        while (self.pid != 0 and alive(self.pid) and clock.monotonicNs() < deadline) sleepMs(20);
+        if (self.pid != 0 and alive(self.pid)) return error.DaemonStuck;
+        if (self.parent > 1) {
+            const parent_deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+            while (alive(self.parent) and clock.monotonicNs() < parent_deadline) sleepMs(20);
+            if (alive(self.parent)) _ = linux.kill(self.parent, .KILL);
+        }
+        self.pid = 0;
+        self.parent = 0;
+    }
+};
+
+fn pidFromReadyLog(text: []const u8) ?linux.pid_t {
+    const at = std.mem.indexOf(u8, text, "ready: ") orelse return null;
+    const key = "(pid ";
+    const p = std.mem.indexOf(u8, text[at..], key) orelse return null;
+    const rest = text[at + p + key.len ..];
+    const end = std.mem.indexOfAny(u8, rest, " ;)") orelse return null;
+    return std.fmt.parseInt(linux.pid_t, rest[0..end], 10) catch null;
+}
+
+fn ppidOf(pid: linux.pid_t) ?linux.pid_t {
+    var pb: [64]u8 = undefined;
+    var buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "/proc/{d}/stat", .{pid}) catch return null;
+    const text = Io.Dir.cwd().readFile(testing.io, path, &buf) catch return null;
+    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return null;
+    var it = std.mem.tokenizeScalar(u8, text[close + 1 ..], ' ');
+    _ = it.next() orelse return null;
+    return std.fmt.parseInt(linux.pid_t, it.next() orelse return null, 10) catch null;
+}
+
+fn spawnSupervisedMount(rig: *Rig, name: []const u8, meta_uri: []const u8, env: *const std.process.Environ.Map) !SupervisedMount {
+    const mp = try std.fmt.allocPrintSentinel(rig.gpa, "{s}/mnt-{s}", .{ rig.root, name }, 0);
+    errdefer rig.gpa.free(mp);
+    _ = linux.mkdir(mp.ptr, 0o755);
+    const log_path = try std.fmt.allocPrintSentinel(rig.gpa, "{s}/{s}.log", .{ rig.root, name }, 0);
+    errdefer rig.gpa.free(log_path);
+    const log_file = try Io.Dir.cwd().createFile(rig.io, log_path, .{ .truncate = false });
+    log_file.close(rig.io);
+    const r = try rig.sqzEnv(&.{ "mount", "--daemon", "--supervise", "--log-file", log_path, meta_uri, mp }, env);
+    defer rig.freeRun(r);
+    if (!r.term.success()) {
+        const text = Io.Dir.cwd().readFileAlloc(rig.io, log_path, rig.gpa, .limited(1 << 20)) catch null;
+        defer if (text) |t| rig.gpa.free(t);
+        std.debug.print("\n--- supervised mount of {s} ({f}) ---\n{s}\n--- log ---\n{s}\n", .{ mp, r.term, r.stderr, text orelse "" });
+        return error.MountFailed;
+    }
+    const deadline = clock.monotonicNs() + ready_wait_ns;
+    while (clock.monotonicNs() < deadline) {
+        const text = try Io.Dir.cwd().readFileAlloc(rig.io, log_path, rig.gpa, .limited(16 << 20));
+        defer rig.gpa.free(text);
+        if (std.mem.indexOf(u8, text, "supervisor: watching daemon ") != null) {
+            if (pidFromReadyLog(text)) |pid| {
+                return .{ .pid = pid, .parent = ppidOf(pid) orelse 0, .mp = mp, .log_path = log_path };
+            }
+        }
+        sleepMs(50);
+    }
+    const text = Io.Dir.cwd().readFileAlloc(rig.io, log_path, rig.gpa, .limited(1 << 20)) catch null;
+    defer if (text) |t| rig.gpa.free(t);
+    std.debug.print("\n--- supervised mount of {s} never became ready ---\n{s}\n", .{ mp, text orelse "" });
+    if (text) |body| {
+        if (pidFromReadyLog(body)) |pid| {
+            if (ppidOf(pid)) |parent| {
+                if (parent > 1) _ = linux.kill(parent, .KILL);
+            }
+            _ = linux.kill(pid, .KILL);
+        }
+    }
+    _ = linux.umount2(mp.ptr, linux.MNT.DETACH);
+    return error.Timeout;
+}
+
+fn readRel(rig: *Rig, mp: []const u8, rel: []const u8) ![]u8 {
+    var pb: [linux.PATH_MAX]u8 = undefined;
+    const p = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ mp, rel });
+    return Io.Dir.cwd().readFileAlloc(rig.io, p, rig.gpa, .limited(1 << 20));
+}
+
+fn readAcked(rig: *Rig, mp: []const u8) !u64 {
+    const text = readRel(rig, mp, "acked") catch return 0;
+    defer rig.gpa.free(text);
+    return std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10) catch 0;
+}
+
+fn awaitAckedAbove(rig: *Rig, mp: []const u8, floor: u64, deadline_ns: u64) !u64 {
+    const deadline = clock.monotonicNs() + deadline_ns;
+    while (true) {
+        const n = try readAcked(rig, mp);
+        if (n > floor) return n;
+        if (clock.monotonicNs() >= deadline) {
+            std.debug.print("\n--- acked stayed {d} (wanted above {d}) ---\n", .{ n, floor });
+            return error.Timeout;
+        }
+        sleepMs(200);
+    }
+}
+
+fn statsAt(rig: *Rig, mp: []const u8) ![]u8 {
+    return readRel(rig, mp, ".stats");
+}
+
+/// Poll `.stats` until `key` is at least `min`.
+fn awaitStatAtLeast(rig: *Rig, mp: []const u8, key: []const u8, min: u64, deadline_ns: u64) ![]u8 {
+    const deadline = clock.monotonicNs() + deadline_ns;
+    while (true) {
+        const text = statsAt(rig, mp) catch |e| {
+            if (clock.monotonicNs() >= deadline) return e;
+            sleepMs(200);
+            continue;
+        };
+        if (json_scan.number(text, key)) |v| if (v >= min) return text;
+        if (clock.monotonicNs() >= deadline) {
+            std.debug.print("\n--- {s} never reached {d}: {?d} ---\n", .{ key, min, json_scan.number(text, key) });
+            rig.gpa.free(text);
+            return error.Timeout;
+        }
+        rig.gpa.free(text);
+        sleepMs(500);
+    }
+}
+
+fn touchPath(path: [:0]const u8) !void {
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(rc) != .SUCCESS) return error.TouchFailed;
+    _ = linux.close(@intCast(rc));
+}
+
+fn printLogTailFile(rig: *Rig, path: []const u8, n: usize) void {
+    const text = Io.Dir.cwd().readFileAlloc(rig.io, path, rig.gpa, .limited(16 << 20)) catch return;
+    defer rig.gpa.free(text);
+    var start = text.len;
+    var lines: usize = 0;
+    while (start > 0 and lines <= n) : (start -= 1) {
+        if (text[start - 1] == '\n') lines += 1;
+    }
+    std.debug.print("--- the last {d} lines of {s} ---\n{s}\n", .{ n, path, text[start..] });
+}
+
+fn unlinkPath(path: [:0]const u8) void {
+    _ = linux.unlinkat(linux.AT.FDCWD, path.ptr, 0);
+}
+
+fn printF10Counters(st: []const u8) void {
+    std.debug.print("\n--- JA: data_pr_refusals_held {?d}, data_pr_write_refusals {?d}, data_dma_fence_refusals {?d}, data_pr_succession_reregistrations {?d}, pr_stale_sibling_kills {?d}, writer_guard_fenced {?d}, fuse_write_promotions_to_striped {?d}, layout_promoted_block {?d} ---\n", .{
+        json_scan.number(st, "data_pr_refusals_held"),
+        json_scan.number(st, "data_pr_write_refusals"),
+        json_scan.number(st, "data_dma_fence_refusals"),
+        json_scan.number(st, "data_pr_succession_reregistrations"),
+        json_scan.number(st, "pr_stale_sibling_kills"),
+        json_scan.number(st, "writer_guard_fenced"),
+        json_scan.number(st, "fuse_write_promotions_to_striped"),
+        json_scan.number(st, "layout_promoted_block"),
+    });
+}
+
+/// One block per file. `acked` advances only after `sync -d` returns.
+/// `F10_HOLD` and `F10_STOP` are paths OFF the mount: releasing the hold
+/// is not a FUSE unlink (that unlink, issued while the manager was frozen,
+/// wedged at meta_backend_start and the supervisor SIGABRTed the daemon).
+const f10_writer =
+    \\mkdir -p busy
+    \\i=0
+    \\while [ ! -e "$F10_STOP" ]; do
+    \\  if [ -e "$F10_HOLD" ]; then
+    \\    sleep 0.05
+    \\    continue
+    \\  fi
+    \\  i=$((i+1))
+    \\  if head -c 65536 /dev/zero | tr '\000' A > "busy/f$i" && sync -d "busy/f$i"; then
+    \\    echo "$i" > acked
+    \\  else
+    \\    echo "fail $i" >> fails
+    \\    rm -f "busy/f$i"
+    \\  fi
+    \\  sleep 0.05
+    \\done
+;
+
+test "nvmet fidelity: F10 — a busy co-located joiner of the superseded manager survives the takeover (decision 0004 §8.2, G-c, round-4 issue 1) — M (host A) manages, JA (host A, supervised, the write cache) keeps writing and fsyncing one 64 KiB block across the takeover; M is SIGSTOPped past the claim TTL and S (host B) mounts: S's admission reconcile fences host A on data while JA is mid-flight — a refused data write is re-admitted (held while metadata is pending, or one synchronous retry once metadata has settled; data_dma_fence_refusals 0, no data fence latch), JA kills M at its metadata re-registration (pr_stale_sibling_kills ≥ 1), data re-registers (data_pr_succession_reregistrations ≥ 1), a later fsync lands, every fsynced block is whole on JA and on S, and fsck --offline --scrub is clean (red on dev: JA's data device latches, its fsyncs answer EIO)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try daemonSetSized(rig, "f10", transport, try rig.servicePorts(transport), &.{}, &.{ "--block-size", "65536" }, 256 << 20);
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    const m = try rig.spawnMount("f10-m", set.metaUri(), null, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    var ja = try spawnSupervisedMount(rig, "f10-ja", set.metaUri(), &rig.env);
+    defer ja.deinit(rig);
+    const ja_log = try Io.Dir.cwd().readFileAlloc(rig.io, ja.log_path, gpa, .limited(1 << 20));
+    defer gpa.free(ja_log);
+    if (std.mem.indexOf(u8, ja_log, "write cache: the memfd") == null) {
+        std.debug.print("\n--- JA's log has no write cache ---\n{s}\n", .{ja_log});
+        return error.NoWriteCache;
+    }
+    var hold_buf: [linux.PATH_MAX]u8 = undefined;
+    const hold = try std.fmt.bufPrintSentinel(&hold_buf, "{s}/f10-hold", .{rig.root}, 0);
+    var stop_buf: [linux.PATH_MAX]u8 = undefined;
+    const stop = try std.fmt.bufPrintSentinel(&stop_buf, "{s}/f10-stop", .{rig.root}, 0);
+    var wenv = try rig.envWithKnob("F10_HOLD", hold);
+    defer wenv.deinit();
+    try wenv.put("F10_STOP", stop);
+    var writer = try std.process.spawn(rig.io, .{ .argv = &.{ "sh", "-c", f10_writer }, .cwd = .{ .path = ja.mp }, .environ_map = &wenv, .stdin = .ignore });
+    var writer_done = false;
+    defer if (!writer_done) {
+        if (writer.id) |pid| _ = linux.kill(pid, .KILL);
+        _ = writer.wait(rig.io) catch {};
+    };
+    _ = try awaitAckedAbove(rig, ja.mp, 3, ready_wait_ns);
+    // Park the writer between files before freezing M, so no FUSE request
+    // is outstanding for the claim-TTL wait.
+    try touchPath(hold);
+    {
+        const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+        var last = try readAcked(rig, ja.mp);
+        var stable: u32 = 0;
+        while (stable < 5) {
+            if (clock.monotonicNs() >= deadline) {
+                printLogTailFile(rig, ja.log_path, 40);
+                return error.WriterNotParked;
+            }
+            sleepMs(200);
+            const n = try readAcked(rig, ja.mp);
+            if (n == last) stable += 1 else {
+                stable = 0;
+                last = n;
+            }
+        }
+    }
+    const pid_m = rig.daemons.items[m].pid;
+    _ = linux.kill(pid_m, .STOP);
+    std.debug.print("\nF10: M stopped; waiting {d} ms for its claim to age (JA's writer is paused)\n", .{lease_clock.T_OWNER_MS + 5_000});
+    sleepMs(lease_clock.T_OWNER_MS + 5_000);
+    // The hold file is on the rig's ext4 root. Unlinking it does not enter
+    // JA. Writes resume as S's open starts, so JA is mid-flight at the
+    // admission reconcile.
+    unlinkPath(hold);
+    const s = try rig.spawnMount("f10-s", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(s, "ready: ", ready_wait_ns);
+    {
+        const ss = try rig.awaitStat(s, "data_pr_reconcile_preempts", 1, g2_wait_ns);
+        defer gpa.free(ss);
+        try testing.expect(try statNumber(ss, "data_pr_reconcile_preempts") >= 1);
+    }
+    const st = awaitStatAtLeast(rig, ja.mp, "data_pr_succession_reregistrations", 1, g2_wait_ns) catch |e| {
+        printLogTailFile(rig, ja.log_path, 80);
+        return e;
+    };
+    defer gpa.free(st);
+    printF10Counters(st);
+    // `data_pr_write_refusals` counts a synchronous retry as well as a
+    // latch (`tryReadmit`'s `.retry`). The latch is `data_dma_fence_refusals`
+    // and the reservation-conflict log. A refusal while metadata is still
+    // pending is `data_pr_refusals_held`; one that arrives after the
+    // metadata re-registration is the retry. Either re-admits.
+    const held_n = try statNumber(st, "data_pr_refusals_held");
+    const retry_n = try statNumber(st, "data_pr_write_refusals");
+    try testing.expect(held_n + retry_n >= 1);
+    try testing.expectEqual(@as(u64, 0), try statNumber(st, "data_dma_fence_refusals"));
+    try testing.expect(try statNumber(st, "data_pr_succession_reregistrations") >= 1);
+    try testing.expect(try statNumber(st, "pr_stale_sibling_kills") >= 1);
+    try testing.expectEqual(@as(u64, 0), try statNumber(st, "writer_guard_fenced"));
+    const promotions = (json_scan.number(st, "fuse_write_promotions_to_striped") orelse 0) + (json_scan.number(st, "layout_promoted_block") orelse 0);
+    try testing.expect(promotions >= 1);
+    try testing.expect(!alive(pid_m));
+    const acked_at_hold = try readAcked(rig, ja.mp);
+    const acked = try awaitAckedAbove(rig, ja.mp, acked_at_hold, g2_wait_ns);
+    try touchPath(stop);
+    const writer_deadline = clock.monotonicNs() + ready_wait_ns;
+    while (clock.monotonicNs() < writer_deadline) {
+        // A finished writer is a zombie until waited. The stop file ends
+        // the loop at its next check.
+        if (writer.id) |pid| {
+            if (!alive(pid)) break;
+        }
+        sleepMs(100);
+    }
+    if (writer.id) |pid| {
+        if (alive(pid)) return error.WriterStuck;
+    }
+    _ = try writer.wait(rig.io);
+    writer_done = true;
+    if (readRel(rig, ja.mp, "fails")) |fails| {
+        defer gpa.free(fails);
+        std.debug.print("\n--- JA's fsyncs that returned an error ---\n{s}\n", .{fails});
+        return error.FsyncFailed;
+    } else |_| {}
+    const check = "n=$(cat acked); ok=0; bad=0; k=1; while [ \"$k\" -le \"$n\" ]; do if [ \"$(wc -c < busy/f$k)\" = 65536 ] && [ \"$(tr -d A < busy/f$k | wc -c)\" = 0 ]; then ok=$((ok+1)); else bad=$((bad+1)); fi; k=$((k+1)); done; echo \"$n $ok $bad\"";
+    const seen_ja = try std.process.run(gpa, rig.io, .{ .argv = &.{ "sh", "-c", check }, .cwd = .{ .path = ja.mp }, .environ_map = &rig.env });
+    defer gpa.free(seen_ja.stderr);
+    if (!seen_ja.term.success()) {
+        std.debug.print("\n--- JA's byte check failed ---\n{s}\n{s}\n", .{ seen_ja.stdout, seen_ja.stderr });
+        gpa.free(seen_ja.stdout);
+        return error.ScriptFailed;
+    }
+    defer gpa.free(seen_ja.stdout);
+    var it = std.mem.tokenizeAny(u8, seen_ja.stdout, " \n");
+    const n = try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10);
+    const ok = try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10);
+    const bad = try std.fmt.parseInt(u64, it.next() orelse return error.ScriptFailed, 10);
+    try testing.expectEqual(acked, n);
+    try testing.expectEqual(n, ok);
+    try testing.expectEqual(@as(u64, 0), bad);
+    const seen_s = try rig.onMount(s, check);
+    defer gpa.free(seen_s);
+    try testing.expectEqualStrings(std.mem.trim(u8, seen_ja.stdout, " \n"), std.mem.trim(u8, seen_s, " \n"));
+    const ja_after = try Io.Dir.cwd().readFileAlloc(rig.io, ja.log_path, gpa, .limited(16 << 20));
+    defer gpa.free(ja_after);
+    try testing.expect(std.mem.indexOf(u8, ja_after, "POISONED") == null);
+    try testing.expect(std.mem.indexOf(u8, ja_after, "reservation-conflict errno") == null);
+    try ja.umount(rig);
+    try rig.kill9(m);
+    try rig.umount(s);
+    // fsck opens the data path recorded at format. Reconnect the namespace
+    // and bind it over that path when the kernel has reused the number.
+    const bound = try bindDataForFsck(rig, &set, transport);
+    defer if (bound) {
+        var stored_buf: [64]u8 = undefined;
+        if (std.fmt.bufPrintSentinel(&stored_buf, "{s}", .{set.dataDev()}, 0)) |stored_z| {
+            _ = linux.umount2(stored_z.ptr, linux.MNT.DETACH);
+        } else |_| {}
+    };
+    const fsck = try rig.sqz(&.{ "fsck", "--offline", "--scrub", set.metaUri() });
+    defer rig.freeRun(fsck);
+    if (!fsck.term.success() or std.mem.indexOf(u8, fsck.stdout, "findings: 0 (clean)") == null) {
+        std.debug.print("\n--- fsck --offline --scrub ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ fsck.term, fsck.stdout, fsck.stderr });
+        return error.FsckNotClean;
+    }
     _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
     try rig.disconnect(&cm_b);

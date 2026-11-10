@@ -256,6 +256,23 @@ pub const SharedLink = struct {
         self.mux = null;
     }
 
+    /// When a successor manager's page appears on the device, check the
+    /// resolver: if the checkpointed `endpoint:{0}` moved off `self.ep`,
+    /// retire the current session (which may be a TCP socket to a frozen
+    /// predecessor) so the next call dials the successor at once.
+    pub fn repointIfMoved(self: *SharedLink) void {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        const r = self.resolver orelse return;
+        const ep = r.resolve(r.ctx) orelse return;
+        if (ep.eql(self.ep)) return;
+        stats.peer_links_repointed.inc();
+        self.ep = ep;
+        const m = self.mux orelse return;
+        self.retired.append(self.gpa, m) catch m.close();
+        self.mux = null;
+    }
+
     /// The endpoint the next dial takes (the current one; for tests).
     pub fn endpointNow(self: *SharedLink) endpoint.EndpointWire {
         self.lock.lockUncancelable(self.io);
@@ -403,9 +420,12 @@ pub const JoinedSet = struct {
     resolution: member_fence.Resolution = .{},
     withdraw_drain: member_fence.WithdrawDrain = .{},
     withdraw_timeout_ns: u64 = member_fence.T_WITHDRAW_NS,
-    /// Appender 0's writer at the last registration. A different Live
-    /// writer is a successor.
+    /// Appender 0's writer and term at the last registration. A different
+    /// Live writer at a higher term is a successor; C1 also checks that
+    /// the latest membership grant came from that owner term.
     mgr_writer: u64 = 0,
+    mgr_term: u64 = 0,
+    grant_term: std.atomic.Value(u64) = .init(0),
     /// Set while `SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD` blocks the member
     /// beat: the census beat and the succession park stay down so
     /// committers keep serving until they park at `T_self`. Also set as
@@ -505,6 +525,7 @@ pub const JoinedSet = struct {
             .park_gate = park.ParkGate.arm(be.io, be.stamp.member_position, park.tParkMaxMs(grant.failoverBoundMs(0, 0), park.graceMs(shard.tOwnerMsFromEnv(be.env)))),
             .readmit = member_fence.Readmit.joiner(),
             .mgr_writer = page0.identity.writer_id,
+            .mgr_term = page0.term,
             .gate = ring_growth.Gate.init(be.io),
             .fence = fence,
         };
@@ -1189,6 +1210,8 @@ pub const JoinedSet = struct {
             .node_token = r.page.identity.node_token,
             .term = r.page.term,
             .mgr_writer = self.mgr_writer,
+            .mgr_term = self.mgr_term,
+            .grant_term = self.grant_term.load(.acquire),
         };
         const currency = self.liveOnEveryJoined(who);
         if (currency == .dead) {
@@ -1201,8 +1224,21 @@ pub const JoinedSet = struct {
         if (currency == .unreadable) return;
         const report = self.reservationReport();
         const verdict = self.readmit.beat(who, mapped, report);
+        if (self.readmit.obs.successor_page) {
+            self.link.repointIfMoved();
+            if (self.park_gate.isParked()) {
+                if (page0Owner(mapped)) |p0| {
+                    const t_owner_ms = shard.tOwnerMsFromEnv(self.be.env);
+                    const elapsed_ms = self.park_gate.parkedAgeNs(clock.monotonicNs()) / std.time.ns_per_ms;
+                    _ = self.park_gate.extendTo(p0.term, elapsed_ms +| t_owner_ms +| park.graceMs(t_owner_ms));
+                }
+            }
+        }
         if (self.readmit.obs.host_registered) {
-            if (page0Writer(mapped)) |w| self.mgr_writer = w;
+            if (page0Owner(mapped)) |p0| {
+                self.mgr_writer = p0.writer_id;
+                self.mgr_term = p0.term;
+            }
             if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
         }
         if (verdict == .latch) {
@@ -1227,6 +1263,8 @@ pub const JoinedSet = struct {
             .node_token = r.page.identity.node_token,
             .term = r.page.term,
             .mgr_writer = self.mgr_writer,
+            .mgr_term = self.mgr_term,
+            .grant_term = self.grant_term.load(.acquire),
         };
         return switch (self.liveOnEveryJoined(who)) {
             .dead => .dead,
@@ -1311,7 +1349,10 @@ pub const JoinedSet = struct {
                     return;
                 }
                 if (self.readmit.obs.host_registered) {
-                    if (page0Writer(mapped)) |w| self.mgr_writer = w;
+                    if (page0Owner(mapped)) |p0| {
+                        self.mgr_writer = p0.writer_id;
+                        self.mgr_term = p0.term;
+                    }
                     if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
                     log.warn("meta volume {s}: re-registered this host under key {x:0>16} after a succession", .{ self.be.path, f.client.key });
                 }
@@ -1405,8 +1446,10 @@ pub const JoinedSet = struct {
         return .{ .readable = true, .rtype = facts.rtype, .host_registered = facts.registered };
     }
 
-    fn page0Writer(pages: []const member_fence.PageView) ?u64 {
-        for (pages) |p| if (p.appender_id == 0 and p.state == .live) return p.writer_id;
+    const Page0Owner = struct { writer_id: u64, term: u64 };
+
+    fn page0Owner(pages: []const member_fence.PageView) ?Page0Owner {
+        for (pages) |p| if (p.appender_id == 0 and p.state == .live) return .{ .writer_id = p.writer_id, .term = p.term };
         return null;
     }
 

@@ -1288,6 +1288,7 @@ pub const Member = struct {
     role: Role,
     link: Link,
     words: lease_clock.MemberLeaseWords = .{},
+    term: u64 = 0,
     epoch: u64 = 0,
     label: u64 = 0,
     clocks: ?LeaseClocks = null,
@@ -1329,6 +1330,7 @@ pub const Member = struct {
         const h = g.head;
         self.clocks = .{ .t_owner_ms = h.t_owner_ms, .skew_max_ms = h.skew_max_ms, .d_purge_ms = h.d_purge_ms, .t_self_ms = lease_clock.grantTSelfMs(h.t_owner_ms, h.skew_max_ms, h.d_purge_ms), .renew_ms = h.renew_ms, .grace_ms = park.graceMs(h.t_owner_ms) };
         if (self.clocks.?.t_self_ms == 0) return error.UnsafeClocks;
+        self.term = h.term;
         self.epoch = h.epoch;
         self.label += 1;
         self.config_generation = h.config_generation;
@@ -1428,24 +1430,32 @@ pub const Member = struct {
         if (self.gate) |g| {
             if (g.isExpired()) return .fenced;
             if (g.isParked()) {
-                const t0 = clock.monotonicNs();
-                const answer: park.ReclaimAnswer = switch (self.join(now_ms, self.epoch)) {
-                    .granted => .granted,
-                    .unknown_lease => .unknown_lease,
-                    else => .not_now,
-                };
-                // Expiry judged first (`reclaimUnderPark`'s order): a park
-                // past `T_park_max` is the lattice's terminal verdict.
-                if (answer == .unknown_lease and self.rejoin_armed and !g.expireIfDue(now_mono_ns, self.poison) and !g.isExpired()) return .evicted;
-                return switch (park.reclaimUnderPark(g, answer, now_mono_ns, clock.monotonicNs() - t0, self.poison)) {
-                    .rejoined => .rejoined,
-                    .fenced => blk: {
+                if (g.reason == .succession and g.reclaimed_under_park.load(.acquire)) {
+                    if (g.expireIfDue(now_mono_ns, self.poison)) {
                         _ = self.words.fence();
                         stats.membership_self_fenced.set(1);
-                        break :blk .fenced;
-                    },
-                    .parked => .parked,
-                };
+                        return .fenced;
+                    }
+                } else {
+                    const t0 = clock.monotonicNs();
+                    const answer: park.ReclaimAnswer = switch (self.join(now_ms, self.epoch)) {
+                        .granted => .granted,
+                        .unknown_lease => .unknown_lease,
+                        else => .not_now,
+                    };
+                    // Expiry judged first (`reclaimUnderPark`'s order): a park
+                    // past `T_park_max` is the lattice's terminal verdict.
+                    if (answer == .unknown_lease and self.rejoin_armed and !g.expireIfDue(now_mono_ns, self.poison) and !g.isExpired()) return .evicted;
+                    return switch (park.reclaimUnderPark(g, answer, now_mono_ns, clock.monotonicNs() - t0, self.poison)) {
+                        .rejoined => .rejoined,
+                        .fenced => blk: {
+                            _ = self.words.fence();
+                            stats.membership_self_fenced.set(1);
+                            break :blk .fenced;
+                        },
+                        .parked => .parked,
+                    };
+                }
             }
         }
         if (self.words.fenced.load(.acquire)) return .fenced;

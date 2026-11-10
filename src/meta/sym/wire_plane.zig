@@ -384,6 +384,7 @@ const JoinedHalf = struct {
                 return;
             }
             if (v == .renewed or v == .rejoined) {
+                for (self.plane.set.volumes) |be| if (be.joined) |js| js.grant_term.store(self.member.term, .release);
                 self.granted_generation.store(self.member.config_generation, .monotonic);
                 _ = self.grants.fetchAdd(1, .release);
             }
@@ -1043,6 +1044,7 @@ pub const WirePlane = struct {
             },
         }
         const clocks = j.member.clocks.?;
+        for (self.set.volumes) |be| if (be.joined) |js| js.grant_term.store(j.member.term, .release);
         // `T_park_max = failover_bound + grace` at the grant's `T_owner`.
         j.js.park_gate.t_park_max_ms = membership.park_reclaim.tParkMaxMs(@import("extent_grant.zig").failoverBoundMs(0, 0), clocks.grace_ms);
         // The committers judge `T_self` at the pre-admission gate from here
@@ -1286,6 +1288,7 @@ pub const WirePlane = struct {
             return false;
         }
         const clocks = j.member.clocks.?;
+        j.js.grant_term.store(j.member.term, .release);
         j.js.park_gate.t_park_max_ms = membership.park_reclaim.tParkMaxMs(@import("extent_grant.zig").failoverBoundMs(0, 0), clocks.grace_ms);
         j.js.park_gate.bindSelfFence(j.member.selfFenceSeam());
         j.census.setRenewInterval(clocks.renew_ms * std.time.ns_per_ms);

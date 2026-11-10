@@ -254,8 +254,9 @@ const MetaVol = struct {
     /// Recovering pages observed while this host was registered on this
     /// volume (R-3.2's filter).
     seen: member_fence.Seen = .{},
-    /// Appender 0's writer the last time this host saw itself registered.
+    /// Appender 0's writer and term the last time this host saw itself registered.
     mgr_writer: u64 = 0,
+    mgr_term: u64 = 0,
 };
 
 pub const Volume = struct {
@@ -1387,10 +1388,13 @@ pub const DataFence = struct {
         defer gpa.free(pages);
         var views: [64]member_fence.PageView = undefined;
         const mapped = fillPageViews(pages, &views);
-        const who = self.selfViewOn(mv.mgr_writer, mapped);
+        const who = self.selfViewOn(mv.mgr_writer, mv.mgr_term, mapped);
         const facts = member_fence.pageFacts(who, mapped, mv.seen);
         if (report.registered) {
-            if (page0Writer(mapped)) |w| mv.mgr_writer = w;
+            if (page0Owner(mapped)) |p0| {
+                mv.mgr_writer = p0.writer_id;
+                mv.mgr_term = p0.term;
+            }
             member_fence.noteRecovering(&mv.seen, who, mapped);
         }
         return .{ .classified = member_fence.classifyForData(.{
@@ -1422,7 +1426,7 @@ pub const DataFence = struct {
         return views[0..n];
     }
 
-    fn selfViewOn(self: *const DataFence, mgr_writer: u64, pages: []const member_fence.PageView) member_fence.SelfView {
+    fn selfViewOn(self: *const DataFence, mgr_writer: u64, mgr_term: u64, pages: []const member_fence.PageView) member_fence.SelfView {
         var appender_id: u32 = 0;
         var term: u64 = 0;
         for (pages) |p| {
@@ -1438,8 +1442,16 @@ pub const DataFence = struct {
             .node_token = self.in.node_token,
             .term = term,
             .mgr_writer = mgr_writer,
+            .mgr_term = mgr_term,
             .meta_rtype = nvme.RTYPE_WERO,
         };
+    }
+
+    const Page0Owner = struct { writer_id: u64, term: u64 };
+
+    fn page0Owner(pages: []const member_fence.PageView) ?Page0Owner {
+        for (pages) |p| if (p.appender_id == 0 and p.state == .live) return .{ .writer_id = p.writer_id, .term = p.term };
+        return null;
     }
 
     fn page0Writer(pages: []const member_fence.PageView) ?u64 {

@@ -76,6 +76,10 @@ pub const SelfView = struct {
     term: u64,
     /// Appender 0's writer the last time this host saw itself registered.
     mgr_writer: u64,
+    /// Appender 0's term the last time this host saw itself registered (0 = unknown).
+    mgr_term: u64 = 0,
+    /// The owner term carried by the latest membership grant (0 = not yet bound).
+    grant_term: u64 = 0,
     meta_rtype: u8 = 3,
 };
 
@@ -111,6 +115,7 @@ pub const Seen = struct {
 pub const PageFacts = struct {
     own_page_live: bool,
     successor_page: bool,
+    reasserted: bool = false,
     sibling_death: bool,
 };
 
@@ -118,15 +123,19 @@ pub const PageFacts = struct {
 pub fn pageFacts(who: SelfView, pages: []const PageView, seen: Seen) PageFacts {
     var own_live = false;
     var successor = false;
+    var reasserted = false;
     var sibling = false;
     for (pages) |p| {
-        if (p.appender_id == 0 and p.state == .live and p.writer_id != who.mgr_writer) successor = true;
+        if (p.appender_id == 0 and p.state == .live and p.writer_id != who.mgr_writer and (who.mgr_term == 0 or p.term > who.mgr_term)) {
+            successor = true;
+            if (who.grant_term == 0 or (who.grant_term > who.mgr_term and p.term == who.grant_term)) reasserted = true;
+        }
         if (p.appender_id == who.appender_id) {
             own_live = p.state == .live and p.writer_id == who.writer_id and p.node_token == who.node_token and p.term == who.term;
         }
         if (p.appender_id != who.appender_id and p.state == .recovering and p.node_token == who.node_token and !seen.contains(p.appender_id, p.term)) sibling = true;
     }
-    return .{ .own_page_live = own_live, .successor_page = successor, .sibling_death = sibling };
+    return .{ .own_page_live = own_live, .successor_page = successor, .reasserted = reasserted, .sibling_death = sibling };
 }
 
 pub fn noteRecovering(seen: *Seen, who: SelfView, pages: []const PageView) void {
@@ -193,6 +202,7 @@ pub const Readmit = struct {
         self.obs.own_page_live = facts.own_page_live;
         self.obs.sibling_death = facts.sibling_death;
         self.obs.successor_page = facts.successor_page;
+        self.obs.reasserted = facts.reasserted;
         self.obs.meta_rtype = who.meta_rtype;
         if (report.readable) {
             self.obs.rtype = report.rtype;
@@ -308,6 +318,10 @@ pub const Observation = struct {
     retry_credits: u32 = 1,
     /// Appender 0's Live page names a writer other than `mgr_writer`.
     successor_page: bool = false,
+    /// C1's grant-term half (decision 0004 §4.5.4): the latest grant came
+    /// from an owner at term `T' > mgr_term`, and appender 0's Live page
+    /// names that owner's incarnation (`p.term == grant_term`).
+    reasserted: bool = true,
     /// A sibling page turned Recovering after the last confirmed
     /// registration, and no `r` line of this process covers it.
     sibling_death: bool = false,
@@ -699,14 +713,15 @@ pub const PrSubmit = struct {
     }
 };
 
-/// C1's page evidence (a successor) and C2 (this incarnation still Live):
+/// C1's page + grant-term evidence (a successor whose owner term matches
+/// the latest grant's `T' > mgr_term`) and C2 (this incarnation still Live):
 /// re-register through the rule once writes already submitted on this
 /// controller have completions (DO.33). An unreadable report, a lapse, a
 /// sibling death, a manager, or a terminal word does not register.
 pub fn wantsRegister(o: Observation, report_readable: bool, pr_sem_allowed: bool, word: ?*const Resolution) bool {
     if (!report_readable or !pr_sem_allowed) return false;
     if (word) |w| if (w.snapshot().state == .terminal) return false;
-    if (o.host_registered or !o.own_page_live) return false;
+    if (o.host_registered or !o.own_page_live or !o.reasserted) return false;
     const c = classify(o);
     return c.verdict == .held and c.arm == .succession;
 }
@@ -1514,4 +1529,62 @@ test "member fence: unreadable recheck caches a negative entry for the current t
     try testing.expectEqual(Resolution.State.cleared, w.snapshot().state);
     try testing.expectEqual(@as(Gen, 1), w.snapshot().gen);
     try testing.expectEqual(@as(u32, 2), probe.calls.load(.acquire));
+}
+
+test "member fence: C1 requires appender 0's successor term > mgr_term and matching the latest grant_term" {
+    const pages = [_]PageView{
+        .{ .appender_id = 0, .state = .live, .writer_id = 0x20, .node_token = 0xbb, .term = 2 },
+        .{ .appender_id = 1, .state = .live, .writer_id = 0x11, .node_token = 0xaa, .term = 1 },
+    };
+    const report: ReportView = .{ .readable = true, .rtype = 3, .host_registered = false };
+    var w: Resolution = .{};
+    var rm = Readmit.joiner();
+    rm.word = &w;
+
+    // 1. Successor page visible at term 2 (> mgr_term 1), but grant_term is still 1 (prior manager):
+    // holds (Arm.succession), yet wantsRegister is false until the successor's grant lands.
+    const stale_grant: SelfView = .{
+        .appender_id = 1,
+        .writer_id = 0x11,
+        .node_token = 0xaa,
+        .term = 1,
+        .mgr_writer = 0x10,
+        .mgr_term = 1,
+        .grant_term = 1,
+    };
+    try testing.expectEqual(Verdict.held, rm.beat(stale_grant, &pages, report));
+    try testing.expect(rm.obs.successor_page);
+    try testing.expect(!rm.obs.reasserted);
+    try testing.expect(!wantsRegister(rm.obs, true, true, &w));
+
+    // 2. Grant arrives from the successor at term 2 (grant_term == p0.term > mgr_term):
+    // C1 holds and wantsRegister becomes true.
+    const reasserted_grant: SelfView = .{
+        .appender_id = 1,
+        .writer_id = 0x11,
+        .node_token = 0xaa,
+        .term = 1,
+        .mgr_writer = 0x10,
+        .mgr_term = 1,
+        .grant_term = 2,
+    };
+    try testing.expectEqual(Verdict.held, rm.beat(reasserted_grant, &pages, report));
+    try testing.expect(rm.obs.successor_page);
+    try testing.expect(rm.obs.reasserted);
+    try testing.expect(wantsRegister(rm.obs, true, true, &w));
+
+    // 3. A page at term <= mgr_term is not a successor at all.
+    const regressed_mgr: SelfView = .{
+        .appender_id = 1,
+        .writer_id = 0x11,
+        .node_token = 0xaa,
+        .term = 1,
+        .mgr_writer = 0x10,
+        .mgr_term = 2,
+        .grant_term = 2,
+    };
+    try testing.expectEqual(Verdict.held, rm.beat(regressed_mgr, &pages, report));
+    try testing.expect(!rm.obs.successor_page);
+    try testing.expect(!rm.obs.reasserted);
+    try testing.expect(!wantsRegister(rm.obs, true, true, &w));
 }

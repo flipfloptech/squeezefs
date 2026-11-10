@@ -124,6 +124,12 @@ pub const ParkGate = struct {
     /// The member's `T_self` judgement for the committers (`bindSelfFence`
     /// once the first grant is learnt; null = the beat's alone).
     self_fence: ?SelfFence = null,
+    /// When `reason == .succession`, a membership reclaim (`reclaimUnderPark`)
+    /// records its grant here without releasing the gate early: `JoinedSet`
+    /// releases the gate once the host's metadata PR re-registration lands.
+    reclaimed_under_park: std.atomic.Value(bool) = .init(false),
+    reclaimed_wait_ns: u64 = 0,
+    reclaimed_rtt_ns: u64 = 0,
 
     /// `arm_symmetric_appender(home_volume, t_park_max)`.
     pub fn arm(io: Io, home_volume: u16, t_park_max_ms: u64) ParkGate {
@@ -225,8 +231,17 @@ pub const ParkGate = struct {
     /// Park for `reason`. Null when this call did not park (already parked,
     /// expired or retired).
     pub fn parkFor(self: *ParkGate, reason: Reason, now_mono_ns: u64) ?u32 {
-        if (self.state.cmpxchgStrong(@backingInt(Word.running), @backingInt(Word.parked), .seq_cst, .seq_cst) != null) return null;
+        if (self.state.cmpxchgStrong(@backingInt(Word.running), @backingInt(Word.parked), .seq_cst, .seq_cst) != null) {
+            if (self.isParked()) {
+                if (reason == .succession) self.reason = .succession;
+                if (reason == .t_self) self.reclaimed_under_park.store(false, .release);
+            }
+            return null;
+        }
         self.reason = reason;
+        self.reclaimed_under_park.store(false, .release);
+        self.reclaimed_wait_ns = 0;
+        self.reclaimed_rtt_ns = 0;
         self.extended_for.store(0, .release);
         self.parked_at_mono_ns.store(now_mono_ns, .release);
         const inflight = self.inflight.load(.seq_cst);
@@ -288,13 +303,18 @@ pub const ParkGate = struct {
     /// `expire*`), every parker woken, the phases recorded exact-sum.
     pub fn release(self: *ParkGate, wait_successor_ns: u64, reclaim_rtt_ns: u64) bool {
         if (self.state.cmpxchgStrong(@backingInt(Word.parked), @backingInt(Word.running), .seq_cst, .seq_cst) != null) return false;
+        const waited = if (wait_successor_ns == 0 and reclaim_rtt_ns == 0) self.reclaimed_wait_ns else wait_successor_ns;
+        const rtt = if (wait_successor_ns == 0 and reclaim_rtt_ns == 0) self.reclaimed_rtt_ns else reclaim_rtt_ns;
+        self.reclaimed_under_park.store(false, .release);
+        self.reclaimed_wait_ns = 0;
+        self.reclaimed_rtt_ns = 0;
         self.extended_for.store(0, .release);
         self.reason = .t_self;
         stats.appender_parked.set(@backingInt(Word.running));
         stats.slot_lease_reclaims.inc();
-        stats.appender_park_ns[@backingInt(Phase.wait_successor)].record(wait_successor_ns);
-        stats.appender_park_ns[@backingInt(Phase.reclaim_rtt)].record(reclaim_rtt_ns);
-        stats.appender_park_ns[@backingInt(Phase.total)].record(wait_successor_ns + reclaim_rtt_ns);
+        stats.appender_park_ns[@backingInt(Phase.wait_successor)].record(waited);
+        stats.appender_park_ns[@backingInt(Phase.reclaim_rtt)].record(rtt);
+        stats.appender_park_ns[@backingInt(Phase.total)].record(waited + rtt);
         self.wakeAll();
         return true;
     }
@@ -390,6 +410,12 @@ pub fn reclaimUnderPark(gate: *ParkGate, answer: ReclaimAnswer, now_mono_ns: u64
     switch (answer) {
         .granted => {
             const waited = gate.parkedAgeNs(now_mono_ns) -| reclaim_rtt_ns;
+            if (gate.reason == .succession) {
+                gate.reclaimed_wait_ns = waited;
+                gate.reclaimed_rtt_ns = reclaim_rtt_ns;
+                gate.reclaimed_under_park.store(true, .release);
+                return .rejoined;
+            }
             return if (gate.release(waited, reclaim_rtt_ns)) .rejoined else .fenced;
         },
         .unknown_lease => {

@@ -2528,7 +2528,7 @@ fn readyOrDead(rig: *Rig, d: usize) !bool {
 
 const ident_c: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0", .hostid = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0" };
 
-test "nvmet fidelity: stale sibling — one manager per volume and per-host fencing's safety rule on a three-host set: B (host A's manager) and A (a joiner on host A) under host A's one identity (B registers the host, A adopts); B frozen (SIGSTOP) past the claim's TTL; two successors on hosts B and C race for the role — P1 arbitrates and parks before its claim (SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD), P2 arbitrates meanwhile: the device keeps ONE holder (WERO), so P2's acquire conflicts and preempts P1's host, P2 binds and P1, released, never does (review round 3 N1: under rtype 5 both bound); host A was fenced by the takeover — A's fsync refused; a fresh mount on host A whose kill of B is refused (SQUEEZEFS_TEST_SIBLING_KILL_REFUSED) refuses its registration loud by name and exits, B alive; A2 kills the superseded manager B (and A, if evicted meanwhile) before it registers host A, joins P2 and writes; P2 reads it" {
+test "nvmet fidelity: stale sibling — one manager per volume and per-host fencing's safety rule on a three-host set: B (host A's manager) and A (a joiner on host A) under host A's one identity (B registers the host, A adopts); B frozen (SIGSTOP) past the claim's TTL; two successors on hosts B and C race for the role — P1 arbitrates and parks before its claim (SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD), P2 arbitrates meanwhile: the device keeps ONE holder (WERO), so P2's acquire conflicts and preempts P1's host, P2 binds and P1, released, never does (review round 3 N1: under rtype 5 both bound); host A was fenced by the takeover — a fresh mount on host A whose kill of B is refused (SQUEEZEFS_TEST_SIBLING_KILL_REFUSED) refuses its registration loud by name and exits, B alive; A's fsync then re-registers, killing the superseded B (decision 0004 §4.5.5), and the write lands; A2, after A is killed, adopts the standing registration, joins P2 and writes; P2 reads both" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -2582,20 +2582,9 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
     // ONE manager: the later arbiter (P2) preempted P1's host; P1 never binds.
     try testing.expect(p2_ready);
     try testing.expect(!p1_ready);
-    // Host A was fenced by the takeover (B's key, host A's, preempted): A's
-    // fsync is refused at the device (or A, parked past its bound, is gone).
-    const a_wrote = scriptSucceeds(rig, a, "echo x > da/z && sync -d da/z") catch false;
-    try testing.expect(!a_wrote);
-    {
-        // Host C and P2's fencer: every takeover preempt took the superseded
-        // host's fencer with it (host A's, then P1's host B's).
-        const rr = try rig.resvReportJson(cm.dev());
-        defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
-    }
     // A stale sibling that can be neither proven dead nor killed refuses the
     // registration loud by name: the mount exits, B lives on, host A stays
-    // unregistered.
+    // unregistered. This runs before A's fsync, which kills B.
     {
         var env_r = try rig.envWithKnob("SQUEEZEFS_TEST_SIBLING_KILL_REFUSED", "1");
         defer env_r.deinit();
@@ -2617,26 +2606,46 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
         defer gpa.free(rr);
         try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
     }
-    // A, fenced with its host, is stopped by hand: whether P2 evicted it
-    // yet is timing, so the rule below meets exactly one live stale sibling.
+    // Host A was fenced by the takeover. A's fsync re-registers through the
+    // rule, which kills the superseded B, and the write lands (decision
+    // 0004 §4.5.5). Host C, P2's fencer, and host A are the registrants.
+    const a_wrote = scriptSucceeds(rig, a, "echo x > da/z && sync -d da/z") catch false;
+    if (!a_wrote) {
+        if (rig.readLog(a)) |text| {
+            defer gpa.free(text);
+            std.debug.print("\n--- A's log after the refused fsync ---\n{s}\n", .{text});
+        } else |_| {}
+    }
+    try testing.expect(a_wrote);
+    try testing.expect(!alive(pid_b));
+    {
+        const sa = try rig.stats(a);
+        defer gpa.free(sa);
+        try testing.expect((try statNumber(sa, "pr_stale_sibling_kills")) >= 1);
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, 3), json_scan.number(rr, "regctl"));
+    }
+    // A is stopped by hand. B is already dead, so A2 adopts or registers
+    // without a kill and joins P2.
     try rig.kill9(a);
-    // A2 re-registers host A — never while the superseded B lives.
     const a2 = try rig.spawnMount("ss-a2", set.metaUri(), null, &.{});
     try rig.awaitLog(a2, "ready: ", ready_wait_ns);
     try testing.expect(!alive(pid_b));
     {
         const s2 = try rig.stats(a2);
         defer gpa.free(s2);
-        try testing.expectEqual(@as(u64, 1), try statNumber(s2, "pr_stale_sibling_kills"));
-        try testing.expectEqual(@as(u64, 1), try statNumber(s2, "pr_host_registrations"));
+        const admitted = (try statNumber(s2, "pr_host_registrations")) + (try statNumber(s2, "pr_host_adoptions"));
+        try testing.expectEqual(@as(u64, 1), admitted);
+        try testing.expectEqual(@as(u64, 0), try statNumber(s2, "pr_stale_sibling_kills"));
         try testing.expectEqual(@as(u64, 0), try statNumber(s2, "pr_stale_sibling_refusals"));
     }
-    const after = try rig.onMount(a2, "mkdir d2 && echo after > d2/g && sync -d d2/g && cat f d2/g");
+    const after = try rig.onMount(a2, "mkdir d2 && echo after > d2/g && sync -d d2/g && cat f da/z d2/g");
     defer gpa.free(after);
-    try testing.expectEqualStrings("before\nafter\n", after);
-    const seen = try rig.onMount(p2, "cat d2/g");
+    try testing.expectEqualStrings("before\nx\nafter\n", after);
+    const seen = try rig.onMount(p2, "cat da/z d2/g");
     defer gpa.free(seen);
-    try testing.expectEqualStrings("after\n", seen);
+    try testing.expectEqualStrings("x\nafter\n", seen);
     try rig.kill9(b);
     try rig.kill9(p1);
     try rig.umount(a2);

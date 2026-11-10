@@ -1312,11 +1312,11 @@ pub const DataFence = struct {
     /// declines; an unreserved data namespace retries (a lapse);
     /// `classifyForData` on every joined metadata volume — pending or an
     /// unreadable input holds and pends `data_resolution[d]`, a fence
-    /// declines; a member slow after a lapse — the lapse still pending
-    /// here, metadata settled and this incarnation current, before and
-    /// after a register through the stale-sibling rule — retries, stores
-    /// `cleared`, and the command goes once more. Anything else declines,
-    /// and the fence latches.
+    /// declines; metadata settled and this incarnation current (a lapse
+    /// re-admission, or a data-only fence: a reconcile or §DJ.12(b)'s stray
+    /// preempt) registers through the stale-sibling rule, stores `cleared`,
+    /// and the command goes once more. Anything else declines, and the
+    /// fence latches.
     pub fn readmitAfterRefusal(self: *DataFence, vol_tag: u64) nvme_dev.ReadmitAnswer {
         self.lock.lock();
         defer self.lock.unlock();
@@ -2213,7 +2213,7 @@ fn pgRecovering(aid: u32, node: u64, wid: u64) appender_page.Page {
     return p;
 }
 
-test "decision 0003 §DL, a member slow on data: after a PTPL-less restart the joiner re-registers on metadata but not yet on data and the manager re-reserves WEAR without it — its refused write is re-admitted (registered on metadata, its page Live, the lapse pending; the registration fresh, counted); once its beat saw itself registered under the reservation the lapse is over and a refusal is a fence (declined); a host fenced on metadata, and a member whose page left Live, are never re-admitted" {
+test "decision 0003 §DL, a member slow on data: after a PTPL-less restart the joiner re-registers on metadata but not yet on data and the manager re-reserves WEAR without it — its refused write is re-admitted (registered on metadata, its page Live, the lapse pending; the registration fresh, counted); once its beat saw itself registered under the reservation the lapse is over and a data-only preempt is re-admitted (decision 0004 §4.5.5), not latched; a host fenced on metadata, and a member whose page left Live, are never re-admitted" {
     const gpa = testing.allocator;
     const fake = @import("fake_nvme.zig");
     var tb: [128]u8 = undefined;
@@ -2303,12 +2303,20 @@ test "decision 0003 §DL, a member slow on data: after a PTPL-less restart the j
     try testing.expect(!dns.isRegistered(0x3333));
     try testing.expectEqual(declined0 + 2, stats.data_pr_refusal_readmissions_declined.load());
     // J's beat sees itself registered under the reservation: the lapse is
-    // over; a later refusal (its host fenced on data) latches.
+    // over. A later data-only preempt is a stray fence with metadata
+    // settled (decision 0004 §4.5.5, §DJ.12(b)): the synchronous arm
+    // re-admits. It is not a succession, and it does not latch.
     dj.beat();
     try testing.expect(!dj.vols[0].lapse_pending);
     try dm.clients[0].preemptAndAbort(0x2222);
-    try testing.expectEqual(nvme_dev.ReadmitVerdict.decline, dj.readmitAfterRefusal(1).verdict);
-    try testing.expect(!dns.isRegistered(0x2222));
+    const re1 = stats.data_pr_refusal_readmissions.load();
+    const succ1 = stats.data_pr_succession_reregistrations.load();
+    const declined1 = stats.data_pr_refusal_readmissions_declined.load();
+    try testing.expectEqual(nvme_dev.ReadmitVerdict.retry, dj.readmitAfterRefusal(1).verdict);
+    try testing.expect(dns.isRegistered(0x2222));
+    try testing.expectEqual(re1 + 1, stats.data_pr_refusal_readmissions.load());
+    try testing.expectEqual(succ1, stats.data_pr_succession_reregistrations.load());
+    try testing.expectEqual(declined1, stats.data_pr_refusal_readmissions_declined.load());
 }
 
 test "decision 0004 §4.5.5: a current joiner unregistered on metadata answers held for a data refusal, and the decline counter does not move" {

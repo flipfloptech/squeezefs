@@ -1092,6 +1092,11 @@ pub const JoinedSet = struct {
     fn parkForSuccession(ctx: ?*anyopaque) void {
         const self: *JoinedSet = @ptrCast(@alignCast(ctx.?));
         if (self.membershipHoldActive()) return;
+        // No device fence (a file, a loop device, RESCAP 0): there is no
+        // metadata registration for the succession hold to wait on. Upgrading
+        // a T_self park to succession would keep the gate parked until
+        // T_park_max and poison the joiner (the kill-matrix rows).
+        if (self.fence == null) return;
         _ = self.park_gate.parkFor(.succession, clock.monotonicNs());
     }
 
@@ -2070,12 +2075,33 @@ test "member fence: a held membership beat does not park for succession" {
     js.member_beat_held = .init(true);
     js.member_beat_hold_done = .init(false);
     js.member_beat_hold_path = null;
+    // Non-null so this row is the hold, not the no-fence case. The callback
+    // only tests the pointer for null.
+    var fence_sentinel: host_fence.Joiner = undefined;
+    js.fence = &fence_sentinel;
     js.park_gate = park.ParkGate.arm(testing.io, 0, 48_000);
     JoinedSet.parkForSuccession(@ptrCast(&js));
     try testing.expect(!js.park_gate.isParked());
     js.member_beat_held.store(false, .release);
     JoinedSet.parkForSuccession(@ptrCast(&js));
     try testing.expect(js.park_gate.isParked());
+    try testing.expectEqual(park.Reason.succession, js.park_gate.reason);
+}
+
+test "member fence: no device fence does not take a succession park" {
+    var js: JoinedSet = undefined;
+    js.member_beat_held = .init(false);
+    js.member_beat_hold_done = .init(false);
+    js.member_beat_hold_path = null;
+    js.fence = null;
+    js.park_gate = park.ParkGate.arm(testing.io, 0, 48_000);
+    _ = js.park_gate.parkFor(.t_self, 1);
+    JoinedSet.parkForSuccession(@ptrCast(&js));
+    try testing.expect(js.park_gate.isParked());
+    try testing.expectEqual(park.Reason.t_self, js.park_gate.reason);
+    _ = js.park_gate.release(0, 0);
+    JoinedSet.parkForSuccession(@ptrCast(&js));
+    try testing.expect(!js.park_gate.isParked());
 }
 
 test "KD20: a dismount does not wait when no held write is in flight" {

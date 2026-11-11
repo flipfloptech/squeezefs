@@ -5,7 +5,7 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5` is at `51f0187b`.** No upstream.
+**Branch `feat/pr5`.** `identityHolds` is `51f0187b` (parent `938cdb9f`). No upstream.
 Not pushed. Not merged. `dev` (and the parent of this branch) is `b40ac017`
 (`fix(meta): do not succession-park a volume with no device fence`).
 

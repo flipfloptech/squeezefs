@@ -5,12 +5,13 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** The report-first commit's parent is `7c7feecc`. No upstream.
+**Branch `feat/pr5`.** HEAD when this note was written is the docs commit on top of
+`d75445b9`. Report-first recovery is `d75445b9`. Do not amend it. No upstream.
 Not pushed. Not merged. `dev` is `b40ac017`.
 
 Decision 0004 is the spec. PR-5 is not finished. W_end, the fence debt, `identityHolds`,
 the registration lock, rule markers, the re-acquire mark, the frozen-joiner kill, and
-report-first recovery are committed.
+report-first recovery are committed. The hashes are in the table below.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
@@ -35,11 +36,11 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | `ef1c472c` | W_end evicts a listed writer whose key is missing from a managed namespace, then reconciles and clears the window. `writer_guard_succession_evictions`. The reconcile no longer runs at settle. |
 | `938cdb9f` | Volume 0's claim records `meta_fence_debt`. Admission pays every key it names, then deletes the record. F1: `data_pr_debt_preempts` 1, `data_pr_reconcile_preempts` 0, 41/41. |
 | `51f0187b` | Appender 0's page is ours, usurped, or unreadable (§4.4.2). See below. |
-| registration lock | `.register` is its own flock. A rule and a manager mutation hold it across the page check and the command. See below. |
-| markers | A metadata rule's `.reg` / `.wd` / `.abandoned` marker. A section refuses while one stands. The hold check acquires and then removes that volume's judged markers. See below. |
-| re-acquire mark | `a <boottime_ns> <generation>` on the manager's registry line, written under the registration lock. The re-judge kills an unmarked manager when a restart filled in after the re-read. See below. |
-| frozen joiner | The same holder across one member-death bound, every thread stopped or the cgroup frozen, and an unjoined joiner line. See below. |
-| report-first | A death fence whose key the report already shows absent is `.fenced` and issues no preempt. `appender_recovery_keys_absent`. See below. |
+| `1fffe4ea` | `.register` is its own flock. A rule and a manager mutation hold it across the page check and the command. See below. |
+| `415fbdef` | A metadata rule's `.reg` / `.wd` / `.abandoned` marker. A section refuses while one stands. The hold check acquires and then removes that volume's judged markers. See below. |
+| `ef271bf2` | `a <boottime_ns> <generation>` on the manager's registry line, written under the registration lock. The re-judge kills an unmarked manager when a restart filled in after the re-read. See below. |
+| `7c7feecc` | The same holder across one member-death bound, every thread stopped or the cgroup frozen, and an unjoined joiner line. See below. |
+| `d75445b9` | A death fence whose key the report already shows absent is `.fenced` and issues no preempt. `appender_recovery_keys_absent`. See below. |
 
 ## What is true in the code
 

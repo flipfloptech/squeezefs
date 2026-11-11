@@ -142,7 +142,7 @@ pub const Guard = struct {
     keep_hold: bool = false,
     /// Open when this incarnation's hold was a preempt-all of another
     /// manager (decision 0004 §4.6). A first manager's acquire opens none.
-    /// `settled` stays set; W_end is what clears the window.
+    /// `settled` is this volume's half of W_end; `endSuccession` clears it.
     succession: ?SuccessionWindow = null,
     /// Once, when the window settles: the data fence's reconcile
     /// (decision 0004 §4.7). Admission binds it.
@@ -318,10 +318,28 @@ pub const Guard = struct {
         guard.stats.succession_settles.inc();
         if (early) guard.stats.succession_early_settles.inc();
         log.info("meta volume {s}: the succession window settled ({s})", .{ g.be.path, if (early) "before the grace deadline" else "at the grace deadline" });
-        // After the counters, so a reader that sees the settle has the
-        // reconcile behind it. The hook takes the data-fence lock, never
-        // this client's.
+    }
+
+    /// This volume's half of W_end is done: the census completed and every
+    /// key it named is registered here. The wire plane waits for every
+    /// managed volume before it evicts (decision 0004 §4.6, §4.10).
+    pub fn successionSettled(g: *const Guard) bool {
+        const w = g.succession orelse return false;
+        return w.settled;
+    }
+
+    /// W_end's last two steps for this volume (decision 0004 §4.6 steps 3
+    /// and 4; the model's `.reconcile`, then the window cleared). The data
+    /// reconcile runs first — `endSuccession` is idempotent — and the
+    /// window is cleared after it, so a lapse beat that races the reconcile
+    /// still sees the window and stays suppressed. A window that never
+    /// opened, or that is not settled yet, is left alone.
+    pub fn endSuccession(g: *Guard) void {
+        const w = g.succession orelse return;
+        if (!w.settled) return;
         if (g.settle_hook) |h| h.run(h.ctx);
+        g.succession = null;
+        log.info("meta volume {s}: the succession window closed", .{g.be.path});
     }
 
     fn keysOnReport(c: *pr.Client, keys: []const u64) bool {
@@ -2433,6 +2451,65 @@ test "decision 0003 §DL, the lapse grace's early end: the hold returns at the f
     try testing.expectEqual(@as(u32, 1), kicks.lapse);
     try testing.expectEqual(@as(u32, 1), kicks.hold);
     try testing.expect(!be.isFailed());
+}
+
+/// The census a fixture drives: pending until it says the members are back.
+const WendCensus = struct {
+    pending: bool = true,
+    keys: []const u64 = &.{},
+    /// The lapse path's census. This fixture never reaches a lapse.
+    fn none(_: *anyopaque, _: Allocator) error{ Incomplete, OutOfMemory }![]u64 {
+        return error.Incomplete;
+    }
+    fn view(ctx: *anyopaque, gpa: Allocator) error{OutOfMemory}!Guard.SuccessionView {
+        const self: *WendCensus = @ptrCast(@alignCast(ctx));
+        if (self.pending) return .pending;
+        return .{ .complete = .{ .keys = try gpa.dupe(u64, self.keys), .early = true } };
+    }
+};
+
+test "W_end (decision 0004 §4.6): the window settles without reconciling; it is not cleared, and the reconcile does not run, until endSuccession — which runs the reconcile and then clears it, once" {
+    const gpa = testing.allocator;
+    const v = try Vol.create(gpa, "wend", "600000");
+    defer v.destroy();
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var host: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
+    const me = ident(boot_a, 4000, 780);
+    const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
+    defer be.close();
+    const g = be.guard.?;
+    // The open acquired on an unreserved namespace, so it opened no window.
+    g.succession = .{ .since_ns = 1 };
+    var ran: u32 = 0;
+    const Hook = struct {
+        fn run(ctx: *anyopaque) void {
+            const n: *u32 = @ptrCast(@alignCast(ctx));
+            n.* += 1;
+        }
+    };
+    g.settle_hook = .{ .ctx = &ran, .run = &Hook.run };
+    var census: WendCensus = .{};
+    g.bindCensus(.{ .ctx = &census, .keys = &WendCensus.none, .succession = &WendCensus.view });
+    g.trySettleSuccession();
+    try testing.expect(!g.successionSettled());
+    try testing.expectEqual(@as(u32, 0), ran);
+    // Ending before the settle does nothing: the reconcile stays behind the
+    // eviction, which waits for every managed volume.
+    g.endSuccession();
+    try testing.expect(g.succession != null and !g.successionSettled());
+    try testing.expectEqual(@as(u32, 0), ran);
+    census.pending = false;
+    g.trySettleSuccession();
+    try testing.expect(g.successionSettled());
+    try testing.expectEqual(@as(u32, 0), ran);
+    try testing.expect(g.succession != null);
+    g.endSuccession();
+    try testing.expect(g.succession == null);
+    try testing.expectEqual(@as(u32, 1), ran);
+    // Cleared once: a second end does not reconcile again.
+    g.endSuccession();
+    try testing.expectEqual(@as(u32, 1), ran);
 }
 
 test "decision 0003 §DL: a flat (single-writer) volume has no member to wait for — its lapse grace ends at the first lapse beat" {

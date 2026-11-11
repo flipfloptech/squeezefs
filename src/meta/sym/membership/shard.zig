@@ -978,6 +978,60 @@ pub const Owner = struct {
         return null;
     }
 
+    /// W_end's eviction (decision 0004 §4.6 step 2; the model's `.evict`):
+    /// every listed writer who re-asserted — a row, or a re-assertion's
+    /// join — and whose host key is not registered on every managed
+    /// namespace, shipped as a death with the key it holds now. Someone the
+    /// reap already shipped never re-asserted, so is not listed here. A key
+    /// of 0 owns no region. `missing` is called outside the lock (a report
+    /// per namespace); the row delete and the sink are too, one entry per
+    /// hold, as `expireDue` does.
+    pub fn evictUnregistered(self: *Owner, now_ms: u64, missing: *const fn (ctx: *anyopaque, key: u64) bool, ctx: *anyopaque) u32 {
+        var n: u32 = 0;
+        var next: usize = 0;
+        while (self.nextUnregistered(now_ms, &next, missing, ctx)) |gone| {
+            self.deleteRow(&gone);
+            if (self.death_sink) |s| s.noteDeath(s.ctx, .{ .id = gone.id, .identity = memberIdentity(gone.id), .epoch = gone.epoch, .pr_key = gone.pr_key });
+            n += 1;
+        }
+        if (n != 0) {
+            const r = self.lockRoster();
+            defer self.unlockRoster();
+            r.publishCounts();
+        }
+        return n;
+    }
+
+    /// The next re-asserted writer at or after `next.*` whose key
+    /// `missing` says is absent from some managed namespace, removed.
+    /// `missing` runs outside the lock. A member a leave swaps behind the
+    /// cursor meanwhile is judged at the next call.
+    fn nextUnregistered(self: *Owner, now_ms: u64, next: *usize, missing: *const fn (ctx: *anyopaque, key: u64) bool, ctx: *anyopaque) ?MemberState {
+        while (true) {
+            const cand: ?struct { id: MemberId, key: u64 } = blk: {
+                const r = self.lockRoster();
+                defer self.unlockRoster();
+                const g = r.grace orelse return null;
+                while (next.* < r.members.items.len) {
+                    const i = next.*;
+                    const m = &r.members.items[i];
+                    next.* += 1;
+                    if (m.role != .writer or m.pr_key == 0) continue;
+                    if (!g.hasReasserted(m.id)) continue;
+                    break :blk .{ .id = m.id, .key = m.pr_key };
+                }
+                break :blk null;
+            };
+            const c = cand orelse return null;
+            if (!missing(ctx, c.key)) continue;
+            const r = self.lockRoster();
+            defer self.unlockRoster();
+            const i = r.indexOf(c.id) orelse continue;
+            if (r.members.items[i].pr_key != c.key) continue;
+            return r.remove(i, now_ms, self.clocks.t_owner_ms);
+        }
+    }
+
     pub fn graceRemainingMs(self: *Owner, now_ms: u64) u64 {
         const r = self.lockRoster();
         defer self.unlockRoster();
@@ -2406,6 +2460,56 @@ test "succession census (decision 0004 §4.6): no grace is none; pending until e
             else => return error.CensusNotComplete,
         }
     }
+}
+
+/// The managed namespaces a W_end eviction is judged against: `absent` is
+/// missing from one of them.
+const NsReports = struct {
+    absent: u64 = 0,
+    fn missing(ctx: *anyopaque, key: u64) bool {
+        const self: *NsReports = @ptrCast(@alignCast(ctx));
+        return key == self.absent;
+    }
+};
+
+test "W_end eviction (decision 0004 §4.6 step 2): a listed writer who re-asserted and whose key is not registered on every managed namespace is evicted with that key; one registered everywhere stays; one who never re-asserted is the reap's, not this step's; a key of 0 is not evicted; a second pass evicts nobody" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    const back_id = writerMemberId(testIdentity(1));
+    const gone_id = writerMemberId(testIdentity(2));
+    const silent_id = writerMemberId(testIdentity(3));
+    const zero_id = writerMemberId(testIdentity(4));
+    const expected = [_]Expected{
+        .{ .id = back_id, .key = 0xA11 },
+        .{ .id = gone_id, .key = 0xB22 },
+        .{ .id = silent_id, .key = 0xC33 },
+        .{ .id = zero_id, .key = 0 },
+    };
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &expected, &.{}, 1_000);
+    defer o.deinit();
+    var deaths: Deaths = .{};
+    defer deaths.list.deinit(gpa);
+    o.bindDeathSink(deaths.sink());
+    var kept = joinReqOf(1, 1, "/kept");
+    kept.pr_key = 0xA11;
+    _ = o.join(kept, 1_100).granted;
+    var dropped = joinReqOf(2, 1, "/dropped");
+    dropped.pr_key = 0xB22;
+    _ = o.join(dropped, 1_200).granted;
+    var zero = joinReqOf(4, 1, "/zero");
+    zero.pr_key = 0;
+    _ = o.join(zero, 1_300).granted;
+    var reports: NsReports = .{ .absent = 0xB22 };
+    try testing.expectEqual(@as(u32, 1), o.evictUnregistered(1_400, NsReports.missing, &reports));
+    try testing.expectEqual(@as(usize, 1), deaths.list.items.len);
+    try testing.expect(deaths.list.items[0].identity.?.sameMember(testIdentity(2)));
+    try testing.expectEqual(@as(u64, 0xB22), deaths.list.items[0].pr_key);
+    try testing.expect(o.member(back_id) != null);
+    try testing.expect(o.member(silent_id) == null);
+    try testing.expect(o.member(zero_id) != null);
+    try testing.expect(o.member(gone_id) == null);
+    try testing.expectEqual(@as(u32, 0), o.evictUnregistered(1_500, NsReports.missing, &reports));
+    try testing.expectEqual(@as(usize, 1), deaths.list.items.len);
 }
 
 /// Two callers of one owner raced at a hook site (decision 0003 §DM): the

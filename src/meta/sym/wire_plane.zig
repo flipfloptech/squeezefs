@@ -1951,11 +1951,60 @@ pub const WirePlane = struct {
         // After the reap, so a deadline that just shipped its deaths can
         // settle on this same tick (decision 0004 §4.6).
         for (self.set.volumes) |be| if (be.guard) |g| g.trySettleSuccession();
+        // W_end (decision 0004 §4.6, §4.10; the model's `.evict` then
+        // `.reconcile`): once every managed volume that opened a window has
+        // settled — or, past the grace deadline, once the reap above has
+        // shipped the unreasserted — evict every listed writer whose key is
+        // not registered on every managed namespace, then reconcile and
+        // clear. A volume with no window does not hold the others.
+        const ended = self.endSuccession(m, now);
         const rep = m.projection.run(now, @intCast(clock.realtimeCoarseNs()));
-        if (evicted != 0 or reaped != 0 or rep.deaths != 0 or rep.released != 0 or rep.retired != 0) {
-            log.info("cluster wire: tick — {d} evicted at T_owner, {d} reaped at the grace deadline; ledger: {d} death record(s) standing, {d} acted, {d} region(s) released, {d} retired, {d} parked record(s) drained", .{ evicted, reaped, rep.deaths, rep.acted, rep.released, rep.retired, rep.drained });
+        if (evicted != 0 or reaped != 0 or ended != 0 or rep.deaths != 0 or rep.released != 0 or rep.retired != 0) {
+            log.info("cluster wire: tick — {d} evicted at T_owner, {d} reaped at the grace deadline, {d} evicted at the succession's end; ledger: {d} death record(s) standing, {d} acted, {d} region(s) released, {d} retired, {d} parked record(s) drained", .{ evicted, reaped, ended, rep.deaths, rep.acted, rep.released, rep.retired, rep.drained });
         }
         if (rep.role_released) log.err("cluster wire: volume 0 unreachable for longer than T_owner — the manager role is released (the mount serves until its fence)", .{});
+    }
+
+    /// W_end, once (decision 0004 §4.6). Every managed volume that opened a
+    /// window must have settled, and past the grace deadline the reap has
+    /// already run on this tick. Then: evict every listed writer whose key
+    /// is not registered on every managed namespace, reconcile each volume's
+    /// data, and clear its window. A volume with no device fence has no
+    /// report to refuse a key, so it holds nothing. Answers how many writers
+    /// were evicted.
+    fn endSuccession(self: *WirePlane, m: *ManagerHalf, now: u64) u32 {
+        if (m.owner.graceRemainingMs(now) != 0) {
+            for (self.set.volumes) |be| if (be.guard) |g| {
+                if (g.succession != null and !g.successionSettled()) return 0;
+            };
+        }
+        var open = false;
+        for (self.set.volumes) |be| if (be.guard) |g| {
+            if (g.successionSettled()) open = true;
+        };
+        if (!open) return 0;
+        const n = m.owner.evictUnregistered(now, keyMissing, self);
+        for (self.set.volumes) |be| if (be.guard) |g| g.endSuccession();
+        if (n != 0) @import("../guard.zig").stats.succession_evictions.add(n);
+        return n;
+    }
+
+    /// Is `key` absent from some managed volume's namespace? A volume with
+    /// no PR client carries no registration to lack. A report that cannot be
+    /// read is not read as "absent": evicting on it would kill a writer
+    /// whose key may still be registered.
+    fn keyMissing(ctx: *anyopaque, host_key: u64) bool {
+        const self: *WirePlane = @ptrCast(@alignCast(ctx));
+        for (self.set.volumes) |be| {
+            const g = be.guard orelse continue;
+            const c = g.prClient() orelse continue;
+            c.lockOps();
+            defer c.unlockOps();
+            var rep = c.report() catch return false;
+            defer rep.deinit(c.gpa);
+            if (!rep.registered(host_key)) return true;
+        }
+        return false;
     }
 
     /// A `.stats` family: the listener and the shard (the manager's) or

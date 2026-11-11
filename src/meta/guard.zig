@@ -118,12 +118,16 @@ pub const Stats = struct {
     /// `writer_guard_succession_early_settles`: of those, settled before
     /// the grace deadline — every expected member back and registered.
     succession_early_settles: counters.ShardedCounter = .{},
+    /// `writer_guard_succession_evictions`: listed writers W_end evicted
+    /// because their host key was not registered on every managed namespace
+    /// (decision 0004 §4.6 step 2). One per writer, not per volume.
+    succession_evictions: counters.ShardedCounter = .{},
 };
 
 pub var stats: Stats = .{};
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"writer_guard_fenced\":{d},\"volume_fenced\":{d},\"writer_guard_pr_reacquires\":{d},\"writer_guard_claims_committed\":{d},\"writer_guard_heartbeats\":{d},\"writer_guard_heartbeat_failures\":{d},\"writer_guard_reclaims_dead_pid\":{d},\"writer_guard_preempts\":{d},\"writer_guard_preempt_alls\":{d},\"writer_guard_preempt_all_victims\":{d},\"writer_guard_preempt_all_unseen_events\":{d},\"writer_guard_pr_unavailable\":{d},\"writer_guard_claim_refusals\":{d},\"writer_guard_clear_cleared\":{d},\"writer_guard_clear_refusals\":{d},\"clients_registered\":{d},\"writer_guard_identity_mismatch\":{d},\"pr_host_registrations\":{d},\"pr_host_adoptions\":{d},\"pr_stale_sibling_kills\":{d},\"pr_siblings_proven_dead\":{d},\"pr_stale_sibling_refusals\":{d},\"writer_guard_claim_probes\":{d},\"writer_guard_claim_probe_bytes\":{d},\"writer_guard_claim_probe_frames\":{d},\"writer_guard_lapse_beats\":{d},\"writer_guard_lapse_early_ends\":{d},\"writer_guard_succession_settles\":{d},\"writer_guard_succession_early_settles\":{d},\"writer_guard_heartbeat_interval_s\":{d},\"writer_guard_stale_ttl_s\":{d}}}", .{
+    try w.print("{{\"writer_guard_fenced\":{d},\"volume_fenced\":{d},\"writer_guard_pr_reacquires\":{d},\"writer_guard_claims_committed\":{d},\"writer_guard_heartbeats\":{d},\"writer_guard_heartbeat_failures\":{d},\"writer_guard_reclaims_dead_pid\":{d},\"writer_guard_preempts\":{d},\"writer_guard_preempt_alls\":{d},\"writer_guard_preempt_all_victims\":{d},\"writer_guard_preempt_all_unseen_events\":{d},\"writer_guard_pr_unavailable\":{d},\"writer_guard_claim_refusals\":{d},\"writer_guard_clear_cleared\":{d},\"writer_guard_clear_refusals\":{d},\"clients_registered\":{d},\"writer_guard_identity_mismatch\":{d},\"pr_host_registrations\":{d},\"pr_host_adoptions\":{d},\"pr_stale_sibling_kills\":{d},\"pr_siblings_proven_dead\":{d},\"pr_stale_sibling_refusals\":{d},\"writer_guard_claim_probes\":{d},\"writer_guard_claim_probe_bytes\":{d},\"writer_guard_claim_probe_frames\":{d},\"writer_guard_lapse_beats\":{d},\"writer_guard_lapse_early_ends\":{d},\"writer_guard_succession_settles\":{d},\"writer_guard_succession_early_settles\":{d},\"writer_guard_succession_evictions\":{d},\"writer_guard_heartbeat_interval_s\":{d},\"writer_guard_stale_ttl_s\":{d}}}", .{
         stats.fenced.load(),
         stats.volume_fenced.load(),
         stats.pr_reacquires.load(),
@@ -153,6 +157,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.lapse_early_ends.load(),
         stats.succession_settles.load(),
         stats.succession_early_settles.load(),
+        stats.succession_evictions.load(),
         claim.HEARTBEAT_INTERVAL_S,
         claim.STALE_TTL_S,
     });
@@ -184,7 +189,7 @@ test "the stats JSON names every writer_guard_* family and the two constants" {
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
-    inline for (.{ "writer_guard_claim_probes", "writer_guard_claim_probe_bytes", "writer_guard_claim_probe_frames", "writer_guard_lapse_beats", "writer_guard_lapse_early_ends", "writer_guard_succession_settles", "writer_guard_succession_early_settles", "writer_guard_fenced", "volume_fenced", "writer_guard_pr_reacquires", "writer_guard_claims_committed", "writer_guard_heartbeats", "writer_guard_reclaims_dead_pid", "writer_guard_preempts", "writer_guard_preempt_alls", "writer_guard_preempt_all_victims", "writer_guard_preempt_all_unseen_events", "writer_guard_pr_unavailable", "clients_registered", "writer_guard_identity_mismatch", "pr_host_registrations", "pr_host_adoptions", "pr_stale_sibling_kills", "pr_siblings_proven_dead", "pr_stale_sibling_refusals" }) |k| {
+    inline for (.{ "writer_guard_claim_probes", "writer_guard_claim_probe_bytes", "writer_guard_claim_probe_frames", "writer_guard_lapse_beats", "writer_guard_lapse_early_ends", "writer_guard_succession_settles", "writer_guard_succession_early_settles", "writer_guard_succession_evictions", "writer_guard_fenced", "volume_fenced", "writer_guard_pr_reacquires", "writer_guard_claims_committed", "writer_guard_heartbeats", "writer_guard_reclaims_dead_pid", "writer_guard_preempts", "writer_guard_preempt_alls", "writer_guard_preempt_all_victims", "writer_guard_preempt_all_unseen_events", "writer_guard_pr_unavailable", "clients_registered", "writer_guard_identity_mismatch", "pr_host_registrations", "pr_host_adoptions", "pr_stale_sibling_kills", "pr_siblings_proven_dead", "pr_stale_sibling_refusals" }) |k| {
         try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"" ++ k ++ "\":") != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"writer_guard_stale_ttl_s\":45") != null);

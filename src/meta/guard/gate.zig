@@ -135,6 +135,10 @@ pub const Guard = struct {
     /// The hold stays at this incarnation's end: taken by a preempt or
     /// inherited (review 4 blocker 2, `host_fence.HoldOutcome.kept`).
     keep_hold: bool = false,
+    /// Open when this incarnation's hold was a preempt-all of another
+    /// manager (decision 0004 §4.6). A first manager's acquire opens none.
+    /// `settled` stays set; W_end is what clears the window.
+    succession: ?SuccessionWindow = null,
     /// The writer whose fresh claim the second early probe found, fenced by
     /// this open's preempt (review 4 minor 4): the gate takes it over.
     early_fenced_writer: ?u64 = null,
@@ -149,6 +153,7 @@ pub const Guard = struct {
     /// The membership census's live writer keys (decision 0003 §DL: the
     /// grace ends once each is registered again), bound by the wire plane's
     /// manager half while its owner shard stands; null = no early end.
+    /// `succession` on it is the window's census (decision 0004 §4.6).
     census: ?CensusKeys = null,
     /// The data fence's lapse beat (volume 0's guard): kicked when this beat
     /// first sees a lapse and when the hold returns (§DL).
@@ -190,12 +195,26 @@ pub const Guard = struct {
 
     pub const TestHook = struct { ctx: *anyopaque, fire: *const fn (ctx: *anyopaque) void };
 
-    /// The census's live writer keys: every writer member's host key (≠ 0,
-    /// distinct); `error.Incomplete` while a successor's census still fills
-    /// (its members re-asserting).
+    /// The succession window's census (decision 0004 §4.6). `complete.keys`
+    /// is owned by the caller: distinct, non-zero host keys of the members
+    /// that re-asserted. `early` is true while the grace deadline stands.
+    pub const SuccessionView = union(enum) {
+        none,
+        pending,
+        complete: struct { keys: []u64, early: bool },
+    };
+
     pub const CensusKeys = struct {
         ctx: *anyopaque,
         keys: *const fn (ctx: *anyopaque, gpa: Allocator) error{ Incomplete, OutOfMemory }![]u64,
+        /// Null on a fixture that only drives the lapse grace.
+        succession: ?*const fn (ctx: *anyopaque, gpa: Allocator) error{OutOfMemory}!SuccessionView = null,
+    };
+
+    /// A preempt-all opened this. `settled` is the volume's half of W_end.
+    pub const SuccessionWindow = struct {
+        since_ns: u64,
+        settled: bool = false,
     };
 
     /// The data fence's lapse beat kick; `lapse` = a lapse was seen.
@@ -235,6 +254,61 @@ pub const Guard = struct {
             break :blk census.keys(census.ctx, g.gpa) catch return false;
         };
         defer g.gpa.free(keys);
+        var rep = c.report() catch return false;
+        defer rep.deinit(c.gpa);
+        outer: for (keys) |k| {
+            for (rep.registrants) |r| if (r.rkey == k) continue :outer;
+            return false;
+        }
+        return true;
+    }
+
+    /// The membership cadence's settle (decision 0004 §4.6). A window a
+    /// preempt-all opened settles when every expected member has re-asserted
+    /// (or the deadline was reaped) and each re-asserted host key is
+    /// registered on this namespace. Before the deadline that is an early
+    /// settle. A member who never returns stays pending until the reap;
+    /// a death record completing the census ahead of the reap is later.
+    pub fn trySettleSuccession(g: *Guard) void {
+        const window = g.succession orelse return;
+        if (window.settled or g.be.isFailed()) return;
+        const c = g.prClient() orelse return;
+        const view = g.successionView() orelse return;
+        switch (view) {
+            .none => g.markSettled(true),
+            .pending => {},
+            .complete => |done| {
+                defer g.gpa.free(done.keys);
+                c.lockOps();
+                defer c.unlockOps();
+                if (keysOnReport(c, done.keys)) {
+                    g.markSettled(done.early);
+                } else {
+                    const first: u64 = if (done.keys.len == 0) 0 else done.keys[0];
+                    log.info("meta volume {s}: succession census is complete ({d} key(s), first {x:0>16}, early {}) and this namespace does not register every one yet", .{ g.be.path, done.keys.len, first, done.early });
+                }
+            },
+        }
+    }
+
+    fn successionView(g: *Guard) ?SuccessionView {
+        g.hooks_lock.lock();
+        defer g.hooks_lock.unlock();
+        const census = g.census orelse return null;
+        const f = census.succession orelse return null;
+        return f(census.ctx, g.gpa) catch null;
+    }
+
+    fn markSettled(g: *Guard, early: bool) void {
+        const w = if (g.succession) |*w| w else return;
+        if (w.settled) return;
+        w.settled = true;
+        guard.stats.succession_settles.inc();
+        if (early) guard.stats.succession_early_settles.inc();
+        log.info("meta volume {s}: the succession window settled ({s})", .{ g.be.path, if (early) "before the grace deadline" else "at the grace deadline" });
+    }
+
+    fn keysOnReport(c: *pr.Client, keys: []const u64) bool {
         var rep = c.report() catch return false;
         defer rep.deinit(c.gpa);
         outer: for (keys) |k| {
@@ -477,6 +551,10 @@ pub const Guard = struct {
             g.early_fresh = e.fresh;
             g.keep_hold = e.keep_hold;
             g.early_fenced_writer = e.fenced_writer;
+            // The preempt-all already ran in step 3b (`Early.takeHold`).
+            // The gate's own `hold` does not run again, so the window
+            // opens here (decision 0004 §4.6).
+            if (e.hold == .preempted) g.succession = .{ .since_ns = clock.monotonicNs() };
             gpa.destroy(e);
             return;
         }
@@ -672,6 +750,9 @@ pub const Guard = struct {
         if (c.rtype == nvme.RTYPE_WEAR) {
             const outcome = host_fence.takeSuccession(c, g.be.path) catch return error.Busy;
             g.keep_hold = outcome.kept();
+            // A first manager acquires an unreserved namespace. A successor's
+            // preempt-all is what opens the window (decision 0004 §4.6).
+            if (outcome == .preempted) g.succession = .{ .since_ns = clock.monotonicNs() };
             return;
         }
         c.acquire() catch |e| switch (e) {

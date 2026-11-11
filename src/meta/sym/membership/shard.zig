@@ -377,6 +377,9 @@ const Grace = struct {
     fresh_closed: bool = false,
     /// The deadline was reaped (the non-reclaimers are dead).
     reaped: bool = false,
+    /// Every expected member had re-asserted while the deadline still
+    /// stood. A later settle keeps counting as early (decision 0004 §4.6).
+    completed_early: bool = false,
 
     fn deinit(self: *Grace, gpa: Allocator) void {
         self.expected.deinit(gpa);
@@ -796,6 +799,73 @@ pub const Owner = struct {
         };
         self.deleteRow(&gone);
         return true;
+    }
+
+    /// The succession window's census (decision 0004 §4.6). No grace: `.none`
+    /// (a steady owner; the lapse path keeps `writerKeys`). Pending while
+    /// some expected member has neither re-asserted nor been reaped at the
+    /// deadline. Otherwise complete: the distinct non-zero host keys of the
+    /// members that came back, and `early` while `now` is still before the
+    /// deadline. A death record is not yet a completion; the reap is.
+    pub const SuccessionView = union(enum) {
+        none,
+        pending,
+        complete: struct { keys: []u64, early: bool },
+    };
+
+    pub fn successionCensus(self: *Owner, gpa: Allocator, now_ms: u64) error{OutOfMemory}!SuccessionView {
+        var cap: usize = 8;
+        while (true) {
+            const buf = try gpa.alloc(u64, cap);
+            errdefer gpa.free(buf);
+            var n: usize = 0;
+            var early = false;
+            const kind: enum { none, pending, grow, ready } = blk: {
+                const r = self.lockRoster();
+                defer self.unlockRoster();
+                const g = if (r.grace) |*gp| gp else break :blk .none;
+                const all_back = for (g.expected.items) |e| {
+                    if (!g.hasReasserted(e.id)) break false;
+                } else true;
+                if (!all_back and !g.reaped) break :blk .pending;
+                if (all_back and now_ms < g.until_ms) g.completed_early = true;
+                early = g.completed_early;
+                for (g.expected.items) |e| {
+                    if (!g.hasReasserted(e.id) or e.key == 0) continue;
+                    if (n == cap) break :blk .grow;
+                    buf[n] = e.key;
+                    n += 1;
+                }
+                break :blk .ready;
+            };
+            switch (kind) {
+                .none => {
+                    gpa.free(buf);
+                    return .none;
+                },
+                .pending => {
+                    gpa.free(buf);
+                    return .pending;
+                },
+                .grow => {
+                    gpa.free(buf);
+                    cap *= 4;
+                    continue;
+                },
+                .ready => {
+                    std.mem.sort(u64, buf[0..n], {}, std.sort.asc(u64));
+                    var d: usize = 0;
+                    for (buf[0..n]) |k| {
+                        if (d != 0 and buf[d - 1] == k) continue;
+                        buf[d] = k;
+                        d += 1;
+                    }
+                    const keys = try gpa.dupe(u64, buf[0..d]);
+                    gpa.free(buf);
+                    return .{ .complete = .{ .keys = keys, .early = early } };
+                },
+            }
+        }
     }
 
     /// The keys of every listed WRITER (≠ 0, distinct) — the metadata
@@ -2290,6 +2360,52 @@ test "the census's writer keys (decision 0003 §DL): every listed writer's host 
     const keys = try succ.writerKeys(gpa, 1000 + clocks.grace_ms);
     defer gpa.free(keys);
     try testing.expectEqual(@as(usize, 0), keys.len);
+}
+
+test "succession census (decision 0004 §4.6): no grace is none; pending until every expected member re-asserts; then complete with the page keys that came back, early while the deadline stands; a key of 0 is not required; a reap with nobody back completes late and names no key" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    var steady = try Owner.arm(gpa, testing.io, clocks, 0, 1, 0, &.{}, &.{}, 0);
+    defer steady.deinit();
+    try testing.expect(try steady.successionCensus(gpa, 0) == .none);
+
+    const expected = [_]Expected{
+        .{ .id = writerMemberId(testIdentity(1)), .key = 0xA11 },
+        .{ .id = writerMemberId(testIdentity(2)), .key = 0 },
+    };
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &expected, &.{}, 1_000);
+    defer o.deinit();
+    try testing.expect(try o.successionCensus(gpa, 1_000) == .pending);
+    var back = joinReqOf(1, 1, "/m1");
+    back.pr_key = 0xA11;
+    _ = o.join(back, 1_100).granted;
+    try testing.expect(try o.successionCensus(gpa, 1_200) == .pending);
+    _ = o.join(joinReqOf(2, 1, "/m2"), 1_300).granted;
+    {
+        const v = try o.successionCensus(gpa, 1_400);
+        defer if (v == .complete) gpa.free(v.complete.keys);
+        switch (v) {
+            .complete => |c| {
+                try testing.expect(c.early);
+                try testing.expectEqualSlices(u64, &.{0xA11}, c.keys);
+            },
+            else => return error.CensusNotComplete,
+        }
+    }
+    var late = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{.{ .id = writerMemberId(testIdentity(3)), .key = 0xB22 }}, &.{}, 1_000);
+    defer late.deinit();
+    try testing.expectEqual(@as(u32, 1), late.reapGraceDeadline(1_000 + clocks.grace_ms));
+    {
+        const v = try late.successionCensus(gpa, 1_000 + clocks.grace_ms);
+        defer if (v == .complete) gpa.free(v.complete.keys);
+        switch (v) {
+            .complete => |c| {
+                try testing.expect(!c.early);
+                try testing.expectEqual(@as(usize, 0), c.keys.len);
+            },
+            else => return error.CensusNotComplete,
+        }
+    }
 }
 
 /// Two callers of one owner raced at a hook site (decision 0003 §DM): the

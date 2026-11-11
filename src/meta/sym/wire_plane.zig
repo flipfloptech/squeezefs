@@ -71,6 +71,7 @@ const record = @import("../record.zig");
 const backend = @import("../backend.zig");
 const meta_set = @import("../meta_set.zig");
 const claim = @import("../guard/claim.zig");
+const guard_gate = @import("../guard/gate.zig");
 const manager = @import("manager.zig");
 const page = @import("appender_page.zig");
 const cr = @import("control_records.zig");
@@ -944,13 +945,23 @@ pub const WirePlane = struct {
         }
         // Every managed volume's lapse grace ends once each live member's
         // host key in this census is registered again (decision 0003 §DL).
-        for (set.volumes) |be| if (be.guard) |g| g.bindCensus(.{ .ctx = &m.owner, .keys = &censusKeysFn });
+        for (set.volumes) |be| if (be.guard) |g| g.bindCensus(.{ .ctx = &m.owner, .keys = &censusKeysFn, .succession = &successionCensusFn });
     }
 
     /// The census's writer keys (the metadata guards' lapse grace).
     fn censusKeysFn(ctx: *anyopaque, gpa: Allocator) error{ Incomplete, OutOfMemory }![]u64 {
         const owner: *shard.Owner = @ptrCast(@alignCast(ctx));
         return owner.writerKeys(gpa, nowMs());
+    }
+
+    fn successionCensusFn(ctx: *anyopaque, gpa: Allocator) error{OutOfMemory}!guard_gate.Guard.SuccessionView {
+        const owner: *shard.Owner = @ptrCast(@alignCast(ctx));
+        const v = try owner.successionCensus(gpa, nowMs());
+        return switch (v) {
+            .none => .none,
+            .pending => .pending,
+            .complete => |c| .{ .complete = .{ .keys = c.keys, .early = c.early } },
+        };
     }
 
     /// A served ship by `peer` on `slot` of `volume`: the peer's appender
@@ -1937,6 +1948,9 @@ pub const WirePlane = struct {
         const now = nowMs();
         const evicted = m.owner.expireDue(now);
         const reaped = m.owner.reapGraceDeadline(now);
+        // After the reap, so a deadline that just shipped its deaths can
+        // settle on this same tick (decision 0004 §4.6).
+        for (self.set.volumes) |be| if (be.guard) |g| g.trySettleSuccession();
         const rep = m.projection.run(now, @intCast(clock.realtimeCoarseNs()));
         if (evicted != 0 or reaped != 0 or rep.deaths != 0 or rep.released != 0 or rep.retired != 0) {
             log.info("cluster wire: tick — {d} evicted at T_owner, {d} reaped at the grace deadline; ledger: {d} death record(s) standing, {d} acted, {d} region(s) released, {d} retired, {d} parked record(s) drained", .{ evicted, reaped, rep.deaths, rep.acted, rep.released, rep.retired, rep.drained });

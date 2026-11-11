@@ -3578,7 +3578,7 @@ const f10_writer =
     \\done
 ;
 
-test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2, §4.4) — M (host A) manages, J (host C) writes and fsyncs; M is SIGSTOPped past the claim TTL; S (host B) mounts: one preempt-all (writer_guard_preempt_alls 1) removes every other registrant (writer_guard_preempt_all_victims >= 2) and the namespace stays WEAR (rtype 5); S reads J's acked bytes; J's key is back, writer_guard_fenced is 0, and J reads its own bytes. The window's early settle and the data-fence debt are the next pins, not this row yet" {
+test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2, §4.4) — M (host A) manages, J (host C) writes and fsyncs; M is SIGSTOPped past the claim TTL; S (host B) mounts: one preempt-all (writer_guard_preempt_alls 1) removes every other registrant (writer_guard_preempt_all_victims >= 2) and the namespace stays WEAR (rtype 5); S reads J's acked bytes; J's key is back, writer_guard_fenced is 0, and J reads its own bytes; the succession window settles early (writer_guard_succession_early_settles 1). The data-fence debt is the next pin, not this row yet" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -3645,6 +3645,27 @@ test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2
         printF1Joiner(rig, j);
         std.debug.print("\n--- J's key {s} is absent from the report (regctl {?d}) ---\n{s}\n", .{ key_j, json_scan.number(rr_j, "regctl"), rr_j });
         return error.JKeyAbsent;
+    }
+    // The membership cadence is 5 s. J is back before this poll; the next
+    // tick settles the window.
+    const settle_deadline = clock.monotonicNs() + 12 * std.time.ns_per_s;
+    var early: u64 = 0;
+    while (true) {
+        const st = try rig.stats(s);
+        early = json_scan.number(st, "writer_guard_succession_early_settles") orelse 0;
+        const settled = json_scan.number(st, "writer_guard_succession_settles") orelse 0;
+        if (early >= 1 and settled >= 1) {
+            gpa.free(st);
+            break;
+        }
+        if (clock.monotonicNs() >= settle_deadline) {
+            std.debug.print("\n--- F1: succession window did not settle early (early {d}, settles {d}, grace remaining {?d}, members {?d}, J key {s}) ---\n", .{ early, settled, json_scan.number(st, "membership_grace_remaining_ms"), json_scan.number(st, "membership_members"), key_j });
+            gpa.free(st);
+            printLogTailFile(rig, rig.daemons.items[s].log_path, 50);
+            return error.NoEarlySettle;
+        }
+        gpa.free(st);
+        sleepMs(200);
     }
     try rig.umount(j);
     try rig.kill9(m);

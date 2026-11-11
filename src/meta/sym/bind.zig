@@ -115,6 +115,10 @@ pub const AppenderSet = struct {
     /// blank page, the first manager ever). The allocation leases'
     /// same-node succession proves THIS identity dead and no other.
     page0_at_open: ?page.Identity = null,
+    /// That page's host key, when it is Live and neither 0 nor this
+    /// mount's key (decision 0004 §4.7). Same-host remount stays 0.
+    /// shortcut: RAM for this open only, upgrade when the claim transaction writes the durable meta_fence_debt record.
+    predecessor_host_key: u64 = 0,
     /// The ring-budget remainder as of the last census.
     budget_remaining: u64 = 0,
     /// A page-aligned zero buffer for the carve's zeroing (one per set).
@@ -257,6 +261,7 @@ pub const AppenderSet = struct {
         var words: page.Page = prior orelse page.Page.free(0, 0, page.SegmentTable.one(.{ .start = be.sb.journal.start, .len = be.sb.journal.len }));
         if (prior) |p| if (p.state == .live) {
             self.page0_at_open = p.identity;
+            if (p.host_key != 0 and p.host_key != self.hostKey()) self.predecessor_host_key = p.host_key;
         };
         if (prior) |p| if (p.state == .live and !p.identity.sameMount(self.identity)) {
             log.info("meta volume {s}: appender 0's page is Live under node 0x{x} mount slot {d} (term {d}) — the D0 ladder was won over its holder; the manager role passes with the page", .{ be.path, p.identity.node_token, p.identity.mount_slot, p.term });

@@ -108,6 +108,11 @@ pub const ClearOutcome = union(enum) {
     }
 };
 
+pub const SettleHook = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque) void,
+};
+
 /// The volume's guard state for its life.
 pub const Guard = struct {
     gpa: Allocator,
@@ -139,6 +144,9 @@ pub const Guard = struct {
     /// manager (decision 0004 §4.6). A first manager's acquire opens none.
     /// `settled` stays set; W_end is what clears the window.
     succession: ?SuccessionWindow = null,
+    /// Once, when the window settles: the data fence's reconcile
+    /// (decision 0004 §4.7). Admission binds it.
+    settle_hook: ?SettleHook = null,
     /// The writer whose fresh claim the second early probe found, fenced by
     /// this open's preempt (review 4 minor 4): the gate takes it over.
     early_fenced_writer: ?u64 = null,
@@ -279,13 +287,17 @@ pub const Guard = struct {
             .pending => {},
             .complete => |done| {
                 defer g.gpa.free(done.keys);
-                c.lockOps();
-                defer c.unlockOps();
-                if (keysOnReport(c, done.keys)) {
-                    g.markSettled(done.early);
+                const early = done.early;
+                const ok = blk: {
+                    c.lockOps();
+                    defer c.unlockOps();
+                    break :blk keysOnReport(c, done.keys);
+                };
+                if (ok) {
+                    g.markSettled(early);
                 } else {
                     const first: u64 = if (done.keys.len == 0) 0 else done.keys[0];
-                    log.info("meta volume {s}: succession census is complete ({d} key(s), first {x:0>16}, early {}) and this namespace does not register every one yet", .{ g.be.path, done.keys.len, first, done.early });
+                    log.info("meta volume {s}: succession census is complete ({d} key(s), first {x:0>16}, early {}) and this namespace does not register every one yet", .{ g.be.path, done.keys.len, first, early });
                 }
             },
         }
@@ -306,6 +318,10 @@ pub const Guard = struct {
         guard.stats.succession_settles.inc();
         if (early) guard.stats.succession_early_settles.inc();
         log.info("meta volume {s}: the succession window settled ({s})", .{ g.be.path, if (early) "before the grace deadline" else "at the grace deadline" });
+        // After the counters, so a reader that sees the settle has the
+        // reconcile behind it. The hook takes the data-fence lock, never
+        // this client's.
+        if (g.settle_hook) |h| h.run(h.ctx);
     }
 
     fn keysOnReport(c: *pr.Client, keys: []const u64) bool {

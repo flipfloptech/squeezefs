@@ -3222,9 +3222,10 @@ fn printReapCounters(sm: []const u8) void {
 }
 
 /// The successor's preempt-all (decision 0004 §4.4) removes the dead host
-/// before the grace reap, and the data admission reconciles that key off
-/// the data namespace. The recovery's keyed preempt then finds the key
-/// already gone, so either counter is the fence that landed.
+/// before the grace reap. A same-host remount pays no fence debt, so the
+/// succession reconcile fences that key on data when the window settles.
+/// The recovery's keyed preempt then finds the key already gone, so either
+/// counter is the fence that landed.
 fn expectReapedHostFenced(sm: []const u8) !void {
     try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
     const meta_fenced = (try statNumber(sm, "appender_recovery_preempts")) + (try statNumber(sm, "writer_guard_preempt_alls"));
@@ -3234,7 +3235,7 @@ fn expectReapedHostFenced(sm: []const u8) !void {
     try testing.expectEqual(@as(u64, 0), try statNumber(sm, "data_pr_fence_failures"));
 }
 
-test "nvmet fidelity: pr5 F9 — a member reaped at a successor's grace deadline is FENCED with its appender page's host key (decision 0004 §2.4 G-b, KD8, §4.4) — M (host B) manages, X (host A) a joiner writes behind a held landing (SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE) and is SIGSTOPped; M is killed and M2 (host B) mounts: X's row is expected, X never re-asserts and the deadline reaps it with its page's host_key — M2's preempt-all removes host A and the data admission reconciles that key before the region is released (the recovery's keyed preempt finds the key already gone); host A's key is gone from the report; X resumed is refused at the device (its journal's reservation-conflict line)" {
+test "nvmet fidelity: pr5 F9 — a member reaped at a successor's grace deadline is FENCED with its appender page's host key (decision 0004 §2.4 G-b, KD8, §4.4) — M (host B) manages, X (host A) a joiner writes behind a held landing (SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE) and is SIGSTOPped; M is killed and M2 (host B) mounts: X's row is expected, X never re-asserts and the deadline reaps it with its page's host_key — M2's preempt-all removes host A and the succession reconcile fences that key before the region is released (the recovery's keyed preempt finds the key already gone); host A's key is gone from the report; X resumed is refused at the device (its journal's reservation-conflict line)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -3299,7 +3300,7 @@ test "nvmet fidelity: pr5 F9 — a member reaped at a successor's grace deadline
     try expectNoResidue(rig, set.data_nqn);
 }
 
-test "nvmet fidelity: pr5 F9b — a member whose row was LOST is still expected, reaped and fenced (decision 0004 §2.4 G-b, KD17, §4.4) — M (host B) manages and drops X's member row (SQUEEZEFS_TEST_MEMBER_ROW_DROP: a manager dead within the flush interval after the join); X (host A) writes and syncs a file and is SIGSTOPped; M is killed and M2 (host B) mounts: no row names X, its Live appender page opens M2's grace by itself, X never re-asserts and the deadline reaps it with its page's host_key — M2's preempt-all removes host A and the data admission reconciles that key before the region is released; host A's key is gone, and X's acked file reads back whole through M2" {
+test "nvmet fidelity: pr5 F9b — a member whose row was LOST is still expected, reaped and fenced (decision 0004 §2.4 G-b, KD17, §4.4) — M (host B) manages and drops X's member row (SQUEEZEFS_TEST_MEMBER_ROW_DROP: a manager dead within the flush interval after the join); X (host A) writes and syncs a file and is SIGSTOPped; M is killed and M2 (host B) mounts: no row names X, its Live appender page opens M2's grace by itself, X never re-asserts and the deadline reaps it with its page's host_key — M2's preempt-all removes host A and the succession reconcile fences that key before the region is released; host A's key is gone, and X's acked file reads back whole through M2" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -3578,7 +3579,7 @@ const f10_writer =
     \\done
 ;
 
-test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2, §4.4) — M (host A) manages, J (host C) writes and fsyncs; M is SIGSTOPped past the claim TTL; S (host B) mounts: one preempt-all (writer_guard_preempt_alls 1) removes every other registrant (writer_guard_preempt_all_victims >= 2) and the namespace stays WEAR (rtype 5); S reads J's acked bytes; J's key is back, writer_guard_fenced is 0, and J reads its own bytes; the succession window settles early (writer_guard_succession_early_settles 1). The data-fence debt is the next pin, not this row yet" {
+test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2, §4.4, §4.7) — M (host A) manages, J (host C) writes and fsyncs; M is SIGSTOPped past the claim TTL; S (host B) mounts: one preempt-all (writer_guard_preempt_alls 1) removes every other registrant (writer_guard_preempt_all_victims >= 2) and the namespace stays WEAR (rtype 5); S reads J's acked bytes; J's key is back, writer_guard_fenced is 0, and J reads its own bytes; the succession window settles early (writer_guard_succession_early_settles 1); S's admission pays the fence debt (data_pr_debt_preempts >= 1) and the reconcile after the window settles preempts nothing else (data_pr_reconcile_preempts 0)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -3667,6 +3668,14 @@ test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2
         gpa.free(st);
         sleepMs(200);
     }
+    const dst = try rig.stats(s);
+    defer gpa.free(dst);
+    const debt = json_scan.number(dst, "data_pr_debt_preempts") orelse 0;
+    const reconciled = json_scan.number(dst, "data_pr_reconcile_preempts") orelse 0;
+    std.debug.print("\n--- F1 debt: data_pr_debt_preempts {d}, data_pr_reconcile_preempts {d} ---\n", .{ debt, reconciled });
+    if (debt < 1 or reconciled != 0) printLogTailFile(rig, rig.daemons.items[s].log_path, 50);
+    try testing.expect(debt >= 1);
+    try testing.expectEqual(@as(u64, 0), reconciled);
     try rig.umount(j);
     try rig.kill9(m);
     try rig.umount(s);
@@ -3695,7 +3704,7 @@ test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2
     try expectNoResidue(rig, set.data_nqn);
 }
 
-test "nvmet fidelity: F10 — a busy co-located joiner of the superseded manager survives the takeover (decision 0004 §8.2, G-c, round-4 issue 1) — M (host A) manages, JA (host A, supervised, the write cache) keeps writing and fsyncing one 64 KiB block across the takeover; M is SIGSTOPped past the claim TTL and S (host B) mounts: S's admission reconcile fences host A on data while JA is mid-flight — a refused data write is re-admitted (held while metadata is pending, or one synchronous retry once metadata has settled; data_dma_fence_refusals 0, no data fence latch), JA kills M at its metadata re-registration (pr_stale_sibling_kills ≥ 1), data re-registers (data_pr_succession_reregistrations ≥ 1), a later fsync lands, every fsynced block is whole on JA and on S, and fsck --offline --scrub is clean (red on dev: JA's data device latches, its fsyncs answer EIO)" {
+test "nvmet fidelity: F10 — a busy co-located joiner of the superseded manager survives the takeover (decision 0004 §8.2, G-c, round-4 issue 1) — M (host A) manages, JA (host A, supervised, the write cache) keeps writing and fsyncing one 64 KiB block across the takeover; M is SIGSTOPped past the claim TTL and S (host B) mounts: S's admission pays the fence debt and fences host A on data while JA is mid-flight (data_pr_debt_preempts >= 1) — a refused data write is re-admitted (held while metadata is pending, or one synchronous retry once metadata has settled; data_dma_fence_refusals 0, no data fence latch), JA kills M at its metadata re-registration (pr_stale_sibling_kills ≥ 1), data re-registers (data_pr_succession_reregistrations ≥ 1), a later fsync lands, every fsynced block is whole on JA and on S, and fsck --offline --scrub is clean (red on dev: JA's data device latches, its fsyncs answer EIO)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -3760,9 +3769,9 @@ test "nvmet fidelity: F10 — a busy co-located joiner of the superseded manager
     const s = try rig.spawnMount("f10-s", meta_uri_b, ident_b, &.{});
     try rig.awaitLog(s, "ready: ", ready_wait_ns);
     {
-        const ss = try rig.awaitStat(s, "data_pr_reconcile_preempts", 1, g2_wait_ns);
+        const ss = try rig.awaitStat(s, "data_pr_debt_preempts", 1, g2_wait_ns);
         defer gpa.free(ss);
-        try testing.expect(try statNumber(ss, "data_pr_reconcile_preempts") >= 1);
+        try testing.expect(try statNumber(ss, "data_pr_debt_preempts") >= 1);
     }
     const st = awaitStatAtLeast(rig, ja.mp, "data_pr_succession_reregistrations", 1, g2_wait_ns) catch |e| {
         printLogTailFile(rig, ja.log_path, 80);
@@ -3786,7 +3795,9 @@ test "nvmet fidelity: F10 — a busy co-located joiner of the superseded manager
     try testing.expect(promotions >= 1);
     try testing.expect(!alive(pid_m));
     const acked_at_hold = try readAcked(rig, ja.mp);
-    const acked = try awaitAckedAbove(rig, ja.mp, acked_at_hold, g2_wait_ns);
+    // Proves a fsync landed after the takeover. The count itself is racy:
+    // the writer can finish one more file before it sees the stop file.
+    _ = try awaitAckedAbove(rig, ja.mp, acked_at_hold, g2_wait_ns);
     try touchPath(stop);
     const writer_deadline = clock.monotonicNs() + ready_wait_ns;
     while (clock.monotonicNs() < writer_deadline) {
@@ -3802,6 +3813,8 @@ test "nvmet fidelity: F10 — a busy co-located joiner of the superseded manager
     }
     _ = try writer.wait(rig.io);
     writer_done = true;
+    const acked = try readAcked(rig, ja.mp);
+    try testing.expect(acked > acked_at_hold);
     if (readRel(rig, ja.mp, "fails")) |fails| {
         defer gpa.free(fails);
         std.debug.print("\n--- JA's fsyncs that returned an error ---\n{s}\n", .{fails});

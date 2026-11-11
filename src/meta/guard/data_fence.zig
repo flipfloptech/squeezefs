@@ -122,6 +122,10 @@ pub const stats = struct {
     /// The manager's reconciliation: data registrants volume 0's metadata
     /// namespace no longer registers, preempted.
     pub var data_pr_reconcile_preempts: counters.ShardedCounter = .{};
+    /// The fence debt: the predecessor manager's host key preempted on a
+    /// data namespace at admission (decision 0004 §4.7). One per namespace
+    /// the key was still registered on. An already-absent key counts nothing.
+    pub var data_pr_debt_preempts: counters.ShardedCounter = .{};
     /// Admissions refused (a fenced host, a stale sibling alive, a foreign
     /// reservation, an unreadable report): the mount or the volume refused.
     pub var data_pr_admission_refusals: counters.ShardedCounter = .{};
@@ -222,8 +226,15 @@ pub const Inputs = struct {
     /// Volume 0's writer (the manager, or a flat set's): it reserves and
     /// reconciles.
     manager: bool,
-    /// Volume 0's guard (the manager's): it kicks the lapse beat (§DL).
+    /// Volume 0's guard (the manager's): it kicks the lapse beat (§DL)
+    /// and, while its succession window is open, defers the reconcile.
     guard: ?*gate.Guard = null,
+    /// The predecessor manager's host key (decision 0004 §4.7). 0 = none
+    /// (first manager, same-host remount, no page key).
+    /// shortcut: one key in RAM, upgrade when a chain of successions must keep every unpaid key in the durable record.
+    predecessor_key: u64 = 0,
+    /// Test seam: treat the succession window as open without a guard.
+    window_open: bool = false,
     /// A joiner's other joined metadata volumes with a device fence
     /// (decision 0003 §DN): copied at `create`, never read after.
     joined_metas: []const JoinedMeta = &.{},
@@ -352,6 +363,8 @@ pub const DataFence = struct {
     pending: ?Pending = null,
     /// `abortReadmit` ran: the next beat says it ran on the predecessor.
     beat_after_abort: bool = false,
+    /// `endSuccession` already reconciled this window.
+    reconciled_succession: bool = false,
 
     /// The alert's repeat: a held recovery polls every tick; one line per
     /// half minute keeps the log readable and the alert loud.
@@ -389,6 +402,7 @@ pub const DataFence = struct {
         if (knobs.parseStr(in.env.get("SQUEEZEFS_TEST_LAPSE_BEAT_HOLD"))) |fifo| {
             if (!std.mem.eql(u8, fifo, "off") and fifo.len < self.beat_hold.len) @memcpy(self.beat_hold[0..fifo.len], fifo);
         }
+        if (self.in.guard) |g| g.settle_hook = .{ .ctx = self, .run = &settleHook };
         return self;
     }
 
@@ -470,7 +484,7 @@ pub const DataFence = struct {
                     stats.data_pr_admission_refusals.inc();
                     return e;
                 };
-                self.reconcile(path, client) catch |e| {
+                self.fenceAdmission(path, client) catch |e| {
                     stats.data_pr_admission_refusals.inc();
                     return e;
                 };
@@ -479,7 +493,7 @@ pub const DataFence = struct {
                 if (rtype != 0 and rtype != nvme.RTYPE_WEAR) return foreignReservation(path, rtype);
                 if (rtype == 0) {
                     lapse_since_ns = @max(clock.monotonicNs(), 1);
-                } else self.reconcile(path, client) catch |e| {
+                } else self.fenceAdmission(path, client) catch |e| {
                     stats.data_pr_admission_refusals.inc();
                     return e;
                 };
@@ -636,6 +650,78 @@ pub const DataFence = struct {
         };
         stats.data_pr_reservations.inc();
         return true;
+    }
+
+    /// While the succession window is open, pay the predecessor's key and
+    /// leave every other data registrant for `endSuccession` (decision
+    /// 0004 §4.7). A first manager, and a lapse with no window, reconcile
+    /// here as before.
+    fn fenceAdmission(self: *DataFence, path: []const u8, c: *pr.Client) AdmitError!void {
+        if (self.successionOpen()) return self.payDebt(path, c);
+        return self.reconcile(path, c);
+    }
+
+    fn successionOpen(self: *const DataFence) bool {
+        if (self.in.window_open) return true;
+        const g = self.in.guard orelse return false;
+        const w = g.succession orelse return false;
+        return !w.settled;
+    }
+
+    /// `fence(k)` on this data namespace, then a report proving WEAR with
+    /// k absent. The own key and 0 are not debts. An already-absent key is
+    /// the paid end state and counts nothing.
+    fn payDebt(self: *DataFence, path: []const u8, c: *pr.Client) AdmitError!void {
+        const k = self.in.predecessor_key;
+        if (k == 0 or k == c.key) return;
+        const held = self.meta.admittedHere() catch return reportRefusal(path, "the metadata namespace's report");
+        if (!held) {
+            log.err("data volume {s}: this mount no longer holds the metadata reservation — it pays no fence debt and refuses", .{path});
+            return error.Refused;
+        }
+        const present = keyOnNamespace(c, k) catch return reportRefusal(path, "the data namespace's report");
+        if (!present) return;
+        c.preemptAndAbort(k) catch |e| {
+            const gone = !(keyOnNamespace(c, k) catch true);
+            if (gone) return;
+            var buf: [128]u8 = undefined;
+            var w: Io.Writer = .fixed(&buf);
+            c.writeError(&w, e) catch {};
+            log.err("data volume {s}: the fence debt's preempt of key {x:0>16} failed ({s}); an unproven key refuses the admission", .{ path, k, w.buffered() });
+            return error.Refused;
+        };
+        const still = keyOnNamespace(c, k) catch return reportRefusal(path, "the data namespace's report");
+        if (still) {
+            log.err("data volume {s}: key {x:0>16} is still registered after the fence debt's preempt — refusing the admission", .{ path, k });
+            return error.Refused;
+        }
+        const rtype = reportRtype(c) catch return reportRefusal(path, "the data namespace's report");
+        if (rtype != nvme.RTYPE_WEAR) return foreignReservation(path, rtype);
+        stats.data_pr_debt_preempts.inc();
+        log.warn("data volume {s}: paid the fence debt — preempted key {x:0>16} (the predecessor manager's host)", .{ path, k });
+    }
+
+    fn settleHook(ctx: *anyopaque) void {
+        const self: *DataFence = @ptrCast(@alignCast(ctx));
+        self.endSuccession();
+    }
+
+    /// The general reconcile, once, when the window settles (decision
+    /// 0004 §4.7). Keys a Live page names are not skipped yet.
+    /// shortcut: an offline writer never ticks the cadence, so this reconcile does not run there; upgrade when offline repair must fence keys the debt did not pay.
+    pub fn endSuccession(self: *DataFence) void {
+        if (!self.in.manager) return;
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.reconciled_succession) return;
+        var failed = false;
+        for (self.vols[0..self.n]) |*v| {
+            self.reconcile(v.path(), v.client) catch {
+                failed = true;
+            };
+        }
+        if (!failed) self.reconciled_succession = true;
+        log.info("data fence: succession reconcile over {d} data namespace(s) ({s})", .{ self.n, if (failed) "a namespace refused" else "done" });
     }
 
     /// The manager's reconciliation: every data registrant ≠ ours that
@@ -1086,6 +1172,14 @@ pub const DataFence = struct {
         const in_grace = now -| v.lapse_since_ns < self.grace_ns;
         if (!back and in_grace) return;
         const acquired = self.reserve(v.path(), c) catch return;
+        if (self.successionOpen()) {
+            if (acquired) v.acquired = true;
+            v.lapse_since_ns = 0;
+            stats.data_pr_lapse_rereservations.inc();
+            if (back and in_grace) stats.data_pr_lapse_early_rereservations.inc();
+            log.warn("data volume {s}: re-reserved Write Exclusive – All Registrants after the lapse ({s}); the reconcile waits until the succession window settles (decision 0004 §4.7)", .{ v.path(), if (back) "every live host back" else "the grace elapsed" });
+            return;
+        }
         self.reconcile(v.path(), c) catch return;
         if (acquired) v.acquired = true;
         v.lapse_since_ns = 0;
@@ -1584,6 +1678,11 @@ pub const DataFence = struct {
     /// metadata release: the host's last process of the set leaves each data
     /// namespace by the kept law; every client and node closed.
     pub fn release(self: *DataFence) void {
+        if (self.in.guard) |g| {
+            if (g.settle_hook) |h| {
+                if (h.ctx == @as(*anyopaque, self)) g.settle_hook = null;
+            }
+        }
         const gpa = self.in.gpa;
         defer gpa.destroy(self);
         self.stopBeat();
@@ -1717,7 +1816,8 @@ fn inputsOf(gpa: Allocator, env: *const std.process.Environ.Map, vols: []const *
     if (be0.guard) |g| {
         const c = g.prClient() orelse return null;
         const dev = g.device orelse return null;
-        return .{ .gpa = gpa, .env = env, .meta_face = dev.face(), .meta_nsid = dev.nsid, .key = c.key, .reg = g.fence_reg, .local = g.identity, .node_token = join.nodeToken(g.identity), .pages = pages, .meta_path = be0.path, .writer_id = g.identity.writerId(be0.index), .config = config, .manager = true, .guard = g };
+        const predecessor_key: u64 = if (be0.sym) |s| s.predecessor_host_key else 0;
+        return .{ .gpa = gpa, .env = env, .meta_face = dev.face(), .meta_nsid = dev.nsid, .key = c.key, .reg = g.fence_reg, .local = g.identity, .node_token = join.nodeToken(g.identity), .pages = pages, .meta_path = be0.path, .writer_id = g.identity.writerId(be0.index), .config = config, .manager = true, .guard = g, .predecessor_key = predecessor_key };
     }
     const js = be0.joined orelse return null;
     const f = js.fence orelse return null;
@@ -2037,6 +2137,87 @@ test "review MAJOR 1 (decision 0003 §DJ): step 2c holds unless every non-retire
     log.testing.expectErrorLogs(1);
     try testing.expectEqual(fencing.DataFenceOutcome.failed, dm.fenceDead(&meta_m, 0x3333));
     try log.testing.expectAllFired();
+}
+
+test "pr5 debt: admission pays the predecessor's host key and leaves every other data registrant until the window settles (decision 0004 §4.7); the own key is not a debt" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    const m_id: [16]u8 = "manager-host-id1".*;
+    const j_id: [16]u8 = "joiner-host-id-2".*;
+    const o_id: [16]u8 = "old-manager-id-3".*;
+    const s_id: [16]u8 = "stranger-host-id".*;
+    var mns = fake.Namespace.init(gpa);
+    defer mns.deinit();
+    var mh: fake.Host = .{ .ns = &mns, .host_id = m_id };
+    var meta_m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer meta_m.deinit();
+    try fencing.acquireManagerHold(&meta_m);
+    var jh: fake.Host = .{ .ns = &mns, .host_id = j_id };
+    var meta_j = try pr.Client.init(gpa, jh.face(), 1, 0x2222);
+    defer meta_j.deinit();
+    _ = try fencing.joinAsRegistrant(&meta_j, null);
+    var dns = fake.Namespace.init(gpa);
+    defer dns.deinit();
+    var doh: fake.Host = .{ .ns = &dns, .host_id = o_id };
+    var data_o = try pr.Client.init(gpa, doh.face(), 1, 0x3333);
+    defer data_o.deinit();
+    data_o.rtype = nvme.RTYPE_WEAR;
+    _ = try data_o.registerLadder();
+    try data_o.acquire();
+    var djh: fake.Host = .{ .ns = &dns, .host_id = j_id };
+    var data_j = try pr.Client.init(gpa, djh.face(), 1, 0x2222);
+    defer data_j.deinit();
+    data_j.rtype = nvme.RTYPE_WEAR;
+    _ = try data_j.registerLadder();
+    var dsh: fake.Host = .{ .ns = &dns, .host_id = s_id };
+    var data_s = try pr.Client.init(gpa, dsh.face(), 1, 0x5555);
+    defer data_s.deinit();
+    data_s.rtype = nvme.RTYPE_WEAR;
+    _ = try data_s.registerLadder();
+    var no_pages: u8 = 0;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var cfg: FixtureConfig = .{ .live = &.{1} };
+    const debt0 = stats.data_pr_debt_preempts.load();
+    const reconciles0 = stats.data_pr_reconcile_preempts.load();
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = true, .predecessor_key = 0x3333, .window_open = true });
+    defer dm.release();
+    var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
+    try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
+    try testing.expect(!dns.isRegistered(0x3333));
+    try testing.expect(dns.isRegistered(0x2222));
+    try testing.expect(dns.isRegistered(0x5555));
+    try testing.expectEqual(debt0 + 1, stats.data_pr_debt_preempts.load());
+    try testing.expectEqual(reconciles0, stats.data_pr_reconcile_preempts.load());
+    dm.endSuccession();
+    try testing.expect(!dns.isRegistered(0x5555));
+    try testing.expect(dns.isRegistered(0x2222));
+    try testing.expectEqual(reconciles0 + 1, stats.data_pr_reconcile_preempts.load());
+    dm.endSuccession();
+    try testing.expectEqual(reconciles0 + 1, stats.data_pr_reconcile_preempts.load());
+
+    // Same-host remount: the predecessor key is this mount's, so the debt
+    // pays nothing and the absent key waits for the settle.
+    var dns2 = fake.Namespace.init(gpa);
+    defer dns2.deinit();
+    var doh2: fake.Host = .{ .ns = &dns2, .host_id = o_id };
+    var data_o2 = try pr.Client.init(gpa, doh2.face(), 1, 0x3333);
+    defer data_o2.deinit();
+    data_o2.rtype = nvme.RTYPE_WEAR;
+    _ = try data_o2.registerLadder();
+    try data_o2.acquire();
+    const debt1 = stats.data_pr_debt_preempts.load();
+    const reconciles1 = stats.data_pr_reconcile_preempts.load();
+    const own = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = .{ .ctx = &no_pages, .read = &noPages }, .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = true, .predecessor_key = 0x1111, .window_open = true });
+    defer own.release();
+    var dmh2: fake.Host = .{ .ns = &dns2, .host_id = m_id };
+    try own.admitClient(1, "fake-data-2", null, try fixtureClient(gpa, dmh2.face()));
+    try testing.expect(dns2.isRegistered(0x3333));
+    try testing.expectEqual(debt1, stats.data_pr_debt_preempts.load());
+    try testing.expectEqual(reconciles1, stats.data_pr_reconcile_preempts.load());
+    own.endSuccession();
+    try testing.expect(!dns2.isRegistered(0x3333));
+    try testing.expectEqual(reconciles1 + 1, stats.data_pr_reconcile_preempts.load());
 }
 
 test "review minor 1 (decision 0003 §DJ): the manager's reconcile preempts a key that left between its two reports — a joiner leaving data then metadata after the data report — and the target refuses (the key is gone): the data report is read again, the key absent is success, the admission proceeds and counts no preempt" {

@@ -96,6 +96,9 @@ pub const stats = struct {
     /// A death whose record carried no key fenced with the dead appender
     /// page's host key (decision 0004 §4.8, KD8: a grace-reaped member).
     pub var appender_recovery_key_from_page: counters.ShardedCounter = .{};
+    /// The report before the preempt already showed the dead key absent
+    /// (decision 0004 §4.8 step 4): fenced, no preempt issued.
+    pub var appender_recovery_keys_absent: counters.ShardedCounter = .{};
     /// A death record's key and the dead page's host key both non-zero and
     /// different: the recovery holds (must stay 0).
     pub var appender_recovery_key_mismatch: counters.Tripwire = .init("appender_recovery_key_mismatch");
@@ -328,6 +331,19 @@ pub fn preemptDeadRegistrant(client: ?*pr.Client, fencer: ?*pr.Client, victim_ke
         stats.pr_preempts_unheld_refused.inc();
         log.warn("recovery preempt: the reservation is not held by this host — the preempt of key 0x{x} is withheld (a successor took the hold: this manager is superseded); the full tail scan is the fence", .{victim_key});
         return .failed;
+    }
+    // Report first (decision 0004 §4.8). An absent key is already fenced:
+    // every removal of it either drained or followed the commands admitted
+    // under it. A preempt here would be a no-op, or a refusal the tail scan
+    // would treat as unfenced.
+    const present = keyRegistered(c, victim_key) catch |e| {
+        log.warn("recovery preempt: the report before the preempt of key 0x{x} failed ({s}) — nothing preempted; the full tail scan is the fence", .{ victim_key, @errorName(e) });
+        return .failed;
+    };
+    if (!present) {
+        stats.appender_recovery_keys_absent.inc();
+        log.info("recovery preempt: key 0x{x} is already absent — fenced without a preempt (decision 0004 §4.8)", .{victim_key});
+        return .fenced;
     }
     const issuer = fencer orelse c;
     issuer.preemptAndAbort(victim_key) catch |e| return preemptFailed(issuer, victim_key, e);
@@ -871,8 +887,13 @@ test "the death preempt: a usurper's key is preempted-and-aborted (fenced; the v
     try testing.expectEqual(guards0 + 1, stats.appender_recovery_own_key_guards.load());
     try testing.expectEqual(PreemptOutcome.no_key, preemptDeadRegistrant(&m, null, 0));
     try testing.expectEqual(PreemptOutcome.no_device, preemptDeadRegistrant(null, null, 0x5));
-    // An unknown victim: the device answers Invalid Field — failed, logged.
-    try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, null, 0x4444));
+    // A key the report does not name is already fenced: no preempt
+    // (decision 0004 §4.8). The device's Invalid Field answer is not reached.
+    const absent0 = stats.appender_recovery_keys_absent.load();
+    const cdw = ns.last_acquire.cdw10;
+    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, null, 0x4444));
+    try testing.expectEqual(absent0 + 1, stats.appender_recovery_keys_absent.load());
+    try testing.expectEqual(cdw, ns.last_acquire.cdw10);
 }
 
 test "the death fence's key (decision 0004 §4.8, KD8): the death record's key when it carries one, else the dead appender page's host_key; both non-zero and different is a mismatch (the recovery holds); both zero is no key (the tail scan)" {
@@ -885,6 +906,36 @@ test "the death fence's key (decision 0004 §4.8, KD8): the death record's key w
     try testing.expectEqual(@as(u64, 0x11), deathKey(0x11, 0).victim().?);
     try testing.expectEqual(@as(?u64, 0), deathKey(0, 0).victim());
     try testing.expectEqual(@as(?u64, null), deathKey(0x11, 0x22).victim());
+}
+
+test "report-first: a death whose key the report already shows absent is fenced without a preempt (decision 0004 §4.8)" {
+    const gpa = testing.allocator;
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var mh: fake.Host = .{ .ns = &ns, .host_id = host_m };
+    var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer m.deinit();
+    try acquireManagerHold(&m);
+    var rh: fake.Host = .{ .ns = &ns, .host_id = host_r };
+    var r = try pr.Client.init(gpa, rh.face(), 1, 0x2222);
+    defer r.deinit();
+    _ = try joinAsRegistrant(&r, null);
+    try r.unregister(r.key);
+    const absent0 = stats.appender_recovery_keys_absent.load();
+    const preempts0 = stats.appender_recovery_preempts.load();
+    const cdw = ns.last_acquire.cdw10;
+    const crkey = ns.last_acquire_crkey;
+    const prkey = ns.last_acquire_prkey;
+    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, null, 0x2222));
+    try testing.expectEqual(absent0 + 1, stats.appender_recovery_keys_absent.load());
+    try testing.expectEqual(preempts0, stats.appender_recovery_preempts.load());
+    try testing.expectEqual(cdw, ns.last_acquire.cdw10);
+    try testing.expectEqual(crkey, ns.last_acquire_crkey);
+    try testing.expectEqual(prkey, ns.last_acquire_prkey);
+    // Never registered: the same skip.
+    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, null, 0x3333));
+    try testing.expectEqual(absent0 + 2, stats.appender_recovery_keys_absent.load());
+    try testing.expectEqual(cdw, ns.last_acquire.cdw10);
 }
 
 test "the death preempt under the manager's WERO hold: on nvmet 7.3's semantics the holder's preempt answers success yet keeps the victim registered — .ignored (the full tail scan, counted, no re-fence), never a release that would leave the namespace unreserved; on a spec-conformant target the same preempt fences the victim's host with the hold kept; the re-fence preempts a key registered again" {
@@ -1072,11 +1123,12 @@ test "review 4 minor 3: a report that fails after the death preempt fenced nothi
     defer r.deinit();
     _ = try joinAsRegistrant(&r, null);
     const preempts0 = stats.appender_recovery_preempts.load();
-    // The host id read and cached; the report before the preempt (two
-    // commands) and the preempt pass; the report after it fails.
+    // The host id read and cached. Two reports before the preempt (the hold,
+    // then the key — two commands each) and the preempt pass; the report
+    // after it fails.
     _ = try m.wireHostId();
     ns.fail_next = error.InputOutput;
-    ns.fail_skip = 3;
+    ns.fail_skip = 5;
     try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, null, 0x2222));
     // The preempt reached the device; the report after it failed.
     try testing.expectEqual(nvme.RACQA_PREEMPT_AND_ABORT, ns.last_acquire.cdw10 & 0x7);

@@ -5,18 +5,17 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** The frozen-joiner commit's parent is `ef271bf2`. No upstream.
+**Branch `feat/pr5`.** The report-first commit's parent is `7c7feecc`. No upstream.
 Not pushed. Not merged. `dev` is `b40ac017`.
 
 Decision 0004 is the spec. PR-5 is not finished. W_end, the fence debt, `identityHolds`,
-the registration lock, rule markers, the re-acquire mark, and the frozen-joiner kill are
-committed.
+the registration lock, rule markers, the re-acquire mark, the frozen-joiner kill, and
+report-first recovery are committed.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
-1. Report-first recovery (`appender_recovery_keys_absent`). Then blind-rule refusals
-   (F15, F16, F16b), incompat bit 4 and `claim convert-pr`, retire the fencing registrant,
-   the fidelity rows that are not yet written.
+1. Blind-rule refusals (F15, F16, F16b). Then incompat bit 4 and `claim convert-pr`,
+   retire the fencing registrant, the fidelity rows that are not yet written.
 
 A full venue gate has not been run on this branch. Do not merge to `dev` until that gate is
 green and the owner asks. Landing a fast-forward of `dev` is pushed by the local post-commit
@@ -40,6 +39,7 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | markers | A metadata rule's `.reg` / `.wd` / `.abandoned` marker. A section refuses while one stands. The hold check acquires and then removes that volume's judged markers. See below. |
 | re-acquire mark | `a <boottime_ns> <generation>` on the manager's registry line, written under the registration lock. The re-judge kills an unmarked manager when a restart filled in after the re-read. See below. |
 | frozen joiner | The same holder across one member-death bound, every thread stopped or the cgroup frozen, and an unjoined joiner line. See below. |
+| report-first | A death fence whose key the report already shows absent is `.fenced` and issues no preempt. `appender_recovery_keys_absent`. See below. |
 
 ## What is true in the code
 
@@ -234,11 +234,30 @@ F1 (`~/tmp/pr5-f1-frozen.log`): `regctl` 3, identity counters 0,
 - Not in this slice: the rule's "unregister only while my `.wd` still stands" test, and
   the no-manager prune.
 
+## Report-first recovery, on top of `7c7feecc`
+
+Decision §4.8 step 4. Not the page check, and not deleting `.ignored` or the fencer.
+Unit tests `report-first`, `death preempt`, `review 4 minor 3`, `decision 0004 §4.8`:
+56 pass. F1 (`~/tmp/pr5-f1-report.log`): `regctl` 3, identity counters 0,
+`data_pr_debt_preempts` 1, `data_pr_reconcile_preempts` 0, 41/41.
+
+- `preemptDeadRegistrant`, after `admittedHere` and before the preempt, reads the
+  report again. The key absent returns `.fenced` and counts `appender_recovery_keys_absent`.
+  No preempt is issued, and `appender_recovery_preempts` does not move. A report that
+  fails there is still `.failed` (the tail scan). A key the report names is preempted
+  as before.
+- The re-fence still calls the same function only when the key came back, so an absent
+  key at step 2b stays a no-op. A key that vanishes between that check and the preempt
+  takes this skip.
+- Not in this slice: `identityHolds` on the recovery fence, and retiring `.ignored`.
+
 ## Explicitly not in this branch
 
-- F9 and F10 have not been re-run on this commit. F1 has, after the frozen-joiner kill.
+- F9 and F10 have not been re-run on this commit. F1 has, after report-first recovery.
+  F9's metadata fence is the preempt-all; the keyed recovery preempt should now find
+  the key already gone (`appender_recovery_preempts` 0, `appender_recovery_keys_absent` 1).
+  That row has not been run.
 - Recovery's `fence(k)` does not call `identityHolds`.
-- Report-first recovery (`appender_recovery_keys_absent`). F9's metadata fence is the preempt-all; the keyed recovery preempt finds the key already gone (`appender_recovery_preempts` 0).
 - Incompat bit 4 `META_PR_ALL_REGISTRANTS`, `Mode.convert_pr`, `claim convert-pr`, `claim posture-reset`.
 - Deleting `src/meta/guard/fencer.zig`. `stand()` uses WEAR. `forTest` stays WERO. `acquireManagerHold` still forces WERO. Flat `pr_rtype` 1 and the WERO pr legs stay 1.
 - `meta_pr_succession_parks`, `meta_pr_succession_reregistrations`, `meta_pr_refusal_readmissions`. Do not invent them. Parks increment `stats.appender_parks`. `writer_guard_fenced` increments in `journal.noteFence`.

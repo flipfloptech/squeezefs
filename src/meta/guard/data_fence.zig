@@ -91,6 +91,7 @@ const nvme = @import("nvme_cmd.zig");
 const proc = @import("proc.zig");
 const pr_linux = @import("pr_linux.zig");
 const host_fence = @import("host_fence.zig");
+const marker_mod = @import("marker.zig");
 const fencing = @import("../sym/membership/fencing.zig");
 const recovery = @import("../sym/membership/recovery.zig");
 const appender_page = @import("../sym/appender_page.zig");
@@ -734,6 +735,10 @@ pub const DataFence = struct {
             return error.Refused;
         };
         errdefer hold.release();
+        if (marker_mod.forbids(reg.dir(), .mutation)) {
+            log.err("data volume {s}: a rule marker stands — the mutation is refused (decision 0004 §4.4.2)", .{path});
+            return error.Refused;
+        }
         try self.screenPage(path);
         return .{ .hold = hold, .armed = true };
     }

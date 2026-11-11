@@ -52,6 +52,7 @@ const pr_linux = @import("pr_linux.zig");
 const proc = @import("proc.zig");
 const nvme = @import("nvme_cmd.zig");
 const host_fence = @import("host_fence.zig");
+const marker = @import("marker.zig");
 const fencer = @import("fencer.zig");
 const fencing = @import("../sym/membership/fencing.zig");
 const join = @import("../sym/join.zig");
@@ -1072,6 +1073,39 @@ pub const Guard = struct {
         }
     }
 
+    /// A dead or abandoned marker whose wait is over: one report and one
+    /// acquire, back to back under the registration lock, then that
+    /// volume's judged markers are removed (decision 0004 §4.4.2). A lapse
+    /// owns the namespace instead. The claim refresh stays outside this.
+    fn considerMarkers(g: *Guard) void {
+        if (!g.be.sb.symmetricPlaneStamped()) return;
+        const reg = &(g.fence_reg orelse return);
+        if (g.lapse_since_ns != 0) return;
+        if (!marker.survey(reg.dir(), false).needsCheck()) return;
+        var section = reg.lockRegistration(0) catch return;
+        defer section.release();
+        if (!marker.survey(reg.dir(), true).needsCheck()) return;
+        const c = g.prClient() orelse return;
+        c.lockOps();
+        defer c.unlockOps();
+        var rep = c.report() catch return;
+        defer rep.deinit(c.gpa);
+        if (rep.rtype == 0) return;
+        if (rep.rtype != nvme.RTYPE_WEAR) {
+            g.failStop("the hold check's report is not WEAR — this manager was superseded (decision 0004 §4.4.2)");
+            return;
+        }
+        const me = c.wireHostId() catch return;
+        if (!rep.heldByHost(c.key, me)) {
+            g.failStop("the hold check: WEAR stands and this host is not registered (decision 0004 §4.4.2)");
+            return;
+        }
+        // The re-acquire mark (DC24) is not written yet. A conflict retries
+        // next beat; the markers stay until an acquire lands.
+        c.acquire() catch return;
+        marker.removeJudged(reg.dir(), g.be.index);
+    }
+
     /// One beat. Skipped on a FAILED volume (nothing may be written) and
     /// after the claim was released.
     pub fn beat(g: *Guard) void {
@@ -1079,6 +1113,8 @@ pub const Guard = struct {
         // Before the reservation re-check and the claim refresh (decision
         // 0004 §4.4.2). A superseded manager must not refresh its claim.
         if (!g.screenIdentity()) return;
+        g.considerMarkers();
+        if (g.be.isFailed()) return;
         if (g.prClient()) |c| {
             if (!g.prRecheck(c)) return;
             if (g.be.isFailed()) return;
@@ -1298,6 +1334,10 @@ pub const Guard = struct {
             armed = true;
         }
         defer if (armed) section.release();
+        // A live withdrawal, a live section marker, or a dead section marker
+        // still inside its I/O timeout refuses the lapse acquire. The claim
+        // refresh still proceeds (decision 0004 §4.4.2, §4.9).
+        if (armed and marker.forbids(g.fence_reg.?.dir(), .lapse_acquire)) return .ours;
         if (!g.screenIdentity()) return .report_failed;
         c.lockOps();
         defer c.unlockOps();
@@ -1447,6 +1487,10 @@ pub const Guard = struct {
                     }
                 }
                 defer if (armed) section.release();
+                if (armed and marker.forbids(g.fence_reg.?.dir(), .mutation)) {
+                    log.err("meta volume {s}: a rule marker stands — the release is refused (decision 0004 §4.4.2)", .{g.be.path});
+                    last = false;
+                }
                 if (last and g.screenIdentity()) {
                     // The holder's sequence lock: no recovery check-preempt
                     // runs across the leave (review minor 4).

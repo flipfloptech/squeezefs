@@ -25,6 +25,17 @@ pub fn monotonicNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
+/// `CLOCK_BOOTTIME`: the withdrawal marker's age (decision 0004 §4.4.2).
+/// It counts time the machine spent suspended, which `MONOTONIC` does not.
+/// Elsewhere, monotonic is the stand-in (there is no boottime clock).
+pub fn boottimeNs() u64 {
+    const id: posix.clockid_t = if (builtin.os.tag == .linux) .BOOTTIME else .MONOTONIC;
+    const ts = read(id);
+    const sec: u64 = if (ts.sec < 0) 0 else @intCast(ts.sec);
+    const nsec: u64 = if (ts.nsec < 0) 0 else @intCast(ts.nsec);
+    return sec * std.time.ns_per_s + nsec;
+}
+
 pub fn realtimeCoarseS() u64 {
     const clock: posix.clockid_t = if (builtin.os.tag == .linux) .REALTIME_COARSE else .REALTIME;
     const ts = read(clock);

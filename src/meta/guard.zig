@@ -35,6 +35,7 @@ pub const proc = if (is_linux) @import("guard/proc.zig") else struct {};
 pub const pr_linux = if (is_linux) @import("guard/pr_linux.zig") else struct {};
 pub const gate = if (is_linux) @import("guard/gate.zig") else struct {};
 pub const host_fence = if (is_linux) @import("guard/host_fence.zig") else struct {};
+pub const marker = if (is_linux) @import("guard/marker.zig") else struct {};
 pub const fencer = if (is_linux) @import("guard/fencer.zig") else struct {};
 pub const data_fence = if (is_linux) @import("guard/data_fence.zig") else struct {};
 pub const smoke = if (is_linux) @import("guard/smoke.zig") else struct {};
@@ -191,6 +192,7 @@ test {
         _ = pr_linux;
         _ = gate;
         _ = host_fence;
+        _ = marker;
         _ = fencer;
         _ = data_fence;
         _ = smoke;

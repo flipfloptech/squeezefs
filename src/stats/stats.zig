@@ -729,6 +729,8 @@ fn writeNvmet(src: *Sources, w: *Writer) Error!void {
         // The data namespaces' fence (decision 0003 §DJ).
         if (any or src.fabric != null) try w.writeByte(',');
         _ = try counters.writeNamespaceEntries(guard.data_fence.stats, w);
+        try w.writeByte(',');
+        _ = try counters.writeNamespaceEntries(guard.marker.stats, w);
         if (src.data_fence) |df| {
             try w.writeByte(',');
             try df.writeStatsJson(w);

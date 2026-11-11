@@ -56,6 +56,7 @@ const pr_linux = @import("pr_linux.zig");
 const page = @import("../sym/appender_page.zig");
 const fencing = @import("../sym/membership/fencing.zig");
 const initiator = @import("../../ops/nvmet/initiator.zig");
+const marker = @import("marker.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("guard/host_fence is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -950,37 +951,80 @@ pub fn registerUnderRule(ctx_in: RuleContext, reg: *const Registry, c: *pr.Clien
             defer ctx.gpa.free(ps);
             if (try clearStaleSiblings(ctx, reg, ps) > 0) try awaitWriteDrain(ctx);
         }
-        // The kill and the drain stay outside. The re-read, the register
-        // and the re-judge share the registration lock (decision 0004 DC20).
+        // The kill and the drain stay outside. The re-read, the marker, the
+        // register and the re-judge share the registration lock (decision
+        // 0004 DC20). Data rules make no marker.
         var hold = reg.lockRegistration(0) catch return error.RegistryUnavailable;
-        errdefer hold.release();
-        const preread = reportFacts(c) catch return error.ReportUnreadable;
+        const preread = reportFacts(c) catch {
+            hold.release();
+            return error.ReportUnreadable;
+        };
         if (preread.registered) {
             hold.release();
             return false;
         }
         ctx.facts = preread.facts;
-        register.run(register.ctx, c) catch return error.RegisterFailed;
-        // Registered: an error from here takes the registration back (review
-        // round 3, major 2 — never a fresh registration left unjudged).
-        errdefer c.unregister(c.key) catch {};
-        // The re-judge: the report and the pages read again (a takeover or a
-        // remote recovery that raced the register is seen here).
-        ctx.facts = (reportFacts(c) catch return error.ReportUnreadable).facts;
-        const ps = try pages.get(ctx.gpa);
+        const mark = marker.createIn(reg.dir(), ctx.vol_index) catch {
+            hold.release();
+            return error.RegistryUnavailable;
+        };
+        register.run(register.ctx, c) catch {
+            marker.dropSection(reg.dir(), &mark);
+            hold.release();
+            return error.RegisterFailed;
+        };
+        const judged = reportFacts(c) catch {
+            // The register landed and the re-judge could not be read. The
+            // withdrawal marker is published before the lock drops; the
+            // unregister follows outside it.
+            _ = marker.publishWithdrawal(reg.dir(), &mark);
+            hold.release();
+            _ = finishWithdrawal(reg, &mark, c);
+            return error.ReportUnreadable;
+        };
+        ctx.facts = judged.facts;
+        const ps = pages.get(ctx.gpa) catch |e| {
+            _ = marker.publishWithdrawal(reg.dir(), &mark);
+            hold.release();
+            _ = finishWithdrawal(reg, &mark, c);
+            return e;
+        };
         defer ctx.gpa.free(ps);
-        const stale = try anyStaleAlive(ctx, reg, ps);
+        const stale = anyStaleAlive(ctx, reg, ps) catch |e| {
+            _ = marker.publishWithdrawal(reg.dir(), &mark);
+            hold.release();
+            _ = finishWithdrawal(reg, &mark, c);
+            return e;
+        };
+        if (!stale) {
+            marker.dropSection(reg.dir(), &mark);
+            hold.release();
+            return true;
+        }
+        _ = marker.publishWithdrawal(reg.dir(), &mark);
         hold.release();
-        if (!stale) return true;
         log.warn("meta volume {s}: a sibling of this set on this host turned stale between the rule and the register (a takeover or a remote recovery raced it) — the host's registration withdrawn before it is killed", .{ctx.path});
-        c.unregister(c.key) catch {
+        if (!finishWithdrawal(reg, &mark, c)) {
             log.err("meta volume {s}: REFUSING the registration: it could not be withdrawn from a stale sibling's host", .{ctx.path});
             return error.SiblingLive;
-        };
+        }
     }
     guard.stats.pr_stale_sibling_refusals.inc();
     log.err("meta volume {s}: REFUSING to register this host: siblings kept turning stale across {d} registers", .{ ctx.path, REJUDGE_ROUNDS });
     return error.SiblingLive;
+}
+
+/// Unregister outside the registration lock. Success removes the `.wd`.
+/// Failure renames it `.abandoned` under the lock. True = unregistered.
+fn finishWithdrawal(reg: *const Registry, mark: *const marker.Mark, c: *pr.Client) bool {
+    c.unregister(c.key) catch {
+        var hold = reg.lockRegistration(0) catch return false;
+        defer hold.release();
+        marker.abandonWithdrawal(reg.dir(), mark);
+        return false;
+    };
+    marker.dropWithdrawal(reg.dir(), mark);
+    return true;
 }
 
 pub const DataAdmitError = AdmitError || error{HostFenced};

@@ -3222,10 +3222,9 @@ fn printReapCounters(sm: []const u8) void {
 }
 
 /// The successor's preempt-all (decision 0004 §4.4) removes the dead host
-/// before the grace reap. A same-host remount pays no fence debt, so the
-/// succession reconcile fences that key on data when the window settles.
-/// The recovery's keyed preempt then finds the key already gone, so either
-/// counter is the fence that landed.
+/// on metadata. A same-host remount pays no fence debt. The reconcile
+/// leaves the key because the appender page is still Live, and recovery's
+/// data preempt fences it. Either data counter is that fence.
 fn expectReapedHostFenced(sm: []const u8) !void {
     try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
     const meta_fenced = (try statNumber(sm, "appender_recovery_preempts")) + (try statNumber(sm, "writer_guard_preempt_alls"));
@@ -3235,7 +3234,7 @@ fn expectReapedHostFenced(sm: []const u8) !void {
     try testing.expectEqual(@as(u64, 0), try statNumber(sm, "data_pr_fence_failures"));
 }
 
-test "nvmet fidelity: pr5 F9 — a member reaped at a successor's grace deadline is FENCED with its appender page's host key (decision 0004 §2.4 G-b, KD8, §4.4) — M (host B) manages, X (host A) a joiner writes behind a held landing (SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE) and is SIGSTOPped; M is killed and M2 (host B) mounts: X's row is expected, X never re-asserts and the deadline reaps it with its page's host_key — M2's preempt-all removes host A and the succession reconcile fences that key before the region is released (the recovery's keyed preempt finds the key already gone); host A's key is gone from the report; X resumed is refused at the device (its journal's reservation-conflict line)" {
+test "nvmet fidelity: pr5 F9 — a member reaped at a successor's grace deadline is FENCED with its appender page's host key (decision 0004 §2.4 G-b, KD8, §4.4) — M (host B) manages, X (host A) a joiner writes behind a held landing (SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE) and is SIGSTOPped; M is killed and M2 (host B) mounts: X's row is expected, X never re-asserts and the deadline reaps it with its page's host_key — M2's preempt-all removes host A and the reconcile leaves host A's key because its page is still Live, and recovery's data preempt fences it before the region is released; host A's key is gone from the report; X resumed is refused at the device (its journal's reservation-conflict line)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -3300,7 +3299,7 @@ test "nvmet fidelity: pr5 F9 — a member reaped at a successor's grace deadline
     try expectNoResidue(rig, set.data_nqn);
 }
 
-test "nvmet fidelity: pr5 F9b — a member whose row was LOST is still expected, reaped and fenced (decision 0004 §2.4 G-b, KD17, §4.4) — M (host B) manages and drops X's member row (SQUEEZEFS_TEST_MEMBER_ROW_DROP: a manager dead within the flush interval after the join); X (host A) writes and syncs a file and is SIGSTOPped; M is killed and M2 (host B) mounts: no row names X, its Live appender page opens M2's grace by itself, X never re-asserts and the deadline reaps it with its page's host_key — M2's preempt-all removes host A and the succession reconcile fences that key before the region is released; host A's key is gone, and X's acked file reads back whole through M2" {
+test "nvmet fidelity: pr5 F9b — a member whose row was LOST is still expected, reaped and fenced (decision 0004 §2.4 G-b, KD17, §4.4) — M (host B) manages and drops X's member row (SQUEEZEFS_TEST_MEMBER_ROW_DROP: a manager dead within the flush interval after the join); X (host A) writes and syncs a file and is SIGSTOPped; M is killed and M2 (host B) mounts: no row names X, its Live appender page opens M2's grace by itself, X never re-asserts and the deadline reaps it with its page's host_key — M2's preempt-all removes host A and the reconcile leaves host A's key because its page is still Live, and recovery's data preempt fences it before the region is released; host A's key is gone, and X's acked file reads back whole through M2" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();

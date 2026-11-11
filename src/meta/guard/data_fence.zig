@@ -126,6 +126,9 @@ pub const stats = struct {
     /// data namespace at admission (decision 0004 §4.7). One per namespace
     /// the key was still registered on. An already-absent key counts nothing.
     pub var data_pr_debt_preempts: counters.ShardedCounter = .{};
+    /// Reconcile left a data key alone because a Live page on volume 0
+    /// names it (decision 0004 §4.7). Recovery fences that host.
+    pub var data_pr_reconcile_live_page_skips: counters.ShardedCounter = .{};
     /// Admissions refused (a fenced host, a stale sibling alive, a foreign
     /// reservation, an unreadable report): the mount or the volume refused.
     pub var data_pr_admission_refusals: counters.ShardedCounter = .{};
@@ -707,7 +710,7 @@ pub const DataFence = struct {
     }
 
     /// The general reconcile, once, when the window settles (decision
-    /// 0004 §4.7). Keys a Live page names are not skipped yet.
+    /// 0004 §4.7). A Live page's host key is left for recovery.
     /// shortcut: an offline writer never ticks the cadence, so this reconcile does not run there; upgrade when offline repair must fence keys the debt did not pay.
     pub fn endSuccession(self: *DataFence) void {
         if (!self.in.manager) return;
@@ -742,11 +745,18 @@ pub const DataFence = struct {
         defer drep.deinit(gpa);
         var mrep = meta.report() catch return reportRefusal(path, "the metadata namespace's report");
         defer mrep.deinit(gpa);
+        const live = try self.liveHostKeys(path);
+        defer gpa.free(live);
         var done: [router.MAX_VOLUMES]u64 = undefined;
         var n_done: usize = 0;
         outer: for (drep.registrants) |r| {
             if (r.rkey == c.key) continue;
             for (mrep.registrants) |mr| if (mr.rkey == r.rkey) continue :outer;
+            for (live) |k| if (k == r.rkey) {
+                stats.data_pr_reconcile_live_page_skips.inc();
+                log.info("data volume {s}: left key {x:0>16} registered — a Live page on volume 0 names it (decision 0004 §4.7)", .{ path, r.rkey });
+                continue :outer;
+            };
             for (done[0..n_done]) |k| if (k == r.rkey) continue :outer;
             c.preemptAndAbort(r.rkey) catch |e| {
                 // The key may have left since the data report (a joiner
@@ -767,6 +777,33 @@ pub const DataFence = struct {
             stats.data_pr_reconcile_preempts.inc();
             log.warn("data volume {s}: preempted key {x:0>16} — registered on the data namespace, absent from the metadata namespace (a superseded manager, or a host whose metadata fence landed alone): fenced before this manager allocates", .{ path, r.rkey });
         }
+    }
+
+    /// Host keys of volume 0's Live appender pages. An unreadable directory
+    /// refuses the reconcile: without it a live member could be fenced.
+    fn liveHostKeys(self: *DataFence, path: []const u8) AdmitError![]u64 {
+        const gpa = self.in.gpa;
+        const pages = self.in.pages.read(self.in.pages.ctx, gpa) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.err("data volume {s}: volume 0's appender pages could not be read ({s}) — the reconcile refuses rather than fence a Live page's host", .{ path, @errorName(e) });
+                return error.Refused;
+            },
+        };
+        defer gpa.free(pages);
+        var n: usize = 0;
+        for (pages) |p| {
+            if (p.state == .live and p.host_key != 0) n += 1;
+        }
+        const keys = try gpa.alloc(u64, n);
+        var i: usize = 0;
+        for (pages) |p| {
+            if (p.state == .live and p.host_key != 0) {
+                keys[i] = p.host_key;
+                i += 1;
+            }
+        }
+        return keys;
     }
 
     /// Recovery's step 2c (`recovery.DataFence.fence`): every non-retired
@@ -2218,6 +2255,53 @@ test "pr5 debt: admission pays the predecessor's host key and leaves every other
     own.endSuccession();
     try testing.expect(!dns2.isRegistered(0x3333));
     try testing.expectEqual(reconciles1 + 1, stats.data_pr_reconcile_preempts.load());
+}
+
+test "pr5 live page: the reconcile leaves a key a Live page on volume 0 names and preempts one a recovered page names (decision 0004 §4.7)" {
+    const gpa = testing.allocator;
+    const fake = @import("fake_nvme.zig");
+    const m_id: [16]u8 = "manager-host-id1".*;
+    const j_id: [16]u8 = "joiner-host-id-2".*;
+    const d_id: [16]u8 = "dead-host-id---6".*;
+    var mns = fake.Namespace.init(gpa);
+    defer mns.deinit();
+    var mh: fake.Host = .{ .ns = &mns, .host_id = m_id };
+    var meta_m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
+    defer meta_m.deinit();
+    try fencing.acquireManagerHold(&meta_m);
+    var dns = fake.Namespace.init(gpa);
+    defer dns.deinit();
+    var djh: fake.Host = .{ .ns = &dns, .host_id = j_id };
+    var data_j = try pr.Client.init(gpa, djh.face(), 1, 0x2222);
+    defer data_j.deinit();
+    data_j.rtype = nvme.RTYPE_WEAR;
+    _ = try data_j.registerLadder();
+    try data_j.acquire();
+    var ddh: fake.Host = .{ .ns = &dns, .host_id = d_id };
+    var data_d = try pr.Client.init(gpa, ddh.face(), 1, 0x6666);
+    defer data_d.deinit();
+    data_d.rtype = nvme.RTYPE_WEAR;
+    _ = try data_d.registerLadder();
+    var named = livePage(2, 0x2, 0x20);
+    named.host_key = 0x2222;
+    var recovered = livePage(3, 0x3, 0x30);
+    recovered.state = .recovered;
+    recovered.host_key = 0x6666;
+    var pages = [_]appender_page.Page{ named, recovered };
+    var src: FixturePages = .{ .pages = &pages };
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var cfg: FixtureConfig = .{ .live = &.{1} };
+    const skips0 = stats.data_pr_reconcile_live_page_skips.load();
+    const reconciles0 = stats.data_pr_reconcile_preempts.load();
+    const dm = try DataFence.create(.{ .gpa = gpa, .env = &env, .meta_face = mh.face(), .meta_nsid = 1, .key = 0x1111, .reg = null, .local = proc.localIdentity(), .node_token = 0, .pages = src.source(), .meta_path = "fake-meta", .writer_id = 0, .config = cfg.source(), .manager = true });
+    defer dm.release();
+    var dmh: fake.Host = .{ .ns = &dns, .host_id = m_id };
+    try dm.admitClient(1, "fake-data", null, try fixtureClient(gpa, dmh.face()));
+    try testing.expect(dns.isRegistered(0x2222));
+    try testing.expect(!dns.isRegistered(0x6666));
+    try testing.expectEqual(skips0 + 1, stats.data_pr_reconcile_live_page_skips.load());
+    try testing.expectEqual(reconciles0 + 1, stats.data_pr_reconcile_preempts.load());
 }
 
 test "review minor 1 (decision 0003 §DJ): the manager's reconcile preempts a key that left between its two reports — a joiner leaving data then metadata after the data report — and the target refuses (the key is gone): the data report is read again, the key absent is success, the admission proceeds and counts no preempt" {

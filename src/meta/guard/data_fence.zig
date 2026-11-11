@@ -694,20 +694,11 @@ pub const DataFence = struct {
         var storage: [cr.FenceDebt.MAX_KEYS]u64 = undefined;
         const keys = try self.debtKeys(path, c, &storage);
         if (keys.len == 0) return;
-        // The bounded re-read already ran before the lock (`provePageForDebt`).
-        // This is the check at the mutation, and it does not sleep.
-        if (self.in.guard) |g| switch (g.identityHolds()) {
-            .ours => {},
-            .usurped => {
-                g.noteUsurped();
-                log.err("data volume {s}: appender 0's page names another writer or term — the fence debt is not paid (decision 0004 §4.4.2)", .{path});
-                return error.Refused;
-            },
-            .unreadable => {
-                log.err("data volume {s}: appender 0's page is unreadable — the fence debt is not paid (decision 0004 §4.4.2)", .{path});
-                return error.Refused;
-            },
-        };
+        // The bounded re-read already ran before the data-fence lock. This
+        // is the check at the mutation, under the registration lock, and it
+        // does not sleep (decision 0004 DC20).
+        var section = try self.enterSection(path);
+        defer section.release();
         const held = self.meta.admittedHere() catch return reportRefusal(path, "the metadata namespace's report");
         if (!held) {
             log.err("data volume {s}: this mount no longer holds the metadata reservation — it pays no fence debt and refuses", .{path});
@@ -717,6 +708,49 @@ pub const DataFence = struct {
         for (keys) |k| {
             if (k == 0 or k == c.key) continue;
             try proveDebtKey(path, c, k);
+        }
+    }
+
+    /// The registration lock around one manager mutation (decision 0004
+    /// DC20). The data-fence lock is already held. No registry (the seam, a
+    /// fixture): the page check alone. The hold is empty then.
+    const Section = struct {
+        hold: host_fence.RegistrationHold = .{},
+        armed: bool = false,
+
+        fn release(self: *Section) void {
+            if (self.armed) self.hold.release();
+            self.armed = false;
+        }
+    };
+
+    fn enterSection(self: *DataFence, path: []const u8) AdmitError!Section {
+        const reg = self.in.reg orelse {
+            try self.screenPage(path);
+            return .{};
+        };
+        var hold = reg.lockRegistration(0) catch {
+            log.err("data volume {s}: the registration lock could not be taken — refusing the mutation (decision 0004 §4.4.2)", .{path});
+            return error.Refused;
+        };
+        errdefer hold.release();
+        try self.screenPage(path);
+        return .{ .hold = hold, .armed = true };
+    }
+
+    fn screenPage(self: *DataFence, path: []const u8) AdmitError!void {
+        const g = self.in.guard orelse return;
+        switch (g.identityHolds()) {
+            .ours => {},
+            .usurped => {
+                g.noteUsurped();
+                log.err("data volume {s}: appender 0's page names another writer or term — the mutation does not run (decision 0004 §4.4.2)", .{path});
+                return error.Refused;
+            },
+            .unreadable => {
+                log.warn("data volume {s}: appender 0's page is unreadable — the mutation waits (decision 0004 §4.4.2)", .{path});
+                return error.Refused;
+            },
         }
     }
 
@@ -859,18 +893,8 @@ pub const DataFence = struct {
     /// changes nothing it preempts: every key it names is absent from the
     /// metadata namespace — a fenced host.
     fn reconcile(self: *DataFence, path: []const u8, c: *pr.Client) AdmitError!void {
-        if (self.in.guard) |g| switch (g.identityHolds()) {
-            .ours => {},
-            .usurped => {
-                g.noteUsurped();
-                log.err("data volume {s}: appender 0's page names another writer or term — the reconcile does not run (decision 0004 §4.4.2)", .{path});
-                return error.Refused;
-            },
-            .unreadable => {
-                log.warn("data volume {s}: appender 0's page is unreadable — the reconcile waits (decision 0004 §4.4.2)", .{path});
-                return error.Refused;
-            },
-        };
+        var section = try self.enterSection(path);
+        defer section.release();
         const gpa = self.in.gpa;
         const meta = self.meta;
         const held = meta.admittedHere() catch return reportRefusal(path, "the metadata namespace's report");

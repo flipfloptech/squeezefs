@@ -246,6 +246,23 @@ pub const Entry = struct {
 
 pub const RegistryError = error{RegistryUnavailable};
 
+/// This thread's registration-lock depth. The registry flock must not be
+/// taken under it (decision 0004 DC25: flock, then the registration lock).
+threadlocal var registration_depth: u32 = 0;
+
+/// One acquisition of the registration lock. Release closes its file
+/// description, which drops the flock.
+pub const RegistrationHold = struct {
+    fd: linux.fd_t = -1,
+
+    pub fn release(self: *RegistrationHold) void {
+        if (self.fd < 0) return;
+        if (registration_depth > 0) registration_depth -= 1;
+        _ = linux.close(self.fd);
+        self.fd = -1;
+    }
+};
+
 /// A registry directory under the run dir (`/run/squeezefs/hosts` as root),
 /// one file per process, one flock serializing every mutation and
 /// judgement.
@@ -302,6 +319,7 @@ pub const Registry = struct {
     /// major 10: a SIGSTOPped holder never wedges every co-located mount):
     /// `LOCK_NB` retried on a doubling backoff; past the bound, refused.
     pub fn lock(self: *Registry) RegistryError!void {
+        if (registration_depth != 0) log.err("host registry {s}: the registry flock was taken while this thread holds the registration lock — the order is flock, then registration (decision 0004 DC25)", .{self.dir()});
         try self.mkdirs();
         var buf: [linux.PATH_MAX]u8 = undefined;
         const p = self.pathOf(&buf, ".lock");
@@ -339,6 +357,48 @@ pub const Registry = struct {
         if (self.lock_fd < 0) return;
         _ = linux.close(self.lock_fd);
         self.lock_fd = -1;
+    }
+
+    /// The set's registration lock (decision 0004 DC20): `<dir>/.register`,
+    /// beside the registry flock's `.lock`. Each acquisition opens its own
+    /// file description, so two threads of one process exclude each other
+    /// (a flock excludes only separate descriptions). `wait_ms` 0 is the
+    /// production bound. Closing the description releases the lock.
+    pub fn lockRegistration(self: *const Registry, wait_ms: u64) RegistryError!RegistrationHold {
+        try self.mkdirs();
+        var buf: [linux.PATH_MAX]u8 = undefined;
+        const p = self.pathOf(&buf, ".register");
+        const rc = linux.open(p.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+        if (linux.errno(rc) != .SUCCESS) return error.RegistryUnavailable;
+        const fd: linux.fd_t = @intCast(rc);
+        const bound_ms = if (wait_ms == 0) REGISTRATION_LOCK_WAIT_MS else wait_ms;
+        const deadline = clock.monotonicNs() +| bound_ms * std.time.ns_per_ms;
+        var backoff_ns: u64 = std.time.ns_per_ms;
+        while (true) {
+            const lr = linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+            switch (linux.errno(lr)) {
+                .SUCCESS => {
+                    registration_depth += 1;
+                    return .{ .fd = fd };
+                },
+                .INTR => continue,
+                .AGAIN => {
+                    const now = clock.monotonicNs();
+                    if (now >= deadline) {
+                        _ = linux.close(fd);
+                        log.err("host registry {s}: its registration lock is held past {d} ms (a stopped or wedged section holds it) — refused", .{ self.dir(), bound_ms });
+                        return error.RegistryUnavailable;
+                    }
+                    const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(@min(backoff_ns, deadline - now)) };
+                    _ = linux.nanosleep(&ts, null);
+                    backoff_ns = @min(backoff_ns * 2, 100 * std.time.ns_per_ms);
+                },
+                else => {
+                    _ = linux.close(fd);
+                    return error.RegistryUnavailable;
+                },
+            }
+        }
     }
 
     /// This process's entry text (null = none).
@@ -663,6 +723,12 @@ pub const RuleContext = struct {
     label: []const u8 = "meta volume",
 };
 
+/// The registration lock's waiter bound: one NVMe admin command
+/// (`nvme_core.admin_timeout`'s 30 s default). A holder keeps it for one
+/// report, the page reads, one register or preempt, and the re-judge —
+/// never a kill's wait (decision 0004 §4.4.2, DC20).
+pub const REGISTRATION_LOCK_WAIT_MS: u64 = 30_000;
+
 /// How long a SIGKILLed sibling may take to exit (an I/O it sleeps in must
 /// complete first) before the registration is refused.
 pub const KILL_WAIT_MS: i32 = 10_000;
@@ -884,6 +950,16 @@ pub fn registerUnderRule(ctx_in: RuleContext, reg: *const Registry, c: *pr.Clien
             defer ctx.gpa.free(ps);
             if (try clearStaleSiblings(ctx, reg, ps) > 0) try awaitWriteDrain(ctx);
         }
+        // The kill and the drain stay outside. The re-read, the register
+        // and the re-judge share the registration lock (decision 0004 DC20).
+        var hold = reg.lockRegistration(0) catch return error.RegistryUnavailable;
+        errdefer hold.release();
+        const preread = reportFacts(c) catch return error.ReportUnreadable;
+        if (preread.registered) {
+            hold.release();
+            return false;
+        }
+        ctx.facts = preread.facts;
         register.run(register.ctx, c) catch return error.RegisterFailed;
         // Registered: an error from here takes the registration back (review
         // round 3, major 2 — never a fresh registration left unjudged).
@@ -893,7 +969,9 @@ pub fn registerUnderRule(ctx_in: RuleContext, reg: *const Registry, c: *pr.Clien
         ctx.facts = (reportFacts(c) catch return error.ReportUnreadable).facts;
         const ps = try pages.get(ctx.gpa);
         defer ctx.gpa.free(ps);
-        if (!try anyStaleAlive(ctx, reg, ps)) return true;
+        const stale = try anyStaleAlive(ctx, reg, ps);
+        hold.release();
+        if (!stale) return true;
         log.warn("meta volume {s}: a sibling of this set on this host turned stale between the rule and the register (a takeover or a remote recovery raced it) — the host's registration withdrawn before it is killed", .{ctx.path});
         c.unregister(c.key) catch {
             log.err("meta volume {s}: REFUSING the registration: it could not be withdrawn from a stale sibling's host", .{ctx.path});
@@ -933,6 +1011,15 @@ pub fn registerDataUnderRule(ctx_in: RuleContext, reg: *const Registry, meta: *p
             defer ctx.gpa.free(ps);
             if (try clearStaleSiblings(ctx, reg, ps) > 0) try awaitWriteDrain(ctx);
         }
+        // Same section as the metadata rule (decision 0004 DC20). The data
+        // fence's lock and the registry flock are already held (DC25).
+        var hold = reg.lockRegistration(0) catch return error.RegistryUnavailable;
+        errdefer hold.release();
+        const preread = reportFacts(data) catch return error.ReportUnreadable;
+        if (preread.registered) {
+            hold.release();
+            return false;
+        }
         register.run(register.ctx, data) catch return error.RegisterFailed;
         // Registered: an error from here takes the registration back.
         errdefer data.unregister(data.key) catch {};
@@ -941,7 +1028,9 @@ pub fn registerDataUnderRule(ctx_in: RuleContext, reg: *const Registry, meta: *p
         ctx.facts = after.facts;
         const ps = try pages.get(ctx.gpa);
         defer ctx.gpa.free(ps);
-        if (!try anyStaleAlive(ctx, reg, ps)) return true;
+        const stale = try anyStaleAlive(ctx, reg, ps);
+        hold.release();
+        if (!stale) return true;
         log.warn("{s} {s}: a sibling of this set on this host turned stale between the rule and the register — the host's data registration withdrawn before it is killed", .{ ctx.label, ctx.path });
         data.unregister(data.key) catch {
             log.err("{s} {s}: REFUSING the registration: it could not be withdrawn from a stale sibling's host", .{ ctx.label, ctx.path });
@@ -1649,6 +1738,33 @@ test "the judgement: a Live page names a current sibling; a Recovering, Recovere
     try testing.expectEqual(Verdict.current, judge(&m, &.{pg(0, .live, node, 0xc2)}, node, 1, false, .{}));
     try testing.expect(Entry.parse(1, "") == null);
     try testing.expect(Entry.parse(1, "x\n") == null);
+}
+
+test "registration lock: two open file descriptions of .register exclude each other, and the registry flock is a different file (decision 0004 DC20)" {
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-reglock-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var reg = Registry.at(base, .set, 0xdc20);
+    reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer reg.unlock();
+    var a = try reg.lockRegistration(0);
+    defer a.release();
+    // The flock and the registration lock are held together: that is the
+    // rule's order, not an inversion.
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.RegistryUnavailable, reg.lockRegistration(1));
+    try log.testing.expectAllFired();
+    a.release();
+    var b = try reg.lockRegistration(50);
+    b.release();
+    // Flock under the registration lock is the inversion.
+    var c = try reg.lockRegistration(50);
+    defer c.release();
+    var other = Registry.at(base, .set, 0xdc21);
+    log.testing.expectErrorLogs(1);
+    try other.lock();
+    other.unlock();
+    try log.testing.expectAllFired();
 }
 
 test "the registry's fabric users per namespace (review minor 2 of decision 0003 §DG): one process standing fencers for two namespaces of one subsystem holds a line per namespace — the first namespace's give-back leaves the process a user of the association, the second's ends it" {

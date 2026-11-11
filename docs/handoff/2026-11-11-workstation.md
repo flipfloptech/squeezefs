@@ -5,21 +5,19 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** `identityHolds` is `51f0187b` (parent `938cdb9f`). No upstream.
-Not pushed. Not merged. `dev` (and the parent of this branch) is `b40ac017`
-(`fix(meta): do not succession-park a volume with no device fence`).
+**Branch `feat/pr5`.** The registration lock's parent is `34ace6e3`. `identityHolds` is
+`51f0187b`. No upstream. Not pushed. Not merged. `dev` is `b40ac017`.
 
-Decision 0004 is the spec. PR-5 is not finished. W_end, the durable fence debt, and
-`Guard.identityHolds` are committed. The registration lock is not started.
+Decision 0004 is the spec. PR-5 is not finished. W_end, the durable fence debt,
+`Guard.identityHolds`, and the registration lock are committed. Markers are not started.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
-1. The rest of the PR-5 heading in decision 0004: report-first recovery
-   (`appender_recovery_keys_absent`), registration lock and markers (revisions 16–27),
-   blind-rule refusals (F15, F16, F16b), incompat bit 4 and `claim convert-pr`, retire the
-   fencing registrant, the fidelity rows that are not yet written. That is still most of the PR.
-   The registration lock is the slice that makes `identityHolds` one section with the
-   mutation. Do not start it by folding it into a drive-by.
+1. Rule markers (revisions 22–27), then the rest of the PR-5 heading: report-first recovery
+   (`appender_recovery_keys_absent`), the re-acquire mark (DC24), blind-rule refusals
+   (F15, F16, F16b), incompat bit 4 and `claim convert-pr`, retire the fencing registrant,
+   the fidelity rows that are not yet written. The frozen-holder kill is part of the marker
+   work. Do not start it by folding it into a drive-by.
 
 A full venue gate has not been run on this branch. Do not merge to `dev` until that gate is
 green and the owner asks. Landing a fast-forward of `dev` is pushed by the local post-commit
@@ -39,6 +37,7 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | `ef1c472c` | W_end evicts a listed writer whose key is missing from a managed namespace, then reconciles and clears the window. `writer_guard_succession_evictions`. The reconcile no longer runs at settle. |
 | `938cdb9f` | Volume 0's claim records `meta_fence_debt`. Admission pays every key it names, then deletes the record. F1: `data_pr_debt_preempts` 1, `data_pr_reconcile_preempts` 0, 41/41. |
 | `51f0187b` | Appender 0's page is ours, usurped, or unreadable (§4.4.2). See below. |
+| registration lock | `.register` is its own flock. A rule and a manager mutation hold it across the page check and the command. See below. Markers are not in it. |
 
 ## What is true in the code
 
@@ -123,13 +122,41 @@ returned the cached bytes. Do not treat that as J never coming back.
 - Stats JSON is two `print`s. A format call allows 32 arguments.
 - F1 waits up to 12 s for `appender_parked` 0. J's `cat` can hit the page cache while the
   reclaim is still in flight. The membership cadence is 5 s.
-- Not wired, and not this slice: the registration lock around the check and the mutation,
-  and recovery's `fence(k)`.
+- Recovery's `fence(k)` still does not call `identityHolds`.
+
+## Registration lock, on top of `34ace6e3`
+
+Decision DC20 and DC25's order, not the markers. Unit test `registration lock` plus
+`pr5 identity`, `pr5 debt`, `lapse grace`, and the B2 re-judge: 53 pass, 1 skip.
+F1 (`~/tmp/pr5-f1-reglock.log`): `regctl` 3, identity counters 0, `data_pr_debt_preempts` 1,
+`data_pr_reconcile_preempts` 0, 41/41.
+
+- `Registry.lockRegistration` opens `<dir>/.register` on a fresh file description and flocks
+  it. `wait_ms` 0 waits `REGISTRATION_LOCK_WAIT_MS` (30 s, one admin timeout). Closing the
+  description releases it. Two descriptions exclude each other, including two threads of one
+  process. The registry flock stays `.lock`.
+- A rule (`registerUnderRule`, `registerDataUnderRule`) holds it from the re-read before
+  `register` through the re-judge's reads, then releases it before a withdrawal. The kill
+  and the drain stay outside. Callers already hold the registry flock.
+- A manager data mutation (`payDebt`, `reconcile`) holds the data-fence lock, then this
+  lock, across the page check and the command. No registry (a fixture, the seam): the page
+  check alone. The admission's bounded re-read still runs before the data-fence lock.
+- The lapse re-acquire takes the flock, lets the rule take and drop the registration lock,
+  then takes it again around the page check and `acquire`. The sequence lock is inside that
+  section. A refused lock returns `.ours` so this beat still refreshes the claim; the lapse
+  stays open.
+- The kept-law release takes the flock, then the registration lock, then the sequence lock
+  around `leaveRegistration`. A refused lock leaves the registration and still drops the client.
+- Taking the registry flock while this thread holds the registration lock logs an error
+  (DC25). It does not refuse the flock.
+- Not in this slice: markers, the re-acquire mark, the frozen-holder kill, DC24's
+  stale-manager kill under the lock, and the five-lock rank rail. Recovery's `fence(k)` is
+  still not a section.
 
 ## Explicitly not in this branch
 
-- F9 and F10 have not been re-run on this commit. F1 has, after the raw probe.
-- Registration lock, rule markers, the frozen-holder kill, DC20–DC25. Recovery's `fence(k)` does not call `identityHolds`.
+- F9 and F10 have not been re-run on this commit. F1 has, after the registration lock.
+- Rule markers, the re-acquire mark, the frozen-holder kill. Recovery's `fence(k)` does not call `identityHolds`.
 - Report-first recovery (`appender_recovery_keys_absent`). F9's metadata fence is the preempt-all; the keyed recovery preempt finds the key already gone (`appender_recovery_preempts` 0).
 - Incompat bit 4 `META_PR_ALL_REGISTRANTS`, `Mode.convert_pr`, `claim convert-pr`, `claim posture-reset`.
 - Deleting `src/meta/guard/fencer.zig`. `stand()` uses WEAR. `forTest` stays WERO. `acquireManagerHold` still forces WERO. Flat `pr_rtype` 1 and the WERO pr legs stay 1.

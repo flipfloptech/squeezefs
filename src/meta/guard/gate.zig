@@ -1282,15 +1282,25 @@ pub const Guard = struct {
     /// The lapse's re-acquire, once the device's claim names this
     /// incarnation: the registration through the rule, the hold.
     fn reacquireBlocking(g: *Guard, c: *pr.Client) Recheck {
-        // The page check again, at the mutation (decision 0004 §4.4.2).
-        // The registration lock that makes it one section with the acquire
-        // is later.
-        if (!g.screenIdentity()) return .report_failed;
-        c.lockOps();
-        defer c.unlockOps();
+        // Flock, then the rule (it takes the registration lock around its
+        // own register and releases it), then this acquire's section:
+        // registration lock, the page check, the command (decision 0004
+        // DC20, DC25). The sequence lock stays inside the section.
         const locked = g.lockRegistry() catch return .reacquire_failed;
         defer if (locked) g.fence_reg.?.unlock();
         const fresh = g.registerHost(c, false) catch return .reacquire_failed;
+        var section: host_fence.RegistrationHold = .{};
+        var armed = false;
+        if (locked) {
+            // A refused lock retries next beat. `.ours` lets this beat's
+            // claim refresh proceed; the lapse stays open (decision 0004 §4.9).
+            section = g.fence_reg.?.lockRegistration(0) catch return .ours;
+            armed = true;
+        }
+        defer if (armed) section.release();
+        if (!g.screenIdentity()) return .report_failed;
+        c.lockOps();
+        defer c.unlockOps();
         c.acquire() catch return .reacquire_failed;
         if (locked and fresh) guard.stats.pr_host_registrations.inc();
         return .reacquired;
@@ -1385,9 +1395,6 @@ pub const Guard = struct {
     pub fn releasePr(g: *Guard) void {
         switch (g.posture) {
             .active => |c| {
-                // The holder's sequence lock: no recovery check-preempt runs
-                // across the leave (review minor 4).
-                c.lockOps();
                 // The hold stays while anyone relies on it (review round 3,
                 // major 4): a sibling of the set on this host rides our
                 // host's registration, and another host's registrant writes
@@ -1395,14 +1402,18 @@ pub const Guard = struct {
                 // registration stays the hold, a successor preempts it. Only
                 // the namespace's last registrant with no sibling releases
                 // and unregisters (zero residue).
+                // Flock first, then the registration lock, then the sequence
+                // lock around the release (decision 0004 DC25).
                 var last = true;
+                var flocked = false;
                 if (g.fence_reg) |*reg| {
                     if (reg.lock()) |_| {
-                        defer reg.unlock();
+                        flocked = true;
                         reg.removeRegion(g.identity.pid, "mp", g.identity.writerId(g.be.index), .any) catch {};
                         last = (reg.othersAlive(g.gpa, g.identity.pid) catch 1) == 0;
                     } else |_| last = false;
                 }
+                defer if (flocked) g.fence_reg.?.unlock();
                 // Never registered (a refusal before the arbitration, no
                 // early registration): nothing to take back.
                 const registered = g.pr_active or g.early_fresh != null;
@@ -1422,13 +1433,32 @@ pub const Guard = struct {
                 // fenced host (unreserved).
                 // The kept-law release is a manager mutation (decision 0004
                 // §4.4.2). Unreadable or usurped: leave the registration.
-                if (last and g.screenIdentity()) host_fence.leaveRegistration(c, g.keep_hold or c.stats.preempts > 0 or fencer_preempts > 0) catch |e| {
-                    var buf: [128]u8 = undefined;
-                    var w: Io.Writer = .fixed(&buf);
-                    c.writeError(&w, e) catch {};
-                    log.warn("meta volume {s}: reservation release/unregister failed ({s}) — a stale registration may remain (the next mount's ladder recovers it)", .{ g.be.path, w.buffered() });
-                };
-                c.unlockOps();
+                var section: host_fence.RegistrationHold = .{};
+                var armed = false;
+                if (flocked) {
+                    if (g.fence_reg.?.lockRegistration(0)) |h| {
+                        section = h;
+                        armed = true;
+                    } else |_| {
+                        // The release is a mutation. Refusing it leaves the
+                        // registration; the process still drops its client.
+                        log.err("meta volume {s}: the registration lock could not be taken — the release is refused (decision 0004 §4.4.2)", .{g.be.path});
+                        last = false;
+                    }
+                }
+                defer if (armed) section.release();
+                if (last and g.screenIdentity()) {
+                    // The holder's sequence lock: no recovery check-preempt
+                    // runs across the leave (review minor 4).
+                    c.lockOps();
+                    defer c.unlockOps();
+                    host_fence.leaveRegistration(c, g.keep_hold or c.stats.preempts > 0 or fencer_preempts > 0) catch |e| {
+                        var buf: [128]u8 = undefined;
+                        var w: Io.Writer = .fixed(&buf);
+                        c.writeError(&w, e) catch {};
+                        log.warn("meta volume {s}: reservation release/unregister failed ({s}) — a stale registration may remain (the next mount's ladder recovers it)", .{ g.be.path, w.buffered() });
+                    };
+                }
                 c.deinit();
                 g.gpa.destroy(c);
                 g.posture = .{ .none = .not_nvme_namespace };

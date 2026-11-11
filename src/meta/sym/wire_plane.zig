@@ -359,6 +359,11 @@ const JoinedHalf = struct {
                 self.member.windows_bytes = d.bytes;
                 self.member.n_windows = d.n_windows;
             }
+            // A parked reclaim calls `join` on this link. A reply timeout
+            // leaves the session up, so without this the join keeps
+            // dialling the frozen manager after the successor has
+            // checkpointed `endpoint:{0}`.
+            if (self.js.park_gate.isParked()) self.js.link.repointIfMoved();
             const t = clock.monotonicNs();
             const v = self.member.tick(t / std.time.ns_per_ms, t);
             self.plane.releaseRetiredIfDrained(self);
@@ -2575,7 +2580,19 @@ const PeerLinks = struct {
     fn create(self: *PeerLinks, k: @FieldType(Peer, "key"), ep: endpoint.EndpointWire) ?*Peer {
         const p = self.plane.gpa.create(Peer) catch return null;
         p.* = .{ .links = self, .key = k, .link = joined.SharedLink.init(self.plane.gpa, self.plane.io, ep, self.secret(), self.plane.identity) };
-        p.link.resolver = .{ .ctx = p, .resolve = &Peer.resolveFn };
+        // Holder 0 on a joiner is the manager. Its resolver is the
+        // membership endpoint (a RAM word). Rechecking it while the
+        // session stands retires a socket whose peer was SIGSTOPped:
+        // the token plane otherwise keeps pinging that port after the
+        // membership link has moved (decision 0004 §8.2 F1). A manager's
+        // own holder-0 link stays resolve-on-dial (that resolve is the
+        // RAM table under the verbs lock). Any other holder stays
+        // resolve-on-dial too: a live recheck of those is a wire call.
+        const recheck_holder0 = switch (k) {
+            .holder => |h| h == MANAGER_HOLDER and self.plane.set.volumes[0].joined != null,
+            .client => false,
+        };
+        p.link.resolver = .{ .ctx = p, .resolve = &Peer.resolveFn, .recheck_while_live = recheck_holder0 };
         return p;
     }
 

@@ -209,6 +209,15 @@ const LIVE_RECHECK_DEFERRALS: u64 = 10;
 pub const EndpointResolver = struct {
     ctx: *anyopaque,
     resolve: *const fn (ctx: *anyopaque) ?endpoint.EndpointWire,
+    /// Resolve even while a session stands, and retire that session when
+    /// the endpoint moved. The membership link leaves this false: its
+    /// resolver reads the device, and the census beat (or a parked
+    /// reclaim) calls `repointIfMoved`. A holder-0 peer link sets it.
+    /// Its resolver is the membership endpoint, a RAM word. A frozen
+    /// manager's TCP session otherwise stays the token plane's target:
+    /// SIGSTOP does not reset the socket, and a reply timeout does not
+    /// poison it (decision 0004 §8.2 F1).
+    recheck_while_live: bool = false,
 };
 
 /// A thread-safe `Link` over ONE dialled session to a peer: the reply
@@ -216,8 +225,10 @@ pub const EndpointResolver = struct {
 /// next call — the `TcpLink` contract per thread), the mux multiplexes the
 /// calls, a poisoned mux is replaced under the lock and retired (never
 /// freed under a caller still reading its cell). A link with a resolver
-/// re-resolves the endpoint before every dial; one without dials its
-/// fixed endpoint (the joiner's manager link).
+/// re-resolves the endpoint before every dial. One whose resolver sets
+/// `recheck_while_live` also does so while the session stands, and retires
+/// it when the endpoint moved. A reply timeout does not poison the
+/// session, so a frozen peer's socket would otherwise stay the target.
 pub const SharedLink = struct {
     gpa: Allocator,
     io: Io,
@@ -266,6 +277,13 @@ pub const SharedLink = struct {
         defer self.lock.unlock(self.io);
         const r = self.resolver orelse return;
         const ep = r.resolve(r.ctx) orelse return;
+        self.retireIfMovedLocked(ep);
+    }
+
+    /// The lock is held. A different endpoint retires the live session
+    /// (the next `ensure` dials it) and is remembered even when no
+    /// session stands yet.
+    fn retireIfMovedLocked(self: *SharedLink, ep: endpoint.EndpointWire) void {
         if (ep.eql(self.ep)) return;
         stats.peer_links_repointed.inc();
         self.ep = ep;
@@ -290,6 +308,11 @@ pub const SharedLink = struct {
     fn ensure(self: *SharedLink) errors.Error!*dialer.Mux {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
+        if (self.resolver) |r| {
+            if (r.recheck_while_live) {
+                if (r.resolve(r.ctx)) |ep| self.retireIfMovedLocked(ep);
+            }
+        }
         if (self.mux) |m| {
             if (!m.isPoisoned()) return m;
             self.retired.append(self.gpa, m) catch m.close();

@@ -3513,6 +3513,20 @@ fn touchPath(path: [:0]const u8) !void {
     _ = linux.close(@intCast(rc));
 }
 
+fn printF1Joiner(rig: *Rig, j: usize) void {
+    const text = rig.readLog(j) catch return;
+    defer rig.gpa.free(text);
+    std.debug.print("\n--- F1 J: park {d} listener-moved {d} reclaim {d} reregistered {d} poisoned {d} fenced-log {d} ---\n", .{
+        @intFromBool(std.mem.indexOf(u8, text, "appender park: T_self") != null),
+        @intFromBool(std.mem.indexOf(u8, text, "the manager's listener moved to") != null),
+        @intFromBool(std.mem.indexOf(u8, text, "admitted the reclaim") != null),
+        @intFromBool(std.mem.indexOf(u8, text, "re-registered this host") != null),
+        @intFromBool(std.mem.indexOf(u8, text, "POISONED") != null),
+        @intFromBool(std.mem.indexOf(u8, text, "member-fence beat") != null),
+    });
+    printLogTailFile(rig, rig.daemons.items[j].log_path, 30);
+}
+
 fn printLogTailFile(rig: *Rig, path: []const u8, n: usize) void {
     const text = Io.Dir.cwd().readFileAlloc(rig.io, path, rig.gpa, .limited(16 << 20)) catch return;
     defer rig.gpa.free(text);
@@ -3564,7 +3578,7 @@ const f10_writer =
     \\done
 ;
 
-test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2, §4.4) — M (host A) manages, J (host C) writes and fsyncs; M is SIGSTOPped past the claim TTL; S (host B) mounts: one preempt-all (writer_guard_preempt_alls 1) removes every other registrant (writer_guard_preempt_all_victims >= 2) and the namespace stays WEAR (rtype 5); S reads J's acked bytes and fsck is clean. J's re-admission, the window's early settle and the data-fence debt are the next pins, not this row yet" {
+test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2, §4.4) — M (host A) manages, J (host C) writes and fsyncs; M is SIGSTOPped past the claim TTL; S (host B) mounts: one preempt-all (writer_guard_preempt_alls 1) removes every other registrant (writer_guard_preempt_all_victims >= 2) and the namespace stays WEAR (rtype 5); S reads J's acked bytes; J's key is back, writer_guard_fenced is 0, and J reads its own bytes. The window's early settle and the data-fence debt are the next pins, not this row yet" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -3606,10 +3620,33 @@ test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2
     try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
     try testing.expectEqual(@as(u64, 1), try statNumber(ss, "writer_guard_preempt_alls"));
     try testing.expect(try statNumber(ss, "writer_guard_preempt_all_victims") >= 2);
-    // J's getattr wedges on the superseded manager's token channel
-    // (TokenChannelStale, then EIO at the move gate). Re-admission is the
-    // next pin: this row does not require J's mount to answer.
-    try rig.kill9(j);
+    // J's bytes come back through the successor's token plane. `timeout`
+    // bounds a channel that stayed on M's frozen socket (the move gate
+    // would otherwise sit for its full deadline, then answer EIO).
+    const seen = rig.onMount(j, "timeout 70 cat dj/j") catch |e| {
+        printF1Joiner(rig, j);
+        return e;
+    };
+    defer gpa.free(seen);
+    if (!std.mem.eql(u8, seen, "j\n")) {
+        printF1Joiner(rig, j);
+        std.debug.print("\n--- J read {s} ---\n", .{seen});
+        return error.JBytesLost;
+    }
+    const js = try rig.stats(j);
+    defer gpa.free(js);
+    try testing.expectEqual(@as(u64, 0), try statNumber(js, "writer_guard_fenced"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(js, "appender_parked"));
+    const key_j = try statString(rig, j, "pr_key");
+    defer gpa.free(key_j);
+    const rr_j = try rig.resvReportJson(cm.dev());
+    defer gpa.free(rr_j);
+    if (std.mem.indexOf(u8, rr_j, key_j) == null) {
+        printF1Joiner(rig, j);
+        std.debug.print("\n--- J's key {s} is absent from the report (regctl {?d}) ---\n{s}\n", .{ key_j, json_scan.number(rr_j, "regctl"), rr_j });
+        return error.JKeyAbsent;
+    }
+    try rig.umount(j);
     try rig.kill9(m);
     try rig.umount(s);
     const bound = try bindDataForFsck(rig, &set, transport);

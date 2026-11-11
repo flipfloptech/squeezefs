@@ -5,7 +5,7 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** Parent of the identityHolds commit is `938cdb9f`. No upstream.
+**Branch `feat/pr5` is at `51f0187b`.** No upstream.
 Not pushed. Not merged. `dev` (and the parent of this branch) is `b40ac017`
 (`fix(meta): do not succession-park a volume with no device fence`).
 
@@ -38,7 +38,7 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | `697e5f35` | Reconcile does not preempt a key a Live appender page on volume 0 names. A recovered page does not spare the key. F9's data fence moved to `data_pr_preempts` 1, reconcile 0. |
 | `ef1c472c` | W_end evicts a listed writer whose key is missing from a managed namespace, then reconciles and clears the window. `writer_guard_succession_evictions`. The reconcile no longer runs at settle. |
 | `938cdb9f` | Volume 0's claim records `meta_fence_debt`. Admission pays every key it names, then deletes the record. F1: `data_pr_debt_preempts` 1, `data_pr_reconcile_preempts` 0, 41/41. |
-| identityHolds | Appender 0's page is ours, usurped, or unreadable (§4.4.2). See below. |
+| `51f0187b` | Appender 0's page is ours, usurped, or unreadable (§4.4.2). See below. |
 
 ## What is true in the code
 
@@ -97,7 +97,7 @@ F1 on the safe exe after the `owesFenceDebt` fix: `data_pr_debt_preempts` 1,
   C's records A's and B's. C's remount does not add C's own key. `storeFenceDebt(be, &.{})`
   deletes the record.
 
-## identityHolds, committed on top of `938cdb9f`
+## identityHolds, committed `51f0187b`
 
 Decision §4.4.2. Unit tests `pr5 identity` + `pr5 debt` + `lapse grace`: 47 pass, 1 skip.
 F1 after the probe fix (`~/tmp/pr5-f1-ident2.log`): `regctl` 3, `writer_guard_identity_failures` 0,

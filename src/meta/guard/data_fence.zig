@@ -103,6 +103,7 @@ const route_table = @import("../routing/route_table.zig");
 const set_config = @import("../../data/set_config.zig");
 const nvme_dev = @import("../../io/nvme_dev.zig");
 const gate = @import("gate.zig");
+const cr = @import("../sym/control_records.zig");
 const member_fence = @import("member_fence.zig");
 const park = @import("../sym/membership/park_reclaim.zig");
 const grant = @import("../sym/extent_grant.zig");
@@ -233,9 +234,14 @@ pub const Inputs = struct {
     /// and, while its succession window is open, defers the reconcile.
     guard: ?*gate.Guard = null,
     /// The predecessor manager's host key (decision 0004 §4.7). 0 = none
-    /// (first manager, same-host remount, no page key).
-    /// shortcut: one key in RAM, upgrade when a chain of successions must keep every unpaid key in the durable record.
+    /// (first manager, same-host remount, no page key). Unioned with the
+    /// durable record at payment, so a fixture with no volume still pays
+    /// the one key.
     predecessor_key: u64 = 0,
+    /// Volume 0, when the debt record is durable (decision 0004 §6.3).
+    /// Null in a fixture: payment uses `predecessor_key` alone and removes
+    /// nothing.
+    debt_be: ?*backend.KvBackend = null,
     /// Test seam: treat the succession window as open without a guard.
     window_open: bool = false,
     /// A joiner's other joined metadata volumes with a device fence
@@ -368,6 +374,8 @@ pub const DataFence = struct {
     beat_after_abort: bool = false,
     /// `endSuccession` already reconciled this window.
     reconciled_succession: bool = false,
+    /// `payDebt` proved the debt on a data namespace this admission.
+    debt_attempted: bool = false,
 
     /// The alert's repeat: a held recovery polls every tick; one line per
     /// half minute keeps the log readable and the alert loud.
@@ -655,12 +663,14 @@ pub const DataFence = struct {
         return true;
     }
 
-    /// While the succession window is open, pay the predecessor's key and
-    /// leave every other data registrant for `endSuccession` (decision
-    /// 0004 §4.7). A first manager, and a lapse with no window, reconcile
-    /// here as before.
+    /// Pay the fence debt on this data namespace, then reconcile — unless a
+    /// succession window is open, in which case the general reconcile waits
+    /// for W_end (decision 0004 §4.7). The debt is paid whether or not a
+    /// window is open: a crash between the claim and this admission leaves
+    /// the keys in the record and the remount may not be a preempt.
     fn fenceAdmission(self: *DataFence, path: []const u8, c: *pr.Client) AdmitError!void {
-        if (self.successionOpen()) return self.payDebt(path, c);
+        try self.payDebt(path, c);
+        if (self.successionOpen()) return;
         return self.reconcile(path, c);
     }
 
@@ -671,17 +681,60 @@ pub const DataFence = struct {
         return !w.settled;
     }
 
-    /// `fence(k)` on this data namespace, then a report proving WEAR with
-    /// k absent. The own key and 0 are not debts. An already-absent key is
-    /// the paid end state and counts nothing.
+    /// `fence(k)` on this data namespace for every key the debt names, then
+    /// a report proving WEAR with k absent. The own key and 0 are not
+    /// debts. An already-absent key is the paid end state and counts
+    /// nothing. The record is removed only after every data namespace has
+    /// been through here (`retirePaidDebt`): removing it on the first
+    /// volume would leave the key registered on the next.
     fn payDebt(self: *DataFence, path: []const u8, c: *pr.Client) AdmitError!void {
-        const k = self.in.predecessor_key;
-        if (k == 0 or k == c.key) return;
+        var storage: [cr.FenceDebt.MAX_KEYS]u64 = undefined;
+        const keys = try self.debtKeys(path, c, &storage);
+        if (keys.len == 0) return;
         const held = self.meta.admittedHere() catch return reportRefusal(path, "the metadata namespace's report");
         if (!held) {
             log.err("data volume {s}: this mount no longer holds the metadata reservation — it pays no fence debt and refuses", .{path});
             return error.Refused;
         }
+        self.debt_attempted = true;
+        for (keys) |k| {
+            if (k == 0 or k == c.key) continue;
+            try proveDebtKey(path, c, k);
+        }
+    }
+
+    /// The durable record, plus the page's predecessor key when the record
+    /// does not already name it (a fixture has no record).
+    fn debtKeys(self: *DataFence, path: []const u8, c: *pr.Client, buf: *[cr.FenceDebt.MAX_KEYS]u64) AdmitError![]u64 {
+        var n: usize = 0;
+        if (self.in.debt_be) |be| {
+            const loaded = gate.loadFenceDebt(be, buf) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    log.err("data volume {s}: the fence debt record could not be read ({s}) — refusing the admission", .{ path, @errorName(e) });
+                    return error.Refused;
+                },
+            };
+            n = loaded.len;
+        }
+        const add = self.in.predecessor_key;
+        if (add != 0 and add != c.key) {
+            const seen = for (buf[0..n]) |k| {
+                if (k == add) break true;
+            } else false;
+            if (!seen) {
+                if (n == buf.len) {
+                    log.err("data volume {s}: the fence debt holds {d} keys and cannot take the predecessor's — refusing the admission", .{ path, n });
+                    return error.Refused;
+                }
+                buf[n] = add;
+                n += 1;
+            }
+        }
+        return buf[0..n];
+    }
+
+    fn proveDebtKey(path: []const u8, c: *pr.Client, k: u64) AdmitError!void {
         const present = keyOnNamespace(c, k) catch return reportRefusal(path, "the data namespace's report");
         if (!present) return;
         c.preemptAndAbort(k) catch |e| {
@@ -702,6 +755,39 @@ pub const DataFence = struct {
         if (rtype != nvme.RTYPE_WEAR) return foreignReservation(path, rtype);
         stats.data_pr_debt_preempts.inc();
         log.warn("data volume {s}: paid the fence debt — preempted key {x:0>16} (the predecessor manager's host)", .{ path, k });
+    }
+
+    /// Every key the record names was proven on each data namespace this
+    /// admission fenced (decision 0004 §6.3: removed in a transaction, then
+    /// a barrier). A fixture with no volume has nothing to remove.
+    fn retirePaidDebt(self: *DataFence) AdmitError!void {
+        const be = self.in.debt_be orelse return;
+        if (!self.in.manager) return;
+        var buf: [cr.FenceDebt.MAX_KEYS]u64 = undefined;
+        const cur = gate.loadFenceDebt(be, &buf) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.err("data fence: the fence debt record could not be read after it was paid ({s}) — refusing the admission", .{@errorName(e)});
+                return error.Refused;
+            },
+        };
+        if (cur.len == 0) return;
+        if (!self.debt_attempted) {
+            log.err("data fence: a fence debt of {d} key(s) was not paid on a data namespace — refusing the admission (decision 0004 §4.7)", .{cur.len});
+            return error.Refused;
+        }
+        gate.storeFenceDebt(be, &.{}) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.err("data fence: the fence debt record could not be cleared after it was paid ({s}) — refusing the admission", .{@errorName(e)});
+                return error.Refused;
+            },
+        };
+        be.fsync() catch |e| {
+            log.err("data fence: the fence debt's barrier failed ({s}) — refusing the admission", .{@errorName(e)});
+            return error.Refused;
+        };
+        log.info("data fence: fence debt cleared ({d} key(s) proven)", .{cur.len});
     }
 
     fn settleHook(ctx: *anyopaque) void {
@@ -1827,6 +1913,10 @@ fn admitAllBlocking(df: *DataFence, data: []const set_config.DataVolume) ?[]cons
     switch (df.metaHostId()) {
         .known => {},
         .unknown => {
+            if (owesFenceDebt(df)) {
+                log.err("data fence: the metadata namespace answers no host identifier and a fence debt is unpaid — refusing the admission (decision 0004 §4.7)", .{});
+                return "volume 0's metadata namespace (its host identifier)";
+            }
             log.warn("data fence: the metadata namespace answers no host identifier (FID 0x81 zeros) — the data namespaces' registrations cannot be judged: no data volume is fenced (decision 0003 §DJ)", .{});
             df.lock.lock();
             defer df.lock.unlock();
@@ -1843,7 +1933,16 @@ fn admitAllBlocking(df: *DataFence, data: []const set_config.DataVolume) ?[]cons
         if (d.state == .retired) continue;
         df.admitVolume(d.vol_tag, d.uri) catch return d.uri;
     }
+    df.retirePaidDebt() catch return "volume 0's fence debt";
     return null;
+}
+
+fn owesFenceDebt(self: *DataFence) bool {
+    if (self.in.predecessor_key != 0) return true;
+    const be = self.in.debt_be orelse return false;
+    var buf: [cr.FenceDebt.MAX_KEYS]u64 = undefined;
+    const n = gate.loadFenceDebt(be, &buf) catch return true;
+    return n.len != 0;
 }
 
 fn inputsOf(gpa: Allocator, env: *const std.process.Environ.Map, vols: []const *backend.KvBackend, joined_buf: *[route_table.MAX_VOLUMES]JoinedMeta) ?Inputs {
@@ -1854,7 +1953,7 @@ fn inputsOf(gpa: Allocator, env: *const std.process.Environ.Map, vols: []const *
         const c = g.prClient() orelse return null;
         const dev = g.device orelse return null;
         const predecessor_key: u64 = if (be0.sym) |s| s.predecessor_host_key else 0;
-        return .{ .gpa = gpa, .env = env, .meta_face = dev.face(), .meta_nsid = dev.nsid, .key = c.key, .reg = g.fence_reg, .local = g.identity, .node_token = join.nodeToken(g.identity), .pages = pages, .meta_path = be0.path, .writer_id = g.identity.writerId(be0.index), .config = config, .manager = true, .guard = g, .predecessor_key = predecessor_key };
+        return .{ .gpa = gpa, .env = env, .meta_face = dev.face(), .meta_nsid = dev.nsid, .key = c.key, .reg = g.fence_reg, .local = g.identity, .node_token = join.nodeToken(g.identity), .pages = pages, .meta_path = be0.path, .writer_id = g.identity.writerId(be0.index), .config = config, .manager = true, .guard = g, .predecessor_key = predecessor_key, .debt_be = be0 };
     }
     const js = be0.joined orelse return null;
     const f = js.fence orelse return null;

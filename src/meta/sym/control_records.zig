@@ -2,7 +2,8 @@
 //! `slot_tails:{s}`, `extent_grant:{a}:{chunk}`, `appender_hint:{identity}`,
 //! `node_seq_incarnations`; on VOLUME 0 only `alloc_lease:{vol}`,
 //! `dead_member:{id}`, `recovered:{id, vol}`, `dir_rename`,
-//! `custody_quarantine:{slot}`; `docs/porting/sym_appenders_manager.md` §1).
+//! `meta_fence_debt`, `custody_quarantine:{slot}`;
+//! `docs/porting/sym_appenders_manager.md` §1).
 //! PORTABLE: canonical, total, sized codecs — the ONE codec every reader
 //! and writer of tree 0 uses (`routing/slot_state.zig` re-exports the
 //! `slot_state` half).
@@ -72,6 +73,9 @@ pub const Tag = enum(u8) {
     /// per volume, in tree 0 — no slot, no lease, no door, never migrated
     /// (`docs/porting/dynamic_routing.md` Q4; decision 0003 §AS).
     writer_claim = 15,
+    /// Superseded managers' host keys not yet proven fenced on data
+    /// (decision 0004 §6.3). One record, on volume 0 only.
+    meta_fence_debt = 16,
 
     /// The id bytes behind the two-byte prefix.
     pub fn idLen(self: Tag) usize {
@@ -82,7 +86,7 @@ pub const Tag = enum(u8) {
             .appender_hint, .dead_member, .member, .job_shard => 12,
             .recovered => 14,
             .alloc_lease, .job => 8,
-            .dir_rename, .node_seq_incarnations, .writer_claim => 0,
+            .dir_rename, .node_seq_incarnations, .writer_claim, .meta_fence_debt => 0,
         };
     }
 
@@ -207,6 +211,10 @@ pub fn nodeSeqIncarnationsKey() ControlKey {
 
 pub fn writerClaimKey() ControlKey {
     return ControlKey.prefix(.writer_claim);
+}
+
+pub fn metaFenceDebtKey() ControlKey {
+    return ControlKey.prefix(.meta_fence_debt);
 }
 
 /// The tag of a tree-0 key, or null for a key that is not a control key
@@ -1216,6 +1224,88 @@ pub const EndpointRecordWire = extern struct {
 };
 
 // ---------------------------------------------------------------------------
+// meta_fence_debt: superseded managers' host keys not yet proven fenced on
+// data (decision 0004 §6.3). One record on volume 0. `n` ≤ 64; a longer
+// chain refuses the takeover. 0 and the mounting host's own key are never
+// entries. The checksum is xxh3-64 over the record with the field zeroed.
+// ---------------------------------------------------------------------------
+
+pub const FenceDebt = struct {
+    pub const MAGIC = "MFDB";
+    pub const VERSION: u16 = 1;
+    pub const MAX_KEYS: usize = 64;
+    /// magic ‖ version ‖ n ‖ reserved.
+    pub const HEAD: usize = 12;
+    pub const MAX_LEN: usize = HEAD + MAX_KEYS * 8 + 8;
+
+    pub fn encodedLen(n: usize) usize {
+        return HEAD + n * 8 + 8;
+    }
+};
+
+pub fn encodeFenceDebt(keys: []const u64, buf: []u8) error{Invalid}![]u8 {
+    if (keys.len > FenceDebt.MAX_KEYS or buf.len < FenceDebt.encodedLen(keys.len)) return error.Invalid;
+    var i: usize = 0;
+    while (i < keys.len) : (i += 1) {
+        if (keys[i] == 0) return error.Invalid;
+        var j: usize = 0;
+        while (j < i) : (j += 1) if (keys[j] == keys[i]) return error.Invalid;
+    }
+    const len = FenceDebt.encodedLen(keys.len);
+    @memset(buf[0..len], 0);
+    @memcpy(buf[0..4], FenceDebt.MAGIC);
+    std.mem.writeInt(u16, buf[4..6], FenceDebt.VERSION, .little);
+    std.mem.writeInt(u16, buf[6..8], @intCast(keys.len), .little);
+    for (keys, 0..) |k, n| std.mem.writeInt(u64, buf[FenceDebt.HEAD + n * 8 ..][0..8], k, .little);
+    checksum.stamp(buf[0..len], len - 8);
+    return buf[0..len];
+}
+
+pub fn decodeFenceDebt(bytes: []const u8, out: *[FenceDebt.MAX_KEYS]u64) DecodeError!usize {
+    if (bytes.len < FenceDebt.HEAD + 8) return error.Corrupt;
+    if (!std.mem.eql(u8, bytes[0..4], FenceDebt.MAGIC)) return error.Corrupt;
+    if (std.mem.readInt(u16, bytes[4..6], .little) != FenceDebt.VERSION) return error.Corrupt;
+    const n = std.mem.readInt(u16, bytes[6..8], .little);
+    if (n > FenceDebt.MAX_KEYS) return error.Corrupt;
+    if (std.mem.readInt(u32, bytes[8..12], .little) != 0) return error.Corrupt;
+    if (bytes.len != FenceDebt.encodedLen(n)) return error.Corrupt;
+    if (!checksum.verify(bytes, bytes.len - 8)) return error.Corrupt;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const k = std.mem.readInt(u64, bytes[FenceDebt.HEAD + i * 8 ..][0..8], .little);
+        if (k == 0) return error.Corrupt;
+        for (out[0..i]) |prev| if (prev == k) return error.Corrupt;
+        out[i] = k;
+    }
+    return n;
+}
+
+/// `existing ∪ {add} \ {own, 0}`, sorted, deduplicated. `error.ChainTooLong`
+/// when the result would pass `MAX_KEYS` (decision 0004 §6.3: the takeover
+/// refuses). `add` and `own` of 0 add nothing.
+pub fn mergeFenceDebt(existing: []const u64, add: u64, own: u64, out: *[FenceDebt.MAX_KEYS]u64) error{ChainTooLong}![]u64 {
+    var n: usize = 0;
+    for (existing) |k| {
+        if (k == 0 or k == own) continue;
+        if (n == FenceDebt.MAX_KEYS) return error.ChainTooLong;
+        out[n] = k;
+        n += 1;
+    }
+    if (add != 0 and add != own) {
+        const seen = for (out[0..n]) |k| {
+            if (k == add) break true;
+        } else false;
+        if (!seen) {
+            if (n == FenceDebt.MAX_KEYS) return error.ChainTooLong;
+            out[n] = add;
+            n += 1;
+        }
+    }
+    std.mem.sort(u64, out[0..n], {}, std.sort.asc(u64));
+    return out[0..n];
+}
+
+// ---------------------------------------------------------------------------
 // node_seq_incarnations: the value codec is `node_seq.zig`'s (9 B, total);
 // the key is this module's binary one.
 // ---------------------------------------------------------------------------
@@ -1236,6 +1326,8 @@ comptime {
     assert(@sizeOf(DeadMemberWire) == DeadMemberWire.LEN);
     assert(@sizeOf(RecoveredWire) == RecoveredWire.LEN);
     assert(@sizeOf(EndpointRecordWire) == EndpointRecordWire.LEN);
+    assert(FenceDebt.HEAD == 12);
+    assert(FenceDebt.MAX_LEN == 12 + 64 * 8 + 8);
     // Every control key sorts below the ASCII-keyed records of tree 0.
     assert(key.TREE_CONTROL < 'a');
     _ = checksum;
@@ -1557,6 +1649,14 @@ fn checkDecodersTotal(bytes: []const u8) !void {
     if (DeadMemberWire.decode(bytes)) |d| try testing.expectEqualSlices(u8, bytes, &DeadMemberWire.init(d).encode()) else |_| {}
     if (RecoveredWire.decode(bytes)) |r| try testing.expectEqualSlices(u8, bytes, &RecoveredWire.init(r).encode()) else |_| {}
     if (EndpointRecordWire.decode(bytes)) |e| try testing.expectEqualSlices(u8, bytes, &EndpointRecordWire.init(e).encode()) else |_| {}
+    {
+        var fence_buf: [FenceDebt.MAX_KEYS]u64 = undefined;
+        if (decodeFenceDebt(bytes, &fence_buf)) |n| {
+            var re: [FenceDebt.MAX_LEN]u8 = undefined;
+            const enc = try encodeFenceDebt(fence_buf[0..n], &re);
+            try testing.expectEqualSlices(u8, bytes, enc);
+        } else |_| {}
+    }
     _ = decodeNodeSeqIncarnations(bytes) catch {};
 }
 
@@ -1573,6 +1673,40 @@ fn fuzzSlice(comptime bytes: []const u8) []const u8 {
         break :blk len ++ bytes[0..bytes.len].*;
     };
     return &framed;
+}
+
+test "fence debt (decision 0004 §6.3): magic MFDB, version 1, n keys, xxh3-64; 0, a duplicate, a bad checksum, a reserved word and a short buffer refuse; merge unions the predecessor, drops 0 and the own key, and refuses a 65th" {
+    var buf: [FenceDebt.MAX_LEN]u8 = undefined;
+    const enc = try encodeFenceDebt(&.{ 0xA, 0x3 }, &buf);
+    try testing.expectEqual(FenceDebt.encodedLen(2), enc.len);
+    try testing.expectEqualSlices(u8, FenceDebt.MAGIC, enc[0..4]);
+    var got: [FenceDebt.MAX_KEYS]u64 = undefined;
+    try testing.expectEqual(@as(usize, 2), try decodeFenceDebt(enc, &got));
+    try testing.expectEqualSlices(u64, &.{ 0xA, 0x3 }, got[0..2]);
+    var good: [FenceDebt.encodedLen(2)]u8 = undefined;
+    @memcpy(&good, enc);
+    const again = try encodeFenceDebt(got[0..2], &buf);
+    try testing.expectEqualSlices(u8, &good, again);
+    var bad = good;
+    bad[bad.len - 1] ^= 1;
+    try testing.expectError(error.Corrupt, decodeFenceDebt(&bad, &got));
+    bad = good;
+    bad[8] = 1;
+    try testing.expectError(error.Corrupt, decodeFenceDebt(&bad, &got));
+    try testing.expectError(error.Corrupt, decodeFenceDebt(enc[0 .. enc.len - 1], &got));
+    try testing.expectError(error.Invalid, encodeFenceDebt(&.{0}, &buf));
+    try testing.expectError(error.Invalid, encodeFenceDebt(&.{ 1, 1 }, &buf));
+    const empty = try encodeFenceDebt(&.{}, &buf);
+    try testing.expectEqual(@as(usize, 0), try decodeFenceDebt(empty, &got));
+
+    var out: [FenceDebt.MAX_KEYS]u64 = undefined;
+    try testing.expectEqualSlices(u64, &.{0x3}, try mergeFenceDebt(&.{ 0x4, 0x3 }, 0x3, 0x4, &out));
+    try testing.expectEqualSlices(u64, &.{0x2}, try mergeFenceDebt(&.{0x2}, 0, 0x9, &out));
+    try testing.expectEqualSlices(u64, &.{ 0x2, 0x5 }, try mergeFenceDebt(&.{0x5}, 0x2, 0x9, &out));
+    var full: [FenceDebt.MAX_KEYS]u64 = undefined;
+    for (&full, 0..) |*k, i| k.* = @intCast(i + 1);
+    try testing.expectError(error.ChainTooLong, mergeFenceDebt(&full, 1000, 0, &out));
+    try testing.expectEqual(@as(usize, FenceDebt.MAX_KEYS), (try mergeFenceDebt(&full, 1, 0, &out)).len);
 }
 
 test "fuzz: every tree-0 decoder is total on arbitrary bytes and canonical where it accepts" {

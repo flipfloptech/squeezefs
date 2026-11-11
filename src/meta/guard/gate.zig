@@ -43,6 +43,7 @@ const superblock = @import("../superblock.zig");
 const journal = @import("../journal.zig");
 const device_loader = @import("../device_loader.zig");
 const cr = @import("../sym/control_records.zig");
+const appender_page = @import("../sym/appender_page.zig");
 const backend = @import("../backend.zig");
 const guard = @import("../guard.zig");
 const claim = @import("claim.zig");
@@ -831,6 +832,9 @@ pub const Guard = struct {
         {
             errdefer g.be.abandon(t);
             try g.stageClaimPut(t, g.ourClaim());
+            // The same transaction as the claim (decision 0004 §4.4 step 10,
+            // §6.3). Volume 0 only; a flat volume has no predecessor page.
+            try g.stageFenceDebt(t);
         }
         g.be.commit(t) catch |e| {
             log.err("meta volume {s}: the writer claim could not be committed ({s}) — refusing the mount", .{ g.be.path, @errorName(e) });
@@ -839,6 +843,62 @@ pub const Guard = struct {
         // Release pairs with `close`'s acquire: the deletion runs iff the
         // claim landed.
         g.claimed.store(true, .release);
+    }
+
+    /// `debt := debt ∪ {page 0's host key} \ {own key, 0}` (decision 0004
+    /// §6.3). The page still names the predecessor: region 0 is rewritten
+    /// after this commit. An unreadable record or page refuses the mount —
+    /// guessing would drop a key the next open can no longer see. A chain
+    /// past 64 keys refuses the takeover.
+    fn stageFenceDebt(g: *Guard, t: *backend.KvTx) backend.OpenError!void {
+        if (g.be.index != 0 or !g.be.sb.symmetricPlaneStamped()) return;
+        const own: u64 = if (g.prClient()) |c| c.key else 0;
+        const add = g.livePage0HostKey() catch |e| {
+            log.err("meta volume {s}: appender 0's page could not be read ({s}) — the fence debt would drop the predecessor's host key, refusing the mount", .{ g.be.path, @errorName(e) });
+            return e;
+        };
+        var existing_buf: [cr.FenceDebt.MAX_KEYS]u64 = undefined;
+        const existing = loadFenceDebt(g.be, &existing_buf) catch |e| {
+            log.err("meta volume {s}: the fence debt record could not be read ({s}) — refusing the mount", .{ g.be.path, @errorName(e) });
+            return e;
+        };
+        std.mem.sort(u64, existing, {}, std.sort.asc(u64));
+        var merged_buf: [cr.FenceDebt.MAX_KEYS]u64 = undefined;
+        const merged = cr.mergeFenceDebt(existing, add orelse 0, own, &merged_buf) catch {
+            log.err("meta volume {s}: the fence debt already holds {d} unpaid host keys and this takeover would add another — refusing (decision 0004 §6.3, at most {d})", .{ g.be.path, existing.len, cr.FenceDebt.MAX_KEYS });
+            return error.Busy;
+        };
+        if (std.mem.eql(u64, existing, merged)) return;
+        const k = cr.metaFenceDebtKey();
+        if (merged.len == 0) {
+            try t.stageDelete(key.TREE_CONTROL, k.slice());
+            return;
+        }
+        var buf: [cr.FenceDebt.MAX_LEN]u8 = undefined;
+        const enc = cr.encodeFenceDebt(merged, &buf) catch return error.Corrupt;
+        try t.stagePut(key.TREE_CONTROL, k.slice(), enc);
+        log.info("meta volume {s}: fence debt records {d} host key(s), first {x:0>16}", .{ g.be.path, merged.len, merged[0] });
+    }
+
+    /// Appender 0's Live page host key, or null when the page is absent or
+    /// not Live. The four slots are read off the device; a layout this
+    /// binary does not read refuses the mount.
+    fn livePage0HostKey(g: *Guard) backend.OpenError!?u64 {
+        const be = g.be;
+        const offs = appender_page.appender0PageOffsets(be.sb.journal.start);
+        var bufs: [appender_page.PAGE_SLOTS][appender_page.PAGE_LEN]u8 = undefined;
+        var imgs: [appender_page.PAGE_SLOTS]?[]const u8 = @splat(null);
+        for (offs, 0..) |off, i| {
+            const img = be.dev.readRange(g.gpa, off, appender_page.PAGE_LEN) catch return error.Io;
+            defer g.gpa.free(img);
+            if (img.len < appender_page.PAGE_LEN) return error.Io;
+            @memcpy(&bufs[i], img[0..appender_page.PAGE_LEN]);
+            imgs[i] = &bufs[i];
+        }
+        const prior = appender_page.newestValid(imgs) catch return error.UnsupportedFormat;
+        const p = prior orelse return null;
+        if (p.state != .live) return null;
+        return p.host_key;
     }
 
     fn barrier(g: *Guard) backend.OpenError!void {
@@ -1278,6 +1338,41 @@ pub const Guard = struct {
     }
 };
 
+/// The fence-debt record on volume 0 (decision 0004 §6.3). Absent is an
+/// empty slice of `out`. A record that does not decode is `Corrupt`.
+pub fn loadFenceDebt(be: *KvBackend, out: *[cr.FenceDebt.MAX_KEYS]u64) backend.OpenError![]u64 {
+    const raw = be.lookup(be.gpa, key.TREE_CONTROL, cr.metaFenceDebtKey().slice()) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Io,
+    };
+    const bytes = raw orelse return out[0..0];
+    defer be.gpa.free(bytes);
+    const n = cr.decodeFenceDebt(bytes, out) catch return error.Corrupt;
+    return out[0..n];
+}
+
+/// Replace the fence-debt record. An empty list deletes it. Its own
+/// transaction: the claim commit stages into the claim's transaction
+/// instead, and the data admission removes keys here after they are proven.
+pub fn storeFenceDebt(be: *KvBackend, keys: []const u64) backend.OpenError!void {
+    const t = try be.begin(@src());
+    {
+        errdefer be.abandon(t);
+        const k = cr.metaFenceDebtKey();
+        if (keys.len == 0) {
+            try t.stageDelete(key.TREE_CONTROL, k.slice());
+        } else {
+            var buf: [cr.FenceDebt.MAX_LEN]u8 = undefined;
+            const enc = cr.encodeFenceDebt(keys, &buf) catch return error.Corrupt;
+            try t.stagePut(key.TREE_CONTROL, k.slice(), enc);
+        }
+    }
+    be.commit(t) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Io,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // The probe (`open_probe`): the claim off the device without the flock.
 // ---------------------------------------------------------------------------
@@ -1483,8 +1578,10 @@ const test_volume_len: u64 = 64 << 20;
 
 const host_a_id: [16]u8 = "guard-host-a-01!".*;
 const host_b_id: [16]u8 = "guard-host-b-02!".*;
+const host_c_id: [16]u8 = "guard-host-c-03!".*;
 const boot_a: [16]u8 = "boot-a-boot-a-01".*;
 const boot_b: [16]u8 = "boot-b-boot-b-02".*;
+const boot_c: [16]u8 = "boot-c-boot-c-03".*;
 
 /// A fixed pid table: 500 live at tick 123; everything else absent.
 const PidTable = struct {
@@ -1815,7 +1912,6 @@ test "B1 on a PR substrate (the fake): the symmetric volume's manager holds WEAR
 
 /// Appender 0's newest valid page on the device, its host key.
 fn page0HostKey(be: *backend.KvBackend) !u64 {
-    const appender_page = @import("../sym/appender_page.zig");
     const offs = appender_page.appender0PageOffsets(be.sb.journal.start);
     var bufs: [appender_page.PAGE_SLOTS][appender_page.PAGE_LEN]u8 = undefined;
     var imgs: [appender_page.PAGE_SLOTS]?[]const u8 = @splat(null);
@@ -2510,6 +2606,59 @@ test "W_end (decision 0004 §4.6): the window settles without reconciling; it is
     // Cleared once: a second end does not reconcile again.
     g.endSuccession();
     try testing.expectEqual(@as(u32, 1), ran);
+}
+
+fn expectDebt(be: *KvBackend, keys: []const u64) !void {
+    var got: [cr.FenceDebt.MAX_KEYS]u64 = undefined;
+    const have = try loadFenceDebt(be, &got);
+    var want: [cr.FenceDebt.MAX_KEYS]u64 = undefined;
+    @memcpy(want[0..keys.len], keys);
+    std.mem.sort(u64, want[0..keys.len], {}, std.sort.asc(u64));
+    try testing.expectEqualSlices(u64, want[0..keys.len], have);
+}
+
+test "pr5 debt record: the claim transaction on volume 0 unions the predecessor's host key and keeps the chain (decision 0004 §6.3, §4.7); 0 and this mount's own key are not debts; clearing the record removes it" {
+    const gpa = testing.allocator;
+    const v = try Vol.create(gpa, "debt-rec", null);
+    defer v.destroy();
+    var ns = fake.Namespace.init(gpa);
+    defer ns.deinit();
+    var ha: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
+    var hb: fake.Host = .{ .ns = &ns, .host_id = host_b_id };
+    var hc: fake.Host = .{ .ns = &ns, .host_id = host_c_id };
+    var key_a: u64 = undefined;
+    {
+        const be = try v.open(.{ .test_identity = ident(boot_a, 4000, 781), .test_namespace = ha.face(), .test_pid_probe = PidTable.probe }, 0);
+        key_a = be.guard.?.prClient().?.key;
+        try testing.expect(key_a != 0);
+        try expectDebt(be, &.{});
+        be.close();
+    }
+    var key_b: u64 = undefined;
+    {
+        const be = try v.open(.{ .test_identity = ident(boot_b, 5000, 882), .test_namespace = hb.face(), .test_pid_probe = PidTable.probe }, 0);
+        key_b = be.guard.?.prClient().?.key;
+        try testing.expect(key_b != 0 and key_b != key_a);
+        try expectDebt(be, &.{key_a});
+        be.close();
+    }
+    var key_c: u64 = undefined;
+    {
+        const be = try v.open(.{ .test_identity = ident(boot_c, 6000, 983), .test_namespace = hc.face(), .test_pid_probe = PidTable.probe }, 0);
+        key_c = be.guard.?.prClient().?.key;
+        try testing.expect(key_c != key_a and key_c != key_b);
+        try expectDebt(be, &.{ key_a, key_b });
+        be.close();
+    }
+    // Same host again: the page names this mount, so the chain is unchanged.
+    {
+        const be = try v.open(.{ .test_identity = ident(boot_c, 6000, 983), .test_namespace = hc.face(), .test_pid_probe = PidTable.probe }, 0);
+        defer be.close();
+        try testing.expectEqual(key_c, be.guard.?.prClient().?.key);
+        try expectDebt(be, &.{ key_a, key_b });
+        try storeFenceDebt(be, &.{});
+        try expectDebt(be, &.{});
+    }
 }
 
 test "decision 0003 §DL: a flat (single-writer) volume has no member to wait for — its lapse grace ends at the first lapse beat" {

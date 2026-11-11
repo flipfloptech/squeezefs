@@ -117,7 +117,9 @@ pub const AppenderSet = struct {
     page0_at_open: ?page.Identity = null,
     /// That page's host key, when it is Live and neither 0 nor this
     /// mount's key (decision 0004 §4.7). Same-host remount stays 0.
-    /// shortcut: RAM for this open only, upgrade when the claim transaction writes the durable meta_fence_debt record.
+    /// The claim transaction has already unioned it into the durable
+    /// `meta_fence_debt` record (decision 0004 §6.3); this word is the
+    /// same key, so a payment that races the record still names it.
     predecessor_host_key: u64 = 0,
     /// The ring-budget remainder as of the last census.
     budget_remaining: u64 = 0,

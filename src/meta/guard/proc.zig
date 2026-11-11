@@ -1081,6 +1081,125 @@ pub const ThreadedStandIn = struct {
     }
 };
 
+/// How a rule's threads read for the frozen-joiner kill and an aged
+/// withdrawal marker (decision 0004 §4.4.2). `frozen` is every thread
+/// `T`/`t`, or the cgroup's `frozen 1`. `uninterruptible` is some thread
+/// in `D` outside that. A partial read is not a freeze.
+pub const RuleState = enum { frozen, uninterruptible, other, unreadable };
+
+/// `states` are the state letters of `/proc/<pid>/task/*/stat`. `partial`
+/// means the scan did not see every thread (the buffer filled, or a stat
+/// could not be read). A cgroup freeze does not need the threads.
+pub fn classifyRuleState(states: []const u8, cgroup_frozen: bool, partial: bool) RuleState {
+    if (cgroup_frozen) return .frozen;
+    if (states.len == 0) return .unreadable;
+    var stopped: usize = 0;
+    var uninterruptible = false;
+    for (states) |s| switch (s) {
+        'T', 't' => stopped += 1,
+        'D' => uninterruptible = true,
+        else => {},
+    };
+    if (stopped == states.len and !partial) return .frozen;
+    if (uninterruptible) return .uninterruptible;
+    return .other;
+}
+
+/// One `cgroup.events` body. `frozen 1` is the line the kernel writes; a
+/// missing line is not frozen.
+pub fn cgroupEventsFrozen(text: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), "frozen 1")) return true;
+    }
+    return false;
+}
+
+fn cgroupFrozen(pid: u32) bool {
+    var pb: [64]u8 = undefined;
+    const cg = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/cgroup", .{pid}, 0) catch return false;
+    var body: [1024]u8 = undefined;
+    const text = readSmall(cg.ptr, &body) orelse return false;
+    var rel: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "0::")) {
+            rel = line["0::".len..];
+            break;
+        }
+    }
+    if (rel.len == 0 or rel[0] != '/' or std.mem.indexOf(u8, rel, "..") != null) return false;
+    var eb: [linux.PATH_MAX]u8 = undefined;
+    const events = if (std.mem.eql(u8, rel, "/"))
+        std.fmt.bufPrintSentinel(&eb, "/sys/fs/cgroup/cgroup.events", .{}, 0) catch return false
+    else
+        std.fmt.bufPrintSentinel(&eb, "/sys/fs/cgroup{s}/cgroup.events", .{rel}, 0) catch return false;
+    var ebuf: [256]u8 = undefined;
+    const ev = readSmall(events.ptr, &ebuf) orelse return false;
+    return cgroupEventsFrozen(ev);
+}
+
+const TaskScan = struct { n: usize, partial: bool };
+
+fn readTaskStates(pid: u32, out: []u8) TaskScan {
+    var pb: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/task", .{pid}, 0) catch return .{ .n = 0, .partial = true };
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return .{ .n = 0, .partial = true };
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var buf: [8192]u8 = undefined;
+    var n: usize = 0;
+    var partial = false;
+    while (true) {
+        const got = linux.getdents64(fd, &buf, buf.len);
+        if (linux.errno(got) != .SUCCESS or got == 0) break;
+        var off: usize = 0;
+        while (off < got) {
+            const reclen = std.mem.readInt(u16, buf[off + 16 ..][0..2], .little);
+            if (reclen == 0) break;
+            const name_at = off + 19;
+            var name_end = name_at;
+            const rec_end = off + reclen;
+            while (name_end < rec_end and buf[name_end] != 0) name_end += 1;
+            const name = buf[name_at..name_end];
+            if (name.len != 0 and name[0] != '.') {
+                if (n == out.len) {
+                    partial = true;
+                } else if (taskState(pid, name)) |s| {
+                    out[n] = s;
+                    n += 1;
+                } else partial = true;
+            }
+            off += reclen;
+        }
+    }
+    return .{ .n = n, .partial = partial };
+}
+
+fn taskState(pid: u32, tid: []const u8) ?u8 {
+    var pb: [80]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/task/{s}/stat", .{ pid, tid }, 0) catch return null;
+    var buf: [512]u8 = undefined;
+    const text = readSmall(path.ptr, &buf) orelse return null;
+    return stateLetterOf(text);
+}
+
+fn stateLetterOf(text: []const u8) ?u8 {
+    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return null;
+    const rest = std.mem.trimStart(u8, text[close + 1 ..], " ");
+    return if (rest.len == 0) null else rest[0];
+}
+
+/// The freeze proof for `pid` (decision 0004 §4.4.2). Every task under
+/// `/proc/<pid>/task`, or the cgroup's `frozen 1`. The leader's stat alone
+/// is not a proof.
+pub fn ruleState(pid: u32) RuleState {
+    var states: [64]u8 = undefined;
+    const scan = readTaskStates(pid, &states);
+    return classifyRuleState(states[0..scan.n], cgroupFrozen(pid), scan.partial);
+}
+
 /// The state letter of `/proc/<pid>/stat` (after the comm's closing
 /// paren); null when unreadable.
 pub fn stateLetter(pid: linux.pid_t) ?u8 {
@@ -1088,9 +1207,39 @@ pub fn stateLetter(pid: linux.pid_t) ?u8 {
     const path = std.fmt.bufPrintSentinel(&pb, "/proc/{d}/stat", .{pid}, 0) catch return null;
     var buf: [512]u8 = undefined;
     const text = readSmall(path.ptr, &buf) orelse return null;
-    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return null;
-    const rest = std.mem.trimStart(u8, text[close + 1 ..], " ");
-    return if (rest.len == 0) null else rest[0];
+    return stateLetterOf(text);
+}
+
+test "frozen proof: every thread stopped, or a frozen cgroup; a running thread or a partial read is not, and a stopped group reads frozen on every task" {
+    try testing.expectEqual(RuleState.frozen, classifyRuleState("Tt", false, false));
+    // A ptrace-stopped leader with a running lock-holder is not frozen.
+    try testing.expectEqual(RuleState.other, classifyRuleState("TR", false, false));
+    try testing.expectEqual(RuleState.uninterruptible, classifyRuleState("TD", false, false));
+    try testing.expectEqual(RuleState.uninterruptible, classifyRuleState("D", false, false));
+    try testing.expectEqual(RuleState.other, classifyRuleState("RS", false, false));
+    try testing.expectEqual(RuleState.frozen, classifyRuleState("D", true, false));
+    try testing.expectEqual(RuleState.frozen, classifyRuleState("", true, true));
+    try testing.expectEqual(RuleState.unreadable, classifyRuleState("", false, false));
+    try testing.expectEqual(RuleState.other, classifyRuleState("T", false, true));
+    try testing.expect(!cgroupEventsFrozen("populated 1\nfrozen 0\n"));
+    try testing.expect(cgroupEventsFrozen("frozen 1\n"));
+    try testing.expect(ruleState(@intCast(linux.getpid())) != .frozen);
+
+    var lb: [96:0]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintSentinel(&lb, "/build/tmp/guard-proc-frozen-{d}", .{linux.getpid()}, 0);
+    _ = linux.mkdir("/build/tmp", 0o755);
+    defer _ = linux.unlink(lock_path.ptr);
+    var stand = ThreadedStandIn.start(lock_path.ptr) catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer stand.deinit();
+    const pid: u32 = @intCast(stand.pid);
+    try testing.expect(ruleState(pid) != .frozen);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(stand.pid, .STOP)));
+    while (ruleState(pid) != .frozen) std.Thread.yield() catch {};
+    var states: [8]u8 = undefined;
+    const scan = readTaskStates(pid, &states);
+    try testing.expect(!scan.partial);
+    try testing.expect(scan.n >= 2);
+    for (states[0..scan.n]) |s| try testing.expect(s == 'T' or s == 't');
 }
 
 /// Does another open file description hold an exclusive flock on `path`

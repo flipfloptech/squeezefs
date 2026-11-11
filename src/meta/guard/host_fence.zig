@@ -370,6 +370,24 @@ pub const Registry = struct {
         self.lock_fd = fd;
     }
 
+    /// The exclusive flock holder of `.lock` or `.register`, with its start
+    /// ticks. Null when the census names none (a tear reads as unnamed, and
+    /// the frozen-joiner count resets).
+    pub fn flockHolder(self: *const Registry, which: LockFile) ?marker.HolderId {
+        var buf: [linux.PATH_MAX]u8 = undefined;
+        const leaf: []const u8 = switch (which) {
+            .registry => ".lock",
+            .registration => ".register",
+        };
+        const found = proc.exclusiveLocker(self.pathOf(&buf, leaf)) orelse return null;
+        if (found.pid <= 0) return null;
+        const ticks = switch (proc.startTicksAnyState(@intCast(found.pid))) {
+            .ticks => |t| t,
+            else => return null,
+        };
+        return .{ .pid = @intCast(found.pid), .start_ticks = ticks };
+    }
+
     pub fn unlock(self: *Registry) void {
         if (self.lock_fd < 0) return;
         _ = linux.close(self.lock_fd);
@@ -775,6 +793,43 @@ pub const REGISTRATION_LOCK_WAIT_MS: u64 = 30_000;
 /// complete first) before the registration is refused.
 pub const KILL_WAIT_MS: i32 = 10_000;
 
+/// One member-death bound: `T_owner`, the claim TTL. A frozen joiner is
+/// killed only after the same holder has been named for this long
+/// (decision 0004 §4.4.2).
+pub const MEMBER_DEATH_BOUND_NS: u64 = claim.STALE_TTL_S * std.time.ns_per_s;
+
+/// Which flock a manager's refusal waited on.
+pub const LockFile = enum { registry, registration };
+
+/// The same holder named by every refusal across one member-death bound.
+pub const FrozenJoiner = struct {
+    holder: ?marker.HolderId = null,
+    since_ns: u64 = 0,
+
+    /// Null, or a different holder, starts over. True when `holder` has
+    /// been the named one for the whole bound.
+    pub fn note(self: *FrozenJoiner, holder: ?marker.HolderId, now_ns: u64) bool {
+        const h = holder orelse {
+            self.* = .{};
+            return false;
+        };
+        if (self.holder) |cur| {
+            if (cur.pid != h.pid or cur.start_ticks != h.start_ticks) {
+                self.* = .{ .holder = h, .since_ns = now_ns };
+                return false;
+            }
+        } else {
+            self.* = .{ .holder = h, .since_ns = now_ns };
+            return false;
+        }
+        return now_ns -| self.since_ns >= MEMBER_DEATH_BOUND_NS;
+    }
+
+    pub fn clear(self: *FrozenJoiner) void {
+        self.* = .{};
+    }
+};
+
 /// How long a killed sibling's writes may take to leave the namespace's
 /// block queue (a reconnecting controller requeues them) before the
 /// registration is refused.
@@ -840,9 +895,9 @@ fn proveIncarnationAlive(ctx: RuleContext, e: *const Entry) bool {
 /// signal was sent or the process is already dead. The wait is `awaitDead`:
 /// a mark-clause kill sends under the registration lock and waits outside
 /// it (decision 0004 DC24).
-fn signalSibling(ctx: RuleContext, e: *const Entry) ?[]const u8 {
-    if (killRefusedSeam(ctx.env)) return "SQUEEZEFS_TEST_SIBLING_KILL_REFUSED denies its kill";
-    const pinned = switch (proc.pin(@intCast(e.pid), e.start_ticks)) {
+fn signalPinned(env: *const std.process.Environ.Map, pid: u32, start_ticks: u64) ?[]const u8 {
+    if (killRefusedSeam(env)) return "SQUEEZEFS_TEST_SIBLING_KILL_REFUSED denies its kill";
+    const pinned = switch (proc.pin(@intCast(pid), start_ticks)) {
         .pinned => |p| p,
         .gone => return null,
         .refused => return "cannot be pinned (its pidfd_open or its start ticks' read refused)",
@@ -854,10 +909,13 @@ fn signalSibling(ctx: RuleContext, e: *const Entry) ?[]const u8 {
     };
 }
 
+fn signalSibling(ctx: RuleContext, e: *const Entry) ?[]const u8 {
+    return signalPinned(ctx.env, e.pid, e.start_ticks);
+}
+
 /// Wait out a sibling already signalled. Null = dead.
-fn awaitDead(ctx: RuleContext, e: *const Entry) ?[]const u8 {
-    _ = ctx;
-    const pinned = switch (proc.pin(@intCast(e.pid), e.start_ticks)) {
+fn awaitPinned(pid: u32, start_ticks: u64) ?[]const u8 {
+    const pinned = switch (proc.pin(@intCast(pid), start_ticks)) {
         .pinned => |p| p,
         .gone => return null,
         .refused => return "cannot be pinned (its pidfd_open or its start ticks' read refused)",
@@ -874,12 +932,51 @@ fn awaitDead(ctx: RuleContext, e: *const Entry) ?[]const u8 {
     }
 }
 
+fn awaitDead(ctx: RuleContext, e: *const Entry) ?[]const u8 {
+    _ = ctx;
+    return awaitPinned(e.pid, e.start_ticks);
+}
+
 /// SIGKILL through a pidfd pinned by the entry's start ticks (`proc.pin`:
 /// never another process under a recycled pid) and the whole thread
 /// group's exit awaited on it. Null = dead; otherwise why not.
 fn killSibling(ctx: RuleContext, e: *const Entry) ?[]const u8 {
     if (signalSibling(ctx, e)) |why| return why;
     return awaitDead(ctx, e);
+}
+
+pub const KillWord = enum { killed, not_joiner, still_alive };
+
+/// The registry line is an unadmitted joiner of this set: joiner regions
+/// only, none of them naming a page. A manager, a pending mount, a leaver,
+/// or a joined page has a row. No line is not a joiner.
+fn unadmittedJoiner(reg: *const Registry, h: marker.HolderId) bool {
+    var buf: [4096]u8 = undefined;
+    const text = reg.readEntry(h.pid, &buf) orelse return false;
+    const e = Entry.parse(h.pid, text) orelse return false;
+    if (e.start_ticks != h.start_ticks or e.n_regions == 0) return false;
+    for (e.regionSlice()) |r| {
+        if (r.role != .joiner or r.joined != null) return false;
+    }
+    return true;
+}
+
+/// Kill a frozen unadmitted joiner. No drain: it has written nothing. The
+/// caller has already proved the freeze and the bound. `still_alive` retries
+/// at the next beat (decision 0004 §4.4.2).
+pub fn killFrozenJoiner(env: *const std.process.Environ.Map, reg: *const Registry, h: marker.HolderId) KillWord {
+    if (!unadmittedJoiner(reg, h)) return .not_joiner;
+    if (signalPinned(env, h.pid, h.start_ticks)) |why| {
+        log.err("host fence: a frozen unadmitted joiner pid {d} {s} — the kill retries at the next beat (decision 0004 §4.4.2)", .{ h.pid, why });
+        return .still_alive;
+    }
+    if (awaitPinned(h.pid, h.start_ticks)) |why| {
+        log.err("host fence: a frozen unadmitted joiner pid {d} {s} — the kill retries at the next beat (decision 0004 §4.4.2)", .{ h.pid, why });
+        return .still_alive;
+    }
+    marker.stats.host_fence_frozen_joiner_kills.inc();
+    log.warn("host fence: killed a frozen unadmitted joiner pid {d} after one member-death bound (decision 0004 §4.4.2)", .{h.pid});
+    return .killed;
 }
 
 /// A live manager entry other than this process, and whether its re-acquire
@@ -1693,24 +1790,29 @@ pub const Joiner = struct {
             return error.HostAdmissionRefused;
         };
         defer reg.unlock();
-        const fresh = registerUnderRule(ctx, &reg, c, pages, .{ .ctx = @constCast(ctx.env), .run = &joinRegisterFn }) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.SiblingLive => return error.HostAdmissionRefused,
-            error.RegisterFailed => {
-                log.err("meta volume {s}: this host's registration (key {x:0>16}) failed — refusing the join", .{ ctx.path, c.key });
-                return error.HostAdmissionRefused;
-            },
-            error.RegistryUnavailable, error.PagesUnreadable, error.ReportUnreadable => {
-                log.err("meta volume {s}: the stale-sibling rule could not read its inputs ({s}) — refusing to register this host", .{ ctx.path, @errorName(e) });
-                return error.HostAdmissionRefused;
-            },
-        };
+        // The unjoined line goes in before the section. A manager that finds
+        // this process frozen in the register can see an unadmitted joiner
+        // (no page) and kill it (decision 0004 §4.4.2). The rule skips this
+        // process's own line.
         var lb: [64]u8 = undefined;
         reg.append(ctx.local.pid, ctx.local.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = slot, .writer_id = writer_id })) catch {
             log.err("meta volume {s}: this mount could not enter the host's registry of the set ({s}) — refusing the join", .{ ctx.path, reg.dir() });
-            // The registration this admission made is taken back with it.
-            if (fresh and departUnregisters(&reg, ctx.gpa, c, ctx.local.pid)) c.unregister(c.key) catch {};
             return error.HostAdmissionRefused;
+        };
+        const fresh = registerUnderRule(ctx, &reg, c, pages, .{ .ctx = @constCast(ctx.env), .run = &joinRegisterFn }) catch |e| {
+            reg.removeRegion(ctx.local.pid, "j", writer_id, .unjoined) catch {};
+            switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.SiblingLive => return error.HostAdmissionRefused,
+                error.RegisterFailed => {
+                    log.err("meta volume {s}: this host's registration (key {x:0>16}) failed — refusing the join", .{ ctx.path, c.key });
+                    return error.HostAdmissionRefused;
+                },
+                error.RegistryUnavailable, error.PagesUnreadable, error.ReportUnreadable => {
+                    log.err("meta volume {s}: the stale-sibling rule could not read its inputs ({s}) — refusing to register this host", .{ ctx.path, @errorName(e) });
+                    return error.HostAdmissionRefused;
+                },
+            }
         };
         if (fresh) {
             guard.stats.pr_host_registrations.inc();
@@ -1927,6 +2029,99 @@ test "re-acquire mark: the line records the acquire's boottime and generation, a
     // The manager line survived the mark.
     try testing.expectEqual(@as(usize, 1), e.n_regions);
     try testing.expectEqual(Role.manager, e.regionSlice()[0].role);
+}
+
+test "frozen joiner: the bound is one member-death, T_owner, and a different holder or an unnamed refusal resets it" {
+    try testing.expectEqual(claim.STALE_TTL_S * std.time.ns_per_s, MEMBER_DEATH_BOUND_NS);
+    try testing.expectEqual(@import("lease_clock.zig").T_OWNER_MS * std.time.ns_per_ms, MEMBER_DEATH_BOUND_NS);
+    var w: FrozenJoiner = .{};
+    const a: marker.HolderId = .{ .pid = 3, .start_ticks = 9 };
+    try testing.expect(!w.note(a, 0));
+    try testing.expect(!w.note(a, MEMBER_DEATH_BOUND_NS - 1));
+    try testing.expect(w.note(a, MEMBER_DEATH_BOUND_NS));
+    const b: marker.HolderId = .{ .pid = 4, .start_ticks = 9 };
+    try testing.expect(!w.note(b, MEMBER_DEATH_BOUND_NS));
+    try testing.expect(!w.note(null, MEMBER_DEATH_BOUND_NS + 1));
+    try testing.expect(w.holder == null);
+}
+
+const Paused = struct {
+    pid: linux.pid_t,
+    hold: linux.fd_t,
+
+    fn start() !Paused {
+        var fds: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+        const rc = linux.fork();
+        if (linux.errno(rc) != .SUCCESS) return error.Fork;
+        if (rc == 0) {
+            _ = linux.close(fds[1]);
+            var byte: u8 = 0;
+            _ = linux.read(fds[0], @ptrCast(&byte), 1);
+            linux.exit_group(0);
+        }
+        _ = linux.close(fds[0]);
+        return .{ .pid = @intCast(rc), .hold = fds[1] };
+    }
+
+    fn stop(self: Paused) !void {
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(self.pid, .STOP)));
+        const id: u32 = @intCast(self.pid);
+        while (proc.ruleState(id) != .frozen) std.Thread.yield() catch {};
+    }
+
+    fn deinit(self: *Paused) void {
+        _ = linux.close(self.hold);
+        _ = linux.kill(self.pid, .KILL);
+        var status: i32 = 0;
+        _ = linux.waitpid(self.pid, &status, 0);
+    }
+};
+
+test "frozen joiner: a stopped unadmitted joiner is killed, a stopped manager is not, and a live marker names its holder" {
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-frozen-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var reg = Registry.at(base, .set, 0xdc21);
+    reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer reg.unlock();
+    const mark = marker.createIn(reg.dir(), 0) catch return error.Marker;
+    const named = marker.liveHolder(reg.dir()) orelse return error.Holder;
+    try testing.expectEqual(proc.localIdentity().pid, named.pid);
+    marker.dropSection(reg.dir(), &mark);
+    try testing.expect(marker.liveHolder(reg.dir()) == null);
+
+    var joiner = Paused.start() catch return error.Fork;
+    defer joiner.deinit();
+    var manager = Paused.start() catch return error.Fork;
+    defer manager.deinit();
+    const jid: u32 = @intCast(joiner.pid);
+    const mid: u32 = @intCast(manager.pid);
+    const jticks = switch (proc.startTicksAnyState(jid)) {
+        .ticks => |t| t,
+        else => return error.Ticks,
+    };
+    const mticks = switch (proc.startTicksAnyState(mid)) {
+        .ticks => |t| t,
+        else => return error.Ticks,
+    };
+    try joiner.stop();
+    try manager.stop();
+    var lb: [64]u8 = undefined;
+    try reg.append(jid, jticks, regionLine(&lb, .{ .role = .joiner, .slot = 1, .writer_id = 0x11 }));
+    try reg.append(mid, mticks, regionLine(&lb, .{ .role = .manager, .slot = 0, .writer_id = 0x22 }));
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    const before = marker.stats.host_fence_frozen_joiner_kills.load();
+    try testing.expectEqual(KillWord.not_joiner, killFrozenJoiner(&env, &reg, .{ .pid = mid, .start_ticks = mticks }));
+    try testing.expectEqual(proc.RuleState.frozen, proc.ruleState(mid));
+    try testing.expectEqual(KillWord.killed, killFrozenJoiner(&env, &reg, .{ .pid = jid, .start_ticks = jticks }));
+    try testing.expectEqual(before + 1, marker.stats.host_fence_frozen_joiner_kills.load());
+    // A joined page is a row. The kill does not signal it.
+    try reg.removeRegion(mid, "m", 0x22, .any);
+    try reg.append(mid, mticks, regionLine(&lb, .{ .role = .joiner, .slot = 1, .writer_id = 0x33, .joined = .{ .appender_id = 2, .term = 1, .vol = 0 } }));
+    try testing.expectEqual(KillWord.not_joiner, killFrozenJoiner(&env, &reg, .{ .pid = mid, .start_ticks = mticks }));
+    try testing.expectEqual(proc.RuleState.frozen, proc.ruleState(mid));
 }
 
 test "registration lock: two open file descriptions of .register exclude each other, and the registry flock is a different file (decision 0004 DC20)" {

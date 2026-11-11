@@ -40,13 +40,23 @@ pub const NVME_IO_TIMEOUT_S: u64 = 30;
 pub const MARKER_WITHDRAW_MAX_S: u64 = T_WITHDRAW_S + NVME_IO_TIMEOUT_S + claim.HEARTBEAT_INTERVAL_S;
 
 pub const stats = struct {
-    /// A `.wd` past the span whose rule is frozen (`T`/`t`).
+    /// A `.wd` past the span whose every thread is `T`/`t`, or whose cgroup
+    /// is frozen (decision 0004 §4.4.2).
     pub var host_fence_marker_wd_aged_frozen: counters.ShardedCounter = .{};
-    /// A `.wd` past the span whose rule is in `D`.
+    /// A `.wd` past the span with some thread in `D`, and not the frozen case.
     pub var host_fence_marker_wd_aged_uninterruptible: counters.ShardedCounter = .{};
     /// A `.wd` past the span whose rule is neither. The alarm: under normal
     /// load it stays 0.
     pub var host_fence_marker_wd_aged_other: counters.ShardedCounter = .{};
+    /// An unadmitted joiner killed once the same holder was named across one
+    /// member-death bound and proven frozen.
+    pub var host_fence_frozen_joiner_kills: counters.ShardedCounter = .{};
+};
+
+/// The process a marker or a flock names (decision 0004 §4.4.2).
+pub const HolderId = struct {
+    pid: u32,
+    start_ticks: u64,
 };
 
 /// `EEXIST` on a section marker. The id includes a per-process sequence, so
@@ -157,29 +167,16 @@ fn alive(pid: u32, ticks: u64) bool {
 }
 
 fn noteAged(pid: u32) void {
-    const state = threadState(pid) orelse {
-        stats.host_fence_marker_wd_aged_other.inc();
-        log.err("host fence: a withdrawal marker aged past {d} s and the rule's state could not be read (pid {d})", .{ MARKER_WITHDRAW_MAX_S, pid });
-        return;
-    };
-    switch (state) {
-        'T', 't' => stats.host_fence_marker_wd_aged_frozen.inc(),
-        'D' => stats.host_fence_marker_wd_aged_uninterruptible.inc(),
-        else => {
+    // Every thread, not the leader's stat: a ptrace stop is per thread
+    // (decision 0004 §4.4.2, revision 22).
+    switch (proc.ruleState(pid)) {
+        .frozen => stats.host_fence_marker_wd_aged_frozen.inc(),
+        .uninterruptible => stats.host_fence_marker_wd_aged_uninterruptible.inc(),
+        .other, .unreadable => {
             stats.host_fence_marker_wd_aged_other.inc();
-            log.err("host fence: a withdrawal marker aged past {d} s with the rule in state {c} (pid {d}) — host_fence_marker_wd_aged_other", .{ MARKER_WITHDRAW_MAX_S, state, pid });
+            log.err("host fence: a withdrawal marker aged past {d} s and the rule is not frozen or uninterruptible (pid {d}) — host_fence_marker_wd_aged_other", .{ MARKER_WITHDRAW_MAX_S, pid });
         },
     }
-}
-
-fn threadState(pid: u32) ?u8 {
-    var path: [64]u8 = undefined;
-    const z = std.fmt.bufPrintSentinel(&path, "/proc/{d}/stat", .{pid}, 0) catch return null;
-    var buf: [512]u8 = undefined;
-    const text = proc.readSmall(z.ptr, &buf) orelse return null;
-    const paren = std.mem.lastIndexOfScalar(u8, text, ')') orelse return null;
-    if (paren + 2 >= text.len) return null;
-    return text[paren + 2];
 }
 
 fn encodeWithdrawal(now_ns: u64) [16]u8 {
@@ -420,6 +417,24 @@ pub fn survey(dir: []const u8, under_lock: bool) Survey {
     var rows: [32]Listed = undefined;
     const got = list(dir, clock.monotonicNs(), clock.boottimeNs(), &rows);
     return tally(got, clock.monotonicNs(), under_lock);
+}
+
+/// The one live marker's holder, when every live section or withdrawal
+/// marker names that same process. None, or two processes, or a listing
+/// that filled the buffer, is null: the frozen-joiner count resets.
+pub fn liveHolder(dir: []const u8) ?HolderId {
+    var rows: [32]Listed = undefined;
+    const got = list(dir, clock.monotonicNs(), clock.boottimeNs(), &rows);
+    if (got.len == rows.len) return null;
+    var holder: ?HolderId = null;
+    for (got) |r| {
+        if (r.kind == .abandoned or r.aged or !r.alive) continue;
+        const h: HolderId = .{ .pid = r.pid, .start_ticks = r.start_ticks };
+        if (holder) |cur| {
+            if (cur.pid != h.pid or cur.start_ticks != h.start_ticks) return null;
+        } else holder = h;
+    }
+    return holder;
 }
 
 pub fn forbids(dir: []const u8, role: Role) bool {

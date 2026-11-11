@@ -5,16 +5,16 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** The re-acquire-mark commit's parent is `415fbdef`. No upstream.
+**Branch `feat/pr5`.** The frozen-joiner commit's parent is `ef271bf2`. No upstream.
 Not pushed. Not merged. `dev` is `b40ac017`.
 
 Decision 0004 is the spec. PR-5 is not finished. W_end, the fence debt, `identityHolds`,
-the registration lock, rule markers, and the re-acquire mark are committed.
+the registration lock, rule markers, the re-acquire mark, and the frozen-joiner kill are
+committed.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
-1. The frozen-joiner kill keyed on a marker's pid (every thread, not just the main stat).
-   Then report-first recovery (`appender_recovery_keys_absent`), blind-rule refusals
+1. Report-first recovery (`appender_recovery_keys_absent`). Then blind-rule refusals
    (F15, F16, F16b), incompat bit 4 and `claim convert-pr`, retire the fencing registrant,
    the fidelity rows that are not yet written.
 
@@ -39,6 +39,7 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | registration lock | `.register` is its own flock. A rule and a manager mutation hold it across the page check and the command. See below. |
 | markers | A metadata rule's `.reg` / `.wd` / `.abandoned` marker. A section refuses while one stands. The hold check acquires and then removes that volume's judged markers. See below. |
 | re-acquire mark | `a <boottime_ns> <generation>` on the manager's registry line, written under the registration lock. The re-judge kills an unmarked manager when a restart filled in after the re-read. See below. |
+| frozen joiner | The same holder across one member-death bound, every thread stopped or the cgroup frozen, and an unjoined joiner line. See below. |
 
 ## What is true in the code
 
@@ -202,14 +203,41 @@ Decision DC24. Unit tests `re-acquire mark`, `registration lock`, `B2 (review)`,
   signalled under the lock and awaited outside it, and the fresh registration is withdrawn.
   A mark, or no live manager, leaves the register. This process's own lapse rule does not
   judge itself.
-- Not the frozen-joiner kill, and not "reserved and unregistered at the re-read" as its own
-  kill before the register. That re-read still registers. The mark clause is the half that
-  runs when the re-read was unreserved.
+- Not the frozen-joiner kill (now the next section), and not "reserved and unregistered at
+  the re-read" as its own kill before the register. That re-read still registers. The mark
+  clause is the half that runs when the re-read was unreserved.
+
+## Frozen joiner, on top of `ef271bf2`
+
+Decision §4.4.2, revisions 20–22 and the aged-marker half of 26–27. Unit tests
+`frozen joiner`, `frozen proof`, `marker `, `registration lock`, `re-acquire mark`,
+`pr5 identity`, `B2 (review)`: 64 pass, 1 skip. The death-proof filter: 41 pass.
+F1 (`~/tmp/pr5-f1-frozen.log`): `regctl` 3, identity counters 0,
+`data_pr_debt_preempts` 1, `data_pr_reconcile_preempts` 0, 41/41.
+
+- A joiner's unjoined `j` line is written before `registerUnderRule`, so a freeze inside
+  the section has a line with no page. A failed rule removes that line. The rule still
+  skips this process's own entry.
+- `FrozenJoiner.note` starts over on a different holder or an unnamed refusal.
+  `MEMBER_DEATH_BOUND_NS` is `T_owner` (the claim TTL, 45 s). The tie test restates it.
+- The proof is `proc.ruleState`: every `/proc/<pid>/task/*/stat` is `T` or `t`, or
+  `cgroup.events` says `frozen 1`. A partial scan is not frozen. One thread in `D` outside
+  that is uninterruptible. Anything else, including a stopped leader with a running
+  thread, is other and is not killed. The aged `.wd` counters use this, not the main stat.
+- The beat notes a live marker's holder, lock-free. A refused registry flock, registration
+  lock, or live marker on a manager path (the lapse rule, the lapse acquire, the release,
+  a data mutation) notes the flock holder or the marker's holder. Taking the lock with no
+  live marker clears the count. Our own pid is not a candidate.
+- The kill reads the line lock-free. It signals only an unjoined joiner: no manager, no
+  pending line, no page. No drain. `host_fence_frozen_joiner_kills` counts it. A kill that
+  does not land retries next beat. A joined page or a manager line is left alone.
+- Not in this slice: the rule's "unregister only while my `.wd` still stands" test, and
+  the no-manager prune.
 
 ## Explicitly not in this branch
 
-- F9 and F10 have not been re-run on this commit. F1 has, after the re-acquire mark.
-- The frozen-joiner kill. Recovery's `fence(k)` does not call `identityHolds`.
+- F9 and F10 have not been re-run on this commit. F1 has, after the frozen-joiner kill.
+- Recovery's `fence(k)` does not call `identityHolds`.
 - Report-first recovery (`appender_recovery_keys_absent`). F9's metadata fence is the preempt-all; the keyed recovery preempt finds the key already gone (`appender_recovery_preempts` 0).
 - Incompat bit 4 `META_PR_ALL_REGISTRANTS`, `Mode.convert_pr`, `claim convert-pr`, `claim posture-reset`.
 - Deleting `src/meta/guard/fencer.zig`. `stand()` uses WEAR. `forTest` stays WERO. `acquireManagerHold` still forces WERO. Flat `pr_rtype` 1 and the WERO pr legs stay 1.

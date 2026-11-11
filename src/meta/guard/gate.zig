@@ -167,6 +167,10 @@ pub const Guard = struct {
     /// beat re-registers its host first (decision 0003 §DJ, review MAJOR 2)
     /// — or at the first beat that finds every census key back (§DL).
     lapse_since_ns: u64 = 0,
+    /// The holder named by a refused manager path, and when it was first
+    /// named (decision 0004 §4.4.2). A different holder, or a section that
+    /// gets the lock with no live marker, clears it.
+    frozen_joiner: host_fence.FrozenJoiner = .{},
     lapse_grace_ns: u64 = claim.LAPSE_GRACE_S * std.time.ns_per_s,
     /// The membership census's live writer keys (decision 0003 §DL: the
     /// grace ends once each is registered again), bound by the wire plane's
@@ -669,7 +673,15 @@ pub const Guard = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.SiblingLive => error.Busy,
             error.RegisterFailed => g.prErrorLog(c, "register", error.DeviceStatus),
-            error.RegistryUnavailable, error.PagesUnreadable, error.ReportUnreadable => {
+            // The registration lock's bound. A marker-create failure has
+            // already dropped the lock, and the census then names nobody.
+            error.RegistryUnavailable => {
+                g.observeFrozenHolder(reg.flockHolder(.registration));
+                log.err("meta volume {s}: the stale-sibling rule could not read its inputs ({s}; registry {s}) — refusing to register this host", .{ g.be.path, @errorName(e), reg.dir() });
+                return error.Busy;
+            },
+            error.PagesUnreadable, error.ReportUnreadable => {
+                g.clearFrozenJoiner();
                 log.err("meta volume {s}: the stale-sibling rule could not read its inputs ({s}; registry {s}) — refusing to register this host", .{ g.be.path, @errorName(e), reg.dir() });
                 return error.Busy;
             },
@@ -679,6 +691,7 @@ pub const Guard = struct {
     fn lockRegistry(g: *Guard) backend.OpenError!bool {
         const reg = &(g.fence_reg orelse return false);
         reg.lock() catch {
+            g.observeFrozenHolder(reg.flockHolder(.registry));
             log.err("meta volume {s}: the host's registry of this set ({s}) cannot be opened — refusing to register this host (the stale-sibling rule cannot run)", .{ g.be.path, reg.dir() });
             return error.Busy;
         };
@@ -742,6 +755,7 @@ pub const Guard = struct {
             const locked = try g.lockRegistry();
             defer if (locked) g.fence_reg.?.unlock();
             const fresh = try g.registerHost(c, true);
+            g.clearFrozenJoiner();
             // Enrolled under the register's lock: a co-located departure
             // sees this process (B3).
             if (g.fence_reg) |*reg| try g.enrolLocked(reg, .pending);
@@ -1073,6 +1087,38 @@ pub const Guard = struct {
         }
     }
 
+    /// A manager path named `holder` (a lock's flock, or a live marker).
+    /// Null resets the count. Our own pid is not a joiner we would kill.
+    /// Due and frozen: kill an unadmitted joiner, outside any lock the
+    /// caller has already dropped (decision 0004 §4.4.2).
+    pub fn observeFrozenHolder(g: *Guard, holder: ?marker.HolderId) void {
+        if (holder) |h| if (h.pid == g.identity.pid) {
+            g.clearFrozenJoiner();
+            return;
+        };
+        const due = g.frozen_joiner.note(holder, clock.monotonicNs());
+        if (!due) return;
+        const h = g.frozen_joiner.holder orelse return;
+        if (proc.ruleState(h.pid) != .frozen) return;
+        const reg = &(g.fence_reg orelse return);
+        switch (host_fence.killFrozenJoiner(g.be.env, reg, h)) {
+            .killed, .not_joiner => g.frozen_joiner.clear(),
+            .still_alive => {},
+        }
+    }
+
+    /// The lock was taken and no live marker stands: the holder let go.
+    pub fn clearFrozenJoiner(g: *Guard) void {
+        if (g.fence_reg) |*reg| if (marker.liveHolder(reg.dir()) != null) return;
+        g.frozen_joiner.clear();
+    }
+
+    /// A live marker on the beat is a holder, lock-free (decision 0004 §4.4.2).
+    fn considerFrozenJoiner(g: *Guard) void {
+        const reg = &(g.fence_reg orelse return);
+        if (marker.liveHolder(reg.dir())) |h| g.observeFrozenHolder(h);
+    }
+
     /// A dead or abandoned marker whose wait is over: one report and one
     /// acquire, back to back under the registration lock, then that
     /// volume's judged markers are removed (decision 0004 §4.4.2). A lapse
@@ -1082,8 +1128,12 @@ pub const Guard = struct {
         const reg = &(g.fence_reg orelse return);
         if (g.lapse_since_ns != 0) return;
         if (!marker.survey(reg.dir(), false).needsCheck()) return;
-        var section = reg.lockRegistration(0) catch return;
+        var section = reg.lockRegistration(0) catch {
+            g.observeFrozenHolder(reg.flockHolder(.registration));
+            return;
+        };
         defer section.release();
+        g.clearFrozenJoiner();
         if (!marker.survey(reg.dir(), true).needsCheck()) return;
         const c = g.prClient() orelse return;
         c.lockOps();
@@ -1130,6 +1180,7 @@ pub const Guard = struct {
         // Before the reservation re-check and the claim refresh (decision
         // 0004 §4.4.2). A superseded manager must not refresh its claim.
         if (!g.screenIdentity()) return;
+        g.considerFrozenJoiner();
         g.considerMarkers();
         if (g.be.isFailed()) return;
         if (g.prClient()) |c| {
@@ -1327,6 +1378,7 @@ pub const Guard = struct {
             const locked = g.lockRegistry() catch return .refused;
             defer if (locked) g.fence_reg.?.unlock();
             const fresh = g.registerHost(c, false) catch return .refused;
+            if (locked) g.clearFrozenJoiner();
             if (locked and fresh) guard.stats.pr_host_registrations.inc();
         }
         return if (g.everyLiveMemberRegistered(c)) .every_member_back else .waiting;
@@ -1347,14 +1399,24 @@ pub const Guard = struct {
         if (locked) {
             // A refused lock retries next beat. `.ours` lets this beat's
             // claim refresh proceed; the lapse stays open (decision 0004 §4.9).
-            section = g.fence_reg.?.lockRegistration(0) catch return .ours;
+            section = g.fence_reg.?.lockRegistration(0) catch {
+                g.observeFrozenHolder(g.fence_reg.?.flockHolder(.registration));
+                return .ours;
+            };
             armed = true;
         }
         defer if (armed) section.release();
         // A live withdrawal, a live section marker, or a dead section marker
         // still inside its I/O timeout refuses the lapse acquire. The claim
         // refresh still proceeds (decision 0004 §4.4.2, §4.9).
-        if (armed and marker.forbids(g.fence_reg.?.dir(), .lapse_acquire)) return .ours;
+        if (armed and marker.forbids(g.fence_reg.?.dir(), .lapse_acquire)) {
+            const holder = marker.liveHolder(g.fence_reg.?.dir());
+            section.release();
+            armed = false;
+            g.observeFrozenHolder(holder);
+            return .ours;
+        }
+        if (armed) g.clearFrozenJoiner();
         if (!g.screenIdentity()) return .report_failed;
         c.lockOps();
         defer c.unlockOps();
@@ -1500,15 +1562,21 @@ pub const Guard = struct {
                     } else |_| {
                         // The release is a mutation. Refusing it leaves the
                         // registration; the process still drops its client.
+                        g.observeFrozenHolder(g.fence_reg.?.flockHolder(.registration));
                         log.err("meta volume {s}: the registration lock could not be taken — the release is refused (decision 0004 §4.4.2)", .{g.be.path});
                         last = false;
                     }
                 }
                 defer if (armed) section.release();
                 if (armed and marker.forbids(g.fence_reg.?.dir(), .mutation)) {
+                    const holder = marker.liveHolder(g.fence_reg.?.dir());
+                    section.release();
+                    armed = false;
+                    g.observeFrozenHolder(holder);
                     log.err("meta volume {s}: a rule marker stands — the release is refused (decision 0004 §4.4.2)", .{g.be.path});
                     last = false;
                 }
+                if (armed) g.clearFrozenJoiner();
                 if (last and g.screenIdentity()) {
                     // The holder's sequence lock: no recovery check-preempt
                     // runs across the leave (review minor 4).

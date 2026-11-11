@@ -712,6 +712,22 @@ pub const DataFence = struct {
         }
     }
 
+    fn observeLock(self: *DataFence, which: host_fence.LockFile) void {
+        const g = self.in.guard orelse return;
+        const reg = self.in.reg orelse return;
+        g.observeFrozenHolder(reg.flockHolder(which));
+    }
+
+    fn observeHolder(self: *DataFence, holder: ?marker_mod.HolderId) void {
+        const g = self.in.guard orelse return;
+        g.observeFrozenHolder(holder);
+    }
+
+    fn clearFrozen(self: *DataFence) void {
+        const g = self.in.guard orelse return;
+        g.clearFrozenJoiner();
+    }
+
     /// The registration lock around one manager mutation (decision 0004
     /// DC20). The data-fence lock is already held. No registry (the seam, a
     /// fixture): the page check alone. The hold is empty then.
@@ -731,14 +747,19 @@ pub const DataFence = struct {
             return .{};
         };
         var hold = reg.lockRegistration(0) catch {
+            self.observeLock(.registration);
             log.err("data volume {s}: the registration lock could not be taken — refusing the mutation (decision 0004 §4.4.2)", .{path});
             return error.Refused;
         };
         errdefer hold.release();
         if (marker_mod.forbids(reg.dir(), .mutation)) {
+            const holder = marker_mod.liveHolder(reg.dir());
+            hold.release();
+            self.observeHolder(holder);
             log.err("data volume {s}: a rule marker stands — the mutation is refused (decision 0004 §4.4.2)", .{path});
             return error.Refused;
         }
+        self.clearFrozen();
         try self.screenPage(path);
         return .{ .hold = hold, .armed = true };
     }

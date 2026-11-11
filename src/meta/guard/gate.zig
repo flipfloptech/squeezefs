@@ -1100,10 +1100,27 @@ pub const Guard = struct {
             g.failStop("the hold check: WEAR stands and this host is not registered (decision 0004 §4.4.2)");
             return;
         }
-        // The re-acquire mark (DC24) is not written yet. A conflict retries
-        // next beat; the markers stay until an acquire lands.
+        // A conflict retries next beat; the markers stay until an acquire
+        // lands. The mark is written before the lock drops (decision 0004 DC24).
         c.acquire() catch return;
+        g.writeReacquireMark(c);
         marker.removeJudged(reg.dir(), g.be.index);
+    }
+
+    /// The manager's re-acquire mark, under the registration lock the caller
+    /// still holds (decision 0004 DC24). A missed write is logged: the
+    /// joiner's re-judge would then treat the acquire as another host's.
+    fn writeReacquireMark(g: *Guard, c: *pr.Client) void {
+        const reg = &(g.fence_reg orelse return);
+        var gen: u32 = 0;
+        if (c.report()) |rep| {
+            var held = rep;
+            defer held.deinit(c.gpa);
+            gen = held.generation;
+        } else |_| {}
+        reg.noteReacquire(g.identity.pid, g.identity.start_ticks, clock.boottimeNs(), gen) catch |e| {
+            log.warn("meta volume {s}: the re-acquire mark was not written ({s}) — a joiner's re-judge may treat this acquire as another host's (decision 0004 DC24)", .{ g.be.path, @errorName(e) });
+        };
     }
 
     /// One beat. Skipped on a FAILED volume (nothing may be written) and
@@ -1342,6 +1359,7 @@ pub const Guard = struct {
         c.lockOps();
         defer c.unlockOps();
         c.acquire() catch return .reacquire_failed;
+        if (locked) g.writeReacquireMark(c);
         if (locked and fresh) guard.stats.pr_host_registrations.inc();
         return .reacquired;
     }

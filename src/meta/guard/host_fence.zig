@@ -189,9 +189,20 @@ pub const Entry = struct {
     n_regions: usize = 0,
     retired: [MAX_REGIONS]Retired = undefined,
     n_retired: usize = 0,
+    /// The manager's re-acquire mark (decision 0004 DC24): `CLOCK_BOOTTIME`
+    /// of the acquire, and the reservation generation it answered. 0 = none.
+    reacquire_ns: u64 = 0,
+    reacquire_gen: u32 = 0,
 
     pub fn regionSlice(self: *const Entry) []const Region {
         return self.regions[0..self.n_regions];
+    }
+
+    /// A re-acquire mark written at or after `since_ns` (decision 0004 DC24).
+    /// The re-read's boottime is `since_ns`; a mark from before it does not
+    /// cover an acquire that landed after the re-read.
+    pub fn markedSince(self: *const Entry, since_ns: u64) bool {
+        return self.reacquire_ns != 0 and self.reacquire_ns >= since_ns;
     }
 
     fn covers(self: *const Entry, p: page.Page, vol: u32) bool {
@@ -215,6 +226,11 @@ pub const Entry = struct {
         while (lines.next()) |line| {
             var f = std.mem.tokenizeScalar(u8, line, ' ');
             const tag = f.next() orelse continue;
+            if (std.mem.eql(u8, tag, "a")) {
+                e.reacquire_ns = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
+                e.reacquire_gen = std.fmt.parseInt(u32, f.next() orelse "0", 10) catch 0;
+                continue;
+            }
             if (std.mem.eql(u8, tag, "r")) {
                 const w = std.fmt.parseInt(u64, f.next() orelse continue, 16) catch continue; // a writer id, hex as `retiredLine` writes it
                 const a = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue; // an appender id, decimal as `retiredLine` writes it
@@ -446,6 +462,29 @@ pub const Registry = struct {
         try self.writeEntry(pid, w.buffered());
     }
 
+    /// The manager's re-acquire mark (decision 0004 DC24), replacing any
+    /// mark already on the line. The caller holds the registration lock.
+    /// `at_ns` is `CLOCK_BOOTTIME` of the acquire; `generation` is the
+    /// reservation generation it answered.
+    pub fn noteReacquire(self: *const Registry, pid: u32, start_ticks: u64, at_ns: u64, generation: u32) RegistryError!void {
+        var rb: [4096]u8 = undefined;
+        var out: [4096]u8 = undefined;
+        var w: Io.Writer = .fixed(&out);
+        const old = self.readEntry(pid, &rb);
+        const ours = if (old) |t| if (Entry.parse(pid, t)) |e| e.start_ticks == start_ticks else false else false;
+        if (ours) {
+            var lines = std.mem.tokenizeScalar(u8, old.?, '\n');
+            const header = lines.next() orelse return error.RegistryUnavailable;
+            w.print("{s}\n", .{header}) catch return error.RegistryUnavailable;
+            while (lines.next()) |line| {
+                if (std.mem.startsWith(u8, line, "a ")) continue;
+                w.print("{s}\n", .{line}) catch return error.RegistryUnavailable;
+            }
+        } else w.print("{d}\n", .{start_ticks}) catch return error.RegistryUnavailable;
+        w.print("a {d} {d}\n", .{ at_ns, generation }) catch return error.RegistryUnavailable;
+        try self.writeEntry(pid, w.buffered());
+    }
+
     /// Which of a writer id's lines `removeRegion` drops: all of them; a
     /// joiner's lines not yet naming a page; or those naming one appender id
     /// (its `j`/`l` line and its `r` retirement) — a re-joined successor
@@ -468,7 +507,9 @@ pub const Registry = struct {
         while (lines.next()) |line| {
             if (!dropsLine(line, tags, writer_id, which)) {
                 w.print("{s}\n", .{line}) catch return error.RegistryUnavailable;
-                kept += 1;
+                // The re-acquire mark is not a region. The file goes when
+                // the last region does.
+                if (!std.mem.startsWith(u8, line, "a ")) kept += 1;
             }
         }
         try self.writeEntry(pid, if (kept == 0) "" else w.buffered());
@@ -795,10 +836,11 @@ fn proveIncarnationAlive(ctx: RuleContext, e: *const Entry) bool {
     return false;
 }
 
-/// SIGKILL through a pidfd pinned by the entry's start ticks (`proc.pin`:
-/// never another process under a recycled pid) and the whole thread
-/// group's exit awaited on it. Null = dead; otherwise why not.
-fn killSibling(ctx: RuleContext, e: *const Entry) ?[]const u8 {
+/// SIGKILL through a pidfd pinned by the entry's start ticks. Null = the
+/// signal was sent or the process is already dead. The wait is `awaitDead`:
+/// a mark-clause kill sends under the registration lock and waits outside
+/// it (decision 0004 DC24).
+fn signalSibling(ctx: RuleContext, e: *const Entry) ?[]const u8 {
     if (killRefusedSeam(ctx.env)) return "SQUEEZEFS_TEST_SIBLING_KILL_REFUSED denies its kill";
     const pinned = switch (proc.pin(@intCast(e.pid), e.start_ticks)) {
         .pinned => |p| p,
@@ -806,13 +848,22 @@ fn killSibling(ctx: RuleContext, e: *const Entry) ?[]const u8 {
         .refused => return "cannot be pinned (its pidfd_open or its start ticks' read refused)",
     };
     defer pinned.close();
-    const fd = pinned.fd;
-    switch (linux.errno(linux.pidfd_send_signal(fd, .KILL, null, 0))) {
-        .SUCCESS => {},
-        .SRCH => return null,
-        else => return "refuses SIGKILL",
-    }
-    var pfd = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    return switch (linux.errno(linux.pidfd_send_signal(pinned.fd, .KILL, null, 0))) {
+        .SUCCESS, .SRCH => null,
+        else => "refuses SIGKILL",
+    };
+}
+
+/// Wait out a sibling already signalled. Null = dead.
+fn awaitDead(ctx: RuleContext, e: *const Entry) ?[]const u8 {
+    _ = ctx;
+    const pinned = switch (proc.pin(@intCast(e.pid), e.start_ticks)) {
+        .pinned => |p| p,
+        .gone => return null,
+        .refused => return "cannot be pinned (its pidfd_open or its start ticks' read refused)",
+    };
+    defer pinned.close();
+    var pfd = [1]linux.pollfd{.{ .fd = pinned.fd, .events = linux.POLL.IN, .revents = 0 }};
     while (true) {
         const pr_rc = linux.poll(&pfd, 1, KILL_WAIT_MS);
         switch (linux.errno(pr_rc)) {
@@ -821,6 +872,38 @@ fn killSibling(ctx: RuleContext, e: *const Entry) ?[]const u8 {
             else => return "cannot be awaited",
         }
     }
+}
+
+/// SIGKILL through a pidfd pinned by the entry's start ticks (`proc.pin`:
+/// never another process under a recycled pid) and the whole thread
+/// group's exit awaited on it. Null = dead; otherwise why not.
+fn killSibling(ctx: RuleContext, e: *const Entry) ?[]const u8 {
+    if (signalSibling(ctx, e)) |why| return why;
+    return awaitDead(ctx, e);
+}
+
+/// A live manager entry other than this process, and whether its re-acquire
+/// mark covers `since_ns` (decision 0004 DC24). `.unmarked` is the one to
+/// signal: the re-read saw the namespace unreserved and it is reserved now,
+/// and this manager did not acquire in between.
+fn managerUnmarked(ctx: RuleContext, reg: *const Registry, since_ns: u64) (Allocator.Error || RegistryError)!union(enum) { marked, none, unmarked: Entry } {
+    const es = try reg.entries(ctx.gpa);
+    defer ctx.gpa.free(es);
+    var unmarked: ?Entry = null;
+    for (es) |e| {
+        if (e.pid == ctx.local.pid) continue;
+        var manages = false;
+        for (e.regionSlice()) |r| if (r.role == .manager) {
+            manages = true;
+            break;
+        };
+        if (!manages) continue;
+        if (!proc.incarnationAlive(e.pid, e.start_ticks)) continue;
+        if (e.markedSince(since_ns)) return .marked;
+        if (unmarked == null) unmarked = e;
+    }
+    if (unmarked) |e| return .{ .unmarked = e };
+    return .none;
 }
 
 /// The namespace's block queue holds no write in flight (`/sys/class/block/
@@ -963,6 +1046,11 @@ pub fn registerUnderRule(ctx_in: RuleContext, reg: *const Registry, c: *pr.Clien
             hold.release();
             return false;
         }
+        // The re-judge's mark clause compares against this re-read
+        // (decision 0004 DC24). A mark written earlier does not cover an
+        // acquire that landed after it.
+        const preread_ns = clock.boottimeNs();
+        const was_unreserved = !preread.facts.reserved;
         ctx.facts = preread.facts;
         const mark = marker.createIn(reg.dir(), ctx.vol_index) catch {
             hold.release();
@@ -983,6 +1071,32 @@ pub fn registerUnderRule(ctx_in: RuleContext, reg: *const Registry, c: *pr.Clien
             return error.ReportUnreadable;
         };
         ctx.facts = judged.facts;
+        // Unreserved at the re-read, reserved now: either this host's
+        // manager acquired and marked, or another host did. No mark since
+        // the re-read kills the manager. The signal is under the lock; the
+        // wait is outside (decision 0004 DC24). This process's own lapse
+        // rule is not its own judge.
+        var doomed: ?Entry = null;
+        if (was_unreserved and judged.facts.reserved) {
+            switch (managerUnmarked(ctx, reg, preread_ns) catch |e| {
+                _ = marker.publishWithdrawal(reg.dir(), &mark);
+                hold.release();
+                _ = finishWithdrawal(reg, &mark, c);
+                return e;
+            }) {
+                .marked, .none => {},
+                .unmarked => |mgr| {
+                    if (signalSibling(ctx, &mgr)) |why| {
+                        _ = marker.publishWithdrawal(reg.dir(), &mark);
+                        hold.release();
+                        _ = finishWithdrawal(reg, &mark, c);
+                        log.err("meta volume {s}: REFUSING the registration: the manager pid {d} {s} (decision 0004 DC24)", .{ ctx.path, mgr.pid, why });
+                        return error.SiblingLive;
+                    }
+                    doomed = mgr;
+                },
+            }
+        }
         const ps = pages.get(ctx.gpa) catch |e| {
             _ = marker.publishWithdrawal(reg.dir(), &mark);
             hold.release();
@@ -990,12 +1104,12 @@ pub fn registerUnderRule(ctx_in: RuleContext, reg: *const Registry, c: *pr.Clien
             return e;
         };
         defer ctx.gpa.free(ps);
-        const stale = anyStaleAlive(ctx, reg, ps) catch |e| {
+        const stale = doomed != null or (anyStaleAlive(ctx, reg, ps) catch |e| {
             _ = marker.publishWithdrawal(reg.dir(), &mark);
             hold.release();
             _ = finishWithdrawal(reg, &mark, c);
             return e;
-        };
+        });
         if (!stale) {
             marker.dropSection(reg.dir(), &mark);
             hold.release();
@@ -1003,6 +1117,11 @@ pub fn registerUnderRule(ctx_in: RuleContext, reg: *const Registry, c: *pr.Clien
         }
         _ = marker.publishWithdrawal(reg.dir(), &mark);
         hold.release();
+        if (doomed) |mgr| if (awaitDead(ctx, &mgr)) |why| {
+            _ = finishWithdrawal(reg, &mark, c);
+            log.err("meta volume {s}: REFUSING the registration: the manager pid {d} {s} (decision 0004 DC24)", .{ ctx.path, mgr.pid, why });
+            return error.SiblingLive;
+        };
         log.warn("meta volume {s}: a sibling of this set on this host turned stale between the rule and the register (a takeover or a remote recovery raced it) — the host's registration withdrawn before it is killed", .{ctx.path});
         if (!finishWithdrawal(reg, &mark, c)) {
             log.err("meta volume {s}: REFUSING the registration: it could not be withdrawn from a stale sibling's host", .{ctx.path});
@@ -1782,6 +1901,32 @@ test "the judgement: a Live page names a current sibling; a Recovering, Recovere
     try testing.expectEqual(Verdict.current, judge(&m, &.{pg(0, .live, node, 0xc2)}, node, 1, false, .{}));
     try testing.expect(Entry.parse(1, "") == null);
     try testing.expect(Entry.parse(1, "x\n") == null);
+}
+
+test "re-acquire mark: the line records the acquire's boottime and generation, a later mark replaces it, and a mark from before the re-read does not cover it (decision 0004 DC24)" {
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-mark-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var reg = Registry.at(base, .set, 0xdc24);
+    reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer reg.unlock();
+    const me = proc.localIdentity();
+    var lb: [64]u8 = undefined;
+    try reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .manager, .slot = 0, .writer_id = 0xabc }));
+    try reg.noteReacquire(me.pid, me.start_ticks, 1000, 4);
+    try reg.noteReacquire(me.pid, me.start_ticks, 2500, 9);
+    var rb: [4096]u8 = undefined;
+    const text = reg.readEntry(me.pid, &rb) orelse return error.Missing;
+    const e = Entry.parse(me.pid, text) orelse return error.Parse;
+    try testing.expectEqual(@as(u64, 2500), e.reacquire_ns);
+    try testing.expectEqual(@as(u32, 9), e.reacquire_gen);
+    try testing.expect(e.markedSince(2500));
+    try testing.expect(e.markedSince(1000));
+    try testing.expect(!e.markedSince(2501));
+    try testing.expect(!Entry.parse(1, "1\n").?.markedSince(1));
+    // The manager line survived the mark.
+    try testing.expectEqual(@as(usize, 1), e.n_regions);
+    try testing.expectEqual(Role.manager, e.regionSlice()[0].role);
 }
 
 test "registration lock: two open file descriptions of .register exclude each other, and the registry flock is a different file (decision 0004 DC20)" {

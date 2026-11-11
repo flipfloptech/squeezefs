@@ -1,5 +1,8 @@
 # Handoff — 2026-11-10
 
+**Stale.** PR-4 landed. Resume from `docs/handoff/2026-11-11-workstation.md`.
+Do not follow this note. Do not merge `feat/pr4` from it.
+
 ## Current state and next action
 
 **Branch `feat/pr4` is at `a489076`** (5 commits ahead of `origin/feat/pr4`, 7 ahead of `dev`).

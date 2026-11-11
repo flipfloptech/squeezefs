@@ -3538,6 +3538,47 @@ fn printLogTailFile(rig: *Rig, path: []const u8, n: usize) void {
     std.debug.print("--- the last {d} lines of {s} ---\n{s}\n", .{ n, path, text[start..] });
 }
 
+/// Lines that name the page check, the park, or the reclaim. The rig deletes
+/// its directory on the way out, so a miss has to print before the expect.
+fn printLogNeedles(rig: *Rig, path: []const u8) void {
+    const text = Io.Dir.cwd().readFileAlloc(rig.io, path, rig.gpa, .limited(16 << 20)) catch return;
+    defer rig.gpa.free(text);
+    const needles = [_][]const u8{
+        "appender 0",
+        "superseded",
+        "unreadable",
+        "FAILED",
+        "fail-stop",
+        "re-registered",
+        "admitted the reclaim",
+        "appender park",
+        "fence debt",
+        "preempt-all",
+        "listener moved",
+        "POISONED",
+        "member-fence",
+        "succession",
+        "refusing",
+        "latching",
+    };
+    std.debug.print("--- needles in {s} ---\n", .{path});
+    var line_start: usize = 0;
+    var shown: usize = 0;
+    while (line_start < text.len and shown < 80) {
+        const rest = text[line_start..];
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const line = rest[0..nl];
+        for (needles) |n| if (std.mem.indexOf(u8, line, n) != null) {
+            std.debug.print("{s}\n", .{line});
+            shown += 1;
+            break;
+        };
+        line_start += nl;
+        if (line_start < text.len and text[line_start] == '\n') line_start += 1;
+    }
+    if (shown == 80) std.debug.print("--- needle cap ---\n", .{});
+}
+
 fn unlinkPath(path: [:0]const u8) void {
     _ = linux.unlinkat(linux.AT.FDCWD, path.ptr, 0);
 }
@@ -3610,12 +3651,15 @@ test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2
     defer gpa.free(rr);
     const ss = try rig.stats(s);
     defer gpa.free(ss);
-    std.debug.print("\n--- F1 after S binds: rtype {?d} regctl {?d}; writer_guard_preempts {?d} writer_guard_preempt_alls {?d} writer_guard_preempt_all_victims {?d} ---\n", .{
+    std.debug.print("\n--- F1 after S binds: rtype {?d} regctl {?d}; writer_guard_preempts {?d} writer_guard_preempt_alls {?d} writer_guard_preempt_all_victims {?d}; identity_failures {?d} identity_unreadable {?d} fenced {?d} ---\n", .{
         json_scan.number(rr, "rtype"),
         json_scan.number(rr, "regctl"),
         json_scan.number(ss, "writer_guard_preempts"),
         json_scan.number(ss, "writer_guard_preempt_alls"),
         json_scan.number(ss, "writer_guard_preempt_all_victims"),
+        json_scan.number(ss, "writer_guard_identity_failures"),
+        json_scan.number(ss, "writer_guard_identity_unreadable_beats"),
+        json_scan.number(ss, "writer_guard_fenced"),
     });
     try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
     try testing.expectEqual(@as(u64, 1), try statNumber(ss, "writer_guard_preempt_alls"));
@@ -3636,7 +3680,31 @@ test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2
     const js = try rig.stats(j);
     defer gpa.free(js);
     try testing.expectEqual(@as(u64, 0), try statNumber(js, "writer_guard_fenced"));
-    try testing.expectEqual(@as(u64, 0), try statNumber(js, "appender_parked"));
+    // J's cat can be served from its page cache while the reclaim is still
+    // in flight. Membership cadence is 5 s; wait for the unpark, don't
+    // sample it.
+    const back_deadline = clock.monotonicNs() + 12 * std.time.ns_per_s;
+    var parked = try statNumber(js, "appender_parked");
+    while (parked != 0 and clock.monotonicNs() < back_deadline) {
+        sleepMs(200);
+        const again = try rig.stats(j);
+        defer gpa.free(again);
+        parked = try statNumber(again, "appender_parked");
+    }
+    if (parked != 0) {
+        std.debug.print("\n--- F1 J still parked: identity_failures {?d} unreadable {?d} fenced {?d}; S identity_failures {?d} unreadable {?d} ---\n", .{
+            json_scan.number(js, "writer_guard_identity_failures"),
+            json_scan.number(js, "writer_guard_identity_unreadable_beats"),
+            json_scan.number(js, "writer_guard_fenced"),
+            json_scan.number(ss, "writer_guard_identity_failures"),
+            json_scan.number(ss, "writer_guard_identity_unreadable_beats"),
+        });
+        printF1Joiner(rig, j);
+        printLogNeedles(rig, rig.daemons.items[j].log_path);
+        printLogNeedles(rig, rig.daemons.items[s].log_path);
+        printLogTailFile(rig, rig.daemons.items[s].log_path, 40);
+    }
+    try testing.expectEqual(@as(u64, 0), parked);
     const key_j = try statString(rig, j, "pr_key");
     defer gpa.free(key_j);
     const rr_j = try rig.resvReportJson(cm.dev());

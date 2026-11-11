@@ -145,6 +145,14 @@ pub const Guard = struct {
     /// manager (decision 0004 §4.6). A first manager's acquire opens none.
     /// `settled` is this volume's half of W_end; `endSuccession` clears it.
     succession: ?SuccessionWindow = null,
+    /// Appender 0's term and writer this incarnation bound (decision 0004
+    /// §4.4.2). 0 = not bound (a flat volume, or before region 0's join):
+    /// the page check does not apply.
+    bound_term: u64 = 0,
+    bound_writer: u64 = 0,
+    /// Consecutive beats whose appender-0 page did not decode. A readable
+    /// page resets it. One claim TTL of them fail-stops.
+    unreadable_identity_beats: u32 = 0,
     /// Once, when the window settles: the data fence's reconcile
     /// (decision 0004 §4.7). Admission binds it.
     settle_hook: ?SettleHook = null,
@@ -901,6 +909,100 @@ pub const Guard = struct {
         return p.host_key;
     }
 
+    /// Region 0's join landed (decision 0004 §4.4.2). The page check compares
+    /// against these words.
+    pub fn noteBoundIdentity(g: *Guard, term: u64, writer: u64) void {
+        g.bound_term = term;
+        g.bound_writer = writer;
+    }
+
+    pub const Identity = enum { ours, usurped, unreadable };
+
+    /// Appender 0's Live page names this incarnation's writer and the term
+    /// it bound (decision 0004 §4.4.2, DC16). `usurped` only on a positive
+    /// mismatch. Anything that does not decode is `unreadable`, not a
+    /// guess. Not bound: `.ours` (the check does not apply).
+    pub fn identityHolds(g: *Guard) Identity {
+        if (g.bound_term == 0) return .ours;
+        const page = g.newestAppender0() orelse return .unreadable;
+        if (page.state == .live and page.identity.writer_id == g.bound_writer and page.term == g.bound_term) return .ours;
+        if (page.identity.writer_id != 0 and page.identity.writer_id != g.bound_writer) return .usurped;
+        if (page.identity.writer_id == g.bound_writer and page.term != g.bound_term) return .usurped;
+        return .unreadable;
+    }
+
+    /// The admission's re-read (decision 0004 §4.4.2, round-3 issue 7):
+    /// while the page is unreadable, up to one claim TTL of attempts. A
+    /// positive mismatch or an exhausted budget is the answer. The wait
+    /// between attempts is the beat interval, except in tests, where the
+    /// attempts are the budget and the read is already synchronous.
+    /// The caller must not hold the data-fence lock across this: the wait
+    /// is a beat interval, and that lock is held across the debt's preempts.
+    pub fn identityHoldsBounded(g: *Guard) Identity {
+        var i: u32 = 0;
+        while (i < unreadable_lapse_beats_max) : (i += 1) {
+            const id = g.identityHolds();
+            if (id != .unreadable) return id;
+            if (i + 1 == unreadable_lapse_beats_max) return .unreadable;
+            log.warn("meta volume {s}: appender 0's page is unreadable — the admission re-reads ({d} of {d})", .{ g.be.path, i + 1, unreadable_lapse_beats_max });
+            if (!builtin.is_test) g.io.sleep(.fromSeconds(claim.HEARTBEAT_INTERVAL_S), .awake) catch {};
+        }
+        return .unreadable;
+    }
+
+    /// A positive mismatch (decision 0004 §4.4.2). The volume fail-stops.
+    pub fn noteUsurped(g: *Guard) void {
+        guard.stats.identity_failures.inc();
+        g.failStop("appender 0's page names another writer or another term — this manager was superseded (decision 0004 §4.4.2)");
+    }
+
+    /// The beat's accounting for one check (decision 0004 §4.4.2). False:
+    /// this beat writes nothing. `usurped` fail-stops. `unreadable` skips
+    /// the claim refresh, and fail-stops at one claim TTL of consecutive
+    /// beats. A readable page resets that count.
+    fn screenIdentity(g: *Guard) bool {
+        switch (g.identityHolds()) {
+            .ours => {
+                g.unreadable_identity_beats = 0;
+                return true;
+            },
+            .usurped => {
+                g.noteUsurped();
+                return false;
+            },
+            .unreadable => {
+                g.unreadable_identity_beats += 1;
+                guard.stats.identity_unreadable_beats.inc();
+                if (g.unreadable_identity_beats >= unreadable_lapse_beats_max) {
+                    g.failStop("appender 0's page stayed unreadable for one claim TTL of beats (decision 0004 §4.4.2)");
+                } else {
+                    log.warn("meta volume {s}: appender 0's page is unreadable — this beat withholds the claim refresh and every manager mutation ({d} of {d})", .{ g.be.path, g.unreadable_identity_beats, unreadable_lapse_beats_max });
+                }
+                return false;
+            },
+        }
+    }
+
+    /// Newest valid appender-0 page, or null when none decodes (a read
+    /// error, a foreign layout, a blank slot). `readAtRaw` bypasses
+    /// `MetaReadmit`: a conflict or EIO on this probe is unreadable, not a
+    /// fence of the manager (decision 0004 §4.4.2, §4.5.3).
+    fn newestAppender0(g: *Guard) ?appender_page.Page {
+        const be = g.be;
+        const offs = appender_page.appender0PageOffsets(be.sb.journal.start);
+        var bufs: [appender_page.PAGE_SLOTS][appender_page.PAGE_LEN]u8 = undefined;
+        var imgs: [appender_page.PAGE_SLOTS]?[]const u8 = @splat(null);
+        for (offs, 0..) |off, i| {
+            var r = be.pool.readAtRaw(be.path, off, appender_page.PAGE_LEN) catch return null;
+            defer r.deinit();
+            const got = r.bytes();
+            if (got.len < appender_page.PAGE_LEN) return null;
+            @memcpy(&bufs[i], got[0..appender_page.PAGE_LEN]);
+            imgs[i] = &bufs[i];
+        }
+        return appender_page.newestValid(imgs) catch null;
+    }
+
     fn barrier(g: *Guard) backend.OpenError!void {
         g.be.fsync() catch |e| {
             log.err("meta volume {s}: the writer claim's barrier failed ({s}) — refusing the mount", .{ g.be.path, @errorName(e) });
@@ -974,6 +1076,9 @@ pub const Guard = struct {
     /// after the claim was released.
     pub fn beat(g: *Guard) void {
         if (g.be.isFailed() or !g.claimed.load(.acquire)) return;
+        // Before the reservation re-check and the claim refresh (decision
+        // 0004 §4.4.2). A superseded manager must not refresh its claim.
+        if (!g.screenIdentity()) return;
         if (g.prClient()) |c| {
             if (!g.prRecheck(c)) return;
             if (g.be.isFailed()) return;
@@ -1177,6 +1282,10 @@ pub const Guard = struct {
     /// The lapse's re-acquire, once the device's claim names this
     /// incarnation: the registration through the rule, the hold.
     fn reacquireBlocking(g: *Guard, c: *pr.Client) Recheck {
+        // The page check again, at the mutation (decision 0004 §4.4.2).
+        // The registration lock that makes it one section with the acquire
+        // is later.
+        if (!g.screenIdentity()) return .report_failed;
         c.lockOps();
         defer c.unlockOps();
         const locked = g.lockRegistry() catch return .reacquire_failed;
@@ -1311,7 +1420,9 @@ pub const Guard = struct {
                 // this client or its fencer preempted a member — stays
                 // (review 4 blocker 2): released, it would re-admit the
                 // fenced host (unreserved).
-                if (last) host_fence.leaveRegistration(c, g.keep_hold or c.stats.preempts > 0 or fencer_preempts > 0) catch |e| {
+                // The kept-law release is a manager mutation (decision 0004
+                // §4.4.2). Unreadable or usurped: leave the registration.
+                if (last and g.screenIdentity()) host_fence.leaveRegistration(c, g.keep_hold or c.stats.preempts > 0 or fencer_preempts > 0) catch |e| {
                     var buf: [128]u8 = undefined;
                     var w: Io.Writer = .fixed(&buf);
                     c.writeError(&w, e) catch {};
@@ -2682,4 +2793,115 @@ test "decision 0003 §DL: a flat (single-writer) volume has no member to wait fo
     try testing.expectEqual(early0 + 1, guard.stats.lapse_early_ends.load());
     try testing.expectEqual(@as(?u64, claim.prKey(me.writerId(0), boot_a)), ns.holder);
     try testing.expect(!be.isFailed());
+}
+
+fn readAppender0(be: *KvBackend) !appender_page.Page {
+    const offs = appender_page.appender0PageOffsets(be.sb.journal.start);
+    var bufs: [appender_page.PAGE_SLOTS][appender_page.PAGE_LEN]u8 = undefined;
+    var imgs: [appender_page.PAGE_SLOTS]?[]const u8 = @splat(null);
+    for (offs, 0..) |off, i| {
+        const img = try be.dev.readRange(testing.allocator, off, appender_page.PAGE_LEN);
+        defer testing.allocator.free(img);
+        @memcpy(&bufs[i], img[0..appender_page.PAGE_LEN]);
+        imgs[i] = &bufs[i];
+    }
+    return (try appender_page.newestValid(imgs)) orelse error.PageMissing;
+}
+
+fn writeAppender0(be: *KvBackend, img: []const u8) !void {
+    const offs = appender_page.appender0PageOffsets(be.sb.journal.start);
+    for (offs) |off| try be.pool.writeAt(be.path, off, img);
+}
+
+test "pr5 identity: appender 0's page is ours, another writer or term is usurped and fail-stops without refreshing the claim, an unreadable page skips four beats and fail-stops on the fifth, and one readable beat resets the count (decision 0004 §4.4.2)" {
+    const gpa = testing.allocator;
+    const me = ident(boot_a, 4000, 790);
+    const v = try Vol.create(gpa, "ident", "600000");
+    defer v.destroy();
+    const be = try v.open(.{ .test_identity = me, .test_pid_probe = PidTable.probe }, 0);
+    defer be.close();
+    const g = be.guard.?;
+    try testing.expect(g.bound_term != 0);
+    try testing.expect(g.identityHolds() == .ours);
+    const seq0 = (try v.probe()).?.heartbeat_seq;
+    g.beat();
+    try testing.expectEqual(seq0 + 1, (try v.probe()).?.heartbeat_seq);
+    try testing.expect(!be.isFailed());
+
+    // Another term is a positive mismatch, and it does not fail-stop until a beat.
+    var page = try readAppender0(be);
+    page.term += 1;
+    page.generation += 1;
+    var img: [appender_page.PAGE_LEN]u8 = undefined;
+    try page.encode(&img);
+    try writeAppender0(be, &img);
+    try testing.expect(g.identityHolds() == .usurped);
+    try testing.expect(!be.isFailed());
+    // Another writer, likewise.
+    page.identity.writer_id +%= 1;
+    page.term = g.bound_term;
+    page.generation += 1;
+    try page.encode(&img);
+    try writeAppender0(be, &img);
+    try testing.expect(g.identityHolds() == .usurped);
+    const seq1 = (try v.probe()).?.heartbeat_seq;
+    const fails0 = guard.stats.identity_failures.load();
+    log.testing.expectErrorLogs(1);
+    g.beat();
+    try log.testing.expectAllFired();
+    try testing.expect(be.isFailed());
+    try testing.expectEqual(seq1, (try v.probe()).?.heartbeat_seq);
+    try testing.expectEqual(fails0 + 1, guard.stats.identity_failures.load());
+    g.beat();
+    try testing.expectEqual(fails0 + 1, guard.stats.identity_failures.load());
+
+    // A second mount: unreadable for four beats, fail-stop on the fifth.
+    const v2 = try Vol.create(gpa, "ident-blank", "600000");
+    defer v2.destroy();
+    const be2 = try v2.open(.{ .test_identity = me, .test_pid_probe = PidTable.probe }, 0);
+    defer be2.close();
+    const g2 = be2.guard.?;
+    var blank: [appender_page.PAGE_LEN]u8 = @splat(0);
+    try writeAppender0(be2, &blank);
+    try testing.expect(g2.identityHolds() == .unreadable);
+    const seq2 = (try v2.probe()).?.heartbeat_seq;
+    const unread0 = guard.stats.identity_unreadable_beats.load();
+    var n: u32 = 1;
+    while (n <= 4) : (n += 1) {
+        g2.beat();
+        try testing.expect(!be2.isFailed());
+        try testing.expectEqual(seq2, (try v2.probe()).?.heartbeat_seq);
+        try testing.expectEqual(n, g2.unreadable_identity_beats);
+    }
+    try testing.expectEqual(unread0 + 4, guard.stats.identity_unreadable_beats.load());
+    log.testing.expectErrorLogs(1);
+    g2.beat();
+    try log.testing.expectAllFired();
+    try testing.expect(be2.isFailed());
+    try testing.expectEqual(unread0 + 5, guard.stats.identity_unreadable_beats.load());
+
+    // A third mount: one unreadable beat, then the page back, and the count resets.
+    const v3 = try Vol.create(gpa, "ident-reset", "600000");
+    defer v3.destroy();
+    const be3 = try v3.open(.{ .test_identity = me, .test_pid_probe = PidTable.probe }, 0);
+    defer be3.close();
+    const g3 = be3.guard.?;
+    var kept: [appender_page.PAGE_LEN]u8 = undefined;
+    const live = try readAppender0(be3);
+    try live.encode(&kept);
+    try writeAppender0(be3, &blank);
+    g3.beat();
+    try testing.expectEqual(@as(u32, 1), g3.unreadable_identity_beats);
+    try testing.expect(!be3.isFailed());
+    try writeAppender0(be3, &kept);
+    const seq3 = (try v3.probe()).?.heartbeat_seq;
+    g3.beat();
+    try testing.expectEqual(@as(u32, 0), g3.unreadable_identity_beats);
+    try testing.expect(!be3.isFailed());
+    try testing.expectEqual(seq3 + 1, (try v3.probe()).?.heartbeat_seq);
+    try testing.expect(g3.identityHolds() == .ours);
+    // The admission's re-read answers unreadable once the budget is exhausted, without fail-stopping.
+    try writeAppender0(be3, &blank);
+    try testing.expect(g3.identityHoldsBounded() == .unreadable);
+    try testing.expect(!be3.isFailed());
 }

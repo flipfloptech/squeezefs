@@ -310,6 +310,7 @@ pub const AppenderSet = struct {
         r.core.page.seq_offset = be.reg.seqOffset();
         try self.regions.append(self.gpa, r);
         try self.writePages(r, false);
+        if (be.guard) |g| g.noteBoundIdentity(words.term, self.identity.writer_id);
         self.manager.holdLease(words.term);
         self.manager.appenders_known = self.live_pages.items.len + 1;
         log.info("meta volume {s}: appender 0 Live as the manager (term {d}, node 0x{x}, mount slot {d}); {d} other appender(s) live on the directory", .{ be.path, words.term, self.identity.node_token, self.identity.mount_slot, self.live_pages.items.len });

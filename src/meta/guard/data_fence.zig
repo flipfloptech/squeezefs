@@ -475,6 +475,9 @@ pub const DataFence = struct {
         };
         const node = try gpa.dupe(u8, path);
         errdefer gpa.free(node);
+        // Before the lock. The bounded re-read sleeps a beat interval, and
+        // this lock is held across the debt's preempts (decision 0004 §4.4.2).
+        if (self.in.manager) try self.provePageForDebt(path, client);
         self.lock.lock();
         defer self.lock.unlock();
         if (self.n == self.vols.len) return error.Refused;
@@ -691,6 +694,20 @@ pub const DataFence = struct {
         var storage: [cr.FenceDebt.MAX_KEYS]u64 = undefined;
         const keys = try self.debtKeys(path, c, &storage);
         if (keys.len == 0) return;
+        // The bounded re-read already ran before the lock (`provePageForDebt`).
+        // This is the check at the mutation, and it does not sleep.
+        if (self.in.guard) |g| switch (g.identityHolds()) {
+            .ours => {},
+            .usurped => {
+                g.noteUsurped();
+                log.err("data volume {s}: appender 0's page names another writer or term — the fence debt is not paid (decision 0004 §4.4.2)", .{path});
+                return error.Refused;
+            },
+            .unreadable => {
+                log.err("data volume {s}: appender 0's page is unreadable — the fence debt is not paid (decision 0004 §4.4.2)", .{path});
+                return error.Refused;
+            },
+        };
         const held = self.meta.admittedHere() catch return reportRefusal(path, "the metadata namespace's report");
         if (!held) {
             log.err("data volume {s}: this mount no longer holds the metadata reservation — it pays no fence debt and refuses", .{path});
@@ -700,6 +717,28 @@ pub const DataFence = struct {
         for (keys) |k| {
             if (k == 0 or k == c.key) continue;
             try proveDebtKey(path, c, k);
+        }
+    }
+
+    /// The admission's bounded page re-read, before the data-fence lock
+    /// (decision 0004 §4.4.2). No debt: the check does not apply. A positive
+    /// mismatch fail-stops. An exhausted unreadable budget refuses the open.
+    fn provePageForDebt(self: *DataFence, path: []const u8, c: *pr.Client) AdmitError!void {
+        var storage: [cr.FenceDebt.MAX_KEYS]u64 = undefined;
+        const keys = try self.debtKeys(path, c, &storage);
+        if (keys.len == 0) return;
+        const g = self.in.guard orelse return;
+        switch (g.identityHoldsBounded()) {
+            .ours => {},
+            .usurped => {
+                g.noteUsurped();
+                log.err("data volume {s}: appender 0's page names another writer or term — the fence debt is not paid (decision 0004 §4.4.2)", .{path});
+                return error.Refused;
+            },
+            .unreadable => {
+                log.err("data volume {s}: appender 0's page stayed unreadable through the page check's budget — the fence debt is not paid (decision 0004 §4.4.2)", .{path});
+                return error.Refused;
+            },
         }
     }
 
@@ -820,6 +859,18 @@ pub const DataFence = struct {
     /// changes nothing it preempts: every key it names is absent from the
     /// metadata namespace — a fenced host.
     fn reconcile(self: *DataFence, path: []const u8, c: *pr.Client) AdmitError!void {
+        if (self.in.guard) |g| switch (g.identityHolds()) {
+            .ours => {},
+            .usurped => {
+                g.noteUsurped();
+                log.err("data volume {s}: appender 0's page names another writer or term — the reconcile does not run (decision 0004 §4.4.2)", .{path});
+                return error.Refused;
+            },
+            .unreadable => {
+                log.warn("data volume {s}: appender 0's page is unreadable — the reconcile waits (decision 0004 §4.4.2)", .{path});
+                return error.Refused;
+            },
+        };
         const gpa = self.in.gpa;
         const meta = self.meta;
         const held = meta.admittedHere() catch return reportRefusal(path, "the metadata namespace's report");

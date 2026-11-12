@@ -4096,6 +4096,115 @@ test "nvmet fidelity: pr5 F1 — succession re-registration (decision 0004 §8.2
     try expectNoResidue(rig, set.data_nqn);
 }
 
+test "nvmet fidelity: pr5 F5 — a lapse inside the succession window (decision 0004 §8.2, §4.9) — tcp: M (host A) manages, J (host C) writes and fsyncs; J is SIGSTOPped, then M past the claim TTL; S (host B) mounts and preempts-all once; J, still stopped, has no lapse re-registration; both subsystems are wiped and restored (the namespace is unreserved, nvmet keeps no PTPL) before J is continued; J re-registers through the lapse path (meta_pr_lapse_reregistrations >= 1); S's re-acquire is not a second preempt-all (writer_guard_preempt_alls stays 1, grace 600 s); the window settles and the data reconcile runs once" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .tcp;
+    const ports = try rig.servicePorts(transport);
+    const set = try symmetricSet(rig, "f5", transport, ports);
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, ports[0], ident_b, &.{});
+    const cm_c = try rig.connect(set.meta_nqn, transport, ports[0], ident_c, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var mu_c: [64]u8 = undefined;
+    const meta_uri_c = try std.fmt.bufPrint(&mu_c, "sqmeta://{s}", .{cm_c.dev()});
+    const m = try rig.spawnMount("f5-m", set.metaUri(), null, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const j = try rig.spawnMount("f5-j", meta_uri_c, ident_c, &.{});
+    try rig.awaitLog(j, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, j, "mkdir dj && echo j > dj/j && sync -d dj/j"));
+    // Stopped before S binds, so the succession re-registration cannot land
+    // before the target restart. Stats of a stopped daemon would block.
+    _ = linux.kill(rig.daemons.items[j].pid, .STOP);
+    _ = linux.kill(rig.daemons.items[m].pid, .STOP);
+    sleepMs(lease_clock.T_OWNER_MS + 5_000);
+    var env_s = try rig.envWith(ident_b);
+    defer env_s.deinit();
+    try env_s.put("SQUEEZEFS_TEST_LAPSE_GRACE_S", "600");
+    const s = try rig.spawnMountEnv("f5-s", meta_uri_b, &env_s, &.{});
+    try rig.awaitLog(s, "ready: ", ready_wait_ns);
+    {
+        const ss = try rig.stats(s);
+        defer gpa.free(ss);
+        try testing.expectEqual(@as(u64, 1), try statNumber(ss, "writer_guard_preempt_alls"));
+    }
+    {
+        const jlog = try rig.readLog(j);
+        defer gpa.free(jlog);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, jlog, "after the lapse"));
+    }
+    try restartSubsystems(rig, &.{ set.meta_nqn, set.data_nqn });
+    {
+        const deadline = clock.monotonicNs() + 15 * std.time.ns_per_s;
+        while (true) {
+            if (rig.resvReportJson(cm.dev())) |rr| {
+                const rtype = json_scan.number(rr, "rtype") orelse 0;
+                if (rtype == 0) {
+                    gpa.free(rr);
+                    break;
+                }
+                if (clock.monotonicNs() >= deadline) {
+                    std.debug.print("\n--- F5 namespace not unreserved after the restart: {s} ---\n", .{rr});
+                    gpa.free(rr);
+                    return error.NamespaceReserved;
+                }
+                gpa.free(rr);
+            } else |e| {
+                if (clock.monotonicNs() >= deadline) {
+                    std.debug.print("\n--- F5 reservation report unread after the restart: {s} ---\n", .{@errorName(e)});
+                    return e;
+                }
+            }
+            sleepMs(200);
+        }
+    }
+    _ = linux.kill(rig.daemons.items[j].pid, .CONT);
+    const deadline = clock.monotonicNs() + g2_wait_ns;
+    var lapses: u64 = 0;
+    var settles: u64 = 0;
+    var preempts: u64 = 0;
+    var reconciles: usize = 0;
+    while (true) {
+        if (rig.stats(j)) |sj| {
+            lapses = json_scan.number(sj, "meta_pr_lapse_reregistrations") orelse 0;
+            gpa.free(sj);
+        } else |_| {}
+        if (rig.stats(s)) |ss| {
+            settles = json_scan.number(ss, "writer_guard_succession_settles") orelse 0;
+            preempts = json_scan.number(ss, "writer_guard_preempt_alls") orelse 0;
+            gpa.free(ss);
+        } else |_| {}
+        if (rig.readLog(s)) |slog| {
+            reconciles = std.mem.count(u8, slog, "succession reconcile over");
+            gpa.free(slog);
+        } else |_| {}
+        if (lapses >= 1 and settles >= 1 and preempts == 1 and reconciles == 1) break;
+        if (clock.monotonicNs() >= deadline) {
+            std.debug.print("\n--- F5: lapse rereg {d}, preempt_alls {d}, settles {d}, reconcile lines {d} ---\n", .{ lapses, preempts, settles, reconciles });
+            printLogTailFile(rig, rig.daemons.items[s].log_path, 40);
+            printLogTailFile(rig, rig.daemons.items[j].log_path, 40);
+            return error.LapseWindow;
+        }
+        sleepMs(200);
+    }
+    std.debug.print("\n--- F5: lapse rereg {d}, preempt_alls {d}, settles {d}, reconcile lines {d} ---\n", .{ lapses, preempts, settles, reconciles });
+    try rig.kill9(m);
+    try rig.umount(j);
+    try rig.umount(s);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    try rig.disconnect(&cm_c);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
 test "nvmet fidelity: F10 — a busy co-located joiner of the superseded manager survives the takeover (decision 0004 §8.2, G-c, round-4 issue 1) — M (host A) manages, JA (host A, supervised, the write cache) keeps writing and fsyncing one 64 KiB block across the takeover; M is SIGSTOPped past the claim TTL and S (host B) mounts: S's admission pays the fence debt and fences host A on data while JA is mid-flight (data_pr_debt_preempts >= 1) — a refused data write is re-admitted (held while metadata is pending, or one synchronous retry once metadata has settled; data_dma_fence_refusals 0, no data fence latch), JA kills M at its metadata re-registration (pr_stale_sibling_kills ≥ 1), data re-registers (data_pr_succession_reregistrations ≥ 1), a later fsync lands, every fsynced block is whole on JA and on S, and fsck --offline --scrub is clean (red on dev: JA's data device latches, its fsyncs answer EIO)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);

@@ -440,6 +440,10 @@ pub const JoinedSet = struct {
     /// `T_park_max` expires it. Armed here with the env-derived clocks; the
     /// membership grant's `T_owner` refines `t_park_max_ms`.
     park_gate: park.ParkGate,
+    /// Another volume's succession park is waiting for this volume's host
+    /// key to be observed registered again. Cleared by this volume's own
+    /// beat. Peers do not `clear` while any of these is set (W26).
+    succession_key_outstanding: std.atomic.Value(bool) = .init(false),
     readmit: member_fence.Readmit = .{},
     resolution: member_fence.Resolution = .{},
     withdraw_drain: member_fence.WithdrawDrain = .{},
@@ -1122,6 +1126,28 @@ pub const JoinedSet = struct {
         // T_park_max and poison the joiner (the kill-matrix rows).
         if (self.fence == null) return;
         _ = self.park_gate.parkFor(.succession, clock.monotonicNs());
+        // The other volumes must publish a post-park registration before
+        // this one releases a held write (W26). Marking ourselves would
+        // deadlock: each side waits for a flag only the other clears.
+        // A volume with no commit of its own never takes the T_self park,
+        // so its beat never reaches `successionReregister` (that bails
+        // unless this gate is parked) and the preempt-all's key stays gone.
+        const now = clock.monotonicNs();
+        for (self.peers) |be| {
+            if (be == self.be) continue;
+            const js = be.joined orelse continue;
+            js.succession_key_outstanding.store(true, .release);
+            _ = js.park_gate.parkFor(.succession, now);
+        }
+    }
+
+    fn peerKeyOutstanding(self: *JoinedSet) bool {
+        for (self.peers) |be| {
+            if (be == self.be) continue;
+            const js = be.joined orelse return true;
+            if (js.succession_key_outstanding.load(.acquire)) return true;
+        }
+        return false;
     }
 
     /// The hold FIFO is present and the one-shot hold has not finished, or
@@ -1253,6 +1279,8 @@ pub const JoinedSet = struct {
         }
         if (currency == .unreadable) return;
         const report = self.reservationReport();
+        if (report.readable and report.host_registered) self.succession_key_outstanding.store(false, .release);
+        self.readmit.hold_clear = self.peerKeyOutstanding();
         const verdict = self.readmit.beat(who, mapped, report);
         if (self.readmit.obs.successor_page) {
             self.link.repointIfMoved();
@@ -1264,7 +1292,7 @@ pub const JoinedSet = struct {
                 }
             }
         }
-        if (self.readmit.obs.host_registered) {
+        if (self.readmit.obs.host_registered and !self.readmit.hold_clear) {
             if (page0Owner(mapped)) |p0| {
                 self.mgr_writer = p0.writer_id;
                 self.mgr_term = p0.term;
@@ -1278,6 +1306,7 @@ pub const JoinedSet = struct {
         if (member_fence.wantsRegister(self.readmit.obs, report.readable, self.be.pool.writesOutstanding() == 0, self.readmit.word)) {
             self.successionReregister(who);
         }
+        self.readmit.hold_clear = false;
     }
 
     /// Pre-sleep re-check callback for `self.resolution` (decision 0004
@@ -1304,6 +1333,8 @@ pub const JoinedSet = struct {
                 const report = self.reservationReport();
                 if (!report.readable) break :blk .unreadable;
                 if (report.rtype == 0 or (report.rtype == who.meta_rtype and report.host_registered)) {
+                    if (report.host_registered) self.succession_key_outstanding.store(false, .release);
+                    if (self.peerKeyOutstanding()) break :blk .unregistered;
                     if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
                     if (self.readmit.on_cleared) |f| f(self.readmit.on_cleared_ctx);
                     break :blk .registered;
@@ -1319,6 +1350,13 @@ pub const JoinedSet = struct {
     /// registration (C2): this incarnation's page must be Live under its
     /// writer id, node token and term on every joined volume (§DN.2).
     fn successionReregister(self: *JoinedSet, who: member_fence.SelfView) void {
+        // The park's on_held has marked the other volumes. A clear inside
+        // finishReregister's beat would release this volume's waiters
+        // before those keys are back. On a multi-volume set the last
+        // volume to register has no peer still outstanding, so the beat
+        // would wake the write before the log below; hold the clear until
+        // that log has landed. A single volume keeps the beat's clear.
+        self.readmit.hold_clear = self.peerKeyOutstanding() or self.peers.len > 1;
         const f = self.fence orelse return;
         if (!self.park_gate.isParked()) return;
         if (self.be.pool.writesOutstanding() != 0) return;
@@ -1384,8 +1422,14 @@ pub const JoinedSet = struct {
                         self.mgr_writer = p0.writer_id;
                         self.mgr_term = p0.term;
                     }
-                    if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
+                    // The log lands before the flag drops, so a peer that
+                    // clears on seeing the flag already has this line.
                     log.warn("meta volume {s}: re-registered this host under key {x:0>16} after a succession", .{ self.be.path, f.client.key });
+                    self.succession_key_outstanding.store(false, .release);
+                    if (!self.peerKeyOutstanding() and self.park_gate.reason == .succession) {
+                        _ = self.park_gate.release(0, 0);
+                        _ = self.resolution.clear();
+                    }
                 }
             },
         }

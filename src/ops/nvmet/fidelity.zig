@@ -4205,6 +4205,87 @@ test "nvmet fidelity: pr5 F5 — a lapse inside the succession window (decision 
     try expectNoResidue(rig, set.data_nqn);
 }
 
+test "nvmet fidelity: pr5 F6 — two metadata volumes (decision 0004 §8.2) — tcp, twoMetaSet: M (host B) manages both, J (host C) joins both and spreads directories over them; M is SIGSTOPped past the claim TTL; S (host A) preempts-all on both namespaces (writer_guard_preempt_alls 2, victims >= 4); J re-registers once on each volume; a write issued into the window lands, and only once both succession lines are in J's log" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const set = try twoMetaSet(rig, "f6", data_fence_volume);
+    var cm_b: [2]Connected = undefined;
+    var ub: [160]u8 = undefined;
+    const meta_uri_b = try set.connectHost(rig, ident_b, &cm_b, &ub);
+    var cm_c: [2]Connected = undefined;
+    var uc: [160]u8 = undefined;
+    const meta_uri_c = try set.connectHost(rig, ident_c, &cm_c, &uc);
+    // The format connect is already host A. A second connect is EALREADY.
+    const m = try rig.spawnMount("f6-m", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const j = try rig.spawnMount("f6-j", meta_uri_c, ident_c, &.{});
+    try rig.awaitLog(j, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, j, "for d in d0 d1 d2 d3; do mkdir $d && echo j > $d/j; done && sync -f ."));
+    {
+        const sj = try rig.stats(j);
+        defer gpa.free(sj);
+        try testing.expect(try statNumber(sj, "routing_dir_place_remote") >= 1);
+    }
+    _ = linux.kill(rig.daemons.items[m].pid, .STOP);
+    sleepMs(lease_clock.T_OWNER_MS + 5_000);
+    const s = try rig.spawnMount("f6-s", set.metaUri(), null, &.{});
+    const ss = try rig.awaitStat(s, "writer_guard_preempt_alls", 2, g2_wait_ns);
+    defer gpa.free(ss);
+    try testing.expect(try statNumber(ss, "writer_guard_preempt_all_victims") >= 4);
+    // The write is the held window. It returns only after both volumes
+    // have re-registered (C2: live on every joined volume).
+    if (!try scriptSucceeds(rig, j, "echo x > d0/z && sync -d d0/z && cat d0/j")) {
+        printLogTailFile(rig, rig.daemons.items[j].log_path, 40);
+        printLogTailFile(rig, rig.daemons.items[s].log_path, 30);
+        return error.HeldWrite;
+    }
+    const jlog = try rig.readLog(j);
+    defer gpa.free(jlog);
+    const lines = std.mem.count(u8, jlog, "after a succession");
+    var paths: [2][]const u8 = .{ "", "" };
+    var npaths: usize = 0;
+    var rest = jlog;
+    while (std.mem.indexOf(u8, rest, "after a succession")) |at| {
+        const line = rest[0..at];
+        const mark = std.mem.lastIndexOf(u8, line, "meta volume ") orelse break;
+        const tail = line[mark + "meta volume ".len ..];
+        const path = tail[0 .. std.mem.indexOfAny(u8, tail, ": ") orelse tail.len];
+        if (npaths < paths.len) {
+            paths[npaths] = path;
+            npaths += 1;
+        }
+        rest = rest[at + "after a succession".len ..];
+    }
+    std.debug.print("\n--- F6: preempt_alls {d}, victims {d}, succession lines {d}, paths {d} ---\n", .{
+        try statNumber(ss, "writer_guard_preempt_alls"),
+        try statNumber(ss, "writer_guard_preempt_all_victims"),
+        lines,
+        npaths,
+    });
+    try testing.expectEqual(@as(usize, 2), lines);
+    try testing.expectEqual(@as(usize, 2), npaths);
+    try testing.expect(!std.mem.eql(u8, paths[0], paths[1]));
+    const sj = try rig.stats(j);
+    defer gpa.free(sj);
+    try testing.expectEqual(@as(u64, 0), try statNumber(sj, "writer_guard_fenced"));
+    try rig.kill9(m);
+    try rig.umount(j);
+    try rig.umount(s);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    for (0..2) |v| {
+        try rig.disconnect(&cm_b[v]);
+        try rig.disconnect(&cm_c[v]);
+        try rig.disconnect(&set.cm[v]);
+    }
+    try rig.unshare(set.data_nqn);
+    for (set.meta_nqn) |nqn| try rig.unshare(nqn);
+    try expectNoResidue(rig, set.data_nqn);
+    for (set.meta_nqn) |nqn| try expectNoResidue(rig, nqn);
+}
+
 test "nvmet fidelity: F10 — a busy co-located joiner of the superseded manager survives the takeover (decision 0004 §8.2, G-c, round-4 issue 1) — M (host A) manages, JA (host A, supervised, the write cache) keeps writing and fsyncing one 64 KiB block across the takeover; M is SIGSTOPped past the claim TTL and S (host B) mounts: S's admission pays the fence debt and fences host A on data while JA is mid-flight (data_pr_debt_preempts >= 1) — a refused data write is re-admitted (held while metadata is pending, or one synchronous retry once metadata has settled; data_dma_fence_refusals 0, no data fence latch), JA kills M at its metadata re-registration (pr_stale_sibling_kills ≥ 1), data re-registers (data_pr_succession_reregistrations ≥ 1), a later fsync lands, every fsynced block is whole on JA and on S, and fsck --offline --scrub is clean (red on dev: JA's data device latches, its fsyncs answer EIO)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);

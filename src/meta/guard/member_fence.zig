@@ -165,6 +165,10 @@ pub const Readmit = struct {
     /// A metadata `cleared` kicks the data-fence beat (decision 0004 §4.5.5).
     on_cleared: ?*const fn (ctx: ?*anyopaque) void = null,
     on_cleared_ctx: ?*anyopaque = null,
+    /// When set, a beat that would `clear` leaves the word pending. The
+    /// joined set sets it while another volume's host key is still
+    /// outstanding (decision 0004 §8.2 F6, model W26).
+    hold_clear: bool = false,
     /// Re-registration beats whose `clear` CAS failed because `word` was
     /// already `terminal` (`meta_pr_late_cleared_refused`, §4.5.3).
     late_cleared_refused: u64 = 0,
@@ -245,7 +249,7 @@ pub const Readmit = struct {
         if (self.word) |w| {
             if (fence) w.terminate();
             if (park) _ = w.reopen();
-            if (verdict == .retry and report.readable and report.host_registered and facts.own_page_live) {
+            if (verdict == .retry and report.readable and report.host_registered and facts.own_page_live and !self.hold_clear) {
                 if (w.clear()) {
                     if (self.on_cleared) |f| f(self.on_cleared_ctx);
                 } else {

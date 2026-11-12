@@ -217,6 +217,19 @@ pub const Identity = struct {
         return !std.mem.allEqual(u8, &self.boot_id, 0);
     }
 
+    /// The NODE's token: `hash64(boot_id ‖ hostname)`. Every page, claim and
+    /// host registry entry of this host carries it, because the host's name is
+    /// part of what the stale-sibling rule judges pages by: `hostnamectl
+    /// set-hostname` changes it under the daemons that were already running
+    /// (decision 0004 §4.4.2, KD19). `sym/join.zig`'s `nodeToken` is this.
+    pub fn nodeToken(self: Identity) u64 {
+        var h: checksum.Hasher = .init();
+        h.update(&self.boot_id);
+        h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, self.hostname_hash)));
+        const k = h.finalLow64();
+        return if (k == 0) 1 else k; // 0 is the registry's "no token at all" (§4.4.2)
+    }
+
     /// `writer_id` for mount slot `slot` (the volume's lane index — the
     /// per-daemon coordinate two concurrent volumes of one set differ by).
     pub fn writerId(self: Identity, slot: u16) u64 {

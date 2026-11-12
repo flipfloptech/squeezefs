@@ -94,9 +94,31 @@ pub const Stats = struct {
     /// `pr_siblings_proven_dead`: registry entries the writer-id proof
     /// found dead.
     pr_siblings_proven_dead: counters.ShardedCounter = .{},
-    /// `pr_stale_sibling_refusals`: registrations refused because a stale
-    /// sibling could be neither proven dead nor killed.
+    /// `pr_stale_sibling_refusals`: registrations refused by the host's rule —
+    /// a stale sibling that could be neither proven dead nor killed, or one it
+    /// could not judge at all (a foreign registry root, another node token:
+    /// decision 0004 §4.4.2, KD19). Every refusal below counts here too.
     pr_stale_sibling_refusals: counters.ShardedCounter = .{},
+    /// `pr_stale_sibling_refusals_registry_root`: the daemon's host registry
+    /// root is not the host's (its own `/run`), or pid 1's view has no such
+    /// path: its siblings are invisible to it and it to them (KD19).
+    pr_stale_sibling_refusals_registry_root: counters.ShardedCounter = .{},
+    /// `pr_stale_sibling_refusals_registry_root_unreadable`: the comparison
+    /// itself failed (`/proc/1/root` under `hidepid`, an LSM, any other
+    /// errno). "Cannot compare" is never a pass (KD19).
+    pr_stale_sibling_refusals_registry_root_unreadable: counters.ShardedCounter = .{},
+    /// `pr_stale_sibling_refusals_node_token_hostname`: a live sibling under
+    /// another node token in ANOTHER UTS namespace — two hostnames for one set
+    /// on one host (KD19).
+    pr_stale_sibling_refusals_node_token_hostname: counters.ShardedCounter = .{},
+    /// `pr_stale_sibling_refusals_node_token_renamed`: a live sibling under
+    /// another node token in THIS UTS namespace — the host's name changed while
+    /// it runs, so it keeps the previous name's token (KD19).
+    pr_stale_sibling_refusals_node_token_renamed: counters.ShardedCounter = .{},
+    /// `pr_stale_sibling_refusals_node_token_missing`: a live sibling's entry
+    /// carries no node token at all (an older binary). Never judged under this
+    /// process's token (KD19).
+    pr_stale_sibling_refusals_node_token_missing: counters.ShardedCounter = .{},
     /// `writer_guard_claim_probes`: private claim replays (`gate.probeClaim`:
     /// two per writer open on an NVMe namespace, up to three per lapse).
     claim_probes: counters.ShardedCounter = .{},
@@ -168,9 +190,14 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.succession_early_settles.load(),
         stats.succession_evictions.load(),
     });
-    try w.print(",\"writer_guard_identity_failures\":{d},\"writer_guard_identity_unreadable_beats\":{d},\"writer_guard_heartbeat_interval_s\":{d},\"writer_guard_stale_ttl_s\":{d}}}", .{
+    try w.print(",\"writer_guard_identity_failures\":{d},\"writer_guard_identity_unreadable_beats\":{d},\"pr_stale_sibling_refusals_registry_root\":{d},\"pr_stale_sibling_refusals_registry_root_unreadable\":{d},\"pr_stale_sibling_refusals_node_token_hostname\":{d},\"pr_stale_sibling_refusals_node_token_renamed\":{d},\"pr_stale_sibling_refusals_node_token_missing\":{d},\"writer_guard_heartbeat_interval_s\":{d},\"writer_guard_stale_ttl_s\":{d}}}", .{
         stats.identity_failures.load(),
         stats.identity_unreadable_beats.load(),
+        stats.pr_stale_sibling_refusals_registry_root.load(),
+        stats.pr_stale_sibling_refusals_registry_root_unreadable.load(),
+        stats.pr_stale_sibling_refusals_node_token_hostname.load(),
+        stats.pr_stale_sibling_refusals_node_token_renamed.load(),
+        stats.pr_stale_sibling_refusals_node_token_missing.load(),
         claim.HEARTBEAT_INTERVAL_S,
         claim.STALE_TTL_S,
     });
@@ -203,7 +230,7 @@ test "the stats JSON names every writer_guard_* family and the two constants" {
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
-    inline for (.{ "writer_guard_claim_probes", "writer_guard_claim_probe_bytes", "writer_guard_claim_probe_frames", "writer_guard_lapse_beats", "writer_guard_lapse_early_ends", "writer_guard_succession_settles", "writer_guard_succession_early_settles", "writer_guard_succession_evictions", "writer_guard_identity_failures", "writer_guard_identity_unreadable_beats", "writer_guard_fenced", "volume_fenced", "writer_guard_pr_reacquires", "writer_guard_claims_committed", "writer_guard_heartbeats", "writer_guard_reclaims_dead_pid", "writer_guard_preempts", "writer_guard_preempt_alls", "writer_guard_preempt_all_victims", "writer_guard_preempt_all_unseen_events", "writer_guard_pr_unavailable", "clients_registered", "writer_guard_identity_mismatch", "pr_host_registrations", "pr_host_adoptions", "pr_stale_sibling_kills", "pr_siblings_proven_dead", "pr_stale_sibling_refusals" }) |k| {
+    inline for (.{ "writer_guard_claim_probes", "writer_guard_claim_probe_bytes", "writer_guard_claim_probe_frames", "writer_guard_lapse_beats", "writer_guard_lapse_early_ends", "writer_guard_succession_settles", "writer_guard_succession_early_settles", "writer_guard_succession_evictions", "writer_guard_identity_failures", "writer_guard_identity_unreadable_beats", "writer_guard_fenced", "volume_fenced", "writer_guard_pr_reacquires", "writer_guard_claims_committed", "writer_guard_heartbeats", "writer_guard_reclaims_dead_pid", "writer_guard_preempts", "writer_guard_preempt_alls", "writer_guard_preempt_all_victims", "writer_guard_preempt_all_unseen_events", "writer_guard_pr_unavailable", "clients_registered", "writer_guard_identity_mismatch", "pr_host_registrations", "pr_host_adoptions", "pr_stale_sibling_kills", "pr_siblings_proven_dead", "pr_stale_sibling_refusals", "pr_stale_sibling_refusals_registry_root", "pr_stale_sibling_refusals_registry_root_unreadable", "pr_stale_sibling_refusals_node_token_hostname", "pr_stale_sibling_refusals_node_token_renamed", "pr_stale_sibling_refusals_node_token_missing" }) |k| {
         try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"" ++ k ++ "\":") != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"writer_guard_stale_ttl_s\":45") != null);

@@ -45,12 +45,11 @@ pub const stats = struct {
 /// daemons on one box: the manager's node token at `0x5000 + n`).
 pub const HARNESS_MOUNT_SLOT_BASE: u32 = 0x5000;
 
-/// ONE token per host.
+/// ONE token per host (the derivation lives on `claim.Identity`, so the host
+/// registry entry and the appender page cannot drift apart: decision 0004
+/// §4.4.2 refuses a sibling whose token this process cannot judge).
 pub fn nodeToken(id: claim.Identity) u64 {
-    var h: checksum.Hasher = .init();
-    h.update(&id.boot_id);
-    h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, id.hostname_hash)));
-    return h.finalLow64();
+    return id.nodeToken();
 }
 
 /// The appender identity a mount presents at `mount_slot`.

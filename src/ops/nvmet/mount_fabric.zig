@@ -328,7 +328,7 @@ pub const Plan = struct {
         defer b.users.unlock();
         {
             const me = proc.localIdentity();
-            b.users.append(me.pid, me.start_ticks, "u\n") catch {
+            b.users.append(me.pid, me.start_ticks, me.nodeToken(), "u\n") catch {
                 diag.* = .{ .users = .{ .vol_tag = d.vol_tag, .dir = b.users.dir() } };
                 return error.Refused;
             };

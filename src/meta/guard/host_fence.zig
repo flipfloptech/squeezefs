@@ -185,6 +185,10 @@ pub const MAX_REGIONS = 16; // one region per metadata volume a process writes: 
 pub const Entry = struct {
     pid: u32,
     start_ticks: u64,
+    /// The writer's node token (decision 0004 §4.4.2, KD19): what the entry's
+    /// process judges pages by. 0 = the entry carries none, which is
+    /// unjudgeable, not a token.
+    node_token: u64 = 0,
     regions: [MAX_REGIONS]Region = undefined,
     n_regions: usize = 0,
     retired: [MAX_REGIONS]Retired = undefined,
@@ -214,15 +218,19 @@ pub const Entry = struct {
         return false;
     }
 
-    /// The entry's text: the start ticks, then `m|p|j|l <slot> <writer id>`
-    /// per region — a joined `j`/`l` line adds `<appender id> <term>
-    /// <volume>` —, `r <writer id> <appender id> <term>` per retired
+    /// The entry's text: the header line — this process's start ticks and its
+    /// node token, hex (an entry of an older binary has no token word, which
+    /// is `.unjudgeable`, never a token of 0) — then `m|p|j|l <slot>
+    /// <writer id>` per region — a joined `j`/`l` line adds `<appender id>
+    /// <term> <volume>` —, `r <writer id> <appender id> <term>` per retired
     /// incarnation (an `r` line short of a word retires nothing; a region
     /// line short of its page's words names no page).
     pub fn parse(pid: u32, text: []const u8) ?Entry {
         var lines = std.mem.tokenizeScalar(u8, text, '\n');
         const first = lines.next() orelse return null;
-        var e: Entry = .{ .pid = pid, .start_ticks = std.fmt.parseInt(u64, std.mem.trim(u8, first, " "), 10) catch return null }; // proc(5)'s start ticks, decimal
+        var hf = std.mem.tokenizeScalar(u8, first, ' ');
+        var e: Entry = .{ .pid = pid, .start_ticks = std.fmt.parseInt(u64, hf.next() orelse return null, 10) catch return null }; // proc(5)'s start ticks, decimal
+        e.node_token = std.fmt.parseInt(u64, hf.next() orelse "", 16) catch 0; // the node token, hex as `append` writes it
         while (lines.next()) |line| {
             var f = std.mem.tokenizeScalar(u8, line, ' ');
             const tag = f.next() orelse continue;
@@ -466,8 +474,10 @@ pub const Registry = struct {
 
     /// Append `line` to this process's entry. The entry's start ticks are
     /// this process's: a file a crashed predecessor under a reused pid left
-    /// is replaced, never extended (review major 10).
-    pub fn append(self: *const Registry, pid: u32, start_ticks: u64, line: []const u8) RegistryError!void {
+    /// is replaced, never extended (review major 10). The header carries this
+    /// process's node token, so a sibling can tell whether it can judge this
+    /// entry at all (decision 0004 §4.4.2, KD19).
+    pub fn append(self: *const Registry, pid: u32, start_ticks: u64, node_token: u64, line: []const u8) RegistryError!void {
         if (builtin.is_test and self.test_fail_append) return error.RegistryUnavailable;
         try self.mkdirs();
         var rb: [4096]u8 = undefined;
@@ -475,7 +485,7 @@ pub const Registry = struct {
         var w: Io.Writer = .fixed(&out);
         const old = self.readEntry(pid, &rb);
         const ours = if (old) |t| if (Entry.parse(pid, t)) |e| e.start_ticks == start_ticks else false else false;
-        if (ours) w.writeAll(old.?) catch return error.RegistryUnavailable else w.print("{d}\n", .{start_ticks}) catch return error.RegistryUnavailable;
+        if (ours) w.writeAll(old.?) catch return error.RegistryUnavailable else w.print("{d} {x:0>16}\n", .{ start_ticks, node_token }) catch return error.RegistryUnavailable;
         w.writeAll(line) catch return error.RegistryUnavailable;
         try self.writeEntry(pid, w.buffered());
     }
@@ -484,7 +494,7 @@ pub const Registry = struct {
     /// mark already on the line. The caller holds the registration lock.
     /// `at_ns` is `CLOCK_BOOTTIME` of the acquire; `generation` is the
     /// reservation generation it answered.
-    pub fn noteReacquire(self: *const Registry, pid: u32, start_ticks: u64, at_ns: u64, generation: u32) RegistryError!void {
+    pub fn noteReacquire(self: *const Registry, pid: u32, start_ticks: u64, node_token: u64, at_ns: u64, generation: u32) RegistryError!void {
         var rb: [4096]u8 = undefined;
         var out: [4096]u8 = undefined;
         var w: Io.Writer = .fixed(&out);
@@ -498,7 +508,7 @@ pub const Registry = struct {
                 if (std.mem.startsWith(u8, line, "a ")) continue;
                 w.print("{s}\n", .{line}) catch return error.RegistryUnavailable;
             }
-        } else w.print("{d}\n", .{start_ticks}) catch return error.RegistryUnavailable;
+        } else w.print("{d} {x:0>16}\n", .{ start_ticks, node_token }) catch return error.RegistryUnavailable;
         w.print("a {d} {d}\n", .{ at_ns, generation }) catch return error.RegistryUnavailable;
         try self.writeEntry(pid, w.buffered());
     }
@@ -686,6 +696,10 @@ pub const Verdict = enum {
     /// A recoverer took one of its regions (or the manager role passed):
     /// it must be dead before the host is admitted.
     stale,
+    /// Its entry's node token is not this process's, or it has none: every
+    /// judgement here reads pages by node token, so this entry cannot be
+    /// judged either way. A refusal, never a kill (decision 0004 §4.4.2).
+    unjudgeable,
 };
 
 /// What the report says while the rule runs (this host unregistered).
@@ -703,6 +717,10 @@ pub const Facts = struct {
 /// mount is winning the D0 role on this volume: appender 0's page names a
 /// superseded holder.
 pub fn judge(e: *const Entry, pages: []const page.Page, node_token: u64, vol_index: u32, taking_manager: bool, facts: Facts) Verdict {
+    // Blind before anything else: every judgement below matches a page's node
+    // token, so an entry under another token (or under none) has no verdict
+    // (decision 0004 §4.4.2, KD19).
+    if (e.node_token == 0 or e.node_token != node_token) return .unjudgeable;
     var verdict: Verdict = .joining;
     for (e.regionSlice()) |r| {
         const v = judgeRegion(e, r, pages, node_token, vol_index, taking_manager, facts) orelse continue;
@@ -713,6 +731,9 @@ pub fn judge(e: *const Entry, pages: []const page.Page, node_token: u64, vol_ind
                 verdict = .retired;
             },
             .joining => {},
+            // A region of an entry whose token already matched is never
+            // unjudgeable: that is the entry's own verdict, above.
+            .unjudgeable => unreachable,
         }
     }
     return verdict;
@@ -765,6 +786,111 @@ fn judgeRegion(e: *const Entry, r: Region, pages: []const page.Page, node_token:
 // ---------------------------------------------------------------------------
 // The rule.
 // ---------------------------------------------------------------------------
+
+/// Why a PR-capable mount was refused because the host's rule could not see
+/// what it had to judge (decision 0004 §4.4.2, KD19). Every refusal names its
+/// reason, counts it by name, and names the remedy.
+pub const RefuseReason = enum {
+    /// This daemon's host registry root is not the host's (its own `/run`,
+    /// typically a container's), or pid 1's view has no such path.
+    registry_root,
+    /// The comparison itself failed: `/proc/1/root` under `hidepid` or an LSM,
+    /// or any other errno. "Cannot compare" is never a pass.
+    registry_root_unreadable,
+    /// A live sibling under another node token in ANOTHER UTS namespace: two
+    /// hostnames for one set on one host.
+    node_token_hostname,
+    /// A live sibling under another node token in THIS UTS namespace: the host's
+    /// name changed while that sibling runs.
+    node_token_renamed,
+    /// A live sibling's entry carries no node token (an older binary).
+    node_token_missing,
+
+    /// The reason's name, as the log line and the counter carry it (KD19).
+    pub fn text(self: RefuseReason) []const u8 {
+        return switch (self) {
+            .registry_root => "registry_root",
+            .registry_root_unreadable => "registry_root_unreadable",
+            .node_token_hostname => "node_token_hostname",
+            .node_token_renamed => "node_token_renamed",
+            .node_token_missing => "node_token_missing",
+        };
+    }
+
+    /// This reason's counter. `pr_stale_sibling_refusals` counts every
+    /// refusal, named or not (decision 0004 §9's counter row).
+    pub fn count(self: RefuseReason) void {
+        switch (self) {
+            .registry_root => guard.stats.pr_stale_sibling_refusals_registry_root.inc(),
+            .registry_root_unreadable => guard.stats.pr_stale_sibling_refusals_registry_root_unreadable.inc(),
+            .node_token_hostname => guard.stats.pr_stale_sibling_refusals_node_token_hostname.inc(),
+            .node_token_renamed => guard.stats.pr_stale_sibling_refusals_node_token_renamed.inc(),
+            .node_token_missing => guard.stats.pr_stale_sibling_refusals_node_token_missing.inc(),
+        }
+    }
+};
+
+/// One blind-rule refusal: counted on the total and on its reason, logged by
+/// name with its remedy (`why` says what was met). KD19's rows assert on the
+/// reason name in this line.
+fn refuseBlind(label: []const u8, path: []const u8, reason: RefuseReason, why: []const u8) void {
+    guard.stats.pr_stale_sibling_refusals.inc();
+    reason.count();
+    log.err("{s} {s}: REFUSING the PR-capable mount: {s} (reason {s})", .{ label, path, why, reason.text() });
+}
+
+/// The reason a live sibling's node token cannot be judged, told apart by the
+/// sibling's UTS namespace (decision 0004 §4.4.2): another namespace means
+/// another hostname for this set on this host; this namespace means the host's
+/// name changed while the sibling runs. A sibling whose namespace cannot be
+/// read is reported under `node_token_hostname`, noting that.
+fn tokenRefusalReason(e: *const Entry) RefuseReason {
+    if (e.node_token == 0) return .node_token_missing;
+    const mine = proc.utsNamespaceIno(0) orelse return .node_token_hostname;
+    const theirs = proc.utsNamespaceIno(e.pid) orelse return .node_token_hostname;
+    return if (theirs == mine) .node_token_renamed else .node_token_hostname;
+}
+
+/// The refusal's sentence, with the remedy KD19 names (the log line is the
+/// operator's only instruction, so it says what to do).
+fn tokenRefusalText(e: *const Entry, reason: RefuseReason, buf: []u8) []const u8 {
+    const ns_unreadable = e.node_token != 0 and (proc.utsNamespaceIno(0) == null or proc.utsNamespaceIno(e.pid) == null);
+    return switch (reason) {
+        .node_token_hostname => std.fmt.bufPrint(buf, "a live sibling of the set (pid {d}) runs under another hostname (node token {x:0>16}{s}); it cannot be judged; refusing to register — one hostname per host for one set", .{ e.pid, e.node_token, if (ns_unreadable) ", its UTS namespace unreadable" else "" }) catch "a live sibling of the set runs under another hostname; it cannot be judged; refusing to register",
+        .node_token_renamed => std.fmt.bufPrint(buf, "a live sibling of the set (pid {d}) runs under the host's previous name (node token {x:0>16}); the host's name changed while siblings run: restart them (or restore the name) before mounting again", .{ e.pid, e.node_token }) catch "a live sibling of the set runs under the host's previous name; restart it or restore the name",
+        .node_token_missing => std.fmt.bufPrint(buf, "a live sibling's registry entry (pid {d}) carries no node token (an older binary); refusing to register — restart it on this binary", .{e.pid}) catch "a live sibling's registry entry carries no node token; refusing to register",
+        .registry_root, .registry_root_unreadable => unreachable, // the root check writes its own line
+    };
+}
+
+/// One unjudgeable live sibling, refused by name. `judge` reaches it too (the
+/// re-judge, the beat); this is the entry-only path an admission runs.
+fn refuseUnjudgeableEntry(ctx: RuleContext, e: *const Entry) error{SiblingUnjudgeable} {
+    const reason = tokenRefusalReason(e);
+    var wb: [400]u8 = undefined;
+    refuseBlind(ctx.label, ctx.path, reason, tokenRefusalText(e, reason, &wb));
+    return error.SiblingUnjudgeable;
+}
+
+/// Every live sibling's entry must be judgeable by this process's node token
+/// (decision 0004 §4.4.2, KD19): an entry under another token, or under none,
+/// makes the mount refuse rather than register beside a sibling its page
+/// judgements cannot see.
+///
+/// It runs at EVERY admission, an adoption included, not only when the rule
+/// reaches its kills: a mount that adopts a registration a foreign-token
+/// sibling wrote is just as blind as one that writes its own, and row F16
+/// measures the second mount refusing while the first lives. The caller holds
+/// the registry's flock.
+pub fn refuseUnjudgeableSiblings(ctx: RuleContext, reg: *const Registry) RuleError!void {
+    const es = try reg.entries(ctx.gpa);
+    defer ctx.gpa.free(es);
+    for (es) |*e| {
+        if (e.pid == ctx.local.pid) continue;
+        if (e.node_token == ctx.node_token) continue;
+        return refuseUnjudgeableEntry(ctx, e);
+    }
+}
 
 pub const RuleContext = struct {
     /// The report's word for the judgement (set by `registerUnderRule`).
@@ -835,7 +961,7 @@ pub const FrozenJoiner = struct {
 /// registration is refused.
 pub const DRAIN_WAIT_MS: u64 = 10_000;
 
-pub const RuleError = RegistryError || Allocator.Error || error{SiblingLive};
+pub const RuleError = RegistryError || Allocator.Error || error{ SiblingLive, SiblingUnjudgeable };
 
 /// Under the registry's lock: every live sibling judged against `pages`; a
 /// stale one proven dead or killed. Returns how many it killed.
@@ -847,6 +973,7 @@ pub fn clearStaleSiblings(ctx: RuleContext, reg: *const Registry, pages: []const
     for (es) |*e| {
         if (e.pid == ctx.local.pid) continue;
         const v = judge(e, pages, ctx.node_token, ctx.vol_index, ctx.taking_manager, ctx.facts);
+        if (v == .unjudgeable) return refuseUnjudgeableEntry(ctx, e);
         if (v != .stale) {
             log.info("{s} {s}: sibling pid {d} of this set on this host is {s} — spared by the host's registration (its region is its own)", .{ ctx.label, ctx.path, e.pid, @tagName(v) });
             continue;
@@ -869,13 +996,16 @@ pub fn clearStaleSiblings(ctx: RuleContext, reg: *const Registry, pages: []const
     return killed;
 }
 
-/// Is any live sibling stale against `pages` (no kill)?
+/// Is any live sibling stale against `pages` (no kill)? An unjudgeable one
+/// refuses: the re-judge cannot clear a registration beside it either.
 fn anyStaleAlive(ctx: RuleContext, reg: *const Registry, pages: []const page.Page) RuleError!bool {
     const es = try reg.entries(ctx.gpa);
     defer ctx.gpa.free(es);
     for (es) |*e| {
         if (e.pid == ctx.local.pid) continue;
-        if (judge(e, pages, ctx.node_token, ctx.vol_index, ctx.taking_manager, ctx.facts) == .stale and proveIncarnationAlive(ctx, e)) return true;
+        const v = judge(e, pages, ctx.node_token, ctx.vol_index, ctx.taking_manager, ctx.facts);
+        if (v == .unjudgeable) return refuseUnjudgeableEntry(ctx, e);
+        if (v == .stale and proveIncarnationAlive(ctx, e)) return true;
     }
     return false;
 }
@@ -1116,6 +1246,9 @@ const REJUDGE_ROUNDS: u32 = 3; // a remote recovery's step 2 races at most once 
 /// fenced again) before it is killed and the register retried. True =
 /// registered afresh.
 pub fn registerUnderRule(ctx_in: RuleContext, reg: *const Registry, c: *pr.Client, pages: PageSource, register: Register) AdmitError!bool {
+    // Blindness is refused before anything else, an adoption included (an
+    // entry under another node token makes every page judgement here blind).
+    try refuseUnjudgeableSiblings(ctx_in, reg);
     // Every judgement reads the report afresh (the device's word on the
     // reservation, review round 3 major 1); one that fails judges nothing —
     // the registration is refused, no sibling killed on a guess.
@@ -1258,6 +1391,7 @@ pub const DataAdmitError = AdmitError || error{HostFenced};
 /// registration away before it is killed and the register retried. True =
 /// registered afresh.
 pub fn registerDataUnderRule(ctx_in: RuleContext, reg: *const Registry, meta: *pr.Client, data: *pr.Client, pages: PageSource, register: Register) DataAdmitError!bool {
+    try refuseUnjudgeableSiblings(ctx_in, reg);
     const first = reportFacts(data) catch return error.ReportUnreadable;
     if (first.registered) return false;
     var ctx = ctx_in;
@@ -1374,7 +1508,177 @@ pub fn departUnregisters(reg: *const Registry, gpa: Allocator, c: *pr.Client, pi
     return !rep.heldByHost(c.key, me);
 }
 
-/// What a writer's registration rides: its key (the host's, or the
+// ---------------------------------------------------------------------------
+// The host's registry root (decision 0004 §4.4.2, KD19).
+// ---------------------------------------------------------------------------
+
+/// A directory the comparison opened, or the errno that stopped it (`linux.E`
+/// is an enum, not an error set: every failure here is a verdict, never a
+/// propagated error).
+const FdOrErr = union(enum) { fd: linux.fd_t, err: linux.E };
+
+/// `path` as a NUL-terminated string for the syscall boundary (the registry
+/// paths are short; `pathOf` and `entryPath` already treat a longer one as a
+/// bug rather than a runtime case).
+fn zpath(buf: *[linux.PATH_MAX]u8, path: []const u8) [:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "{s}", .{path}, 0) catch unreachable;
+}
+
+/// `openat2`'s `open_how`, the three u64s the 5.6 syscall takes. A larger
+/// struct is a later kernel's; this size is the one every kernel since 5.6
+/// accepts.
+const OpenHow = extern struct {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+
+    comptime {
+        if (@sizeOf(OpenHow) != 24) @compileError("open_how is three u64s");
+    }
+};
+
+/// `linux/openat2.h`. `IN_ROOT` re-roots absolute symlinks and `..` inside the
+/// directory fd. `NO_MAGICLINKS` refuses a procfs magic link with `ELOOP`
+/// (decision 0004 §4.4.2, round-4 issue 2).
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_IN_ROOT: u64 = 0x10;
+
+/// The host's view of `path`: `openat2(root, path, RESOLVE_IN_ROOT |
+/// RESOLVE_NO_MAGICLINKS)`. A plain `openat` resolves an absolute symlink from
+/// THIS process's root, so a host whose `/run` is an absolute symlink would
+/// compare a private registry with itself. Measured on 7.3.1: a relative
+/// symlink and `..` open, an absolute symlink stays inside `root`, and a magic
+/// link (`/proc/self/root`) is `ELOOP`.
+fn openInRoot(root: linux.fd_t, path: []const u8) FdOrErr {
+    var buf: [linux.PATH_MAX]u8 = undefined;
+    const how = OpenHow{
+        .flags = @as(u32, @bitCast(linux.O{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true })),
+        .mode = 0,
+        .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS,
+    };
+    const rc = linux.syscall4(.openat2, @as(u32, @bitCast(root)), @intFromPtr(zpath(&buf, path).ptr), @intFromPtr(&how), @sizeOf(OpenHow));
+    const e = linux.errno(rc);
+    if (e != .SUCCESS) return .{ .err = e };
+    return .{ .fd = @intCast(rc) };
+}
+
+/// Does `SQUEEZEFS_TEST_HOST_REGISTRY_DIR` move the host registries off the run
+/// dir? Every process of such a rig shares the one directory it names, so the
+/// root comparison would judge the rig's scratch, not the host: exempt (§4.4.2).
+fn seamMovesRegistries(env: *const std.process.Environ.Map) bool {
+    const raw = knobs.parseStr(env.get("SQUEEZEFS_TEST_HOST_REGISTRY_DIR")) orelse return false;
+    return !std.mem.eql(u8, raw, "off");
+}
+
+/// The host's own root: `/proc/1/root`, or `SQUEEZEFS_TEST_PID1_ROOT` for the
+/// units that build a two-view tree under scratch — it changes WHICH root is
+/// compared, never whether the comparison runs.
+fn hostRootName(env: *const std.process.Environ.Map) []const u8 {
+    const raw = knobs.parseStr(env.get("SQUEEZEFS_TEST_PID1_ROOT")) orelse return "/proc/1/root";
+    // The registry's default spelling: compare against pid 1, not a directory named "off".
+    if (std.mem.eql(u8, raw, "off")) return "/proc/1/root";
+    return raw;
+}
+
+fn openHostRoot(host_root: []const u8, buf: *[linux.PATH_MAX]u8) FdOrErr {
+    const z = zpath(buf, host_root);
+    // `O_PATH|O_DIRECTORY` (§4.4.2): the fd is only the root `openat2` walks
+    // from. Resolving `/proc/1/root` is the ptrace-read `hidepid` or an LSM
+    // takes away (EACCES, EPERM), which is this open's refusal.
+    const rc = linux.open(z.ptr, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    const e = linux.errno(rc);
+    if (e != .SUCCESS) return .{ .err = e };
+    return .{ .fd = @intCast(rc) };
+}
+
+/// `(st_dev, st_ino)` of an open directory: what says two views are the same
+/// directory (a zram or an LV's `dev` is its major:minor, which is what the
+/// comparison needs).
+fn devIno(fd: linux.fd_t) ?struct { dev: u64, ino: u64 } {
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st)) != .SUCCESS) return null;
+    return .{ .dev = (@as(u64, st.dev_major) << 32) | st.dev_minor, .ino = st.ino };
+}
+
+/// KD19's mapping of a failed comparison, pinned by its own tie test: the
+/// pid-1 side's `ENOENT`, with pid 1's root itself readable, is a private
+/// `/run` the host never saw — the same shape as a mismatch, `registry_root`.
+/// Every other failure says the host's view could not be read and is
+/// `registry_root_unreadable`: `EACCES`/`EPERM` on `/proc/1/root` (procfs
+/// `hidepid`, an LSM), `ELOOP` from `RESOLVE_NO_MAGICLINKS`, `EXDEV`, `ENOSYS`,
+/// anything else.
+pub fn rootRefusal(step: enum { host_root, walk }, err: linux.E) RefuseReason {
+    if (step == .walk and err == .NOENT) return .registry_root;
+    return .registry_root_unreadable;
+}
+
+pub const RootVerdict = union(enum) {
+    /// The same directory: this daemon sees the siblings it must judge.
+    same,
+    /// Not the same, or not comparable: `reason` names the refusal, `errno`
+    /// says how the comparison failed (`SUCCESS` for a plain mismatch).
+    refused: struct { reason: RefuseReason, errno: linux.E },
+};
+
+/// This daemon's host registry root against the same path in the host's root
+/// (§4.4.2). Every failure to compare refuses: "cannot compare" is never a
+/// pass, because a rule that cannot see its siblings is the blindness KD19
+/// turns into a loud refusal.
+pub fn judgeRegistryRoot(env: *const std.process.Environ.Map, root: []const u8) RootVerdict {
+    return judgeRootPaths(hostRootName(env), root);
+}
+
+/// The comparison itself, with the host's root named: a forked unit runs it
+/// inside a namespace without touching an allocator.
+pub fn judgeRootPaths(host_root: []const u8, root: []const u8) RootVerdict {
+    var hbuf: [linux.PATH_MAX]u8 = undefined;
+    const host: linux.fd_t = switch (openHostRoot(host_root, &hbuf)) {
+        .fd => |f| f,
+        .err => |e| return .{ .refused = .{ .reason = rootRefusal(.host_root, e), .errno = e } },
+    };
+    defer _ = linux.close(host);
+    // The daemon's own view: a plain open of its absolute path, which resolves
+    // in its own root — that is the whole point of the comparison.
+    var obuf: [linux.PATH_MAX]u8 = undefined;
+    const own_rc = linux.open(zpath(&obuf, root).ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    const own_errno = linux.errno(own_rc);
+    if (own_errno != .SUCCESS) return .{ .refused = .{ .reason = rootRefusal(.walk, own_errno), .errno = own_errno } };
+    const own: linux.fd_t = @intCast(own_rc);
+    defer _ = linux.close(own);
+    const theirs: linux.fd_t = switch (openInRoot(host, if (root.len > 0 and root[0] == '/') root[1..] else root)) {
+        .fd => |f| f,
+        .err => |e| return .{ .refused = .{ .reason = rootRefusal(.walk, e), .errno = e } },
+    };
+    defer _ = linux.close(theirs);
+    const a = devIno(own) orelse return .{ .refused = .{ .reason = .registry_root_unreadable, .errno = .INVAL } };
+    const b = devIno(theirs) orelse return .{ .refused = .{ .reason = .registry_root_unreadable, .errno = .INVAL } };
+    if (a.dev == b.dev and a.ino == b.ino) return .same;
+    return .{ .refused = .{ .reason = .registry_root, .errno = .SUCCESS } };
+}
+
+/// §4.4.2's registry-root comparison, refused, counted and logged by name with
+/// its remedy. True = this daemon may run PR-capable mounts: its registry root
+/// IS the host's (a private mount namespace that keeps `/run` passes, because
+/// the registry is the same inode — which is why the check compares the root
+/// and not the mount-namespace inode), or the registry seam exempts it.
+pub fn hostRegistryRootAgrees(env: *const std.process.Environ.Map, root: []const u8, path: []const u8) bool {
+    if (seamMovesRegistries(env)) return true;
+    switch (judgeRegistryRoot(env, root)) {
+        .same => return true,
+        .refused => |r| {
+            var wb: [640]u8 = undefined;
+            const why: []const u8 = switch (r.reason) {
+                .registry_root => std.fmt.bufPrint(&wb, "this daemon's host registry root {s} is not the host's ({s} answers {s}): the stale-sibling rule could not see its siblings and they could not see it; refusing PR-capable mounts: run the daemon with the host's /run", .{ root, hostRootName(env), if (r.errno == .NOENT) "no such path" else "another directory" }) catch return false,
+                .registry_root_unreadable => std.fmt.bufPrint(&wb, "cannot read {s} (errno {d}) to compare the host registry root {s}; refusing PR-capable mounts: grant this daemon ptrace-read access to pid 1, or lift the hidepid/LSM restriction", .{ hostRootName(env), @backingInt(r.errno), root }) catch return false,
+                else => unreachable,
+            };
+            refuseBlind("host registry", path, r.reason, why);
+            return false;
+        },
+    }
+}
+
+/// What a PR-capable mount rides: its key (the host's, or the
 /// incarnation's under the seam) and the set's registry (null under the
 /// seam); `refused` = this daemon may not register here at all.
 pub const Plan = struct {
@@ -1399,7 +1703,19 @@ pub fn plan(env: *const std.process.Environ.Map, c: *pr.Client, set_uuid: [16]u8
         log.warn("meta volume {s}: the namespace answers no host identifier (FID 0x81) — the reservation key is this incarnation's and the stale-sibling rule cannot run", .{path});
         return .{ .key = incarnation_key, .reg = null };
     };
-    return .{ .key = hostKey(&wire, set_uuid), .reg = Registry.runtime(env, .set, setRegistryKey(&wire, set_uuid)) };
+    const reg = Registry.runtime(env, .set, setRegistryKey(&wire, set_uuid));
+    // The daemon creates its own registry root first, then compares it with the
+    // host's (§4.4.2). A root that is not the host's leaves the rule blind to
+    // every sibling on the host — a refusal, never a silent downgrade (KD19).
+    var mkdirs = reg;
+    mkdirs.mkdirs() catch {
+        log.err("meta volume {s}: the host's registry of this set ({s}) cannot be created — refusing the PR-capable mount", .{ path, reg.dir() });
+        return .{ .key = incarnation_key, .reg = null, .refused = true };
+    };
+    var root_buf: [linux.PATH_MAX]u8 = undefined;
+    const root = zpath(&root_buf, journal_tail.HeldDir.runtimeOf(.hosts).slice());
+    if (!hostRegistryRootAgrees(env, root, path)) return .{ .key = incarnation_key, .reg = null, .refused = true };
+    return .{ .key = hostKey(&wire, set_uuid), .reg = reg };
 }
 
 fn ladderRegisterFn(ctx: *anyopaque, c: *pr.Client) anyerror!void {
@@ -1506,7 +1822,7 @@ pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map,
         var path_word = path;
         fresh = registerUnderRule(ctx, &reg, c, pages, .{ .ctx = @ptrCast(&path_word), .run = &ladderRegisterFn }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.SiblingLive => return error.Busy,
+            error.SiblingLive, error.SiblingUnjudgeable => return error.Busy,
             error.RegisterFailed => {
                 log.err("meta volume {s}: this host's registration (key {x:0>16}) failed — refusing the mount", .{ path, c.key });
                 return error.Busy;
@@ -1517,7 +1833,7 @@ pub fn registerBeforeWrites(gpa: Allocator, env: *const std.process.Environ.Map,
             },
         };
         var lb: [64]u8 = undefined;
-        reg.append(local.pid, local.start_ticks, regionLine(&lb, .{ .role = .pending, .slot = vol_index, .writer_id = local.writerId(@intCast(vol_index)) })) catch {
+        reg.append(local.pid, local.start_ticks, node_token, regionLine(&lb, .{ .role = .pending, .slot = vol_index, .writer_id = local.writerId(@intCast(vol_index)) })) catch {
             log.err("meta volume {s}: this mount could not enter the host's registry of the set ({s}) — refusing the mount", .{ path, reg.dir() });
             if (fresh and departUnregisters(&reg, gpa, c, local.pid)) c.unregister(c.key) catch {};
             return error.Busy;
@@ -1795,7 +2111,7 @@ pub const Joiner = struct {
         // (no page) and kill it (decision 0004 §4.4.2). The rule skips this
         // process's own line.
         var lb: [64]u8 = undefined;
-        reg.append(ctx.local.pid, ctx.local.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = slot, .writer_id = writer_id })) catch {
+        reg.append(ctx.local.pid, ctx.local.start_ticks, ctx.node_token, regionLine(&lb, .{ .role = .joiner, .slot = slot, .writer_id = writer_id })) catch {
             log.err("meta volume {s}: this mount could not enter the host's registry of the set ({s}) — refusing the join", .{ ctx.path, reg.dir() });
             return error.HostAdmissionRefused;
         };
@@ -1803,7 +2119,7 @@ pub const Joiner = struct {
             reg.removeRegion(ctx.local.pid, "j", writer_id, .unjoined) catch {};
             switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.SiblingLive => return error.HostAdmissionRefused,
+                error.SiblingLive, error.SiblingUnjudgeable => return error.HostAdmissionRefused,
                 error.RegisterFailed => {
                     log.err("meta volume {s}: this host's registration (key {x:0>16}) failed — refusing the join", .{ ctx.path, c.key });
                     return error.HostAdmissionRefused;
@@ -1834,7 +2150,7 @@ pub const Joiner = struct {
         defer self.reg.unlock();
         var lb: [96]u8 = undefined;
         const me = proc.localIdentity();
-        self.reg.append(me.pid, me.start_ticks, retiredLine(&lb, .{ .writer_id = self.writer_id, .appender_id = appender_id, .term = term, .vol = self.vol })) catch {};
+        self.reg.append(me.pid, me.start_ticks, me.nodeToken(), retiredLine(&lb, .{ .writer_id = self.writer_id, .appender_id = appender_id, .term = term, .vol = self.vol })) catch {};
     }
 
     /// After its `JoinAppender`: the line names the page — its appender id
@@ -1849,7 +2165,7 @@ pub const Joiner = struct {
         defer self.reg.unlock();
         const me = proc.localIdentity();
         var lb: [96]u8 = undefined;
-        try self.reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = self.slot, .writer_id = self.writer_id, .joined = self.page }));
+        try self.reg.append(me.pid, me.start_ticks, me.nodeToken(), regionLine(&lb, .{ .role = .joiner, .slot = self.slot, .writer_id = self.writer_id, .joined = self.page }));
         try self.reg.removeRegion(me.pid, "j", self.writer_id, .unjoined);
     }
 
@@ -1867,7 +2183,7 @@ pub const Joiner = struct {
         defer self.reg.unlock();
         const me = proc.localIdentity();
         var lb: [96]u8 = undefined;
-        self.reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .leaving, .slot = self.slot, .writer_id = self.writer_id, .joined = self.page })) catch return;
+        self.reg.append(me.pid, me.start_ticks, me.nodeToken(), regionLine(&lb, .{ .role = .leaving, .slot = self.slot, .writer_id = self.writer_id, .joined = self.page })) catch return;
         self.reg.removeRegion(me.pid, "j", self.writer_id, self.own()) catch {};
     }
 
@@ -1968,7 +2284,7 @@ test "a joiner's claimed page key against the joined volume's report (decision 0
 
 test "the judgement: a Live page names a current sibling; a Recovering, Recovered or Free page under its writer id is stale unless its own retirement (writer id, appender id, term) covers it; no page yet is joining; the manager is current only on appender 0's Live page, stale once the role passed or while this mount takes it over; a manager of this host (pending or durable) is stale while a reservation stands that this host's key does not hold; another node's page never names a sibling" {
     const node: u64 = 0xA;
-    var e = Entry.parse(42, "77\nj 9 00000000000000b1\n").?;
+    var e = Entry.parse(42, "77 000000000000000a\nj 9 00000000000000b1\n").?;
     try testing.expectEqual(Verdict.joining, judge(&e, &.{}, node, 0, false, .{}));
     try testing.expectEqual(Verdict.current, judge(&e, &.{pg(3, .live, node, 0xb1)}, node, 0, false, .{}));
     try testing.expectEqual(Verdict.stale, judge(&e, &.{pg(3, .recovered, node, 0xb1)}, node, 0, false, .{}));
@@ -1978,24 +2294,24 @@ test "the judgement: a Live page names a current sibling; a Recovering, Recovere
     try testing.expectEqual(Verdict.current, judge(&e, &.{ pg(3, .recovered, node, 0xb1), pg(5, .live, node, 0xb1) }, node, 0, false, .{}));
     // Another node's page under the same writer id is not this sibling's.
     try testing.expectEqual(Verdict.joining, judge(&e, &.{pg(3, .recovered, 0xB, 0xb1)}, node, 0, false, .{}));
-    var r = Entry.parse(43, "78\nj 9 00000000000000b2\nr 00000000000000b2 4 0 0\n").?;
+    var r = Entry.parse(43, "78 000000000000000a\nj 9 00000000000000b2\nr 00000000000000b2 4 0 0\n").?;
     try testing.expectEqual(Verdict.retired, judge(&r, &.{pg(4, .recovered, node, 0xb2)}, node, 0, false, .{}));
     // An `r` line short of a word retires nothing.
-    var bare = Entry.parse(43, "78\nj 9 00000000000000b2\nr 00000000000000b2 4\n").?;
+    var bare = Entry.parse(43, "78 000000000000000a\nj 9 00000000000000b2\nr 00000000000000b2 4\n").?;
     try testing.expectEqual(Verdict.stale, judge(&bare, &.{pg(4, .recovered, node, 0xb2)}, node, 0, false, .{}));
     // A manager of this host — pending or durable — is stale once a
     // reservation stands that this host's key does not hold (superseded,
     // its appender-0 page possibly still Live: review round 3 N1/major 1);
     // with no reservation appender 0's Live page decides.
-    var p = Entry.parse(45, "80\np 0 00000000000000c9\n").?;
+    var p = Entry.parse(45, "80 000000000000000a\np 0 00000000000000c9\n").?;
     try testing.expectEqual(Verdict.stale, judge(&p, &.{pg(0, .live, node, 0xc9)}, node, 0, false, .{ .reserved = true }));
     try testing.expectEqual(Verdict.stale, judge(&p, &.{pg(0, .live, node, 0xd1)}, node, 0, false, .{}));
     try testing.expectEqual(Verdict.current, judge(&p, &.{pg(0, .live, node, 0xc9)}, node, 0, false, .{}));
     try testing.expectEqual(Verdict.joining, judge(&p, &.{pg(0, .live, node, 0xd1)}, node, 1, false, .{ .reserved = true }));
-    var mm = Entry.parse(47, "82\nm 0 00000000000000ca\n").?;
+    var mm = Entry.parse(47, "82 000000000000000a\nm 0 00000000000000ca\n").?;
     try testing.expectEqual(Verdict.stale, judge(&mm, &.{pg(0, .live, node, 0xca)}, node, 0, false, .{ .reserved = true }));
     try testing.expectEqual(Verdict.current, judge(&mm, &.{pg(0, .live, node, 0xca)}, node, 0, false, .{ .reserved = true, .holder_ours = true }));
-    var m = Entry.parse(44, "79\nm 0 00000000000000c1\nm 1 00000000000000c2\n").?;
+    var m = Entry.parse(44, "79 000000000000000a\nm 0 00000000000000c1\nm 1 00000000000000c2\n").?;
     try testing.expectEqual(Verdict.current, judge(&m, &.{pg(0, .live, node, 0xc1)}, node, 0, false, .{}));
     try testing.expectEqual(Verdict.stale, judge(&m, &.{pg(0, .live, node, 0xd1)}, node, 0, false, .{}));
     try testing.expectEqual(Verdict.stale, judge(&m, &.{pg(0, .live, node, 0xc1)}, node, 0, true, .{}));
@@ -2014,9 +2330,9 @@ test "re-acquire mark: the line records the acquire's boottime and generation, a
     defer reg.unlock();
     const me = proc.localIdentity();
     var lb: [64]u8 = undefined;
-    try reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .manager, .slot = 0, .writer_id = 0xabc }));
-    try reg.noteReacquire(me.pid, me.start_ticks, 1000, 4);
-    try reg.noteReacquire(me.pid, me.start_ticks, 2500, 9);
+    try reg.append(me.pid, me.start_ticks, 0xA, regionLine(&lb, .{ .role = .manager, .slot = 0, .writer_id = 0xabc }));
+    try reg.noteReacquire(me.pid, me.start_ticks, 0xA, 1000, 4);
+    try reg.noteReacquire(me.pid, me.start_ticks, 0xA, 2500, 9);
     var rb: [4096]u8 = undefined;
     const text = reg.readEntry(me.pid, &rb) orelse return error.Missing;
     const e = Entry.parse(me.pid, text) orelse return error.Parse;
@@ -2025,7 +2341,7 @@ test "re-acquire mark: the line records the acquire's boottime and generation, a
     try testing.expect(e.markedSince(2500));
     try testing.expect(e.markedSince(1000));
     try testing.expect(!e.markedSince(2501));
-    try testing.expect(!Entry.parse(1, "1\n").?.markedSince(1));
+    try testing.expect(!Entry.parse(1, "1 000000000000000a\n").?.markedSince(1));
     // The manager line survived the mark.
     try testing.expectEqual(@as(usize, 1), e.n_regions);
     try testing.expectEqual(Role.manager, e.regionSlice()[0].role);
@@ -2108,8 +2424,8 @@ test "frozen joiner: a stopped unadmitted joiner is killed, a stopped manager is
     try joiner.stop();
     try manager.stop();
     var lb: [64]u8 = undefined;
-    try reg.append(jid, jticks, regionLine(&lb, .{ .role = .joiner, .slot = 1, .writer_id = 0x11 }));
-    try reg.append(mid, mticks, regionLine(&lb, .{ .role = .manager, .slot = 0, .writer_id = 0x22 }));
+    try reg.append(jid, jticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 1, .writer_id = 0x11 }));
+    try reg.append(mid, mticks, 0xA, regionLine(&lb, .{ .role = .manager, .slot = 0, .writer_id = 0x22 }));
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
     const before = marker.stats.host_fence_frozen_joiner_kills.load();
@@ -2119,7 +2435,7 @@ test "frozen joiner: a stopped unadmitted joiner is killed, a stopped manager is
     try testing.expectEqual(before + 1, marker.stats.host_fence_frozen_joiner_kills.load());
     // A joined page is a row. The kill does not signal it.
     try reg.removeRegion(mid, "m", 0x22, .any);
-    try reg.append(mid, mticks, regionLine(&lb, .{ .role = .joiner, .slot = 1, .writer_id = 0x33, .joined = .{ .appender_id = 2, .term = 1, .vol = 0 } }));
+    try reg.append(mid, mticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 1, .writer_id = 0x33, .joined = .{ .appender_id = 2, .term = 1, .vol = 0 } }));
     try testing.expectEqual(KillWord.not_joiner, killFrozenJoiner(&env, &reg, .{ .pid = mid, .start_ticks = mticks }));
     try testing.expectEqual(proc.RuleState.frozen, proc.ruleState(mid));
 }
@@ -2159,8 +2475,8 @@ test "the registry's fabric users per namespace (review minor 2 of decision 0003
     reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
     defer reg.unlock();
     const me = proc.localIdentity();
-    try reg.append(me.pid, me.start_ticks, "f 1\n");
-    try reg.append(me.pid, me.start_ticks, "f 2\n");
+    try reg.append(me.pid, me.start_ticks, 0xA, "f 1\n");
+    try reg.append(me.pid, me.start_ticks, 0xA, "f 2\n");
     try testing.expect(try reg.removeLine(me.pid, "f 1\n"));
     {
         const es = try reg.entries(testing.allocator);
@@ -2176,7 +2492,7 @@ test "the registry's fabric users per namespace (review minor 2 of decision 0003
     // not, a dead one's never (the parent of this process stands in).
     const parent: u32 = @intCast(linux.getppid());
     const parent_ticks = proc.startTicksOf(parent) orelse return;
-    try reg.append(parent, parent_ticks, "f 2\n");
+    try reg.append(parent, parent_ticks, 0xA, "f 2\n");
     try testing.expectEqual(@as(usize, 1), try reg.othersWithLine(testing.allocator, me.pid, "f 2\n"));
     try testing.expectEqual(@as(usize, 0), try reg.othersWithLine(testing.allocator, me.pid, "f 1\n"));
     try testing.expectEqual(@as(usize, 0), try reg.othersWithLine(testing.allocator, parent, "f 2\n"));
@@ -2192,11 +2508,11 @@ test "the registry: entries append and parse; a dead process's entry is pruned b
     defer reg.unlock();
     const me = proc.localIdentity();
     var lb: [64]u8 = undefined;
-    try reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xb1 }));
-    try reg.append(me.pid, me.start_ticks, retiredLine(&lb, .{ .writer_id = 0xb1, .appender_id = 3, .term = 2, .vol = 0 }));
-    try reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .manager, .slot = 1, .writer_id = 0xc2 }));
+    try reg.append(me.pid, me.start_ticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xb1 }));
+    try reg.append(me.pid, me.start_ticks, 0xA, retiredLine(&lb, .{ .writer_id = 0xb1, .appender_id = 3, .term = 2, .vol = 0 }));
+    try reg.append(me.pid, me.start_ticks, 0xA, regionLine(&lb, .{ .role = .manager, .slot = 1, .writer_id = 0xc2 }));
     // A dead process (pid 1's start ticks never match 1).
-    try reg.append(1, 1, regionLine(&lb, .{ .role = .manager, .slot = 0, .writer_id = 0xc1 }));
+    try reg.append(1, 1, 0xA, regionLine(&lb, .{ .role = .manager, .slot = 0, .writer_id = 0xc1 }));
     const es = try reg.entries(testing.allocator);
     defer testing.allocator.free(es);
     try testing.expectEqual(@as(usize, 1), es.len);
@@ -2220,7 +2536,7 @@ test "the registry: entries append and parse; a dead process's entry is pruned b
     // A file a dead predecessor under this pid left (other start ticks) is
     // replaced at the next append, never extended.
     try reg.writeEntry(me.pid, "1\nj 9 00000000000000ee\n");
-    try reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xb5 }));
+    try reg.append(me.pid, me.start_ticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xb5 }));
     {
         const fresh = try reg.entries(testing.allocator);
         defer testing.allocator.free(fresh);
@@ -2237,13 +2553,13 @@ test "the registry: entries append and parse; a dead process's entry is pruned b
 
 test "B1 (review): a re-joined-in-place member's retired mark covers ONLY its retired incarnation's page — the successor incarnation (the same writer id) evicted later, its page Recovering, is STALE; while its page is Live it is current; the retired page alone is spared" {
     const node: u64 = 0xA;
-    var e = Entry.parse(42, "77\nj 9 00000000000000b1\nr 00000000000000b1 3 0 0\n").?;
+    var e = Entry.parse(42, "77 000000000000000a\nj 9 00000000000000b1\nr 00000000000000b1 3 0 0\n").?;
     try testing.expectEqual(Verdict.stale, judge(&e, &.{ pg(3, .recovered, node, 0xb1), pg(5, .recovering, node, 0xb1) }, node, 0, false, .{}));
     try testing.expectEqual(Verdict.current, judge(&e, &.{ pg(3, .recovered, node, 0xb1), pg(5, .live, node, 0xb1) }, node, 0, false, .{}));
     try testing.expectEqual(Verdict.retired, judge(&e, &.{pg(3, .recovered, node, 0xb1)}, node, 0, false, .{}));
     // Round 3 major 1: the appender id comes back (the lowest Free pair) under
     // a later term — the old retirement does not cover the new page.
-    var reused = Entry.parse(42, "77\nj 9 00000000000000b1\nr 00000000000000b1 5 4 0\nr 00000000000000b1 7 6 0\n").?;
+    var reused = Entry.parse(42, "77 000000000000000a\nj 9 00000000000000b1\nr 00000000000000b1 5 4 0\nr 00000000000000b1 7 6 0\n").?;
     try testing.expectEqual(Verdict.retired, judge(&reused, &.{ pgTerm(5, .recovered, node, 0xb1, 4), pgTerm(7, .recovered, node, 0xb1, 6) }, node, 0, false, .{}));
     try testing.expectEqual(Verdict.stale, judge(&reused, &.{ pgTerm(5, .recovering, node, 0xb1, 8), pgTerm(7, .recovered, node, 0xb1, 6) }, node, 0, false, .{}));
 }
@@ -2306,7 +2622,7 @@ test "B2 (review): the rule re-judges AFTER the register, under the lock — a s
     const ticks = proc.startTicksOf(sib_pid) orelse return @import("../../core/testkit.zig").skip(@src(), .no_device, "/proc does not show the spawned sibling's start ticks");
     const sib: claim.Identity = .{ .boot_id = local.boot_id, .pid = sib_pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
     var lb: [64]u8 = undefined;
-    try reg.append(sib_pid, ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = sib.writerId(9) }));
+    try reg.append(sib_pid, ticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = sib.writerId(9) }));
     // The device: another host holds WERO; this host was fenced (absent).
     var ns = fake.Namespace.init(gpa);
     defer ns.deinit();
@@ -2338,7 +2654,7 @@ test "B2 (review): the rule re-judges AFTER the register, under the lock — a s
 
 test "round 3 major 1: a live manager's entry once its role is durable (`p` at registration, `m` at enrolment, appender 0's page Live under it) is CURRENT when no reservation stands (a target restart without PTPL): a co-located rule run before its heartbeat re-acquires never kills it" {
     const node: u64 = 0xA;
-    var pm = Entry.parse(45, "80\np 0 00000000000000c9\nm 0 00000000000000c9\n").?;
+    var pm = Entry.parse(45, "80 000000000000000a\np 0 00000000000000c9\nm 0 00000000000000c9\n").?;
     try testing.expectEqual(Verdict.current, judge(&pm, &.{pg(0, .live, node, 0xc9)}, node, 0, false, .{}));
 }
 
@@ -2353,9 +2669,9 @@ test "review 4 blocker 1: a joined line round-trips its page (appender id, term,
     var lb: [96]u8 = undefined;
     // The predecessor joined at appender 4, term 6, retired; its successor
     // (the same writer id) not joined yet.
-    try reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xd2, .joined = .{ .appender_id = 4, .term = 6, .vol = 1 } }));
-    try reg.append(me.pid, me.start_ticks, retiredLine(&lb, .{ .writer_id = 0xd2, .appender_id = 4, .term = 6, .vol = 1 }));
-    try reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xd2 }));
+    try reg.append(me.pid, me.start_ticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xd2, .joined = .{ .appender_id = 4, .term = 6, .vol = 1 } }));
+    try reg.append(me.pid, me.start_ticks, 0xA, retiredLine(&lb, .{ .writer_id = 0xd2, .appender_id = 4, .term = 6, .vol = 1 }));
+    try reg.append(me.pid, me.start_ticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xd2 }));
     {
         const es = try reg.entries(testing.allocator);
         defer testing.allocator.free(es);
@@ -2365,7 +2681,7 @@ test "review 4 blocker 1: a joined line round-trips its page (appender id, term,
     }
     // The successor's join replaces its unjoined line only.
     reg.removeRegion(me.pid, "j", 0xd2, .unjoined) catch {};
-    try reg.append(me.pid, me.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xd2, .joined = .{ .appender_id = 7, .term = 8, .vol = 1 } }));
+    try reg.append(me.pid, me.start_ticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xd2, .joined = .{ .appender_id = 7, .term = 8, .vol = 1 } }));
     // The predecessor goes: its line and its `r` only.
     try reg.removeRegion(me.pid, "jlr", 0xd2, .{ .page = .{ .aid = 4, .vol = 1 } });
     const es = try reg.entries(testing.allocator);
@@ -2377,7 +2693,7 @@ test "review 4 blocker 1: a joined line round-trips its page (appender id, term,
 
 test "review 5 minor 1: a retirement covers its page on ITS volume only — a member's volumes share its writer id and often its appender id: volume 0's `r` never spares volume 1's evicted page" {
     const node: u64 = 0xA;
-    var e = Entry.parse(49, "84\nj 9 00000000000000d2 4 6 1\nr 00000000000000d2 4 6 0\n").?;
+    var e = Entry.parse(49, "84 000000000000000a\nj 9 00000000000000d2 4 6 1\nr 00000000000000d2 4 6 0\n").?;
     try testing.expectEqual(Verdict.stale, judge(&e, &.{pgTerm(4, .recovered, node, 0xd2, 6)}, node, 1, false, .{}));
 }
 
@@ -2389,8 +2705,8 @@ test "review 5 minor 1: removing one volume's page lines leaves another volume's
     reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
     defer reg.unlock();
     const me = proc.localIdentity();
-    try reg.append(me.pid, me.start_ticks, "j 9 00000000000000d2 4 6 0\n");
-    try reg.append(me.pid, me.start_ticks, "j 9 00000000000000d2 4 6 1\n");
+    try reg.append(me.pid, me.start_ticks, 0xA, "j 9 00000000000000d2 4 6 0\n");
+    try reg.append(me.pid, me.start_ticks, 0xA, "j 9 00000000000000d2 4 6 1\n");
     try reg.removeRegion(me.pid, "jlr", 0xd2, .{ .page = .{ .aid = 4, .vol = 0 } });
     const es = try reg.entries(testing.allocator);
     defer testing.allocator.free(es);
@@ -2408,7 +2724,7 @@ test "review 5 minor 2: a joiner's line naming its page is appended BEFORE its u
     {
         reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
         defer reg.unlock();
-        try reg.append(me.pid, me.start_ticks, "j 9 00000000000000d2\n");
+        try reg.append(me.pid, me.start_ticks, 0xA, "j 9 00000000000000d2\n");
     }
     var j: Joiner = .{ .gpa = testing.allocator, .device = undefined, .client = undefined, .reg = reg, .slot = 9, .writer_id = 0xd2, .vol = 0 };
     j.reg.test_fail_append = true;
@@ -2421,7 +2737,7 @@ test "review 5 minor 2: a joiner's line naming its page is appended BEFORE its u
 
 test "round 3 major 4, review 4 blocker 1b: a sibling mid-leave stays visible to the rule — its `l` line names its appender id, term and volume: Live under it is current; Recovering (frozen during its leave, evicted) is stale; a Free page naming it — only `releaseRecovered` leaves one (the leave's own Free page clears the identity) — is stale; Free with the identity cleared (its own landed leave, the line removed next) is stale too: its writes all landed, a kill there costs nothing" {
     const node: u64 = 0xA;
-    var e = Entry.parse(46, "81\nl 9 00000000000000d1 4 6 0\n").?;
+    var e = Entry.parse(46, "81 000000000000000a\nl 9 00000000000000d1 4 6 0\n").?;
     try testing.expectEqual(Verdict.stale, judge(&e, &.{pgTerm(4, .recovering, node, 0xd1, 6)}, node, 0, false, .{}));
     try testing.expectEqual(Verdict.current, judge(&e, &.{pgTerm(4, .live, node, 0xd1, 6)}, node, 0, false, .{}));
     try testing.expectEqual(Verdict.stale, judge(&e, &.{pgTerm(4, .free, node, 0xd1, 6)}, node, 0, false, .{}));
@@ -2430,16 +2746,16 @@ test "round 3 major 4, review 4 blocker 1b: a sibling mid-leave stays visible to
 
 test "review 4 blocker 1: a joined member's line names its appender id, term and volume (`j <slot> <writer id> <appender id> <term> <volume>`) — its pair released after its recovery and reused by a new joiner (the lowest Free pair) names no one: STALE, never joining; Live under its own writer id and term is current, under another term stale; a retirement covering its (appender id, term) spares it; a line without an appender id (before its JoinAppender) is joining; another volume's line is not judged here" {
     const node: u64 = 0xA;
-    var e = Entry.parse(48, "83\nj 9 00000000000000d2 4 6 0\n").?;
+    var e = Entry.parse(48, "83 000000000000000a\nj 9 00000000000000d2 4 6 0\n").?;
     try testing.expectEqual(Verdict.stale, judge(&e, &.{pgTerm(4, .live, node, 0xe7, 7)}, node, 0, false, .{}));
     try testing.expectEqual(Verdict.current, judge(&e, &.{pgTerm(4, .live, node, 0xd2, 6)}, node, 0, false, .{}));
     try testing.expectEqual(Verdict.stale, judge(&e, &.{pgTerm(4, .live, node, 0xd2, 8)}, node, 0, false, .{}));
     try testing.expectEqual(Verdict.stale, judge(&e, &.{pgTerm(4, .free, node, 0xd2, 6)}, node, 0, false, .{}));
-    var r = Entry.parse(48, "83\nj 9 00000000000000d2 4 6 0\nr 00000000000000d2 4 6 0\n").?;
+    var r = Entry.parse(48, "83 000000000000000a\nj 9 00000000000000d2 4 6 0\nr 00000000000000d2 4 6 0\n").?;
     try testing.expectEqual(Verdict.retired, judge(&r, &.{pgTerm(4, .recovered, node, 0xd2, 6)}, node, 0, false, .{}));
-    var pre = Entry.parse(48, "83\nj 9 00000000000000d2\n").?;
+    var pre = Entry.parse(48, "83 000000000000000a\nj 9 00000000000000d2\n").?;
     try testing.expectEqual(Verdict.joining, judge(&pre, &.{pgTerm(4, .live, node, 0xe7, 7)}, node, 0, false, .{}));
-    var other = Entry.parse(48, "83\nj 9 00000000000000d2 4 6 1\n").?;
+    var other = Entry.parse(48, "83 000000000000000a\nj 9 00000000000000d2 4 6 1\n").?;
     try testing.expect(judge(&other, &.{pgTerm(4, .live, node, 0xe7, 7)}, node, 0, false, .{}) != .stale);
 }
 
@@ -2474,9 +2790,9 @@ test "decision 0003 §DJ, a co-located member's death: its recoverer on this hos
     const reg = Registry.at(base, .set, 0xd1);
     var lb: [96]u8 = undefined;
     const joined: Joined = .{ .appender_id = 3, .term = 2, .vol = 0 };
-    try reg.append(ids[0].pid, ids[0].start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = ids[0].writerId(9), .joined = joined }));
-    try reg.append(ids[1].pid, ids[1].start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = ids[1].writerId(9), .joined = joined }));
-    try reg.append(ids[1].pid, ids[1].start_ticks, retiredLine(&lb, .{ .writer_id = ids[1].writerId(9), .appender_id = 3, .term = 2, .vol = 0 }));
+    try reg.append(ids[0].pid, ids[0].start_ticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = ids[0].writerId(9), .joined = joined }));
+    try reg.append(ids[1].pid, ids[1].start_ticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = ids[1].writerId(9), .joined = joined }));
+    try reg.append(ids[1].pid, ids[1].start_ticks, 0xA, retiredLine(&lb, .{ .writer_id = ids[1].writerId(9), .appender_id = 3, .term = 2, .vol = 0 }));
     // R's retired page: spared (its own retirement covers it).
     const r_dead = pgTerm(3, .recovering, 0xA, ids[1].writerId(9), 2);
     try testing.expect(killColocatedMember(ctx, reg, &r_dead, &.{}));
@@ -2522,7 +2838,7 @@ test "review minor 2 (decision 0003 §DJ): a co-located member's death whose pro
     const id: claim.Identity = .{ .boot_id = local.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
     const reg = Registry.at(base, .set, 0xd2);
     var lb: [96]u8 = undefined;
-    try reg.append(id.pid, id.start_ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = id.writerId(9), .joined = .{ .appender_id = 3, .term = 2, .vol = 0 } }));
+    try reg.append(id.pid, id.start_ticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = id.writerId(9), .joined = .{ .appender_id = 3, .term = 2, .vol = 0 } }));
     // The data node: one whose block queue cannot be read.
     var nb: [160]u8 = undefined;
     const node = try std.fmt.bufPrint(&nb, "{s}/data-node", .{base});
@@ -2557,7 +2873,7 @@ test "a co-located member whose MAIN thread exited first (a zombie in /proc/<pid
     const id: claim.Identity = .{ .boot_id = local.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
     const reg = Registry.at(base, .set, 0xd3);
     var lb: [96]u8 = undefined;
-    try reg.append(pid, ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = id.writerId(9), .joined = .{ .appender_id = 3, .term = 2, .vol = 0 } }));
+    try reg.append(pid, ticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = id.writerId(9), .joined = .{ .appender_id = 3, .term = 2, .vol = 0 } }));
     w.exitMainThread();
     try testing.expect(proc.flockHeldElsewhere(claim_path.ptr));
     const dead = pgTerm(3, .recovering, 0xA, id.writerId(9), 2);
@@ -2590,7 +2906,7 @@ test "a co-located member whose /proc/<pid>/stat the kernel refuses to open (EMF
     const id: claim.Identity = .{ .boot_id = local.boot_id, .pid = pid, .start_ticks = ticks, .hostname_hash = local.hostname_hash };
     const reg = Registry.at(base, .set, 0xd4);
     var lb: [96]u8 = undefined;
-    try reg.append(pid, ticks, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = id.writerId(9), .joined = .{ .appender_id = 3, .term = 2, .vol = 0 } }));
+    try reg.append(pid, ticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = id.writerId(9), .joined = .{ .appender_id = 3, .term = 2, .vol = 0 } }));
     var fault: proc.TestSeams.StatFault = .{ .pid = pid, .errno = .MFILE };
     proc.test_seams.stat_fault.store(&fault, .release);
     defer proc.test_seams.stat_fault.store(null, .release);
@@ -2644,4 +2960,359 @@ test "decision 0004 §4.4 step 6: a symmetric takeover is one preempt-all — th
     try testing.expect(!ns.isRegistered(0x1111));
     try testing.expect(!ns.isRegistered(0x2222));
     try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
+}
+
+// ---------------------------------------------------------------------------
+// The blind-rule refusals (decision 0004 §4.4.2, KD19).
+// ---------------------------------------------------------------------------
+
+/// A parked child, optionally in a NEW UTS namespace, that has signalled it
+/// finished `unshare`: rows F16 and F16b tell the two shapes apart by that
+/// namespace, so the units need one of each.
+const ParkedNs = struct {
+    pid: linux.pid_t,
+    hold: linux.fd_t,
+
+    fn startIn(new_uts: bool) !ParkedNs {
+        var hold_fds: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&hold_fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+        var ready_fds: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&ready_fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+        const rc = linux.fork();
+        if (linux.errno(rc) != .SUCCESS) return error.Fork;
+        if (rc == 0) {
+            _ = linux.close(hold_fds[1]);
+            _ = linux.close(ready_fds[0]);
+            if (new_uts and linux.errno(linux.unshare(linux.CLONE.NEWUTS)) != .SUCCESS) linux.exit_group(3);
+            const one: u8 = 1;
+            _ = linux.write(ready_fds[1], @ptrCast(&one), 1);
+            var byte: u8 = 0;
+            _ = linux.read(hold_fds[0], @ptrCast(&byte), 1);
+            linux.exit_group(0);
+        }
+        _ = linux.close(hold_fds[0]);
+        _ = linux.close(ready_fds[1]);
+        var done: u8 = 0;
+        if (linux.errno(linux.read(ready_fds[0], @ptrCast(&done), 1)) != .SUCCESS or done != 1) {
+            _ = linux.close(ready_fds[0]);
+            return error.NotReady;
+        }
+        _ = linux.close(ready_fds[0]);
+        return .{ .pid = @intCast(rc), .hold = hold_fds[1] };
+    }
+
+    fn ticks(self: ParkedNs) ?u64 {
+        return switch (proc.startTicksAnyState(@intCast(self.pid))) {
+            .ticks => |t| t,
+            else => null,
+        };
+    }
+
+    fn deinit(self: *ParkedNs) void {
+        _ = linux.close(self.hold);
+        _ = linux.kill(self.pid, .KILL);
+        var status: i32 = 0;
+        _ = linux.waitpid(self.pid, &status, 0);
+    }
+};
+
+/// Removes one mirrored component: the leaf directory the unit made, or the
+/// symlink that took its place (`rmdir` answers ENOTDIR for a symlink, `unlink`
+/// EISDIR for a directory: one of the two is the answer).
+fn rmLeaf(path: []const u8) void {
+    var buf: [linux.PATH_MAX]u8 = undefined;
+    const z = zpath(&buf, path);
+    if (linux.errno(linux.rmdir(z.ptr)) != .SUCCESS) _ = linux.unlink(z.ptr);
+}
+
+/// `mkdir -p` for the two-view trees the registry-root units mirror.
+fn mkdirsTo(path: []const u8) void {
+    var buf: [linux.PATH_MAX]u8 = undefined;
+    var i: usize = 1;
+    while (i <= path.len) : (i += 1) {
+        if (i != path.len and path[i] != '/') continue;
+        const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{path[0..i]}, 0) catch return;
+        _ = linux.mkdir(z.ptr, 0o755);
+    }
+}
+
+/// A registry-root verdict, told as its reason (null = the two views are the
+/// same directory).
+fn rootReason(v: RootVerdict) ?RefuseReason {
+    return switch (v) {
+        .same => null,
+        .refused => |r| r.reason,
+    };
+}
+
+fn rootErrno(v: RootVerdict) ?linux.E {
+    return switch (v) {
+        .same => null,
+        .refused => |r| r.errno,
+    };
+}
+
+test "the judgement is blind to another node token (decision 0004 §4.4.2): an entry whose header names another token, or none, is `.unjudgeable` — never current, retired, stale, and never killed for it — and `append` writes that token once, in the header" {
+    const node: u64 = 0xA;
+    // The same entry, judged by the host its own token names, is current;
+    // judged by another host it has no verdict at all.
+    var e = Entry.parse(42, "77 000000000000000b\nj 9 00000000000000b1\n").?;
+    try testing.expectEqual(Verdict.current, judge(&e, &.{pg(3, .live, 0xB, 0xb1)}, 0xB, 0, false, .{}));
+    try testing.expectEqual(Verdict.unjudgeable, judge(&e, &.{pg(3, .live, 0xB, 0xb1)}, node, 0, false, .{}));
+    try testing.expectEqual(Verdict.unjudgeable, judge(&e, &.{}, node, 0, false, .{}));
+    // A manager under another token is not stale either: the rule never kills
+    // what it cannot read.
+    var m = Entry.parse(45, "80 000000000000000b\nm 0 00000000000000c9\n").?;
+    try testing.expectEqual(Verdict.stale, judge(&m, &.{pg(0, .live, 0xB, 0xc9)}, 0xB, 0, false, .{ .reserved = true }));
+    try testing.expectEqual(Verdict.unjudgeable, judge(&m, &.{pg(0, .live, 0xB, 0xc9)}, node, 0, false, .{ .reserved = true }));
+    // An entry with no token word (an older binary) is unjudgeable, and 0 is
+    // never a token.
+    var none = Entry.parse(42, "77\nj 9 00000000000000b1\n").?;
+    try testing.expectEqual(@as(u64, 0), none.node_token);
+    try testing.expectEqual(Verdict.unjudgeable, judge(&none, &.{pg(3, .live, node, 0xb1)}, node, 0, false, .{}));
+
+    // `append` writes the header once, token included, and keeps the first
+    // writer's across the entry's later lines.
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-token-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var reg = Registry.at(base, .set, 0xd19);
+    reg.lock() catch return @import("../../core/testkit.zig").skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer reg.unlock();
+    const me = proc.localIdentity();
+    var lb: [64]u8 = undefined;
+    try reg.append(me.pid, me.start_ticks, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xb1 }));
+    try reg.append(me.pid, me.start_ticks, 0xB, retiredLine(&lb, .{ .writer_id = 0xb1, .appender_id = 3, .term = 2, .vol = 0 }));
+    var rb: [4096]u8 = undefined;
+    const text = reg.readEntry(me.pid, &rb) orelse return error.Missing;
+    var want: [64]u8 = undefined;
+    const header = std.fmt.bufPrint(&want, "{d} 000000000000000a\n", .{me.start_ticks}) catch return error.Fmt;
+    try testing.expect(std.mem.startsWith(u8, text, header));
+    const back = Entry.parse(me.pid, text) orelse return error.Parse;
+    try testing.expectEqual(@as(u64, 0xA), back.node_token);
+    try testing.expectEqual(@as(usize, 1), back.n_regions);
+    try testing.expectEqual(@as(usize, 1), back.n_retired);
+}
+
+test "blind rules (decision 0004 §4.4.2, KD19): a live sibling the rule cannot judge refuses the admission by name — `node_token_renamed` in this UTS namespace, `node_token_hostname` in another, `node_token_missing` with no token — each counted on its reason and on the total, nothing killed, and an entry under this process's token admits" {
+    const skip = @import("../../core/testkit.zig").skip;
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-blind-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var reg = Registry.at(base, .set, 0xd19);
+    reg.lock() catch return skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer reg.unlock();
+    var same_ns = ParkedNs.startIn(false) catch return skip(@src(), .no_kernel_feature, "fork for the UTS-namespace fixture is refused");
+    defer same_ns.deinit();
+    var other_ns = ParkedNs.startIn(true) catch return skip(@src(), .no_kernel_feature, "unshare(CLONE_NEWUTS) is refused for this test process");
+    defer other_ns.deinit();
+    const st = same_ns.ticks() orelse return error.Ticks;
+    const ot = other_ns.ticks() orelse return error.Ticks;
+    // The discriminator reads real namespaces: the two children differ.
+    const mine = proc.utsNamespaceIno(0) orelse return skip(@src(), .no_kernel_feature, "/proc/self/ns/uts is unreadable");
+    const theirs = proc.utsNamespaceIno(@intCast(other_ns.pid)) orelse return skip(@src(), .no_kernel_feature, "the new UTS namespace is unreadable");
+    try testing.expect(theirs != mine);
+    try testing.expectEqual(mine, proc.utsNamespaceIno(@intCast(same_ns.pid)).?);
+
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    const local = proc.localIdentity();
+    const ctx: RuleContext = .{ .gpa = testing.allocator, .env = &env, .path = "blind", .local = local, .node_token = 0xA, .vol_index = 0, .taking_manager = false };
+    var lb: [64]u8 = undefined;
+    const total0 = guard.stats.pr_stale_sibling_refusals.load();
+    log.testing.expectErrorLogs(3);
+
+    // Another UTS namespace: two hostnames for one set on one host.
+    try reg.append(@intCast(other_ns.pid), ot, 0xB, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xb1 }));
+    const hostname0 = guard.stats.pr_stale_sibling_refusals_node_token_hostname.load();
+    try testing.expectError(error.SiblingUnjudgeable, refuseUnjudgeableSiblings(ctx, &reg));
+    try testing.expectEqual(hostname0 + 1, guard.stats.pr_stale_sibling_refusals_node_token_hostname.load());
+    // The sibling shares this namespace, so the host's name changed while it
+    // ran: the other reason, with the restart-or-restore remedy.
+    reg.remove(@intCast(other_ns.pid));
+    try reg.append(@intCast(same_ns.pid), st, 0xB, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xb2 }));
+    const renamed0 = guard.stats.pr_stale_sibling_refusals_node_token_renamed.load();
+    try testing.expectError(error.SiblingUnjudgeable, refuseUnjudgeableSiblings(ctx, &reg));
+    try testing.expectEqual(renamed0 + 1, guard.stats.pr_stale_sibling_refusals_node_token_renamed.load());
+    // No token at all: an older binary's entry, never judged under this token.
+    reg.remove(@intCast(same_ns.pid));
+    try reg.append(@intCast(same_ns.pid), st, 0, "j 9 00000000000000b3\n");
+    const missing0 = guard.stats.pr_stale_sibling_refusals_node_token_missing.load();
+    try testing.expectError(error.SiblingUnjudgeable, refuseUnjudgeableSiblings(ctx, &reg));
+    try testing.expectEqual(missing0 + 1, guard.stats.pr_stale_sibling_refusals_node_token_missing.load());
+    try log.testing.expectAllFired();
+    try testing.expectEqual(total0 + 3, guard.stats.pr_stale_sibling_refusals.load());
+
+    // Nothing was killed: both siblings still live, the rule met them and
+    // refused. An entry under THIS token admits.
+    try testing.expect(proc.incarnationAlive(@intCast(same_ns.pid), st));
+    try testing.expect(proc.incarnationAlive(@intCast(other_ns.pid), ot));
+    reg.remove(@intCast(same_ns.pid));
+    try reg.append(@intCast(same_ns.pid), st, 0xA, regionLine(&lb, .{ .role = .joiner, .slot = 9, .writer_id = 0xb4 }));
+    try refuseUnjudgeableSiblings(ctx, &reg);
+    try testing.expectEqual(total0 + 3, guard.stats.pr_stale_sibling_refusals.load());
+}
+
+test "KD19's mapping of a failed registry-root comparison: the host's view having no such path is the private registry (`registry_root`, the shape a mismatch is); every other failure to compare reads the host's view as unreadable — EACCES and EPERM on /proc/1/root, ELOOP from the resolve flags, EXDEV, ENOSYS, anything else" {
+    try testing.expectEqual(RefuseReason.registry_root, rootRefusal(.walk, .NOENT));
+    for ([_]linux.E{ .ACCES, .PERM, .LOOP, .XDEV, .NOSYS, .INVAL, .NOLCK }) |e| {
+        try testing.expectEqual(RefuseReason.registry_root_unreadable, rootRefusal(.walk, e));
+        try testing.expectEqual(RefuseReason.registry_root_unreadable, rootRefusal(.host_root, e));
+    }
+    // pid 1's root itself missing is unreadable too: there is no host to see.
+    try testing.expectEqual(RefuseReason.registry_root_unreadable, rootRefusal(.host_root, .NOENT));
+    try testing.expectEqualStrings("registry_root", RefuseReason.registry_root.text());
+    try testing.expectEqualStrings("registry_root_unreadable", RefuseReason.registry_root_unreadable.text());
+    try testing.expectEqualStrings("node_token_hostname", RefuseReason.node_token_hostname.text());
+    try testing.expectEqualStrings("node_token_renamed", RefuseReason.node_token_renamed.text());
+    try testing.expectEqualStrings("node_token_missing", RefuseReason.node_token_missing.text());
+}
+
+test "blind rules (decision 0004 §4.4.2, KD19): the registry-root comparison over a two-view tree — the same inode passes, another directory or no such path in the host's view refuses as `registry_root`, an unreadable host root as `registry_root_unreadable`, a symlink that resolves differently refuses and one that resolves identically passes, and an ABSOLUTE symlink component resolves INSIDE the host's view where a plain `openat` falsely passes" {
+    const skip = @import("../../core/testkit.zig").skip;
+    // Every path has a plain slice and its own NUL-terminated twin: `zpath`
+    // cannot print into the buffer its argument lives in.
+    var tb: [linux.PATH_MAX]u8 = undefined;
+    const base = std.fmt.bufPrint(&tb, "/build/tmp/host-fence-root-{d}", .{linux.getpid()}) catch return error.Fmt;
+    var z: struct {
+        base: [linux.PATH_MAX]u8,
+        own: [linux.PATH_MAX]u8,
+        alias: [linux.PATH_MAX]u8,
+        proot: [linux.PATH_MAX]u8,
+        mirror: [linux.PATH_MAX]u8,
+    } = undefined;
+    var own_b: [linux.PATH_MAX]u8 = undefined;
+    const own = std.fmt.bufPrint(&own_b, "{s}/own/hosts", .{base}) catch return error.Fmt; // this daemon's registry root
+    mkdirsTo(own);
+    var alias_b: [linux.PATH_MAX]u8 = undefined;
+    const alias = std.fmt.bufPrint(&alias_b, "{s}/alias", .{base}) catch return error.Fmt;
+    var parent_b: [linux.PATH_MAX]u8 = undefined;
+    const own_parent = std.fmt.bufPrint(&parent_b, "{s}/own", .{base}) catch return error.Fmt;
+    // `alias` -> `own`'s parent: a symlinked component the walk meets either way.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink(zpath(&z.base, own_parent).ptr, zpath(&z.alias, alias).ptr)));
+    var proot_b: [linux.PATH_MAX]u8 = undefined;
+    const proot = std.fmt.bufPrint(&proot_b, "{s}/proot", .{base}) catch return error.Fmt; // the mirrored host root
+    mkdirsTo(proot);
+    var mir_b: [linux.PATH_MAX]u8 = undefined;
+    const mirror = std.fmt.bufPrint(&mir_b, "{s}/{s}", .{ proot, own[1..] }) catch return error.Fmt; // the host's view of it
+    var mir_dir_b: [linux.PATH_MAX]u8 = undefined;
+    const mir_dir = std.fmt.bufPrint(&mir_dir_b, "{s}", .{mirror[0 .. mirror.len - "/hosts".len]}) catch return error.Fmt;
+
+    // No such path in the host's view: a private `/run` the host never saw.
+    const missing = judgeRootPaths(proot, own);
+    try testing.expectEqual(RefuseReason.registry_root, rootReason(missing).?);
+    try testing.expectEqual(linux.E.NOENT, rootErrno(missing).?);
+    // The same path, another directory there.
+    mkdirsTo(mirror);
+    try testing.expectEqual(RefuseReason.registry_root, rootReason(judgeRootPaths(proot, own)).?);
+    // A symlinked component that resolves differently in the host's view.
+    rmLeaf(mirror);
+    var away_b: [linux.PATH_MAX]u8 = undefined;
+    const away = std.fmt.bufPrint(&away_b, "{s}/away", .{proot}) catch return error.Fmt;
+    mkdirsTo(away);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink("away", zpath(&z.mirror, mirror).ptr)));
+    const diff = judgeRootPaths(proot, own);
+    try testing.expectEqual(linux.E.NOENT, rootErrno(diff).?);
+    try testing.expectEqual(RefuseReason.registry_root, rootReason(diff).?);
+    // The host's root itself unreadable — the shape `hidepid` and an LSM give
+    // EACCES and EPERM for: the comparison cannot answer, and that refuses.
+    var gone_b: [linux.PATH_MAX]u8 = undefined;
+    const gone = std.fmt.bufPrint(&gone_b, "{s}/no-such-host-root", .{base}) catch return error.Fmt;
+    try testing.expectEqual(RefuseReason.registry_root_unreadable, rootReason(judgeRootPaths(gone, own)).?);
+    // The host's real root: this daemon's path resolves identically in both
+    // views — symlinked component and all — so it passes.
+    try testing.expectEqual(@as(?RefuseReason, null), rootReason(judgeRootPaths("/", own)));
+    try testing.expectEqual(@as(?RefuseReason, null), rootReason(judgeRootPaths("/", alias)));
+    // The absolute symlink. The host's view meets `own`'s parent as an ABSOLUTE
+    // symlink whose target is this daemon's own tree: `RESOLVE_IN_ROOT` walks it
+    // inside the host's root, into another directory — refused. A plain `openat`
+    // resolves that target from THIS process's root, lands on the daemon's own
+    // registry, and falsely passes: the witness below says so.
+    rmLeaf(mirror);
+    rmLeaf(mir_dir);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink(zpath(&z.alias, alias).ptr, zpath(&z.mirror, mir_dir).ptr)));
+    var mir_alias_b: [linux.PATH_MAX]u8 = undefined;
+    const mir_alias = std.fmt.bufPrint(&mir_alias_b, "{s}/alias/hosts", .{mir_dir}) catch return error.Fmt;
+    mkdirsTo(mir_alias); // what the absolute target resolves to INSIDE the host's root
+    try testing.expectEqual(RefuseReason.registry_root, rootReason(judgeRootPaths(proot, own)).?);
+    {
+        const hf = linux.open(zpath(&z.proot, proot).ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+        if (linux.errno(hf) != .SUCCESS) return skip(@src(), .other_step, "cannot open the two-view root");
+        defer _ = linux.close(@intCast(hf));
+        var rel_b: [linux.PATH_MAX]u8 = undefined;
+        const plain = linux.openat(@intCast(hf), zpath(&rel_b, own[1..]).ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+        if (linux.errno(plain) != .SUCCESS) return skip(@src(), .other_step, "the plain `openat` witness cannot walk the two-view tree");
+        defer _ = linux.close(@intCast(plain));
+        const ofd = linux.open(zpath(&z.own, own).ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+        if (linux.errno(ofd) != .SUCCESS) return error.Open;
+        defer _ = linux.close(@intCast(ofd));
+        const ours = devIno(@intCast(ofd)) orelse return error.Open;
+        const sees = devIno(@intCast(plain)) orelse return error.Open;
+        try testing.expectEqual(ours.dev, sees.dev); // the false pass `openat2` refuses
+        try testing.expectEqual(ours.ino, sees.ino);
+    }
+    // `RESOLVE_NO_MAGICLINKS`: the host's view of `/proc/self/root` walks a
+    // procfs magic link. openat2 refuses that with ELOOP; a plain open follows
+    // it, which is why this process's own view of the path succeeds. The host
+    // root is `/` — the directory `/proc/1/root` opens — so the walked path is
+    // `proc/self/root`, the magic link itself.
+    const magic = judgeRootPaths("/", "/proc/self/root");
+    try testing.expectEqual(RefuseReason.registry_root_unreadable, rootReason(magic).?);
+    try testing.expectEqual(linux.E.LOOP, rootErrno(magic).?);
+    // The registry seam exempts a rig that shares one root by construction; the
+    // same mismatch without it refuses, logged by name with its remedy.
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("SQUEEZEFS_TEST_PID1_ROOT", proot);
+    log.testing.expectErrorLogs(1);
+    try testing.expect(!hostRegistryRootAgrees(&env, own, "fixture"));
+    try log.testing.expectAllFired();
+    try env.put("SQUEEZEFS_TEST_HOST_REGISTRY_DIR", base);
+    try testing.expect(hostRegistryRootAgrees(&env, own, "fixture"));
+    // `off` is the knob's documented default: pid 1's root, and this path passes.
+    try env.put("SQUEEZEFS_TEST_PID1_ROOT", "off");
+    try testing.expectEqual(@as(?RefuseReason, null), rootReason(judgeRootPaths(hostRootName(&env), own)));
+}
+
+test "blind rules (decision 0004 §4.4.2): a private MOUNT namespace that keeps the host's registry root passes (the same inode — systemd's `PrivateTmp=`, `ProtectSystem=` shape); a tmpfs over it — a container's own `/run` — refuses" {
+    const skip = @import("../../core/testkit.zig").skip;
+    var tb: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&tb, "/build/tmp/host-fence-mntns-{d}", .{linux.getpid()});
+    defer Io.Dir.cwd().deleteTree(testing.io, base) catch {};
+    var own_b: [linux.PATH_MAX]u8 = undefined;
+    const own = std.fmt.bufPrint(&own_b, "{s}/own/hosts", .{base}) catch return error.Fmt;
+    mkdirsTo(own);
+    var fds: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+    const rc = linux.fork();
+    if (linux.errno(rc) != .SUCCESS) return error.Fork;
+    if (rc == 0) {
+        _ = linux.close(fds[0]);
+        const verdict: u8 = blk: {
+            if (linux.errno(linux.unshare(linux.CLONE.NEWNS)) != .SUCCESS) break :blk 4;
+            // Nothing this namespace mounts propagates back out.
+            if (linux.errno(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0)) != .SUCCESS) break :blk 5;
+            // The namespace alone changes nothing: the registry is the same
+            // directory in the host's view, so it passes.
+            if (rootReason(judgeRootPaths("/proc/1/root", own)) != null) break :blk 1;
+            // A tmpfs over it is a container's own `/run`: the siblings are
+            // invisible, and that is the refusal.
+            var tmp_b: [linux.PATH_MAX]u8 = undefined;
+            if (linux.errno(linux.mount("tmpfs", zpath(&tmp_b, own).ptr, "tmpfs", 0, 0)) != .SUCCESS) break :blk 2;
+            if (rootReason(judgeRootPaths("/proc/1/root", own)) != RefuseReason.registry_root) break :blk 3;
+            break :blk 0;
+        };
+        var byte = verdict;
+        _ = linux.write(fds[1], @ptrCast(&byte), 1);
+        linux.exit_group(0);
+    }
+    _ = linux.close(fds[1]);
+    var got: u8 = 9;
+    if (linux.errno(linux.read(fds[0], @ptrCast(&got), 1)) != .SUCCESS) return error.Read;
+    _ = linux.close(fds[0]);
+    var status: i32 = 0;
+    _ = linux.waitpid(@intCast(rc), &status, 0);
+    if (got == 4 or got == 5) return skip(@src(), .no_kernel_feature, "unshare(CLONE_NEWNS) is refused for this test process");
+    if (got == 2) return skip(@src(), .no_device, "a tmpfs cannot be mounted over the fixture's registry root");
+    try testing.expectEqual(@as(u8, 0), got);
 }

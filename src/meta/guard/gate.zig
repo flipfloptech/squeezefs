@@ -671,7 +671,7 @@ pub const Guard = struct {
         });
         return host_fence.registerUnderRule(g.ruleContext(taking_manager), reg, c, .{ .ctx = g.be, .read = &pagesFn }, .{ .ctx = g, .run = &ladderFn }) catch |e| switch (e) {
             error.OutOfMemory => error.OutOfMemory,
-            error.SiblingLive => error.Busy,
+            error.SiblingLive, error.SiblingUnjudgeable => error.Busy,
             error.RegisterFailed => g.prErrorLog(c, "register", error.DeviceStatus),
             // The registration lock's bound. A marker-create failure has
             // already dropped the lock, and the census then names nobody.
@@ -700,7 +700,7 @@ pub const Guard = struct {
 
     fn enrolLocked(g: *Guard, reg: *host_fence.Registry, role: host_fence.Role) backend.OpenError!void {
         var lb: [64]u8 = undefined;
-        reg.append(g.identity.pid, g.identity.start_ticks, host_fence.regionLine(&lb, .{ .role = role, .slot = g.be.index, .writer_id = g.identity.writerId(g.be.index) })) catch |e| {
+        reg.append(g.identity.pid, g.identity.start_ticks, join.nodeToken(g.identity), host_fence.regionLine(&lb, .{ .role = role, .slot = g.be.index, .writer_id = g.identity.writerId(g.be.index) })) catch |e| {
             log.err("meta volume {s}: this mount could not enter the host's registry of the set ({s}: {s}) — refusing the mount (a sibling's registration could not judge it)", .{ g.be.path, reg.dir(), @errorName(e) });
             return error.Busy;
         };
@@ -1168,7 +1168,7 @@ pub const Guard = struct {
             defer held.deinit(c.gpa);
             gen = held.generation;
         } else |_| {}
-        reg.noteReacquire(g.identity.pid, g.identity.start_ticks, clock.boottimeNs(), gen) catch |e| {
+        reg.noteReacquire(g.identity.pid, g.identity.start_ticks, join.nodeToken(g.identity), clock.boottimeNs(), gen) catch |e| {
             log.warn("meta volume {s}: the re-acquire mark was not written ({s}) — a joiner's re-judge may treat this acquire as another host's (decision 0004 DC24)", .{ g.be.path, @errorName(e) });
         };
     }

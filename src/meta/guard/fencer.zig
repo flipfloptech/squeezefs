@@ -340,7 +340,7 @@ fn standOrRefuse(gpa: Allocator, env: *const std.process.Environ.Map, in: Input)
     const me = proc.localIdentity();
     var lb: [24]u8 = undefined;
     const line = userLine(&lb, in.nsid);
-    users.append(me.pid, me.start_ticks, line) catch return error.UsersUnavailable;
+    users.append(me.pid, me.start_ticks, me.nodeToken(), line) catch return error.UsersUnavailable;
     var reused = true;
     const got = findOurs(gpa, spec, want_uuid) orelse blk: {
         reused = false;

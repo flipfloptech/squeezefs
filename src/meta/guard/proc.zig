@@ -444,6 +444,20 @@ pub fn localIdentity() claim.Identity {
     };
 }
 
+/// The inode of a process's UTS namespace: two processes with the same value
+/// read the same hostname, so this is what tells "another hostname for one set
+/// on one host" (another namespace) from "the host's name changed while a
+/// sibling runs" (this one) — decision 0004 §4.4.2's discriminator. `pid` 0 is
+/// this process. Null = unreadable (the caller reports it under the namespace
+/// reason, noting that).
+pub fn utsNamespaceIno(pid: u32) ?u64 {
+    var pb: [64]u8 = undefined;
+    const path: [:0]const u8 = if (pid == 0) "/proc/self/ns/uts" else std.fmt.bufPrintSentinel(&pb, "/proc/{d}/ns/uts", .{pid}, 0) catch return null;
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path.ptr, 0, .{ .INO = true }, &st)) != .SUCCESS) return null;
+    return st.ino;
+}
+
 /// `/proc/locks` is a table of every lock on the host; a flock line reads
 /// `N: FLOCK  ADVISORY  WRITE pid MAJ:MIN:INO start end`. The table of a
 /// busy host is a few hundred lines; 1 MiB holds thousands.

@@ -30,7 +30,11 @@
 //! 0003 §DG; a frozen member's released windows refused), F9/F9b (a grace
 //! reap carries the page's host key), F1 (a successor's preempt-all, decision
 //! 0004 §8.2) and F10 (a busy co-located joiner
-//! survives the superseded manager's takeover, decision 0004 §8.2),
+//! survives the superseded manager's takeover, decision 0004 §8.2); the blind-rule
+//! refusals F15, F16 and F16b (a daemon with its own `/run`, a second hostname on
+//! the host, the host's name moved under a running sibling — decision 0004 §4.4.2,
+//! KD19; `spawnMountNs` puts a leg in the namespace, `expectRefused` reads the
+//! reason from its log),
 //! `g2-restore-tcp` (the PTPL
 //! lapse: the subsystem wiped by hand under a live mount, `restore`
 //! rebuilds it with the recorded uuid, the heartbeat re-acquires:
@@ -65,6 +69,7 @@ const ledger = @import("ledger.zig");
 const storage = @import("storage.zig");
 const pr_legs = @import("pr_legs.zig");
 const initiator = @import("initiator.zig");
+const journal_tail = @import("../../meta/journal_tail.zig");
 const multipath = @import("multipath.zig");
 const fencing = @import("../../meta/sym/membership/fencing.zig");
 const proc = @import("../../meta/guard/proc.zig");
@@ -669,6 +674,239 @@ const Rig = struct {
         }
     }
 
+    /// How a leg's daemon enters the world, for the blind-rule refusals
+    /// (decision 0004 §4.4.2, KD19, rows F15, F16, F16b). Every step runs in the
+    /// forked child between `fork` and `execve`, on an argv and environ built
+    /// before it, so a row needs no `unshare`, `nsenter` or `mount` binary.
+    const Ns = struct {
+        /// A MOUNT namespace of its own, made recursively private so nothing it
+        /// mounts reaches the host.
+        mount_ns: bool = false,
+        /// With `mount_ns`: a tmpfs over the host's registry root — a container's
+        /// own `/run`, which pid 1's view does not have (F15).
+        tmpfs_registry: bool = false,
+        /// A UTS namespace of its own under this hostname (F16): the set's second
+        /// hostname on the host. With `uts_of`, this changes THAT namespace's name
+        /// instead — the host's name moving under a running sibling (F16b).
+        hostname: ?[:0]const u8 = null,
+        /// Live in `pid`'s UTS namespace rather than this process's: F16b's two
+        /// daemons share the one namespace whose name changes between them.
+        uts_of: ?linux.pid_t = null,
+    };
+
+    /// `spawnMount` under a namespace posture. The child reports a failed
+    /// namespace step on a `CLOEXEC` pipe, so an EOF there is the exec's own
+    /// success and a byte says which step refused.
+    fn spawnMountNs(self: *Rig, name: []const u8, meta_uri: []const u8, env: *const std.process.Environ.Map, ns: Ns, extra: []const []const u8) !usize {
+        const gpa = self.gpa;
+        const mp = try std.fmt.allocPrintSentinel(gpa, "{s}/mnt-{s}", .{ self.root, name }, 0);
+        // Once the daemon record exists, `deinit` frees these. An earlier error
+        // still has to, including a namespace step that refuses after the append.
+        var owned_by_daemon = false;
+        errdefer if (!owned_by_daemon) gpa.free(mp);
+        _ = linux.mkdir(mp.ptr, 0o755);
+        const log_path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}.log", .{ self.root, name }, 0);
+        errdefer if (!owned_by_daemon) gpa.free(log_path);
+        const log_file = try Io.Dir.cwd().createFile(self.io, log_path, .{ .truncate = false });
+        errdefer if (!owned_by_daemon) log_file.close(self.io);
+        // argv, environ and the registry root are complete before the fork: the
+        // child allocates nothing between `unshare` and `execve`.
+        var words: [12]?[*:0]const u8 = undefined; // the extras; the parent frees them after the fork
+        var word_n: usize = 0;
+        var argv: [20]?[*:0]const u8 = undefined;
+        var n: usize = 0;
+        argv[n] = self.bin.ptr;
+        n += 1;
+        argv[n] = "mount";
+        n += 1;
+        for (extra) |e| {
+            words[word_n] = @ptrCast(try std.fmt.allocPrintSentinel(gpa, "{s}", .{e}, 0));
+            argv[n] = words[word_n];
+            word_n += 1;
+            n += 1;
+        }
+        const uri = try std.fmt.allocPrintSentinel(gpa, "{s}", .{meta_uri}, 0);
+        argv[n] = @ptrCast(uri);
+        n += 1;
+        argv[n] = mp.ptr;
+        n += 1;
+        argv[n] = null; // the sentinel sits at `n`; the slice length is the argument count
+        const argv_z: [:null]?[*:0]const u8 = argv[0..n :null];
+        // One slot per variable, plus the sentinel `allocSentinel` stores past
+        // the length. Slicing `0 .. len + 1 : null` reads one past that slot.
+        const env_keys = env.keys();
+        const envp = try gpa.allocSentinel(?[*:0]const u8, env_keys.len, null);
+        var nfilled: usize = 0;
+        errdefer {
+            for (envp[0..nfilled]) |slot| gpa.free(std.mem.span(slot.?));
+            gpa.free(envp);
+            gpa.free(uri);
+            for (words[0..word_n]) |w| gpa.free(std.mem.span(w.?));
+        }
+        for (env_keys, env.values()) |k, v| {
+            envp[nfilled] = @ptrCast(try std.fmt.allocPrintSentinel(gpa, "{s}={s}", .{ k, v }, 0));
+            nfilled += 1;
+        }
+        const envp_z = envp;
+        // The host's registry root, as the daemon itself names it (§4.4.2).
+        var reg_b: [linux.PATH_MAX:0]u8 = undefined;
+        const reg_root: [:0]const u8 = blk: {
+            const hosts = journal_tail.HeldDir.runtimeOf(.hosts).slice();
+            @memcpy(reg_b[0..hosts.len], hosts);
+            reg_b[hosts.len] = 0;
+            break :blk reg_b[0..hosts.len :0];
+        };
+        var err_fds: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&err_fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+        const rc = linux.fork();
+        if (linux.errno(rc) != .SUCCESS) {
+            _ = linux.close(err_fds[0]);
+            _ = linux.close(err_fds[1]);
+            return error.Fork;
+        }
+        if (rc == 0) {
+            _ = linux.close(err_fds[0]);
+            const die = struct {
+                fn at(pipe: linux.fd_t, step: u8) noreturn {
+                    var b = step;
+                    _ = linux.write(pipe, @ptrCast(&b), 1);
+                    linux.exit_group(64);
+                }
+            }.at;
+            if (ns.uts_of) |p| {
+                // Enter the keeper's UTS namespace: one hostname for both daemons.
+                var nb: [64:0]u8 = undefined;
+                const np = std.fmt.bufPrintSentinel(&nb, "/proc/{d}/ns/uts", .{p}, 0) catch die(err_fds[1], 10);
+                const nsfd = linux.open(np.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+                if (linux.errno(nsfd) != .SUCCESS) die(err_fds[1], 11);
+                if (linux.errno(linux.setns(@intCast(nsfd), linux.CLONE.NEWUTS)) != .SUCCESS) die(err_fds[1], 12);
+                _ = linux.close(@intCast(nsfd));
+            } else if (ns.hostname != null) {
+                if (linux.errno(linux.unshare(linux.CLONE.NEWUTS)) != .SUCCESS) die(err_fds[1], 13);
+            }
+            if (ns.hostname) |h| {
+                if (linux.errno(linux.syscall2(.sethostname, @intFromPtr(h.ptr), h.len)) != .SUCCESS) die(err_fds[1], 14);
+            }
+            if (ns.mount_ns) {
+                if (linux.errno(linux.unshare(linux.CLONE.NEWNS)) != .SUCCESS) die(err_fds[1], 15);
+                // Nothing this namespace mounts reaches back out.
+                if (linux.errno(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0)) != .SUCCESS) die(err_fds[1], 16);
+                if (ns.tmpfs_registry) {
+                    // mount(2) needs the directory. One parent: `/run` exists,
+                    // `/run/squeezefs` may not. EEXIST is the directory already there.
+                    if (std.mem.lastIndexOfScalar(u8, reg_root, '/')) |slash| {
+                        var parent: [linux.PATH_MAX]u8 = undefined;
+                        const p = std.fmt.bufPrintSentinel(&parent, "{s}", .{reg_root[0..slash]}, 0) catch die(err_fds[1], 19);
+                        _ = linux.mkdir(p.ptr, 0o755);
+                    }
+                    const mk = linux.mkdir(reg_root.ptr, 0o755);
+                    const me = linux.errno(mk);
+                    if (me != .SUCCESS and me != .EXIST) die(err_fds[1], 19);
+                    if (linux.errno(linux.mount("tmpfs", reg_root.ptr, "tmpfs", 0, 0)) != .SUCCESS) die(err_fds[1], 17);
+                }
+            }
+            _ = linux.dup2(log_file.handle, 1);
+            _ = linux.dup2(log_file.handle, 2);
+            if (log_file.handle > 2) _ = linux.close(log_file.handle);
+            _ = linux.execve(self.bin.ptr, argv_z.ptr, envp_z.ptr);
+            die(err_fds[1], 18);
+        }
+        _ = linux.close(err_fds[1]);
+        var step: u8 = 0;
+        const got = linux.read(err_fds[0], @ptrCast(&step), 1);
+        _ = linux.close(err_fds[0]);
+        const child: std.process.Child = .{ .id = @intCast(rc), .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
+        try self.daemons.append(gpa, .{ .child = child, .pid = @intCast(rc), .log_path = log_path, .mp = mp, .log_file = log_file });
+        owned_by_daemon = true;
+        if (linux.errno(got) == .SUCCESS and got == 1) {
+            std.debug.print("\n--- the mount's namespace step {d} refused ---\n", .{step});
+            return error.NamespaceRefused;
+        }
+        for (envp[0..nfilled]) |slot| gpa.free(std.mem.span(slot.?));
+        gpa.free(envp);
+        gpa.free(uri);
+        for (words[0..word_n]) |w| gpa.free(std.mem.span(w.?));
+        nfilled = 0;
+        word_n = 0;
+        return self.daemons.items.len - 1;
+    }
+
+    /// A mount that must refuse: the daemon exits and its log names KD19's
+    /// reason. The log is read after the exit, so nothing races the write.
+    fn expectRefused(self: *Rig, d: usize, reason: []const u8) !void {
+        const dm = &self.daemons.items[d];
+        const deadline = clock.monotonicNs() + ready_wait_ns;
+        while (alive(dm.pid) and clock.monotonicNs() < deadline) sleepMs(20);
+        const lived = alive(dm.pid);
+        const term = try dm.child.wait(self.io);
+        dm.reaped = true;
+        const text = try self.readLog(d);
+        defer self.gpa.free(text);
+        if (lived) {
+            std.debug.print("\n--- the mount was expected to refuse ({s}) and is still up ---\n{s}\n", .{ reason, text });
+            return error.NotRefused;
+        }
+        if (std.mem.indexOf(u8, text, reason) == null) {
+            std.debug.print("\n--- the refusal does not name '{s}' ---\n{s}\n", .{ reason, text });
+            return error.ReasonMissing;
+        }
+        try testing.expect(!term.success());
+    }
+
+    /// The same refusal's log, again for the sentence the operator needs: the
+    /// remedy KD19 promised in the line.
+    fn expectRefusedText(self: *Rig, d: usize, needle: []const u8) !void {
+        const text = try self.readLog(d);
+        defer self.gpa.free(text);
+        if (std.mem.indexOf(u8, text, needle) == null) {
+            std.debug.print("\n--- the refusal does not say '{s}' ---\n{s}\n", .{ needle, text });
+            return error.RemedyMissing;
+        }
+    }
+
+    /// The orderly stop of a leg that mounted in a namespace of its own: SIGTERM
+    /// (`cli/daemon.zig`'s orderly stop), which unmounts where the mount lives.
+    /// `squeezefs umount` from this namespace could not reach it: a private mount
+    /// namespace's mounts are invisible to the host's.
+    fn termMount(self: *Rig, d: usize) !void {
+        const dm = &self.daemons.items[d];
+        _ = linux.kill(dm.pid, .TERM);
+        const deadline = clock.monotonicNs() + exit_wait_ns;
+        while (alive(dm.pid) and clock.monotonicNs() < deadline) sleepMs(20);
+        _ = try dm.child.wait(self.io);
+        dm.reaped = true;
+        if (alive(dm.pid)) return error.DaemonStuck;
+    }
+
+    /// A parked child in a NEW UTS namespace under `name`: F16b's namespace, held
+    /// open so both of the row's daemons enter it, and whose name the row changes
+    /// while one of them runs. Teardown kills it.
+    fn utsKeeper(name: [:0]const u8) !linux.pid_t {
+        var ready_fds: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&ready_fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+        const rc = linux.fork();
+        if (linux.errno(rc) != .SUCCESS) return error.Fork;
+        if (rc == 0) {
+            _ = linux.close(ready_fds[0]);
+            if (linux.errno(linux.unshare(linux.CLONE.NEWUTS)) != .SUCCESS) linux.exit_group(3);
+            if (linux.errno(linux.syscall2(.sethostname, @intFromPtr(name.ptr), name.len)) != .SUCCESS) linux.exit_group(4);
+            const one: u8 = 1;
+            _ = linux.write(ready_fds[1], @ptrCast(&one), 1);
+            _ = linux.close(ready_fds[1]);
+            _ = linux.pause();
+            linux.exit_group(0);
+        }
+        _ = linux.close(ready_fds[1]);
+        var done: u8 = 0;
+        if (linux.errno(linux.read(ready_fds[0], @ptrCast(&done), 1)) != .SUCCESS or done != 1) {
+            _ = linux.close(ready_fds[0]);
+            _ = linux.kill(@intCast(rc), .KILL);
+            return error.KeeperRefused;
+        }
+        _ = linux.close(ready_fds[0]);
+        return @intCast(rc);
+    }
+
     /// The mount's `.stats` document.
     fn stats(self: *Rig, d: usize) ![]u8 {
         var pb: [linux.PATH_MAX]u8 = undefined;
@@ -725,7 +963,104 @@ const Rig = struct {
         }
         return r.stdout;
     }
+
+    /// `sh -e -c script` with the mount as cwd, inside the daemon's mount
+    /// namespace. A `MS_PRIVATE` namespace's FUSE mount is invisible to this
+    /// process (F15's C), and this process is multithreaded, so `setns` is
+    /// refused here: the child enters the namespace, then execs.
+    fn onMountNs(self: *Rig, d: usize, script: []const u8) ![]u8 {
+        const gpa = self.gpa;
+        const dm = &self.daemons.items[d];
+        const script_z = try std.fmt.allocPrintSentinel(gpa, "{s}", .{script}, 0);
+        defer gpa.free(script_z);
+        var out_fds: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&out_fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.Pipe;
+        var err_fds: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&err_fds, .{ .CLOEXEC = true })) != .SUCCESS) {
+            _ = linux.close(out_fds[0]);
+            _ = linux.close(out_fds[1]);
+            return error.Pipe;
+        }
+        const rc = linux.fork();
+        if (linux.errno(rc) != .SUCCESS) {
+            _ = linux.close(out_fds[0]);
+            _ = linux.close(out_fds[1]);
+            _ = linux.close(err_fds[0]);
+            _ = linux.close(err_fds[1]);
+            return error.Fork;
+        }
+        if (rc == 0) {
+            _ = linux.close(out_fds[0]);
+            _ = linux.close(err_fds[0]);
+            const die = struct {
+                fn at(code: u8) noreturn {
+                    linux.exit_group(code);
+                }
+            }.at;
+            var nb: [64:0]u8 = undefined;
+            const np = std.fmt.bufPrintSentinel(&nb, "/proc/{d}/ns/mnt", .{dm.pid}, 0) catch die(11);
+            const nsfd = linux.open(np.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+            if (linux.errno(nsfd) != .SUCCESS) die(12);
+            if (linux.errno(linux.setns(@intCast(nsfd), linux.CLONE.NEWNS)) != .SUCCESS) die(13);
+            _ = linux.close(@intCast(nsfd));
+            if (linux.errno(linux.chdir(dm.mp.ptr)) != .SUCCESS) die(14);
+            _ = linux.dup2(out_fds[1], 1);
+            _ = linux.dup2(err_fds[1], 2);
+            if (out_fds[1] > 2) _ = linux.close(out_fds[1]);
+            if (err_fds[1] > 2) _ = linux.close(err_fds[1]);
+            const argv = [_:null]?[*:0]const u8{ "sh", "-e", "-c", script_z.ptr };
+            const envp = [_:null]?[*:0]const u8{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"};
+            _ = linux.execve("/bin/sh", &argv, &envp);
+            die(18);
+        }
+        _ = linux.close(out_fds[1]);
+        _ = linux.close(err_fds[1]);
+        const stdout = readFdAll(gpa, out_fds[0]) catch |e| {
+            _ = linux.close(err_fds[0]);
+            var ignored: i32 = 0;
+            _ = linux.waitpid(@intCast(rc), &ignored, 0);
+            return e;
+        };
+        errdefer gpa.free(stdout);
+        const stderr = readFdAll(gpa, err_fds[0]) catch |e| {
+            var ignored: i32 = 0;
+            _ = linux.waitpid(@intCast(rc), &ignored, 0);
+            return e;
+        };
+        defer gpa.free(stderr);
+        var status: i32 = 0;
+        if (linux.errno(linux.waitpid(@intCast(rc), &status, 0)) != .SUCCESS) return error.Wait;
+        const st: u32 = @bitCast(status);
+        if (!linux.W.IFEXITED(st) or linux.W.EXITSTATUS(st) != 0) {
+            std.debug.print("\n--- mount script failed in the daemon's mount namespace (status {d}, exit {d}): {s}\n{s}\n{s}\n", .{ st, linux.W.EXITSTATUS(st), script, stdout, stderr });
+            return error.ScriptFailed;
+        }
+        return stdout;
+    }
 };
+
+/// Read an fd to EOF and close it. An empty read is still an allocated slice,
+/// so the caller can free it.
+fn readFdAll(gpa: Allocator, fd: linux.fd_t) ![]u8 {
+    defer _ = linux.close(fd);
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = linux.read(fd, &tmp, tmp.len);
+        const e = linux.errno(n);
+        if (e == .INTR) continue;
+        if (e != .SUCCESS) return error.Read;
+        if (n == 0) break;
+        try buf.appendSlice(gpa, tmp[0..n]);
+        if (buf.items.len > (1 << 20)) return error.TooBig;
+    }
+    if (buf.items.len == 0) {
+        buf.deinit(gpa);
+        return gpa.alloc(u8, 0);
+    }
+    return buf.toOwnedSlice(gpa);
+}
 
 fn lineAfter(text: []const u8, prefix: []const u8) ?[]const u8 {
     const at = std.mem.indexOf(u8, text, prefix) orelse return null;
@@ -3354,6 +3689,142 @@ test "nvmet fidelity: pr5 F9b — a member whose row was LOST is still expected,
     _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
     try rig.disconnect(&cm_b);
     try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+test "nvmet fidelity: pr5 F15 — a daemon with its own `/run` is refused; one in a private MOUNT namespace that keeps the host's `/run` is accepted (decision 0004 §4.4.2, KD19) — a symmetric set whose manager M mounts as usual; B mounts with a tmpfs over the host's registry root (a container's own `/run`: pid 1's view has no such directory), and its writer open refuses with `registry_root` before any registration — the report's registrants are exactly what they were; C, in a mount namespace that keeps the host's registry root (systemd's `PrivateTmp=`, `ProtectSystem=` shape: the same inode, so the comparison passes), is admitted and reads M's file" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    // Seam-off mounts register under the host's `/run`. Remove those lines
+    // after the daemons are gone: a kill leaves them, and the next row must
+    // not inherit a dead sibling.
+    defer Io.Dir.cwd().deleteTree(testing.io, "/run/squeezefs") catch {};
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "f15", transport, try rig.servicePorts(transport));
+    const m = try rig.spawnMount("f15-m", set.metaUri(), ident_a, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, m, "mkdir f15 && echo m > f15/m && sync -d f15/m"));
+    // This row is the run's one user of the HOST's registry root: the rig's
+    // seam exempts the comparison by construction (§4.4.2), so `off` here.
+    var env_run = try rig.envWith(ident_a);
+    defer env_run.deinit();
+    try env_run.put("SQUEEZEFS_TEST_HOST_REGISTRY_DIR", "off");
+    const rr0 = try rig.resvReportJson(set.cm.dev());
+    defer gpa.free(rr0);
+    const regctl0 = json_scan.number(rr0, "regctl");
+    // B: its own `/run`. The refusal names the reason and the remedy, and it
+    // lands before the device is touched.
+    const b = try rig.spawnMountNs("f15-blind", set.metaUri(), &env_run, .{ .mount_ns = true, .tmpfs_registry = true }, &.{});
+    try rig.expectRefused(b, "(reason registry_root)");
+    try rig.expectRefusedText(b, "run the daemon with the host's /run");
+    {
+        const rr = try rig.resvReportJson(set.cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(regctl0, json_scan.number(rr, "regctl"));
+    }
+    // C: a private namespace that keeps the host's registry root passes — the
+    // siblings are still visible, so the rule can still judge them.
+    const c = try rig.spawnMountNs("f15-kept", set.metaUri(), &env_run, .{ .mount_ns = true }, &.{});
+    try rig.awaitLog(c, "ready: ", ready_wait_ns);
+    {
+        // C's FUSE mount is in its own mount namespace.
+        const out = try rig.onMountNs(c, "cat f15/m");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("m\n", out);
+        const wrote = try rig.onMountNs(c, "echo c > f15/c && sync -d f15/c");
+        gpa.free(wrote);
+    }
+    // C's mount lives in its own namespace, invisible to `squeezefs umount` from
+    // this one: the daemon's orderly stop is the way out.
+    try rig.termMount(c);
+    try rig.umount(m);
+    try rig.disconnect(&set.cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+test "nvmet fidelity: pr5 F16 — a live sibling under another hostname is refused (decision 0004 §4.4.2, KD19) — a symmetric set whose manager M mounts; B mounts in its own UTS namespace under a SECOND hostname of this host, sharing the registry: every page judgement B would make is by a node token it cannot read, so B refuses with `node_token_hostname` while M lives and registers nothing; once M is gone, the same shape mounts and writes" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "f16", transport, try rig.servicePorts(transport));
+    var hb: [96:0]u8 = undefined;
+    const other = try std.fmt.bufPrintSentinel(&hb, "fideli-{d}-other", .{rig.pid}, 0);
+    const m = try rig.spawnMount("f16-m", set.metaUri(), ident_a, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const rr0 = try rig.resvReportJson(set.cm.dev());
+    defer gpa.free(rr0);
+    const regctl0 = json_scan.number(rr0, "regctl");
+    var env_a = try rig.envWith(ident_a);
+    defer env_a.deinit();
+    const b = try rig.spawnMountNs("f16-blind", set.metaUri(), &env_a, .{ .hostname = other }, &.{});
+    try rig.expectRefused(b, "(reason node_token_hostname)");
+    try rig.expectRefusedText(b, "one hostname per host for one set");
+    {
+        const rr = try rig.resvReportJson(set.cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(regctl0, json_scan.number(rr, "regctl"));
+    }
+    // M leaves; nothing of the host's is left to judge, so B's shape registers.
+    try rig.umount(m);
+    const c = try rig.spawnMountNs("f16-alone", set.metaUri(), &env_a, .{ .hostname = other }, &.{});
+    try rig.awaitLog(c, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, c, "mkdir f16 && echo c > f16/c && sync -d f16/c"));
+    try rig.umount(c);
+    try rig.disconnect(&set.cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+test "nvmet fidelity: pr5 F16b — the host's name changes while a sibling of the set runs (decision 0004 §4.4.2, KD19) — M and B share ONE UTS namespace (one keeper process holds it): M mounts under the old name, then B enters the same namespace and changes its name, so the two carry different node tokens inside one namespace and B refuses with `node_token_renamed`, naming its remedy (restart the old daemons or restore the name); once M is remounted under the new name the two agree and both mounts write and read each other's files" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "f16b", transport, try rig.servicePorts(transport));
+    var ob: [96:0]u8 = undefined;
+    var nb: [96:0]u8 = undefined;
+    const old_name = try std.fmt.bufPrintSentinel(&ob, "fideli-{d}-old", .{rig.pid}, 0);
+    const new_name = try std.fmt.bufPrintSentinel(&nb, "fideli-{d}-new", .{rig.pid}, 0);
+    const keeper = try Rig.utsKeeper(old_name);
+    defer _ = linux.kill(keeper, .KILL);
+    var env_a = try rig.envWith(ident_a);
+    defer env_a.deinit();
+    const m = try rig.spawnMountNs("f16b-old", set.metaUri(), &env_a, .{ .uts_of = keeper }, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, m, "mkdir f16b && echo m > f16b/m && sync -d f16b/m"));
+    // B enters the SAME namespace and moves its hostname: M keeps the old token,
+    // so neither can judge the other, and this namespace says the name changed.
+    const b = try rig.spawnMountNs("f16b-blind", set.metaUri(), &env_a, .{ .uts_of = keeper, .hostname = new_name }, &.{});
+    try rig.expectRefused(b, "(reason node_token_renamed)");
+    try rig.expectRefusedText(b, "restart them (or restore the name)");
+    // M remounted under the name the namespace carries now: the tokens agree.
+    try rig.umount(m);
+    const m2 = try rig.spawnMountNs("f16b-old-again", set.metaUri(), &env_a, .{ .uts_of = keeper }, &.{});
+    try rig.awaitLog(m2, "ready: ", ready_wait_ns);
+    const c = try rig.spawnMountNs("f16b-new", set.metaUri(), &env_a, .{ .uts_of = keeper }, &.{});
+    try rig.awaitLog(c, "ready: ", ready_wait_ns);
+    {
+        const out = try rig.onMount(c, "cat f16b/m");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("m\n", out);
+        try testing.expect(try scriptSucceeds(rig, c, "echo c > f16b/c && sync -d f16b/c"));
+        const back = try rig.onMount(m2, "cat f16b/c");
+        defer gpa.free(back);
+        try testing.expectEqualStrings("c\n", back);
+    }
+    try rig.umount(c);
+    try rig.umount(m2);
+    try rig.disconnect(&set.cm);
     try rig.unshare(set.data_nqn);
     try rig.unshare(set.meta_nqn);
     try expectNoResidue(rig, set.meta_nqn);

@@ -5,19 +5,24 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** The blind-rule refusals are `eea93412`. This note is the docs
-commit on top of it. Report-first recovery is `d75445b9`. Do not amend those.
-No upstream. Not pushed. Not merged. `dev` is `b40ac017`.
+**Branch `feat/pr5`.** Incompat bit 4 and `claim convert-pr` are `694b43c2`. This note
+is the docs commit on top of it. The blind-rule refusals are `eea93412`. Report-first
+recovery is `d75445b9`. Do not amend those. No upstream. Not pushed. Not merged.
+`dev` is `b40ac017`.
 
 Decision 0004 is the spec. PR-5 is not finished. W_end, the fence debt, `identityHolds`,
 the registration lock, rule markers, the re-acquire mark, the frozen-joiner kill,
-report-first recovery, and the blind-rule refusals are committed. The hashes are in
-the table below.
+report-first recovery, the blind-rule refusals, and incompat bit 4 are committed.
+The hashes are in the table below.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
-1. Incompat bit 4 and `claim convert-pr`. Then retire the fencing registrant. Then the
-   fidelity rows that are not yet written.
+1. Retire the fencing registrant (`src/meta/guard/fencer.zig`). `stand()` uses WEAR.
+   `forTest` stays WERO. `acquireManagerHold` still forces WERO. Flat `pr_rtype` 1 and
+   the WERO pr legs stay 1.
+2. Then the fidelity rows that are not yet written. F8 is the device row and stays
+   with those rows. `claim posture-reset` is the other offline door; it is not part
+   of retiring the fencer.
 
 A full venue gate has not been run on this branch. Do not merge to `dev` until that gate is
 green and the owner asks. Landing a fast-forward of `dev` is pushed by the local post-commit
@@ -43,6 +48,7 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | `7c7feecc` | The same holder across one member-death bound, every thread stopped or the cgroup frozen, and an unjoined joiner line. See below. |
 | `d75445b9` | A death fence whose key the report already shows absent is `.fenced` and issues no preempt. `appender_recovery_keys_absent`. See below. |
 | `eea93412` | A sibling the stale-sibling rule cannot judge is refused before registration. Registry root via `openat2`, and the node-token reasons. F15, F16, F16b. See below. |
+| `694b43c2` | Incompat bit 4 `META_PR_ALL_REGISTRANTS` and `squeezefs claim convert-pr --all-mounts-down`. A mount does not stamp the bit. See below. |
 
 ## What is true in the code
 
@@ -294,6 +300,38 @@ per source file plus the real rows. A green F15 line that says 41/41 is the one 
 - F16 and F16b (`~/tmp/pr5-f16-smoke.log`): `EXIT:0`, 42/42, the test step 9s. The product
   exe was cached.
 
+## META_PR_ALL_REGISTRANTS, committed `694b43c2`
+
+Decision 0004 §6.4 and decision 0002 row 571. Bit 4 is presence required.
+`features_incompat_known` is `0x1F`. `features_incompat_implemented` is the plane,
+the block-map tree, and bit 4. Layout deltas and the volume lifecycle stay refused.
+
+Format and enable-symmetric set the bit on the symmetric class.
+`SQUEEZEFS_TEST_FORMAT_WITHOUT_META_WEAR=1` omits it. A single-writer volume stays
+features 0. The missing-bit refusal is writer mode only, before
+`registerBeforeWrites`, and the log names `squeezefs claim convert-pr
+sqmeta://<path> --all-mounts-down`. A reader and `claim clear` still open.
+`Mode.convert_pr` returns `UnsupportedFormat` before replay. The verb is
+`guard.convert_pr.claimConvert`, which does not open a backend.
+
+The verb requires `--all-mounts-down`. It disconnects controllers whose hostnqn
+starts with `nqn.2026-10.io.squeezefs:fencer:` before any volume. Per volume: the
+writer flock, a single-writer volume is left untouched, a fresh claim or any other
+live registry line of the set refuses, then register, stamp bit 4 on both
+superblock copies, retype to Write Exclusive — All Registrants, restamp, and
+rewrite layout-1 directory pair slots and appender 0's four slots to layout 2
+with `host_key` 0. A foreign page keeps the stamp and the hold. A later volume's
+refusal leaves an earlier volume converted.
+
+`convertReservation` sets `client.rtype` to WEAR only after the confirming report.
+`preempt_alls` and `preempt_all_victims` move only then. `.acquired` is only an
+unreserved namespace, no other host, and a generation gap of 1.
+
+Units on this host, 2026-11-12: `scripts/venue test convert-pr`
+(`~/tmp/convert-pr-direct.log`, 51 pass) and the superblock, format, args,
+enable-symmetric, and device-format filters (`~/tmp/convert-pr-related.log`,
+52 pass, 714 ms). No full gate.
+
 ## Explicitly not in this branch
 
 - F9 and F10 have not been re-run on this commit. F1 has, after report-first recovery.
@@ -301,7 +339,7 @@ per source file plus the real rows. A green F15 line that says 41/41 is the one 
   the key already gone (`appender_recovery_preempts` 0, `appender_recovery_keys_absent` 1).
   That row has not been run.
 - Recovery's `fence(k)` does not call `identityHolds`.
-- Incompat bit 4 `META_PR_ALL_REGISTRANTS`, `Mode.convert_pr`, `claim convert-pr`, `claim posture-reset`.
+- `claim posture-reset --all-mounts-down` (`Mode.posture_reset`).
 - Deleting `src/meta/guard/fencer.zig`. `stand()` uses WEAR. `forTest` stays WERO. `acquireManagerHold` still forces WERO. Flat `pr_rtype` 1 and the WERO pr legs stay 1.
 - `meta_pr_succession_parks`, `meta_pr_succession_reregistrations`, `meta_pr_refusal_readmissions`. Do not invent them. Parks increment `stats.appender_parks`. `writer_guard_fenced` increments in `journal.noteFence`.
 - Fidelity rows F2, F3, F4, F5, F6, F7a, F7b, F8, F11, F12, F13, F14. F15, F16, and F16b are committed. F12/F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist.
@@ -329,7 +367,7 @@ Cache is `/build/zig-cache-v2`. One `zig build` takes a build slot. The nvmet ex
 
 ```bash
 git checkout feat/pr5
-git status -sb    # clean, no upstream; blind rules are eea93412
+git status -sb    # clean, no upstream; convert-pr is 694b43c2
 
 # Unit: census, debt, live-page skip, the old admission reconcile.
 scripts/venue 'zig build --cache-dir /build/zig-cache-v2 test -Dtest-filter="pr5 debt" -Dtest-filter="pr5 live page" -Dtest-filter="succession census" --summary all'

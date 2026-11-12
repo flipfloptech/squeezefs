@@ -574,6 +574,12 @@ const Lane = struct {
     }
 
     fn run(self: *Lane) void {
+        // A serve that waits out a succession park deadlocks `Listener.stop`:
+        // the beat that would release the gate is already joined. The FUSE
+        // committer still waits (decision 0004 §4.5.6).
+        const park = @import("../meta/sym/membership/park_reclaim.zig");
+        park.serve_must_not_wait = true;
+        defer park.serve_must_not_wait = false;
         const lanes = self.lanes;
         const conn = lanes.conn;
         const l = conn.listener;

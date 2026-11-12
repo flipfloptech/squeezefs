@@ -591,9 +591,16 @@ pub const MetaSet = struct {
             // appender leases is the door's to refuse, and a tree minted
             // for it would shadow the root a later grant transfers; a
             // joiner's unleased slot is minted by its first touch's install.
-            if (s.tree_id != key.TREE_CONTROL and h.be.slotTree(h.slot) == null and h.be.slots.mayMintAtCommit(h.slot)) _ = h.be.mintGuestTree(h.slot) catch {
+            if (s.tree_id != key.TREE_CONTROL and h.be.slotTree(h.slot) == null and h.be.slots.mayMintAtCommit(h.slot)) _ = h.be.mintGuestTree(h.slot) catch |e| {
                 self.abandon(t);
-                return error.Io;
+                // §4.16: a hold stays a hold. The mint waits out a park
+                // itself; this is the answer when it did not.
+                return switch (e) {
+                    error.Held => error.Held,
+                    error.Deferred => error.Deferred,
+                    error.VolumeFailed => error.VolumeFailed,
+                    else => error.Io,
+                };
             };
             const v = self.route.volumeOf(h.slot);
             if (home) |hv| {
@@ -913,6 +920,10 @@ pub const MetaSet = struct {
             const be = self.volumeOfSlot(m.slot);
             const local = be.allocateInoInSlot(m.slot) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
+                // §4.16. The mint waits out a parked hold before this.
+                error.Held => error.Held,
+                error.Deferred => error.Deferred,
+                error.VolumeFailed => error.VolumeFailed,
                 else => error.Io,
             };
             // The handover law (decision 0003 §BV): the ino is kept only

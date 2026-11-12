@@ -31,6 +31,9 @@
 
 const std = @import("std");
 const Io = std.Io;
+
+/// Set for the life of a cluster-wire connection thread. See `preAdmission`.
+pub threadlocal var serve_must_not_wait: bool = false;
 const counters = @import("../../../core/counters.zig");
 const clock = @import("../../../core/clock.zig");
 const log = @import("../../../core/log.zig");
@@ -191,6 +194,11 @@ pub const ParkGate = struct {
     /// RUNNING gate judges `T_self` first (`SelfFence`): a committer past
     /// the member's deadline parks the gate itself and waits like the rest.
     /// RETIRED answers `Retired`: this incarnation admits nothing more.
+    /// A cluster-wire serve does not wait (`serve_must_not_wait`). Its
+    /// caller's reply bound is 10 s and `Listener.stop` joins the thread,
+    /// so a park wait (up to `T_park_max`) both blows the bound and wedges
+    /// the dismount. It answers `Retired` (nothing written); the caller
+    /// retries. A FUSE committer still waits (decision 0004 §4.5.6).
     pub fn preAdmission(self: *ParkGate) error{ Expired, Retired }!void {
         while (true) {
             switch (self.word()) {
@@ -204,7 +212,7 @@ pub const ParkGate = struct {
                 },
                 .expired => return error.Expired,
                 .retired => return error.Retired,
-                .parked => {},
+                .parked => if (serve_must_not_wait) return error.Retired,
             }
             var n = self.admission_wake.notified();
             if (n.enable(self.io)) {
@@ -549,6 +557,16 @@ test "step 5 / the terminal poison: a park past T_park_max expires exactly once 
     try log.testing.expectAllFired();
     try testing.expect(g2.isExpired());
     try testing.expectEqual(@as(u32, 2), p.count);
+}
+
+test "a cluster-wire serve does not wait out a standing park: preAdmission answers Retired and the gate stays parked" {
+    var g = ParkGate.arm(testing.io, 0, 1 << 40);
+    _ = g.parkFor(.succession, 1);
+    serve_must_not_wait = true;
+    defer serve_must_not_wait = false;
+    try testing.expectError(error.Retired, g.preAdmission());
+    try testing.expect(g.isParked());
+    try testing.expectEqual(Reason.succession, g.reason);
 }
 
 test "THE RETIREMENT (a live member evicted re-joins in place): retire moves RUNNING or PARKED to RETIRED exactly once, exclusive with release and expiry; a parked committer wakes and refuses Retired, a later one at once; the leave writes nothing; a refused re-join expires the retired word into the poison" {

@@ -26,8 +26,10 @@
 //! identity per host, decision 0003 §DF), `sigstop-preempt` (a stopped holder is preempted past
 //! `T_owner`; resumed, its next beat reads the usurpation and its barrier
 //! answers the device's `-EBADE` — FAILED), F9/F9b (a grace
-//! reap carries the page's host key), F1 (a successor's preempt-all, decision
-//! 0004 §8.2) and F10 (a busy co-located joiner
+//! reap carries the page's host key), F1 (a successor's preempt-all), F2
+//! (two successors; the later preempt-all wins), F3 (the kept hold stays
+//! WEAR), F4 (a member death fenced by the manager's own client), decision
+//! 0004 §8.2, and F10 (a busy co-located joiner
 //! survives the superseded manager's takeover, decision 0004 §8.2); the blind-rule
 //! refusals F15, F16 and F16b (a daemon with its own `/run`, a second hostname on
 //! the host, the host's name moved under a running sibling — decision 0004 §4.4.2,
@@ -2742,7 +2744,7 @@ fn readyOrDead(rig: *Rig, d: usize) !bool {
 
 const ident_c: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0", .hostid = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0" };
 
-test "nvmet fidelity: stale sibling — one manager per volume and per-host fencing's safety rule on a three-host set: B (host A's manager) and A (a joiner on host A) under host A's one identity (B registers the host, A adopts); B frozen (SIGSTOP) past the claim's TTL; two successors on hosts B and C race for the role — P1 arbitrates and parks before its claim (SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD), P2 arbitrates meanwhile: the device keeps ONE holder (WERO), so P2's acquire conflicts and preempts P1's host, P2 binds and P1, released, never does (review round 3 N1: under rtype 5 both bound); host A was fenced by the takeover — a fresh mount on host A whose kill of B is refused (SQUEEZEFS_TEST_SIBLING_KILL_REFUSED) refuses its registration loud by name and exits, B alive; A's fsync then re-registers, killing the superseded B (decision 0004 §4.5.5), and the write lands; A2, after A is killed, adopts the standing registration, joins P2 and writes; P2 reads both" {
+test "nvmet fidelity: pr5 F2 — two successors (decision 0004 §8.2) — one manager per volume and per-host fencing's safety rule on a three-host set: B (host A's manager) and A (a joiner on host A) under host A's one identity (B registers the host, A adopts); B frozen (SIGSTOP) past the claim's TTL; two successors on hosts B and C race for the role — P1 arbitrates and parks before its claim (SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD), P2 arbitrates meanwhile: the device keeps ONE holder (WEAR, rtype 5): P2's preempt-all removes P1's host, P2 binds and P1 never does; host A was fenced by the takeover — a fresh mount on host A whose kill of B is refused (SQUEEZEFS_TEST_SIBLING_KILL_REFUSED) refuses its registration loud by name and exits, B alive; A's fsync then re-registers, killing the superseded B (decision 0004 §4.5.5), and the write lands; A2, after A is killed, adopts the standing registration, joins P2 and writes; P2 reads both" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -2793,9 +2795,17 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
     const p2_ready = try readyOrDead(rig, p2);
     releaseFifo(fifo);
     const p1_ready = try readyOrDead(rig, p1);
-    // ONE manager: the later arbiter (P2) preempted P1's host; P1 never binds.
+    // ONE manager: P2's preempt-all removed P1's host; P1 never binds.
     try testing.expect(p2_ready);
     try testing.expect(!p1_ready);
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
+        const sp = try rig.stats(p2);
+        defer gpa.free(sp);
+        try testing.expect(try statNumber(sp, "writer_guard_preempt_alls") >= 1);
+    }
     // A stale sibling that can be neither proven dead nor killed refuses the
     // registration loud by name: the mount exits, B lives on, host A stays
     // unregistered. This runs before A's fsync, which kills B.
@@ -2824,14 +2834,38 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
     // Host A was fenced by the takeover. A's fsync re-registers through the
     // rule, which kills the superseded B, and the write lands (decision
     // 0004 §4.5.5). Host C and host A are the registrants.
-    const a_wrote = scriptSucceeds(rig, a, "echo x > da/z && sync -d da/z") catch false;
-    if (!a_wrote) {
+    // ls separates a lookup of da from the create. The shell's exit is the
+    // create's, or the sync's once the create lands.
+    const wrote = std.process.run(gpa, rig.io, .{ .argv = &.{ "sh", "-c", "ls -d da; echo LS:$?; echo x > da/z; cr=$?; echo CR:$cr; if [ \"$cr\" -ne 0 ]; then exit \"$cr\"; fi; sync -d da/z; sy=$?; echo SY:$sy; exit $sy" }, .cwd = .{ .path = rig.daemons.items[a].mp }, .environ_map = &rig.env }) catch |e| {
+        std.debug.print("\n--- A's fsync spawn failed: {s} ---\n", .{@errorName(e)});
+        return e;
+    };
+    defer rig.freeRun(wrote);
+    if (!wrote.term.success()) {
+        std.debug.print("\n--- A's fsync failed ({f}) ---\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n", .{ wrote.term, wrote.stdout, wrote.stderr });
+        std.debug.print("--- B alive {any} ---\n", .{alive(pid_b)});
+        if (rig.stats(a)) |sa| {
+            defer gpa.free(sa);
+            std.debug.print("--- A kills {?d} regs {?d} adopts {?d} parked {?d} parks {?d} fenced {?d} ---\n", .{
+                json_scan.number(sa, "pr_stale_sibling_kills"),
+                json_scan.number(sa, "pr_host_registrations"),
+                json_scan.number(sa, "pr_host_adoptions"),
+                json_scan.number(sa, "appender_parked"),
+                json_scan.number(sa, "appender_parks"),
+                json_scan.number(sa, "volume_fenced"),
+            });
+        } else |e| std.debug.print("--- A's stats unreadable: {s} ---\n", .{@errorName(e)});
+        if (rig.resvReportJson(cm.dev())) |rr| {
+            defer gpa.free(rr);
+            std.debug.print("--- report rtype {?d} regctl {?d} ---\n", .{ json_scan.number(rr, "rtype"), json_scan.number(rr, "regctl") });
+        } else |e| std.debug.print("--- report unreadable: {s} ---\n", .{@errorName(e)});
         if (rig.readLog(a)) |text| {
             defer gpa.free(text);
-            std.debug.print("\n--- A's log after the refused fsync ---\n{s}\n", .{text});
-        } else |_| {}
+            const from = std.mem.indexOf(u8, text, "appender park:") orelse 0;
+            std.debug.print("--- A's log from the park ---\n{s}\n", .{text[from..]});
+        } else |e| std.debug.print("--- A's log unreadable: {s} ---\n", .{@errorName(e)});
     }
-    try testing.expect(a_wrote);
+    try testing.expect(wrote.term.success());
     try testing.expect(!alive(pid_b));
     {
         const sa = try rig.stats(a);
@@ -2918,7 +2952,7 @@ test "nvmet fidelity: a remote joiner never registers or writes before its claim
     try expectNoResidue(rig, set.data_nqn);
 }
 
-test "nvmet fidelity: a superseded manager never wins the hold back (review round 3 major 3) nor writes over its successor's acked data (review 4 blocker 2) — M0 (host A), its last files unsynced, frozen past its claim's TTL; the successor S (host B) takes over by a preempt, writes ds/s and unmounts cleanly: a hold taken by a preempt STAYS (regctl 1, rtype 3 — the next mount preempts or adopts it; releasing it re-admitted every host the preempt fenced); S2 on host B adopts the standing hold, reads ds/s, writes ds/t and unmounts: the inherited hold stays too; M0 resumed is refused at its first write or its beat (writer_guard_fenced 1, writer_guard_pr_reacquires 0) — its checkpoint lands nothing; a remount reads ds/s and ds/t back" {
+test "nvmet fidelity: pr5 F3 — a superseded manager never wins the hold back (decision 0004 §4.12, §8.2) nor writes over its successor's acked data (review 4 blocker 2) — M0 (host A), its last files unsynced, frozen past its claim's TTL; the successor S (host B) takes over by a preempt-all, writes ds/s and unmounts cleanly: a hold taken by a preempt STAYS (regctl 1, rtype 5 — the next mount adopts it; releasing the last registrant would re-admit every host the preempt fenced); S2 on host B adopts the standing hold, reads ds/s, writes ds/t and unmounts: the inherited hold stays too; M0 resumed is refused at its first write or its beat (writer_guard_fenced 1, writer_guard_pr_reacquires 0) — its checkpoint lands nothing; a remount reads ds/s and ds/t back" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -2979,7 +3013,7 @@ test "nvmet fidelity: a superseded manager never wins the hold back (review roun
 }
 
 /// After a takeover successor's clean last unmount: its hold stands under
-/// WERO with its host's one registration (review 4 blocker 2).
+/// WEAR with its host's one registration (decision 0004 §4.12).
 fn expectHoldStands(rig: *Rig, dev: []const u8) !void {
     const rr = try rig.resvReportJson(dev);
     defer rig.gpa.free(rr);
@@ -3148,6 +3182,90 @@ fn probeCost(rig: *Rig, d: usize) !ProbeCost {
 
 /// The membership `T_owner` of the member-death row (the smoke rows' value).
 const member_t_owner_ms: u64 = 3000;
+
+test "nvmet fidelity: pr5 F4 — member death, no fencer (decision 0004 §4.8, §8.2) — M (host B) manages WEAR; X (host A) writes behind a held landing (SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE) and is SIGSTOPped; M's own client preempt-and-aborts X's key (appender_recovery_preempts 1, meta_pr_preempt_kept 0, regctl 1, rtype 5, X's key gone); X's held windows, released and X resumed, are refused at the device (a reservation conflict, -EBADE)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "f4", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    var tb: [16]u8 = undefined;
+    const t_owner = try std.fmt.bufPrint(&tb, "{d}", .{member_t_owner_ms});
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var fb: [128]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/f4-landing.fifo", .{rig.root}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    var env_m = try rig.envWith(ident_b);
+    defer env_m.deinit();
+    try env_m.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    var env_x = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
+    defer env_x.deinit();
+    // X's second FUSE WRITE arms the hold: that write's commit and every
+    // later one admitted and acked, never issued until the FIFO opens.
+    try env_x.put("SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", "2");
+    try env_x.put("SQUEEZEFS_TEST_LANDING_HOLD_RELEASE", fifo);
+    const m = try rig.spawnMountEnv("f4-m", meta_uri_b, &env_m, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const x = try rig.spawnMountEnv("f4-x", set.metaUri(), &env_x, &.{});
+    try rig.awaitLog(x, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, x, "mkdir dx && echo a > dx/a && sync -d dx/a && echo b > dx/b"));
+    try rig.awaitLog(x, "test seam: SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", ready_wait_ns);
+    try rig.awaitLog(x, "SQUEEZEFS_TEST_LANDING_HOLD_RELEASE — the release waits", ready_wait_ns);
+    const key_x = try statString(rig, x, "pr_key");
+    defer gpa.free(key_x);
+    const key_m = try statString(rig, m, "pr_key");
+    defer gpa.free(key_m);
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
+        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
+        try testing.expect(std.mem.indexOf(u8, rr, key_x) != null);
+    }
+    _ = linux.kill(rig.daemons.items[x].pid, .STOP);
+    const sm = try rig.awaitStat(m, "appender_recoveries", 1, ready_wait_ns);
+    defer gpa.free(sm);
+    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
+    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recovery_preempts"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(sm, "meta_pr_preempt_kept"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(sm, "appender_recovery_refences"));
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expect(std.mem.indexOf(u8, rr, key_x) == null);
+        try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+        try testing.expectEqualStrings(key_m, json_scan.string(rr, "holder_key") orelse return error.StatMissing);
+        // holder_key and the one registrant. WEAR: that registrant holds.
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, rr, key_m));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rr, "\"holds_reservation\":true"));
+    }
+    releaseFifo(fifo);
+    _ = linux.kill(rig.daemons.items[x].pid, .CONT);
+    try rig.awaitLog(x, "SQUEEZEFS_TEST_LANDING_HOLD_RELEASE released", 30 * std.time.ns_per_s);
+    try rig.awaitLog(x, "journal: reservation-conflict errno at", 30 * std.time.ns_per_s);
+    try rig.kill9(x);
+    try rig.umount(m);
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+        try testing.expectEqualStrings(key_m, json_scan.string(rr, "holder_key") orelse return error.StatMissing);
+    }
+    // The rig's connect and host B's. No fencing-registrant controller.
+    try testing.expectEqual(@as(u32, 2), try rig.controllersOf(set.meta_nqn, null));
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
 
 /// The data-fence row's data volume: 32 MiB at 64 KiB blocks (510 usable),
 /// so a fill to ENOSPC takes every free block — the dead member's grant

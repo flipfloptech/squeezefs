@@ -1384,6 +1384,13 @@ pub const WirePlane = struct {
                 log.warn("cluster wire: SQUEEZEFS_TEST_MEMBERSHIP_LEAVE_LOST — the membership leave is not sent (the home shard keeps this member's row)", .{});
             } else j.member.leave() catch log.err("cluster wire: the membership leave was refused over a standing park or past the poison — the home shard records this mount's death", .{});
         }
+        // The beat that would clear a held window is already joined.
+        // `Listener.stop` joins a serve blocked in that window
+        // (`Conveyor.commit` → `awaitPast`), and `shutdown` — the
+        // terminate that wakes it — sits behind the join.
+        if (self.joined) |j| {
+            if (j.js.resolution.snapshot().state == .pending) j.js.resolution.terminate();
+        }
         self.listener.stop();
         stats.wire_listener_up.set(0);
         stats.wire_listener_connections.set(0);

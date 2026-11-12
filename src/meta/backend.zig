@@ -2758,28 +2758,44 @@ pub const KvBackend = struct {
     /// root in a fresh extent (its image written now, barriered and named
     /// in tree 0 by the next checkpoint's C1b; a crash before that recreates
     /// it from the window). Serialized on `trees_lock`; a concurrent first
-    /// toucher finds the winner's tree.
+    /// toucher finds the winner's tree. A reservation hold while this
+    /// joiner is parked (decision 0004 §4.5.6) drops the lock and waits
+    /// out the park, then mints again.
     pub fn mintGuestTree(be: *KvBackend, slot: u16) OpenError!*KvTree {
         const identity: tree.TreeIdentity = .{ .slot = key.guestForestSlot(slot) };
-        if (be.trees.find(identity)) |t| return t;
-        be.trees_lock.lockUncancelable(be.io);
-        defer be.trees_lock.unlock(be.io);
-        if (be.trees.find(identity)) |t| return t;
-        const t = KvTree.create(be.gpa, be.cache, &be.alloc, identity, &be.seq) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Io => return error.Io,
-            error.NoSpace => {
-                log.err("meta volume {s}: no heap extent for slot {d}'s first tree (heap full)", .{ be.path, slot });
-                return error.Io;
-            },
-            else => |other| return other,
-        };
-        errdefer t.destroy();
-        // Its records are this commit's and later: none sits under the head.
-        t.setRootFloor(be.core.headPos());
-        try be.trees.add(t);
-        routing.stats.stats.routing_guest_trees_minted.inc();
-        return t;
+        while (true) {
+            if (be.trees.find(identity)) |t| return t;
+            // The device answer already ran the readmit hook (the park
+            // upgrade) before `Held` got here. Wait outside `trees_lock`:
+            // the member thread re-registers and releases the gate.
+            parked: {
+                be.trees_lock.lockUncancelable(be.io);
+                defer be.trees_lock.unlock(be.io);
+                if (be.trees.find(identity)) |t| return t;
+                const t = KvTree.create(be.gpa, be.cache, &be.alloc, identity, &be.seq) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Io => return error.Io,
+                    error.NoSpace => {
+                        log.err("meta volume {s}: no heap extent for slot {d}'s first tree (heap full)", .{ be.path, slot });
+                        return error.Io;
+                    },
+                    error.Held => break :parked,
+                    else => |other| return other,
+                };
+                errdefer t.destroy();
+                // Its records are this commit's and later: none sits under the head.
+                t.setRootFloor(be.core.headPos());
+                try be.trees.add(t);
+                routing.stats.stats.routing_guest_trees_minted.inc();
+                return t;
+            }
+            const js = be.joined orelse return error.Held;
+            if (!js.park_gate.isParked()) return error.Held;
+            js.park_gate.preAdmission() catch |pe| return switch (pe) {
+                error.Expired => error.VolumeFailed,
+                error.Retired => error.Deferred,
+            };
+        }
     }
 
     /// A guest tree built elsewhere (the migration engine's bulk copy)

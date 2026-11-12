@@ -5,9 +5,9 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** HEAD when this note was written is `eea93412`, the blind-rule
-refusals, on top of the docs commit `f3d04fa9` and report-first recovery `d75445b9`.
-Do not amend those. No upstream. Not pushed. Not merged. `dev` is `b40ac017`.
+**Branch `feat/pr5`.** The blind-rule refusals are `eea93412`. This note is the docs
+commit on top of it. Report-first recovery is `d75445b9`. Do not amend those.
+No upstream. Not pushed. Not merged. `dev` is `b40ac017`.
 
 Decision 0004 is the spec. PR-5 is not finished. W_end, the fence debt, `identityHolds`,
 the registration lock, rule markers, the re-acquire mark, the frozen-joiner kill,
@@ -329,7 +329,7 @@ Cache is `/build/zig-cache-v2`. One `zig build` takes a build slot. The nvmet ex
 
 ```bash
 git checkout feat/pr5
-git status -sb    # clean, eea93412, no upstream
+git status -sb    # clean, no upstream; blind rules are eea93412
 
 # Unit: census, debt, live-page skip, the old admission reconcile.
 scripts/venue 'zig build --cache-dir /build/zig-cache-v2 test -Dtest-filter="pr5 debt" -Dtest-filter="pr5 live page" -Dtest-filter="succession census" --summary all'

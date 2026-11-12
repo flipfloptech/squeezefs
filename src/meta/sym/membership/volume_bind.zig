@@ -151,7 +151,6 @@ pub const VolumeBinding = struct {
             .mount = .{
                 .identity = identity,
                 .meta_pr = if (be.guard) |g| g.prClient() else null,
-                .fencer = if (be.guard) |g| g.fencerClient() else null,
                 // The data namespaces' fence binds once the data plane's
                 // admission ran (`WirePlane.bindDataFence`, decision 0003
                 // §DJ).

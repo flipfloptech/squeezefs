@@ -157,8 +157,7 @@ pub const Device = struct {
 
 /// The issuers' lock: `std.Io.Mutex`'s three-state algorithm over the raw
 /// process-private futex (the Device holds no `Io`; a PR command is no hot
-/// path). 0 unlocked, 1 locked, 2 locked with waiters. The fencing
-/// registrant's sequence lock is one too (`fencer.zig`).
+/// path). 0 unlocked, 1 locked, 2 locked with waiters.
 pub const IssueLock = struct {
     word: futex.Word = .init(0),
 

@@ -53,7 +53,6 @@ const proc = @import("proc.zig");
 const nvme = @import("nvme_cmd.zig");
 const host_fence = @import("host_fence.zig");
 const marker = @import("marker.zig");
-const fencer = @import("fencer.zig");
 const fencing = @import("../sym/membership/fencing.zig");
 const join = @import("../sym/join.zig");
 const joined = @import("../sym/joined.zig");
@@ -85,8 +84,6 @@ pub const Options = struct {
     test_identity: if (builtin.is_test) ?claim.Identity else void = if (builtin.is_test) null else {},
     test_namespace: if (builtin.is_test) ?nvme.Namespace else void = if (builtin.is_test) null else {},
     test_pid_probe: if (builtin.is_test) ?claim.PidProbe else void = if (builtin.is_test) null else {},
-    /// A fencing registrant over a fake host's face beside `test_namespace`.
-    test_fencer: if (builtin.is_test) ?nvme.Namespace else void = if (builtin.is_test) null else {},
     /// Skip layer A (the flock): the "another host" simulation — two
     /// writers of one volume in one process, so the claim alone refuses.
     test_skip_flock: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
@@ -187,20 +184,12 @@ pub const Guard = struct {
     /// plane's stop, the data fence's release) — a heartbeat never calls
     /// into a stopped plane or a released fence.
     hooks_lock: pr_linux.IssueLock = .{},
-    /// The manager's fencing registrant (decision 0003 §DG), stood after the
-    /// hold on a symmetric volume; null with `fencer_absent` naming why.
-    fencer: ?*fencer.Fencer = null,
-    fencer_absent: ?fencer.Absent = null,
     /// Orders the holder client's multi-command sequences — the heartbeat's
     /// report and re-acquire, recovery's check-preempt-verify, the teardown's
     /// leave — so its shared state (the register ladder's status, the cached
     /// wire host id, the counters) has one writer at a time (review minor 4
-    /// of §DG). Taken before the fencer's sequence lock, never after.
+    /// of §DG).
     pr_seq_lock: pr_linux.IssueLock = .{},
-    test_fencer: if (builtin.is_test) ?nvme.Namespace else void = if (builtin.is_test) null else {},
-    /// Test seam: fired in a lapse's re-acquire between the hold and the
-    /// fencer's re-register (a successor's hold landing in that window).
-    test_after_reacquire: if (builtin.is_test) ?TestHook else void = if (builtin.is_test) null else {},
     /// Test seam: fired after a lapse's claim probe read "ours" and before
     /// the re-acquire (a successor's whole tenure landing in that window).
     test_after_lapse_probe: if (builtin.is_test) ?TestHook else void = if (builtin.is_test) null else {},
@@ -385,12 +374,6 @@ pub const Guard = struct {
         };
     }
 
-    /// The fencing registrant's client (the death preempts' issuer).
-    pub fn fencerClient(self: *const Guard) ?*pr.Client {
-        const f = self.fencer orelse return null;
-        return f.client;
-    }
-
     pub fn ourClaim(self: *const Guard) claim.Claim {
         var c = self.identity.claim(self.be.index, clock.realtimeCoarseNs());
         c.heartbeat_seq = self.heartbeat_seq;
@@ -404,10 +387,6 @@ pub const Guard = struct {
             try w.writeAll(",\"pr\":");
             try c.writeStatsJson(w);
         }
-        if (self.fencer) |f| {
-            try w.writeAll(",\"pr_fencer\":");
-            try f.writeStatsJson(w);
-        } else if (self.fencer_absent) |why| try w.print(",\"pr_fencer_absent\":\"{t}\"", .{why});
         try w.writeByte('}');
     }
 
@@ -435,7 +414,6 @@ pub const Guard = struct {
         const g = try gpa.create(Guard);
         errdefer gpa.destroy(g);
         g.* = .{ .gpa = gpa, .io = io, .be = be, .mode = opts.mode, .identity = identity, .probe = probe, .posture = .{ .none = .not_nvme_namespace }, .identity_opts = opts.identity, .identity_stamp = .{ .nqn_hash = 0, .id_hash = 0 } };
-        if (builtin.is_test) g.test_fencer = opts.test_fencer;
         g.lapse_grace_ns = claim.lapseGraceNs(be.env);
         if (!identity.bootIdReadable()) log.warn("meta volume {s}: the boot id is unreadable — the same-host dead-pid proof never applies on this host (every foreign claim is judged by the TTL alone)", .{be.path});
 
@@ -772,40 +750,6 @@ pub const Guard = struct {
         }
         // Rung 6's shared-identity probe: another rkey under our wire id.
         if (c.identityShared() catch false) log.warn("{s}: another registration shares this mount's wire host id — fencing between the two is PROCESS-LOCAL (co-located mounts on one registrant)", .{g.be.path});
-        if (g.be.sb.symmetricPlaneStamped()) g.standFencer(c);
-    }
-
-    /// The manager's fencing registrant (decision 0003 §DG), after the hold
-    /// and the stale-sibling rule: registered under the host's key, its
-    /// preempts a non-holder's. Never fails the open — without it a death
-    /// preempt is the holder's own (device-grade on a spec-conformant
-    /// target, §DF.11's detection on nvmet 7.3), said here.
-    fn standFencer(g: *Guard, c: *pr.Client) void {
-        if (builtin.is_test) if (g.test_fencer) |face| {
-            g.fencer = fencer.Fencer.forTest(g.gpa, face, c.key) catch null;
-            if (g.fencer) |f| _ = f.confirmHeld(c);
-            return;
-        };
-        const dev = g.device orelse return;
-        const st: fencer.Stood = if (c.wireHostId()) |wire|
-            fencer.stand(g.gpa, g.be.env, .{ .path = g.be.path, .node = dev.nodeName(), .nsid = dev.nsid, .wire_host_id = wire, .set_uuid = g.be.sb.set_uuid, .key = c.key })
-        else |_|
-            .{ .absent = .no_wire_host_id };
-        switch (st) {
-            .stood => |f| {
-                // The hold may have passed since (a successor's preempt):
-                // the fencer never stands registered beside a host that does
-                // not hold (review M1 of §DG). The open then fails at its
-                // first write; the fencer is given back at its teardown.
-                _ = f.confirmHeld(c);
-                g.fencer = f;
-            },
-            .absent => |why| {
-                g.fencer_absent = why;
-                fencing.stats.pr_fencer_unavailable.inc();
-                log.warn("meta volume {s}: no fencing registrant ({s}) — a member's death preempt rides this holder's own: device-grade on a spec-conformant target, DETECTION ONLY on nvmet 7.3 (decision 0003 §DF.11, §DG)", .{ g.be.path, why.text() });
-            },
-        }
     }
 
     /// The hold. Symmetric volumes take the preempt-all (`c.rtype` is WEAR).
@@ -1302,7 +1246,8 @@ pub const Guard = struct {
                 // this host holds: no successor binds without fencing it, and
                 // one that bound and left replaced or deleted the claim.
                 switch (g.deviceClaim()) {
-                    .ours => outcome = sqz.runBlocking(fencerReregisterBlocking, .{ g, c }) catch return true,
+                    // The re-read already proved the claim. The hold stands.
+                    .ours => {},
                     .foreign => {
                         _ = g.be.lane.latch.noteFence("the reservation lapse: the device's claim, read again after the re-acquire, names another writer");
                         log.err("meta volume {s}: after the re-acquire the claim on the device is not this incarnation's — a successor bound (and left) between the claim probe and the hold: this volume fail-stops instead of running on a superseded view", .{g.be.path});
@@ -1353,8 +1298,7 @@ pub const Guard = struct {
             return .report_failed;
         };
         const rtype = rep.rtype;
-        // Held by THIS host: our key under our host id — never another
-        // identity under the same key (the fencer, decision 0003 §DG).
+        // Held by THIS host: our key under our host id.
         const me = c.wireHostId() catch {
             rep.deinit(c.gpa);
             log.warn("meta volume {s}: the host identifier read failed on the heartbeat — retrying next beat", .{g.be.path});
@@ -1429,23 +1373,6 @@ pub const Guard = struct {
         c.acquire() catch return .reacquire_failed;
         if (locked) g.writeReacquireMark(c);
         if (locked and fresh) guard.stats.pr_host_registrations.inc();
-        return .reacquired;
-    }
-
-    /// After the re-acquire and the claim's re-read: the lapse forgot the
-    /// fencer too; re-registered, it must find this host holding (review M1
-    /// of §DG) — a successor's hold that landed since the acquire leaves it
-    /// unregistered and this volume usurped.
-    fn fencerReregisterBlocking(g: *Guard, c: *pr.Client) Recheck {
-        if (builtin.is_test) if (g.test_after_reacquire) |h| h.fire(h.ctx);
-        c.lockOps();
-        defer c.unlockOps();
-        if (g.fencer) |f| {
-            if (!f.reregisterHeld(c)) {
-                const foreign = (c.holder() catch null) orelse 0;
-                return .{ .usurped = foreign };
-            }
-        }
         return .reacquired;
     }
 
@@ -1544,19 +1471,9 @@ pub const Guard = struct {
                 // early registration): nothing to take back.
                 const registered = g.pr_active or g.early_fresh != null;
                 if (!registered) last = false;
-                // The fencer's preempts are this manager's (decision 0003
-                // §DG): counted before it goes, given back first (its last
-                // user unregisters it).
-                var fencer_preempts: u64 = 0;
-                if (g.fencer) |f| {
-                    fencer_preempts = f.client.stats.preempts;
-                    f.release();
-                    g.fencer = null;
-                }
                 // A hold taken by a preempt or inherited — or one under which
-                // this client or its fencer preempted a member — stays
-                // (review 4 blocker 2): released, it would re-admit the
-                // fenced host (unreserved).
+                // this client preempted a member — stays (review 4 blocker
+                // 2): released, it would re-admit the fenced host (unreserved).
                 // The kept-law release is a manager mutation (decision 0004
                 // §4.4.2). Unreadable or usurped: leave the registration.
                 var section: host_fence.RegistrationHold = .{};
@@ -1588,7 +1505,7 @@ pub const Guard = struct {
                     // runs across the leave (review minor 4).
                     c.lockOps();
                     defer c.unlockOps();
-                    host_fence.leaveRegistration(c, g.keep_hold or c.stats.preempts > 0 or fencer_preempts > 0) catch |e| {
+                    host_fence.leaveRegistration(c, g.keep_hold or c.stats.preempts > 0) catch |e| {
                         var buf: [128]u8 = undefined;
                         var w: Io.Writer = .fixed(&buf);
                         c.writeError(&w, e) catch {};
@@ -2222,49 +2139,40 @@ test "region 0's appender page carries the manager's registration key (decision 
     try testing.expectEqual(@as(u64, 0), try page0HostKey(be));
 }
 
-const host_f_id: [16]u8 = "guard-fencer-03!".*;
-
-test "the fencing registrant on a PR substrate (the fake, decision 0003 §DG): the symmetric manager stands its fencer after the hold — registered under the manager's key beside its host, never the holder (regctl 2); a member's death preempt through it lands under nvmet 7.3's semantics; the clean unmount gives the fencer back and KEEPS the hold a preempt landed under; without a preempt the unmount leaves zero residue" {
+test "a symmetric manager's own preempt-and-abort fences a member under nvmet 7.3's holder-preempt quirk (decision 0004 §4.8): WEAR, one registrant, the victim unregistered, the hold kept across the clean unmount because the preempt landed; a later open that preempts nobody leaves zero residue" {
     const gpa = testing.allocator;
-    const v = try Vol.create(gpa, "fencer", null);
+    const v = try Vol.create(gpa, "wear-death", null);
     defer v.destroy();
     var ns = fake.Namespace.init(gpa);
     defer ns.deinit();
     ns.holder_preempt_retypes = true;
     var host: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
-    var fhost: fake.Host = .{ .ns = &ns, .host_id = host_f_id };
     const me = ident(boot_a, 4000, 777);
-    const pr_key = claim.prKey(me.writerId(0), boot_a);
     {
-        const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_fencer = fhost.face(), .test_pid_probe = PidTable.probe }, 0);
-        const g = be.guard.?;
-        try testing.expect(g.fencerClient() != null);
-        try testing.expectEqual(@as(usize, 2), ns.registered.items.len);
-        try testing.expectEqual(pr_key, ns.find(host_f_id).?.key);
+        const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
+        const c = be.guard.?.prClient().?;
+        try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
+        try testing.expectEqual(@as(usize, 1), ns.registered.items.len);
         try testing.expect(ns.isHolder(host_a_id));
-        var buf: [4096]u8 = undefined;
-        var w: Io.Writer = .fixed(&buf);
-        try g.writeStatsJson(&w);
-        try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"pr_fencer\":{") != null);
-        // A member host registers; its death preempt goes through the fencer.
         var mhost: fake.Host = .{ .ns = &ns, .host_id = host_b_id };
         var member = try pr.Client.init(gpa, mhost.face(), 1, 0xb0b0);
         defer member.deinit();
         _ = try fencing.joinAsRegistrant(&member, null);
-        try testing.expectEqual(fencing.PreemptOutcome.fenced, fencing.preemptDeadRegistrant(g.prClient(), g.fencerClient(), 0xb0b0));
+        try testing.expectEqual(fencing.PreemptOutcome.fenced, fencing.preemptDeadRegistrant(c, 0xb0b0));
         try testing.expect(!ns.writeAllowed(host_b_id));
+        try testing.expect(c.stats.preempts > 0);
         be.close();
     }
-    // The fencer unregistered (its last user); the hold kept: a preempt
-    // landed under it — released, the fenced host would be re-admitted.
-    try testing.expect(ns.find(host_f_id) == null);
+    // The hold kept: a preempt landed under it — released, the fenced host
+    // would be re-admitted.
     try testing.expect(ns.isHolder(host_a_id));
     try testing.expectEqual(@as(usize, 1), ns.registered.items.len);
     try testing.expect(!ns.writeAllowed(host_b_id));
     ns.powerCycle();
     {
-        const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_fencer = fhost.face(), .test_pid_probe = PidTable.probe }, 0);
-        try testing.expectEqual(@as(usize, 2), ns.registered.items.len);
+        const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_pid_probe = PidTable.probe }, 0);
+        try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
+        try testing.expectEqual(@as(usize, 1), ns.registered.items.len);
         be.close();
     }
     try testing.expectEqual(@as(?u64, null), ns.holder);
@@ -2313,56 +2221,11 @@ test "review (the lapse claim window, decision 0003 §DG.13(h)): a lapse's re-ac
     try log.testing.expectAllFired();
 }
 
-/// A successor on host B taking the hold by preempting `victim` (the
-/// manager's key) — the M1 window's other side.
-const Takeover = struct {
-    s: *pr.Client,
-    victim: u64,
-
-    fn run(ctx: *anyopaque) void {
-        const t: *Takeover = @ptrCast(@alignCast(ctx));
-        _ = t.s.registerLadder() catch return;
-        t.s.preempt(t.victim) catch return;
-    }
-};
-
-test "review M1 (decision 0003 §DG): a fencer re-registered after its host was preempted never preempts — a lapse; the manager's beat re-acquires; a successor's hold preempts the manager's key before the fencer's re-register (the seam); the fencer re-registers under the superseded key; the manager, finishing a recovery, preempts the successor's host key through it: REFUSED — the successor keeps its reservation (nvmet's holder-key arm would have made the fencer the holder) and the fencer is not left registered" {
-    const gpa = testing.allocator;
-    const v = try Vol.create(gpa, "m1", "600000");
-    defer v.destroy();
-    var ns = fake.Namespace.init(gpa);
-    defer ns.deinit();
-    ns.holder_preempt_retypes = true;
-    var host: fake.Host = .{ .ns = &ns, .host_id = host_a_id };
-    var fhost: fake.Host = .{ .ns = &ns, .host_id = host_f_id };
-    var shost: fake.Host = .{ .ns = &ns, .host_id = host_b_id };
-    const me = ident(boot_a, 4000, 777);
-    const pr_key = claim.prKey(me.writerId(0), boot_a);
-    const be = try v.open(.{ .test_identity = me, .test_namespace = host.face(), .test_fencer = fhost.face(), .test_pid_probe = PidTable.probe }, 0);
-    defer be.close();
-    const g = be.guard.?;
-    var s = try pr.Client.init(gpa, shost.face(), 1, 0x5a5a);
-    defer s.deinit();
-    s.rtype = nvme.RTYPE_WERO;
-    var takeover: Takeover = .{ .s = &s, .victim = pr_key };
-    g.test_after_reacquire = .{ .ctx = &takeover, .fire = Takeover.run };
-    log.testing.expectErrorLogs(2);
-    g.lapse_grace_ns = 0; // the hold at the lapse's first beat (the grace has its own test)
-    ns.powerCycle();
-    g.beat();
-    try testing.expect(ns.isHolder(host_b_id));
-    const out = fencing.preemptDeadRegistrant(g.prClient(), g.fencerClient(), 0x5a5a);
-    try testing.expect(out != .fenced);
-    try testing.expect(ns.isHolder(host_b_id));
-    try testing.expect(ns.find(host_f_id) == null);
-    // The beat read the successor's hold after its re-acquire: usurped.
-    try testing.expect(be.isFailed());
-    try log.testing.expectAllFired();
-}
-
 test "the recovery ladder step 2 on PR: a TTL-stale foreign claim with a foreign reservation holder is PREEMPTED (one preempt, holder transferred); a FRESH foreign claim is refused BEFORE any PR arbitration; a conflict with no holder in the report refuses blind" {
     const gpa = testing.allocator;
-    const v = try Vol.create(gpa, "preempt", null);
+    // Flat (`--single-writer`). A symmetric hold refuses a reservation that
+    // is not WEAR (decision 0004 §6.4) instead of preempting its one holder.
+    const v = try Vol.createClassed(gpa, "preempt", null, .single_writer);
     defer v.destroy();
     var ns = fake.Namespace.init(gpa);
     defer ns.deinit();

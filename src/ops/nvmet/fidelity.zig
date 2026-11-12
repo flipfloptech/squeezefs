@@ -25,9 +25,7 @@
 //! registrants), `co-located mounts` and `stale sibling` (one host
 //! identity per host, decision 0003 §DF), `sigstop-preempt` (a stopped holder is preempted past
 //! `T_owner`; resumed, its next beat reads the usurpation and its barrier
-//! answers the device's `-EBADE` — FAILED), the member-death rows (the
-//! manager's fencing registrant preempts the dead member's host, decision
-//! 0003 §DG; a frozen member's released windows refused), F9/F9b (a grace
+//! answers the device's `-EBADE` — FAILED), F9/F9b (a grace
 //! reap carries the page's host key), F1 (a successor's preempt-all, decision
 //! 0004 §8.2) and F10 (a busy co-located joiner
 //! survives the superseded manager's takeover, decision 0004 §8.2); the blind-rule
@@ -71,8 +69,6 @@ const pr_legs = @import("pr_legs.zig");
 const initiator = @import("initiator.zig");
 const journal_tail = @import("../../meta/journal_tail.zig");
 const multipath = @import("multipath.zig");
-const fencing = @import("../../meta/sym/membership/fencing.zig");
-const proc = @import("../../meta/guard/proc.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("ops/nvmet/fidelity is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -1929,121 +1925,6 @@ test "nvmet fidelity: keepalive-teardown-during-drain-tcp — P17's keep-alive-e
 /// before the record), the data volume's `fabric_endpoint` record set,
 /// the operator's data association released — the daemon connects its
 /// own at mount.
-/// A PR client on a connected namespace's char twin (the caller frees both).
-fn clientOn(gpa: Allocator, c: *const Connected, key: u64) !struct { dev: *pr_linux.Device, client: *pr.Client } {
-    const dev = switch (pr_linux.resolve(gpa, c.dev())) {
-        .device => |d| d,
-        .none => return error.NotAnNvmeNamespace,
-    };
-    errdefer dev.deinit();
-    const client = try gpa.create(pr.Client);
-    errdefer gpa.destroy(client);
-    client.* = try pr.Client.init(gpa, dev.face(), dev.nsid, key);
-    client.rtype = nvme.RTYPE_WERO;
-    _ = try client.probeRescap();
-    return .{ .dev = dev, .client = client };
-}
-
-const ident_fa: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:fafafafa-fafa-4afa-8afa-fafafafafafa", .hostid = "fafafafa-fafa-4afa-8afa-fafafafafafa" };
-
-test "nvmet fidelity: the fencing registrant's device laws on nvmet 7.3 (decision 0003 §DG) — four identities on one loop namespace: host A holds WERO under key K, host A's fencer F registered under the SAME key K from another host id, member host B under KB, successor host C under KC; F's preempt of KB unregisters B (its write refused, -EBADE) and keeps A's reservation — A the holder, F not; C's takeover preempt of K unregisters A AND F in one command; F's preempt then answers a conflict (nothing fenced, C's hold intact)" {
-    const gpa = testing.allocator;
-    var rig = try venue(gpa, testing.io);
-    defer rig.deinit();
-    const nqn = try rig.share("fl", meta_len, .loop, 0);
-    const ca = try rig.connect(nqn, .loop, 0, null, &.{});
-    const cf = try rig.connect(nqn, .loop, 0, ident_fa, &.{});
-    const cb = try rig.connect(nqn, .loop, 0, ident_b, &.{});
-    const cc = try rig.connect(nqn, .loop, 0, ident_c, &.{});
-    const key_k: u64 = 0xFE4C_0000_0000_00A1;
-    const key_b: u64 = 0xFE4C_0000_0000_00B1;
-    const key_c: u64 = 0xFE4C_0000_0000_00C1;
-    const a = try clientOn(gpa, &ca, key_k);
-    defer {
-        a.client.deinit();
-        gpa.destroy(a.client);
-        a.dev.deinit();
-    }
-    const f = try clientOn(gpa, &cf, key_k);
-    defer {
-        f.client.deinit();
-        gpa.destroy(f.client);
-        f.dev.deinit();
-    }
-    const b = try clientOn(gpa, &cb, key_b);
-    defer {
-        b.client.deinit();
-        gpa.destroy(b.client);
-        b.dev.deinit();
-    }
-    const c = try clientOn(gpa, &cc, key_c);
-    defer {
-        c.client.deinit();
-        gpa.destroy(c.client);
-        c.dev.deinit();
-    }
-    try fencing.acquireManagerHold(a.client);
-    _ = try f.client.registerLadder();
-    _ = try b.client.registerLadder();
-    _ = uring_fs.registerMetaDevice(gpa, &rig.env, cb.dev()) catch return error.DirectOpenRefused;
-    var buf = try uring_fs.AlignedBuf.zeroed(gpa, 4096, 4096);
-    defer buf.deinit();
-    try rig.pool.writeAt(cb.dev(), 0, buf.bytes);
-    // F — a non-holder under the holder's key — preempts B's key.
-    try testing.expectEqual(fencing.PreemptOutcome.fenced, fencing.preemptDeadRegistrant(a.client, f.client, key_b));
-    {
-        var rep = try a.client.report();
-        defer rep.deinit(gpa);
-        try testing.expectEqual(nvme.RTYPE_WERO, rep.rtype);
-        try testing.expect(!rep.registered(key_b));
-        try testing.expectEqual(@as(?u64, key_k), rep.holder());
-        try testing.expectEqual(@as(usize, 2), rep.registrants.len);
-        var holders: u32 = 0;
-        for (rep.registrants) |r| {
-            if (!r.holds) continue;
-            holders += 1;
-            try testing.expectEqualSlices(u8, &(proc.parseUuid(ident_a.hostid) orelse return error.BadUuid), &r.host_id);
-        }
-        try testing.expectEqual(@as(u32, 1), holders);
-    }
-    try testing.expectError(error.ReservationConflict, rig.pool.writeAt(cb.dev(), 0, buf.bytes));
-    // C takes over by preempting the holder's key: A and its fencer go.
-    _ = try c.client.registerLadder();
-    try c.client.preempt(key_k);
-    {
-        var rep = try c.client.report();
-        defer rep.deinit(gpa);
-        try testing.expectEqual(@as(?u64, key_c), rep.holder());
-        try testing.expect(!rep.registered(key_k));
-    }
-    // A, superseded, finishing a recovery: the report shows C holding — the
-    // preempt withheld (review M1); the fencer's own command conflicts at
-    // the device anyway.
-    _ = try b.client.registerLadder();
-    try testing.expectEqual(fencing.PreemptOutcome.failed, fencing.preemptDeadRegistrant(a.client, f.client, key_b));
-    try testing.expectError(error.ReservationConflict, f.client.preemptAndAbort(key_b));
-    {
-        var rep = try c.client.report();
-        defer rep.deinit(gpa);
-        try testing.expectEqual(@as(?u64, key_c), rep.holder());
-        try testing.expect(rep.registered(key_b));
-    }
-    // Zero residue.
-    try c.client.release();
-    try b.client.unregister(key_b);
-    {
-        const rr = try rig.resvReportJson(ca.dev());
-        defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 0), json_scan.number(rr, "regctl"));
-    }
-    try rig.disconnect(&cc);
-    try rig.disconnect(&cb);
-    try rig.disconnect(&cf);
-    try rig.disconnect(&ca);
-    try rig.unshare(nqn);
-    try expectNoResidue(rig, nqn);
-}
-
 const DaemonSet = struct {
     meta_nqn: []const u8,
     data_nqn: []const u8,
@@ -2772,7 +2653,7 @@ fn statNumber(text: []const u8, key: []const u8) !u64 {
     };
 }
 
-test "nvmet fidelity: co-located mounts — ONE host identity for every mount of a set on a host (owner ruling 2026-11-02, option C): a symmetric set on nvmet-loop, the manager A and a joiner B on this host under the one identity; ONE controller of the data subsystem serves both; ONE registration of the host under the manager's WERO hold, beside the manager's fencing registrant under the same key, never holding (regctl 2, decision 0003 §DG), A registered it, B adopted it (the same key, no device mutation); both read each other's files; B's umount leaves the shared association and the registration standing (A reads B's file and writes on), A's umount releases them all (no controller, regctl 0)" {
+test "nvmet fidelity: co-located mounts — ONE host identity for every mount of a set on a host (owner ruling 2026-11-02, option C): a symmetric set on nvmet-loop, the manager A and a joiner B on this host under the one identity; ONE controller of the data subsystem serves both; ONE registration of the host under the manager's WEAR hold (regctl 1, decision 0004 §4.8), A registered it, B adopted it (the same key, no device mutation); both read each other's files; B's umount leaves the shared association and the registration standing (A reads B's file and writes on), A's umount releases them all (no controller, regctl 0)" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
@@ -2787,7 +2668,7 @@ test "nvmet fidelity: co-located mounts — ONE host identity for every mount of
     {
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
         try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
         const sa = try rig.stats(a);
         defer gpa.free(sa);
@@ -2796,17 +2677,13 @@ test "nvmet fidelity: co-located mounts — ONE host identity for every mount of
         try testing.expectEqual(@as(u64, 1), try statNumber(sa, "pr_host_registrations"));
         try testing.expectEqual(@as(u64, 0), try statNumber(sb, "pr_host_registrations"));
         try testing.expectEqual(@as(u64, 1), try statNumber(sb, "pr_host_adoptions"));
-        // The manager stood its fencer; the joiner none.
-        try testing.expectEqual(@as(u64, 1), try statNumber(sa, "pr_fencer_registrations"));
-        try testing.expectEqual(@as(u64, 0), try statNumber(sb, "pr_fencer_registrations"));
         const key_a = json_scan.string(sa, "pr_key") orelse return error.StatMissing;
         const key_b = json_scan.string(sb, "pr_key") orelse return error.StatMissing;
         try testing.expectEqualStrings(key_a, key_b);
         try testing.expectEqualStrings(key_a, json_scan.string(rr, "holder_key") orelse return error.StatMissing);
-        // holder_key + the host and its fencer under the one key. WEAR: every
-        // registrant holds.
-        try testing.expectEqual(@as(usize, 3), std.mem.count(u8, rr, key_a));
-        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, rr, "\"holds_reservation\":true"));
+        // holder_key and the one registrant. WEAR: that registrant holds.
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, rr, key_a));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rr, "\"holds_reservation\":true"));
     }
     const sum_a = try rig.onMount(a, "head -c 1048576 /dev/urandom > fa && sync -d fa && cksum fa | cut -d' ' -f1");
     defer gpa.free(sum_a);
@@ -2826,11 +2703,11 @@ test "nvmet fidelity: co-located mounts — ONE host identity for every mount of
     {
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
     }
     try rig.umount(a);
     try testing.expectEqual(@as(u32, 0), try rig.controllersOf(set.data_nqn, null));
-    // The fencer's controller went with its last user: the rig's own alone.
+    // The rig's own connect of the metadata subsystem remains.
     try testing.expectEqual(@as(u32, 1), try rig.controllersOf(set.meta_nqn, null));
     {
         const rr = try rig.resvReportJson(cm.dev());
@@ -2890,10 +2767,10 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
         const sa = try rig.stats(a);
         defer gpa.free(sa);
         try testing.expectEqual(@as(u64, 1), try statNumber(sa, "pr_host_adoptions"));
-        // Host A and the manager B's fencer under host A's key.
+        // Host A is the one registrant.
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
     }
     try testing.expect(try scriptSucceeds(rig, a, "mkdir da && echo a > da/a && sync -d da/a"));
     const before = try rig.onMount(b, "echo before > f && sync -d f && cat f");
@@ -2939,13 +2816,14 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
         if (!named) std.debug.print("\n--- the refused mount's log ---\n{s}\n", .{text});
         try testing.expect(named);
         try testing.expect(alive(pid_b));
+        // P2's preempt-all left host C; the refused mount registered nothing.
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
     }
     // Host A was fenced by the takeover. A's fsync re-registers through the
     // rule, which kills the superseded B, and the write lands (decision
-    // 0004 §4.5.5). Host C, P2's fencer, and host A are the registrants.
+    // 0004 §4.5.5). Host C and host A are the registrants.
     const a_wrote = scriptSucceeds(rig, a, "echo x > da/z && sync -d da/z") catch false;
     if (!a_wrote) {
         if (rig.readLog(a)) |text| {
@@ -2961,7 +2839,7 @@ test "nvmet fidelity: stale sibling — one manager per volume and per-host fenc
         try testing.expect((try statNumber(sa, "pr_stale_sibling_kills")) >= 1);
         const rr = try rig.resvReportJson(cm.dev());
         defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 3), json_scan.number(rr, "regctl"));
+        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
     }
     // A is stopped by hand. B is already dead, so A2 adopts or registers
     // without a kill and joins P2.
@@ -3271,148 +3149,6 @@ fn probeCost(rig: *Rig, d: usize) !ProbeCost {
 /// The membership `T_owner` of the member-death row (the smoke rows' value).
 const member_t_owner_ms: u64 = 3000;
 
-test "nvmet fidelity: a member's death on nvmet 7.3 is FENCED by the manager's fencing registrant (decision 0003 §DG) — a symmetric set whose manager M (host B) holds WERO and stood its fencer (a second identity of host B under M's key, never holding); the member X on host A, frozen past T_owner, is evicted; M's fencer — a NON-holder — preempts host A's key (nvmet's spec path): host A unregistered, the reservation kept under M's key (appender_recovery_preempts 1, pr_fencer_preempts 1, appender_recovery_preempts_ignored 0, no re-fence; the report: M's host holding beside its fencer under the same key, host A's key gone)" {
-    const gpa = testing.allocator;
-    var rig = try venue(gpa, testing.io);
-    defer rig.deinit();
-    const transport: configfs.Trtype = .loop;
-    const set = try symmetricSet(rig, "md", transport, try rig.servicePorts(transport));
-    const cm = set.cm;
-    var tb: [16]u8 = undefined;
-    const t_owner = try std.fmt.bufPrint(&tb, "{d}", .{member_t_owner_ms});
-    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
-    var mu_b: [64]u8 = undefined;
-    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
-    var env_m = try rig.envWith(ident_b);
-    defer env_m.deinit();
-    try env_m.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
-    var env_x = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
-    defer env_x.deinit();
-    const m = try rig.spawnMountEnv("md-m", meta_uri_b, &env_m, &.{});
-    try rig.awaitLog(m, "ready: ", ready_wait_ns);
-    const x = try rig.spawnMountEnv("md-x", set.metaUri(), &env_x, &.{});
-    try rig.awaitLog(x, "ready: ", ready_wait_ns);
-    // X's own directory: its creates land through X's own ring and slot.
-    try testing.expect(try scriptSucceeds(rig, x, "mkdir dx && echo x > dx/x && sync -d dx/x"));
-    const key_x = try statString(rig, x, "pr_key");
-    defer gpa.free(key_x);
-    const key_m = try statString(rig, m, "pr_key");
-    defer gpa.free(key_m);
-    {
-        const rr = try rig.resvReportJson(cm.dev());
-        defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
-        try testing.expect(std.mem.indexOf(u8, rr, key_x) != null);
-    }
-    _ = linux.kill(rig.daemons.items[x].pid, .STOP);
-    const sm = try rig.awaitStat(m, "appender_recoveries", 1, ready_wait_ns);
-    defer gpa.free(sm);
-    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
-    // The death preempt LANDED, through the fencer: no ignored preempt, and
-    // the key stood absent once the page was Recovering (no re-fence).
-    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recovery_preempts"));
-    try testing.expectEqual(@as(u64, 0), try statNumber(sm, "appender_recovery_preempts_ignored"));
-    try testing.expectEqual(@as(u64, 0), try statNumber(sm, "appender_recovery_refences"));
-    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "pr_fencer_preempts"));
-    try testing.expectEqual(@as(u64, 1), try statNumber(sm, "pr_fencer_registrations"));
-    {
-        // Host A unregistered (the frozen X, resumed, is refused at the
-        // device); the reservation kept: M's host and its fencer under the
-        // same key. WEAR: both hold.
-        const rr = try rig.resvReportJson(cm.dev());
-        defer gpa.free(rr);
-        try testing.expect(std.mem.indexOf(u8, rr, key_x) == null);
-        try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
-        try testing.expectEqualStrings(key_m, json_scan.string(rr, "holder_key") orelse return error.StatMissing);
-        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
-        // holder_key + the two registrants.
-        try testing.expectEqual(@as(usize, 3), std.mem.count(u8, rr, key_m));
-        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, rr, "\"holds_reservation\":true"));
-    }
-    try rig.kill9(x);
-    try rig.umount(m);
-    // M's umount released its fencer (the last user): its registration and
-    // its controller gone, the hold kept (a preempt landed under it).
-    {
-        const rr = try rig.resvReportJson(cm.dev());
-        defer gpa.free(rr);
-        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
-        try testing.expectEqualStrings(key_m, json_scan.string(rr, "holder_key") orelse return error.StatMissing);
-    }
-    try testing.expectEqual(@as(u32, 2), try rig.controllersOf(set.meta_nqn, null));
-    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
-    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
-    try rig.disconnect(&cm_b);
-    try rig.disconnect(&cm);
-    try rig.unshare(set.data_nqn);
-    try rig.unshare(set.meta_nqn);
-    try expectNoResidue(rig, set.meta_nqn);
-    try expectNoResidue(rig, set.data_nqn);
-}
-
-test "nvmet fidelity: a frozen member fenced through the manager's fencing registrant never lands its in-flight writes (decision 0003 §DG) — X (host A) writes behind a held landing (SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE: its acked windows admitted, never issued) and is SIGSTOPped; M (host B) evicts it at T_owner and fences host A through its fencer; X's held windows released (SQUEEZEFS_TEST_LANDING_HOLD_RELEASE) and X resumed: the device refuses them (a reservation conflict, -EBADE): X latches the fence class (its journal's reservation-conflict line) and never lands them" {
-    const gpa = testing.allocator;
-    var rig = try venue(gpa, testing.io);
-    defer rig.deinit();
-    const transport: configfs.Trtype = .loop;
-    const set = try symmetricSet(rig, "mr", transport, try rig.servicePorts(transport));
-    const cm = set.cm;
-    var tb: [16]u8 = undefined;
-    const t_owner = try std.fmt.bufPrint(&tb, "{d}", .{member_t_owner_ms});
-    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
-    var mu_b: [64]u8 = undefined;
-    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
-    var fb: [128]u8 = undefined;
-    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/x-landing.fifo", .{rig.root}, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
-    var env_m = try rig.envWith(ident_b);
-    defer env_m.deinit();
-    try env_m.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
-    var env_x = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", t_owner);
-    defer env_x.deinit();
-    // X's second FUSE WRITE arms the hold: that write's commit and every
-    // later one admitted and acked, never issued until the FIFO opens.
-    try env_x.put("SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", "2");
-    try env_x.put("SQUEEZEFS_TEST_LANDING_HOLD_RELEASE", fifo);
-    const m = try rig.spawnMountEnv("mr-m", meta_uri_b, &env_m, &.{});
-    try rig.awaitLog(m, "ready: ", ready_wait_ns);
-    const x = try rig.spawnMountEnv("mr-x", set.metaUri(), &env_x, &.{});
-    try rig.awaitLog(x, "ready: ", ready_wait_ns);
-    try testing.expect(try scriptSucceeds(rig, x, "mkdir dx && echo a > dx/a && sync -d dx/a && echo b > dx/b"));
-    try rig.awaitLog(x, "test seam: SQUEEZEFS_TEST_LANDING_HOLD_AT_WRITE", ready_wait_ns);
-    // The release's read end is open before the STOP: the release below
-    // never waits on X being scheduled.
-    try rig.awaitLog(x, "SQUEEZEFS_TEST_LANDING_HOLD_RELEASE — the release waits", ready_wait_ns);
-    _ = linux.kill(rig.daemons.items[x].pid, .STOP);
-    {
-        const sm = try rig.awaitStat(m, "appender_recoveries", 1, ready_wait_ns);
-        defer gpa.free(sm);
-        try testing.expectEqual(@as(u64, 1), try statNumber(sm, "appender_recoveries"));
-    }
-    // The held windows released while X is stopped (the FIFO's writer opens
-    // and closes beside X's read end), then X resumed: its lane issues them
-    // at its next poll.
-    releaseFifo(fifo);
-    _ = linux.kill(rig.daemons.items[x].pid, .CONT);
-    // The device's answer to X's released windows: the fence class latched
-    // (the journal's reservation-conflict line, logged once at the latch).
-    // X's `.stats` is no witness: the incarnation X learns is evicted holds
-    // un-landed windows, so it is poisoned (decision 0003 §BS) and its
-    // mount answers EIO.
-    try rig.awaitLog(x, "SQUEEZEFS_TEST_LANDING_HOLD_RELEASE released", 30 * std.time.ns_per_s);
-    try rig.awaitLog(x, "journal: reservation-conflict errno at", 30 * std.time.ns_per_s);
-    try rig.kill9(x);
-    try rig.umount(m);
-    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
-    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
-    try rig.disconnect(&cm_b);
-    try rig.disconnect(&cm);
-    try rig.unshare(set.data_nqn);
-    try rig.unshare(set.meta_nqn);
-    try expectNoResidue(rig, set.meta_nqn);
-    try expectNoResidue(rig, set.data_nqn);
-}
-
 /// The data-fence row's data volume: 32 MiB at 64 KiB blocks (510 usable),
 /// so a fill to ENOSPC takes every free block — the dead member's grant
 /// window's among them.
@@ -3553,7 +3289,7 @@ const reap_wait_ns: u64 = 30 * std.time.ns_per_s;
 /// The successor's recovery counters a reaped member's death shows, printed
 /// before the row asserts them (the red's evidence names every one).
 fn printReapCounters(sm: []const u8) void {
-    std.debug.print("\n--- the successor's recovery: appender_recoveries {?d}, appender_recovery_preempts {?d}, pr_fencer_preempts {?d}, data_pr_preempts {?d}, data_pr_reconcile_preempts {?d}, writer_guard_preempt_alls {?d}, appender_recovery_key_from_page {?d} ---\n", .{ json_scan.number(sm, "appender_recoveries"), json_scan.number(sm, "appender_recovery_preempts"), json_scan.number(sm, "pr_fencer_preempts"), json_scan.number(sm, "data_pr_preempts"), json_scan.number(sm, "data_pr_reconcile_preempts"), json_scan.number(sm, "writer_guard_preempt_alls"), json_scan.number(sm, "appender_recovery_key_from_page") });
+    std.debug.print("\n--- the successor's recovery: appender_recoveries {?d}, appender_recovery_preempts {?d}, data_pr_preempts {?d}, data_pr_reconcile_preempts {?d}, writer_guard_preempt_alls {?d}, appender_recovery_key_from_page {?d} ---\n", .{ json_scan.number(sm, "appender_recoveries"), json_scan.number(sm, "appender_recovery_preempts"), json_scan.number(sm, "data_pr_preempts"), json_scan.number(sm, "data_pr_reconcile_preempts"), json_scan.number(sm, "writer_guard_preempt_alls"), json_scan.number(sm, "appender_recovery_key_from_page") });
 }
 
 /// The successor's preempt-all (decision 0004 §4.4) removes the dead host
@@ -4893,87 +4629,38 @@ test "nvmet fidelity: a re-join in place refused AFTER its data re-admission nev
     for (set.meta_nqn) |nqn| try expectNoResidue(rig, nqn);
 }
 
-/// The manager's fencing registrant's controller of `nqn`: the one whose
-/// identity none of the rig's connects carries.
-fn fencerController(rig: *Rig, nqn: []const u8) !?initiator.Controller {
-    const ctrls = try initiator.listControllers(rig.gpa, initiator.SYSFS_ROOT);
-    defer rig.gpa.free(ctrls);
-    for (ctrls) |c| {
-        if (!std.mem.eql(u8, c.subsysnqnOf(), nqn)) continue;
-        var ours = false;
-        for ([_]initiator.HostPair{ ident_a, ident_b, ident_c }) |i| ours = ours or c.hasIdentity(i.hostnqn, i.hostid);
-        if (!ours) return c;
-    }
-    return null;
-}
-
-test "nvmet fidelity: a metadata mount pointed at the fencing registrant's namespace node is refused by name (review M3 of decision 0003 §DG) — M (host B) manages a symmetric set and stood its fencer; a mount with no explicit pair on the fencer's block node (a by-id link that picked it, a hand-typed path) never registers there: it exits naming the fencer; `appender clear` on that node is refused the same way (review minor 1: the refusal sits at the metadata door every user passes); the fencer's registration under M's key stands (no own-stale ladder unregistered it)" {
+test "nvmet fidelity: a metadata mount pointed at a fencer-prefixed controller's namespace node is refused by name (decision 0003 §DG.16, until PR-8) — a controller whose hostnqn starts with the fencing-registrant prefix; a mount of its block node never registers: it exits naming that node; `appender clear` on that node is refused the same way" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
-    const transport: configfs.Trtype = .loop;
-    const set = try symmetricSet(rig, "fz", transport, try rig.servicePorts(transport));
-    const cm = set.cm;
-    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
-    var mu_b: [64]u8 = undefined;
-    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
-    const m = try rig.spawnMount("fz-m", meta_uri_b, ident_b, &.{});
-    try rig.awaitLog(m, "ready: ", ready_wait_ns);
-    const key_m = try statString(rig, m, "pr_key");
-    defer gpa.free(key_m);
-    const fc = (try fencerController(rig, set.meta_nqn)) orelse return error.NoFencerController;
-    const ns = (try initiator.controllerNamespace(gpa, initiator.SYSFS_ROOT, fc.instance)) orelse return error.NoFencerNamespace;
-    var nb: [40]u8 = undefined;
+    const nqn = try rig.share("fz", meta_len, .loop, 0);
+    const ident_residue: initiator.HostPair = .{
+        .hostnqn = "nqn.2026-10.io.squeezefs:fencer:fafafafa-fafa-4afa-8afa-fafafafafafa",
+        .hostid = "fafafafa-fafa-4afa-8afa-fafafafafafa",
+    };
+    const cf = try rig.connect(nqn, .loop, 0, ident_residue, &.{});
     var ub: [64]u8 = undefined;
-    const meta_uri_f = try std.fmt.bufPrint(&ub, "sqmeta://{s}", .{ns.blockPath(&nb)});
+    const meta_uri = try std.fmt.bufPrint(&ub, "sqmeta://{s}", .{cf.dev()});
     var env_z = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", "3000");
     defer env_z.deinit();
     _ = env_z.swapRemove(hostnqn_knob);
     _ = env_z.swapRemove(hostid_knob);
-    const z = try rig.spawnMountEnv("fz-z", meta_uri_f, &env_z, &.{});
+    const z = try rig.spawnMountEnv("fz-z", meta_uri, &env_z, &.{});
     try testing.expect(!(try readyOrDead(rig, z)));
     {
-        // The refusal's tail: the CLI's own stdout line is written at the
-        // log's offset 0 over the start of the stderr text that preceded it.
         const text = try rig.readLog(z);
         defer gpa.free(text);
         try testing.expect(std.mem.indexOf(u8, text, "use the host's own node of the namespace (decision 0003 §DG.16)") != null);
     }
     {
-        // `appender clear` on the fencer's node: refused at the metadata
-        // door every user passes (review minor 1), never writing through the
-        // fencer's controller.
-        const r = try rig.sqzEnv(&.{ "appender", "clear", meta_uri_f, "1" }, &env_z);
+        const r = try rig.sqzEnv(&.{ "appender", "clear", meta_uri, "1" }, &env_z);
         defer rig.freeRun(r);
         try testing.expect(!r.term.success());
         try testing.expect(std.mem.indexOf(u8, r.stderr, "fencing registrant") != null);
     }
-    {
-        // The fencer still registered under M's key beside M's host.
-        const rr = try rig.resvReportJson(cm.dev());
-        defer gpa.free(rr);
-        try testing.expectEqual(@as(usize, 3), std.mem.count(u8, rr, key_m));
-        try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
-    }
-    try rig.umount(m);
-    // Whatever the refused mount connected on the data subsystem is the rig's
-    // to sweep (its identity is the host's derived one).
-    for ([_][]const u8{ set.data_nqn, set.meta_nqn }) |nqn| {
-        const ctrls = try initiator.listControllers(gpa, initiator.SYSFS_ROOT);
-        defer gpa.free(ctrls);
-        for (ctrls) |c| if (std.mem.eql(u8, c.subsysnqnOf(), nqn) and !c.hasIdentity(ident_a.hostnqn, ident_a.hostid) and !c.hasIdentity(ident_b.hostnqn, ident_b.hostid)) {
-            initiator.deleteController(c.instance) catch {};
-            _ = initiator.awaitControllerGone(c.instance);
-        };
-    }
-    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
-    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
-    try rig.disconnect(&cm_b);
-    try rig.disconnect(&cm);
-    try rig.unshare(set.data_nqn);
-    try rig.unshare(set.meta_nqn);
-    try expectNoResidue(rig, set.meta_nqn);
-    try expectNoResidue(rig, set.data_nqn);
+    try rig.disconnect(&cf);
+    try rig.unshare(nqn);
+    try expectNoResidue(rig, nqn);
 }
 
 /// A stats string that must be present, owned by the caller.

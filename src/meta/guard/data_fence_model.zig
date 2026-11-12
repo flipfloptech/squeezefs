@@ -17,14 +17,13 @@
 //! (`nvmet_pr_do_abort`); a killed process's queued write still arrives (a
 //! requeue).
 //!
-//! Every configuration runs beside both metadata planes (`MetaPlane`,
-//! decision 0003 §DO): `.wero_holder` (a takeover preempts the holder's key,
-//! the code until PR-5) and `.wear_preempt_all` (a takeover is the
-//! successor's preempt-all; the lapse's early end takes the writer keys ∪ the
-//! Live pages' keys — `Lapse{.unlisted_joiner}`, W33). Under
-//! `.wear_preempt_all` a configuration declares `stuck()`, so the explorer's
-//! quiescence and cycle checks run on it; `firstError` names a schedule's
-//! error through `explorer.replayError`.
+//! Every configuration runs beside the metadata plane (`MetaPlane`,
+//! decision 0004 §7.0): `.wear_preempt_all` (a takeover is the successor's
+//! preempt-all; the lapse's early end takes the writer keys ∪ the Live
+//! pages' keys — `Lapse{.unlisted_joiner}`, W33). A configuration declares
+//! `stuck()`, so the explorer's quiescence and cycle checks run;
+//! `firstError` names a schedule's error through `explorer.replayError`.
+//! A WERO metadata hold was the code until PR-5.
 //!
 //! `Death` — data namespaces D0 and D1; hosts A (the manager MG), B (the dead
 //! member X; S, a sibling mounting there), C (Y, a live member):
@@ -54,7 +53,7 @@
 //! `Succession` — one data namespace; M (host A) the manager, frozen with an
 //! in-place write to one of its file's blocks and, `late_admission`, its own
 //! data admission still running; S1 (host B) takes the metadata hold
-//! (preempting the holder's key), admits on data and reconciles; S2 (host C)
+//! (the preempt-all), admits on data and reconciles; S2 (host C)
 //! takes the hold from whoever holds it, admits, reconciles — every data
 //! registrant volume 0's metadata namespace no longer registers, the data
 //! report read first, then the metadata's — and reallocates M's block.
@@ -69,12 +68,8 @@
 
 const std = @import("std");
 
-/// The metadata plane the data models run beside (decision 0003 §DO,
-/// decision 0004 §7.0).
+/// The metadata plane the data models run beside (decision 0004 §7.0).
 pub const MetaPlane = enum {
-    /// WERO held by the manager: a takeover preempts the holder's key (the
-    /// code until PR-5).
-    wero_holder,
     /// Write Exclusive – All Registrants: a takeover is the successor's
     /// preempt-all; the lapse re-acquire an `acquire`; the lapse's early end
     /// takes the writer keys ∪ the Live pages' keys. Its configurations
@@ -142,7 +137,7 @@ pub const FenceOrder = enum {
 };
 
 pub const DeathConfig = struct {
-    meta: MetaPlane = .wero_holder,
+    meta: MetaPlane = .wear_preempt_all,
     data_rtype: DataRtype = .wear,
     order: FenceOrder = .after_recovering,
     /// An unproven data fence proceeds (the metadata plane's posture, which
@@ -535,7 +530,7 @@ pub const Reconcile = enum {
 };
 
 pub const SuccessionConfig = struct {
-    meta: MetaPlane = .wero_holder,
+    meta: MetaPlane = .wear_preempt_all,
     data_rtype: enum { wear, none } = .wear,
     reconcile: Reconcile = .unregistered_on_meta,
     /// M froze inside its own data admission.
@@ -685,28 +680,21 @@ fn SuccessionModel(comptime cfg: SuccessionConfig) type {
         fn successor(self: *Self, s: usize, h: u8) void {
             switch (self.pc[s + 1]) {
                 0 => self.mreg[h] = true,
-                // The metadata takeover: WERO, the holder's key preempted;
-                // WEAR, the preempt-all — every other host unregistered (the
-                // predecessor whose page key enters the debt: the holder).
-                1 => switch (cfg.meta) {
-                    .wero_holder => if (self.holder != h) {
-                        self.victim[s] = self.holder;
-                        self.mreg[self.holder] = false;
-                        self.holder = h;
-                    },
-                    .wear_preempt_all => {
-                        // P8: a host the preempt-all of a racing successor
-                        // removed cannot preempt.
-                        if (!self.mreg[h]) {
-                            self.stopped[s] = true;
-                            return;
-                        }
-                        if (self.holder != h) self.victim[s] = self.holder;
-                        for (0..4) |k| {
-                            if (k != h) self.mreg[k] = false;
-                        }
-                        self.holder = h;
-                    },
+                // The metadata takeover: the successor's preempt-all
+                // unregisters every other host (the predecessor whose page
+                // key enters the debt: the holder).
+                1 => {
+                    // P8: a host the preempt-all of a racing successor
+                    // removed cannot preempt.
+                    if (!self.mreg[h]) {
+                        self.stopped[s] = true;
+                        return;
+                    }
+                    if (self.holder != h) self.victim[s] = self.holder;
+                    for (0..4) |k| {
+                        if (k != h) self.mreg[k] = false;
+                    }
+                    self.holder = h;
                 },
                 // A superseded successor's admission stops at its re-check or
                 // its hold check (its acts refused from here).
@@ -811,7 +799,7 @@ pub const LapseEarly = enum {
 };
 
 pub const LapseConfig = struct {
-    meta: MetaPlane = .wero_holder,
+    meta: MetaPlane = .wear_preempt_all,
     /// The metadata namespace lapses with the data namespace (one target).
     meta_too: bool = true,
     /// Members re-register after a lapse (the beat); false: the code before.
@@ -1504,8 +1492,8 @@ const explorer = @import("../../model/explorer.zig");
 const limits: explorer.Limits = .{};
 const testing = std.testing;
 
-/// Every check runs beside both metadata planes (decision 0004 §7.0).
-const metas = [_]MetaPlane{ .wero_holder, .wear_preempt_all };
+/// Every check runs on the metadata plane (decision 0004 §7.0).
+const metas = [_]MetaPlane{.wear_preempt_all};
 
 fn withMeta(c: LapseConfig, mp: MetaPlane) LapseConfig {
     var out = c;
@@ -1660,10 +1648,6 @@ fn ptplLessRestart(comptime mp: MetaPlane) !void {
     std.debug.print("\ndata fence model [{t}] (lapse, data only): {d} states explored, depth {d}\n", .{ mp, r2.states, r2.max_depth_seen });
 }
 
-test "data fence model: a PTPL-less target restart under a running set as built (review MAJOR 2) — every member re-registers at its beat through its currency and the metadata check, the manager re-acquires and re-reserves after the grace (or once every metadata registrant is on data) and reconciles; with the metadata namespace on the same target and without — holds: no live member's write refused, no stale write outside the accepted windows, both namespaces reserved again, the dead member's region released [wero_holder]" {
-    try ptplLessRestart(.wero_holder);
-}
-
 test "data fence model: a PTPL-less target restart under a running set as built (review MAJOR 2) — every member re-registers at its beat through its currency and the metadata check, the manager re-acquires and re-reserves after the grace (or once every metadata registrant is on data) and reconciles; with the metadata namespace on the same target and without — holds: no live member's write refused, no stale write outside the accepted windows, both namespaces reserved again, the dead member's region released [wear_preempt_all]" {
     try ptplLessRestart(.wear_preempt_all);
 }
@@ -1707,10 +1691,6 @@ fn lapseEarlyEnd(comptime mp: MetaPlane) !void {
     std.debug.print("\ndata fence model [{t}] (lapse, slow member): {d} states explored, depth {d}\n", .{ mp, r.states, r.max_depth_seen });
     const r2 = try statesOf(Lapse(.{ .meta = mp, .slow_member = true, .x_second_write = false, .meta_too = false }));
     std.debug.print("\ndata fence model [{t}] (lapse, slow member, data only): {d} states explored, depth {d}\n", .{ mp, r2.states, r2.max_depth_seen });
-}
-
-test "data fence model (decision 0003 §DL): the lapse as built with the metadata grace's early end — the manager re-acquires the metadata hold as soon as every live member's host key in the census is registered there (else after the grace) and re-reserves the data namespace at once when every metadata registrant is back on data — and a slow member (its data re-registration after the re-reservation) re-admitted at its refused write through its lapse, its metadata registration and its currency, before and after the register, its write retried — holds; the code before the early end holds too (the early end is liveness) [wero_holder]" {
-    try lapseEarlyEnd(.wero_holder);
 }
 
 test "data fence model (decision 0003 §DL): the lapse as built with the metadata grace's early end — the manager re-acquires the metadata hold as soon as every live member's host key in the census is registered there (else after the grace) and re-reserves the data namespace at once when every metadata registrant is back on data — and a slow member (its data re-registration after the re-reservation) re-admitted at its refused write through its lapse, its metadata registration and its currency, before and after the register, its write retried — holds; the code before the early end holds too (the early end is liveness) [wear_preempt_all]" {
@@ -1779,10 +1759,6 @@ fn twoVolumeLapse(comptime mp: MetaPlane) !void {
             std.debug.print("\ndata fence model [{t}] (lapse, two metadata volumes, restart {t}, volume {d} recovered first): {d} states explored, depth {d}\n", .{ mp, r, first, rep.states, rep.max_depth_seen });
         }
     }
-}
-
-test "data fence model (decision 0003 §DN): a two-metadata-volume set as built — every member's lapse beat re-registers its host on EVERY joined metadata volume (its currency: its page Live on every joined volume), each volume's guard re-acquires once every census key is registered on ITS namespace (else after the grace), a member's data checks read every joined volume's registration and page; volume 1's target restarted alone, both targets, volume 0's alone; X recovered on volume 0 first and on volume 1 first — holds: no live member's write refused on either volume, no stale data write, every namespace reserved again, X's region released [wero_holder]" {
-    try twoVolumeLapse(.wero_holder);
 }
 
 test "data fence model (decision 0003 §DN): a two-metadata-volume set as built — every member's lapse beat re-registers its host on EVERY joined metadata volume (its currency: its page Live on every joined volume), each volume's guard re-acquires once every census key is registered on ITS namespace (else after the grace), a member's data checks read every joined volume's registration and page; volume 1's target restarted alone, both targets, volume 0's alone; X recovered on volume 0 first and on volume 1 first — holds: no live member's write refused on either volume, no stale data write, every namespace reserved again, X's region released [wear_preempt_all]" {

@@ -66,9 +66,9 @@ removes/s, 284 k mkdir/s, 283 k rmdir/s. The measurement notes behind every numb
 - **Zig 0.17.0** to build. No other build dependency; zstd is vendored.
 - Optional: `nvme-cli` and the `nvmet` modules for NVMe-oF; OpenMPI + `mdtest`/`ior` for the metadata
   and bandwidth rows; `fio` for the bandwidth rows.
-- **NVMe-oF deployments** install `scripts/udev/60-squeezefs-fencer.rules` on every node (a package
-  must ship it; the venue's provisioning does): it keeps the host's tools off the fencing
-  registrant's namespace nodes (QUICKSTART §5, decision 0003 §DG.16).
+- **NVMe-oF.** A metadata mount on a node whose controller hostnqn starts with
+  `nqn.2026-10.io.squeezefs:fencer:` is refused (`error.FencerNode`, until PR-8): that prefix is
+  residue from a mount that stood a fencing registrant. Use the host's own node of the namespace.
 
 ## Build
 

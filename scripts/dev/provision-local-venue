@@ -138,12 +138,6 @@ if [ -x /usr/lib/udisks2/udisksd ] || [ -x /usr/libexec/udisks2/udisksd ]; then
   else udev_rule_apply=1; miss "udisks/udiskie kept off the suites' loop devices (a desktop host auto-mounts what LTP and xfstests format)" "scripts/dev/provision-local-venue --apply   # $udev_rule: UDISKS_IGNORE for loop devices backed under $(readlink -f "$ROOT" 2>/dev/null || echo "$ROOT")"; fi
 fi
 
-# The fencing registrant's namespace node (decision 0003 §DG, review M3): the repo's udev rule
-# keeps by-id links, systemd and udisks off it.
-fencer_rule_src=$REPO/scripts/udev/60-squeezefs-fencer.rules
-fencer_rule=/etc/udev/rules.d/60-squeezefs-fencer.rules
-if [ -f "$fencer_rule" ] && cmp -s "$fencer_rule_src" "$fencer_rule"; then ok "the fencing registrant's udev rule ($fencer_rule)"
-else miss "the fencing registrant's udev rule (its namespace node's by-id links lowered, SYSTEMD_READY=0)" "scripts/dev/provision-local-venue --apply   # provision-ssh-venue installs $fencer_rule_src as $fencer_rule"; fi
 
 echo "== packages"
 pkgs=()

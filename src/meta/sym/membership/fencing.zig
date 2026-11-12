@@ -1,15 +1,10 @@
 //! Fencing under the symmetric plane (charter §5.5 "Fencing"; `docs/
-//! porting/sym_wire_membership_recovery.md` §4; decision 0003 §DF, §DG): the
-//! metadata namespace holds WERO (rtype 3) by the MANAGER — the device keeps
-//! ONE holder, so a successor's acquire conflicts and preempts it — with
-//! every member HOST a REGISTRANT under its host's key; the ledger's preempt
-//! of that key fences the host's members everywhere. It is issued by the
-//! manager's FENCING REGISTRANT (`guard/fencer.zig`: a second host identity
-//! of the manager's host under the same key, a non-holder) — nvmet 7.3
-//! answers a HOLDER's preempt of another key with success and keeps the key,
-//! a non-holder's takes the spec's path; with no fencer standing the holder's
-//! own preempt is the posture (the report proves what landed: a kept key is
-//! `.ignored`, the full tail scan — never a release, never re-fenced). A joiner NEVER acquires: one whose host is registered
+//! porting/sym_wire_membership_recovery.md` §4; decision 0004 §4.8): the
+//! metadata namespace holds Write Exclusive – All Registrants (WEAR, rtype
+//! 5). The manager's own preempt-and-abort of a dead member's key unregisters
+//! that host: nvmet 7.3 runs the All-Registrants arm before the holder
+//! re-type. A key the target keeps is the tripwire `meta_pr_preempt_kept`,
+//! then `.failed` (the full tail scan, never a release). A joiner NEVER acquires: one whose host is registered
 //! under the key ADOPTS with ZERO device mutation (a register here destroyed
 //! the fence in the rung-9 finding: `rtype 0, regctl 0`); another registers
 //! and walks the CAP GATE — the report
@@ -72,27 +67,17 @@ pub const stats = struct {
     pub var pr_colocated_adoptions: counters.ShardedCounter = .{};
     /// The death preempt landed (meta + data namespaces).
     pub var appender_recovery_preempts: counters.ShardedCounter = .{};
-    /// The fencing registrant registered under the host's key (a manager's
-    /// hold, a lapse's re-acquire).
-    pub var pr_fencer_registrations: counters.ShardedCounter = .{};
-    /// Death preempts that landed through the fencing registrant.
-    pub var pr_fencer_preempts: counters.ShardedCounter = .{};
-    /// A symmetric manager's hold with no fencing registrant standing (the
-    /// holder's-preempt posture; the guard's `.stats` names why).
-    pub var pr_fencer_unavailable: counters.ShardedCounter = .{};
     /// Death preempts withheld because a report did not show THIS host
-    /// holding (a superseded manager finishing a recovery — review M1 of
-    /// §DG); and fencer registrations taken back for the same reason.
+    /// holding (a superseded manager finishing a recovery — DC10).
     pub var pr_preempts_unheld_refused: counters.ShardedCounter = .{};
-    pub var pr_fencer_unheld_unregistered: counters.ShardedCounter = .{};
     /// A preempt withheld because the dead key is THIS host's registrant.
     pub var appender_recovery_own_key_guards: counters.ShardedCounter = .{};
     /// The dead key found registered again after the page went Recovering
     /// (review B2): preempted again.
     pub var appender_recovery_refences: counters.ShardedCounter = .{};
-    /// A preempt the target answered with success yet kept the key (nvmet
-    /// 7.3's holder preempt): the dead host NOT fenced, the tail scan.
-    pub var appender_recovery_preempts_ignored: counters.ShardedCounter = .{};
+    /// A preempt-and-abort the target answered with success and still left
+    /// the victim key registered (decision 0004 §4.8 step 6). Must stay 0.
+    pub var meta_pr_preempt_kept: counters.Tripwire = .init("meta_pr_preempt_kept");
     /// A death whose record carried no key fenced with the dead appender
     /// page's host key (decision 0004 §4.8, KD8: a grace-reaped member).
     pub var appender_recovery_key_from_page: counters.ShardedCounter = .{};
@@ -142,8 +127,8 @@ pub const JoinError = error{
     Device,
 };
 
-/// The manager's hold: WERO under our key after the register ladder — the
-/// device's one holder (decision 0003 §DF).
+/// The flat and test hold: WERO under our key after the register ladder.
+/// The product's symmetric hold is `host_fence.takeSuccession` under WEAR.
 pub fn acquireManagerHold(client: *pr.Client) pr.Error!void {
     client.rtype = nvme.RTYPE_WERO;
     _ = try client.registerLadder();
@@ -275,11 +260,6 @@ pub fn deathKey(record_key: u64, page_key: u64) DeathKey {
 pub const PreemptOutcome = enum {
     /// The preempt-and-abort LANDED: `pr_fenced`, the tail scan skipped.
     fenced,
-    /// The target answered success and KEPT the key (nvmet 7.3: the
-    /// holder's preempt only re-types its own hold): nothing fenced, the
-    /// full tail scan; no re-fence (the key never left — a re-read would
-    /// count it "registered again" and re-issue the same no-op).
-    ignored,
     /// The dead key is THIS host's registrant (a co-located appender): a
     /// preempt would take down our own fence — the full tail scan is the
     /// fence.
@@ -294,35 +274,22 @@ pub const PreemptOutcome = enum {
     failed,
 };
 
-/// §5.9 step 1: preempt-and-abort the dead registrant's key on the
-/// namespace `client` holds (`RACQA 2`; nvmet runs it as a plain preempt),
-/// issued by the fencing registrant when one stands (a non-holder under
-/// `client`'s key, decision 0003 §DG), else by the holder. `pr_fenced ≡
-/// fenced`.
-pub fn preemptDeadRegistrant(client: ?*pr.Client, fencer: ?*pr.Client, victim_key: u64) PreemptOutcome {
+/// §4.8: preempt-and-abort the dead registrant's key on the namespace
+/// `client` holds, issued by that client (the manager's own, under WEAR).
+/// `pr_fenced ≡ fenced`.
+pub fn preemptDeadRegistrant(client: ?*pr.Client, victim_key: u64) PreemptOutcome {
     const c = client orelse return .no_device;
     if (victim_key == 0) return .no_key;
-    // Our own key: a preempt of it unregisters the holder — unreserved —
-    // and the fencer with it (nvmet does not skip the sender).
+    // Our own key: a preempt of it unregisters this host.
     if (victim_key == c.key) {
         stats.appender_recovery_own_key_guards.inc();
         return .own_key_guard;
     }
-    // Only while THIS host holds (our key under our host id; review M1 of
-    // §DG): a fencer registered after a successor preempted our key would
-    // otherwise fence the successor's members, and take the reservation
-    // when the victim's key is the holder's. Under the fencer's lock — the
-    // heartbeat's re-register and its check take it too — so the fencer's
-    // registration changes only by a preempt between this read and the
-    // preempt: a takeover, which removes it with our host (one key) and
-    // makes its command conflict.
-    // The holder's sequence lock first, then the fencer's (the heartbeat's
-    // order): the holder client's state has one writer at a time (review
-    // minor 4).
+    // Only while THIS host holds (our key under our host id, DC10). Under
+    // the client's sequence lock, so the registration changes only by a
+    // preempt between this read and the command.
     c.lockOps();
     defer c.unlockOps();
-    if (fencer) |f| f.lockOps();
-    defer if (fencer) |f| f.unlockOps();
     const ours = c.admittedHere() catch |e| {
         log.warn("recovery preempt: the report before the preempt of key 0x{x} failed ({s}) — nothing preempted; the full tail scan is the fence", .{ victim_key, @errorName(e) });
         return .failed;
@@ -345,24 +312,20 @@ pub fn preemptDeadRegistrant(client: ?*pr.Client, fencer: ?*pr.Client, victim_ke
         log.info("recovery preempt: key 0x{x} is already absent — fenced without a preempt (decision 0004 §4.8)", .{victim_key});
         return .fenced;
     }
-    const issuer = fencer orelse c;
-    issuer.preemptAndAbort(victim_key) catch |e| return preemptFailed(issuer, victim_key, e);
-    // The report proves it: a target that answered success yet kept the
-    // key (nvmet 7.3: its HOLDER's preempt only re-types its own hold)
-    // fenced nothing — the full tail scan, never a release (that would leave
-    // the namespace unreserved). A report that fails proves nothing fenced:
-    // the full tail scan too (review 4 minor 3).
+    c.preemptAndAbort(victim_key) catch |e| return preemptFailed(c, victim_key, e);
+    // The report proves it. A key the target kept is the tripwire, then
+    // `.failed` (the full tail scan, never a release). A report that fails
+    // proves nothing fenced (review 4 minor 3).
     const kept = keyRegistered(c, victim_key) catch {
         log.warn("recovery preempt: the report after the preempt of key 0x{x} failed — nothing proven fenced; the full tail scan is the fence", .{victim_key});
         return .failed;
     };
     if (kept) {
-        stats.appender_recovery_preempts_ignored.inc();
-        log.warn("recovery preempt: the target answered the preempt of key 0x{x} ({s}) yet keeps it registered — the dead member's host is NOT fenced; the full tail scan is the fence", .{ victim_key, if (fencer != null) "by the fencing registrant" else "by the holder: nvmet 7.3 only re-types its own hold" });
-        return .ignored;
+        stats.meta_pr_preempt_kept.fire("a preempt-and-abort answered success and left the victim key registered");
+        log.warn("recovery preempt: the target answered the preempt of key 0x{x} yet keeps it registered — the dead member's host is NOT fenced; the full tail scan is the fence", .{victim_key});
+        return .failed;
     }
     stats.appender_recovery_preempts.inc();
-    if (fencer != null) stats.pr_fencer_preempts.inc();
     return .fenced;
 }
 
@@ -372,7 +335,7 @@ pub fn preemptDeadRegistrant(client: ?*pr.Client, fencer: ?*pr.Client, victim_ke
 /// host, and a sibling's rule registered it meanwhile) is preempted again
 /// before the ring is read. Null = the key stands absent (or no device, or
 /// no key); a report that fails is the full tail scan's.
-pub fn refenceAfterRecovering(client: ?*pr.Client, fencer: ?*pr.Client, victim_key: u64) ?PreemptOutcome {
+pub fn refenceAfterRecovering(client: ?*pr.Client, victim_key: u64) ?PreemptOutcome {
     const c = client orelse return null;
     if (victim_key == 0 or victim_key == c.key) return null;
     c.lockOps();
@@ -384,7 +347,7 @@ pub fn refenceAfterRecovering(client: ?*pr.Client, fencer: ?*pr.Client, victim_k
     if (!back) return null;
     stats.appender_recovery_refences.inc();
     log.warn("recovery preempt: key 0x{x} is registered again once the page is Recovering (the dead member's host registered meanwhile) — preempted again", .{victim_key});
-    return preemptDeadRegistrant(c, fencer, victim_key);
+    return preemptDeadRegistrant(c, victim_key);
 }
 
 fn preemptFailed(c: *pr.Client, victim_key: u64, e: pr.Error) PreemptOutcome {
@@ -877,21 +840,21 @@ test "the death preempt: a usurper's key is preempted-and-aborted (fenced; the v
     _ = try joinAsRegistrant(&r, null);
     try testing.expect(ns.writeAllowed(host_r));
     const preempts0 = stats.appender_recovery_preempts.load();
-    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, null, 0x2222));
+    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, 0x2222));
     try testing.expectEqual(preempts0 + 1, stats.appender_recovery_preempts.load());
     try testing.expect(!ns.writeAllowed(host_r));
     try testing.expectEqual(nvme.RACQA_PREEMPT_AND_ABORT, ns.last_acquire.cdw10 & 0x7);
     try testing.expectEqual(@as(?u64, 0x1111), ns.holder);
     const guards0 = stats.appender_recovery_own_key_guards.load();
-    try testing.expectEqual(PreemptOutcome.own_key_guard, preemptDeadRegistrant(&m, null, 0x1111));
+    try testing.expectEqual(PreemptOutcome.own_key_guard, preemptDeadRegistrant(&m, 0x1111));
     try testing.expectEqual(guards0 + 1, stats.appender_recovery_own_key_guards.load());
-    try testing.expectEqual(PreemptOutcome.no_key, preemptDeadRegistrant(&m, null, 0));
-    try testing.expectEqual(PreemptOutcome.no_device, preemptDeadRegistrant(null, null, 0x5));
+    try testing.expectEqual(PreemptOutcome.no_key, preemptDeadRegistrant(&m, 0));
+    try testing.expectEqual(PreemptOutcome.no_device, preemptDeadRegistrant(null, 0x5));
     // A key the report does not name is already fenced: no preempt
     // (decision 0004 §4.8). The device's Invalid Field answer is not reached.
     const absent0 = stats.appender_recovery_keys_absent.load();
     const cdw = ns.last_acquire.cdw10;
-    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, null, 0x4444));
+    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, 0x4444));
     try testing.expectEqual(absent0 + 1, stats.appender_recovery_keys_absent.load());
     try testing.expectEqual(cdw, ns.last_acquire.cdw10);
 }
@@ -926,19 +889,19 @@ test "report-first: a death whose key the report already shows absent is fenced 
     const cdw = ns.last_acquire.cdw10;
     const crkey = ns.last_acquire_crkey;
     const prkey = ns.last_acquire_prkey;
-    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, null, 0x2222));
+    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, 0x2222));
     try testing.expectEqual(absent0 + 1, stats.appender_recovery_keys_absent.load());
     try testing.expectEqual(preempts0, stats.appender_recovery_preempts.load());
     try testing.expectEqual(cdw, ns.last_acquire.cdw10);
     try testing.expectEqual(crkey, ns.last_acquire_crkey);
     try testing.expectEqual(prkey, ns.last_acquire_prkey);
     // Never registered: the same skip.
-    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, null, 0x3333));
+    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, 0x3333));
     try testing.expectEqual(absent0 + 2, stats.appender_recovery_keys_absent.load());
     try testing.expectEqual(cdw, ns.last_acquire.cdw10);
 }
 
-test "the death preempt under the manager's WERO hold: on nvmet 7.3's semantics the holder's preempt answers success yet keeps the victim registered — .ignored (the full tail scan, counted, no re-fence), never a release that would leave the namespace unreserved; on a spec-conformant target the same preempt fences the victim's host with the hold kept; the re-fence preempts a key registered again" {
+test "the death preempt under the manager's WERO hold: on nvmet 7.3's semantics the holder's preempt answers success yet keeps the victim registered — the tripwire meta_pr_preempt_kept, then .failed (the full tail scan, never a release); on a spec-conformant target the same preempt fences the victim's host with the hold kept; the re-fence preempts a key registered again" {
     const gpa = testing.allocator;
     var ns = fake.Namespace.init(gpa);
     defer ns.deinit();
@@ -951,9 +914,12 @@ test "the death preempt under the manager's WERO hold: on nvmet 7.3's semantics 
     var r = try pr.Client.init(gpa, rh.face(), 1, 0x2222);
     defer r.deinit();
     _ = try joinAsRegistrant(&r, null);
-    const ignored0 = stats.appender_recovery_preempts_ignored.load();
-    try testing.expectEqual(PreemptOutcome.ignored, preemptDeadRegistrant(&m, null, 0x2222));
-    try testing.expectEqual(ignored0 + 1, stats.appender_recovery_preempts_ignored.load());
+    const kept0 = stats.meta_pr_preempt_kept.load();
+    stats.meta_pr_preempt_kept.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, 0x2222));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(kept0 + 1, stats.meta_pr_preempt_kept.load());
     try testing.expect(ns.writeAllowed(host_r));
     try testing.expectEqual(@as(?u64, 0x1111), ns.holder);
     try testing.expectEqual(nvme.RTYPE_WERO, ns.rtype);
@@ -968,23 +934,21 @@ test "the death preempt under the manager's WERO hold: on nvmet 7.3's semantics 
     var r2 = try pr.Client.init(gpa, rh2.face(), 1, 0x2222);
     defer r2.deinit();
     _ = try joinAsRegistrant(&r2, null);
-    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m2, null, 0x2222));
+    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m2, 0x2222));
     try testing.expect(!ns2.writeAllowed(host_r));
     try testing.expect(ns2.writeAllowed(host_m));
     try testing.expectEqual(@as(?u64, 0x1111), ns2.holder);
     try testing.expectEqual(nvme.RTYPE_WERO, ns2.rtype);
     // The re-fence (review B2): the key registered again is preempted again.
     _ = try joinAsRegistrant(&r2, null);
-    try testing.expectEqual(@as(?PreemptOutcome, .fenced), refenceAfterRecovering(&m2, null, 0x2222));
+    try testing.expectEqual(@as(?PreemptOutcome, .fenced), refenceAfterRecovering(&m2, 0x2222));
     try testing.expect(!ns2.writeAllowed(host_r));
-    try testing.expectEqual(@as(?PreemptOutcome, null), refenceAfterRecovering(&m2, null, 0x2222));
-    try testing.expectEqual(@as(?PreemptOutcome, null), refenceAfterRecovering(&m2, null, 0x1111));
-    try testing.expectEqual(@as(?PreemptOutcome, null), refenceAfterRecovering(null, null, 0x2222));
+    try testing.expectEqual(@as(?PreemptOutcome, null), refenceAfterRecovering(&m2, 0x2222));
+    try testing.expectEqual(@as(?PreemptOutcome, null), refenceAfterRecovering(&m2, 0x1111));
+    try testing.expectEqual(@as(?PreemptOutcome, null), refenceAfterRecovering(null, 0x2222));
 }
 
-const host_f: [16]u8 = "fencer-host-id-4".*;
-
-test "the death preempt through the fencing registrant (decision 0003 §DG): on nvmet 7.3's semantics the fencer — a second host id under the holder's key, a NON-holder — unregisters the victim's host and keeps the reservation (fenced, counted on pr_fencer_preempts), where the holder's own preempt was ignored; the re-fence goes through it too; the own-key guard withholds our key (a preempt of it would unregister the holder and the fencer)" {
+test "the death preempt under WEAR: the manager's own preempt-and-abort unregisters the victim even when the holder-preempt quirk is on (decision 0004 §4.8)" {
     const gpa = testing.allocator;
     var ns = fake.Namespace.init(gpa);
     defer ns.deinit();
@@ -992,66 +956,21 @@ test "the death preempt through the fencing registrant (decision 0003 §DG): on 
     var mh: fake.Host = .{ .ns = &ns, .host_id = host_m };
     var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
     defer m.deinit();
-    try acquireManagerHold(&m);
-    var fh: fake.Host = .{ .ns = &ns, .host_id = host_f };
-    var f = try pr.Client.init(gpa, fh.face(), 1, 0x1111);
-    defer f.deinit();
-    f.rtype = nvme.RTYPE_WERO;
-    _ = try f.registerLadder();
+    m.rtype = nvme.RTYPE_WEAR;
+    _ = try m.registerLadder();
+    try m.acquire();
     var rh: fake.Host = .{ .ns = &ns, .host_id = host_r };
     var r = try pr.Client.init(gpa, rh.face(), 1, 0x2222);
     defer r.deinit();
     _ = try joinAsRegistrant(&r, null);
-    // The fencer is not the holder: the report names the host's registrant.
-    try testing.expect(ns.isHolder(host_m));
-    try testing.expect(!ns.isHolder(host_f));
-    const preempts0 = stats.appender_recovery_preempts.load();
-    const fencer0 = stats.pr_fencer_preempts.load();
-    const ignored0 = stats.appender_recovery_preempts_ignored.load();
-    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, &f, 0x2222));
-    try testing.expectEqual(preempts0 + 1, stats.appender_recovery_preempts.load());
-    try testing.expectEqual(fencer0 + 1, stats.pr_fencer_preempts.load());
-    try testing.expectEqual(ignored0, stats.appender_recovery_preempts_ignored.load());
+    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m, 0x2222));
     try testing.expect(!ns.writeAllowed(host_r));
-    try testing.expect(ns.isHolder(host_m));
-    try testing.expectEqual(nvme.RTYPE_WERO, ns.rtype);
-    try testing.expect(ns.find(host_f) != null);
-    try testing.expectEqual(nvme.RACQA_PREEMPT_AND_ABORT, ns.last_acquire.cdw10 & 0x7);
-    // The re-fence: the key registered again is preempted again — through
-    // the fencer, so it lands on nvmet too.
-    _ = try joinAsRegistrant(&r, null);
-    try testing.expectEqual(@as(?PreemptOutcome, .fenced), refenceAfterRecovering(&m, &f, 0x2222));
-    try testing.expect(!ns.writeAllowed(host_r));
-    // Our own key: withheld — nothing issued.
-    const commands0 = ns.commands;
-    try testing.expectEqual(PreemptOutcome.own_key_guard, preemptDeadRegistrant(&m, &f, 0x1111));
-    try testing.expectEqual(commands0, ns.commands);
-    try testing.expect(ns.isHolder(host_m));
-    try testing.expect(ns.find(host_f) != null);
-    // A spec-conformant target: the same path, the same outcome — one path
-    // for every target (decision 0003 §DG.6).
-    var ns2 = fake.Namespace.init(gpa);
-    defer ns2.deinit();
-    var mh2: fake.Host = .{ .ns = &ns2, .host_id = host_m };
-    var m2 = try pr.Client.init(gpa, mh2.face(), 1, 0x1111);
-    defer m2.deinit();
-    try acquireManagerHold(&m2);
-    var fh2: fake.Host = .{ .ns = &ns2, .host_id = host_f };
-    var f2 = try pr.Client.init(gpa, fh2.face(), 1, 0x1111);
-    defer f2.deinit();
-    f2.rtype = nvme.RTYPE_WERO;
-    _ = try f2.registerLadder();
-    var rh2: fake.Host = .{ .ns = &ns2, .host_id = host_r };
-    var r2 = try pr.Client.init(gpa, rh2.face(), 1, 0x2222);
-    defer r2.deinit();
-    _ = try joinAsRegistrant(&r2, null);
-    try testing.expectEqual(PreemptOutcome.fenced, preemptDeadRegistrant(&m2, &f2, 0x2222));
-    try testing.expect(!ns2.writeAllowed(host_r));
-    try testing.expect(ns2.isHolder(host_m));
-    try testing.expect(ns2.find(host_f) != null);
+    try testing.expect(ns.writeAllowed(host_m));
+    try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
+    try testing.expectEqual(@as(?u64, 0x1111), ns.holder);
 }
 
-test "the fencer's key is its host's (decision 0003 §DG.2): a successor's takeover preempt of the holder's key unregisters the host AND its fencer in one command — the superseded manager's fencer then answers a conflict (failed, nothing fenced); a fencer under a key of its own outlives the takeover and, preempting the new holder's key, TAKES the reservation" {
+test "a superseded manager's death preempt is refused while another host holds (DC10): .failed and pr_preempts_unheld_refused, nothing fenced" {
     const gpa = testing.allocator;
     var ns = fake.Namespace.init(gpa);
     defer ns.deinit();
@@ -1060,11 +979,6 @@ test "the fencer's key is its host's (decision 0003 §DG.2): a successor's takeo
     var m = try pr.Client.init(gpa, mh.face(), 1, 0x1111);
     defer m.deinit();
     try acquireManagerHold(&m);
-    var fh: fake.Host = .{ .ns = &ns, .host_id = host_f };
-    var f = try pr.Client.init(gpa, fh.face(), 1, 0x1111);
-    defer f.deinit();
-    f.rtype = nvme.RTYPE_WERO;
-    _ = try f.registerLadder();
     var sh: fake.Host = .{ .ns = &ns, .host_id = host_s };
     var s = try pr.Client.init(gpa, sh.face(), 1, 0x3333);
     defer s.deinit();
@@ -1073,40 +987,11 @@ test "the fencer's key is its host's (decision 0003 §DG.2): a successor's takeo
     try s.preempt(0x1111);
     try testing.expect(ns.isHolder(host_s));
     try testing.expect(ns.find(host_m) == null);
-    try testing.expect(ns.find(host_f) == null);
-    // The superseded manager, resumed mid-recovery: the report shows another
-    // host holding — the preempt withheld (review M1); and the fencer's own
-    // command conflicts at the device anyway (its registration went with the
-    // host's) — nothing fenced, the successor's hold intact.
     const refused0 = stats.pr_preempts_unheld_refused.load();
-    try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, &f, 0x3333));
+    try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, 0x3333));
     try testing.expectEqual(refused0 + 1, stats.pr_preempts_unheld_refused.load());
-    try testing.expectError(error.ReservationConflict, f.preemptAndAbort(0x3333));
     try testing.expect(ns.isHolder(host_s));
     try testing.expect(ns.writeAllowed(host_s));
-    // The weakening on the device: a fencer under a key of its own.
-    var ns2 = fake.Namespace.init(gpa);
-    defer ns2.deinit();
-    ns2.holder_preempt_retypes = true;
-    var mh2: fake.Host = .{ .ns = &ns2, .host_id = host_m };
-    var m2 = try pr.Client.init(gpa, mh2.face(), 1, 0x1111);
-    defer m2.deinit();
-    try acquireManagerHold(&m2);
-    var fh2: fake.Host = .{ .ns = &ns2, .host_id = host_f };
-    var f2 = try pr.Client.init(gpa, fh2.face(), 1, 0xF00D);
-    defer f2.deinit();
-    f2.rtype = nvme.RTYPE_WERO;
-    _ = try f2.registerLadder();
-    var sh2: fake.Host = .{ .ns = &ns2, .host_id = host_s };
-    var s2 = try pr.Client.init(gpa, sh2.face(), 1, 0x3333);
-    defer s2.deinit();
-    s2.rtype = nvme.RTYPE_WERO;
-    _ = try s2.registerLadder();
-    try s2.preempt(0x1111);
-    try testing.expect(ns2.find(host_f) != null);
-    try f2.preemptAndAbort(0x3333);
-    try testing.expect(ns2.isHolder(host_f));
-    try testing.expect(!ns2.writeAllowed(host_s));
 }
 
 test "review 4 minor 3: a report that fails after the death preempt fenced nothing proven — .failed (the full tail scan), never .fenced" {
@@ -1129,7 +1014,7 @@ test "review 4 minor 3: a report that fails after the death preempt fenced nothi
     _ = try m.wireHostId();
     ns.fail_next = error.InputOutput;
     ns.fail_skip = 5;
-    try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, null, 0x2222));
+    try testing.expectEqual(PreemptOutcome.failed, preemptDeadRegistrant(&m, 0x2222));
     // The preempt reached the device; the report after it failed.
     try testing.expectEqual(nvme.RACQA_PREEMPT_AND_ABORT, ns.last_acquire.cdw10 & 0x7);
     try testing.expectEqual(preempts0, stats.appender_recovery_preempts.load());

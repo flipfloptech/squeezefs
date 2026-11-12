@@ -704,11 +704,10 @@ pub const Verdict = enum {
 
 /// What the report says while the rule runs (this host unregistered).
 pub const Facts = struct {
-    /// A reservation stands (rtype ≠ 0).
+    /// A reservation stands (rtype ≠ 0). Under WEAR a reservation that
+    /// stands while this host is unregistered means this host is not
+    /// admitted, whatever the holder pointer names (decision 0004 §5.2).
     reserved: bool = false,
-    /// Its holder's key is ours (a lapse re-acquire race; never while this
-    /// host is unregistered on a spec target).
-    holder_ours: bool = false,
 };
 
 /// The verdict of one sibling's entry against one volume's pages (appender
@@ -742,13 +741,13 @@ pub fn judge(e: *const Entry, pages: []const page.Page, node_token: u64, vol_ind
 fn judgeRegion(e: *const Entry, r: Region, pages: []const page.Page, node_token: u64, vol_index: u32, taking_manager: bool, facts: Facts) ?Verdict {
     switch (r.role) {
         // A manager of this host — registered (`p`) or durable (`m`) — is
-        // superseded once a reservation stands that this host's key does not
-        // hold: the device named another holder (review round 3, major 1 —
-        // and N1's frozen manager whose appender-0 page still reads Live).
-        // With no reservation (a lapse) appender 0's Live page decides.
+        // superseded once a reservation stands while this host is
+        // unregistered (decision 0004 §5.2; N1's frozen manager whose
+        // appender-0 page still reads Live). With no reservation (a lapse)
+        // appender 0's Live page decides.
         .pending, .manager => {
             if (r.slot != vol_index) return null;
-            if (taking_manager or (facts.reserved and !facts.holder_ours)) return .stale;
+            if (taking_manager or facts.reserved) return .stale;
             for (pages) |p| {
                 if (p.appender_id == 0 and p.state == .live and p.identity.node_token == node_token and p.identity.writer_id == r.writer_id) return .current;
             }
@@ -1207,7 +1206,7 @@ pub fn reportFacts(c: *pr.Client) pr.Error!ReportFacts {
     for (rep.registrants) |r| if (std.mem.eql(u8, &r.host_id, &me) and r.rkey == c.key) {
         registered = true;
     };
-    return .{ .registered = registered, .rtype = rep.rtype, .facts = .{ .reserved = rep.rtype != 0, .holder_ours = rep.heldByHost(c.key, me) } };
+    return .{ .registered = registered, .rtype = rep.rtype, .facts = .{ .reserved = rep.rtype != 0 } };
 }
 
 /// One volume's appender pages, read under the registry's lock (the
@@ -1884,8 +1883,7 @@ pub fn leaveRegistration(c: *pr.Client, keep_hold: bool) pr.Error!void {
     defer rep.deinit(c.gpa);
     if (!rep.heldByHost(c.key, me)) return c.unregister(c.key);
     if (keep_hold) return;
-    // Any registrant but this host's own keeps the hold (a fencer under our
-    // key that could not be given back included).
+    // Any registrant but this host's own keeps the hold.
     for (rep.registrants) |r| if (r.rkey != c.key or !std.mem.eql(u8, &r.host_id, &me)) return;
     return c.release();
 }
@@ -2022,10 +2020,10 @@ pub fn holdReservation(c: *pr.Client, path: []const u8) error{Refused}!HoldOutco
                 log.err("{s}: reservation acquire conflicted but the report names no holder — refusing to arbitrate blind (single-writer guard)", .{path});
                 return error.Refused;
             };
-            // Our key holding under another host id (only the fencer could):
-            // a preempt of our own key would unregister this host — refused.
+            // Our own key under another host id: a preempt of it would
+            // unregister this host.
             if (victim == c.key) {
-                log.err("{s}: the reservation is held under this host's key by another of its identities (the fencing registrant) — refusing the hold (decision 0003 §DG)", .{path});
+                log.err("{s}: the reservation is held under this host's key by another host id — refusing the hold (a preempt of our own key would unregister this host)", .{path});
                 return error.Refused;
             }
             c.preempt(victim) catch {
@@ -2282,7 +2280,7 @@ test "a joiner's claimed page key against the joined volume's report (decision 0
     try testing.expectEqual(JoinKeyVerdict.absent, joinKeyVerdict(rep, 0x9999, set, false));
 }
 
-test "the judgement: a Live page names a current sibling; a Recovering, Recovered or Free page under its writer id is stale unless its own retirement (writer id, appender id, term) covers it; no page yet is joining; the manager is current only on appender 0's Live page, stale once the role passed or while this mount takes it over; a manager of this host (pending or durable) is stale while a reservation stands that this host's key does not hold; another node's page never names a sibling" {
+test "the judgement: a Live page names a current sibling; a Recovering, Recovered or Free page under its writer id is stale unless its own retirement (writer id, appender id, term) covers it; no page yet is joining; the manager is current only on appender 0's Live page, stale once the role passed or while this mount takes it over; a manager of this host (pending or durable) is stale while a reservation stands and this host is unregistered; another node's page never names a sibling" {
     const node: u64 = 0xA;
     var e = Entry.parse(42, "77 000000000000000a\nj 9 00000000000000b1\n").?;
     try testing.expectEqual(Verdict.joining, judge(&e, &.{}, node, 0, false, .{}));
@@ -2299,10 +2297,10 @@ test "the judgement: a Live page names a current sibling; a Recovering, Recovere
     // An `r` line short of a word retires nothing.
     var bare = Entry.parse(43, "78 000000000000000a\nj 9 00000000000000b2\nr 00000000000000b2 4\n").?;
     try testing.expectEqual(Verdict.stale, judge(&bare, &.{pg(4, .recovered, node, 0xb2)}, node, 0, false, .{}));
-    // A manager of this host — pending or durable — is stale once a
-    // reservation stands that this host's key does not hold (superseded,
-    // its appender-0 page possibly still Live: review round 3 N1/major 1);
-    // with no reservation appender 0's Live page decides.
+    // A manager of this host — pending or durable — is stale while a
+    // reservation stands (this host is unregistered: not admitted, whatever
+    // the holder pointer names). With no reservation appender 0's Live page
+    // decides.
     var p = Entry.parse(45, "80 000000000000000a\np 0 00000000000000c9\n").?;
     try testing.expectEqual(Verdict.stale, judge(&p, &.{pg(0, .live, node, 0xc9)}, node, 0, false, .{ .reserved = true }));
     try testing.expectEqual(Verdict.stale, judge(&p, &.{pg(0, .live, node, 0xd1)}, node, 0, false, .{}));
@@ -2310,7 +2308,6 @@ test "the judgement: a Live page names a current sibling; a Recovering, Recovere
     try testing.expectEqual(Verdict.joining, judge(&p, &.{pg(0, .live, node, 0xd1)}, node, 1, false, .{ .reserved = true }));
     var mm = Entry.parse(47, "82 000000000000000a\nm 0 00000000000000ca\n").?;
     try testing.expectEqual(Verdict.stale, judge(&mm, &.{pg(0, .live, node, 0xca)}, node, 0, false, .{ .reserved = true }));
-    try testing.expectEqual(Verdict.current, judge(&mm, &.{pg(0, .live, node, 0xca)}, node, 0, false, .{ .reserved = true, .holder_ours = true }));
     var m = Entry.parse(44, "79 000000000000000a\nm 0 00000000000000c1\nm 1 00000000000000c2\n").?;
     try testing.expectEqual(Verdict.current, judge(&m, &.{pg(0, .live, node, 0xc1)}, node, 0, false, .{}));
     try testing.expectEqual(Verdict.stale, judge(&m, &.{pg(0, .live, node, 0xd1)}, node, 0, false, .{}));

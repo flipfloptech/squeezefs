@@ -147,16 +147,10 @@ persistent reservations keyed on it, so a node that loses its lease loses its ac
 (the data volumes carry no reservation yet). `squeezefs nvmeof resv-report <dev>` shows the
 reservations.
 
-A node that manages a metadata volume also connects it under a second, write-free identity of its
-own — the fencing registrant, hostnqn `nqn.2026-10.io.squeezefs:fencer:<uuid>` — whose only command
-fences a dead member's host (nvmet answers that only from a non-holder; decision 0003 §DG). With
-`nvme_core.multipath=N` that connection shows up as a second block node of the namespace: install
-`scripts/udev/60-squeezefs-fencer.rules` into `/etc/udev/rules.d/` on every node (a package must
-ship it) so `/dev/disk/by-id` links, systemd and udisks keep to the host's own node, and on a node
-running `multipathd` keep dm-multipath off these namespaces (`blacklist { device { vendor "NVME"
-product "Linux" } }` for nvmet targets). A mount, `fsck` or `appender clear` on a fencer's node is
-refused by name. Under `nvme_core.multipath=Y` no fencer stands and a dead member is detected, not
-fenced, on an nvmet 7.3 target.
+The manager's own client fences a dead member (Write Exclusive – All Registrants, a preempt-and-abort
+of that member's key). A mount, `fsck` or `appender clear` on a node whose controller hostnqn starts
+with `nqn.2026-10.io.squeezefs:fencer:` is refused by name: that prefix is residue from a mount that
+stood a fencing registrant.
 
 ## 6. The bypass: skipping the kernel round trip
 

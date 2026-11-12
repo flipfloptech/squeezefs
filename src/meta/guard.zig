@@ -27,7 +27,6 @@ pub const nvme_cmd = @import("guard/nvme_cmd.zig");
 pub const fake_nvme = @import("guard/fake_nvme.zig");
 pub const pr = @import("guard/pr.zig");
 pub const member_fence = @import("guard/member_fence.zig");
-pub const host_fence_model = @import("guard/host_fence_model.zig");
 pub const data_fence_model = @import("guard/data_fence_model.zig");
 pub const meta_fence_model = @import("guard/meta_fence_model.zig");
 
@@ -36,7 +35,6 @@ pub const pr_linux = if (is_linux) @import("guard/pr_linux.zig") else struct {};
 pub const gate = if (is_linux) @import("guard/gate.zig") else struct {};
 pub const host_fence = if (is_linux) @import("guard/host_fence.zig") else struct {};
 pub const marker = if (is_linux) @import("guard/marker.zig") else struct {};
-pub const fencer = if (is_linux) @import("guard/fencer.zig") else struct {};
 pub const convert_pr = if (is_linux) @import("guard/convert_pr.zig") else struct {};
 pub const data_fence = if (is_linux) @import("guard/data_fence.zig") else struct {};
 pub const smoke = if (is_linux) @import("guard/smoke.zig") else struct {};
@@ -212,7 +210,6 @@ test {
     _ = fake_nvme;
     _ = pr;
     _ = member_fence;
-    _ = host_fence_model;
     _ = data_fence_model;
     _ = meta_fence_model;
     if (is_linux) {
@@ -221,7 +218,6 @@ test {
         _ = gate;
         _ = host_fence;
         _ = marker;
-        _ = fencer;
         _ = convert_pr;
         _ = data_fence;
         _ = smoke;

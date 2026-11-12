@@ -5,10 +5,11 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** The fencing registrant is retired in `281bd07b`. This note
-is the docs commit on top of it. Incompat bit 4 and `claim convert-pr` are `694b43c2`.
-The blind-rule refusals are `eea93412`. Report-first recovery is `d75445b9`. Do not
-amend those. No upstream. Not pushed. Not merged. `dev` is `b40ac017`.
+**Branch `feat/pr5`.** F2, F3, and F4 are in `bc7ae7c4`. This note is the docs
+commit on top of it. The fencing registrant is retired in `281bd07b`. Incompat
+bit 4 and `claim convert-pr` are `694b43c2`. The blind-rule refusals are
+`eea93412`. Report-first recovery is `d75445b9`. Do not amend those. No upstream.
+Not pushed. Not merged. `dev` is `b40ac017`.
 
 Decision 0004 is the spec. PR-5 is not finished. W_end, the fence debt, `identityHolds`,
 the registration lock, rule markers, the re-acquire mark, the frozen-joiner kill,
@@ -17,11 +18,11 @@ The hashes are in the table below.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
-1. The fidelity rows that are not yet written: F2, F3, F4, F5, F6, F7a, F7b, F8,
-   F11, F12, F13, F14. F4 is member death with no fencing registrant. F8 is the
-   convert-pr device row. F12 and F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`,
-   which does not exist. `claim posture-reset` is the other offline door; it is
-   not one of these rows.
+1. The fidelity rows that are not yet written: F5, F6, F7a, F7b, F8, F11, F13.
+   F5 is next. F8 is the convert-pr device row. F12 and F14 need
+   `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist. Do not build
+   that seam before F5–F11 and F13. `claim posture-reset` is the other offline
+   door; it is not one of these rows.
 
 A full venue gate has not been run on this branch. Do not merge to `dev` until that gate is
 green and the owner asks. Landing a fast-forward of `dev` is pushed by the local post-commit
@@ -49,6 +50,7 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | `eea93412` | A sibling the stale-sibling rule cannot judge is refused before registration. Registry root via `openat2`, and the node-token reasons. F15, F16, F16b. See below. |
 | `694b43c2` | Incompat bit 4 `META_PR_ALL_REGISTRANTS` and `squeezefs claim convert-pr --all-mounts-down`. A mount does not stamp the bit. See below. |
 | `281bd07b` | The fencing registrant is gone. The manager's own client fences a dead member. A kept key is `meta_pr_preempt_kept`. See below. |
+| `bc7ae7c4` | A parked mint stays Held and waits at the park gate. A dismount terminates a pending resolution word before `Listener.stop`. F2, F3, F4. See below. |
 
 ## What is true in the code
 
@@ -363,6 +365,24 @@ was that ladder test opening a symmetric volume onto a Write Exclusive holder.
 It is a flat volume now (`~/tmp/ladder-step2.log`, 41 pass). The device rows
 in the unit binary skip without `./squeezefs`. No full gate.
 
+## Parked mint and the dismount join, committed `bc7ae7c4`
+
+Decision 0004 §4.5.5, §4.5.6, §4.12, §4.16, §8.2 F2–F4. A joiner's first guest-tree
+mint during a succession park was collapsed to `Io`, so the post-takeover create
+returned EIO. `mintGuestTree` drops `trees_lock` on `Held` and waits in
+`preAdmission` while the gate is parked. `MetaSet` keeps `Held`, `Deferred`, and
+`VolumeFailed`. A wire serve sets `serve_must_not_wait`, so `preAdmission` answers
+`Retired` and leaves the gate parked. That flag does not cover a serve already
+inside `Conveyor.commit`. `WirePlane.stop` terminates a pending resolution word
+after the membership beat is joined and before `listener.stop`, so `awaitPast`
+returns `.terminal` and the conn can retire. A cleared word is left alone. No
+poison, no park release, and the 32s umount budget is unchanged.
+
+Device, 2026-11-12, cached daemon except F2's link: F2 `~/tmp/pr5-f2j.log` (41/41,
+about 1 min of test after a 5 min link); F3 `~/tmp/pr5-f3.log` (41/41, 55s); F4
+`~/tmp/pr5-f4.log` (41/41, 8s). Each binary's only fidelity name was that row.
+The 41 includes one empty stub per source file. No full gate.
+
 ## Explicitly not in this branch
 
 - F9 and F10 have not been re-run on this commit. F1 has, after report-first recovery.
@@ -372,7 +392,7 @@ in the unit binary skip without `./squeezefs`. No full gate.
 - Recovery's `fence(k)` does not call `identityHolds`.
 - `claim posture-reset --all-mounts-down` (`Mode.posture_reset`).
 - `meta_pr_succession_parks`, `meta_pr_succession_reregistrations`, `meta_pr_refusal_readmissions`. Do not invent them. Parks increment `stats.appender_parks`. `writer_guard_fenced` increments in `journal.noteFence`.
-- Fidelity rows F2, F3, F4, F5, F6, F7a, F7b, F8, F11, F12, F13, F14. F15, F16, and F16b are committed. F12/F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist.
+- Fidelity rows F5, F6, F7a, F7b, F8, F11, F13, F12, F14. F2, F3, F4, F15, F16, and F16b are committed. F12/F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist.
 - An offline writer still never ticks the cadence, so it pays the debt at its own admission and does not run the later reconcile. The shortcut comment in `data_fence.zig` `endSuccession` still says so.
 - `data_pr_reconciles_deferred` and the `data_pr_reconcile_in_window` tripwire.
 - A full `zig build gate` on this branch.
@@ -397,7 +417,7 @@ Cache is `/build/zig-cache-v2`. One `zig build` takes a build slot. The nvmet ex
 
 ```bash
 git checkout feat/pr5
-git status -sb    # clean, no upstream; the fencing registrant is 281bd07b
+git status -sb    # clean, no upstream; F2–F4 are bc7ae7c4
 
 # Unit: census, debt, live-page skip, the old admission reconcile.
 scripts/venue 'zig build --cache-dir /build/zig-cache-v2 test -Dtest-filter="pr5 debt" -Dtest-filter="pr5 live page" -Dtest-filter="succession census" --summary all'
@@ -417,6 +437,7 @@ Last green results, 2026-11-11, on this host:
 - F9 and F9b after the skip (`~/tmp/pr5-f9-live.log`): `data_pr_preempts` 1, reconcile 0, 42/42, about 330 s.
 - F10 after the acked-count fix (`~/tmp/pr5-f10-debt2.log`): 41/41, about 380 s. The run before that failed only on the racy count.
 - Blind rules, 2026-11-12: F15 `~/tmp/pr5-f15-smoke2.log` (`EXIT:0`, 41/41, 3s); F16 and F16b `~/tmp/pr5-f16-smoke.log` (`EXIT:0`, 42/42, 9s). The 41 and 42 include one empty stub per source file.
+- F2 `~/tmp/pr5-f2j.log` (`EXIT:0`, 41/41, about 1 min). F3 `~/tmp/pr5-f3.log` (`EXIT:0`, 41/41, 55s). F4 `~/tmp/pr5-f4.log` (`EXIT:0`, 41/41, 8s).
 
 ## Resume rules
 

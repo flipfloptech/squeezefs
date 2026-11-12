@@ -5,10 +5,10 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** Incompat bit 4 and `claim convert-pr` are `694b43c2`. This note
-is the docs commit on top of it. The blind-rule refusals are `eea93412`. Report-first
-recovery is `d75445b9`. Do not amend those. No upstream. Not pushed. Not merged.
-`dev` is `b40ac017`.
+**Branch `feat/pr5`.** The fencing registrant is retired in `281bd07b`. This note
+is the docs commit on top of it. Incompat bit 4 and `claim convert-pr` are `694b43c2`.
+The blind-rule refusals are `eea93412`. Report-first recovery is `d75445b9`. Do not
+amend those. No upstream. Not pushed. Not merged. `dev` is `b40ac017`.
 
 Decision 0004 is the spec. PR-5 is not finished. W_end, the fence debt, `identityHolds`,
 the registration lock, rule markers, the re-acquire mark, the frozen-joiner kill,
@@ -17,12 +17,11 @@ The hashes are in the table below.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
-1. Retire the fencing registrant (`src/meta/guard/fencer.zig`). `stand()` uses WEAR.
-   `forTest` stays WERO. `acquireManagerHold` still forces WERO. Flat `pr_rtype` 1 and
-   the WERO pr legs stay 1.
-2. Then the fidelity rows that are not yet written. F8 is the device row and stays
-   with those rows. `claim posture-reset` is the other offline door; it is not part
-   of retiring the fencer.
+1. The fidelity rows that are not yet written: F2, F3, F4, F5, F6, F7a, F7b, F8,
+   F11, F12, F13, F14. F4 is member death with no fencing registrant. F8 is the
+   convert-pr device row. F12 and F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`,
+   which does not exist. `claim posture-reset` is the other offline door; it is
+   not one of these rows.
 
 A full venue gate has not been run on this branch. Do not merge to `dev` until that gate is
 green and the owner asks. Landing a fast-forward of `dev` is pushed by the local post-commit
@@ -49,6 +48,7 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | `d75445b9` | A death fence whose key the report already shows absent is `.fenced` and issues no preempt. `appender_recovery_keys_absent`. See below. |
 | `eea93412` | A sibling the stale-sibling rule cannot judge is refused before registration. Registry root via `openat2`, and the node-token reasons. F15, F16, F16b. See below. |
 | `694b43c2` | Incompat bit 4 `META_PR_ALL_REGISTRANTS` and `squeezefs claim convert-pr --all-mounts-down`. A mount does not stamp the bit. See below. |
+| `281bd07b` | The fencing registrant is gone. The manager's own client fences a dead member. A kept key is `meta_pr_preempt_kept`. See below. |
 
 ## What is true in the code
 
@@ -245,7 +245,7 @@ F1 (`~/tmp/pr5-f1-frozen.log`): `regctl` 3, identity counters 0,
 
 ## Report-first recovery, on top of `7c7feecc`
 
-Decision §4.8 step 4. Not the page check, and not deleting `.ignored` or the fencer.
+Decision §4.8 step 4. Not the page check. `.ignored` and the fencing registrant were retired in `281bd07b`.
 Unit tests `report-first`, `death preempt`, `review 4 minor 3`, `decision 0004 §4.8`:
 56 pass. F1 (`~/tmp/pr5-f1-report.log`): `regctl` 3, identity counters 0,
 `data_pr_debt_preempts` 1, `data_pr_reconcile_preempts` 0, 41/41.
@@ -258,7 +258,7 @@ Unit tests `report-first`, `death preempt`, `review 4 minor 3`, `decision 0004 �
 - The re-fence still calls the same function only when the key came back, so an absent
   key at step 2b stays a no-op. A key that vanishes between that check and the preempt
   takes this skip.
-- Not in this slice: `identityHolds` on the recovery fence, and retiring `.ignored`.
+- Not in this slice: `identityHolds` on the recovery fence. `.ignored` was retired with the fencing registrant (`281bd07b`).
 
 ## Blind-rule refusals, committed `eea93412`
 
@@ -332,6 +332,37 @@ Units on this host, 2026-11-12: `scripts/venue test convert-pr`
 enable-symmetric, and device-format filters (`~/tmp/convert-pr-related.log`,
 52 pass, 714 ms). No full gate.
 
+## No fencing registrant, committed `281bd07b`
+
+Decision 0004 §4.8 and §4.14. `src/meta/guard/fencer.zig`,
+`src/meta/guard/host_fence_model.zig`, and `scripts/udev/60-squeezefs-fencer.rules`
+are deleted. The manager's own client issues the death preempt and the re-fence.
+`preemptDeadRegistrant` and `refenceAfterRecovering` take the client and the victim key.
+
+A key the report still names after a successful preempt-and-abort fires
+`meta_pr_preempt_kept` and returns `.failed`. `.ignored` is gone. The own-key
+guard stays. A preempt is issued only while a report shows this host holding.
+`leaveRegistration` keeps the hold when `keep_hold` or `c.stats.preempts > 0`.
+
+`acquireManagerHold` still forces WERO. Do not change it. The product's symmetric
+hold is `host_fence.takeSuccession` under WEAR. Flat `pr_rtype` 1 and the WERO
+pr-legs measurement stay 1. `DataRtype.wero_holder` and the meta-fence weakenings
+that name a WERO holder stay.
+
+A mount on a node whose controller hostnqn starts with
+`nqn.2026-10.io.squeezefs:fencer:` is still refused (`error.FencerNode`, until
+PR-8). `convert-pr` still disconnects those controllers.
+
+The recovery-ladder step 2 unit is a flat volume. A symmetric hold refuses a
+reservation that is not WEAR instead of preempting its one holder.
+
+Units on this host, 2026-11-12: the preempt, judgement, fencer-prefixed,
+co-located, stale-sibling, and stats-JSON filters
+(`~/tmp/fencer-retire-unit.log`) were 112 pass, 16 skip, 1 fail. The failure
+was that ladder test opening a symmetric volume onto a Write Exclusive holder.
+It is a flat volume now (`~/tmp/ladder-step2.log`, 41 pass). The device rows
+in the unit binary skip without `./squeezefs`. No full gate.
+
 ## Explicitly not in this branch
 
 - F9 and F10 have not been re-run on this commit. F1 has, after report-first recovery.
@@ -340,7 +371,6 @@ enable-symmetric, and device-format filters (`~/tmp/convert-pr-related.log`,
   That row has not been run.
 - Recovery's `fence(k)` does not call `identityHolds`.
 - `claim posture-reset --all-mounts-down` (`Mode.posture_reset`).
-- Deleting `src/meta/guard/fencer.zig`. `stand()` uses WEAR. `forTest` stays WERO. `acquireManagerHold` still forces WERO. Flat `pr_rtype` 1 and the WERO pr legs stay 1.
 - `meta_pr_succession_parks`, `meta_pr_succession_reregistrations`, `meta_pr_refusal_readmissions`. Do not invent them. Parks increment `stats.appender_parks`. `writer_guard_fenced` increments in `journal.noteFence`.
 - Fidelity rows F2, F3, F4, F5, F6, F7a, F7b, F8, F11, F12, F13, F14. F15, F16, and F16b are committed. F12/F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist.
 - An offline writer still never ticks the cadence, so it pays the debt at its own admission and does not run the later reconcile. The shortcut comment in `data_fence.zig` `endSuccession` still says so.
@@ -367,7 +397,7 @@ Cache is `/build/zig-cache-v2`. One `zig build` takes a build slot. The nvmet ex
 
 ```bash
 git checkout feat/pr5
-git status -sb    # clean, no upstream; convert-pr is 694b43c2
+git status -sb    # clean, no upstream; the fencing registrant is 281bd07b
 
 # Unit: census, debt, live-page skip, the old admission reconcile.
 scripts/venue 'zig build --cache-dir /build/zig-cache-v2 test -Dtest-filter="pr5 debt" -Dtest-filter="pr5 live page" -Dtest-filter="succession census" --summary all'

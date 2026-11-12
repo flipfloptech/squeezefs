@@ -5,8 +5,9 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** F2, F3, and F4 are in `bc7ae7c4`. This note is the docs
-commit on top of it. The fencing registrant is retired in `281bd07b`. Incompat
+**Branch `feat/pr5`.** F5 is in `2a8f4a2b`. This note is the docs commit on top
+of it. F2, F3, and F4 are in `bc7ae7c4`. The fencing registrant is retired in
+`281bd07b`. Incompat
 bit 4 and `claim convert-pr` are `694b43c2`. The blind-rule refusals are
 `eea93412`. Report-first recovery is `d75445b9`. Do not amend those. No upstream.
 Not pushed. Not merged. `dev` is `b40ac017`.
@@ -18,8 +19,8 @@ The hashes are in the table below.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
-1. The fidelity rows that are not yet written: F5, F6, F7a, F7b, F8, F11, F13.
-   F5 is next. F8 is the convert-pr device row. F12 and F14 need
+1. The fidelity rows that are not yet written: F6, F7a, F7b, F8, F11, F13.
+   F6 is next (two metadata volumes). F8 is the convert-pr device row. F12 and F14 need
    `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist. Do not build
    that seam before F5–F11 and F13. `claim posture-reset` is the other offline
    door; it is not one of these rows.
@@ -51,6 +52,7 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | `694b43c2` | Incompat bit 4 `META_PR_ALL_REGISTRANTS` and `squeezefs claim convert-pr --all-mounts-down`. A mount does not stamp the bit. See below. |
 | `281bd07b` | The fencing registrant is gone. The manager's own client fences a dead member. A kept key is `meta_pr_preempt_kept`. See below. |
 | `bc7ae7c4` | A parked mint stays Held and waits at the park gate. A dismount terminates a pending resolution word before `Listener.stop`. F2, F3, F4. See below. |
+| `2a8f4a2b` | F5: a lapse inside the succession window. The joiner re-registers through the lapse path, `writer_guard_preempt_alls` stays 1, the window settles, one reconcile. |
 
 ## What is true in the code
 
@@ -383,6 +385,20 @@ about 1 min of test after a 5 min link); F3 `~/tmp/pr5-f3.log` (41/41, 55s); F4
 `~/tmp/pr5-f4.log` (41/41, 8s). Each binary's only fidelity name was that row.
 The 41 includes one empty stub per source file. No full gate.
 
+## Lapse inside the window, committed `2a8f4a2b`
+
+Decision 0004 §4.9 and §8.2 F5, tcp. J is SIGSTOPped before S mounts, M past the
+claim TTL. S preempts-all once (`SQUEEZEFS_TEST_LAPSE_GRACE_S` 600). J's log has
+no lapse line while it is stopped. Both subsystems are wiped and restored; the
+metadata namespace reads rtype 0. J continued re-registers through the lapse path
+(`meta_pr_lapse_reregistrations` 1). `writer_guard_preempt_alls` stays 1,
+`writer_guard_succession_settles` is 1, and S's log has one
+`succession reconcile over` line.
+
+Device: `~/tmp/pr5-f5.log` (`EXIT:0`, 41/41, about 1 min of test after a 5 min
+link). The resv-report retries while the controller's char node is gone print
+stderr; the row still exits 0. No full gate.
+
 ## Explicitly not in this branch
 
 - F9 and F10 have not been re-run on this commit. F1 has, after report-first recovery.
@@ -392,7 +408,7 @@ The 41 includes one empty stub per source file. No full gate.
 - Recovery's `fence(k)` does not call `identityHolds`.
 - `claim posture-reset --all-mounts-down` (`Mode.posture_reset`).
 - `meta_pr_succession_parks`, `meta_pr_succession_reregistrations`, `meta_pr_refusal_readmissions`. Do not invent them. Parks increment `stats.appender_parks`. `writer_guard_fenced` increments in `journal.noteFence`.
-- Fidelity rows F5, F6, F7a, F7b, F8, F11, F13, F12, F14. F2, F3, F4, F15, F16, and F16b are committed. F12/F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist.
+- Fidelity rows F6, F7a, F7b, F8, F11, F13, F12, F14. F2, F3, F4, F5, F15, F16, and F16b are committed. F12/F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist.
 - An offline writer still never ticks the cadence, so it pays the debt at its own admission and does not run the later reconcile. The shortcut comment in `data_fence.zig` `endSuccession` still says so.
 - `data_pr_reconciles_deferred` and the `data_pr_reconcile_in_window` tripwire.
 - A full `zig build gate` on this branch.
@@ -417,7 +433,7 @@ Cache is `/build/zig-cache-v2`. One `zig build` takes a build slot. The nvmet ex
 
 ```bash
 git checkout feat/pr5
-git status -sb    # clean, no upstream; F2–F4 are bc7ae7c4
+git status -sb    # clean, no upstream; F5 is 2a8f4a2b
 
 # Unit: census, debt, live-page skip, the old admission reconcile.
 scripts/venue 'zig build --cache-dir /build/zig-cache-v2 test -Dtest-filter="pr5 debt" -Dtest-filter="pr5 live page" -Dtest-filter="succession census" --summary all'
@@ -438,6 +454,7 @@ Last green results, 2026-11-11, on this host:
 - F10 after the acked-count fix (`~/tmp/pr5-f10-debt2.log`): 41/41, about 380 s. The run before that failed only on the racy count.
 - Blind rules, 2026-11-12: F15 `~/tmp/pr5-f15-smoke2.log` (`EXIT:0`, 41/41, 3s); F16 and F16b `~/tmp/pr5-f16-smoke.log` (`EXIT:0`, 42/42, 9s). The 41 and 42 include one empty stub per source file.
 - F2 `~/tmp/pr5-f2j.log` (`EXIT:0`, 41/41, about 1 min). F3 `~/tmp/pr5-f3.log` (`EXIT:0`, 41/41, 55s). F4 `~/tmp/pr5-f4.log` (`EXIT:0`, 41/41, 8s).
+- F5 `~/tmp/pr5-f5.log` (`EXIT:0`, 41/41, about 1 min). Pins printed: lapse rereg 1, preempt_alls 1, settles 1, reconcile lines 1.
 
 ## Resume rules
 

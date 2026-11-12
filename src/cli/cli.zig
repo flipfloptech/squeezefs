@@ -113,6 +113,7 @@ pub fn run(p: Process) u8 {
         .tune => |t| return tune.run(p, t),
         .config => |c| return if (is_linux) config_verb.run(p, c) else linuxOnly(p, "config"),
         .claim_clear => |c| return if (is_linux) claim.run(p, c) else linuxOnly(p, "claim clear"),
+        .convert_pr => |c| return if (is_linux) claim.runConvert(p, c) else linuxOnly(p, "claim convert-pr"),
         .appenders => |a| return if (is_linux) appenders.run(p, a) else linuxOnly(p, "appenders"),
         .appender_clear => |a| return if (is_linux) appenders.runClear(p, a) else linuxOnly(p, "appender clear"),
         .volume => |v| return if (is_linux) volume.run(p, v) else linuxOnly(p, "volume"),

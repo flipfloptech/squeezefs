@@ -39,3 +39,28 @@ pub fn run(p: cli.Process, c: args.ClaimClear) u8 {
     p.stdout.flush() catch {};
     return cli.exit_ok;
 }
+
+pub fn runConvert(p: cli.Process, c: args.ConvertPr) u8 {
+    var report = guard.convert_pr.claimConvert(p.gpa, p.io, p.env, c.meta_uri, .{}) catch |e| {
+        switch (e) {
+            error.InvalidUri => p.stderr.print("squeezefs claim convert-pr: {s} is not a sqmeta:// URI of absolute paths\n", .{c.meta_uri}) catch {},
+            error.OutOfMemory => p.stderr.writeAll("squeezefs claim convert-pr: out of memory\n") catch {},
+            error.ExecutorInit => p.stderr.writeAll("squeezefs claim convert-pr: the executor could not start\n") catch {},
+            error.FencerDisconnect => p.stderr.writeAll("squeezefs claim convert-pr: a fencer controller on this host could not be disconnected — no volume was touched\n") catch {},
+        }
+        return cli.exit_failed;
+    };
+    defer report.deinit();
+    report.write(p.stdout) catch return cli.exit_failed;
+    var refused: usize = 0;
+    for (report.volumes) |v| {
+        if (v.refused()) refused += 1;
+    }
+    if (refused != 0) {
+        p.stderr.print("squeezefs claim convert-pr: refused/failed on {d} of {d} volume(s)\n", .{ refused, report.volumes.len }) catch {};
+        p.stdout.flush() catch {};
+        return cli.exit_failed;
+    }
+    p.stdout.flush() catch {};
+    return cli.exit_ok;
+}

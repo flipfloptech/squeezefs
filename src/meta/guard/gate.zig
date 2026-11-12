@@ -69,6 +69,9 @@ pub const Mode = enum {
     writer,
     /// `squeezefs claim clear`: the same door, deleting a clearable claim.
     claim_clear,
+    /// `squeezefs claim convert-pr`: not an open. `KvBackend.open` refuses
+    /// this mode before replay; the verb is `guard/convert_pr.zig`.
+    convert_pr,
 };
 
 /// What `backend.OpenOptions.guard` carries.
@@ -370,6 +373,7 @@ pub const Guard = struct {
     pub fn modeName(self: *const Guard) []const u8 {
         return switch (self.mode) {
             .claim_clear => "claim-clear",
+            .convert_pr => "convert-pr",
             .writer => self.posture.mode(),
         };
     }
@@ -459,7 +463,8 @@ pub const Guard = struct {
         g.evidence = claim.classify(found, identity, g.gate_now, probe);
 
         // `claim clear` decides at commit (its delete needs the cover too).
-        if (opts.mode == .claim_clear) return g;
+        // `convert-pr` is not this door: no claim, no `clear`.
+        if (opts.mode == .claim_clear or opts.mode == .convert_pr) return g;
 
         // B1 posture: a fake substrate in tests, else the char twin.
         try g.resolvePr(gpa, opts);
@@ -523,6 +528,7 @@ pub const Guard = struct {
             g.gpa.free(r);
             g.found_raw = null;
         };
+        if (g.mode == .convert_pr) return;
         if (g.mode == .claim_clear) {
             g.clear_outcome = try g.clear(g.found_raw, g.evidence, g.gate_now);
             return;

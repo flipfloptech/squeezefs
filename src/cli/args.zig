@@ -220,6 +220,11 @@ pub const ClaimClear = struct {
     meta_uri: []const u8,
 };
 
+/// `squeezefs claim convert-pr --all-mounts-down sqmeta://<path>`.
+pub const ConvertPr = struct {
+    meta_uri: []const u8,
+};
+
 /// `squeezefs appenders [--json] sqmeta://<path>`.
 pub const Appenders = struct {
     meta_uri: []const u8,
@@ -389,6 +394,7 @@ pub const Verb = union(enum) {
     tune: Tune,
     config: Config,
     claim_clear: ClaimClear,
+    convert_pr: ConvertPr,
     appenders: Appenders,
     appender_clear: AppenderClear,
     volume: Volume,
@@ -458,6 +464,8 @@ pub const Refusal = union(enum) {
     identity_half: []const u8,
     /// `--pr-matrix` without `--peer`.
     matrix_without_peer,
+    /// `claim convert-pr` without the operator's attestation.
+    convert_without_attestation,
     /// A `vol-<tag>=<trtype>:<traddr>:<trsvcid>:<subnqn>` spec that does not parse.
     bad_endpoint_spec: struct { word: []const u8, why: EndpointSpecRefusal },
 
@@ -504,6 +512,7 @@ pub const Refusal = union(enum) {
             .bad_uuid => |u| try w.print("--ns-uuid '{s}' is not a uuid (8-4-4-4-12 hex)", .{u}),
             .identity_half => |f| try w.print("nvmeof connect: {s} given without its pair — hostnqn and hostid are PAIR-OR-NEITHER", .{f}),
             .matrix_without_peer => try w.writeAll("nvmeof resv-report: --pr-matrix needs --peer <second namespace node> (a second association under a DISTINCT host identity)"),
+            .convert_without_attestation => try w.writeAll("claim convert-pr: --all-mounts-down is required (every mount of the set is down)"),
             .bad_endpoint_spec => |s| switch (s.why) {
                 .shape => try w.print("config set-fabric-endpoints: '{s}' is not vol-<16 hex>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>[,<tcp|loop>:<traddr>:<trsvcid>:<subnqn>…]", .{s.word}),
                 .subnqn_differs => |d| try w.print("config set-fabric-endpoints: '{s}' names two subsystems, '{s}' and '{s}' — every path of a volume reaches ONE subsystem (its paths merge under one multipath head); a second subsystem is another volume", .{ s.word, d.a, d.b }),
@@ -531,6 +540,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs config show [--json] sqmeta://<path>|<mountpoint>
         \\  squeezefs config set-dir-spread-depth N sqmeta://<path>
         \\  squeezefs claim clear sqmeta://<path>
+        \\  squeezefs claim convert-pr --all-mounts-down sqmeta://<path>
         \\  squeezefs appenders [--json] sqmeta://<path>
         \\  squeezefs appender clear sqmeta://<path> <id>
         \\  squeezefs volume list sqmeta://<path>[,…]
@@ -591,6 +601,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .tune => "usage: squeezefs tune [--apply]\n",
         .config => "usage: squeezefs config show [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-fabric-endpoints sqmeta://<path> vol-<tag>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>[,<path>…]…\n       squeezefs config get-fabric-endpoints [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-dir-spread-depth 0…254 sqmeta://<path>   (directories at depth ≤ N round-robin over the members; 0 = never below /'s children; the set must be unmounted; takes effect at the next mount)\n",
         .claim_clear => "usage: squeezefs claim clear sqmeta://<path>\n",
+        .convert_pr => "usage: squeezefs claim convert-pr --all-mounts-down sqmeta://<path>\n",
         .appenders => "usage: squeezefs appenders [--json] sqmeta://<path>\n",
         .appender_clear => "usage: squeezefs appender clear sqmeta://<path> <id>   (the set must be unmounted; the next mount's recovery fences the cleared page's host with its registration key: every live mount of the set on that host is fenced with it and fail-stops)\n",
         .fsck => "usage: squeezefs fsck [--online|--offline] [--json] [--scrub] [--throttle PCT] [--shards k/N] [--repair [--apply] [--quarantine-dir DIR]] sqmeta://<path>|<mountpoint>\n       squeezefs scrub [--online|--offline] [--json] [--throttle PCT] sqmeta://<path>|<mountpoint>\n",
@@ -1314,15 +1325,29 @@ fn parseConfig(words: []const []const u8, diag: *Refusal) Error!Verb {
 
 fn parseClaim(words: []const []const u8, diag: *Refusal) Error!Verb {
     const sub = try subverb("claim", words, diag);
-    if (!std.mem.eql(u8, sub, "clear")) {
-        diag.* = .{ .unknown_subverb = .{ .verb = "claim", .word = sub } };
-        return error.Refused;
+    if (std.mem.eql(u8, sub, "clear")) {
+        var c: Cursor = .{ .verb = "claim clear", .words = words[1..], .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        const target = try exactlyOne(&c, "the sqmeta:// volume");
+        try checkUri(.meta, target, diag);
+        return .{ .claim_clear = .{ .meta_uri = target } };
     }
-    var c: Cursor = .{ .verb = "claim clear", .words = words[1..], .diag = diag };
-    while (try c.step()) |f| return c.unknown(f);
-    const target = try exactlyOne(&c, "the sqmeta:// volume");
-    try checkUri(.meta, target, diag);
-    return .{ .claim_clear = .{ .meta_uri = target } };
+    if (std.mem.eql(u8, sub, "convert-pr")) {
+        var c: Cursor = .{ .verb = "claim convert-pr", .words = words[1..], .diag = diag };
+        var attested = false;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--all-mounts-down")) attested = true else return c.unknown(f);
+        }
+        const target = try exactlyOne(&c, "the sqmeta:// volume");
+        try checkUri(.meta, target, diag);
+        if (!attested) {
+            diag.* = .convert_without_attestation;
+            return error.Refused;
+        }
+        return .{ .convert_pr = .{ .meta_uri = target } };
+    }
+    diag.* = .{ .unknown_subverb = .{ .verb = "claim", .word = sub } };
+    return error.Refused;
 }
 
 fn parseAppenders(words: []const []const u8, diag: *Refusal) Error!Verb {
@@ -2259,6 +2284,11 @@ test "rung-5 verbs: clients/df/config show take [--json] TARGET (URI or mountpoi
     try testing.expectEqualStrings("sqmeta:///dev/m,/dev/n", cc.claim_clear.meta_uri);
     try testing.expect((try refusal(av(&.{ "claim", "clear", "/mnt" }))) == .bad_uri);
     try testing.expect((try refusal(av(&.{ "claim", "show", "sqmeta:///dev/m" }))) == .unknown_subverb);
+    const cv = try parse(av(&.{ "claim", "convert-pr", "--all-mounts-down", "sqmeta:///dev/m,/dev/n" }), &d);
+    try testing.expectEqualStrings("sqmeta:///dev/m,/dev/n", cv.convert_pr.meta_uri);
+    try testing.expect((try refusal(av(&.{ "claim", "convert-pr", "sqmeta:///dev/m" }))) == .convert_without_attestation);
+    try testing.expect((try refusal(av(&.{ "claim", "convert-pr", "--all-mounts-down", "/mnt" }))) == .bad_uri);
+    try testing.expect((try refusal(av(&.{ "claim", "convert-pr", "--force", "--all-mounts-down", "sqmeta:///dev/m" }))) == .unknown_flag);
 }
 
 test "defrag: the arms; --rekey needs --encrypt-key, runs alone and on a mountpoint; --encrypt-key belongs to --rekey" {
@@ -2443,7 +2473,7 @@ test "usage names every verb" {
     try testing.expect(std.mem.indexOf(u8, usage(null), "squeezefs format") != null);
     inline for (@typeInfo(std.meta.Tag(Verb)).@"enum".field_names) |name| {
         if (!std.mem.eql(u8, name, "version") and !std.mem.eql(u8, name, "help")) {
-            const word = comptime if (std.mem.eql(u8, name, "claim_clear")) "squeezefs claim clear" else if (std.mem.eql(u8, name, "appender_clear")) "squeezefs appender clear" else if (std.mem.eql(u8, name, "fsck_merge")) "squeezefs fsck merge-reports" else "squeezefs " ++ name;
+            const word = comptime if (std.mem.eql(u8, name, "claim_clear")) "squeezefs claim clear" else if (std.mem.eql(u8, name, "convert_pr")) "squeezefs claim convert-pr" else if (std.mem.eql(u8, name, "appender_clear")) "squeezefs appender clear" else if (std.mem.eql(u8, name, "fsck_merge")) "squeezefs fsck merge-reports" else "squeezefs " ++ name;
             try testing.expect(std.mem.indexOf(u8, usage(null), word) != null);
         }
     }

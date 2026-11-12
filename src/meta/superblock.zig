@@ -12,7 +12,7 @@
 //! zero padding under the checksum (the whole sector with the field zeroed).
 //!
 //! Forward-only (charter §1.7): the version IS every always-on mechanism of
-//! the format; the four `features_incompat` bits are CAPABILITIES that can
+//! the format; the five `features_incompat` bits are CAPABILITIES that can
 //! legitimately differ per volume or flip later, one complete thing each.
 //! An unknown incompat bit refuses loud naming the bit; unknown ro bits
 //! classify fine and the mount is read-only. The version gate precedes the
@@ -123,7 +123,7 @@ pub const ExtentRef = struct {
 };
 
 // ---------------------------------------------------------------------------
-// features_incompat: four CAPABILITY bits, one complete thing each. Every
+// features_incompat: five CAPABILITY bits, one complete thing each. Every
 // always-on mechanism of the format (the v3 node layer, the node-seq
 // watermark, the membership stamp, the derived routing width, durable
 // terms, block refcounts, writer-scoped staging, ino lanes, block-key
@@ -137,6 +137,9 @@ pub const Presence = enum {
     format_time,
     /// Stamped bit-before-record by the backend; never at format.
     stamped_later,
+    /// Set by format, by enable-symmetric when it builds the plane, and by
+    /// `squeezefs claim convert-pr`; never by a mount (decision 0004 §6.4).
+    required,
 };
 
 pub const IncompatBit = struct { bit: u6, name: []const u8, presence: Presence };
@@ -146,6 +149,7 @@ pub const incompat_bits = [_]IncompatBit{
     .{ .bit = 1, .name = "LAYOUT_DELTAS", .presence = .stamped_later },
     .{ .bit = 2, .name = "BLOCK_MAP_TREE", .presence = .stamped_later },
     .{ .bit = 3, .name = "VOLUME_LIFECYCLE", .presence = .stamped_later },
+    .{ .bit = 4, .name = "META_PR_ALL_REGISTRANTS", .presence = .required },
 };
 
 /// The appender region + manager plane (charter §5.5): the appender
@@ -158,9 +162,14 @@ pub const layout_deltas: u64 = 1 << 1;
 pub const block_map_tree: u64 = 1 << 2;
 /// The set has lifecycle history; stamped at the first lifecycle commit.
 pub const volume_lifecycle: u64 = 1 << 3;
+/// The metadata reservation is Write Exclusive — All Registrants. Set by
+/// format, enable-symmetric, and `claim convert-pr`; never by a mount.
+pub const meta_pr_all_registrants: u64 = 1 << 4;
 
-/// Bits 0..=3; anything above refuses.
-pub const features_incompat_known: u64 = (1 << 4) - 1;
+/// Bits 0..=4; anything above refuses.
+pub const features_incompat_known: u64 = (1 << 5) - 1;
+/// What this binary mounts. Layout deltas and the volume lifecycle stay refused.
+pub const features_incompat_implemented: u64 = symmetric_plane | block_map_tree | meta_pr_all_registrants;
 /// No ro bits yet: any set ro bit is unknown ⇒ the mount is read-only.
 pub const features_ro_known: u64 = 0;
 
@@ -208,6 +217,10 @@ pub const Superblock = struct {
 
     pub fn symmetricPlaneStamped(self: Superblock) bool {
         return self.features_incompat & symmetric_plane != 0;
+    }
+
+    pub fn metaPrAllRegistrantsStamped(self: Superblock) bool {
+        return self.features_incompat & meta_pr_all_registrants != 0;
     }
 
     /// The DUR-5 copy's offset: the last aligned sector of THIS volume.
@@ -685,7 +698,7 @@ fn msg(buf: []u8, r: Refusal) []const u8 {
     return w.buffered();
 }
 
-test "incompat table: four capability bits, pairwise disjoint, union == KNOWN, one format-time (the plane) and three stamped-later; ro known is 0" {
+test "incompat table: five capability bits, pairwise disjoint, union == KNOWN; plane is format-time, bits 1..3 stamped-later, bit 4 required; ro known is 0" {
     var acc: u64 = 0;
     for (incompat_bits, 0..) |b, i| {
         try testing.expectEqual(@as(u6, @intCast(i)), b.bit);
@@ -695,11 +708,14 @@ test "incompat table: four capability bits, pairwise disjoint, union == KNOWN, o
         acc |= mask;
     }
     try testing.expectEqual(features_incompat_known, acc);
-    try testing.expectEqual(@as(u64, 0xF), features_incompat_known);
+    try testing.expectEqual(@as(u64, 0x1F), features_incompat_known);
+    try testing.expectEqual(features_incompat_implemented | layout_deltas | volume_lifecycle, features_incompat_known);
     try testing.expectEqual(@as(u64, 0), features_ro_known);
     try testing.expectEqual(Presence.format_time, incompat_bits[0].presence);
     try testing.expectEqualStrings("SYMMETRIC_PLANE", incompat_bits[0].name);
-    for (incompat_bits[1..]) |b| try testing.expectEqual(Presence.stamped_later, b.presence);
+    for (incompat_bits[1..4]) |b| try testing.expectEqual(Presence.stamped_later, b.presence);
+    try testing.expectEqual(Presence.required, incompat_bits[4].presence);
+    try testing.expectEqualStrings("META_PR_ALL_REGISTRANTS", incompat_bits[4].name);
     try testing.expectEqual(@as(u16, 5), version_v5);
 }
 
@@ -797,14 +813,17 @@ test "decoder check order and refusals: length, magic, version, checksum, reserv
             s.encodeSector(0, out, null) catch unreachable;
         }
     };
-    Forge.with(sb, symmetric_plane | (1 << 4) | (1 << 40), &bad);
+    Forge.with(sb, symmetric_plane | (1 << 5) | (1 << 40), &bad);
     try testing.expectError(error.UnknownIncompatBits, Superblock.decodeSector(&bad, &diag));
-    try testing.expectEqualStrings("unknown incompatible feature bits on the superblock: bit 4, bit 40 (0x10000000010) — upgrade squeezefs to mount this volume", msg(&buf, diag));
+    try testing.expectEqualStrings("unknown incompatible feature bits on the superblock: bit 5, bit 40 (0x10000000020) — upgrade squeezefs to mount this volume", msg(&buf, diag));
     // The old-binary refusal for a LATER capability: a mask without bit 2
-    // names bit 2.
+    // names bit 2. A mask without bit 4 names META_PR_ALL_REGISTRANTS.
     Forge.with(sb, symmetric_plane | block_map_tree, &bad);
     try testing.expectError(error.UnknownIncompatBits, Superblock.decodeSectorWithKnown(&bad, features_incompat_known & ~block_map_tree, &diag));
     try testing.expectEqualStrings("unknown incompatible feature bits on the superblock: bit 2 (0x4) — upgrade squeezefs to mount this volume", msg(&buf, diag));
+    Forge.with(sb, symmetric_plane | meta_pr_all_registrants, &bad);
+    try testing.expectError(error.UnknownIncompatBits, Superblock.decodeSectorWithKnown(&bad, features_incompat_known & ~meta_pr_all_registrants, &diag));
+    try testing.expectEqualStrings("unknown incompatible feature bits on the superblock: bit 4 (0x10) — upgrade squeezefs to mount this volume", msg(&buf, diag));
 
     // Appender dir named without the plane (dir forged in after the gate).
     Forge.with(sb, 0, &bad);

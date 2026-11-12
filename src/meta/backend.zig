@@ -22,9 +22,9 @@
 //!    io pool, the volume length.
 //! 3. Both superblock copies (DUR-5: a primary that classifies is
 //!    authoritative; the tail copy serves only when sector 0 errors) →
-//!    format v4 with at most the block-map-tree and symmetric-plane bits
-//!    (layout deltas and the volume lifecycle name later rungs'
-//!    mechanisms); `SQUEEZEFS_SYMMETRIC_META=0` on a stamped volume
+//!    format v4 with at most the block-map-tree, symmetric-plane and
+//!    META_PR_ALL_REGISTRANTS bits (layout deltas and the volume lifecycle
+//!    name later rungs' mechanisms); `SQUEEZEFS_SYMMETRIC_META=0` on a stamped volume
 //!    refuses the writable open ("once armed, stays armed").
 //! 4. The newest valid ledger slot (none on a v4 volume is corruption).
 //! 5. The ring replayed from the record's tail (`replayScanImage`: nothing
@@ -397,6 +397,7 @@ pub fn formatVolume(gpa: Allocator, path: []const u8, opts: FormatOptions) Forma
         .member_count = opts.member_count,
         .stamp_override = opts.stamp_override,
         .control_records = opts.control_records,
+        .stamp_meta_pr = !knobs.boolKnob("SQUEEZEFS_TEST_FORMAT_WITHOUT_META_WEAR", opts.env),
     }, &diag) catch |e| {
         log.err("format {s}: the image plan failed ({s})", .{ path, @errorName(e) });
         return e;
@@ -404,6 +405,43 @@ pub fn formatVolume(gpa: Allocator, path: []const u8, opts: FormatOptions) Forma
     defer plan.deinit();
     try dev.writeSteps(plan.steps);
     log.info("formatted {s}: format v4 ({s}), member {d} of {d}, {d} B, node {d} B, journal {d} B, {d} extents", .{ path, @tagName(opts.class), opts.member_position, opts.member_count, volume_len, opts.node_size, plan.superblock.journal.len, plan.superblock.totalExtents() });
+}
+
+/// The writer-open refusal for a symmetric volume with no bit 4. The log
+/// seam does not keep the text; tests assert this writer.
+pub fn writeUnconvertedMetaPr(w: *std.Io.Writer, path: []const u8) std.Io.Writer.Error!void {
+    try w.print("meta volume {s}: this symmetric volume has no META_PR_ALL_REGISTRANTS (incompat bit 4) — refusing the writer open before registration; run `squeezefs claim convert-pr sqmeta://{s} --all-mounts-down` (decision 0004 §6.4)", .{ path, path });
+}
+
+fn refuseUnconvertedMetaPr(path: []const u8, sb: superblock.Superblock) OpenError!void {
+    if (!sb.symmetricPlaneStamped() or sb.metaPrAllRegistrantsStamped()) return;
+    var buf: [linux.PATH_MAX * 2 + 512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    writeUnconvertedMetaPr(&w, path) catch {};
+    log.err("{s}", .{w.buffered()});
+    return error.UnsupportedFormat;
+}
+
+pub fn writeConvertPrOpenRefusal(w: *std.Io.Writer, path: []const u8) std.Io.Writer.Error!void {
+    try w.print("meta volume {s}: refusing open in convert-pr mode before any replay — run `squeezefs claim convert-pr sqmeta://{s} --all-mounts-down` (decision 0004 §6.4)", .{ path, path });
+}
+
+fn refuseConvertPrOpen(path: []const u8) OpenError {
+    var buf: [linux.PATH_MAX * 2 + 512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    writeConvertPrOpenRefusal(&w, path) catch {};
+    log.err("{s}", .{w.buffered()});
+    return error.UnsupportedFormat;
+}
+
+test "the unconverted META_PR refusal names claim convert-pr" {
+    var buf: [linux.PATH_MAX * 2 + 512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeUnconvertedMetaPr(&w, "/dev/nvme1n1");
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "squeezefs claim convert-pr sqmeta:///dev/nvme1n1 --all-mounts-down") != null);
+    w = .fixed(&buf);
+    try writeConvertPrOpenRefusal(&w, "/dev/nvme1n1");
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "squeezefs claim convert-pr sqmeta:///dev/nvme1n1 --all-mounts-down") != null);
 }
 
 // ---------------------------------------------------------------------------
@@ -578,6 +616,8 @@ pub const KvBackend = struct {
         // 3. The superblock, both copies.
         const classified = try readSuperblock(gpa, &dev, path, opts.env, volume_len);
         const sb = classified.sb;
+        if (opts.guard.mode == .writer) try refuseUnconvertedMetaPr(path, sb);
+        if (opts.guard.mode == .convert_pr) return refuseConvertPrOpen(path);
 
         // 3b. On an NVMe namespace, BEFORE the first write (decision 0003
         //     §DF): the claim judged off a private replay, then the host
@@ -587,7 +627,7 @@ pub const KvBackend = struct {
         //     refused at the device. The gate adopts it.
         var early: ?*guard.host_fence.Early = null;
         errdefer if (early) |e| e.discard(gpa);
-        if (opts.guard.mode != .claim_clear and !testNamespaceArmed(opts) and guard.pr_linux.isNvmeNamespace(path)) {
+        if (opts.guard.mode == .writer and !testNamespaceArmed(opts) and guard.pr_linux.isNvmeNamespace(path)) {
             const local = if (builtin.is_test) (opts.guard.test_identity orelse guard.proc.localIdentity()) else guard.proc.localIdentity();
             // The claim FIRST, off a private replay that writes nothing
             // (review round 3, major 2): over a live writer's fresh claim
@@ -1012,11 +1052,11 @@ pub const KvBackend = struct {
             log.err("{s}: unknown incompat feature bits {x} — this binary cannot mount it (reformat required)", .{ path, sb.unknownIncompat() });
             return error.UnsupportedFormat;
         }
-        if (sb.features_incompat & ~(superblock.block_map_tree | superblock.symmetric_plane) != 0) {
-            // Of the four capability bits the block-map tree and the
-            // symmetric plane are implemented (layout deltas and the volume
-            // lifecycle are later rungs').
-            log.err("{s}: capability bits {x} name mechanisms this rung does not implement — refusing the mount", .{ path, sb.features_incompat & ~(superblock.block_map_tree | superblock.symmetric_plane) });
+        if (sb.features_incompat & ~superblock.features_incompat_implemented != 0) {
+            // Layout deltas and the volume lifecycle are later rungs'.
+            // META_PR_ALL_REGISTRANTS is implemented; a missing bit is not
+            // this check (a reader may open an unconverted volume).
+            log.err("{s}: capability bits {x} name mechanisms this rung does not implement — refusing the mount", .{ path, sb.features_incompat & ~superblock.features_incompat_implemented });
             return error.UnsupportedFormat;
         }
         if (sb.symmetricPlaneStamped() and !knobs.boolKnob("SQUEEZEFS_SYMMETRIC_META", env)) {
@@ -1100,6 +1140,7 @@ pub const KvBackend = struct {
             log.err("meta volume {s}: another writer holds it and the volume is `--single-writer` (no symmetric plane) — there is no join door; EBUSY", .{path});
             return error.Busy;
         }
+        try refuseUnconvertedMetaPr(path, sb);
         var mounted = try readNewestLedger(gpa, &dev, path, sb);
         var mounted_in_be = false;
         errdefer if (!mounted_in_be) mounted.deinit(gpa);
@@ -3756,7 +3797,7 @@ fn dentryPresent(be: *KvBackend, name: []const u8) !bool {
     return kvs.items.len != 0;
 }
 
-test "the block-map-tree ratchet: a fresh format carries no bit; the first stamp writes both copies at the next generation and is idempotent; the bit survives close → reopen and the mount accepts it (every other capability bit still refuses)" {
+test "the block-map-tree ratchet: a fresh format carries no BLOCK_MAP_TREE bit; the first stamp writes both copies at the next generation and is idempotent; the bit survives close → reopen and the mount accepts it (every other unimplemented capability bit still refuses)" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "kvmap-ratchet", null);
     defer v.destroy();
@@ -3775,7 +3816,7 @@ test "the block-map-tree ratchet: a fresh format carries no bit; the first stamp
     {
         const be = try v.open();
         try testing.expect(be.sb.blockMapTreeStamped());
-        try testing.expectEqual(superblock.block_map_tree | superblock.symmetric_plane, be.sb.features_incompat);
+        try testing.expectEqual(superblock.block_map_tree | superblock.symmetric_plane | superblock.meta_pr_all_registrants, be.sb.features_incompat);
         try testing.expectEqual(gen + 1, be.sb_generation);
         be.close();
     }
@@ -3909,12 +3950,12 @@ test "format (device path) → open → N creates (singles + a group of 8) → l
         try testing.expect(be.replayStats().clean_unmount);
         try testing.expectEqual(@as(u64, 0), be.replayStats().entries);
         // The forest shape: the control tree and the native slot tree,
-        // features 0, the stamp the format wrote.
+        // the stamp the format wrote.
         try testing.expectEqual(@as(usize, 2), be.trees.load().len);
         try testing.expect(be.treeOf(.control) != null);
         try testing.expect(be.treeOf(.native) != null);
         // The default format is the symmetric class (charter §5.5).
-        try testing.expectEqual(superblock.symmetric_plane, be.sb.features_incompat);
+        try testing.expectEqual(superblock.symmetric_plane | superblock.meta_pr_all_registrants, be.sb.features_incompat);
         try testing.expectEqualSlices(u8, &test_set.set_uuid, &be.mounted.membership_stamp.set_uuid);
         try testing.expectEqual(test_set.hash_seed, be.sb.hash_seed);
         try testing.expectEqual(@as(?u16, 0), be.mounted.membership_stamp.native_slot);

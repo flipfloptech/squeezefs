@@ -11,7 +11,7 @@
 //! record on the set's member 0, empty elsewhere) and the native slot tree
 //! holding the description's records under their kind-carrying keys. The
 //! SYMMETRIC class (the default, charter §5.5) also stamps `SYMMETRIC_PLANE`
-//! and writes the appender directory's first link (heap extent 0, zeroed,
+//! and `META_PR_ALL_REGISTRANTS` and writes the appender directory's first link (heap extent 0, zeroed,
 //! its `KVAD` header FIRST) and appender 0's `Free` page at the fixed ring's
 //! slot 1; `--single-writer` is the flat opt-out with no appender region.
 //!
@@ -52,6 +52,9 @@ pub const zero_chunk: usize = 1 << 20;
 pub const FormatOptions = struct {
     /// The symmetric plane by default; `--single-writer` is the opt-out.
     class: geometry.Class = .symmetric,
+    /// `META_PR_ALL_REGISTRANTS` on the symmetric class. A mount never
+    /// stamps it. The product sets this from `SQUEEZEFS_TEST_FORMAT_WITHOUT_META_WEAR`.
+    stamp_meta_pr: bool = true,
     node_size: u64 = superblock.default_node_size,
     /// `--meta-journal-mb` in bytes; null = the clamp.
     journal_len_override: ?u64 = null,
@@ -146,7 +149,7 @@ pub fn planFormatWith(gpa: Allocator, volume_len: u64, opts: FormatOptions, desc
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const sb = try geometry.plan(volume_len, opts.node_size, opts.journal_len_override, opts.uuid, opts.set, opts.class, diag);
+    const sb = try geometry.plan(volume_len, opts.node_size, opts.journal_len_override, opts.uuid, opts.set, opts.class, opts.stamp_meta_pr, diag);
     const build_plan = geometry.buildPlan(sb);
 
     // The allocator over the planned heap; the layout (frames stamped
@@ -307,7 +310,8 @@ fn expectMounts(gpa: Allocator, image: []const u8, volume_len: u64, extents_allo
     try testing.expectEqual(superblock.SuperblockSlot.primary, fmt.slot);
     const sb = fmt.format.v5;
     try testing.expectEqual(sb.symmetricPlaneStamped(), !sb.appender_dir.isNone());
-    try testing.expectEqual(sb.features_incompat & ~superblock.symmetric_plane, 0);
+    try testing.expectEqual(sb.metaPrAllRegistrantsStamped(), sb.symmetricPlaneStamped());
+    try testing.expectEqual(sb.features_incompat & ~(superblock.symmetric_plane | superblock.meta_pr_all_registrants), 0);
     const layout = try node.NodeLayout.new(sb.node_size, null);
     var record = (try ledger.newestValid(gpa, image[@intCast(sb.root_ledger.start)..][0..@intCast(sb.root_ledger.len)])) orelse return error.TestUnexpectedResult;
     defer record.deinit(gpa);

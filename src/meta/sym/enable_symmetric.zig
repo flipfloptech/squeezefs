@@ -228,6 +228,7 @@ pub fn plan(gpa: Allocator, in: Inputs, diag: ?*Refusal) Error!Plan {
     // format's image byte for byte.
     var stamped = sb;
     _ = stamped.setSymmetricPlane(link, null) catch unreachable;
+    _ = stamped.stampBit(superblock.meta_pr_all_registrants);
     try format.pushZero(a, &steps, zeros, sb.journal.start, sb.journal.len);
     const page_img = try a.create([appender_page.PAGE_LEN]u8);
     const free_page = appender_page.Page.free(journal.FIXED_RING_APPENDER, 1, appender_page.SegmentTable.one(.{ .start = sb.journal.start, .len = sb.journal.len }));
@@ -353,8 +354,9 @@ fn expectSymmetric(gpa: Allocator, image: []u8, link: ExtentRef, want_ledger_seq
     var v = try Volume.load(gpa, image);
     defer v.deinit(gpa);
     try testing.expect(v.sb.symmetricPlaneStamped());
+    try testing.expect(v.sb.metaPrAllRegistrantsStamped());
     try testing.expectEqual(link, v.sb.appender_dir);
-    try testing.expectEqual(@as(u64, 0), v.sb.features_incompat & ~superblock.symmetric_plane);
+    try testing.expectEqual(@as(u64, 0), v.sb.features_incompat & ~(superblock.symmetric_plane | superblock.meta_pr_all_registrants));
     // The chain: one link, the format's header, every pair zero.
     var links: std.ArrayList(appender_dir.Link) = .empty;
     defer links.deinit(gpa);

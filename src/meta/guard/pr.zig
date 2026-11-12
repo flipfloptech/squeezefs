@@ -312,6 +312,22 @@ pub const Client = struct {
         return self.issue(.io, &nvme.reservationAcquire(self.nsid, nvme.RACQA_PREEMPT, self.rtype, self.key, victim, &payload));
     }
 
+    /// Acquire under `rtype` without changing `self.rtype` (convert-pr retypes
+    /// the device before the in-memory type, so a later `release` cannot send
+    /// a type the namespace does not hold).
+    pub fn acquireTyped(self: *Client, rtype: u8) Error!void {
+        var payload: [16]u8 = undefined;
+        self.stats.acquires += 1;
+        return self.issue(.io, &nvme.reservationAcquire(self.nsid, nvme.RACQA_ACQUIRE, rtype, self.key, 0, &payload));
+    }
+
+    /// Preempt `victim` under `rtype` without changing `self.rtype`.
+    pub fn preemptTyped(self: *Client, victim: u64, rtype: u8) Error!void {
+        var payload: [16]u8 = undefined;
+        self.stats.preempts += 1;
+        return self.issue(.io, &nvme.reservationAcquire(self.nsid, nvme.RACQA_PREEMPT, rtype, self.key, victim, &payload));
+    }
+
     /// The successor's takeover (decision 0004 §4.2, §5.1): RACQA 2, PRKEY
     /// 0, RTYPE 5 (P4 + P9). The sender becomes the holder with rtype 5 and
     /// every registrant of another host id is unregistered, each after its

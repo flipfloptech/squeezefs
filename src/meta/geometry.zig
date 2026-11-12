@@ -99,9 +99,11 @@ pub fn mintSetIdentity(io: std.Io) std.Io.RandomSecureError!SetIdentity {
 /// aligned to `node_size`, the LAST sector held back for the DUR-5 copy
 /// (`usable = volume_len − 4096`), and the floor `reserve + 4` (two roots
 /// and growth) — plus one extent for the appender directory on the
-/// symmetric class, which also stamps `SYMMETRIC_PLANE` and names the
-/// directory at heap extent 0. v4's always-on mechanisms are the version.
-pub fn plan(volume_len: u64, node_size: u64, journal_len_override: ?u64, uuid: [16]u8, set: SetIdentity, class: Class, diag: ?*PlanRefusal) PlanError!Superblock {
+/// symmetric class, which also stamps `SYMMETRIC_PLANE` and, when asked,
+/// `META_PR_ALL_REGISTRANTS`, and names the directory at heap extent 0.
+/// v4's always-on mechanisms are the version. `stamp_meta_pr` is ignored
+/// on the single-writer class (no plane, no bit).
+pub fn plan(volume_len: u64, node_size: u64, journal_len_override: ?u64, uuid: [16]u8, set: SetIdentity, class: Class, stamp_meta_pr: bool, diag: ?*PlanRefusal) PlanError!Superblock {
     if (!superblock.nodeSizeValid(node_size)) {
         if (diag) |d| d.* = .{ .invalid_node_size = node_size };
         return error.InvalidNodeSize;
@@ -132,7 +134,7 @@ pub fn plan(volume_len: u64, node_size: u64, journal_len_override: ?u64, uuid: [
     return .{
         .node_size = @intCast(node_size),
         .volume_len = volume_len,
-        .features_incompat = if (class == .symmetric) superblock.symmetric_plane else 0,
+        .features_incompat = if (class == .symmetric) superblock.symmetric_plane | (if (stamp_meta_pr) superblock.meta_pr_all_registrants else 0) else 0,
         .features_ro = 0,
         .root_ledger = root_ledger,
         .journal = journal,
@@ -337,7 +339,7 @@ test "journal ring clamp math: 256 MiB → 8 MiB, 1 GiB → 16 MiB, 4 GiB → 32
 }
 
 test "plan (single-writer class): the four worked examples tie (64 MiB/64 KiB/1 MiB override, 256 MiB, 1 GiB, 1 TiB); volume_len stored; no capability bit" {
-    const a = try plan(64 * MiB, 65536, MiB, test_uuid, test_set, .single_writer, null);
+    const a = try plan(64 * MiB, 65536, MiB, test_uuid, test_set, .single_writer, false, null);
     try testing.expectEqual(ExtentRef{ .start = 4096, .len = 131072 }, a.root_ledger);
     try testing.expectEqual(ExtentRef{ .start = 135168, .len = 1048576 }, a.journal);
     try testing.expectEqual(ExtentRef{ .start = 1183744, .len = 8192 }, a.alloc_bitmap);
@@ -354,20 +356,20 @@ test "plan (single-writer class): the four worked examples tie (64 MiB/64 KiB/1 
     try testing.expectEqual(test_set.hash_seed, a.hash_seed);
     try a.validateGeometry(null);
 
-    const b = try plan(256 * MiB, 262144, null, test_uuid, test_set, .single_writer, null);
+    const b = try plan(256 * MiB, 262144, null, test_uuid, test_set, .single_writer, false, null);
     try testing.expectEqual(ExtentRef{ .start = 135168, .len = 8388608 }, b.journal);
     try testing.expectEqual(ExtentRef{ .start = 8523776, .len = 8192 }, b.alloc_bitmap);
     try testing.expectEqual(ExtentRef{ .start = 8650752, .len = 990 * 262144 }, b.heap);
     try testing.expectEqual(@as(u64, 19), alloc_core.compactionReserveExtents(b.totalExtents()));
     try testing.expectEqual(@as(u64, 268431360), b.backupOffset());
 
-    const c = try plan(GiB, 262144, null, test_uuid, test_set, .single_writer, null);
+    const c = try plan(GiB, 262144, null, test_uuid, test_set, .single_writer, false, null);
     try testing.expectEqual(ExtentRef{ .start = 135168, .len = 16777216 }, c.journal);
     try testing.expectEqual(ExtentRef{ .start = 16912384, .len = 8192 }, c.alloc_bitmap);
     try testing.expectEqual(ExtentRef{ .start = 17039360, .len = 4030 * 262144 }, c.heap);
     try testing.expectEqual(@as(u64, 80), alloc_core.compactionReserveExtents(c.totalExtents()));
 
-    const d = try plan(TiB, 262144, null, test_uuid, test_set, .single_writer, null);
+    const d = try plan(TiB, 262144, null, test_uuid, test_set, .single_writer, false, null);
     try testing.expectEqual(ExtentRef{ .start = 135168, .len = 33554432 }, d.journal);
     try testing.expectEqual(ExtentRef{ .start = 33689600, .len = 1056768 }, d.alloc_bitmap);
     try testing.expectEqual(ExtentRef{ .start = 34865152, .len = 4194170 * 262144 }, d.heap);
@@ -380,9 +382,9 @@ test "plan (single-writer class): the four worked examples tie (64 MiB/64 KiB/1 
 }
 
 test "plan: default = the clamp (8 MiB on 64 MiB); an override is honoured; SB|ledger|ring|bitmap|heap ascend; a 4 MiB volume fails with the exact message" {
-    const def = try plan(64 * MiB, 65536, null, test_uuid, test_set, .single_writer, null);
+    const def = try plan(64 * MiB, 65536, null, test_uuid, test_set, .single_writer, false, null);
     try testing.expectEqual(8 * MiB, def.journal.len);
-    const ov = try plan(64 * MiB, 65536, 2 * MiB, test_uuid, test_set, .single_writer, null);
+    const ov = try plan(64 * MiB, 65536, 2 * MiB, test_uuid, test_set, .single_writer, false, null);
     try testing.expectEqual(2 * MiB, ov.journal.len);
     try testing.expect(ov.root_ledger.start >= 4096);
     try testing.expect(ov.journal.start >= ov.root_ledger.end());
@@ -390,32 +392,34 @@ test "plan: default = the clamp (8 MiB on 64 MiB); an override is honoured; SB|l
     try testing.expect(ov.heap.start >= ov.alloc_bitmap.end());
     var diag: PlanRefusal = undefined;
     var buf: [512]u8 = undefined;
-    try testing.expectError(error.VolumeTooSmall, plan(4 * MiB, 65536, null, test_uuid, test_set, .single_writer, &diag));
+    try testing.expectError(error.VolumeTooSmall, plan(4 * MiB, 65536, null, test_uuid, test_set, .single_writer, false, &diag));
     // 4 MiB: journal 8 MiB already exceeds the volume ⇒ 0 extents, min 12.
     try testing.expectEqualStrings("metadata volume too small for format v5: 4194304 bytes leaves 0 heap extents of 65536 bytes after the fixed structures (superblock + ledger + 8388608-byte journal + bitmap end at 8585216); at least 12 extents are required — grow the volume or pass a smaller --meta-journal-mb / --meta-node-kib", planMsg(&buf, diag));
     // The override floor and alignment.
-    _ = try plan(64 * MiB, 65536, journal_override_floor, test_uuid, test_set, .single_writer, &diag);
-    _ = try plan(64 * MiB, 65536, journal_override_floor + appender0_reserved_bytes, test_uuid, test_set, .symmetric, &diag);
-    try testing.expectError(error.InvalidJournalOverride, plan(64 * MiB, 65536, journal_override_floor, test_uuid, test_set, .symmetric, &diag));
+    _ = try plan(64 * MiB, 65536, journal_override_floor, test_uuid, test_set, .single_writer, false, &diag);
+    _ = try plan(64 * MiB, 65536, journal_override_floor + appender0_reserved_bytes, test_uuid, test_set, .symmetric, true, &diag);
+    try testing.expectError(error.InvalidJournalOverride, plan(64 * MiB, 65536, journal_override_floor, test_uuid, test_set, .symmetric, true, &diag));
     try testing.expectEqualStrings("journal ring override 393216 bytes is invalid: must be a 4 KiB multiple of at least 409600 bytes (reserve + one max entry + appender 0's four page slots)", planMsg(&buf, diag));
-    try testing.expectError(error.InvalidJournalOverride, plan(64 * MiB, 65536, journal_override_floor - 4096, test_uuid, test_set, .single_writer, &diag));
+    try testing.expectError(error.InvalidJournalOverride, plan(64 * MiB, 65536, journal_override_floor - 4096, test_uuid, test_set, .single_writer, false, &diag));
     try testing.expectEqualStrings("journal ring override 389120 bytes is invalid: must be a 4 KiB multiple of at least 393216 bytes (reserve + one max entry)", planMsg(&buf, diag));
-    try testing.expectError(error.InvalidJournalOverride, plan(64 * MiB, 65536, journal_override_floor + 1, test_uuid, test_set, .single_writer, &diag));
-    try testing.expectError(error.InvalidNodeSize, plan(64 * MiB, 4096, null, test_uuid, test_set, .single_writer, &diag));
+    try testing.expectError(error.InvalidJournalOverride, plan(64 * MiB, 65536, journal_override_floor + 1, test_uuid, test_set, .single_writer, false, &diag));
+    try testing.expectError(error.InvalidNodeSize, plan(64 * MiB, 4096, null, test_uuid, test_set, .single_writer, false, &diag));
     try testing.expectEqualStrings("invalid node_size 4096: must be a 4 KiB multiple in [65536, 1048576]", planMsg(&buf, diag));
     // The DUR-5 tail: the last sector is never inside the heap.
     try testing.expect(def.heap.end() <= 64 * MiB - 4096);
     // Exactly the floor: reserve 8 + 4 = 12 extents on a 64 KiB node.
     const tiny_len: u64 = 1245184 + 12 * 65536 + 4096;
-    const tiny = try plan(tiny_len, 65536, MiB, test_uuid, test_set, .single_writer, null);
+    const tiny = try plan(tiny_len, 65536, MiB, test_uuid, test_set, .single_writer, false, null);
     try testing.expectEqual(@as(u64, 12), tiny.totalExtents());
-    try testing.expectError(error.VolumeTooSmall, plan(tiny_len - 1, 65536, MiB, test_uuid, test_set, .single_writer, null));
+    try testing.expectError(error.VolumeTooSmall, plan(tiny_len - 1, 65536, MiB, test_uuid, test_set, .single_writer, false, null));
     // The symmetric class needs ONE more extent (the directory) and refuses
     // one short; it stamps the bit and names heap extent 0.
-    try testing.expectError(error.VolumeTooSmall, plan(tiny_len, 65536, MiB, test_uuid, test_set, .symmetric, &diag));
+    try testing.expectError(error.VolumeTooSmall, plan(tiny_len, 65536, MiB, test_uuid, test_set, .symmetric, true, &diag));
     try testing.expectEqual(@as(u64, 13), diag.volume_too_small.min);
-    const sym = try plan(tiny_len + 65536, 65536, MiB, test_uuid, test_set, .symmetric, null);
-    try testing.expect(sym.symmetricPlaneStamped());
+    const sym = try plan(tiny_len + 65536, 65536, MiB, test_uuid, test_set, .symmetric, true, null);
+    try testing.expect(sym.symmetricPlaneStamped() and sym.metaPrAllRegistrantsStamped());
+    const unstamped = try plan(tiny_len + 65536, 65536, MiB, test_uuid, test_set, .symmetric, false, null);
+    try testing.expect(unstamped.symmetricPlaneStamped() and !unstamped.metaPrAllRegistrantsStamped());
     try testing.expectEqual(ExtentRef{ .start = sym.heap.start, .len = 65536 }, sym.appender_dir);
     try sym.validateGeometry(null);
     try testing.expectEqual(ExtentRef{ .start = sym.journal.start + 16_384, .len = MiB - 16_384 }, fixedRingExtent(sym));
@@ -455,7 +459,7 @@ test "node_seq_base = uuid[0..8] LE with the top bit clear; W = 2^16" {
 }
 
 test "build plan: the single-writer class's 9 steps — zero the fixed region, tree 0 (the control records) then the native slot tree, the bitmap, the ledger record in slot 1, barrier, superblock, barrier; the symmetric class adds the directory header and appender 0's Free page right after the zero" {
-    const sym = try plan(64 * MiB, 65536, MiB, test_uuid, test_set, .symmetric, null);
+    const sym = try plan(64 * MiB, 65536, MiB, test_uuid, test_set, .symmetric, true, null);
     const sbp = buildPlan(sym);
     const ss = sbp.slice();
     try testing.expectEqual(@as(usize, 11), ss.len);
@@ -463,7 +467,7 @@ test "build plan: the single-writer class's 9 steps — zero the fixed region, t
     try testing.expectEqual(sym.journal.start + 4096, ss[3].write_appender0_page.offset);
     try testing.expectEqual(fixedRingExtent(sym), ss[3].write_appender0_page.ring);
     try testing.expectEqual(TreeSpec{ .records = .control }, ss[4].tree_image);
-    const sb = try plan(64 * MiB, 65536, MiB, test_uuid, test_set, .single_writer, null);
+    const sb = try plan(64 * MiB, 65536, MiB, test_uuid, test_set, .single_writer, false, null);
     const bp = buildPlan(sb);
     const s = bp.slice();
     try testing.expectEqual(@as(usize, 9), s.len);

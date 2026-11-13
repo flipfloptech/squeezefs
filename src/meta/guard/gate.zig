@@ -921,6 +921,17 @@ pub const Guard = struct {
         g.failStop("appender 0's page names another writer or another term — this manager was superseded (decision 0004 §4.4.2)");
     }
 
+    /// The checkpoint thread's resume check (decision 0004 I2). False only
+    /// on a positive mismatch, so a tick that woke a checkpoint age late
+    /// does not append this manager's stale tail. The beat still fail-stops
+    /// and counts `writer_guard_identity_failures`. Unreadable is not a
+    /// mismatch: the tick proceeds, and the beat owns that budget.
+    pub fn checkpointAllowed(ctx: *anyopaque) bool {
+        const g: *Guard = @ptrCast(@alignCast(ctx));
+        if (g.bound_term == 0) return true;
+        return g.identityHolds() != .usurped;
+    }
+
     /// The beat's accounting for one check (decision 0004 §4.4.2). False:
     /// this beat writes nothing. `usurped` fail-stops. `unreadable` skips
     /// the claim refresh, and fail-stops at one claim TTL of consecutive

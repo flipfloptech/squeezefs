@@ -998,6 +998,7 @@ pub const KvBackend = struct {
         // the set (the stale-sibling rule's candidates, decision 0003 §DF).
         try be.guard.?.enrollManager();
         be.test_ckpt_error_logs = opts.test_ckpt_error_logs;
+        be.task.may_write = .{ .ctx = be.guard.?, .allow = guard.gate.Guard.checkpointAllowed };
         be.ckpt_thread = std.Thread.spawn(.{}, ckptMain, .{be}) catch return error.ThreadSpawnFailed;
         try be.guard.?.startHeartbeat();
         be.replay.replay_ns = clock.monotonicNs() - t0;

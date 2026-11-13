@@ -1358,10 +1358,20 @@ pub const CheckpointTask = struct {
     /// a JOINED appender's ring growth (`sym/joined.zig` `growRingIfDue`),
     /// which runs cover cycles of its own and must never nest in one.
     after_tick: ?AfterTick = null,
+    /// The manager's page check (`Guard.checkpointAllowed`). Null on a joiner.
+    may_write: ?MayWrite = null,
+    /// A late wake already saw a usurped page. Later on-time wakes keep
+    /// withholding until the beat latches or the page is ours again.
+    stale_resume: bool = false,
 
     pub const AfterTick = struct {
         ctx: *anyopaque,
         run: *const fn (ctx: *anyopaque) void,
+    };
+
+    pub const MayWrite = struct {
+        ctx: *anyopaque,
+        allow: *const fn (ctx: *anyopaque) bool,
     };
 
     pub fn init(cp: *Checkpointer, io: Io) CheckpointTask {
@@ -1452,6 +1462,24 @@ pub const CheckpointTask = struct {
         return true;
     }
 
+    /// A wake later than one checkpoint age may be a manager resumed after a
+    /// successor bound (decision 0004 I2). Withhold the tick while the page
+    /// names that successor; the beat still fail-stops and counts it.
+    /// shortcut: a cycle already inside `checkpointCycle` at the stop still
+    /// finishes; upgrade if a resume mid-cycle tears the image.
+    fn withholdUsurped(self: *CheckpointTask, now_ns: u64) bool {
+        const m = self.may_write orelse return false;
+        if (self.cp.isFailed()) return false;
+        const late = self.cp.cfg.max_age_ms * ns_per_ms;
+        if (!self.stale_resume and now_ns <= self.next_tick_ns +| late) return false;
+        if (m.allow(m.ctx)) {
+            self.stale_resume = false;
+            return false;
+        }
+        self.stale_resume = true;
+        return true;
+    }
+
     /// The loop a thread runs until `stop`: `runOnce` behind the Notify wait
     /// bounded by the cadence deadline.
     pub fn runUntilStopped(self: *CheckpointTask) void {
@@ -1462,6 +1490,11 @@ pub const CheckpointTask = struct {
             self.cp.enterStage(.waiting);
             var w = self.wake.notified();
             const woke = w.waitUntilUncancelable(self.io, self.next_tick_ns) == .notified;
+            const now_ns = clock.monotonicNs();
+            if (self.withholdUsurped(now_ns)) {
+                self.next_tick_ns = now_ns + self.period_ns;
+                continue;
+            }
             const more = blk: {
                 self.cp.enterStage(.serial);
                 if (self.serial) |m| m.lockUncancelable(self.io);

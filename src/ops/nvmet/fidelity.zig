@@ -6073,3 +6073,179 @@ test "nvmet fidelity: pr5 F11 — a successor beside a live joiner on its host (
     try expectNoResidue(rig, set.meta_nqn);
     try expectNoResidue(rig, set.data_nqn);
 }
+
+test "nvmet fidelity: pr5 F13 — a registry-blind superseded manager (decision 0004 §8.2, review issue 3) — M0's host-registry directory is not JA's (SQUEEZEFS_TEST_HOST_REGISTRY_DIR pointed elsewhere for M0); S binds; JA re-registers host A and does not kill M0 (pr_stale_sibling_kills 0); M0 resumed fails its page check at its first beat (writer_guard_identity_failures 1) and issues no recovery or reconcile mutation" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "f13", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    // A different directory from the rig's `{root}/hosts`. The seam exempts
+    // the registry-root comparison; JA's rule then cannot see M0's line.
+    var blind_buf: [linux.PATH_MAX]u8 = undefined;
+    const blind = try std.fmt.bufPrintSentinel(&blind_buf, "{s}/hosts-m0", .{rig.root}, 0);
+    const mk = linux.errno(linux.mkdir(blind.ptr, 0o755));
+    if (mk != .SUCCESS and mk != .EXIST) return error.BlindDir;
+    var env_m0 = try rig.envWithKnob("SQUEEZEFS_TEST_HOST_REGISTRY_DIR", blind);
+    defer env_m0.deinit();
+    const m0 = try rig.spawnMountEnv("f13-m0", set.metaUri(), &env_m0, &.{});
+    try rig.awaitLog(m0, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, m0, "echo m0 > f13 && sync -d f13"));
+    const ja = try rig.spawnMount("f13-ja", set.metaUri(), null, &.{});
+    try rig.awaitLog(ja, "ready: ", ready_wait_ns);
+    const before = try rig.resvReportJson(cm.dev());
+    defer gpa.free(before);
+    std.debug.print("\n--- F13: before S rtype {?d} regctl {?d} ---\n", .{
+        json_scan.number(before, "rtype"),
+        json_scan.number(before, "regctl"),
+    });
+    try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(before, "rtype"));
+    // M0 and JA share host A's one registration.
+    try testing.expectEqual(@as(?u64, 1), json_scan.number(before, "regctl"));
+    // Frozen until CONT, so these cannot move across the takeover.
+    const pre = try rig.stats(m0);
+    defer gpa.free(pre);
+    try testing.expectEqual(@as(u64, 0), try statNumber(pre, "writer_guard_identity_failures"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(pre, "writer_guard_fenced"));
+    const mutation_names = [_][]const u8{
+        "appender_recovery_preempts",
+        "appender_recovery_refences",
+        "appender_recovery_keys_absent",
+        "appender_recovery_own_key_guards",
+        "pr_preempts_unheld_refused",
+        "meta_pr_preempt_kept",
+        "data_pr_preempts",
+        "data_pr_debt_preempts",
+        "data_pr_reconcile_preempts",
+        "writer_guard_pr_reacquires",
+        "writer_guard_fenced",
+        "writer_guard_preempt_alls",
+        "writer_guard_identity_unreadable_beats",
+    };
+    var frozen: [mutation_names.len]u64 = undefined;
+    for (mutation_names, 0..) |name, i| {
+        frozen[i] = try statNumber(pre, name);
+    }
+    const pid_m0 = rig.daemons.items[m0].pid;
+    _ = linux.kill(pid_m0, .STOP);
+    sleepMs(lease_clock.T_OWNER_MS + 5_000);
+    const s = try rig.spawnMount("f13-s", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(s, "ready: ", ready_wait_ns);
+    {
+        const seen = try rig.onMount(s, "cat f13");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("m0\n", seen);
+    }
+    const key_s = try statString(rig, s, "pr_key");
+    defer gpa.free(key_s);
+    const ss = try rig.stats(s);
+    defer gpa.free(ss);
+    std.debug.print("\n--- F13: S bound preempt_alls {?d} victims {?d} ---\n", .{
+        json_scan.number(ss, "writer_guard_preempt_alls"),
+        json_scan.number(ss, "writer_guard_preempt_all_victims"),
+    });
+    try testing.expectEqual(@as(u64, 1), try statNumber(ss, "writer_guard_preempt_alls"));
+    try testing.expectEqual(@as(u64, 1), try statNumber(ss, "writer_guard_preempt_all_victims"));
+    // CONT before this log is F3: the device refuses an unregistered host.
+    // The log is JA's metadata rule, after it has re-registered host A.
+    try rig.awaitLog(ja, "after a succession", g2_wait_ns);
+    const jst = try rig.stats(ja);
+    defer gpa.free(jst);
+    const kills = try statNumber(jst, "pr_stale_sibling_kills");
+    const parked = try statNumber(jst, "appender_parked");
+    std.debug.print("\n--- F13: JA re-registered kills {d} parked {d} ---\n", .{ kills, parked });
+    if (kills != 0 or !alive(pid_m0)) {
+        rig.printLogTail(ja, 40);
+        return error.RuleSawM0;
+    }
+    if (parked != 0) {
+        const jp = try rig.awaitStat(ja, "appender_parked", 0, 15 * std.time.ns_per_s);
+        defer gpa.free(jp);
+        try testing.expectEqual(@as(u64, 0), try statNumber(jp, "appender_parked"));
+    }
+    _ = linux.kill(pid_m0, .CONT);
+    const st = try rig.awaitStat(m0, "writer_guard_identity_failures", 1, 30 * std.time.ns_per_s);
+    defer gpa.free(st);
+    const failures = try statNumber(st, "writer_guard_identity_failures");
+    std.debug.print("\n--- F13: M0 identity_failures {d} unreadable {d} fenced {d} recovery_preempts {d} reconcile {d} ---\n", .{
+        failures,
+        json_scan.number(st, "writer_guard_identity_unreadable_beats") orelse 0,
+        json_scan.number(st, "writer_guard_fenced") orelse 0,
+        json_scan.number(st, "appender_recovery_preempts") orelse 0,
+        json_scan.number(st, "data_pr_reconcile_preempts") orelse 0,
+    });
+    try testing.expectEqual(@as(u64, 1), failures);
+    for (mutation_names, 0..) |name, i| {
+        const got = try statNumber(st, name);
+        if (got != frozen[i]) {
+            std.debug.print("\n--- F13: {s} moved {d} -> {d} ---\n", .{ name, frozen[i], got });
+            rig.printLogTail(m0, 40);
+            return error.MutationIssued;
+        }
+    }
+    // One heartbeat past the fail-stop: a mutation the page check did not
+    // gate would land on the next poll.
+    const quiet_deadline = clock.monotonicNs() + 12 * std.time.ns_per_s;
+    var quiet_err: ?anyerror = null;
+    while (clock.monotonicNs() < quiet_deadline) {
+        const cur = rig.stats(m0) catch |e| {
+            quiet_err = e;
+            sleepMs(200);
+            continue;
+        };
+        defer gpa.free(cur);
+        quiet_err = null;
+        if (try statNumber(cur, "writer_guard_identity_failures") != 1) return error.IdentityFailuresMoved;
+        for (mutation_names, 0..) |name, i| {
+            const got = try statNumber(cur, name);
+            if (got != frozen[i]) {
+                std.debug.print("\n--- F13: {s} moved {d} -> {d} after the fail-stop ---\n", .{ name, frozen[i], got });
+                rig.printLogTail(m0, 40);
+                return error.MutationIssued;
+            }
+        }
+        sleepMs(500);
+    }
+    if (quiet_err != null) return error.StatsUnreadable;
+    const rr = try rig.resvReportJson(cm.dev());
+    defer gpa.free(rr);
+    std.debug.print("\n--- F13: after resume rtype {?d} regctl {?d} ---\n", .{
+        json_scan.number(rr, "rtype"),
+        json_scan.number(rr, "regctl"),
+    });
+    try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
+    // Host A is back (JA) and host B stayed. M0 did not unregister S.
+    try testing.expectEqual(@as(?u64, 2), json_scan.number(rr, "regctl"));
+    if (std.mem.indexOf(u8, rr, key_s) == null) {
+        std.debug.print("\n--- F13: S's key {s} left the report ---\n{s}\n", .{ key_s, rr });
+        return error.SuccessorUnregistered;
+    }
+    try rig.umount(ja);
+    try rig.kill9(m0);
+    try rig.umount(s);
+    const bound = try bindDataForFsck(rig, &set, transport);
+    defer if (bound) {
+        var stored_buf: [64]u8 = undefined;
+        if (std.fmt.bufPrintSentinel(&stored_buf, "{s}", .{set.dataDev()}, 0)) |stored_z| {
+            _ = linux.umount2(stored_z.ptr, linux.MNT.DETACH);
+        } else |_| {}
+    };
+    const fsck = try rig.sqz(&.{ "fsck", "--offline", "--scrub", set.metaUri() });
+    defer rig.freeRun(fsck);
+    if (!fsck.term.success() or std.mem.indexOf(u8, fsck.stdout, "findings: 0 (clean)") == null) {
+        std.debug.print("\n--- fsck --offline --scrub ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ fsck.term, fsck.stdout, fsck.stderr });
+        return error.FsckNotClean;
+    }
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}

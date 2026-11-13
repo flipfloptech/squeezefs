@@ -5,8 +5,8 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** F7b is in `b1f87fa7`. This note is the docs commit on top
-of it. F7a is `bd0d3f5f`. F6 is `88003de0`. F5 is `2a8f4a2b`. F2, F3, and F4 are in `bc7ae7c4`. The fencing registrant is retired in
+**Branch `feat/pr5`.** F8 is in `45fd0f55`. This note is the docs commit on top
+of it. F7b is `b1f87fa7`. F7a is `bd0d3f5f`. F6 is `88003de0`. F5 is `2a8f4a2b`. F2, F3, and F4 are in `bc7ae7c4`. The fencing registrant is retired in
 `281bd07b`. Incompat
 bit 4 and `claim convert-pr` are `694b43c2`. The blind-rule refusals are
 `eea93412`. Report-first recovery is `d75445b9`. Do not amend those. No upstream.
@@ -19,10 +19,10 @@ The hashes are in the table below.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
-1. The fidelity rows that are not yet written: F8, F11, F13.
-   F8 is next (migration without bit 4, refused by name, `claim convert-pr` converts, a second run is a no-op). F12 and F14 need
+1. The fidelity rows that are not yet written: F11, then F13.
+   F8 is `45fd0f55` (migration without bit 4, refused by name, `claim convert-pr` converts, a second run is a no-op). F12 and F14 need
    `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist. Do not build
-   that seam before F8, F11, and F13. `claim posture-reset` is the other offline
+   that seam before F11 and F13. `claim posture-reset` is the other offline
    door; it is not one of these rows.
 
 A full venue gate has not been run on this branch. Do not merge to `dev` until that gate is
@@ -56,6 +56,7 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | `88003de0` | F6: two metadata volumes. Each peer is parked for the succession. The write is released only after both volumes have re-registered. |
 | `bd0d3f5f` | F7a: a joiner's node read during the preempt-all drain. One barrier, one retry, and the drain's length. |
 | `b1f87fa7` | F7b: a joiner's write during the preempt-all drain. EBADE, held, re-registered, retried. `writer_guard_fenced` stays 0. No product change. |
+| `45fd0f55` | F8: a volume formatted without bit 4, held WERO, refused by name, then `claim convert-pr`. rtype 5, bit 4, pages v2. A second run is a no-op. No product change. |
 
 ## What is true in the code
 
@@ -456,6 +457,26 @@ J's 64 rotor slots miss `umount`'s 32 s budget.
 Device: `~/tmp/pr5-f7b.log` (`EXIT:0`, 41/41, about 3 min of the row after the
 link). No full gate.
 
+## A volume without bit 4, committed `45fd0f55`
+
+Decision 0004 §8.2 F8, §6.4. No product change. The file-image unit already
+rewrites a planted layout-1 page. This row is the nvmet device.
+
+Format sets `SQUEEZEFS_TEST_FORMAT_WITHOUT_META_WEAR`. The pr-legs key holds
+WERO from a second host. On this host that key would be a stale registration,
+and convert-pr's register ladder would drop it before the retype. The new
+mount logs the `claim convert-pr` line naming the meta path and exits 1. It
+does not log `ready: `.
+
+`squeezefs claim convert-pr --all-mounts-down` prints the converted line.
+The report is rtype 5, regctl 1, and the pr-legs key is gone. Bit 4 is set.
+Generation goes from 1 to 2. Appender 0's Free page (slot 1) is layout 2
+with host key 0; the other three slots stay blank. A second run prints
+already and leaves generation 2.
+
+Device: `~/tmp/pr5-f8.log` (`EXIT:0`, 41/41, about 5 min including the link).
+No full gate.
+
 ## Explicitly not in this branch
 
 - F9 and F10 have not been re-run on this commit. F1 has, after report-first recovery.
@@ -465,7 +486,7 @@ link). No full gate.
 - Recovery's `fence(k)` does not call `identityHolds`.
 - `claim posture-reset --all-mounts-down` (`Mode.posture_reset`).
 - `meta_pr_succession_parks`, `meta_pr_succession_reregistrations`, `meta_pr_refusal_readmissions`. Do not invent them. Parks increment `stats.appender_parks`. `writer_guard_fenced` increments in `journal.noteFence`.
-- Fidelity rows F8, F11, F13, F12, F14. F2, F3, F4, F5, F6, F7a, F7b, F15, F16, and F16b are committed. F12/F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist. P9c's write-EIO instant is the §8.1 unit, not a device pin. Do not add `meta_pr_write_eio_reclassified` until that unit.
+- Fidelity rows F11, F13, F12, F14. F2, F3, F4, F5, F6, F7a, F7b, F8, F15, F16, and F16b are committed. F12/F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist. P9c's write-EIO instant is the §8.1 unit, not a device pin. Do not add `meta_pr_write_eio_reclassified` until that unit.
 - An offline writer still never ticks the cadence, so it pays the debt at its own admission and does not run the later reconcile. The shortcut comment in `data_fence.zig` `endSuccession` still says so.
 - `data_pr_reconciles_deferred` and the `data_pr_reconcile_in_window` tripwire.
 - A full `zig build gate` on this branch.
@@ -490,7 +511,7 @@ Cache is `/build/zig-cache-v2`. One `zig build` takes a build slot. The nvmet ex
 
 ```bash
 git checkout feat/pr5
-git status -sb    # clean, no upstream; F7b is b1f87fa7
+git status -sb    # clean, no upstream; F8 is 45fd0f55
 
 # Unit: census, debt, live-page skip, the old admission reconcile.
 scripts/venue 'zig build --cache-dir /build/zig-cache-v2 test -Dtest-filter="pr5 debt" -Dtest-filter="pr5 live page" -Dtest-filter="succession census" --summary all'
@@ -515,6 +536,7 @@ Last green results, 2026-11-11, on this host:
 - F6 `~/tmp/pr5-f6.log` (`EXIT:0`, 41/41, about 1 min). Pins printed: preempt_alls 2, victims 4, succession lines 2, paths 2.
 - F7a `~/tmp/pr5-f7a.log` (`EXIT:0`, 41/41, about 3 min). Pins printed: preempt_all_ns 50038341, barriers 1, retries 1, read ok.
 - F7b `~/tmp/pr5-f7b.log` (`EXIT:0`, 41/41, about 3 min). Pins printed: EBADE with 26 writes in flight, write ok, fenced 0, latched false.
+- F8 `~/tmp/pr5-f8.log` (`EXIT:0`, 41/41, about 5 min including the link). Pins printed: before the mount, rtype 3, regctl 1, holder `a1a1a1a100000001`, bit 4 clear, generation 1; after convert, rtype 5, regctl 1, bit 4 set, generation 2.
 
 ## Resume rules
 

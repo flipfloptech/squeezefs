@@ -72,6 +72,9 @@ const pr_legs = @import("pr_legs.zig");
 const initiator = @import("initiator.zig");
 const journal_tail = @import("../../meta/journal_tail.zig");
 const multipath = @import("multipath.zig");
+const superblock = @import("../../meta/superblock.zig");
+const appender_page = @import("../../meta/sym/appender_page.zig");
+const fencing = @import("../../meta/sym/membership/fencing.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("ops/nvmet/fidelity is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -5730,4 +5733,161 @@ test "nvmet fidelity: loudfail + storage-list — the binary's refusals name the
     try rig.disconnect(&c);
     try rig.unshare(nqn);
     try expectNoResidue(rig, nqn);
+}
+
+const MetaSector = struct { sb: superblock.Superblock, gen: u64 };
+
+fn metaSector(rig: *Rig, dev: []const u8) !MetaSector {
+    _ = uring_fs.registerMetaDevice(rig.gpa, &rig.env, dev) catch return error.DirectOpenRefused;
+    var res = try rig.pool.readAt(dev, 0, superblock.sector_len);
+    defer res.deinit();
+    const bytes = res.bytes();
+    if (bytes.len < superblock.sector_len) return error.ShortRead;
+    const decoded = superblock.classifySector0(bytes[0..superblock.sector_len], null) catch return error.Corrupt;
+    switch (decoded) {
+        .v5 => |sb| return .{ .sb = sb, .gen = superblock.sectorGeneration(bytes) },
+        else => return error.Corrupt,
+    }
+}
+
+/// Format's only live page is appender 0's Free page in slot 1 (layout 2,
+/// host key 0). The other three slots stay blank. A planted layout-1 page
+/// is the file-image unit's job.
+fn expectAppender0V2(rig: *Rig, dev: []const u8, sb: superblock.Superblock) !void {
+    const offs = appender_page.appender0PageOffsets(sb.journal.start);
+    for (offs, 0..) |off, i| {
+        var res = try rig.pool.readAt(dev, off, appender_page.PAGE_LEN);
+        defer res.deinit();
+        const buf = res.bytes();
+        if (buf.len < appender_page.PAGE_LEN) return error.ShortRead;
+        if (i == 1) {
+            try testing.expectEqual(appender_page.LAYOUT_VERSION, std.mem.readInt(u16, buf[4..][0..2], .little));
+            try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, buf[appender_page.HOST_KEY_OFF..][0..8], .little));
+        } else {
+            try testing.expect(std.mem.allEqual(u8, buf[0..appender_page.PAGE_LEN], 0));
+        }
+    }
+}
+
+test "nvmet fidelity: pr5 F8 — a set formatted without bit 4, reserved WERO by the pr legs, is refused by name and converted (decision 0004 §8.2)" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const ports = try rig.servicePorts(transport);
+    const meta_nqn = try rig.share("f8meta", meta_len, transport, ports[0]);
+    const data_nqn = try rig.share("f8data", data_len, transport, ports[1]);
+    const cm = try rig.connect(meta_nqn, transport, ports[0], null, &.{});
+    const cd = try rig.connect(data_nqn, transport, ports[1], null, &.{});
+    var mu: [64]u8 = undefined;
+    var du: [64]u8 = undefined;
+    const meta_uri = try std.fmt.bufPrint(&mu, "sqmeta://{s}", .{cm.dev()});
+    const data_uri = try std.fmt.bufPrint(&du, "sqdata://{s}", .{cd.dev()});
+    var fmt_env = try rig.envWithKnob("SQUEEZEFS_TEST_FORMAT_WITHOUT_META_WEAR", "1");
+    defer fmt_env.deinit();
+    const fmt_r = try rig.sqzEnv(&.{ "format", meta_uri, data_uri }, &fmt_env);
+    defer rig.freeRun(fmt_r);
+    if (!fmt_r.term.success()) {
+        std.debug.print("\n--- format failed ({f}) ---\n{s}\n{s}\n", .{ fmt_r.term, fmt_r.stdout, fmt_r.stderr });
+        return error.VerbFailed;
+    }
+    try testing.expect(std.mem.indexOf(u8, fmt_r.stdout, "data volumes 1") != null);
+    try rig.disconnect(&cd);
+
+    // The pr-legs key on a second host. The same host would be this host's
+    // stale key: convert-pr's register ladder would unregister it before
+    // the reservation is retyped.
+    const cm_b = try rig.connect(meta_nqn, transport, 0, ident_b, &.{});
+    const dev_b = switch (pr_linux.resolve(gpa, cm_b.dev())) {
+        .device => |d| d,
+        .none => return error.NotAnNvmeNamespace,
+    };
+    const holder = try gpa.create(pr.Client);
+    holder.* = pr.Client.init(gpa, dev_b.face(), dev_b.nsid, pr_legs.key_a1) catch |e| {
+        gpa.destroy(holder);
+        dev_b.deinit();
+        return e;
+    };
+    var hold_open = true;
+    defer if (hold_open) {
+        holder.deinit();
+        gpa.destroy(holder);
+        dev_b.deinit();
+    };
+    try fencing.acquireManagerHold(holder);
+    var key_txt: [16]u8 = undefined;
+    const key_hex = std.fmt.bufPrint(&key_txt, "{x:0>16}", .{pr_legs.key_a1}) catch unreachable;
+    const before = try metaSector(rig, cm.dev());
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        std.debug.print("\n--- F8: before mount rtype {?d} regctl {?d} holder {s} bit4 {} gen {d} ---\n", .{
+            json_scan.number(rr, "rtype"),
+            json_scan.number(rr, "regctl"),
+            json_scan.string(rr, "holder_key") orelse "none",
+            before.sb.metaPrAllRegistrantsStamped(),
+            before.gen,
+        });
+        try testing.expect(before.sb.symmetricPlaneStamped());
+        try testing.expect(!before.sb.metaPrAllRegistrantsStamped());
+        try testing.expectEqual(@as(?u64, nvme.RTYPE_WERO), json_scan.number(rr, "rtype"));
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+        try testing.expectEqualStrings(key_hex, json_scan.string(rr, "holder_key") orelse return error.StatMissing);
+    }
+
+    const m = try rig.spawnMount("f8", meta_uri, null, &.{});
+    try testing.expect(!try readyOrDead(rig, m));
+    const dm = &rig.daemons.items[m];
+    const term = try dm.child.wait(rig.io);
+    dm.reaped = true;
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+    const text = try rig.readLog(m);
+    defer gpa.free(text);
+    var needle: [160]u8 = undefined;
+    const named = try std.fmt.bufPrint(&needle, "squeezefs claim convert-pr sqmeta://{s} --all-mounts-down", .{cm.dev()});
+    if (std.mem.indexOf(u8, text, named) == null) std.debug.print("\n--- the refused mount's log ---\n{s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, named) != null);
+    try testing.expect(std.mem.indexOf(u8, text, "no META_PR_ALL_REGISTRANTS") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "ready: ") == null);
+
+    const converted = try rig.sqzOk(&.{ "claim", "convert-pr", "--all-mounts-down", meta_uri });
+    defer gpa.free(converted);
+    try testing.expect(std.mem.indexOf(u8, converted, "converted to META_PR_ALL_REGISTRANTS (decision 0004 §6.4)") != null);
+    const after = try metaSector(rig, cm.dev());
+    {
+        const rr = try rig.resvReportJson(cm.dev());
+        defer gpa.free(rr);
+        std.debug.print("\n--- F8: converted rtype {?d} regctl {?d} holder {s} bit4 {} gen {d} -> {d} ---\n", .{
+            json_scan.number(rr, "rtype"),
+            json_scan.number(rr, "regctl"),
+            json_scan.string(rr, "holder_key") orelse "none",
+            after.sb.metaPrAllRegistrantsStamped(),
+            before.gen,
+            after.gen,
+        });
+        try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
+        try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+        try testing.expect(std.mem.indexOf(u8, rr, key_hex) == null);
+    }
+    try testing.expect(after.sb.metaPrAllRegistrantsStamped());
+    try testing.expect(after.gen > before.gen);
+    try expectAppender0V2(rig, cm.dev(), after.sb);
+
+    const again_out = try rig.sqzOk(&.{ "claim", "convert-pr", "--all-mounts-down", meta_uri });
+    defer gpa.free(again_out);
+    try testing.expect(std.mem.indexOf(u8, again_out, "already META_PR_ALL_REGISTRANTS — nothing to convert") != null);
+    const again = try metaSector(rig, cm.dev());
+    try testing.expect(again.sb.metaPrAllRegistrantsStamped());
+    try testing.expectEqual(after.gen, again.gen);
+
+    holder.deinit();
+    gpa.destroy(holder);
+    dev_b.deinit();
+    hold_open = false;
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(data_nqn);
+    try rig.unshare(meta_nqn);
+    try expectNoResidue(rig, meta_nqn);
+    try expectNoResidue(rig, data_nqn);
 }

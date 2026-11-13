@@ -1751,10 +1751,10 @@ pub const Early = struct {
     /// Write Exclusive on a flat one) — the caller read the claim right
     /// before it (review 5 major 1). A symmetric hold is a preempt-all
     /// (decision 0004 §4.4).
-    pub fn takeHold(self: *Early, symmetric: bool, path: []const u8) error{Refused}!void {
+    pub fn takeHold(self: *Early, env: *const std.process.Environ.Map, symmetric: bool, path: []const u8) error{Refused}!void {
         const c = self.posture.active;
         c.rtype = if (symmetric) nvme.RTYPE_WEAR else nvme.RTYPE_WRITE_EXCLUSIVE;
-        self.hold = if (symmetric) try takeSuccession(c, path) else try holdReservation(c, path);
+        self.hold = if (symmetric) try takeSuccession(c, path, env) else try holdReservation(c, path);
         self.keep_hold = self.hold.kept();
     }
 
@@ -1926,12 +1926,29 @@ fn registrantHost(rep: nvme.Report, key: u64, host: [16]u8) bool {
     return false;
 }
 
+/// `SQUEEZEFS_TEST_PREEMPT_ALL_HOLD`: park before the preempt-all ioctl,
+/// outside its timer, until a writer opens the FIFO.
+fn holdPreemptIfArmed(env: *const std.process.Environ.Map, path: []const u8) void {
+    const fifo = knobs.parseStr(env.get("SQUEEZEFS_TEST_PREEMPT_ALL_HOLD")) orelse return;
+    if (std.mem.eql(u8, fifo, "off")) return;
+    var buf: [linux.PATH_MAX]u8 = undefined;
+    const z = zpath(&buf, fifo);
+    log.warn("{s}: SQUEEZEFS_TEST_PREEMPT_ALL_HOLD — the preempt-all parks until a writer opens {s}", .{ path, fifo });
+    const rc = linux.open(z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) == .SUCCESS) {
+        _ = linux.close(@intCast(rc));
+    } else {
+        log.warn("{s}: SQUEEZEFS_TEST_PREEMPT_ALL_HOLD could not open {s} ({t})", .{ path, fifo, linux.errno(rc) });
+    }
+    log.warn("{s}: SQUEEZEFS_TEST_PREEMPT_ALL_HOLD released", .{path});
+}
+
 /// A symmetric volume's hold (decision 0004 §4.4 step 6). Report, acquire
 /// only while the namespace is unreserved, then one preempt-all. The
 /// namespace stays WEAR. `acquired` only when the report before the
 /// preempt-all listed no other host and the generation moved by exactly
 /// that command; anything else keeps the hold.
-pub fn takeSuccession(c: *pr.Client, path: []const u8) error{Refused}!HoldOutcome {
+pub fn takeSuccession(c: *pr.Client, path: []const u8, env: *const std.process.Environ.Map) error{Refused}!HoldOutcome {
     const me = c.wireHostId() catch {
         log.err("{s}: the host identifier could not be read before the preempt-all — refusing the mount", .{path});
         return error.Refused;
@@ -1970,7 +1987,12 @@ pub fn takeSuccession(c: *pr.Client, path: []const u8) error{Refused}!HoldOutcom
     }
     const others = otherHostIds(r0, me);
     const gen0 = r0.generation;
-    c.preemptAllAndAbort() catch |e| switch (e) {
+    // Outside the timed ioctl: the counter is the drain (decision 0004 §9, A7).
+    holdPreemptIfArmed(env, path);
+    const t0 = clock.monotonicNs();
+    const preempted = c.preemptAllAndAbort();
+    guard.stats.preempt_all_ns.add(clock.monotonicNs() -| t0);
+    preempted catch |e| switch (e) {
         error.ReservationConflict => {
             log.err("{s}: the preempt-all conflicted — a racing successor unregistered this host; refusing the mount (decision 0004 §4.4)", .{path});
             return error.Refused;
@@ -2923,6 +2945,8 @@ test "a co-located member whose /proc/<pid>/stat the kernel refuses to open (EMF
 
 test "decision 0004 §4.4 step 6: a symmetric takeover is one preempt-all — the successor is the only registrant under WEAR, and every other host id counts; a fresh namespace's preempt-all removes nobody and the hold may be released" {
     const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
     var ns = fake.Namespace.init(gpa);
     defer ns.deinit();
     const id_a: [16]u8 = "manager-host-id1".*;
@@ -2936,7 +2960,7 @@ test "decision 0004 §4.4 step 6: a symmetric takeover is one preempt-all — th
     a.rtype = nvme.RTYPE_WEAR;
     _ = try a.registerLadder();
     const fresh0 = guard.stats.preempt_alls.load();
-    const fresh = try takeSuccession(&a, "fake-meta");
+    const fresh = try takeSuccession(&a, "fake-meta", &env);
     try testing.expectEqual(HoldOutcome.acquired, fresh);
     try testing.expectEqual(fresh0 + 1, guard.stats.preempt_alls.load());
     try testing.expectEqual(nvme.RTYPE_WEAR, ns.rtype);
@@ -2949,7 +2973,7 @@ test "decision 0004 §4.4 step 6: a symmetric takeover is one preempt-all — th
     _ = try c.registerLadder();
     const all0 = guard.stats.preempt_alls.load();
     const vic0 = guard.stats.preempt_all_victims.load();
-    const took = try takeSuccession(&c, "fake-meta");
+    const took = try takeSuccession(&c, "fake-meta", &env);
     try testing.expectEqual(HoldOutcome.preempted, took);
     try testing.expectEqual(all0 + 1, guard.stats.preempt_alls.load());
     try testing.expect(guard.stats.preempt_all_victims.load() >= vic0 + 2);

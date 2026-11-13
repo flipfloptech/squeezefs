@@ -53,6 +53,7 @@ const completion = @import("../sync/completion.zig");
 const futex = @import("../sync/futex.zig");
 const mpmc = @import("../sync/mpmc.zig");
 const nd = @import("nvme_derive.zig");
+const member_fence = @import("../meta/guard/member_fence.zig");
 const ring_park = @import("ring_park.zig");
 
 comptime {
@@ -170,12 +171,16 @@ pub const ReadmitVerdict = enum { retry, latch, held };
 pub const ReadmitClass = enum { conflict, eio };
 pub const ReadmitOp = enum { read, write };
 pub const ReadmitAnswer = struct { verdict: ReadmitVerdict, gen: u62 = 0 };
+pub const DrainBarrierFn = *const fn (ctx: *anyopaque) nd.BarrierAnswer;
 pub const MetaReadmit = struct {
     ctx: *anyopaque,
     vol: u16 = 0,
     afterError: *const fn (ctx: *anyopaque, vol: u16, op: ReadmitOp, class: ReadmitClass) ReadmitAnswer,
     noteSubmitted: ?*const fn (ctx: *anyopaque) void = null,
     noteCompleted: ?*const fn (ctx: *anyopaque) void = null,
+    /// Decision 0004 §4.5.3: set on a PR-fenced metadata path. A read EIO
+    /// issues it, then retries the read once.
+    drainBarrier: ?DrainBarrierFn = null,
 };
 pub const classOf = errors.classOf;
 pub const fromErrno = errors.fromErrno;
@@ -1284,7 +1289,7 @@ pub const Pool = struct {
             return e;
         };
         const r = self.waitCell(idx).read;
-        return r catch |e| return applyReadmitErr(path, .read, e);
+        return r catch |e| return rereadAfterDrain(self, path, offset, size, e);
     }
 
     /// A read that bypasses `MetaReadmit` (decision 0004 §4.16): the
@@ -1381,6 +1386,41 @@ fn applyReadmitErr(path: []const u8, op: ReadmitOp, err: Error) Error {
         .held, .retry => error.Held,
         .latch => err,
     };
+}
+
+fn sleepMs(ms: u64) void {
+    const ts: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+    _ = linux.nanosleep(&ts, null);
+}
+
+/// A read EIO on a PR-fenced metadata path: `drainBarrier`, then one retry
+/// (decision 0004 §4.5.3). No hook keeps today's `applyReadmitErr`. A failed
+/// retry, and an exhausted unknown bound, return the original EIO so the
+/// node read is counted and never latched.
+fn rereadAfterDrain(self: *Pool, path: []const u8, offset: u64, size: usize, err: Error) Error!ReadResult {
+    if (err != error.InputOutput) return applyReadmitErr(path, .read, err);
+    const hook = lookupMetaReadmit(path) orelse return applyReadmitErr(path, .read, err);
+    const barrierFn = hook.drainBarrier orelse return applyReadmitErr(path, .read, err);
+    const start_ns = clock.monotonicNs();
+    var unknowns: u32 = 0;
+    var delay_ms: u64 = nd.READ_BARRIER_BASE_MS;
+    while (true) {
+        member_fence.stats.meta_pr_drain_barriers.inc();
+        const ans = barrierFn(hook.ctx);
+        const within_ttl = (clock.monotonicNs() -| start_ns) < nd.READ_BARRIER_TTL_NS;
+        switch (nd.readAfterEio(ans, unknowns, within_ttl)) {
+            .retry_read => {
+                member_fence.stats.meta_pr_read_retries_after_drain.inc();
+                return self.readAtRaw(path, offset, size) catch return err;
+            },
+            .surface_eio => return err,
+            .reissue_barrier => {
+                unknowns += 1;
+                sleepMs(delay_ms);
+                delay_ms = @min(delay_ms *| 2, nd.READ_BARRIER_CAP_MS);
+            },
+        }
+    }
 }
 
 /// The worker loop (`docs/porting/uring_fs.md` §1.9): park in the queue when

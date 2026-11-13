@@ -1117,6 +1117,15 @@ pub const JoinedSet = struct {
         r.pageWritten(&plan);
     }
 
+    /// A metadata read's EIO during a preempt-and-abort (decision 0004 §4.5.3).
+    /// Unregistered is the S2 signal: park before this member's next write.
+    pub fn drainAfterReadEio(self: *JoinedSet) pr.Barrier {
+        const f = self.fence orelse return .unknown;
+        const ans = f.client.drainBarrier();
+        if (ans == .unregistered) parkForSuccession(self);
+        return ans;
+    }
+
     fn parkForSuccession(ctx: ?*anyopaque) void {
         const self: *JoinedSet = @ptrCast(@alignCast(ctx.?));
         if (self.membershipHoldActive()) return;

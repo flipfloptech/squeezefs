@@ -756,7 +756,7 @@ pub const Guard = struct {
     /// A flat volume acquires Write Exclusive, or preempts the one holder.
     fn hold(g: *Guard, c: *pr.Client, evidence: claim.Evidence) backend.OpenError!void {
         if (c.rtype == nvme.RTYPE_WEAR) {
-            const outcome = host_fence.takeSuccession(c, g.be.path) catch return error.Busy;
+            const outcome = host_fence.takeSuccession(c, g.be.path, g.be.env) catch return error.Busy;
             g.keep_hold = outcome.kept();
             // A first manager acquires an unreserved namespace. A successor's
             // preempt-all is what opens the window (decision 0004 §4.6).

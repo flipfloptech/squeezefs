@@ -44,7 +44,8 @@
 //! and `storage-list`; the slow drain (decision 0004 §8.2): `slow-drain-
 //! {loop,tcp}` and P17's `teardown-during-drain-{loop,tcp}` on a null_blk
 //! namespace (the stock null_blk module is loaded with no default device
-//! when absent, as the smoke's dm rows load theirs), and the opt-in
+//! when absent, as the smoke's dm rows load theirs), F7a (a joiner's node
+//! read across a 50 ms preempt-all drain), and the opt-in
 //! `keepalive-teardown-during-drain-tcp`.
 
 const std = @import("std");
@@ -4284,6 +4285,244 @@ test "nvmet fidelity: pr5 F6 — two metadata volumes (decision 0004 §8.2) — 
     for (set.meta_nqn) |nqn| try rig.unshare(nqn);
     try expectNoResidue(rig, set.data_nqn);
     for (set.meta_nqn) |nqn| try expectNoResidue(rig, nqn);
+}
+
+/// Host C's writes on its metadata namespace, staggered so the preempt-all's
+/// pre-kill window admits one whose 50 ms timer starts after the ioctl
+/// (decision 0004 §8.2 F7a, A7). Offsets sit at the end of the volume: a
+/// fresh format's live nodes are at the front of the heap.
+const FloodCtl = struct {
+    stop: std.atomic.Value(bool) = .init(false),
+    /// Set once the pipeline is full, just before the preempt-all is released.
+    arm: std.atomic.Value(bool) = .init(false),
+    /// A write completed EIO or EBADE after `arm` (the drain is refusing new commands).
+    refused: std.atomic.Value(bool) = .init(false),
+    submitted: std.atomic.Value(u32) = .init(0),
+};
+
+fn metaWriteFlood(ctl: *FloodCtl, path: [:0]const u8) void {
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .DIRECT = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var ring = linux.IoUring.init(64, 0) catch return;
+    defer ring.deinit();
+    var bufs: [32][4096]u8 align(4096) = undefined;
+    for (&bufs) |*b| @memset(b, 0);
+    var cqes: [32]linux.io_uring_cqe = undefined;
+    var free_mask: u32 = 0xFFFF_FFFF;
+    var inflight: u32 = 0;
+    const base = meta_len - 32 * 4096;
+    const eio = -@as(i32, @backingInt(linux.E.IO));
+    const ebade = -@as(i32, @backingInt(linux.E.BADE));
+    while (!ctl.stop.load(.acquire) or inflight != 0) {
+        const stopping = ctl.stop.load(.acquire);
+        const armed = ctl.arm.load(.acquire);
+        if (!stopping and free_mask != 0) {
+            if (ring.get_sqe()) |sqe| {
+                const bit = @ctz(free_mask);
+                free_mask &= ~(@as(u32, 1) << @as(u5, @truncate(bit)));
+                sqe.prep_write(fd, &bufs[bit], base + @as(u64, bit) * 4096);
+                sqe.user_data = bit;
+                inflight += 1;
+                ctl.submitted.store(ctl.submitted.load(.monotonic) + 1, .monotonic);
+                _ = ring.submit() catch {};
+            } else |_| {}
+        }
+        const wait: u32 = if (free_mask == 0 or stopping) 1 else 0;
+        // Before the preempt, a millisecond apart so completions stay
+        // staggered. Once armed, submit the instant a slot frees.
+        if (wait == 0 and !armed) sleepMs(1);
+        const n = ring.copy_cqes(&cqes, wait) catch break;
+        for (cqes[0..n]) |cqe| {
+            if (cqe.user_data < 32) free_mask |= @as(u32, 1) << @as(u5, @intCast(cqe.user_data));
+            inflight -|= 1;
+            if (armed and (cqe.res == eio or cqe.res == ebade)) ctl.refused.store(true, .release);
+        }
+    }
+    var spins: u32 = 0;
+    while (inflight != 0 and spins < 32) : (spins += 1) {
+        const n = ring.copy_cqes(&cqes, 1) catch break;
+        if (n == 0) break;
+        for (cqes[0..n]) |cqe| {
+            if (cqe.user_data < 32) free_mask |= @as(u32, 1) << @as(u5, @intCast(cqe.user_data));
+            inflight -|= 1;
+        }
+    }
+}
+
+test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drain (decision 0004 §8.2) — null_blk metadata completes in 50 ms; J's controller has a write in flight when S preempts-all and J reads an evicted xattr node; the read returns, meta_pr_drain_barriers and meta_pr_read_retries_after_drain are at least 1, and writer_guard_preempt_all_ns is at least 50 ms" {
+    const gpa = testing.allocator;
+    var nb_slot: ?storage.NullBlk = null;
+    defer if (nb_slot) |*nb| nb.destroy();
+    const rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    if (!nullBlkReady(rig)) return testkit.skip(@src(), .no_kernel_feature, "null_blk (its configfs) — F7a's metadata backend");
+    var name_buf: [32]u8 = undefined;
+    const dev_name = std.fmt.bufPrint(&name_buf, "sqzf7a{d}", .{rig.pid}) catch unreachable;
+    nb_slot = try storage.NullBlk.create(dev_name, meta_len >> 20, 50_000_000);
+    var devb: [48]u8 = undefined;
+    const backing = nb_slot.?.devPath(&devb);
+    const mount_wait_ns: u64 = 180 * std.time.ns_per_s;
+    const ports = try rig.servicePorts(.tcp);
+    const meta_nqn = try rig.shareWith("f7ameta", backing, null, .tcp, ports[0]);
+    const data_nqn = try rig.share("f7adata", data_fence_volume, .tcp, ports[1]);
+    const cm = try rig.connect(meta_nqn, .tcp, ports[0], null, &.{});
+    const cd = try rig.connect(data_nqn, .tcp, ports[1], null, &.{});
+    var mu: [64]u8 = undefined;
+    const meta_uri = try std.fmt.bufPrint(&mu, "sqmeta://{s}", .{cm.dev()});
+    var du: [64]u8 = undefined;
+    const data_uri = try std.fmt.bufPrint(&du, "sqdata://{s}", .{cd.dev()});
+    // Default 256 KiB nodes: a 1 MiB node on this 50 ms device outruns the 10 s join reply.
+    const fmt_out = try rig.sqzOk(&.{ "format", meta_uri, data_uri });
+    defer gpa.free(fmt_out);
+    try testing.expect(std.mem.indexOf(u8, fmt_out, "data volumes 1") != null);
+    try rig.setDataEndpoint(meta_uri, .tcp, ports[1], data_nqn);
+    try rig.disconnect(&cd);
+
+    const m = try rig.spawnMount("f7a-m", meta_uri, null, &.{});
+    try rig.awaitLog(m, "ready: ", mount_wait_ns);
+    const cm_c = try rig.connect(meta_nqn, .tcp, ports[0], ident_c, &.{});
+    var mu_c: [64]u8 = undefined;
+    const meta_uri_c = try std.fmt.bufPrint(&mu_c, "sqmeta://{s}", .{cm_c.dev()});
+    // Membership T_owner stays above the claim wait: the on-disk claim TTL is
+    // unchanged, so S can still take over, and J does not park at T_self first.
+    var env_j = try rig.envWith(ident_c);
+    defer env_j.deinit();
+    try env_j.put("SQUEEZEFS_META_NODE_CACHE_MB", "4");
+    try env_j.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", "600000");
+    const j = try rig.spawnMountEnv("f7a-j", meta_uri_c, &env_j, &.{});
+    try rig.awaitLog(j, "ready: ", mount_wait_ns);
+    // 4 MiB holds the tree roots. 60 KiB xattrs spill into leaves; the second
+    // batch's publish evicts the first batch's clean leaf, and getxattr re-reads it.
+    const fill =
+        \\mkdir -p mine && python3 -c '
+        \\import os
+        \\blob = b"x"*60000
+        \\def put(p):
+        \\    fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
+        \\    os.close(fd)
+        \\    os.setxattr(p, "user.p", blob)
+        \\put("mine/t")
+        \\for i in range(40):
+        \\    put("mine/f%d" % i)
+        \\' && sync -f mine && python3 -c '
+        \\import os
+        \\blob = b"x"*60000
+        \\for i in range(8):
+        \\    p = "mine/g%d" % i
+        \\    fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
+        \\    os.close(fd)
+        \\    os.setxattr(p, "user.p", blob)
+        \\' && sync -f mine
+    ;
+    const filled = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "sh", "-c", fill }, .cwd = .{ .path = rig.daemons.items[j].mp }, .environ_map = &rig.env });
+    defer rig.freeRun(filled);
+    if (!filled.term.success()) {
+        std.debug.print("\n--- F7a fill failed ({f}) ---\n{s}\n{s}\n", .{ filled.term, filled.stdout, filled.stderr });
+        printLogTailFile(rig, rig.daemons.items[j].log_path, 40);
+        return error.FillFailed;
+    }
+    const pre = try rig.stats(j);
+    defer gpa.free(pre);
+    const evicted = try statNumber(pre, "meta_kv_node_cache_evictions");
+    std.debug.print("\n--- F7a fill: node-cache evictions {d} ---\n", .{evicted});
+    if (evicted == 0) {
+        printLogTailFile(rig, rig.daemons.items[j].log_path, 40);
+        return error.NodeNotEvicted;
+    }
+    _ = linux.kill(rig.daemons.items[m].pid, .STOP);
+    sleepMs(lease_clock.T_OWNER_MS + 5_000);
+
+    const cm_b = try rig.connect(meta_nqn, .tcp, ports[0], ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/f7a-preempt.fifo", .{rig.root}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    var env_s = try rig.envWith(ident_b);
+    defer env_s.deinit();
+    try env_s.put("SQUEEZEFS_TEST_PREEMPT_ALL_HOLD", fifo);
+
+    var flood: FloodCtl = .{};
+    var flood_thread: ?std.Thread = null;
+    var flood_joined = false;
+    defer if (!flood_joined) {
+        if (flood_thread) |t| {
+            flood.stop.store(true, .release);
+            t.join();
+        }
+    };
+
+    const s = try rig.spawnMountEnv("f7a-s", meta_uri_b, &env_s, &.{});
+    errdefer {
+        printLogTailFile(rig, rig.daemons.items[j].log_path, 40);
+        printLogTailFile(rig, rig.daemons.items[s].log_path, 40);
+    }
+    try rig.awaitLog(s, "SQUEEZEFS_TEST_PREEMPT_ALL_HOLD — the preempt-all parks", mount_wait_ns);
+
+    var devz: [linux.PATH_MAX]u8 = undefined;
+    const zpath = try std.fmt.bufPrintSentinel(&devz, "{s}", .{cm_c.dev()}, 0);
+    flood_thread = try std.Thread.spawn(.{}, metaWriteFlood, .{ &flood, zpath });
+    const wr_deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+    while (true) {
+        const queued = flood.submitted.load(.monotonic) >= 32;
+        const in_flight = if (nb_slot) |*nb| (nb.inflightWrites() orelse 0) > 0 else false;
+        if (queued and in_flight) break;
+        if (clock.monotonicNs() >= wr_deadline) {
+            std.debug.print("\n--- F7a: submitted {d}, inflight never held ---\n", .{flood.submitted.load(.monotonic)});
+            return error.NoInflightWrite;
+        }
+        sleepMs(1);
+    }
+    flood.arm.store(true, .release);
+    releaseFifo(fifo);
+    const refuse_deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!flood.refused.load(.acquire)) {
+        if (clock.monotonicNs() >= refuse_deadline) return error.DrainRefusedNeverSeen;
+        sleepMs(1);
+    }
+    const still = if (nb_slot) |*nb| nb.inflightWrites() orelse 0 else 0;
+    std.debug.print("\n--- F7a: drain refusal, inflight writes {d} ---\n", .{still});
+    if (still == 0) return error.DrainWindowMissed;
+    // A read, not a stat: the name's inode stays cached; the xattr leaf does not.
+    const read_ok = try scriptSucceeds(rig, j, "python3 -c 'import os; os.getxattr(\"mine/t\", \"user.p\")'");
+    flood.stop.store(true, .release);
+    if (flood_thread) |t| t.join();
+    flood_joined = true;
+
+    try rig.awaitLog(s, "ready: ", mount_wait_ns);
+    const sj = try rig.stats(j);
+    defer gpa.free(sj);
+    const ss = try rig.stats(s);
+    defer gpa.free(ss);
+    const barriers = try statNumber(sj, "meta_pr_drain_barriers");
+    const retries = try statNumber(sj, "meta_pr_read_retries_after_drain");
+    const preempt_ns = try statNumber(ss, "writer_guard_preempt_all_ns");
+    std.debug.print("\n--- F7a: preempt_all_ns {d}, barriers {d}, retries {d}, read {s} ---\n", .{
+        preempt_ns,
+        barriers,
+        retries,
+        if (read_ok) "ok" else "fail",
+    });
+    if (!read_ok) return error.ReadSurfaced;
+    try testing.expect(barriers >= 1);
+    try testing.expect(retries >= 1);
+    try testing.expect(preempt_ns >= 50 * std.time.ns_per_ms);
+
+    try rig.kill9(m);
+    try rig.umount(j);
+    try rig.umount(s);
+    _ = try rig.disconnectIdentity(data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(data_nqn, ident_c);
+    try rig.disconnect(&cm_c);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(data_nqn);
+    try rig.unshare(meta_nqn);
+    try expectNoResidue(rig, meta_nqn);
+    try expectNoResidue(rig, data_nqn);
 }
 
 test "nvmet fidelity: F10 — a busy co-located joiner of the superseded manager survives the takeover (decision 0004 §8.2, G-c, round-4 issue 1) — M (host A) manages, JA (host A, supervised, the write cache) keeps writing and fsyncing one 64 KiB block across the takeover; M is SIGSTOPped past the claim TTL and S (host B) mounts: S's admission pays the fence debt and fences host A on data while JA is mid-flight (data_pr_debt_preempts >= 1) — a refused data write is re-admitted (held while metadata is pending, or one synchronous retry once metadata has settled; data_dma_fence_refusals 0, no data fence latch), JA kills M at its metadata re-registration (pr_stale_sibling_kills ≥ 1), data re-registers (data_pr_succession_reregistrations ≥ 1), a later fsync lands, every fsynced block is whole on JA and on S, and fsck --offline --scrub is clean (red on dev: JA's data device latches, its fsyncs answer EIO)" {

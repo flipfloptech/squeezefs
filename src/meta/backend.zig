@@ -92,6 +92,7 @@ const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
 const align_probe = @import("../io/align_probe.zig");
 const uring_fs = @import("../io/uring_fs.zig");
+const nvme_derive = @import("../io/nvme_derive.zig");
 const sync = @import("../sync/sync.zig");
 const exec = @import("../exec/exec.zig");
 const key = @import("key.zig");
@@ -648,7 +649,7 @@ pub const KvBackend = struct {
                 // manager, never preempted: the open refuses.
                 if (try guard.gate.Guard.freshClaimEarly(gpa, io, opts.env, pool, path, local, probe)) |c| return guard.gate.Guard.refuseFresh(path, c);
                 holdEarlyIfArmed(io, opts.env, path, "SQUEEZEFS_TEST_EARLY_HOLD_PARK", "the claim probed again, the hold not taken");
-                e.takeHold(sb.symmetricPlaneStamped(), path) catch return error.Busy;
+                e.takeHold(opts.env, sb.symmetricPlaneStamped(), path) catch return error.Busy;
                 // Once more under the hold: a writer that committed its claim
                 // in the instant between that probe and the hold held the
                 // reservation then, so this hold preempted its host — fenced,
@@ -1226,6 +1227,10 @@ pub const KvBackend = struct {
         be.dev.readmit = joinedReadmit;
         be.dev.readmit_ctx = be;
         be.dev.withdraw_drain = &js.withdraw_drain;
+        if (js.fence != null) {
+            be.dev.drain_barrier = &joinedDrainBarrier;
+            be.dev.drain_ctx = be;
+        }
         be.dev.bindPoolReadmit();
         errdefer {
             js.deinit();
@@ -1234,6 +1239,8 @@ pub const KvBackend = struct {
             be.dev.withdraw_drain = null;
             be.dev.readmit = null;
             be.dev.readmit_ctx = null;
+            be.dev.drain_barrier = null;
+            be.dev.drain_ctx = null;
         }
         be.slots = try slots_plane.Plane.init(gpa, io, be, opts.env);
         errdefer be.slots.deinit();
@@ -1658,6 +1665,16 @@ pub const KvBackend = struct {
 
     /// The joined posture's `RecordSource.appenderPages`: the page IS the
     /// record (`sym/joined.zig`).
+    fn joinedDrainBarrier(ctx: *anyopaque) nvme_derive.BarrierAnswer {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        const js = be.joined orelse return .unknown;
+        return switch (js.drainAfterReadEio()) {
+            .registered => .registered,
+            .unregistered => .unregistered,
+            .unknown => .unknown,
+        };
+    }
+
     fn joinedReadmit(ctx: ?*anyopaque, op: member_fence.Op, class: member_fence.Class) member_fence.Answer {
         const be: *KvBackend = @ptrCast(@alignCast(ctx.?));
         const js = be.joined orelse return .{ .verdict = .latch };

@@ -34,6 +34,7 @@ const counters = @import("../core/counters.zig");
 const log = @import("../core/log.zig");
 const align_probe = @import("../io/align_probe.zig");
 const uring_fs = @import("../io/uring_fs.zig");
+const nvme_derive = @import("../io/nvme_derive.zig");
 const node_cache = @import("node_cache.zig");
 const checkpoint_cycle = @import("checkpoint_cycle.zig");
 const ledger = @import("ledger.zig");
@@ -204,6 +205,9 @@ pub const DeviceLoader = struct {
     readmit: ?member_fence.Hook = null,
     readmit_ctx: ?*anyopaque = null,
     withdraw_drain: ?*member_fence.WithdrawDrain = null,
+    /// Decision 0004 §4.5.3: a metadata read's EIO issues this before one retry.
+    drain_barrier: ?uring_fs.DrainBarrierFn = null,
+    drain_ctx: ?*anyopaque = null,
     reads: ReadEpisode = .{},
 
     pub fn loader(self: *DeviceLoader) node_cache.NodeLoader {
@@ -212,17 +216,25 @@ pub const DeviceLoader = struct {
 
     /// Install this loader's member-fence hook on the pool waiter for `path`.
     pub fn bindPoolReadmit(self: *DeviceLoader) void {
-        if (self.readmit == null and self.withdraw_drain == null) return;
+        if (self.readmit == null and self.withdraw_drain == null and self.drain_barrier == null) return;
         uring_fs.bindMetaReadmit(self.path, .{
             .ctx = self,
             .afterError = &poolAfterError,
             .noteSubmitted = if (self.withdraw_drain != null) &poolNoteSubmitted else null,
             .noteCompleted = if (self.withdraw_drain != null) &poolNoteCompleted else null,
+            .drainBarrier = if (self.drain_barrier != null) &poolDrainBarrier else null,
         }) catch {};
     }
 
     pub fn unbindPoolReadmit(self: *const DeviceLoader) void {
         uring_fs.unbindMetaReadmit(self.path);
+    }
+
+    fn poolDrainBarrier(ctx: *anyopaque) nvme_derive.BarrierAnswer {
+        const self: *DeviceLoader = @ptrCast(@alignCast(ctx));
+        const f = self.drain_barrier orelse return .unknown;
+        const dctx = self.drain_ctx orelse return .unknown;
+        return f(dctx);
     }
 
     fn poolNoteSubmitted(ctx: *anyopaque) void {

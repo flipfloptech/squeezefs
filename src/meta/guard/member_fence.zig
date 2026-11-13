@@ -23,6 +23,15 @@ const clock = @import("../../core/clock.zig");
 const nvme = @import("nvme_cmd.zig");
 const pr = @import("pr.zig");
 const nvme_derive = @import("../../io/nvme_derive.zig");
+const counters = @import("../../core/counters.zig");
+
+/// Metadata read-EIO drain (decision 0004 §4.5.3, §9).
+pub const stats = struct {
+    /// Barriers issued after a metadata read returned EIO.
+    pub var meta_pr_drain_barriers: counters.ShardedCounter = .{};
+    /// The one read retried after such a barrier.
+    pub var meta_pr_read_retries_after_drain: counters.ShardedCounter = .{};
+};
 
 pub const Verdict = enum { retry, latch, held };
 

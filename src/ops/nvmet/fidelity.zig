@@ -5891,3 +5891,185 @@ test "nvmet fidelity: pr5 F8 — a set formatted without bit 4, reserved WERO by
     try expectNoResidue(rig, meta_nqn);
     try expectNoResidue(rig, data_nqn);
 }
+
+test "nvmet fidelity: pr5 F11 — a successor beside a live joiner on its host (decision 0004 §8.2, §4.4.3) — M (host A) manages, JB (host B) writes and fsyncs; M is SIGSTOPped past the claim TTL; S mounts on host B beside JB: step 3 adopts host B (pr_host_adoptions 1, pr_host_registrations 0) and one preempt-all (writer_guard_preempt_alls 1) removes only the other host (writer_guard_preempt_all_victims 1), leaving WEAR (rtype 5, regctl 1); JB's key never leaves and JB is not refused (writer_guard_fenced 0, data_pr_refusals_held 0, data_pr_write_refusals 0, data_pr_succession_reregistrations 0, no succession re-registration); JB reads its bytes, a later write lands, and the window settles early" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "f11", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    const m = try rig.spawnMount("f11-m", set.metaUri(), null, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    const jb = try rig.spawnMount("f11-jb", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(jb, "ready: ", ready_wait_ns);
+    try testing.expect(try scriptSucceeds(rig, jb, "mkdir djb && echo jb > djb/jb && sync -d djb/jb"));
+    const key_jb = try statString(rig, jb, "pr_key");
+    defer gpa.free(key_jb);
+    {
+        const j0 = try rig.stats(jb);
+        defer gpa.free(j0);
+        try testing.expectEqual(@as(u64, 1), try statNumber(j0, "pr_host_registrations"));
+        try testing.expectEqual(@as(u64, 0), try statNumber(j0, "pr_host_adoptions"));
+    }
+    const before = try rig.resvReportJson(cm.dev());
+    defer gpa.free(before);
+    std.debug.print("\n--- F11: before S rtype {?d} regctl {?d} key {s} ---\n", .{
+        json_scan.number(before, "rtype"),
+        json_scan.number(before, "regctl"),
+        key_jb,
+    });
+    try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(before, "rtype"));
+    try testing.expectEqual(@as(?u64, 2), json_scan.number(before, "regctl"));
+    if (std.mem.indexOf(u8, before, key_jb) == null) {
+        std.debug.print("\n--- F11: JB's key {s} is absent before S ---\n{s}\n", .{ key_jb, before });
+        return error.JbKeyAbsent;
+    }
+    const pid_m = rig.daemons.items[m].pid;
+    _ = linux.kill(pid_m, .STOP);
+    sleepMs(lease_clock.T_OWNER_MS + 5_000);
+    // S and JB share host B's controller. Step 3 finds that host registered.
+    const s = try rig.spawnMount("f11-s", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(s, "ready: ", ready_wait_ns);
+    {
+        const seen = try rig.onMount(s, "cat djb/jb");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("jb\n", seen);
+    }
+    const rr = try rig.resvReportJson(cm.dev());
+    defer gpa.free(rr);
+    const ss = try rig.stats(s);
+    defer gpa.free(ss);
+    std.debug.print("\n--- F11: after S rtype {?d} regctl {?d} preempt_alls {?d} victims {?d} adoptions {?d} registrations {?d} ---\n", .{
+        json_scan.number(rr, "rtype"),
+        json_scan.number(rr, "regctl"),
+        json_scan.number(ss, "writer_guard_preempt_alls"),
+        json_scan.number(ss, "writer_guard_preempt_all_victims"),
+        json_scan.number(ss, "pr_host_adoptions"),
+        json_scan.number(ss, "pr_host_registrations"),
+    });
+    try testing.expectEqual(@as(?u64, nvme.RTYPE_WEAR), json_scan.number(rr, "rtype"));
+    // Host A is the only other host id. Host B stays, one registrant.
+    try testing.expectEqual(@as(?u64, 1), json_scan.number(rr, "regctl"));
+    try testing.expectEqual(@as(u64, 1), try statNumber(ss, "writer_guard_preempt_alls"));
+    try testing.expectEqual(@as(u64, 1), try statNumber(ss, "writer_guard_preempt_all_victims"));
+    try testing.expectEqual(@as(u64, 1), try statNumber(ss, "pr_host_adoptions"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(ss, "pr_host_registrations"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(ss, "pr_stale_sibling_kills"));
+    if (std.mem.indexOf(u8, rr, key_jb) == null) {
+        std.debug.print("\n--- F11: JB's key {s} left the report (regctl {?d}) ---\n{s}\n", .{ key_jb, json_scan.number(rr, "regctl"), rr });
+        return error.JbKeyAbsent;
+    }
+    const seen = rig.onMount(jb, "timeout 70 cat djb/jb") catch |e| {
+        printLogNeedles(rig, rig.daemons.items[jb].log_path);
+        printLogTailFile(rig, rig.daemons.items[jb].log_path, 40);
+        return e;
+    };
+    defer gpa.free(seen);
+    if (!std.mem.eql(u8, seen, "jb\n")) {
+        std.debug.print("\n--- F11 JB read {s} ---\n", .{seen});
+        printLogNeedles(rig, rig.daemons.items[jb].log_path);
+        return error.JbBytesLost;
+    }
+    // Membership cadence is 5 s. JB is already registered, so the window
+    // settles on the re-assert and the park does not stick.
+    const settle_deadline = clock.monotonicNs() + 12 * std.time.ns_per_s;
+    var early: u64 = 0;
+    var settled: u64 = 0;
+    var parked: u64 = 0;
+    while (true) {
+        const st = try rig.stats(s);
+        early = json_scan.number(st, "writer_guard_succession_early_settles") orelse 0;
+        settled = json_scan.number(st, "writer_guard_succession_settles") orelse 0;
+        gpa.free(st);
+        const js = try rig.stats(jb);
+        parked = json_scan.number(js, "appender_parked") orelse 1;
+        gpa.free(js);
+        if (early >= 1 and settled >= 1 and parked == 0) break;
+        if (clock.monotonicNs() >= settle_deadline) {
+            std.debug.print("\n--- F11: window did not settle with JB running (early {d}, settles {d}, parked {d}) ---\n", .{ early, settled, parked });
+            printLogNeedles(rig, rig.daemons.items[jb].log_path);
+            printLogNeedles(rig, rig.daemons.items[s].log_path);
+            printLogTailFile(rig, rig.daemons.items[s].log_path, 40);
+            printLogTailFile(rig, rig.daemons.items[jb].log_path, 40);
+            return error.NoEarlySettle;
+        }
+        sleepMs(200);
+    }
+    if (!try scriptSucceeds(rig, jb, "timeout 30 sh -c 'echo more >> djb/jb && sync -d djb/jb'")) {
+        printLogNeedles(rig, rig.daemons.items[jb].log_path);
+        printLogTailFile(rig, rig.daemons.items[jb].log_path, 40);
+        return error.JbWriteRefused;
+    }
+    {
+        const more = try rig.onMount(jb, "timeout 30 cat djb/jb");
+        defer gpa.free(more);
+        try testing.expectEqualStrings("jb\nmore\n", more);
+    }
+    const j_end = try rig.stats(jb);
+    defer gpa.free(j_end);
+    std.debug.print("\n--- F11 JB: fenced {?d} refusals_held {?d} write_refusals {?d} succession_rereg {?d} registrations {?d} kills {?d} parked {?d} ---\n", .{
+        json_scan.number(j_end, "writer_guard_fenced"),
+        json_scan.number(j_end, "data_pr_refusals_held"),
+        json_scan.number(j_end, "data_pr_write_refusals"),
+        json_scan.number(j_end, "data_pr_succession_reregistrations"),
+        json_scan.number(j_end, "pr_host_registrations"),
+        json_scan.number(j_end, "pr_stale_sibling_kills"),
+        json_scan.number(j_end, "appender_parked"),
+    });
+    try testing.expectEqual(@as(u64, 0), try statNumber(j_end, "writer_guard_fenced"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(j_end, "data_pr_refusals_held"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(j_end, "data_pr_write_refusals"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(j_end, "data_pr_succession_reregistrations"));
+    try testing.expectEqual(@as(u64, 1), try statNumber(j_end, "pr_host_registrations"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(j_end, "pr_stale_sibling_kills"));
+    try testing.expectEqual(@as(u64, 0), try statNumber(j_end, "appender_parked"));
+    const jb_log = try rig.readLog(jb);
+    defer gpa.free(jb_log);
+    if (std.mem.indexOf(u8, jb_log, "re-registered this host") != null) {
+        printLogNeedles(rig, rig.daemons.items[jb].log_path);
+        return error.JbReregistered;
+    }
+    const dst = try rig.stats(s);
+    defer gpa.free(dst);
+    const debt = json_scan.number(dst, "data_pr_debt_preempts") orelse 0;
+    const reconciled = json_scan.number(dst, "data_pr_reconcile_preempts") orelse 0;
+    std.debug.print("\n--- F11 debt: data_pr_debt_preempts {d}, data_pr_reconcile_preempts {d} ---\n", .{ debt, reconciled });
+    if (debt < 1 or reconciled != 0) printLogTailFile(rig, rig.daemons.items[s].log_path, 50);
+    try testing.expect(debt >= 1);
+    try testing.expectEqual(@as(u64, 0), reconciled);
+    const rr_end = try rig.resvReportJson(cm.dev());
+    defer gpa.free(rr_end);
+    if (std.mem.indexOf(u8, rr_end, key_jb) == null) {
+        std.debug.print("\n--- F11: JB's key {s} left after the write (regctl {?d}) ---\n{s}\n", .{ key_jb, json_scan.number(rr_end, "regctl"), rr_end });
+        return error.JbKeyAbsent;
+    }
+    try testing.expectEqual(@as(?u64, 1), json_scan.number(rr_end, "regctl"));
+    try rig.umount(jb);
+    try rig.kill9(m);
+    try rig.umount(s);
+    const bound = try bindDataForFsck(rig, &set, transport);
+    defer if (bound) {
+        var stored_buf: [64]u8 = undefined;
+        if (std.fmt.bufPrintSentinel(&stored_buf, "{s}", .{set.dataDev()}, 0)) |stored_z| {
+            _ = linux.umount2(stored_z.ptr, linux.MNT.DETACH);
+        } else |_| {}
+    };
+    const fsck = try rig.sqz(&.{ "fsck", "--offline", "--scrub", set.metaUri() });
+    defer rig.freeRun(fsck);
+    if (!fsck.term.success() or std.mem.indexOf(u8, fsck.stdout, "findings: 0 (clean)") == null) {
+        std.debug.print("\n--- fsck --offline --scrub ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ fsck.term, fsck.stdout, fsck.stderr });
+        return error.FsckNotClean;
+    }
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}

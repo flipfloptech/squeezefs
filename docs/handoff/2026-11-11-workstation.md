@@ -5,8 +5,8 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** F8 is in `45fd0f55`. This note is the docs commit on top
-of it. F7b is `b1f87fa7`. F7a is `bd0d3f5f`. F6 is `88003de0`. F5 is `2a8f4a2b`. F2, F3, and F4 are in `bc7ae7c4`. The fencing registrant is retired in
+**Branch `feat/pr5`.** F11 is in `afe74d33`. This note is the docs commit on top
+of it. F8 is `45fd0f55`. F7b is `b1f87fa7`. F7a is `bd0d3f5f`. F6 is `88003de0`. F5 is `2a8f4a2b`. F2, F3, and F4 are in `bc7ae7c4`. The fencing registrant is retired in
 `281bd07b`. Incompat
 bit 4 and `claim convert-pr` are `694b43c2`. The blind-rule refusals are
 `eea93412`. Report-first recovery is `d75445b9`. Do not amend those. No upstream.
@@ -19,10 +19,10 @@ The hashes are in the table below.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
-1. The fidelity rows that are not yet written: F11, then F13.
-   F8 is `45fd0f55` (migration without bit 4, refused by name, `claim convert-pr` converts, a second run is a no-op). F12 and F14 need
+1. The fidelity row that is not yet written: F13.
+   F11 is `afe74d33` (a successor beside a live joiner on its host: step 3 adopts, the preempt-all removes only the other host, JB is never refused). F12 and F14 need
    `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist. Do not build
-   that seam before F11 and F13. `claim posture-reset` is the other offline
+   that seam before F13. `claim posture-reset` is the other offline
    door; it is not one of these rows.
 
 A full venue gate has not been run on this branch. Do not merge to `dev` until that gate is
@@ -57,6 +57,7 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | `bd0d3f5f` | F7a: a joiner's node read during the preempt-all drain. One barrier, one retry, and the drain's length. |
 | `b1f87fa7` | F7b: a joiner's write during the preempt-all drain. EBADE, held, re-registered, retried. `writer_guard_fenced` stays 0. No product change. |
 | `45fd0f55` | F8: a volume formatted without bit 4, held WERO, refused by name, then `claim convert-pr`. rtype 5, bit 4, pages v2. A second run is a no-op. No product change. |
+| `afe74d33` | F11: a successor beside a live joiner on its host. Step 3 adopts. The preempt-all removes only the other host. JB is never refused. No product change. |
 
 ## What is true in the code
 
@@ -477,6 +478,28 @@ already and leaves generation 2.
 Device: `~/tmp/pr5-f8.log` (`EXIT:0`, 41/41, about 5 min including the link).
 No full gate.
 
+## A successor beside its joiner, committed `afe74d33`
+
+Decision 0004 §8.2 F11, §4.4.3. No product change.
+
+M manages on host A. JB is a live joiner on host B and has written. S mounts
+on host B, the same identity and the same metadata controller as JB. Step 3
+adopts host B's registration (`pr_host_adoptions` 1, `pr_host_registrations`
+0). The preempt-all skips S's own host id: one victim, host A
+(`writer_guard_preempt_alls` 1, `writer_guard_preempt_all_victims` 1). The
+namespace stays WEAR. regctl goes from 2 to 1, and JB's key is still the one
+registrant.
+
+JB is not refused. `writer_guard_fenced` 0, `data_pr_refusals_held` 0,
+`data_pr_write_refusals` 0, `data_pr_succession_reregistrations` 0,
+`pr_stale_sibling_kills` 0, `appender_parked` 0. JB's log has no succession
+re-registration. JB reads its bytes, a later write lands, and the window
+settles early. S pays host A's fence debt (`data_pr_debt_preempts` 1) and the
+reconcile preempts nothing (`data_pr_reconcile_preempts` 0).
+
+Device: `~/tmp/pr5-f11.log` (`EXIT:0`, 41/41, about 7 min including the link).
+No full gate.
+
 ## Explicitly not in this branch
 
 - F9 and F10 have not been re-run on this commit. F1 has, after report-first recovery.
@@ -486,7 +509,7 @@ No full gate.
 - Recovery's `fence(k)` does not call `identityHolds`.
 - `claim posture-reset --all-mounts-down` (`Mode.posture_reset`).
 - `meta_pr_succession_parks`, `meta_pr_succession_reregistrations`, `meta_pr_refusal_readmissions`. Do not invent them. Parks increment `stats.appender_parks`. `writer_guard_fenced` increments in `journal.noteFence`.
-- Fidelity rows F11, F13, F12, F14. F2, F3, F4, F5, F6, F7a, F7b, F8, F15, F16, and F16b are committed. F12/F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist. P9c's write-EIO instant is the §8.1 unit, not a device pin. Do not add `meta_pr_write_eio_reclassified` until that unit.
+- Fidelity rows F13, F12, F14. F2, F3, F4, F5, F6, F7a, F7b, F8, F11, F15, F16, and F16b are committed. F12/F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist. P9c's write-EIO instant is the §8.1 unit, not a device pin. Do not add `meta_pr_write_eio_reclassified` until that unit.
 - An offline writer still never ticks the cadence, so it pays the debt at its own admission and does not run the later reconcile. The shortcut comment in `data_fence.zig` `endSuccession` still says so.
 - `data_pr_reconciles_deferred` and the `data_pr_reconcile_in_window` tripwire.
 - A full `zig build gate` on this branch.
@@ -511,7 +534,7 @@ Cache is `/build/zig-cache-v2`. One `zig build` takes a build slot. The nvmet ex
 
 ```bash
 git checkout feat/pr5
-git status -sb    # clean, no upstream; F8 is 45fd0f55
+git status -sb    # clean, no upstream; F11 is afe74d33
 
 # Unit: census, debt, live-page skip, the old admission reconcile.
 scripts/venue 'zig build --cache-dir /build/zig-cache-v2 test -Dtest-filter="pr5 debt" -Dtest-filter="pr5 live page" -Dtest-filter="succession census" --summary all'
@@ -537,6 +560,7 @@ Last green results, 2026-11-11, on this host:
 - F7a `~/tmp/pr5-f7a.log` (`EXIT:0`, 41/41, about 3 min). Pins printed: preempt_all_ns 50038341, barriers 1, retries 1, read ok.
 - F7b `~/tmp/pr5-f7b.log` (`EXIT:0`, 41/41, about 3 min). Pins printed: EBADE with 26 writes in flight, write ok, fenced 0, latched false.
 - F8 `~/tmp/pr5-f8.log` (`EXIT:0`, 41/41, about 5 min including the link). Pins printed: before the mount, rtype 3, regctl 1, holder `a1a1a1a100000001`, bit 4 clear, generation 1; after convert, rtype 5, regctl 1, bit 4 set, generation 2.
+- F11 `~/tmp/pr5-f11.log` (`EXIT:0`, 41/41, about 7 min including the link). Pins printed: before S, rtype 5, regctl 2; after S, rtype 5, regctl 1, preempt_alls 1, victims 1, adoptions 1, registrations 0; JB fenced 0, refusals held 0, write refusals 0, succession re-registrations 0, parked 0; debt 1, reconcile 0.
 
 ## Resume rules
 

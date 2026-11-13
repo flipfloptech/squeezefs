@@ -4297,6 +4297,8 @@ const FloodCtl = struct {
     arm: std.atomic.Value(bool) = .init(false),
     /// A write completed EIO or EBADE after `arm` (the drain is refusing new commands).
     refused: std.atomic.Value(bool) = .init(false),
+    /// EBADE specifically: the host is unregistered (P9a), not the kill-to-unregister instant.
+    ebade: std.atomic.Value(bool) = .init(false),
     submitted: std.atomic.Value(u32) = .init(0),
 };
 
@@ -4337,6 +4339,7 @@ fn metaWriteFlood(ctl: *FloodCtl, path: [:0]const u8) void {
         for (cqes[0..n]) |cqe| {
             if (cqe.user_data < 32) free_mask |= @as(u32, 1) << @as(u5, @intCast(cqe.user_data));
             inflight -|= 1;
+            if (armed and cqe.res == ebade) ctl.ebade.store(true, .release);
             if (armed and (cqe.res == eio or cqe.res == ebade)) ctl.refused.store(true, .release);
         }
     }
@@ -4513,6 +4516,234 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
     try rig.kill9(m);
     try rig.umount(j);
     try rig.umount(s);
+    _ = try rig.disconnectIdentity(data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(data_nqn, ident_c);
+    try rig.disconnect(&cm_c);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(data_nqn);
+    try rig.unshare(meta_nqn);
+    try expectNoResidue(rig, meta_nqn);
+    try expectNoResidue(rig, data_nqn);
+}
+
+/// The integer after `mark` in a mount line (`T_self 42756 ms`).
+fn memberClockMs(text: []const u8, mark: []const u8) ?u64 {
+    const at = std.mem.indexOf(u8, text, mark) orelse return null;
+    const rest = text[at + mark.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    return std.fmt.parseInt(u64, rest[0..end], 10) catch null;
+}
+
+/// Opens `mine/t` while the manager is up, then waits off the mount.
+/// `fsetxattr` on that fd does not readdir the root (ino 1 is the manager's;
+/// a path setxattr after the stop sticks at `meta_backend_start`).
+const f7b_writer =
+    \\import os
+    \\fd = os.open("mine/t", os.O_RDONLY)
+    \\os.close(os.open(os.environ["F7B_READY"], os.O_CREAT | os.O_WRONLY, 0o600))
+    \\os.read(os.open(os.environ["F7B_GO"], os.O_RDONLY), 1)
+    \\os.setxattr(fd, "user.p", b"x")
+;
+
+test "nvmet fidelity: pr5 F7b — a joiner's write during a preempt-all drain (decision 0004 §8.2) — null_blk metadata completes in 50 ms; J's write is issued while the drain still has a command in flight and the host is unregistered; the write ends EBADE, is held, re-registered and retried, and writer_guard_fenced stays 0" {
+    const gpa = testing.allocator;
+    var nb_slot: ?storage.NullBlk = null;
+    defer if (nb_slot) |*nb| nb.destroy();
+    const rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    if (!nullBlkReady(rig)) return testkit.skip(@src(), .no_kernel_feature, "null_blk (its configfs) — F7b's metadata backend");
+    var name_buf: [32]u8 = undefined;
+    const dev_name = std.fmt.bufPrint(&name_buf, "sqzf7b{d}", .{rig.pid}) catch unreachable;
+    nb_slot = try storage.NullBlk.create(dev_name, meta_len >> 20, 50_000_000);
+    var devb: [48]u8 = undefined;
+    const backing = nb_slot.?.devPath(&devb);
+    const mount_wait_ns: u64 = 180 * std.time.ns_per_s;
+    const ports = try rig.servicePorts(.tcp);
+    const meta_nqn = try rig.shareWith("f7bmeta", backing, null, .tcp, ports[0]);
+    const data_nqn = try rig.share("f7bdata", data_fence_volume, .tcp, ports[1]);
+    const cm = try rig.connect(meta_nqn, .tcp, ports[0], null, &.{});
+    const cd = try rig.connect(data_nqn, .tcp, ports[1], null, &.{});
+    var mu: [64]u8 = undefined;
+    const meta_uri = try std.fmt.bufPrint(&mu, "sqmeta://{s}", .{cm.dev()});
+    var du: [64]u8 = undefined;
+    const data_uri = try std.fmt.bufPrint(&du, "sqdata://{s}", .{cd.dev()});
+    const fmt_out = try rig.sqzOk(&.{ "format", meta_uri, data_uri });
+    defer gpa.free(fmt_out);
+    try testing.expect(std.mem.indexOf(u8, fmt_out, "data volumes 1") != null);
+    try rig.setDataEndpoint(meta_uri, .tcp, ports[1], data_nqn);
+    try rig.disconnect(&cd);
+
+    // J's T_self is the grant's clock, derived by the manager. A knob on J
+    // does not move it, and the default (about 43 s) parks J before the
+    // claim wait ends, so the write never reaches the drain.
+    var env_m = try rig.envWithKnob("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", "600000");
+    defer env_m.deinit();
+    const m = try rig.spawnMountEnv("f7b-m", meta_uri, &env_m, &.{});
+    try rig.awaitLog(m, "T_owner 600000", mount_wait_ns);
+    try rig.awaitLog(m, "ready: ", mount_wait_ns);
+    const cm_c = try rig.connect(meta_nqn, .tcp, ports[0], ident_c, &.{});
+    var mu_c: [64]u8 = undefined;
+    const meta_uri_c = try std.fmt.bufPrint(&mu_c, "sqmeta://{s}", .{cm_c.dev()});
+    const j = try rig.spawnMount("f7b-j", meta_uri_c, ident_c, &.{});
+    try rig.awaitLog(j, "ready: ", mount_wait_ns);
+    const joined = try rig.readLog(j);
+    defer gpa.free(joined);
+    const t_self = memberClockMs(joined, "T_self ") orelse return error.NoMemberClock;
+    if (t_self < 120_000) {
+        std.debug.print("\n--- F7b: J T_self {d} ms — the grant is still the default ---\n", .{t_self});
+        return error.JoinerClockShort;
+    }
+    // mine/t is J's. Open it while M is alive: a path setxattr after the
+    // stop readdirs ino 1 and never reaches the journal.
+    try testing.expect(try scriptSucceeds(rig, j, "mkdir mine && touch mine/t"));
+    var ready_buf: [linux.PATH_MAX]u8 = undefined;
+    const ready = try std.fmt.bufPrintSentinel(&ready_buf, "{s}/f7b-ready", .{rig.root}, 0);
+    var go_buf: [linux.PATH_MAX]u8 = undefined;
+    const go = try std.fmt.bufPrintSentinel(&go_buf, "{s}/f7b-go.fifo", .{rig.root}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, go.ptr, linux.S.IFIFO | 0o600, 0)));
+    var wenv = try rig.envWithKnob("F7B_READY", ready);
+    defer wenv.deinit();
+    try wenv.put("F7B_GO", go);
+    var writer = try std.process.spawn(rig.io, .{
+        .argv = &.{ "python3", "-c", f7b_writer },
+        .cwd = .{ .path = rig.daemons.items[j].mp },
+        .environ_map = &wenv,
+        .stdin = .ignore,
+    });
+    var writer_done = false;
+    defer if (!writer_done) {
+        if (writer.id) |pid| _ = linux.kill(pid, .KILL);
+        _ = writer.wait(rig.io) catch {};
+    };
+    const ready_deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+    while (linux.errno(linux.access(ready.ptr, linux.F_OK)) != .SUCCESS) {
+        if (writer.id) |pid| if (!alive(pid)) {
+            printLogTailFile(rig, rig.daemons.items[j].log_path, 40);
+            return error.WriterDiedBeforeReady;
+        };
+        if (clock.monotonicNs() >= ready_deadline) return error.WriterNotReady;
+        sleepMs(20);
+    }
+    _ = linux.kill(rig.daemons.items[m].pid, .STOP);
+    sleepMs(lease_clock.T_OWNER_MS + 5_000);
+    const before = try rig.readLog(j);
+    defer gpa.free(before);
+    if (std.mem.indexOf(u8, before, "appender park: T_self") != null) {
+        std.debug.print("\n--- F7b: J parked at T_self before the drain ---\n", .{});
+        return error.ParkedBeforeDrain;
+    }
+
+    const cm_b = try rig.connect(meta_nqn, .tcp, ports[0], ident_b, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var fb: [linux.PATH_MAX]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fb, "{s}/f7b-preempt.fifo", .{rig.root}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo.ptr, linux.S.IFIFO | 0o600, 0)));
+    var env_s = try rig.envWith(ident_b);
+    defer env_s.deinit();
+    try env_s.put("SQUEEZEFS_TEST_PREEMPT_ALL_HOLD", fifo);
+
+    var flood: FloodCtl = .{};
+    var flood_thread: ?std.Thread = null;
+    var flood_joined = false;
+    defer if (!flood_joined) {
+        if (flood_thread) |t| {
+            flood.stop.store(true, .release);
+            t.join();
+        }
+    };
+
+    const s = try rig.spawnMountEnv("f7b-s", meta_uri_b, &env_s, &.{});
+    errdefer {
+        printLogTailFile(rig, rig.daemons.items[j].log_path, 40);
+        printLogTailFile(rig, rig.daemons.items[s].log_path, 40);
+    }
+    try rig.awaitLog(s, "SQUEEZEFS_TEST_PREEMPT_ALL_HOLD — the preempt-all parks", mount_wait_ns);
+
+    var devz: [linux.PATH_MAX]u8 = undefined;
+    const zpath = try std.fmt.bufPrintSentinel(&devz, "{s}", .{cm_c.dev()}, 0);
+    flood_thread = try std.Thread.spawn(.{}, metaWriteFlood, .{ &flood, zpath });
+    const wr_deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+    while (true) {
+        const queued = flood.submitted.load(.monotonic) >= 32;
+        const in_flight = if (nb_slot) |*nb| (nb.inflightWrites() orelse 0) > 0 else false;
+        if (queued and in_flight) break;
+        if (clock.monotonicNs() >= wr_deadline) {
+            std.debug.print("\n--- F7b: submitted {d}, inflight never held ---\n", .{flood.submitted.load(.monotonic)});
+            return error.NoInflightWrite;
+        }
+        sleepMs(1);
+    }
+    flood.arm.store(true, .release);
+    releaseFifo(fifo);
+    const refuse_deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!flood.ebade.load(.acquire)) {
+        if (clock.monotonicNs() >= refuse_deadline) return error.DrainEbadeNeverSeen;
+        sleepMs(1);
+    }
+    const still = if (nb_slot) |*nb| nb.inflightWrites() orelse 0 else 0;
+    std.debug.print("\n--- F7b: EBADE, inflight writes {d} ---\n", .{still});
+    if (still == 0) return error.DrainWindowMissed;
+    // The fd is already open. Releasing the fifo is the issue instant.
+    if (writer.id) |pid| if (!alive(pid)) {
+        const dead = try writer.wait(rig.io);
+        writer_done = true;
+        std.debug.print("\n--- F7b: writer died before the drain write ({f}) ---\n", .{dead});
+        printLogTailFile(rig, rig.daemons.items[j].log_path, 60);
+        printLogTailFile(rig, rig.daemons.items[s].log_path, 40);
+        return error.WriteNotRetried;
+    };
+    releaseFifoBounded(go, 5 * std.time.ns_per_s) catch |e| {
+        printLogTailFile(rig, rig.daemons.items[j].log_path, 60);
+        printLogTailFile(rig, rig.daemons.items[s].log_path, 40);
+        return e;
+    };
+    const writer_deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+    var writer_finished = false;
+    while (clock.monotonicNs() < writer_deadline) {
+        if (writer.id) |pid| if (!alive(pid)) {
+            writer_finished = true;
+            break;
+        };
+        sleepMs(50);
+    }
+    flood.stop.store(true, .release);
+    if (flood_thread) |t| t.join();
+    flood_joined = true;
+    if (!writer_finished) {
+        printLogTailFile(rig, rig.daemons.items[j].log_path, 60);
+        printLogTailFile(rig, rig.daemons.items[s].log_path, 40);
+        return error.WriteNotRetried;
+    }
+    const term = try writer.wait(rig.io);
+    writer_done = true;
+    if (!term.success()) {
+        std.debug.print("\n--- F7b: writer {f} ---\n", .{term});
+        printLogTailFile(rig, rig.daemons.items[j].log_path, 60);
+        printLogTailFile(rig, rig.daemons.items[s].log_path, 40);
+        return error.WriteNotRetried;
+    }
+
+    try rig.awaitLog(j, "appender park: a metadata succession is pending", mount_wait_ns);
+    try rig.awaitLog(j, "re-registered this host under key", mount_wait_ns);
+    try rig.awaitLog(s, "ready: ", mount_wait_ns);
+    const jl = try rig.readLog(j);
+    defer gpa.free(jl);
+    const sj = try rig.stats(j);
+    defer gpa.free(sj);
+    const fenced = try statNumber(sj, "writer_guard_fenced");
+    const latched = std.mem.indexOf(u8, jl, "reservation-conflict errno") != null;
+    std.debug.print("\n--- F7b: write ok, fenced {d}, latched {} ---\n", .{ fenced, latched });
+    try testing.expectEqual(@as(u64, 0), fenced);
+    try testing.expect(!latched);
+
+    // Each slot release barriers this 50 ms device (~300 ms). J holds 64
+    // rotor slots, which misses `umount`'s 32 s exit budget.
+    try rig.kill9(m);
+    try rig.kill9(j);
+    try rig.kill9(s);
     _ = try rig.disconnectIdentity(data_nqn, ident_a);
     _ = try rig.disconnectIdentity(data_nqn, ident_b);
     _ = try rig.disconnectIdentity(data_nqn, ident_c);

@@ -212,6 +212,9 @@ pub const Readmit = struct {
     late_cleared_refused: u64 = 0,
     /// Set once a readable report observes this host unregistered (D2).
     unregistered_seen: bool = false,
+    /// Set once a readable report supplied `obs.rtype`. Until then the
+    /// default is not an observation.
+    rtype_seen: bool = false,
 
     pub fn joiner() Readmit {
         return .{};
@@ -269,6 +272,7 @@ pub const Readmit = struct {
         self.obs.reasserted = facts.reasserted;
         self.obs.meta_rtype = who.meta_rtype;
         if (report.readable) {
+            self.rtype_seen = true;
             self.obs.rtype = report.rtype;
             self.obs.host_registered = report.host_registered;
             if (report.host_registered) {
@@ -280,6 +284,11 @@ pub const Readmit = struct {
             } else {
                 self.unregistered_seen = true;
             }
+        } else if (!self.rtype_seen) {
+            // An unread report is not a type. The default WERO must not look
+            // foreign once metadata is WEAR: a file volume never has a report,
+            // and a successor page still holds.
+            self.obs.rtype = who.meta_rtype;
         }
         const verdict = classify(self.obs).verdict;
         var fence = verdict == .latch and (report.readable or !facts.own_page_live or facts.sibling_death or facts.successor_page);
@@ -1162,6 +1171,29 @@ test "member fence: the beat holds a successor, latches a new recovering sibling
     recovering_self.state = .recovering;
     try testing.expectEqual(Verdict.latch, dead.beat(me, &.{ mgr, recovering_self, next }, .{ .readable = false }));
     try testing.expect(!dead.obs.own_page_live);
+}
+
+test "member fence: an unread report is not a foreign type once metadata is WEAR" {
+    var who = me;
+    who.meta_rtype = nvme.RTYPE_WEAR;
+    const ours = live(2, 9);
+    const mgr = live(0, 1);
+    const next = live(0, 7);
+    var held = Readmit.joiner();
+    // censusBeat passes WEAR. A file volume's report stays unread, so the
+    // default WERO must not latch a successor that should hold.
+    try testing.expectEqual(Verdict.held, held.beat(who, &.{ mgr, ours, next }, .{ .readable = false }));
+    var quiet = Readmit.joiner();
+    try testing.expectEqual(Verdict.retry, quiet.beat(who, &.{ mgr, ours }, .{ .readable = false }));
+    var dead = Readmit.joiner();
+    var recovering_self = ours;
+    recovering_self.state = .recovering;
+    try testing.expectEqual(Verdict.latch, dead.beat(who, &.{ mgr, recovering_self }, .{ .readable = false }));
+    // A type actually read stays. WERO while metadata is WEAR still latches
+    // on the next unread beat, successor page or not.
+    var kept = Readmit.joiner();
+    try testing.expectEqual(Verdict.latch, kept.beat(who, &.{ mgr, ours }, .{ .readable = true, .rtype = nvme.RTYPE_WERO, .host_registered = false }));
+    try testing.expectEqual(Verdict.latch, kept.beat(who, &.{ mgr, ours, next }, .{ .readable = false }));
 }
 
 test "member fence: a joiner's undecided conflict is held and notifies the park once" {

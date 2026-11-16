@@ -10,8 +10,12 @@ export and the literal comments are `61ab9d68`. The held-beat peer init is
 `647c33d5`. F14 is `c190dd05`. F12 is `801d16e4`. F13 is `44364742`. F11 is `afe74d33`. F8 is `45fd0f55`. F7b is `b1f87fa7`. F7a is `bd0d3f5f`. F6 is `88003de0`. F5 is `2a8f4a2b`. F2, F3, and F4 are in `bc7ae7c4`. The fencing registrant is retired in
 `281bd07b`. Incompat
 bit 4 and `claim convert-pr` are `694b43c2`. The blind-rule refusals are
-`eea93412`. Report-first recovery is `d75445b9`. Do not amend those. No upstream.
-Not pushed. Not merged. `dev` is `b40ac017`.
+`eea93412`. Report-first recovery is `d75445b9`. F2's post-pin teardown is
+`d1040fa9`. F7a's 60 ms device is `c552c088`. The unlinked-open stats poll is
+`6e7f0961`. Do not amend those. No upstream.
+Not pushed. Not merged. `dev` is `b40ac017`. The full gate at `6e7f0961` is
+green (`~/tmp/pr5-gate4.log`, EXIT 0, 75/75 steps, 3890/4120 tests passed,
+230 skipped, about 1836 s).
 
 Decision 0004 is the spec. PR-5 is not finished. W_end, the fence debt, `identityHolds`,
 the registration lock, rule markers, the re-acquire mark, the frozen-joiner kill,
@@ -20,21 +24,13 @@ The hashes are in the table below.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
-1. One full venue gate of this branch. It is a check, not a merge. The gate at
-   `ac5aa98e` was red (`~/tmp/pr5-gate.log`, EXIT 1, 61/75 steps, 3877/4115
-   tests, 10 failed, 2 crashed, about 1833 s). On top of that: the held-beat
-   crash, the marker rail, the 22 literals, and the unread-report latch.
-   Kill rows (b) is green again (`~/tmp/pr5-killb.log`, EXIT 0, 41/41). The
-   other smoke rows that latched on that beat were not re-run on their own.
-   Still open from that run, and not chased here: F2's umount waited 32 s for
-   daemon 2175546 after the body passed; F7a read ok with
-   `meta_pr_drain_barriers` 0 (the isolated pin was green); the hung
-   striped-hot-directory row is the flakes.md row; the T_owner eviction row
-   timed out and is the ledger's second shape. F9 and F10 have not been
-   re-run on their own; the gate covers them. `claim posture-reset` is not
-   one of these rows.
+1. Stop. The full venue gate is green (see above). Do not merge to `dev`
+   until the owner asks. Do not start PR-6 or PR-7. `claim posture-reset`
+   is not one of these rows. The hung striped-hot-directory row and the
+   T_owner eviction row did not fail this run; they stay in
+   `docs/gates/flakes.md`.
 
-Do not merge to `dev` until a later gate is green and the owner asks. Landing a fast-forward of `dev` is pushed by the local post-commit
+Do not merge to `dev` until the owner asks. Landing a fast-forward of `dev` is pushed by the local post-commit
 hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 
 ## Commits on `feat/pr5` (oldest first)
@@ -72,6 +68,9 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | `647c33d5` | The held-beat unit test sets `peers` to an empty slice before `parkForSuccession` walks it. |
 | `61ab9d68` | Marker tripwires are in `marker.stats` and `stats.sources`. The literal rail's new numbers are documented on the line. |
 | `6f884b83` | An unread reservation report takes the expected type. A type a report already supplied stays. A file volume's successor holds. |
+| `d1040fa9` | F2: after the pin, kill the joiners. A loaded leave exceeds umount's 32 s budget. The registration and read asserts stay. |
+| `c552c088` | F7a: 1 MiB node cache, and a 60 ms device. The 50 ms floor, the barrier, and the retry stay. |
+| `6e7f0961` | The unlinked-open smoke waits for a `.stats` document whose marks and staged bytes have settled. |
 
 ## What is true in the code
 
@@ -575,7 +574,7 @@ No full gate.
 - F2, F3, F4, F5, F6, F7a, F7b, F8, F11, F12, F13, F14, F15, F16, and F16b are committed. F14 reuses `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which F12 added. P9c's write-EIO instant is the §8.1 unit, not a device pin. Do not add `meta_pr_write_eio_reclassified` until that unit.
 - An offline writer still never ticks the cadence, so it pays the debt at its own admission and does not run the later reconcile. The shortcut comment in `data_fence.zig` `endSuccession` still says so.
 - `data_pr_reconciles_deferred` and the `data_pr_reconcile_in_window` tripwire.
-- The full gate at `ac5aa98e` (`~/tmp/pr5-gate.log`, EXIT 1, about 1833 s) was red. The re-run has not happened.
+- The full gate at `6e7f0961` (`~/tmp/pr5-gate4.log`, EXIT 0, 75/75 steps, 3890/4120 tests passed, 230 skipped, about 1836 s) is green. The gate at `ac5aa98e` (`~/tmp/pr5-gate.log`, EXIT 1, about 1833 s) was red.
 
 ## Invariants that were learned the hard way
 
@@ -597,7 +596,7 @@ Cache is `/build/zig-cache-v2`. One `zig build` takes a build slot. The nvmet ex
 
 ```bash
 git checkout feat/pr5
-git status -sb    # clean, no upstream; the beat fix is 6f884b83
+git status -sb    # clean, no upstream; the green gate is 6e7f0961
 
 # Unit: census, debt, live-page skip, the old admission reconcile.
 scripts/venue 'zig build --cache-dir /build/zig-cache-v2 test -Dtest-filter="pr5 debt" -Dtest-filter="pr5 live page" -Dtest-filter="succession census" --summary all'
@@ -617,6 +616,7 @@ Last green results, 2026-11-11, on this host:
 - F9 and F9b after the skip (`~/tmp/pr5-f9-live.log`): `data_pr_preempts` 1, reconcile 0, 42/42, about 330 s.
 - F10 after the acked-count fix (`~/tmp/pr5-f10-debt2.log`): 41/41, about 380 s. The run before that failed only on the racy count.
 - Blind rules, 2026-11-12: F15 `~/tmp/pr5-f15-smoke2.log` (`EXIT:0`, 41/41, 3s); F16 and F16b `~/tmp/pr5-f16-smoke.log` (`EXIT:0`, 42/42, 9s). The 41 and 42 include one empty stub per source file.
+- Full gate, 2026-11-16, `6e7f0961` (`~/tmp/pr5-gate4.log`): EXIT 0, 75/75 steps, 3890/4120 passed, 230 skipped, about 1836 s. F7a: evictions 4, barriers 1, retries 1, `preempt_all_ns` 59633907. Unlinked-open: destroyed 2, marks 0, staged 0.
 - F2 `~/tmp/pr5-f2j.log` (`EXIT:0`, 41/41, about 1 min). F3 `~/tmp/pr5-f3.log` (`EXIT:0`, 41/41, 55s). F4 `~/tmp/pr5-f4.log` (`EXIT:0`, 41/41, 8s).
 - F5 `~/tmp/pr5-f5.log` (`EXIT:0`, 41/41, about 1 min). Pins printed: lapse rereg 1, preempt_alls 1, settles 1, reconcile lines 1.
 - F6 `~/tmp/pr5-f6.log` (`EXIT:0`, 41/41, about 1 min). Pins printed: preempt_alls 2, victims 4, succession lines 2, paths 2.

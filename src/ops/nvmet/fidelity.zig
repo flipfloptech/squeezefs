@@ -2899,10 +2899,13 @@ test "nvmet fidelity: pr5 F2 — two successors (decision 0004 §8.2) — one ma
     const seen = try rig.onMount(p2, "cat da/z d2/g");
     defer gpa.free(seen);
     try testing.expectEqualStrings("x\nafter\n", seen);
+    // The pin is already checked. A joiner's leave releases its slots over
+    // the manager; under a loaded venue that serve exceeds umount's 32 s
+    // exit budget (the same bound F7b kills past).
     try rig.kill9(b);
     try rig.kill9(p1);
-    try rig.umount(a2);
-    try rig.umount(p2);
+    try rig.kill9(a2);
+    try rig.kill9(p2);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_c);

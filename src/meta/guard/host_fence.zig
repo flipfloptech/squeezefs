@@ -235,8 +235,8 @@ pub const Entry = struct {
             var f = std.mem.tokenizeScalar(u8, line, ' ');
             const tag = f.next() orelse continue;
             if (std.mem.eql(u8, tag, "a")) {
-                e.reacquire_ns = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue;
-                e.reacquire_gen = std.fmt.parseInt(u32, f.next() orelse "0", 10) catch 0;
+                e.reacquire_ns = std.fmt.parseInt(u64, f.next() orelse continue, 10) catch continue; // the reacquire time, decimal as the `a` line writes it
+                e.reacquire_gen = std.fmt.parseInt(u32, f.next() orelse "0", 10) catch 0; // the reacquire generation, decimal as the `a` line writes it
                 continue;
             }
             if (std.mem.eql(u8, tag, "r")) {
@@ -434,7 +434,7 @@ pub const Registry = struct {
                     }
                     const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(@min(backoff_ns, deadline - now)) };
                     _ = linux.nanosleep(&ts, null);
-                    backoff_ns = @min(backoff_ns * 2, 100 * std.time.ns_per_ms);
+                    backoff_ns = @min(backoff_ns * 2, 100 * std.time.ns_per_ms); // a lock poll's ceiling: a held rule lasts seconds
                 },
                 else => {
                     _ = linux.close(fd);

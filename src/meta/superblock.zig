@@ -149,7 +149,7 @@ pub const incompat_bits = [_]IncompatBit{
     .{ .bit = 1, .name = "LAYOUT_DELTAS", .presence = .stamped_later },
     .{ .bit = 2, .name = "BLOCK_MAP_TREE", .presence = .stamped_later },
     .{ .bit = 3, .name = "VOLUME_LIFECYCLE", .presence = .stamped_later },
-    .{ .bit = 4, .name = "META_PR_ALL_REGISTRANTS", .presence = .required },
+    .{ .bit = 4, .name = "META_PR_ALL_REGISTRANTS", .presence = .required }, // decision 0004 §6.4: metadata reservation type
 };
 
 /// The appender region + manager plane (charter §5.5): the appender

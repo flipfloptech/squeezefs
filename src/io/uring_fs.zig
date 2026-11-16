@@ -1389,7 +1389,7 @@ fn applyReadmitErr(path: []const u8, op: ReadmitOp, err: Error) Error {
 }
 
 fn sleepMs(ms: u64) void {
-    const ts: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+    const ts: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) }; // 1000 ms = 1 s
     _ = linux.nanosleep(&ts, null);
 }
 

@@ -814,7 +814,7 @@ pub const Owner = struct {
     };
 
     pub fn successionCensus(self: *Owner, gpa: Allocator, now_ms: u64) error{OutOfMemory}!SuccessionView {
-        var cap: usize = 8;
+        var cap: usize = 8; // first host-key buffer; the loop grows it
         while (true) {
             const buf = try gpa.alloc(u64, cap);
             errdefer gpa.free(buf);
@@ -849,7 +849,7 @@ pub const Owner = struct {
                 },
                 .grow => {
                     gpa.free(buf);
-                    cap *= 4;
+                    cap *= 4; // the census buffer was short
                     continue;
                 },
                 .ready => {

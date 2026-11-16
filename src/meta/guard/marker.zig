@@ -51,6 +51,12 @@ pub const stats = struct {
     /// An unadmitted joiner killed once the same holder was named across one
     /// member-death bound and proven frozen.
     pub var host_fence_frozen_joiner_kills: counters.ShardedCounter = .{};
+    /// `EEXIST` on a section marker. The id includes a per-process sequence,
+    /// so this does not happen.
+    pub var marker_exists: counters.Tripwire = .init("host_fence_marker_exists");
+    /// A live `.reg` met while this thread holds the registration lock. The
+    /// lock has stopped excluding. Must stay 0.
+    pub var marker_live_reg_locked: counters.Tripwire = .init("host_fence_marker_live_reg_locked");
 };
 
 /// The process a marker or a flock names (decision 0004 §4.4.2).
@@ -58,14 +64,6 @@ pub const HolderId = struct {
     pid: u32,
     start_ticks: u64,
 };
-
-/// `EEXIST` on a section marker. The id includes a per-process sequence, so
-/// this does not happen.
-pub var marker_exists: counters.Tripwire = .init("host_fence_marker_exists");
-
-/// A live `.reg` met while this thread holds the registration lock. The
-/// lock has stopped excluding. Must stay 0.
-pub var marker_live_reg_locked: counters.Tripwire = .init("host_fence_marker_live_reg_locked");
 
 pub const Kind = enum { section, withdrawal, abandoned };
 
@@ -189,7 +187,7 @@ fn encodeWithdrawal(now_ns: u64) [16]u8 {
 }
 
 fn withdrawalAged(bytes: []const u8, now_ns: u64) bool {
-    if (bytes.len < 16) return true;
+    if (bytes.len < 16) return true; // shorter than the 8-byte start plus its xxh3-64
     var h: checksum.Hasher = .init();
     h.update(bytes[0..8]);
     if (h.finalLow64() != std.mem.readInt(u64, bytes[8..16], .little)) return true;
@@ -222,7 +220,7 @@ fn parseLeaf(name: []const u8) ?Parsed {
     };
     var parts: [4][]const u8 = undefined;
     var cursor = rest;
-    var i: usize = 4;
+    var i: usize = 4; // pid, start ticks, volume, sequence
     while (i > 0) {
         i -= 1;
         const dash = std.mem.lastIndexOfScalar(u8, cursor, '-') orelse return null;
@@ -231,6 +229,7 @@ fn parseLeaf(name: []const u8) ?Parsed {
     }
     if (cursor.len == 0) return null;
     return .{
+        // pid, ticks, volume and sequence are decimal, as createSection writes them.
         .kind = kind,
         .boot = cursor,
         .pid = std.fmt.parseInt(u32, parts[0], 10) catch return null,
@@ -255,9 +254,9 @@ fn createSection(dir: []const u8, volume: u32) error{ MarkerExists, Io }!Mark {
     mark.len = leaf.len;
     var path: [linux.PATH_MAX]u8 = undefined;
     const z = leafPath(dir, mark.slice(), &path) orelse return error.Io;
-    const rc = linux.open(z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600);
+    const rc = linux.open(z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600); // owner read/write: one rule's marker
     if (linux.errno(rc) == .EXIST) {
-        marker_exists.fire("a section marker already existed");
+        stats.marker_exists.fire("a section marker already existed");
         return error.MarkerExists;
     }
     if (linux.errno(rc) != .SUCCESS) return error.Io;
@@ -351,7 +350,7 @@ fn list(dir: []const u8, now_mono: u64, now_boot: u64, out: []Listed) []Listed {
         while (off < got and n < out.len) {
             const reclen = std.mem.readInt(u16, buf[off + 16 ..][0..2], .little);
             if (reclen == 0) break;
-            const name_at = off + 19;
+            const name_at = off + 19; // linux_dirent64: d_name follows d_reclen at 16 and d_type at 18
             var name_end = name_at;
             const rec_end = off + reclen;
             while (name_end < rec_end and buf[name_end] != 0) name_end += 1;
@@ -407,7 +406,7 @@ fn tally(rows: []const Listed, now_mono: u64, under_lock: bool) Survey {
         }
         if (r.kind == .section) {
             s.live_section += 1;
-            if (under_lock) marker_live_reg_locked.fire("a live section marker was visible under the registration lock");
+            if (under_lock) stats.marker_live_reg_locked.fire("a live section marker was visible under the registration lock");
         } else if (r.kind == .withdrawal) s.live_withdrawal += 1;
     }
     return s;

@@ -1233,13 +1233,13 @@ pub const EndpointRecordWire = extern struct {
 pub const FenceDebt = struct {
     pub const MAGIC = "MFDB";
     pub const VERSION: u16 = 1;
-    pub const MAX_KEYS: usize = 64;
+    pub const MAX_KEYS: usize = 64; // decision 0004 §6.3: a longer chain refuses the takeover
     /// magic ‖ version ‖ n ‖ reserved.
     pub const HEAD: usize = 12;
     pub const MAX_LEN: usize = HEAD + MAX_KEYS * 8 + 8;
 
     pub fn encodedLen(n: usize) usize {
-        return HEAD + n * 8 + 8;
+        return HEAD + n * 8 + 8; // one host key and the xxh3-64 trailer, 8 bytes each
     }
 };
 
@@ -1257,19 +1257,19 @@ pub fn encodeFenceDebt(keys: []const u64, buf: []u8) error{Invalid}![]u8 {
     std.mem.writeInt(u16, buf[4..6], FenceDebt.VERSION, .little);
     std.mem.writeInt(u16, buf[6..8], @intCast(keys.len), .little);
     for (keys, 0..) |k, n| std.mem.writeInt(u64, buf[FenceDebt.HEAD + n * 8 ..][0..8], k, .little);
-    checksum.stamp(buf[0..len], len - 8);
+    checksum.stamp(buf[0..len], len - 8); // xxh3-64 trailer
     return buf[0..len];
 }
 
 pub fn decodeFenceDebt(bytes: []const u8, out: *[FenceDebt.MAX_KEYS]u64) DecodeError!usize {
-    if (bytes.len < FenceDebt.HEAD + 8) return error.Corrupt;
+    if (bytes.len < FenceDebt.HEAD + 8) return error.Corrupt; // xxh3-64 trailer
     if (!std.mem.eql(u8, bytes[0..4], FenceDebt.MAGIC)) return error.Corrupt;
     if (std.mem.readInt(u16, bytes[4..6], .little) != FenceDebt.VERSION) return error.Corrupt;
     const n = std.mem.readInt(u16, bytes[6..8], .little);
     if (n > FenceDebt.MAX_KEYS) return error.Corrupt;
     if (std.mem.readInt(u32, bytes[8..12], .little) != 0) return error.Corrupt;
     if (bytes.len != FenceDebt.encodedLen(n)) return error.Corrupt;
-    if (!checksum.verify(bytes, bytes.len - 8)) return error.Corrupt;
+    if (!checksum.verify(bytes, bytes.len - 8)) return error.Corrupt; // xxh3-64 trailer
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const k = std.mem.readInt(u64, bytes[FenceDebt.HEAD + i * 8 ..][0..8], .little);

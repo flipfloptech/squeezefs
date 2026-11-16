@@ -361,6 +361,7 @@ pub const sources = [_]Source{
     .{ .path = "src/ops/defrag/metrics.zig", .family = "jobs" },
     .{ .path = "src/ops/nvmet/stats.zig", .family = "nvmet" },
     .{ .path = "src/meta/guard/data_fence.zig", .family = "nvmet" },
+    .{ .path = "src/meta/guard/marker.zig", .family = "nvmet" },
     .{ .path = "src/meta/guard/member_fence.zig", .family = "nvmet" },
     .{ .path = "src/ops/zcrx/stats.zig", .family = "zcrx" },
 };

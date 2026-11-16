@@ -5,8 +5,9 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** F14 is in `c190dd05`. This note is the docs commit on top
-of it. F12 is `801d16e4`. F13 is `44364742`. F11 is `afe74d33`. F8 is `45fd0f55`. F7b is `b1f87fa7`. F7a is `bd0d3f5f`. F6 is `88003de0`. F5 is `2a8f4a2b`. F2, F3, and F4 are in `bc7ae7c4`. The fencing registrant is retired in
+**Branch `feat/pr5`.** The unread-report beat fix is `6f884b83`. The marker
+export and the literal comments are `61ab9d68`. The held-beat peer init is
+`647c33d5`. F14 is `c190dd05`. F12 is `801d16e4`. F13 is `44364742`. F11 is `afe74d33`. F8 is `45fd0f55`. F7b is `b1f87fa7`. F7a is `bd0d3f5f`. F6 is `88003de0`. F5 is `2a8f4a2b`. F2, F3, and F4 are in `bc7ae7c4`. The fencing registrant is retired in
 `281bd07b`. Incompat
 bit 4 and `claim convert-pr` are `694b43c2`. The blind-rule refusals are
 `eea93412`. Report-first recovery is `d75445b9`. Do not amend those. No upstream.
@@ -19,12 +20,21 @@ The hashes are in the table below.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
-1. One full venue gate of this branch. It is a check, not a merge. F9 and F10
-   have not been re-run on their own since later commits; the gate covers them.
-   `claim posture-reset` is the other offline door; it is not one of these rows.
+1. One full venue gate of this branch. It is a check, not a merge. The gate at
+   `ac5aa98e` was red (`~/tmp/pr5-gate.log`, EXIT 1, 61/75 steps, 3877/4115
+   tests, 10 failed, 2 crashed, about 1833 s). On top of that: the held-beat
+   crash, the marker rail, the 22 literals, and the unread-report latch.
+   Kill rows (b) is green again (`~/tmp/pr5-killb.log`, EXIT 0, 41/41). The
+   other smoke rows that latched on that beat were not re-run on their own.
+   Still open from that run, and not chased here: F2's umount waited 32 s for
+   daemon 2175546 after the body passed; F7a read ok with
+   `meta_pr_drain_barriers` 0 (the isolated pin was green); the hung
+   striped-hot-directory row is the flakes.md row; the T_owner eviction row
+   timed out and is the ledger's second shape. F9 and F10 have not been
+   re-run on their own; the gate covers them. `claim posture-reset` is not
+   one of these rows.
 
-A full venue gate has not been run on this branch. Do not merge to `dev` until that gate is
-green and the owner asks. Landing a fast-forward of `dev` is pushed by the local post-commit
+Do not merge to `dev` until a later gate is green and the owner asks. Landing a fast-forward of `dev` is pushed by the local post-commit
 hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 
 ## Commits on `feat/pr5` (oldest first)
@@ -59,10 +69,13 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | `44364742` | F13: a registry-blind superseded manager. JA does not kill M0. The page check fail-stops the beat. A late checkpoint wake writes nothing while the page is usurped. |
 | `801d16e4` | F12: a member held unregistered through succession. The handover, the growth drain and the cache-miss read meet that window and complete. No FAILED latch, no noteFailure move. |
 | `c190dd05` | F14: a held handover beside the member's carriage and reclaim. The handover and the growth drain answer Held and release their locks. The carriage installs and the reclaim completes. Both land on the next tick. No FAILED latch. |
+| `647c33d5` | The held-beat unit test sets `peers` to an empty slice before `parkForSuccession` walks it. |
+| `61ab9d68` | Marker tripwires are in `marker.stats` and `stats.sources`. The literal rail's new numbers are documented on the line. |
+| `6f884b83` | An unread reservation report takes the expected type. A type a report already supplied stays. A file volume's successor holds. |
 
 ## What is true in the code
 
-Product metadata on a symmetric volume is WEAR. Takeover is `pr.Client.preemptAllAndAbort`, not a keyed preempt. `host_fence.takeSuccession` returns `.acquired` only when the namespace was unreserved, no other host, and the generation gap is 1. Everything else, including a real successor, is `.preempted`.
+Product metadata on a symmetric volume is WEAR. `Readmit.beat` copies `who.meta_rtype` onto `obs.rtype` until a report has been read, so a file volume's successor holds. A type a report already supplied stays, including WERO while metadata is WEAR. Takeover is `pr.Client.preemptAllAndAbort`, not a keyed preempt. `host_fence.takeSuccession` returns `.acquired` only when the namespace was unreserved, no other host, and the generation gap is 1. Everything else, including a real successor, is `.preempted`.
 
 The successor's preempt-all does **not** run in `Guard.hold`. `KvBackend.open` step 3b calls `Early.takeHold` first. `resolvePrClient` (`src/meta/guard/gate.zig`) adopts that hold and, when `e.hold == .preempted`, sets `g.succession`. `arbitrateBlocking` skips `hold()` when `early_fresh` is set. Opening the window only inside `hold()` leaves the product window null. Both sites set it today. Keep both.
 
@@ -562,7 +575,7 @@ No full gate.
 - F2, F3, F4, F5, F6, F7a, F7b, F8, F11, F12, F13, F14, F15, F16, and F16b are committed. F14 reuses `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which F12 added. P9c's write-EIO instant is the §8.1 unit, not a device pin. Do not add `meta_pr_write_eio_reclassified` until that unit.
 - An offline writer still never ticks the cadence, so it pays the debt at its own admission and does not run the later reconcile. The shortcut comment in `data_fence.zig` `endSuccession` still says so.
 - `data_pr_reconciles_deferred` and the `data_pr_reconcile_in_window` tripwire.
-- A full `zig build gate` on this branch.
+- The full gate at `ac5aa98e` (`~/tmp/pr5-gate.log`, EXIT 1, about 1833 s) was red. The re-run has not happened.
 
 ## Invariants that were learned the hard way
 
@@ -584,7 +597,7 @@ Cache is `/build/zig-cache-v2`. One `zig build` takes a build slot. The nvmet ex
 
 ```bash
 git checkout feat/pr5
-git status -sb    # clean, no upstream; F14 is c190dd05
+git status -sb    # clean, no upstream; the beat fix is 6f884b83
 
 # Unit: census, debt, live-page skip, the old admission reconcile.
 scripts/venue 'zig build --cache-dir /build/zig-cache-v2 test -Dtest-filter="pr5 debt" -Dtest-filter="pr5 live page" -Dtest-filter="succession census" --summary all'
@@ -614,6 +627,8 @@ Last green results, 2026-11-11, on this host:
 - F13, 2026-11-13 (`~/tmp/pr5-f13.log`): `EXIT:0`, 41/41, about 7 min including the link. Pins printed: before S, rtype 5, regctl 1; S preempt_alls 1, victims 1; JA kills 0, parked 0; M0 identity_failures 1, unreadable 0, fenced 0, recovery preempts 0, reconcile 0; after resume, rtype 5, regctl 2. Fsck clean.
 - F12, 2026-11-16 (`~/tmp/pr5-f12.log`): `EXIT:0`, 41/41, about 7 min including the link. Pins printed: grows 2 → 3, forced shrinks 0 → 1, cache misses 1111 → 1138; journal lane write, barrier and volume failures 0, `writer_guard_fenced` 0. Fsck clean.
 - F14, 2026-11-16 (`~/tmp/pr5-f14.log`): `EXIT:0`, 41/41, about 7 min including the link. Pins printed: held returns handover 2, grow_ring 574, checkpoint 0, total 576; offers accepted 0 → 1; grows 2 → 3, forced shrinks 0 → 1; storm 48/48; journal lane write, barrier and volume failures 0, `writer_guard_fenced` 0. Fsck clean.
+- Gate repair, 2026-11-16 (`~/tmp/pr5-beat.log`): rails 34/34 and `member fence:` 94/94, EXIT 0. The red pin is `~/tmp/pr5-rails-red.log` (expected `.held`, found `.latch`).
+- Kill rows (b) after that fix (`~/tmp/pr5-killb.log`): EXIT 0, 41/41. B parked 571 ms after the kill, the storm created 7549 files, reclaim landed, tripwires 0. The other smoke rows that latched on the same beat were not re-run on their own. The full gate has not been re-run.
 
 ## Resume rules
 

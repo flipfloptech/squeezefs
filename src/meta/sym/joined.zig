@@ -462,6 +462,13 @@ pub const JoinedSet = struct {
     member_beat_held: std.atomic.Value(bool) = .init(false),
     member_beat_hold_done: std.atomic.Value(bool) = .init(false),
     member_beat_hold_path: ?[]const u8 = null,
+    /// `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`. While the file exists, a
+    /// beat that wants to re-register does not. The membership beat still runs.
+    succession_reassert_hold_path: ?[]const u8 = null,
+    succession_reassert_logged: std.atomic.Value(bool) = .init(false),
+    /// Checkpoint thread only. Set while the hold skips re-registration, so
+    /// growth is judged even though the outer cycle returned Held.
+    succession_reassert_growth: bool = false,
     /// The ring-growth gate (`ring_growth.zig`): the conveyor's passes
     /// enter it; `growRingIfDue` closes it to drain and swap the ring.
     gate: ring_growth.Gate,
@@ -574,6 +581,9 @@ pub const JoinedSet = struct {
         self.resolution.recheck_fn = &recheckResolution;
         if (knobs.parseStr(be.env.get("SQUEEZEFS_TEST_MEMBERSHIP_BEAT_HOLD"))) |p| {
             if (!std.mem.eql(u8, p, "off")) self.member_beat_hold_path = p;
+        }
+        if (knobs.parseStr(be.env.get("SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD"))) |p| {
+            if (!std.mem.eql(u8, p, "off")) self.succession_reassert_hold_path = p;
         }
         errdefer self.joiner.deinit();
         try self.awaitManagerListener(page0);
@@ -1170,6 +1180,24 @@ pub const JoinedSet = struct {
         return true;
     }
 
+    /// The file is present: skip succession re-registration this beat.
+    fn successionReassertHeld(self: *JoinedSet) bool {
+        const path = self.succession_reassert_hold_path orelse return false;
+        Io.Dir.cwd().access(self.be.io, path, .{}) catch return false;
+        if (self.succession_reassert_logged.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+            log.warn("SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD — re-registration holds until {s} is removed", .{path});
+        }
+        return true;
+    }
+
+    /// Drop the growth retry once the hold file is gone and growth is idle
+    /// or has landed. A present file keeps the retry up.
+    fn dropGrowthHold(self: *JoinedSet) void {
+        if (!self.succession_reassert_growth) return;
+        if (self.successionReassertHeld()) return;
+        self.succession_reassert_growth = false;
+    }
+
     fn mapWrite(self: *JoinedSet, e: anyerror) error{ Io, Held } {
         if (member_fence.isHeld(self.be.dev.readmit, self.be.dev.readmit_ctx, e, .write)) return error.Held;
         return member_fence.mapDeviceWrite(e);
@@ -1239,7 +1267,9 @@ pub const JoinedSet = struct {
 
     /// The checkpoint task's `after_tick` seam: the member-fence beat runs
     /// while a succession is pending and on each cycle that landed; ring
-    /// growth is judged once per cycle that landed.
+    /// growth is judged once per cycle that landed. The succession hold's
+    /// page write returns Held, so the seq does not move; the flag keeps
+    /// growth on the cadence until it is idle or has landed.
     pub fn afterTick(ctx: *anyopaque) void {
         const self: *JoinedSet = @ptrCast(@alignCast(ctx));
         const seq = self.be.cp.checkpointSeq();
@@ -1249,8 +1279,8 @@ pub const JoinedSet = struct {
         if (cycle_landed or succession_pending) {
             if (!self.membershipHoldActive()) self.censusBeat();
         }
-        if (!cycle_landed) return;
-        self.grow_judged_at_seq = seq;
+        if (!cycle_landed and !self.succession_reassert_growth) return;
+        if (cycle_landed) self.grow_judged_at_seq = seq;
         self.growRingIfDue();
     }
 
@@ -1313,7 +1343,16 @@ pub const JoinedSet = struct {
             _ = self.be.lane.latch.noteFence("the member-fence beat");
         }
         if (member_fence.wantsRegister(self.readmit.obs, report.readable, self.be.pool.writesOutstanding() == 0, self.readmit.word)) {
-            self.successionReregister(who);
+            if (self.successionReassertHeld()) {
+                self.succession_reassert_growth = true;
+                // A Held page write returns before `onCheckpoint` kicks the
+                // slot cadence, so the handover would never meet this window.
+                self.be.slots.kickCadence();
+            } else {
+                const release_kick = self.succession_reassert_growth;
+                self.successionReregister(who);
+                if (release_kick) self.be.slots.kickCadence();
+            }
         }
         self.readmit.hold_clear = false;
     }
@@ -1748,7 +1787,10 @@ pub const JoinedSet = struct {
     /// cycle's error: the tick landed before growth was decided.
     pub fn growRingIfDue(self: *JoinedSet) void {
         const be = self.be;
-        if (self.left.load(.acquire) or be.cv.isClosing() or be.lane.latch.isFailed() or self.park_gate.word() != .running) return;
+        // A succession park normally skips growth. The hold keeps the host
+        // unregistered on purpose, so the drain can meet Held and retry.
+        const succession_hold = self.succession_reassert_growth and self.park_gate.isParked() and self.park_gate.reason == .succession;
+        if (self.left.load(.acquire) or be.cv.isClosing() or be.lane.latch.isFailed() or (self.park_gate.word() != .running and !succession_hold)) return;
         const r = self.core();
         const current = r.ringBytes();
         const stalls = be.cv.stats.full_stalls.load();
@@ -1763,20 +1805,37 @@ pub const JoinedSet = struct {
             .segments = r.table.len,
             .node_size = be.sb.node_size,
         })) {
-            .idle => return,
+            .idle => {
+                self.dropGrowthHold();
+                return;
+            },
             .at_ceiling => {
                 self.stalls_at_last_grow = stalls;
+                self.dropGrowthHold();
                 return;
             },
             .table_full => {
                 self.stalls_at_last_grow = stalls;
                 self.grow_declined_at = current;
                 stats.joined_ring_grow_declined.inc();
+                self.dropGrowthHold();
                 log.debug("meta volume {s}: joined appender {d}'s ring wants more than {d} B (derived {d}) but its table is at {d} segments — declined (joined_ring_grow_declined)", .{ be.path, self.appenderId(), current, derived, r.table.len });
                 return;
             },
             .ask => |s| s,
         };
+        // Unregistered: one real cycle so the drain meets Held, and no
+        // GrowRing on the wire until the beat that re-registers.
+        if (succession_hold) {
+            be.cp.checkpointCycle(true) catch |e| {
+                stats.joined_ring_grow_deferrals.inc();
+                log.warn("meta volume {s}: joined appender {d}'s growth drain cycle failed ({s}) — growth retried next cycle", .{ be.path, self.appenderId(), @errorName(e) });
+                return;
+            };
+            stats.joined_ring_grow_deferrals.inc();
+            log.warn("meta volume {s}: joined appender {d}'s GrowRing waits until this host re-registers — retried next cycle", .{ be.path, self.appenderId() });
+            return;
+        }
         // The gate: passes park from here; the window empties.
         _ = self.gate.close();
         var opened = false;
@@ -1835,6 +1894,7 @@ pub const JoinedSet = struct {
             self.stalls_at_last_grow = stalls;
             self.grow_declined_at = current;
             stats.joined_ring_grow_declined.inc();
+            self.dropGrowthHold();
             log.info("meta volume {s}: the manager declined joined appender {d}'s GrowRing ({d} B wanted at {d} B) — the ring stays until a fresh stall or a changed ring (joined_ring_grow_declined)", .{ be.path, own, step, current });
             return;
         };
@@ -1869,6 +1929,7 @@ pub const JoinedSet = struct {
         self.tail_written = head;
         self.stalls_at_last_grow = stalls;
         self.grow_declined_at = ring_growth.NEVER_DECLINED;
+        self.dropGrowthHold();
         stats.joined_ring_grows.inc();
         self.gate.open();
         opened = true;

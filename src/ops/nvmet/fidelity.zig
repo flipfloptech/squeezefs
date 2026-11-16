@@ -6249,3 +6249,353 @@ test "nvmet fidelity: pr5 F13 — a registry-blind superseded manager (decision 
     try expectNoResidue(rig, set.meta_nqn);
     try expectNoResidue(rig, set.data_nqn);
 }
+
+fn f12Stat(rig: *Rig, d: usize, key: []const u8) !u64 {
+    const text = try rig.stats(d);
+    defer rig.gpa.free(text);
+    return statNumber(text, key);
+}
+
+fn f12LogHas(rig: *Rig, d: usize, needle: []const u8) !bool {
+    const text = try rig.readLog(d);
+    defer rig.gpa.free(text);
+    return std.mem.indexOf(u8, text, needle) != null;
+}
+
+/// SIGSTOP is visible as `T` after the last syscall. A GrowRing already in
+/// the manager completes until then and can spend the stall.
+fn f12Stopped(pid: linux.pid_t) bool {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/stat", .{pid}, 0) catch return false;
+    const fd = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return false;
+    defer _ = linux.close(@intCast(fd));
+    var buf: [512]u8 = undefined;
+    const n = linux.read(@intCast(fd), &buf, buf.len);
+    if (linux.errno(n) != .SUCCESS or n == 0) return false;
+    const text = buf[0..n];
+    const paren = std.mem.lastIndexOfScalar(u8, text, ')') orelse return false;
+    if (paren + 2 >= text.len) return false;
+    return text[paren + 2] == 'T';
+}
+
+fn f12Burst(mp: [:0]const u8, stop: *std.atomic.Value(bool), tag: u8) void {
+    var blob: [8192]u8 = @splat('y');
+    var path_buf: [linux.PATH_MAX]u8 = undefined;
+    var i: usize = 0;
+    while (!stop.load(.acquire) and i < 2000) : (i += 1) {
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/mine/q{d}-{d}", .{ mp, tag, i }, 0) catch return;
+        const fd = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o644);
+        if (linux.errno(fd) != .SUCCESS) continue;
+        _ = linux.close(@intCast(fd));
+        _ = linux.setxattr(path.ptr, "user.q", &blob, blob.len, 0);
+    }
+}
+
+const F12Read = struct {
+    path: [*:0]const u8,
+    done: std.atomic.Value(bool) = .init(false),
+    n: usize = 0,
+    err: u16 = 0,
+    buf: [60_000]u8 = undefined,
+
+    fn go(self: *F12Read) void {
+        const rc = linux.getxattr(self.path, "user.p", &self.buf, self.buf.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => self.n = rc,
+            else => |e| self.err = @backingInt(e),
+        }
+        self.done.store(true, .release);
+    }
+};
+
+test "nvmet fidelity: pr5 F12 — a member held unregistered through a slot handover, a GrowRing and a node read (decision 0004 §8.2) — the joiner stays unregistered while the hold file exists; the handover, the growth drain and the cache-miss read meet that window and complete after the file is removed; no FAILED latch, no noteFailure move, no EIO" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "f12", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    const cm_c = try rig.connect(set.meta_nqn, transport, 0, ident_c, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var mu_c: [64]u8 = undefined;
+    const meta_uri_c = try std.fmt.bufPrint(&mu_c, "sqmeta://{s}", .{cm_c.dev()});
+
+    var hold_buf: [linux.PATH_MAX]u8 = undefined;
+    const hold = try std.fmt.bufPrintSentinel(&hold_buf, "{s}/f12-reassert-hold", .{rig.root}, 0);
+    const hf = try Io.Dir.cwd().createFile(rig.io, hold, .{ .truncate = true });
+    hf.close(rig.io);
+
+    const m = try rig.spawnMount("f12-m", set.metaUri(), null, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    var env_j = try rig.envWith(ident_c);
+    defer env_j.deinit();
+    try env_j.put("SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD", hold);
+    try env_j.put("SQUEEZEFS_SYM_MINT_SLOTS", "1");
+    try env_j.put("SQUEEZEFS_SYM_T_IDLE_MS", "80000");
+    try env_j.put("SQUEEZEFS_META_NODE_CACHE_MB", "1");
+    const j = try rig.spawnMountEnv("f12-j", meta_uri_c, &env_j, &.{});
+    try rig.awaitLog(j, "ready: ", ready_wait_ns);
+
+    var read_started = false;
+    var read_joined = false;
+    var read_slot: F12Read = undefined;
+    var read_th: std.Thread = undefined;
+    defer if (read_started and !read_joined) {
+        _ = linux.kill(rig.daemons.items[j].pid, .KILL);
+        read_th.join();
+    };
+    var burst_stop = std.atomic.Value(bool).init(false);
+    var burst_th: [4]std.Thread = undefined;
+    var burst_n: usize = 0;
+    var burst_joined = false;
+    defer if (!burst_joined) {
+        burst_stop.store(true, .release);
+        if (burst_n != 0) _ = linux.kill(rig.daemons.items[j].pid, .KILL);
+        for (burst_th[0..burst_n]) |t| t.join();
+    };
+
+    const leases0 = try f12Stat(rig, j, "slot_leases_held");
+    const fill =
+        \\mkdir -p mine && python3 -c '
+        \\import os, time
+        \\blob = b"x"*60000
+        \\def put(p):
+        \\    fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
+        \\    os.close(fd)
+        \\    os.setxattr(p, "user.p", blob)
+        \\    time.sleep(0.1)
+        \\put("mine/t")
+        \\for i in range(40):
+        \\    put("mine/f%d" % i)
+        \\' && sync -f mine
+    ;
+    const filled = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "sh", "-c", fill }, .cwd = .{ .path = rig.daemons.items[j].mp }, .environ_map = &rig.env });
+    defer rig.freeRun(filled);
+    if (!filled.term.success()) {
+        std.debug.print("\n--- F12 fill failed ({f}) ---\n{s}\n{s}\n", .{ filled.term, filled.stdout, filled.stderr });
+        rig.printLogTail(j, 40);
+        return error.FillFailed;
+    }
+    var overflows = try f12Stat(rig, j, "affinity_ceiling_overflows");
+    var spills = try f12Stat(rig, j, "affinity_ceiling_spills");
+    var evicted = try f12Stat(rig, j, "meta_kv_node_cache_evictions");
+    var leases = try f12Stat(rig, j, "slot_leases_held");
+    if ((overflows < 1 and spills < 1) or evicted < 1 or leases <= leases0) {
+        const more =
+            \\python3 -c '
+            \\import os, time
+            \\blob = b"x"*60000
+            \\for i in range(40, 120):
+            \\    p = "mine/e%d" % i
+            \\    fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
+            \\    os.close(fd)
+            \\    os.setxattr(p, "user.p", blob)
+            \\    time.sleep(0.1)
+            \\' && sync -f mine
+        ;
+        const again = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "sh", "-c", more }, .cwd = .{ .path = rig.daemons.items[j].mp }, .environ_map = &rig.env });
+        defer rig.freeRun(again);
+        if (!again.term.success()) {
+            std.debug.print("\n--- F12 second fill failed ({f}) ---\n{s}\n{s}\n", .{ again.term, again.stdout, again.stderr });
+            return error.FillFailed;
+        }
+        overflows = try f12Stat(rig, j, "affinity_ceiling_overflows");
+        spills = try f12Stat(rig, j, "affinity_ceiling_spills");
+        evicted = try f12Stat(rig, j, "meta_kv_node_cache_evictions");
+        leases = try f12Stat(rig, j, "slot_leases_held");
+    }
+    std.debug.print("\n--- F12 fill: overflows {d} spills {d} evictions {d} leases {d} -> {d} ---\n", .{ overflows, spills, evicted, leases0, leases });
+    if (overflows < 1 and spills < 1) {
+        rig.printLogTail(j, 30);
+        return error.SpillMissed;
+    }
+    if (evicted < 1) return error.NodeNotEvicted;
+    if (leases <= leases0) return error.SpillMissed;
+
+    // A fast fill's EWMA derives the 16 MiB ceiling. There a stall is
+    // consumed and the window never sees an ask. Wait out grows that the
+    // paced fill already decided, then stop the manager before the burst.
+    var grows0 = try f12Stat(rig, j, "joined_ring_grows");
+    var stable: u8 = 0;
+    const settle_deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (stable < 2 and clock.monotonicNs() < settle_deadline) {
+        sleepMs(400);
+        const g = f12Stat(rig, j, "joined_ring_grows") catch grows0;
+        if (g == grows0) {
+            stable += 1;
+        } else {
+            grows0 = g;
+            stable = 0;
+        }
+    }
+    if (try f12LogHas(rig, j, "16777216 B")) {
+        rig.printLogTail(j, 20);
+        return error.GrowthBeforeWindow;
+    }
+    const stalls0 = try f12Stat(rig, j, "meta_kv_journal_full_stalls");
+    const stop_ns = clock.monotonicNs();
+    _ = linux.kill(rig.daemons.items[m].pid, .STOP);
+    const stop_deadline = clock.monotonicNs() + 2 * std.time.ns_per_s;
+    while (!f12Stopped(rig.daemons.items[m].pid) and clock.monotonicNs() < stop_deadline) sleepMs(20);
+    if (!f12Stopped(rig.daemons.items[m].pid)) {
+        std.debug.print("\n--- F12: manager did not reach state T ---\n", .{});
+        return error.GrowthNotDue;
+    }
+    for (0..4) |tag| {
+        burst_th[burst_n] = try std.Thread.spawn(.{}, f12Burst, .{ rig.daemons.items[j].mp, &burst_stop, @as(u8, @intCast(tag)) });
+        burst_n += 1;
+    }
+    const burst_deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+    var stalls = stalls0;
+    while (stalls == stalls0 and clock.monotonicNs() < burst_deadline) {
+        sleepMs(200);
+        stalls = f12Stat(rig, j, "meta_kv_journal_full_stalls") catch stalls0;
+    }
+    burst_stop.store(true, .release);
+    for (burst_th[0..burst_n]) |t| t.join();
+    burst_joined = true;
+    const burst_end = clock.monotonicNs();
+    stalls = try f12Stat(rig, j, "meta_kv_journal_full_stalls");
+    std.debug.print("\n--- F12 burst: stalls {d} -> {d} grows {d} ---\n", .{ stalls0, stalls, grows0 });
+    if (stalls == stalls0) {
+        rig.printLogTail(j, 40);
+        return error.GrowthNotDue;
+    }
+    // Before S mounts: the window's Held cycles must not move these.
+    // A snapshot after the Held log would freeze the move in as the baseline.
+    const failure_names = [_][]const u8{
+        "journal_lane_write_failures",
+        "journal_lane_barrier_failures",
+        "journal_lane_volumes_failed",
+        "writer_guard_fenced",
+    };
+    var frozen: [failure_names.len]u64 = undefined;
+    for (failure_names, 0..) |name, i| frozen[i] = try f12Stat(rig, j, name);
+    std.debug.print("\n--- F12 frozen: write {d} barrier {d} volumes {d} fenced {d} ---\n", .{ frozen[0], frozen[1], frozen[2], frozen[3] });
+    if (frozen[3] != 0) return error.NoteFailureMoved;
+
+    const stale_ns = (lease_clock.T_OWNER_MS + 5_000) * std.time.ns_per_ms;
+    const since_stop = clock.monotonicNs() - stop_ns;
+    if (since_stop < stale_ns) sleepMs((stale_ns - since_stop) / std.time.ns_per_ms);
+
+    const s = try rig.spawnMount("f12-s", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(s, "ready: ", ready_wait_ns);
+    try rig.awaitLog(j, "SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD", g2_wait_ns);
+    if (try f12LogHas(rig, j, "released by appender")) {
+        rig.printLogTail(j, 40);
+        return error.SlotReleasedEarly;
+    }
+    const grows_hold = try f12Stat(rig, j, "joined_ring_grows");
+    if (grows_hold != grows0) {
+        std.debug.print("\n--- F12 grows before the window {d} -> {d} ---\n", .{ grows0, grows_hold });
+        rig.printLogTail(j, 40);
+        return error.GrowthBeforeWindow;
+    }
+    rig.awaitLog(j, "growth drain cycle failed (Held)", 30 * std.time.ns_per_s) catch |e| {
+        rig.printLogTail(j, 40);
+        return e;
+    };
+
+    const shrinks0 = try f12Stat(rig, j, "slot_forced_shrinks");
+
+    // The park poisons at 90 s. T_idle is 80 s, so the rotor slot is quiet
+    // inside that budget and not while the host is still registered.
+    const idle_at = @min(burst_end + 82 * std.time.ns_per_s, stop_ns + 110 * std.time.ns_per_s);
+    const now_idle = clock.monotonicNs();
+    if (now_idle < idle_at) sleepMs((idle_at - now_idle) / std.time.ns_per_ms);
+    rig.awaitLog(j, "did not land this tick (HandoverDeferred)", 20 * std.time.ns_per_s) catch |e| {
+        rig.printLogTail(j, 40);
+        return e;
+    };
+    if (try f12LogHas(rig, j, "released by appender")) return error.SlotReleasedEarly;
+
+    const misses0 = try f12Stat(rig, j, "meta_kv_node_cache_misses");
+    var xp: [linux.PATH_MAX]u8 = undefined;
+    const xpath = try std.fmt.bufPrintSentinel(&xp, "{s}/mine/t", .{rig.daemons.items[j].mp}, 0);
+    read_slot = .{ .path = xpath };
+    read_th = try std.Thread.spawn(.{}, F12Read.go, .{&read_slot});
+    read_started = true;
+    sleepMs(100);
+
+    if (linux.errno(linux.unlink(hold)) != .SUCCESS) return error.HoldRelease;
+    try rig.awaitLog(j, "after a succession", g2_wait_ns);
+    const read_deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+    while (!read_slot.done.load(.acquire)) {
+        if (clock.monotonicNs() >= read_deadline) {
+            rig.printLogTail(j, 30);
+            return error.ReadSurfaced;
+        }
+        sleepMs(200);
+    }
+    read_th.join();
+    read_joined = true;
+    if (read_slot.err != 0 or read_slot.n != 60_000) {
+        std.debug.print("\n--- F12 read: errno {d} n {d} ---\n", .{ read_slot.err, read_slot.n });
+        return error.ReadSurfaced;
+    }
+    for (read_slot.buf[0..read_slot.n]) |b| {
+        if (b != 'x') return error.ReadSurfaced;
+    }
+
+    rig.awaitLog(j, "released by appender", g2_wait_ns) catch |e| {
+        rig.printLogTail(j, 40);
+        return e;
+    };
+    const grow_deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+    var grows: u64 = grows_hold;
+    while (grows == grows_hold and clock.monotonicNs() < grow_deadline) {
+        sleepMs(200);
+        grows = f12Stat(rig, j, "joined_ring_grows") catch grows_hold;
+    }
+    const shrinks = try f12Stat(rig, j, "slot_forced_shrinks");
+    const misses = try f12Stat(rig, j, "meta_kv_node_cache_misses");
+    std.debug.print("\n--- F12 done: grows {d} -> {d} shrinks {d} -> {d} misses {d} -> {d} ---\n", .{ grows_hold, grows, shrinks0, shrinks, misses0, misses });
+    if (grows == grows_hold) {
+        rig.printLogTail(j, 40);
+        return error.RingDidNotGrow;
+    }
+    if (shrinks == shrinks0) return error.SlotNotReleased;
+    if (misses == misses0) return error.NodeNotMissed;
+    for (failure_names, 0..) |name, i| {
+        const got = try f12Stat(rig, j, name);
+        if (got != frozen[i]) {
+            std.debug.print("\n--- F12: {s} moved {d} -> {d} ---\n", .{ name, frozen[i], got });
+            rig.printLogTail(j, 40);
+            return error.NoteFailureMoved;
+        }
+    }
+    if (try f12LogHas(rig, j, "latching the volume FAILED")) {
+        rig.printLogTail(j, 40);
+        return error.VolumeFailedLatched;
+    }
+
+    try rig.umount(j);
+    try rig.kill9(m);
+    try rig.umount(s);
+    const bound = try bindDataForFsck(rig, &set, transport);
+    defer if (bound) {
+        var stored_buf: [64]u8 = undefined;
+        if (std.fmt.bufPrintSentinel(&stored_buf, "{s}", .{set.dataDev()}, 0)) |stored_z| {
+            _ = linux.umount2(stored_z.ptr, linux.MNT.DETACH);
+        } else |_| {}
+    };
+    const fsck = try rig.sqz(&.{ "fsck", "--offline", "--scrub", set.metaUri() });
+    defer rig.freeRun(fsck);
+    if (!fsck.term.success() or std.mem.indexOf(u8, fsck.stdout, "findings: 0 (clean)") == null) {
+        std.debug.print("\n--- fsck --offline --scrub ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ fsck.term, fsck.stdout, fsck.stderr });
+        return error.FsckNotClean;
+    }
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    try rig.disconnect(&cm_c);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}

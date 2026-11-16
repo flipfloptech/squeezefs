@@ -1185,6 +1185,9 @@ pub const Plane = struct {
         self.be.checkpointNow() catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Corrupt => error.Corrupt,
+            // A dirty slot's cover must keep Held. Collapsing it to Io
+            // never reaches the page write, so the cadence cannot retry it.
+            error.Held => error.HandoverDeferred,
             else => error.Io,
         };
         return self.lesseeReusableUpto(slot);

@@ -2224,6 +2224,7 @@ test "member fence: JoinedSet.writePages names Held" {
 
 test "member fence: a held membership beat does not park for succession" {
     var js: JoinedSet = undefined;
+    js.peers = &.{};
     js.member_beat_held = .init(true);
     js.member_beat_hold_done = .init(false);
     js.member_beat_hold_path = null;

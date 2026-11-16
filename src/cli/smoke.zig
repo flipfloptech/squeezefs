@@ -17699,21 +17699,36 @@ test "smoke: AN UNLINKED FILE STILL OPEN READS AND WRITES ITS BYTES UNTIL ITS CL
         try testing.expect(std.mem.endsWith(u8, out, "closed\n"));
     }
     // The closes: both FORGETs are deletes; their destroys land.
+    // `.stats` writes the data plane (the mark, the staged bytes) before
+    // the fuse family (the destroy count). One render spans the destroy,
+    // so the first document that shows both destroys can still show the
+    // marks (one gate: marks 2, staged 32768 B, destroys already +2).
     var polls: u32 = 0;
+    var last_marks: u64 = 0;
+    var last_staged: u64 = 0;
+    var last_destroyed: u64 = 0;
     while (polls < 3000) : (polls += 1) {
         const t = try rig.stats();
         defer gpa.free(t);
         const destroys = numberAfter(t, "\"fuse_reclaim_destroys\":") orelse return error.StatMissing;
         const gathered = numberAfter(t, "\"fuse_reclaim_gathered\":") orelse return error.StatMissing;
-        if (destroys >= destroys0 + 2 and gathered == 0) {
-            std.debug.print("smoke[unlinked, still open]: after the closes: destroyed {d}, marks left {d}, staged {d} B, parked {d}\n", .{ destroys - destroys0, numberAfter(t, "\"discard_at_delete_marks\":") orelse 0, numberAfter(t, "\"current_staged_write_bytes\":") orelse 0, numberAfter(t, "\"parked_buffers\":") orelse 0 });
+        const marks = numberAfter(t, "\"discard_at_delete_marks\":") orelse return error.StatMissing;
+        const staged = numberAfter(t, "\"current_staged_write_bytes\":") orelse return error.StatMissing;
+        last_marks = marks;
+        last_staged = staged;
+        last_destroyed = destroys;
+        if (destroys >= destroys0 + 2 and gathered == 0 and marks == 0 and staged == 0) {
+            std.debug.print("smoke[unlinked, still open]: after the closes: destroyed {d}, marks left {d}, staged {d} B, parked {d}\n", .{ destroys - destroys0, marks, staged, numberAfter(t, "\"parked_buffers\":") orelse 0 });
             try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"discard_at_delete_marks\":"));
             try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"current_staged_write_bytes\":"));
             try testing.expectEqual(@as(?u64, 0), numberAfter(t, "\"invariant_tripwires\":"));
             break;
         }
         try io.sleep(.fromMilliseconds(10), .awake);
-    } else return error.DestroysNeverLanded;
+    } else {
+        std.debug.print("smoke[unlinked, still open]: destroyed {d} (want at least 2), marks {d}, staged {d} B\n", .{ last_destroyed -| destroys0, last_marks, last_staged });
+        return error.DestroysNeverLanded;
+    }
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     {

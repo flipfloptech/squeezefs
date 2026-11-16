@@ -4360,7 +4360,7 @@ fn metaWriteFlood(ctl: *FloodCtl, path: [:0]const u8) void {
     }
 }
 
-test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drain (decision 0004 §8.2) — null_blk metadata completes in 50 ms; J's controller has a write in flight when S preempts-all and J reads an evicted xattr node; the read returns, meta_pr_drain_barriers and meta_pr_read_retries_after_drain are at least 1, and writer_guard_preempt_all_ns is at least 50 ms" {
+test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drain (decision 0004 §8.2) — null_blk metadata completes in 60 ms; J's controller has a write in flight when S preempts-all and J reads an evicted xattr node; the read returns, meta_pr_drain_barriers and meta_pr_read_retries_after_drain are at least 1, and writer_guard_preempt_all_ns is at least 50 ms" {
     const gpa = testing.allocator;
     var nb_slot: ?storage.NullBlk = null;
     defer if (nb_slot) |*nb| nb.destroy();
@@ -4369,7 +4369,10 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
     if (!nullBlkReady(rig)) return testkit.skip(@src(), .no_kernel_feature, "null_blk (its configfs) — F7a's metadata backend");
     var name_buf: [32]u8 = undefined;
     const dev_name = std.fmt.bufPrint(&name_buf, "sqzf7a{d}", .{rig.pid}) catch unreachable;
-    nb_slot = try storage.NullBlk.create(dev_name, meta_len >> 20, 50_000_000);
+    // The timed ioctl starts while a write is already in flight (one 50 ms
+    // run: 49.5 ms). Join on this device serves in ~7 s against a 10 s reply
+    // bound, so 80 ms misses the bound and 60 ms still joins.
+    nb_slot = try storage.NullBlk.create(dev_name, meta_len >> 20, 60_000_000); // completion_nsec
     var devb: [48]u8 = undefined;
     const backing = nb_slot.?.devPath(&devb);
     const mount_wait_ns: u64 = 180 * std.time.ns_per_s;
@@ -4382,7 +4385,7 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
     const meta_uri = try std.fmt.bufPrint(&mu, "sqmeta://{s}", .{cm.dev()});
     var du: [64]u8 = undefined;
     const data_uri = try std.fmt.bufPrint(&du, "sqdata://{s}", .{cd.dev()});
-    // Default 256 KiB nodes: a 1 MiB node on this 50 ms device outruns the 10 s join reply.
+    // Default 256 KiB nodes: a 1 MiB node on this device outruns the 10 s join reply.
     const fmt_out = try rig.sqzOk(&.{ "format", meta_uri, data_uri });
     defer gpa.free(fmt_out);
     try testing.expect(std.mem.indexOf(u8, fmt_out, "data volumes 1") != null);
@@ -4398,12 +4401,14 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
     // unchanged, so S can still take over, and J does not park at T_self first.
     var env_j = try rig.envWith(ident_c);
     defer env_j.deinit();
-    try env_j.put("SQUEEZEFS_META_NODE_CACHE_MB", "4");
+    // 1 MiB cannot hold the fill. 4 MiB sometimes did, under a loaded venue,
+    // so the later getxattr hit and the drain barrier never moved.
+    try env_j.put("SQUEEZEFS_META_NODE_CACHE_MB", "1");
     try env_j.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", "600000");
     const j = try rig.spawnMountEnv("f7a-j", meta_uri_c, &env_j, &.{});
     try rig.awaitLog(j, "ready: ", mount_wait_ns);
-    // 4 MiB holds the tree roots. 60 KiB xattrs spill into leaves; the second
-    // batch's publish evicts the first batch's clean leaf, and getxattr re-reads it.
+    // 60 KiB xattrs spill into leaves. The second batch's publish evicts the
+    // first batch's clean leaf, and getxattr re-reads it.
     const fill =
         \\mkdir -p mine && python3 -c '
         \\import os
@@ -4434,7 +4439,31 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
     }
     const pre = try rig.stats(j);
     defer gpa.free(pre);
-    const evicted = try statNumber(pre, "meta_kv_node_cache_evictions");
+    var evicted = try statNumber(pre, "meta_kv_node_cache_evictions");
+    if (evicted == 0) {
+        // A loaded venue can still be flushing the first batch, so those
+        // nodes are dirty and the sweep skips them. One more clean wave.
+        const more =
+            \\python3 -c '
+            \\import os
+            \\blob = b"x"*60000
+            \\for i in range(40, 80):
+            \\    p = "mine/e%d" % i
+            \\    fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
+            \\    os.close(fd)
+            \\    os.setxattr(p, "user.p", blob)
+            \\' && sync -f mine
+        ;
+        const again = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "sh", "-c", more }, .cwd = .{ .path = rig.daemons.items[j].mp }, .environ_map = &rig.env });
+        defer rig.freeRun(again);
+        if (!again.term.success()) {
+            std.debug.print("\n--- F7a second fill failed ({f}) ---\n{s}\n{s}\n", .{ again.term, again.stdout, again.stderr });
+            return error.FillFailed;
+        }
+        const pre2 = try rig.stats(j);
+        defer gpa.free(pre2);
+        evicted = try statNumber(pre2, "meta_kv_node_cache_evictions");
+    }
     std.debug.print("\n--- F7a fill: node-cache evictions {d} ---\n", .{evicted});
     if (evicted == 0) {
         printLogTailFile(rig, rig.daemons.items[j].log_path, 40);

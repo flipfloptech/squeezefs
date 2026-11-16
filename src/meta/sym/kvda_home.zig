@@ -64,11 +64,16 @@ pub const KvdaHome = struct {
 
     // ---- the device face ----
 
+    fn bitmapHeld() error{Held}!void {
+        member_fence.noteHeldReturn(.bitmap);
+        return error.Held;
+    }
+
     fn regionWrite(ctx: *anyopaque, off: u64, bytes: []const u8) error{ Io, Held }!void {
         const self = self_(ctx);
         self.be.pool.writeAt(self.be.path, off, bytes) catch |e| return switch (e) {
-            error.Held => error.Held,
-            else => if (member_fence.isHeld(self.be.dev.readmit, self.be.dev.readmit_ctx, e, .write)) error.Held else error.Io,
+            error.Held => bitmapHeld(),
+            else => if (member_fence.isHeld(self.be.dev.readmit, self.be.dev.readmit_ctx, e, .write)) bitmapHeld() else error.Io,
         };
     }
 
@@ -82,7 +87,7 @@ pub const KvdaHome = struct {
     fn regionBarrier(ctx: *anyopaque) error{ Io, Held }!void {
         const self = self_(ctx);
         self.be.dev.barrier() catch |e| return switch (e) {
-            error.Held => error.Held,
+            error.Held => bitmapHeld(),
             else => error.Io,
         };
     }
@@ -134,13 +139,13 @@ pub const KvdaHome = struct {
             if (off >= image.len) break;
             const n: usize = @intCast(@min(image.len - off, node));
             be.pool.writeAt(be.path, be.sb.heap.start + c * node, image[off .. off + n]) catch |e| return switch (e) {
-                error.Held => error.Held,
-                else => if (member_fence.isHeld(be.dev.readmit, be.dev.readmit_ctx, e, .write)) error.Held else error.Io,
+                error.Held => bitmapHeld(),
+                else => if (member_fence.isHeld(be.dev.readmit, be.dev.readmit_ctx, e, .write)) bitmapHeld() else error.Io,
             };
             off += n;
         }
         be.dev.barrier() catch |e| return switch (e) {
-            error.Held => error.Held,
+            error.Held => bitmapHeld(),
             else => error.Io,
         };
         const recs = try gpa.alloc(manager.ControlRecord, claims.items.len);

@@ -27,6 +27,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const counters = @import("../../../core/counters.zig");
+const member_fence = @import("../../guard/member_fence.zig");
 const clock = @import("../../../core/clock.zig");
 const derive = @import("../../../core/derive.zig");
 const log = @import("../../../core/log.zig");
@@ -885,7 +886,10 @@ pub const Verbs = struct {
                     log.warn("slot leases: slot {d}'s {d} leaf tails exceed the inline cap and the heap refused the spill — released WITHOUT its tails (its leaves screen by the lease alone)", .{ req.slot, req.tails.len });
                     tails_rec = null;
                 },
-                error.Held => return error.Deferred,
+                error.Held => {
+                    member_fence.noteHeldReturn(.handover);
+                    return error.Deferred;
+                },
                 error.Io => return error.Io,
                 error.OutOfMemory => return error.OutOfMemory,
             }

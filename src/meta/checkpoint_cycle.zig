@@ -57,6 +57,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const counters = @import("../core/counters.zig");
+const member_fence = @import("guard/member_fence.zig");
 const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
 const thread_name = @import("../core/thread_name.zig");
@@ -1436,6 +1437,7 @@ pub const CheckpointTask = struct {
         const drain_deadline: ?u64 = if (shutting_down) null else now_ns + self.period_ns;
         if (cadence or shutting_down) {
             self.cp.tick(shutting_down, drain_deadline, park_kick, self.period_ns / ns_per_ms) catch |e| {
+                if (e == error.Held) member_fence.noteHeldReturn(.checkpoint);
                 ckpt.stats.meta_kv_checkpoint_tick_failures.inc();
                 // Release pairs with `finalTickFailed`'s acquire.
                 if (shutting_down) self.final_tick_failed.store(true, .release);

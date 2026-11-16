@@ -6599,3 +6599,383 @@ test "nvmet fidelity: pr5 F12 — a member held unregistered through a slot hand
     try expectNoResidue(rig, set.meta_nqn);
     try expectNoResidue(rig, set.data_nqn);
 }
+
+fn f14Class(rig: *Rig, d: usize, class: []const u8) !u64 {
+    const text = try rig.stats(d);
+    defer rig.gpa.free(text);
+    const obj = json_scan.object(text, "meta_pr_held_returns") orelse {
+        std.debug.print("\n--- F14: .stats carries no meta_pr_held_returns ---\n", .{});
+        return error.StatMissing;
+    };
+    return statNumber(obj, class);
+}
+
+/// 48 mode flips, the cold offer floor (17) with the handover row's margin.
+/// Errno is counted; a refused flip is the parked window's answer.
+const F14Storm = struct {
+    path: [*:0]const u8,
+    done: std.atomic.Value(bool) = .init(false),
+    ok: std.atomic.Value(u32) = .init(0),
+    fail: std.atomic.Value(u32) = .init(0),
+
+    fn go(self: *F14Storm) void {
+        var i: u32 = 0;
+        while (i < 48) : (i += 1) {
+            const rc = if (i % 2 == 0)
+                linux.chmod(self.path, 0o600)
+            else
+                linux.chmod(self.path, 0o644);
+            if (linux.errno(rc) == .SUCCESS) {
+                _ = self.ok.fetchAdd(1, .monotonic);
+            } else {
+                _ = self.fail.fetchAdd(1, .monotonic);
+            }
+        }
+        self.done.store(true, .release);
+    }
+};
+
+test "nvmet fidelity: pr5 F14 — a held handover beside the member's carriage and reclaim (decision 0004 §8.2) — the handover and the cycle answer Held and release their locks; the carriage install and the reclaim complete; the joiner re-registers and both operations land on the next tick; no FAILED latch" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const transport: configfs.Trtype = .loop;
+    const set = try symmetricSet(rig, "f14", transport, try rig.servicePorts(transport));
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    const cm_c = try rig.connect(set.meta_nqn, transport, 0, ident_c, &.{});
+    var mu_b: [64]u8 = undefined;
+    const meta_uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var mu_c: [64]u8 = undefined;
+    const meta_uri_c = try std.fmt.bufPrint(&mu_c, "sqmeta://{s}", .{cm_c.dev()});
+
+    var hold_buf: [linux.PATH_MAX]u8 = undefined;
+    const hold = try std.fmt.bufPrintSentinel(&hold_buf, "{s}/f14-reassert-hold", .{rig.root}, 0);
+    const hf = try Io.Dir.cwd().createFile(rig.io, hold, .{ .truncate = true });
+    hf.close(rig.io);
+
+    const m = try rig.spawnMount("f14-m", set.metaUri(), null, &.{});
+    try rig.awaitLog(m, "ready: ", ready_wait_ns);
+    var env_j = try rig.envWith(ident_c);
+    defer env_j.deinit();
+    try env_j.put("SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD", hold);
+    try env_j.put("SQUEEZEFS_SYM_MINT_SLOTS", "1");
+    try env_j.put("SQUEEZEFS_SYM_T_IDLE_MS", "80000");
+    try env_j.put("SQUEEZEFS_META_NODE_CACHE_MB", "1");
+    const j = try rig.spawnMountEnv("f14-j", meta_uri_c, &env_j, &.{});
+    try rig.awaitLog(j, "ready: ", ready_wait_ns);
+
+    // The manager mints this file. The joiner must not look it up until the
+    // successor admits the reclaim: the first ship then asks the new manager.
+    const hot = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "sh", "-c", "mkdir -p hot && : > hot/t" }, .cwd = .{ .path = rig.daemons.items[m].mp }, .environ_map = &rig.env });
+    defer rig.freeRun(hot);
+    if (!hot.term.success()) {
+        std.debug.print("\n--- F14 hot file failed ({f}) ---\n{s}\n{s}\n", .{ hot.term, hot.stdout, hot.stderr });
+        return error.HotCreateFailed;
+    }
+
+    var storm_started = false;
+    var storm_joined = false;
+    var storm: F14Storm = undefined;
+    var storm_th: std.Thread = undefined;
+    defer if (storm_started and !storm_joined) {
+        _ = linux.kill(rig.daemons.items[j].pid, .KILL);
+        storm_th.join();
+    };
+    var burst_stop = std.atomic.Value(bool).init(false);
+    var burst_th: [4]std.Thread = undefined;
+    var burst_n: usize = 0;
+    var burst_joined = false;
+    defer if (!burst_joined) {
+        burst_stop.store(true, .release);
+        if (burst_n != 0) _ = linux.kill(rig.daemons.items[j].pid, .KILL);
+        for (burst_th[0..burst_n]) |t| t.join();
+    };
+
+    const leases0 = try f12Stat(rig, j, "slot_leases_held");
+    const fill =
+        \\mkdir -p mine && python3 -c '
+        \\import os, time
+        \\blob = b"x"*60000
+        \\def put(p):
+        \\    fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
+        \\    os.close(fd)
+        \\    os.setxattr(p, "user.p", blob)
+        \\    time.sleep(0.1)
+        \\put("mine/t")
+        \\for i in range(40):
+        \\    put("mine/f%d" % i)
+        \\' && sync -f mine
+    ;
+    const filled = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "sh", "-c", fill }, .cwd = .{ .path = rig.daemons.items[j].mp }, .environ_map = &rig.env });
+    defer rig.freeRun(filled);
+    if (!filled.term.success()) {
+        std.debug.print("\n--- F14 fill failed ({f}) ---\n{s}\n{s}\n", .{ filled.term, filled.stdout, filled.stderr });
+        rig.printLogTail(j, 40);
+        return error.FillFailed;
+    }
+    var overflows = try f12Stat(rig, j, "affinity_ceiling_overflows");
+    var spills = try f12Stat(rig, j, "affinity_ceiling_spills");
+    var evicted = try f12Stat(rig, j, "meta_kv_node_cache_evictions");
+    var leases = try f12Stat(rig, j, "slot_leases_held");
+    if ((overflows < 1 and spills < 1) or evicted < 1 or leases <= leases0) {
+        const more =
+            \\python3 -c '
+            \\import os, time
+            \\blob = b"x"*60000
+            \\for i in range(40, 120):
+            \\    p = "mine/e%d" % i
+            \\    fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
+            \\    os.close(fd)
+            \\    os.setxattr(p, "user.p", blob)
+            \\    time.sleep(0.1)
+            \\' && sync -f mine
+        ;
+        const again = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "sh", "-c", more }, .cwd = .{ .path = rig.daemons.items[j].mp }, .environ_map = &rig.env });
+        defer rig.freeRun(again);
+        if (!again.term.success()) {
+            std.debug.print("\n--- F14 second fill failed ({f}) ---\n{s}\n{s}\n", .{ again.term, again.stdout, again.stderr });
+            return error.FillFailed;
+        }
+        overflows = try f12Stat(rig, j, "affinity_ceiling_overflows");
+        spills = try f12Stat(rig, j, "affinity_ceiling_spills");
+        evicted = try f12Stat(rig, j, "meta_kv_node_cache_evictions");
+        leases = try f12Stat(rig, j, "slot_leases_held");
+    }
+    std.debug.print("\n--- F14 fill: overflows {d} spills {d} evictions {d} leases {d} -> {d} ---\n", .{ overflows, spills, evicted, leases0, leases });
+    if (overflows < 1 and spills < 1) {
+        rig.printLogTail(j, 30);
+        return error.SpillMissed;
+    }
+    if (evicted < 1) return error.NodeNotEvicted;
+    if (leases <= leases0) return error.SpillMissed;
+
+    var grows0 = try f12Stat(rig, j, "joined_ring_grows");
+    var stable: u8 = 0;
+    const settle_deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (stable < 2 and clock.monotonicNs() < settle_deadline) {
+        sleepMs(400);
+        const g = f12Stat(rig, j, "joined_ring_grows") catch grows0;
+        if (g == grows0) {
+            stable += 1;
+        } else {
+            grows0 = g;
+            stable = 0;
+        }
+    }
+    if (try f12LogHas(rig, j, "16777216 B")) {
+        rig.printLogTail(j, 20);
+        return error.GrowthBeforeWindow;
+    }
+    const stalls0 = try f12Stat(rig, j, "meta_kv_journal_full_stalls");
+    const stop_ns = clock.monotonicNs();
+    _ = linux.kill(rig.daemons.items[m].pid, .STOP);
+    const stop_deadline = clock.monotonicNs() + 2 * std.time.ns_per_s;
+    while (!f12Stopped(rig.daemons.items[m].pid) and clock.monotonicNs() < stop_deadline) sleepMs(20);
+    if (!f12Stopped(rig.daemons.items[m].pid)) {
+        std.debug.print("\n--- F14: manager did not reach state T ---\n", .{});
+        return error.GrowthNotDue;
+    }
+    for (0..4) |tag| {
+        burst_th[burst_n] = try std.Thread.spawn(.{}, f12Burst, .{ rig.daemons.items[j].mp, &burst_stop, @as(u8, @intCast(tag)) });
+        burst_n += 1;
+    }
+    const burst_deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+    var stalls = stalls0;
+    while (stalls == stalls0 and clock.monotonicNs() < burst_deadline) {
+        sleepMs(200);
+        stalls = f12Stat(rig, j, "meta_kv_journal_full_stalls") catch stalls0;
+    }
+    burst_stop.store(true, .release);
+    for (burst_th[0..burst_n]) |t| t.join();
+    burst_joined = true;
+    stalls = try f12Stat(rig, j, "meta_kv_journal_full_stalls");
+    std.debug.print("\n--- F14 burst: stalls {d} -> {d} grows {d} ---\n", .{ stalls0, stalls, grows0 });
+    if (stalls == stalls0) {
+        rig.printLogTail(j, 40);
+        return error.GrowthNotDue;
+    }
+    const failure_names = [_][]const u8{
+        "journal_lane_write_failures",
+        "journal_lane_barrier_failures",
+        "journal_lane_volumes_failed",
+        "writer_guard_fenced",
+    };
+    var frozen: [failure_names.len]u64 = undefined;
+    for (failure_names, 0..) |name, i| frozen[i] = try f12Stat(rig, j, name);
+    std.debug.print("\n--- F14 frozen: write {d} barrier {d} volumes {d} fenced {d} ---\n", .{ frozen[0], frozen[1], frozen[2], frozen[3] });
+    if (frozen[3] != 0) return error.NoteFailureMoved;
+
+    const stale_ns = (lease_clock.T_OWNER_MS + 5_000) * std.time.ns_per_ms;
+    const since_stop = clock.monotonicNs() - stop_ns;
+    if (since_stop < stale_ns) sleepMs((stale_ns - since_stop) / std.time.ns_per_ms);
+
+    const s = try rig.spawnMount("f14-s", meta_uri_b, ident_b, &.{});
+    try rig.awaitLog(s, "ready: ", ready_wait_ns);
+    try rig.awaitLog(j, "SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD", 30 * std.time.ns_per_s);
+    if (try f12LogHas(rig, j, "released by appender")) {
+        rig.printLogTail(j, 40);
+        return error.SlotReleasedEarly;
+    }
+    const grows_hold = try f12Stat(rig, j, "joined_ring_grows");
+    if (grows_hold != grows0) {
+        std.debug.print("\n--- F14 grows before the window {d} -> {d} ---\n", .{ grows0, grows_hold });
+        rig.printLogTail(j, 40);
+        return error.GrowthBeforeWindow;
+    }
+    rig.awaitLog(j, "admitted the reclaim", 30 * std.time.ns_per_s) catch |e| {
+        rig.printLogTail(j, 40);
+        return e;
+    };
+    // A wire offer stands for one renew interval plus 40 ms, and the
+    // follower accepts it on an 80 ms tick. An offer pushed just after a
+    // renewal expires before that tick. Anchor on a renewal, then ship
+    // mid-interval so the next grant still has seconds of the stand left.
+    const shrinks0 = try f12Stat(rig, j, "slot_forced_shrinks");
+    const offers0 = try f12Stat(rig, j, "joined_wire_offers_accepted");
+    const renew0 = f12Stat(rig, j, "member_renewals") catch 0;
+    const renew_by = clock.monotonicNs() + 12 * std.time.ns_per_s;
+    var renews = renew0;
+    while (renews <= renew0 and clock.monotonicNs() < renew_by) {
+        sleepMs(200);
+        renews = f12Stat(rig, j, "member_renewals") catch renews;
+    }
+    sleepMs(3_000);
+    var hot_buf: [linux.PATH_MAX]u8 = undefined;
+    const hot_path = try std.fmt.bufPrintSentinel(&hot_buf, "{s}/hot/t", .{rig.daemons.items[j].mp}, 0);
+    storm = .{ .path = hot_path.ptr };
+    storm_th = try std.Thread.spawn(.{}, F14Storm.go, .{&storm});
+    storm_started = true;
+    rig.awaitLog(j, "growth drain cycle failed (Held)", 30 * std.time.ns_per_s) catch |e| {
+        rig.printLogTail(j, 40);
+        return e;
+    };
+
+    // The park poisons about 90 s after the T_self park. One renew interval
+    // after this mid-interval ship covers the grant and the follower, and
+    // the cap stays inside that poison. A deferral for Busy is not the
+    // handover.
+    const idle_at = @min(clock.monotonicNs() + 16 * std.time.ns_per_s, stop_ns + 110 * std.time.ns_per_s);
+    var offers = offers0;
+    var handover_seen = false;
+    var handover_n: u64 = 0;
+    while (true) {
+        offers = f12Stat(rig, j, "joined_wire_offers_accepted") catch offers;
+        if (!handover_seen) handover_seen = f12LogHas(rig, j, "did not land this tick (HandoverDeferred)") catch false;
+        if (handover_seen and handover_n < 1) handover_n = f14Class(rig, j, "handover") catch handover_n;
+        if (offers != offers0 and handover_seen and handover_n >= 1) break;
+        if (clock.monotonicNs() >= idle_at) break;
+        sleepMs(200);
+    }
+    if (offers == offers0) {
+        const ships = f12Stat(rig, s, "slot_ships") catch 0;
+        const pushed = f12Stat(rig, s, "slot_offers_pushed") catch 0;
+        const served = f12Stat(rig, s, "record_served") catch 0;
+        const reactive = f12Stat(rig, j, "joined_wire_reactive_grants") catch 0;
+        const refusals = f12Stat(rig, s, "slot_acquire_refusals") catch 0;
+        const handovers = f12Stat(rig, s, "slot_handovers") catch 0;
+        const renews_now = f12Stat(rig, j, "member_renewals") catch 0;
+        std.debug.print("\n--- F14 offer missed: J offers {d} (was {d}) reactive {d} S ships {d} pushed {d} served {d} refusals {d} handovers {d} renewals {d} -> {d} storm ok {d} fail {d} handover {d} ---\n", .{ offers, offers0, reactive, ships, pushed, served, refusals, handovers, renew0, renews_now, storm.ok.load(.monotonic), storm.fail.load(.monotonic), @as(u8, @intFromBool(handover_seen)) });
+        rig.printLogTail(j, 40);
+        rig.printLogTail(s, 40);
+        return error.OfferMissed;
+    }
+    if (handover_n < 1) {
+        const extra = clock.monotonicNs() + 20 * std.time.ns_per_s;
+        while (handover_n < 1 and clock.monotonicNs() < extra) {
+            sleepMs(200);
+            if (!handover_seen) handover_seen = f12LogHas(rig, j, "did not land this tick (HandoverDeferred)") catch false;
+            if (handover_seen) handover_n = f14Class(rig, j, "handover") catch handover_n;
+        }
+    }
+    if (!handover_seen) {
+        rig.printLogTail(j, 40);
+        return error.Timeout;
+    }
+    if (try f12LogHas(rig, j, "released by appender")) return error.SlotReleasedEarly;
+    const shrinks_hold = try f12Stat(rig, j, "slot_forced_shrinks");
+    if (shrinks_hold != shrinks0) return error.SlotReleasedEarly;
+    const grows_still = try f12Stat(rig, j, "joined_ring_grows");
+    if (grows_still != grows_hold) return error.GrowthBeforeWindow;
+
+    handover_n = try f14Class(rig, j, "handover");
+    const checkpoint_n = try f14Class(rig, j, "checkpoint");
+    const grow_n = try f14Class(rig, j, "grow_ring");
+    var total = handover_n + checkpoint_n + grow_n;
+    for ([_][]const u8{ "lane", "bitmap", "leave", "open" }) |name| {
+        total += try f14Class(rig, j, name);
+    }
+    std.debug.print("\n--- F14 held: handover {d} checkpoint {d} grow_ring {d} total {d} offers {d} -> {d} ---\n", .{ handover_n, checkpoint_n, grow_n, total, offers0, offers });
+    if (handover_n < 1 or (checkpoint_n < 1 and grow_n < 1) or total < 2) {
+        rig.printLogTail(j, 40);
+        return error.HeldReturnsShort;
+    }
+
+    if (linux.errno(linux.unlink(hold)) != .SUCCESS) return error.HoldRelease;
+    try rig.awaitLog(j, "after a succession", g2_wait_ns);
+    rig.awaitLog(j, "released by appender", g2_wait_ns) catch |e| {
+        rig.printLogTail(j, 40);
+        return e;
+    };
+    const grow_deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+    var grows: u64 = grows_hold;
+    while (grows == grows_hold and clock.monotonicNs() < grow_deadline) {
+        sleepMs(200);
+        grows = f12Stat(rig, j, "joined_ring_grows") catch grows_hold;
+    }
+    const shrinks = try f12Stat(rig, j, "slot_forced_shrinks");
+    std.debug.print("\n--- F14 done: grows {d} -> {d} shrinks {d} -> {d} storm ok {d} fail {d} ---\n", .{ grows_hold, grows, shrinks0, shrinks, storm.ok.load(.monotonic), storm.fail.load(.monotonic) });
+    if (grows == grows_hold) {
+        rig.printLogTail(j, 40);
+        return error.RingDidNotGrow;
+    }
+    if (shrinks == shrinks0) return error.SlotNotReleased;
+    for (failure_names, 0..) |name, i| {
+        const got = try f12Stat(rig, j, name);
+        if (got != frozen[i]) {
+            std.debug.print("\n--- F14: {s} moved {d} -> {d} ---\n", .{ name, frozen[i], got });
+            rig.printLogTail(j, 40);
+            return error.NoteFailureMoved;
+        }
+    }
+    if (try f12LogHas(rig, j, "latching the volume FAILED")) {
+        rig.printLogTail(j, 40);
+        return error.VolumeFailedLatched;
+    }
+
+    const storm_deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+    while (!storm.done.load(.acquire) and clock.monotonicNs() < storm_deadline) sleepMs(200);
+    if (!storm.done.load(.acquire)) {
+        std.debug.print("\n--- F14 storm still running: ok {d} fail {d} ---\n", .{ storm.ok.load(.monotonic), storm.fail.load(.monotonic) });
+        return error.StormStuck;
+    }
+    storm_th.join();
+    storm_joined = true;
+
+    try rig.umount(j);
+    try rig.kill9(m);
+    try rig.umount(s);
+    const bound = try bindDataForFsck(rig, &set, transport);
+    defer if (bound) {
+        var stored_buf: [64]u8 = undefined;
+        if (std.fmt.bufPrintSentinel(&stored_buf, "{s}", .{set.dataDev()}, 0)) |stored_z| {
+            _ = linux.umount2(stored_z.ptr, linux.MNT.DETACH);
+        } else |_| {}
+    };
+    const fsck = try rig.sqz(&.{ "fsck", "--offline", "--scrub", set.metaUri() });
+    defer rig.freeRun(fsck);
+    if (!fsck.term.success() or std.mem.indexOf(u8, fsck.stdout, "findings: 0 (clean)") == null) {
+        std.debug.print("\n--- fsck --offline --scrub ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ fsck.term, fsck.stdout, fsck.stderr });
+        return error.FsckNotClean;
+    }
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    try rig.disconnect(&cm_c);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}

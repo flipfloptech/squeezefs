@@ -1634,16 +1634,19 @@ pub const JournalLane = struct {
                             // through to today's failure path below unless
                             // it is held again (the next loop will see it).
                             if (self.heldRefusal(c.first_err.?, .write)) {
+                                journal_guard.member_fence.noteHeldReturn(.lane);
                                 c.verdict = error.Held;
                                 continue;
                             }
                             // Use the re-issue's error as the window's.
                         },
                         .terminal => {
+                            journal_guard.member_fence.noteHeldReturn(.lane);
                             c.verdict = error.Held;
                             continue;
                         },
                     } else {
+                        journal_guard.member_fence.noteHeldReturn(.lane);
                         c.verdict = error.Held;
                         continue;
                     }
@@ -1947,7 +1950,10 @@ pub const JournalLane = struct {
                 return;
             }
             if (answer.verdict != .held) break :blk result_in;
-            const word = self.hooks.word orelse break :blk error.Held;
+            const word = self.hooks.word orelse {
+                journal_guard.member_fence.noteHeldReturn(.lane);
+                break :blk error.Held;
+            };
             switch (word.awaitPast(answer.gen)) {
                 .cleared => {
                     const kind = self.w.barrier_in_flight.?;
@@ -1957,7 +1963,10 @@ pub const JournalLane = struct {
                     if (self.w.barrier_in_flight != null) return;
                     return;
                 },
-                .terminal => break :blk error.Held,
+                .terminal => {
+                    journal_guard.member_fence.noteHeldReturn(.lane);
+                    break :blk error.Held;
+                },
             }
         };
         const w = &self.w;

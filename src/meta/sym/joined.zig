@@ -1828,6 +1828,7 @@ pub const JoinedSet = struct {
         // GrowRing on the wire until the beat that re-registers.
         if (succession_hold) {
             be.cp.checkpointCycle(true) catch |e| {
+                if (e == error.Held) member_fence.noteHeldReturn(.grow_ring);
                 stats.joined_ring_grow_deferrals.inc();
                 log.warn("meta volume {s}: joined appender {d}'s growth drain cycle failed ({s}) — growth retried next cycle", .{ be.path, self.appenderId(), @errorName(e) });
                 return;
@@ -1848,6 +1849,7 @@ pub const JoinedSet = struct {
             // the ring behind the tick that just ran): a cycle advances the
             // tail it waits for, one per round.
             be.cp.checkpointCycle(true) catch |e| {
+                if (e == error.Held) member_fence.noteHeldReturn(.grow_ring);
                 stats.joined_ring_grow_deferrals.inc();
                 log.warn("meta volume {s}: joined appender {d}'s growth drain cycle failed ({s}) — growth retried next cycle", .{ be.path, self.appenderId(), @errorName(e) });
                 return;
@@ -1866,6 +1868,7 @@ pub const JoinedSet = struct {
         var covers: u64 = 0;
         while (!be.ringDrained() and covers < checkpoint.FIXPOINT_COVER_CYCLES_MAX) : (covers += 1) {
             be.cp.checkpointCycle(true) catch |e| {
+                if (e == error.Held) member_fence.noteHeldReturn(.grow_ring);
                 stats.joined_ring_grow_deferrals.inc();
                 log.warn("meta volume {s}: joined appender {d}'s growth cover cycle failed ({s}) — growth retried next cycle", .{ be.path, self.appenderId(), @errorName(e) });
                 return;
@@ -1912,6 +1915,7 @@ pub const JoinedSet = struct {
         r.page.head_hint = head;
         r.page.ledger_tail_seq = head;
         self.writePages(false) catch |e| {
+            if (e == error.Held) member_fence.noteHeldReturn(.grow_ring);
             r.setTable(old_table);
             log.err("meta volume {s}: joined appender {d}'s page could not name its grown ring ({s}) — the segment at 0x{x} ({d} B) the manager carved is named by no page; the manager answers it again at the next GrowRing and returns it at this identity's leave or death", .{ be.path, own, @errorName(e), seg.start, seg.len });
             return;
@@ -2005,6 +2009,7 @@ pub const JoinedSet = struct {
         // slots, barriered, before the manager screens it.
         self.core().page.setSlots(&.{}) catch {};
         self.writePages(false) catch |e| {
+            if (e == error.Held) member_fence.noteHeldReturn(.leave);
             log.err("meta volume {s}: the leave's page write failed ({s}) — the page stays Live for the next open's recovery", .{ be.path, @errorName(e) });
             return;
         };

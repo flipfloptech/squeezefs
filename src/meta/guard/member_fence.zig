@@ -31,7 +31,36 @@ pub const stats = struct {
     pub var meta_pr_drain_barriers: counters.ShardedCounter = .{};
     /// The one read retried after such a barrier.
     pub var meta_pr_read_retries_after_drain: counters.ShardedCounter = .{};
+    /// `held` verdicts, by the caller that unwound them (decision 0004 §8.2).
+    /// `open` stays 0: bring-up's `Held` answers refuse the mount, they do not unwind.
+    pub var meta_pr_held_returns: HeldReturns = .{};
 };
+
+/// One counter per caller that unwinds a `held` verdict.
+pub const HeldReturns = struct {
+    lane: counters.ShardedCounter = .{},
+    checkpoint: counters.ShardedCounter = .{},
+    handover: counters.ShardedCounter = .{},
+    grow_ring: counters.ShardedCounter = .{},
+    bitmap: counters.ShardedCounter = .{},
+    leave: counters.ShardedCounter = .{},
+    open: counters.ShardedCounter = .{},
+};
+
+pub const HeldReturnClass = enum { lane, checkpoint, handover, grow_ring, bitmap, leave, open };
+
+/// Count one `held` unwind. The call site keeps its error mapping.
+pub fn noteHeldReturn(class: HeldReturnClass) void {
+    switch (class) {
+        .lane => stats.meta_pr_held_returns.lane.inc(),
+        .checkpoint => stats.meta_pr_held_returns.checkpoint.inc(),
+        .handover => stats.meta_pr_held_returns.handover.inc(),
+        .grow_ring => stats.meta_pr_held_returns.grow_ring.inc(),
+        .bitmap => stats.meta_pr_held_returns.bitmap.inc(),
+        .leave => stats.meta_pr_held_returns.leave.inc(),
+        .open => stats.meta_pr_held_returns.open.inc(),
+    }
+}
 
 pub const Verdict = enum { retry, latch, held };
 
@@ -1195,6 +1224,15 @@ test "member fence: a refusal re-read that finds this host unregistered under WE
     drained.obs.meta_rtype = nvme.RTYPE_WEAR;
     drained.observeReport(.{});
     try testing.expectEqual(Verdict.held, drained.answer(.write, .conflict).verdict);
+}
+
+test "member fence: noteHeldReturn counts the caller class" {
+    const h0 = stats.meta_pr_held_returns.handover.load();
+    const c0 = stats.meta_pr_held_returns.checkpoint.load();
+    noteHeldReturn(.handover);
+    noteHeldReturn(.checkpoint);
+    try testing.expectEqual(h0 + 1, stats.meta_pr_held_returns.handover.load());
+    try testing.expectEqual(c0 + 1, stats.meta_pr_held_returns.checkpoint.load());
 }
 
 test "member fence: a collapsed write keeps Held and maps every other class to Io" {

@@ -19,6 +19,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const counters = @import("../../../core/counters.zig");
+const member_fence = @import("../../guard/member_fence.zig");
 const clock = @import("../../../core/clock.zig");
 const derive = @import("../../../core/derive.zig");
 const log = @import("../../../core/log.zig");
@@ -1187,7 +1188,10 @@ pub const Plane = struct {
             error.Corrupt => error.Corrupt,
             // A dirty slot's cover must keep Held. Collapsing it to Io
             // never reaches the page write, so the cadence cannot retry it.
-            error.Held => error.HandoverDeferred,
+            error.Held => blk: {
+                member_fence.noteHeldReturn(.handover);
+                break :blk error.HandoverDeferred;
+            },
             else => error.Io,
         };
         return self.lesseeReusableUpto(slot);
@@ -1285,7 +1289,10 @@ pub const Plane = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.Corrupt => error.Corrupt,
             error.Io => error.Io,
-            error.Held => error.HandoverDeferred,
+            error.Held => blk: {
+                member_fence.noteHeldReturn(.handover);
+                break :blk error.HandoverDeferred;
+            },
         };
     }
 

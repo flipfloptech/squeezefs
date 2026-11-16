@@ -5,8 +5,8 @@ metadata WERO, and a merge of PR-4. Do not follow it. PR-4 is on `dev`. This wor
 
 ## Current state and next action
 
-**Branch `feat/pr5`.** F13 is in `44364742`. This note is the docs commit on top
-of it. F11 is `afe74d33`. F8 is `45fd0f55`. F7b is `b1f87fa7`. F7a is `bd0d3f5f`. F6 is `88003de0`. F5 is `2a8f4a2b`. F2, F3, and F4 are in `bc7ae7c4`. The fencing registrant is retired in
+**Branch `feat/pr5`.** F12 is in `801d16e4`. This note is the docs commit on top
+of it. F13 is `44364742`. F11 is `afe74d33`. F8 is `45fd0f55`. F7b is `b1f87fa7`. F7a is `bd0d3f5f`. F6 is `88003de0`. F5 is `2a8f4a2b`. F2, F3, and F4 are in `bc7ae7c4`. The fencing registrant is retired in
 `281bd07b`. Incompat
 bit 4 and `claim convert-pr` are `694b43c2`. The blind-rule refusals are
 `eea93412`. Report-first recovery is `d75445b9`. Do not amend those. No upstream.
@@ -19,10 +19,8 @@ The hashes are in the table below.
 
 **Next action, in this order. Do not skip ahead, and do not start PR-6 or PR-7.**
 
-1. The fidelity rows that are not yet written: F12, then F14.
-   F13 is `44364742` (a registry-blind superseded manager: M0's registry directory is not JA's, S binds, JA re-registers host A and does not kill M0, and M0's first beat fail-stops on the page check). F12 and F14 need
-   `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist. Building
-   that seam is part of F12. `claim posture-reset` is the other offline
+1. The fidelity row that is not yet written: F14.
+   F12 is `801d16e4` (a member held unregistered: the handover, the growth drain and the cache-miss read meet that window). F14 uses `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which F12 added. `claim posture-reset` is the other offline
    door; it is not one of these rows.
 
 A full venue gate has not been run on this branch. Do not merge to `dev` until that gate is
@@ -59,6 +57,7 @@ hook. Never push `feat/pr5`. Never force-push. Never amend these commits.
 | `45fd0f55` | F8: a volume formatted without bit 4, held WERO, refused by name, then `claim convert-pr`. rtype 5, bit 4, pages v2. A second run is a no-op. No product change. |
 | `afe74d33` | F11: a successor beside a live joiner on its host. Step 3 adopts. The preempt-all removes only the other host. JB is never refused. No product change. |
 | `44364742` | F13: a registry-blind superseded manager. JA does not kill M0. The page check fail-stops the beat. A late checkpoint wake writes nothing while the page is usurped. |
+| `801d16e4` | F12: a member held unregistered through succession. The handover, the growth drain and the cache-miss read meet that window and complete. No FAILED latch, no noteFailure move. |
 
 ## What is true in the code
 
@@ -524,6 +523,20 @@ fail-stop. A cycle already inside `checkpointCycle` at SIGSTOP still finishes.
 Device: `~/tmp/pr5-f13.log` (`EXIT:0`, 41/41, about 7 min including the link).
 No full gate.
 
+## A member held unregistered, committed `801d16e4`
+
+Decision 0004 §8.2 F12, review issue 2.
+
+`SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD` is a path. While the file exists, a joiner that wants to re-register after a succession skips that re-registration. The membership beat, the carriage and the slot cadence keep running. Ring growth due in the window is judged again once the file is removed.
+
+The growth drain runs one cycle while the host is unregistered, gets `Held`, and retries. No GrowRing is sent until the registering beat. A dirty slot's cover maps `Held` to `HandoverDeferred`.
+
+After the file is removed the host re-registers. The ring grows and the idle rotor slot releases. The cache-miss read returned 60000 `x` bytes and did not surface EIO. No FAILED latch. `journal_lane_write_failures`, `journal_lane_barrier_failures`, `journal_lane_volumes_failed` and `writer_guard_fenced` stayed 0.
+
+Device: `~/tmp/pr5-f12.log` (`EXIT:0`, 41/41, about 7 min including the link).
+Grows 2 → 3, forced shrinks 0 → 1, cache misses 1111 → 1138. Fsck clean.
+No full gate.
+
 ## Explicitly not in this branch
 
 - F9 and F10 have not been re-run on this commit. F1 has, after report-first recovery.
@@ -533,7 +546,7 @@ No full gate.
 - Recovery's `fence(k)` does not call `identityHolds`.
 - `claim posture-reset --all-mounts-down` (`Mode.posture_reset`).
 - `meta_pr_succession_parks`, `meta_pr_succession_reregistrations`, `meta_pr_refusal_readmissions`. Do not invent them. Parks increment `stats.appender_parks`. `writer_guard_fenced` increments in `journal.noteFence`.
-- Fidelity rows F12, F14. F2, F3, F4, F5, F6, F7a, F7b, F8, F11, F13, F15, F16, and F16b are committed. F12/F14 need `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which does not exist. P9c's write-EIO instant is the §8.1 unit, not a device pin. Do not add `meta_pr_write_eio_reclassified` until that unit.
+- Fidelity row F14. F2, F3, F4, F5, F6, F7a, F7b, F8, F11, F12, F13, F15, F16, and F16b are committed. F14 uses `SQUEEZEFS_TEST_SUCCESSION_REASSERT_HOLD`, which F12 added. P9c's write-EIO instant is the §8.1 unit, not a device pin. Do not add `meta_pr_write_eio_reclassified` until that unit.
 - An offline writer still never ticks the cadence, so it pays the debt at its own admission and does not run the later reconcile. The shortcut comment in `data_fence.zig` `endSuccession` still says so.
 - `data_pr_reconciles_deferred` and the `data_pr_reconcile_in_window` tripwire.
 - A full `zig build gate` on this branch.
@@ -550,7 +563,7 @@ No full gate.
 - Zig 0.17: `if (payload) |x| if (cond) stmt` does not parse when `stmt` is an assignment. Use braces. Do not shadow an import with a local named `gate`, `fake`, or `nvme`. `const g = r.grace orelse` copies the grace.
 - `log.err` in the test process fails the test. `log.err` in the daemon does not. `log.warn` and `log.info` do not fail tests.
 - nvmet-smoke has no cost table. Renaming those tests does not stale one. A test with no row hangs out at 900 s.
-- Non-TTY `scripts/venue` is silent until the step ends. A "failed command:" footer that still says `N/N steps succeeded` is the warn footer, not a failure. A real failure is `error: '…' failed`. An empty log with `EXIT:0` in well under a second is a no-op, not a pass. Keep the filter inside one venue argument: `scripts/venue 'zig build … -Dnvmet-filter="pr5 F1"'`. `-Dnvmet-filter` is a single string. Bare `F1` also matches F10 and F11.
+- Non-TTY `scripts/venue` is silent until the step ends. A "failed command:" footer that still says `N/N steps succeeded` is the warn footer, not a failure. A real failure is `error: '…' failed`. An empty log with `EXIT:0` in well under a second is a no-op, not a pass. Keep the filter inside one venue argument: `scripts/venue 'zig build … -Dnvmet-filter="pr5 F1"'`. `-Dnvmet-filter` is a single string. Bare `F1` also matches F10, F11, and F12.
 
 ## How to check the pins that are already green
 
@@ -558,7 +571,7 @@ Cache is `/build/zig-cache-v2`. One `zig build` takes a build slot. The nvmet ex
 
 ```bash
 git checkout feat/pr5
-git status -sb    # clean, no upstream; F13 is 44364742
+git status -sb    # clean, no upstream; F12 is 801d16e4
 
 # Unit: census, debt, live-page skip, the old admission reconcile.
 scripts/venue 'zig build --cache-dir /build/zig-cache-v2 test -Dtest-filter="pr5 debt" -Dtest-filter="pr5 live page" -Dtest-filter="succession census" --summary all'
@@ -586,6 +599,7 @@ Last green results, 2026-11-11, on this host:
 - F8 `~/tmp/pr5-f8.log` (`EXIT:0`, 41/41, about 5 min including the link). Pins printed: before the mount, rtype 3, regctl 1, holder `a1a1a1a100000001`, bit 4 clear, generation 1; after convert, rtype 5, regctl 1, bit 4 set, generation 2.
 - F11 `~/tmp/pr5-f11.log` (`EXIT:0`, 41/41, about 7 min including the link). Pins printed: before S, rtype 5, regctl 2; after S, rtype 5, regctl 1, preempt_alls 1, victims 1, adoptions 1, registrations 0; JB fenced 0, refusals held 0, write refusals 0, succession re-registrations 0, parked 0; debt 1, reconcile 0.
 - F13, 2026-11-13 (`~/tmp/pr5-f13.log`): `EXIT:0`, 41/41, about 7 min including the link. Pins printed: before S, rtype 5, regctl 1; S preempt_alls 1, victims 1; JA kills 0, parked 0; M0 identity_failures 1, unreadable 0, fenced 0, recovery preempts 0, reconcile 0; after resume, rtype 5, regctl 2. Fsck clean.
+- F12, 2026-11-16 (`~/tmp/pr5-f12.log`): `EXIT:0`, 41/41, about 7 min including the link. Pins printed: grows 2 → 3, forced shrinks 0 → 1, cache misses 1111 → 1138; journal lane write, barrier and volume failures 0, `writer_guard_fenced` 0. Fsck clean.
 
 ## Resume rules
 

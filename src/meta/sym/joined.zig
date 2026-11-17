@@ -1269,7 +1269,8 @@ pub const JoinedSet = struct {
     /// while a succession is pending and on each cycle that landed; ring
     /// growth is judged once per cycle that landed. The succession hold's
     /// page write returns Held, so the seq does not move; the flag keeps
-    /// growth on the cadence until it is idle or has landed.
+    /// the slot cadence running and retries growth until the hold is idle
+    /// or has landed.
     pub fn afterTick(ctx: *anyopaque) void {
         const self: *JoinedSet = @ptrCast(@alignCast(ctx));
         const seq = self.be.cp.checkpointSeq();
@@ -1281,6 +1282,9 @@ pub const JoinedSet = struct {
         }
         if (!cycle_landed and !self.succession_reassert_growth) return;
         if (cycle_landed) self.grow_judged_at_seq = seq;
+        // Held returns before onCheckpoint, and wantsRegister is false while
+        // the report is unreadable, so the hold kicks off the flag.
+        if (self.succession_reassert_growth) self.be.slots.kickCadence();
         self.growRingIfDue();
     }
 
@@ -1345,9 +1349,6 @@ pub const JoinedSet = struct {
         if (member_fence.wantsRegister(self.readmit.obs, report.readable, self.be.pool.writesOutstanding() == 0, self.readmit.word)) {
             if (self.successionReassertHeld()) {
                 self.succession_reassert_growth = true;
-                // A Held page write returns before `onCheckpoint` kicks the
-                // slot cadence, so the handover would never meet this window.
-                self.be.slots.kickCadence();
             } else {
                 const release_kick = self.succession_reassert_growth;
                 self.successionReregister(who);

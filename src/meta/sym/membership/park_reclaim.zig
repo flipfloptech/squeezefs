@@ -32,7 +32,8 @@
 const std = @import("std");
 const Io = std.Io;
 
-/// Set for the life of a cluster-wire connection thread. See `preAdmission`.
+/// Set for the life of a cluster-wire connection thread or the slot cadence.
+/// See `preAdmission`.
 pub threadlocal var serve_must_not_wait: bool = false;
 const counters = @import("../../../core/counters.zig");
 const clock = @import("../../../core/clock.zig");
@@ -197,8 +198,10 @@ pub const ParkGate = struct {
     /// A cluster-wire serve does not wait (`serve_must_not_wait`). Its
     /// caller's reply bound is 10 s and `Listener.stop` joins the thread,
     /// so a park wait (up to `T_park_max`) both blows the bound and wedges
-    /// the dismount. It answers `Retired` (nothing written); the caller
-    /// retries. A FUSE committer still waits (decision 0004 §4.5.6).
+    /// the dismount. The slot cadence sets the same flag: a times-drain
+    /// commit that waited here hid every later release. It answers
+    /// `Retired` (nothing written); the caller retries. A FUSE committer
+    /// still waits (decision 0004 §4.5.6).
     pub fn preAdmission(self: *ParkGate) error{ Expired, Retired }!void {
         while (true) {
             switch (self.word()) {

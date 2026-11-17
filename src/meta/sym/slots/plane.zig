@@ -41,6 +41,7 @@ const bind = @import("../bind.zig");
 const joined = @import("../joined.zig");
 const region_mod = @import("../region.zig");
 const shard_mod = @import("../membership/shard.zig");
+const park_reclaim = @import("../membership/park_reclaim.zig");
 const join_ladder_mod = @import("../membership/join_ladder.zig");
 const manager = @import("../manager.zig");
 const tails_spill = @import("tails_spill.zig");
@@ -1788,6 +1789,10 @@ pub const Plane = struct {
 
     fn cadenceRun(self: *Plane) Io.Cancelable!void {
         defer self.cadence_busy.store(false, .release);
+        // A FUSE committer waits out a succession park. This thread is the
+        // only cadence: a wait here would hide every later release.
+        park_reclaim.serve_must_not_wait = true;
+        defer park_reclaim.serve_must_not_wait = false;
         self.runCadence();
     }
 

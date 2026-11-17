@@ -4440,30 +4440,29 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
     const pre = try rig.stats(j);
     defer gpa.free(pre);
     var evicted = try statNumber(pre, "meta_kv_node_cache_evictions");
-    if (evicted == 0) {
-        // A loaded venue can still be flushing the first batch, so those
-        // nodes are dirty and the sweep skips them. One more clean wave.
-        const more =
-            \\python3 -c '
-            \\import os
-            \\blob = b"x"*60000
-            \\for i in range(40, 80):
-            \\    p = "mine/e%d" % i
-            \\    fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
-            \\    os.close(fd)
-            \\    os.setxattr(p, "user.p", blob)
-            \\' && sync -f mine
-        ;
-        const again = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "sh", "-c", more }, .cwd = .{ .path = rig.daemons.items[j].mp }, .environ_map = &rig.env });
-        defer rig.freeRun(again);
-        if (!again.term.success()) {
-            std.debug.print("\n--- F7a second fill failed ({f}) ---\n{s}\n{s}\n", .{ again.term, again.stdout, again.stderr });
-            return error.FillFailed;
-        }
-        const pre2 = try rig.stats(j);
-        defer gpa.free(pre2);
-        evicted = try statNumber(pre2, "meta_kv_node_cache_evictions");
+    // A loaded venue can still be flushing the first batch, so those
+    // nodes are dirty and the sweep skips them. One eviction can also be
+    // a later leaf, leaving mine/t cached. One more clean wave always.
+    const more =
+        \\python3 -c '
+        \\import os
+        \\blob = b"x"*60000
+        \\for i in range(40, 80):
+        \\    p = "mine/e%d" % i
+        \\    fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
+        \\    os.close(fd)
+        \\    os.setxattr(p, "user.p", blob)
+        \\' && sync -f mine
+    ;
+    const again = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "sh", "-c", more }, .cwd = .{ .path = rig.daemons.items[j].mp }, .environ_map = &rig.env });
+    defer rig.freeRun(again);
+    if (!again.term.success()) {
+        std.debug.print("\n--- F7a second fill failed ({f}) ---\n{s}\n{s}\n", .{ again.term, again.stdout, again.stderr });
+        return error.FillFailed;
     }
+    const pre2 = try rig.stats(j);
+    defer gpa.free(pre2);
+    evicted = try statNumber(pre2, "meta_kv_node_cache_evictions");
     std.debug.print("\n--- F7a fill: node-cache evictions {d} ---\n", .{evicted});
     if (evicted == 0) {
         printLogTailFile(rig, rig.daemons.items[j].log_path, 40);

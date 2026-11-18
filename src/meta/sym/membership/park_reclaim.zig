@@ -487,6 +487,37 @@ test "ties: T_park_max = failover_bound + grace (≈ 91.5 s at the design's row)
     try testing.expectEqual(lease_clock.T_OWNER_MS, graceMs(lease_clock.T_OWNER_MS));
 }
 
+test "the bind extension keeps a park alive past the base T_park_max; without it, expireIfDue fires in that window (decision 0004 §4.5.6, §8.3)" {
+    // Scaled stand-in for a 1 GiB bring-up: the base bound is 100 ms, the
+    // extended deadline is 190 ms. A successor still binding at 150 ms
+    // poisons the member if the extension is skipped.
+    const t0: u64 = 10;
+    const ms = std.time.ns_per_ms;
+    var skipped: Poison = .{};
+    var g_skip = ParkGate.arm(testing.io, 0, 100);
+    try testing.expectEqual(@as(?u32, 0), g_skip.parkFor(.succession, t0));
+    stats.appender_park_expiries.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expect(g_skip.expireIfDue(t0 + 150 * ms, skipped.sink()));
+    try log.testing.expectAllFired();
+    try testing.expect(g_skip.isExpired());
+    try testing.expectEqual(@as(u32, 1), skipped.count);
+
+    var kept: Poison = .{};
+    var g_keep = ParkGate.arm(testing.io, 0, 100);
+    try testing.expectEqual(@as(?u32, 0), g_keep.parkFor(.succession, t0));
+    try testing.expect(g_keep.extendTo(7, 190));
+    try testing.expect(!g_keep.expireIfDue(t0 + 150 * ms, kept.sink()));
+    try testing.expect(g_keep.isParked());
+    try testing.expectEqual(@as(u32, 0), kept.count);
+    stats.appender_park_expiries.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expect(g_keep.expireIfDue(t0 + 190 * ms, kept.sink()));
+    try log.testing.expectAllFired();
+    try testing.expect(g_keep.isExpired());
+    try testing.expectEqual(@as(u32, 1), kept.count);
+}
+
 test "the seven steps: a running gate admits; the park holds the in-flight count; a committer withdraws while parked; the reclaim releases exactly once with the phases recorded; a leave over a park is refused; the class split poisons remote custody only" {
     var g = ParkGate.arm(testing.io, 3, 1000);
     var p: Poison = .{};

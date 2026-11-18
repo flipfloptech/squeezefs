@@ -1331,7 +1331,9 @@ pub const JoinedSet = struct {
                 if (page0Owner(mapped)) |p0| {
                     const t_owner_ms = shard.tOwnerMsFromEnv(self.be.env);
                     const elapsed_ms = self.park_gate.parkedAgeNs(clock.monotonicNs()) / std.time.ns_per_ms;
-                    _ = self.park_gate.extendTo(p0.term, elapsed_ms +| t_owner_ms +| park.graceMs(t_owner_ms));
+                    if (self.park_gate.extendTo(p0.term, elapsed_ms +| t_owner_ms +| park.graceMs(t_owner_ms))) {
+                        member_fence.stats.meta_pr_park_extensions.inc();
+                    }
                 }
             }
         }

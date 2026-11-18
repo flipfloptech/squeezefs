@@ -34,6 +34,9 @@ pub const stats = struct {
     /// `held` verdicts, by the caller that unwound them (decision 0004 §8.2).
     /// `open` stays 0: bring-up's `Held` answers refuse the mount, they do not unwind.
     pub var meta_pr_held_returns: HeldReturns = .{};
+    /// A park beat extended the deadline once for an observed successor bind
+    /// (decision 0004 §4.5.6).
+    pub var meta_pr_park_extensions: counters.ShardedCounter = .{};
 };
 
 /// One counter per caller that unwinds a `held` verdict.

@@ -13,20 +13,38 @@ LOG=$LOG_DIR/rows.log
 : > "$LOG"
 exec > >(stdbuf -oL tee -a "$LOG") 2>&1
 
-# Historical "27 rows" / 71 tests: the KILL, eviction, and re-join family.
-# -Dtest-filter replaces the default smoke: prefix, so this must still
-# match those names.
-ROWS_FILTER='THE KILL ROWS|CLEAN UNMOUNT AND REJOIN|MEMBER JOINS A SET WHOSE MANAGER|LIVE MEMBER EVICTED|RE-JOIN|RE-JOINS'
+# zig build test is units only. The smoke family is `zig build smoke`.
+# -Dtest-filter is a substring, repeatable (OR), not a regex.
+# The historical "27 rows" are the KILL / eviction / re-join family.
+SMOKE_FILTERS=(
+  "THE KILL ROWS"
+  "CLEAN UNMOUNT AND REJOIN"
+  "MEMBER JOINS A SET WHOSE MANAGER"
+  "LIVE MEMBER EVICTED"
+  "RE-JOIN"
+  "A DEAD MANAGER HOLDING A STRIPED HOT DIRECTORY"
+  "A LIVE MEMBER'S SLOW FOLLOW-UP"
+  "THE N-DAEMON POSTURE, the manager half"
+  "A SECOND MOUNT AT A LIVE JOINER"
+  "A SECOND MOUNT WHOSE CENSUS"
+  "THE SHARED HOT DIRECTORY ACROSS DAEMONS"
+)
 CHURN_FILTER='the owner under churn (decision 0003 §DM)'
 
-echo "pr6 rows: $RUNS passes, log $LOG"
+filter_args=()
+for f in "${SMOKE_FILTERS[@]}"; do
+  filter_args+=(-Dtest-filter="$f")
+done
+
+echo "pr6 rows: $RUNS smoke passes plus the §DM churn unit, log $LOG"
+
+echo "=== §DM churn unit ==="
+zig build --cache-dir "$CACHE" --prefix "$PREFIX" test --summary all -Dtest-filter="$CHURN_FILTER"
 
 n=1
 while [ "$n" -le "$RUNS" ]; do
   echo "=== smoke eviction/re-join/KILL family run $n/$RUNS ==="
-  zig build --cache-dir "$CACHE" --prefix "$PREFIX" test --summary all -Dtest-filter="$ROWS_FILTER"
-  echo "=== §DM churn unit run $n/$RUNS ==="
-  zig build --cache-dir "$CACHE" --prefix "$PREFIX" test --summary all -Dtest-filter="$CHURN_FILTER"
+  zig build --cache-dir "$CACHE" --prefix "$PREFIX" smoke --summary all "${filter_args[@]}"
   n=$((n + 1))
 done
 

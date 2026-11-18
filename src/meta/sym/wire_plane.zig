@@ -451,6 +451,12 @@ const JoinedHalf = struct {
         _ = self.plane.divert.repoint(self.plane.io, MANAGER_HOLDER, MANAGER_HOLDER);
         _ = self.plane.publishToManager();
         log.info("cluster wire: the home shard's successor at {f} admitted the reclaim (epoch {d}) — the manager's token plane re-pointed, this listener re-published", .{ self.js.managerEndpoint(), epoch });
+        // A T_self park is also "reclaiming against the successor". The
+        // beat only releases `reason == .succession` (after PR
+        // re-registration). Without this, a T_self park from a stopped
+        // manager outlives T_park_max and poisons the joiner during the
+        // next succession (PR-6 soak cycle 3).
+        if (self.js.park_gate.reason == .t_self) _ = self.js.park_gate.release(0, 0);
     }
 
     /// The member's carriage: an offer queued for the follower, a release

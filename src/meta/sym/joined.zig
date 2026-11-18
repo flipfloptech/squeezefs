@@ -1477,7 +1477,7 @@ pub const JoinedSet = struct {
                     // clears on seeing the flag already has this line.
                     log.warn("meta volume {s}: re-registered this host under key {x:0>16} after a succession", .{ self.be.path, f.client.key });
                     self.succession_key_outstanding.store(false, .release);
-                    if (!self.peerKeyOutstanding() and self.park_gate.reason == .succession) {
+                    if (!self.peerKeyOutstanding() and self.park_gate.isParked()) {
                         _ = self.park_gate.release(0, 0);
                         _ = self.resolution.clear();
                     }

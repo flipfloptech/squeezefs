@@ -7149,7 +7149,9 @@ test "nvmet fidelity: pr6 succession soak (decision 0004 §8.3) — two joiners 
         try rig.awaitLog(s, "ready: ", soak_ready_ns);
         if (std.mem.eql(u8, mode, "stop")) try rig.kill9(mgr);
 
-        const settle_deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+        // A clean manager unmount can settle at the grace deadline (T_owner
+        // after the successor armed), not early. Wait past that bound.
+        const settle_deadline = clock.monotonicNs() + (lease_clock.T_OWNER_MS + 20_000) * std.time.ns_per_ms;
         var settles: u64 = 0;
         var early: u64 = 0;
         while (clock.monotonicNs() < settle_deadline) {

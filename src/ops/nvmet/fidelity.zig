@@ -7033,7 +7033,9 @@ const SoakWriter = struct {
         while (!self.stop.load(.acquire)) {
             i += 1;
             var line: [256]u8 = undefined;
-            const cmd = std.fmt.bufPrint(&line, "mkdir -p {s} && n=0 && while [ $n -lt 140 ]; do printf '{s}-{d}\\n' > {s}/f{d} && sync -d {s}/f{d} && exit 0; n=$((n+1)); sleep 0.5; done; exit 1", .{ self.dir, self.tag, i, self.dir, i, self.dir, i }) catch {
+            // 200 s covers T_self + grace, so a write started at a clean
+            // manager unmount can land after the joiner reclaims.
+            const cmd = std.fmt.bufPrint(&line, "mkdir -p {s} && n=0 && while [ $n -lt 400 ]; do printf '{s}-{d}\\n' > {s}/f{d} && sync -d {s}/f{d} && exit 0; n=$((n+1)); sleep 0.5; done; exit 1", .{ self.dir, self.tag, i, self.dir, i, self.dir, i }) catch {
                 self.failed.store(true, .release);
                 return;
             };
@@ -7046,6 +7048,17 @@ const SoakWriter = struct {
         }
     }
 };
+
+fn soakCopyLogs(rig: *Rig) void {
+    const dest = std.testing.environ.getPosix("SQZ_SOAK_LOG_DIR") orelse return;
+    for (rig.daemons.items) |d| {
+        const name = std.fs.path.basename(d.log_path);
+        var out_buf: [512]u8 = undefined;
+        const out = std.fmt.bufPrint(&out_buf, "{s}/{s}", .{ dest, name }) catch continue;
+        const r = std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "cp", "-a", d.log_path, out } }) catch continue;
+        defer rig.freeRun(r);
+    }
+}
 
 fn soakReadStats(rig: *Rig, d: usize) ![]u8 {
     // A joiner mid-re-registration can answer EIO on `.stats` (errno 5).
@@ -7089,7 +7102,10 @@ fn soakAssertHealthy(rig: *Rig, d: usize, who: []const u8) !void {
 test "nvmet fidelity: pr6 succession soak (decision 0004 §8.3) — two joiners on two hosts write and fsync throughout, plus one data writer; the manager cycles SIGKILL, SIGSTOP past the claim TTL, and a clean unmount; a successor on a fourth host takes over each time; 0 fail-stops, appender_park_expiries 0, settles equal the cycle count with almost all early, fsynced bytes back, fsck 0, meta_pr_preempt_kept 0, data_pr_reconcile_in_window 0" {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
-    defer rig.deinit();
+    defer {
+        soakCopyLogs(rig);
+        rig.deinit();
+    }
     if (std.testing.environ.getPosix("SQUEEZEFS_TEST_SOAK_CYCLES")) |v| try rig.env.put("SQUEEZEFS_TEST_SOAK_CYCLES", v);
     if (std.testing.environ.getPosix("SQUEEZEFS_TEST_SOAK_JOURNAL_MB")) |v| try rig.env.put("SQUEEZEFS_TEST_SOAK_JOURNAL_MB", v);
     const cycles = knobs.intKnob("SQUEEZEFS_TEST_SOAK_CYCLES", u32, &rig.env);
@@ -7214,7 +7230,20 @@ test "nvmet fidelity: pr6 succession soak (decision 0004 §8.3) — two joiners 
     t1.join();
     t2.join();
     td.join();
-    if (w1.failed.load(.acquire) or w2.failed.load(.acquire) or wd.failed.load(.acquire)) return error.WriterFailed;
+    if (w1.failed.load(.acquire) or w2.failed.load(.acquire) or wd.failed.load(.acquire)) {
+        std.debug.print("\n--- soak writer failed: j1={s} fsynced={d}, j2={s} fsynced={d}, data={s} fsynced={d} ---\n", .{
+            if (w1.failed.load(.acquire)) "FAILED" else "ok",
+            w1.fsynced.load(.acquire),
+            if (w2.failed.load(.acquire)) "FAILED" else "ok",
+            w2.fsynced.load(.acquire),
+            if (wd.failed.load(.acquire)) "FAILED" else "ok",
+            wd.fsynced.load(.acquire),
+        });
+        rig.printLogTail(j1, 80);
+        rig.printLogTail(j2, 80);
+        rig.printLogTail(mgr, 40);
+        return error.WriterFailed;
+    }
 
     const n1 = w1.fsynced.load(.acquire);
     const n2 = w2.fsynced.load(.acquire);

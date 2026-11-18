@@ -1965,15 +1965,19 @@ fn daemonSetFormat(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, po
 }
 
 fn daemonSetSized(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [2]u16, mode: []const []const u8, format_extra: []const []const u8, data_size: u64) !DaemonSet {
-    return daemonSetKeepingData(rig, prefix, transport, ports, mode, format_extra, data_size, false);
+    return daemonSetKeepingData(rig, prefix, transport, ports, mode, format_extra, data_size, meta_len, false);
+}
+
+fn daemonSetFormatMeta(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [2]u16, format_extra: []const []const u8, meta_size: u64) !DaemonSet {
+    return daemonSetKeepingData(rig, prefix, transport, ports, &.{}, format_extra, data_len, meta_size, false);
 }
 
 /// `keep_data` leaves the formatting connect up, so the device path stored
 /// in the set config still names that namespace (fsck opens it by path).
-fn daemonSetKeepingData(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [2]u16, mode: []const []const u8, format_extra: []const []const u8, data_size: u64, keep_data: bool) !DaemonSet {
+fn daemonSetKeepingData(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, ports: [2]u16, mode: []const []const u8, format_extra: []const []const u8, data_size: u64, meta_size: u64, keep_data: bool) !DaemonSet {
     var mb: [64]u8 = undefined;
     var db: [64]u8 = undefined;
-    const meta_nqn = try rig.share(try std.fmt.bufPrint(&mb, "{s}meta", .{prefix}), meta_len, transport, ports[0]);
+    const meta_nqn = try rig.share(try std.fmt.bufPrint(&mb, "{s}meta", .{prefix}), meta_size, transport, ports[0]);
     const data_nqn = try rig.share(try std.fmt.bufPrint(&db, "{s}data", .{prefix}), data_size, transport, ports[1]);
     const cm = try rig.connect(meta_nqn, transport, ports[0], null, &.{});
     const cd = try rig.connect(data_nqn, transport, ports[1], null, &.{});
@@ -2747,6 +2751,7 @@ fn readyOrDead(rig: *Rig, d: usize) !bool {
 }
 
 const ident_c: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0", .hostid = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0" };
+const ident_d: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:d0d0d0d0-d0d0-4d0d-8d0d-d0d0d0d0d0d0", .hostid = "d0d0d0d0-d0d0-4d0d-8d0d-d0d0d0d0d0d0" };
 
 test "nvmet fidelity: pr5 F2 — two successors (decision 0004 §8.2) — one manager per volume and per-host fencing's safety rule on a three-host set: B (host A's manager) and A (a joiner on host A) under host A's one identity (B registers the host, A adopts); B frozen (SIGSTOP) past the claim's TTL; two successors on hosts B and C race for the role — P1 arbitrates and parks before its claim (SQUEEZEFS_TEST_GATE_ARBITRATED_HOLD), P2 arbitrates meanwhile: the device keeps ONE holder (WEAR, rtype 5): P2's preempt-all removes P1's host, P2 binds and P1 never does; host A was fenced by the takeover — a fresh mount on host A whose kill of B is refused (SQUEEZEFS_TEST_SIBLING_KILL_REFUSED) refuses its registration loud by name and exits, B alive; A's fsync then re-registers, killing the superseded B (decision 0004 §4.5.5), and the write lands; A2, after A is killed, adopts the standing registration, joins P2 and writes; P2 reads both" {
     const gpa = testing.allocator;
@@ -7002,6 +7007,239 @@ test "nvmet fidelity: pr5 F14 — a held handover beside the member's carriage a
     _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
     _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    try rig.disconnect(&cm_c);
+    try rig.disconnect(&cm_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(set.data_nqn);
+    try rig.unshare(set.meta_nqn);
+    try expectNoResidue(rig, set.meta_nqn);
+    try expectNoResidue(rig, set.data_nqn);
+}
+
+const soak_ready_ns: u64 = 180 * std.time.ns_per_s;
+const soak_meta_large: u64 = 2 << 30;
+
+const SoakWriter = struct {
+    rig: *Rig,
+    d: usize,
+    dir: []const u8,
+    tag: []const u8,
+    stop: *std.atomic.Value(bool),
+    fsynced: std.atomic.Value(u64) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *SoakWriter) void {
+        var i: u64 = 0;
+        while (!self.stop.load(.acquire)) {
+            i += 1;
+            var line: [256]u8 = undefined;
+            const cmd = std.fmt.bufPrint(&line, "mkdir -p {s} && n=0 && while [ $n -lt 140 ]; do printf '{s}-{d}\\n' > {s}/f{d} && sync -d {s}/f{d} && exit 0; n=$((n+1)); sleep 0.5; done; exit 1", .{ self.dir, self.tag, i, self.dir, i, self.dir, i }) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            const ok = scriptSucceeds(self.rig, self.d, cmd) catch false;
+            if (!ok) {
+                self.failed.store(true, .release);
+                return;
+            }
+            self.fsynced.store(i, .release);
+        }
+    }
+};
+
+fn soakStat(rig: *Rig, d: usize, key: []const u8) u64 {
+    const st = rig.stats(d) catch return 0;
+    defer rig.gpa.free(st);
+    return json_scan.number(st, key) orelse 0;
+}
+
+fn soakAssertHealthy(rig: *Rig, d: usize, who: []const u8) !void {
+    const st = try rig.stats(d);
+    defer rig.gpa.free(st);
+    const expiries = json_scan.number(st, "appender_park_expiries") orelse 0;
+    const fenced = json_scan.number(st, "writer_guard_fenced") orelse 0;
+    const vol = json_scan.number(st, "volume_fenced") orelse 0;
+    const kept = json_scan.number(st, "meta_pr_preempt_kept") orelse 0;
+    const in_win = json_scan.number(st, "data_pr_reconcile_in_window") orelse 0;
+    if (expiries != 0 or fenced != 0 or vol != 0 or kept != 0 or in_win != 0) {
+        std.debug.print("\n--- soak {s} fail-stop: expiries {d} fenced {d} volume_fenced {d} preempt_kept {d} reconcile_in_window {d} ---\n", .{ who, expiries, fenced, vol, kept, in_win });
+        rig.printLogTail(d, 40);
+        return error.SoakFailStop;
+    }
+}
+
+test "nvmet fidelity: pr6 succession soak (decision 0004 §8.3) — two joiners on two hosts write and fsync throughout, plus one data writer; the manager cycles SIGKILL, SIGSTOP past the claim TTL, and a clean unmount; a successor on a fourth host takes over each time; 0 fail-stops, appender_park_expiries 0, settles equal the cycle count with almost all early, fsynced bytes back, fsck 0, meta_pr_preempt_kept 0, data_pr_reconcile_in_window 0" {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    if (std.testing.environ.getPosix("SQUEEZEFS_TEST_SOAK_CYCLES")) |v| try rig.env.put("SQUEEZEFS_TEST_SOAK_CYCLES", v);
+    if (std.testing.environ.getPosix("SQUEEZEFS_TEST_SOAK_JOURNAL_MB")) |v| try rig.env.put("SQUEEZEFS_TEST_SOAK_JOURNAL_MB", v);
+    const cycles = knobs.intKnob("SQUEEZEFS_TEST_SOAK_CYCLES", u32, &rig.env);
+    const journal_mb = knobs.intKnob("SQUEEZEFS_TEST_SOAK_JOURNAL_MB", u32, &rig.env);
+    const transport: configfs.Trtype = .loop;
+    const ports = try rig.servicePorts(transport);
+    var jb: [16]u8 = undefined;
+    const set = if (journal_mb == 0)
+        try symmetricSet(rig, "soak", transport, ports)
+    else blk: {
+        const ring = try std.fmt.bufPrint(&jb, "{d}", .{journal_mb});
+        break :blk try daemonSetFormatMeta(rig, "soak", transport, ports, &.{ "--meta-journal-mb", ring }, soak_meta_large);
+    };
+    const cm = set.cm;
+    const cm_b = try rig.connect(set.meta_nqn, transport, 0, ident_b, &.{});
+    const cm_c = try rig.connect(set.meta_nqn, transport, 0, ident_c, &.{});
+    const cm_d = try rig.connect(set.meta_nqn, transport, 0, ident_d, &.{});
+    var mu_b: [64]u8 = undefined;
+    const uri_b = try std.fmt.bufPrint(&mu_b, "sqmeta://{s}", .{cm_b.dev()});
+    var mu_c: [64]u8 = undefined;
+    const uri_c = try std.fmt.bufPrint(&mu_c, "sqmeta://{s}", .{cm_c.dev()});
+    var mu_d: [64]u8 = undefined;
+    const uri_d = try std.fmt.bufPrint(&mu_d, "sqmeta://{s}", .{cm_d.dev()});
+    const uri_a = set.metaUri();
+
+    var mgr = try rig.spawnMount("soak-m", uri_a, ident_a, &.{});
+    try rig.awaitLog(mgr, "ready: ", soak_ready_ns);
+    const j1 = try rig.spawnMount("soak-j1", uri_b, ident_b, &.{});
+    try rig.awaitLog(j1, "ready: ", soak_ready_ns);
+    const j2 = try rig.spawnMount("soak-j2", uri_c, ident_c, &.{});
+    try rig.awaitLog(j2, "ready: ", soak_ready_ns);
+    try testing.expect(try scriptSucceeds(rig, j1, "mkdir -p j1 data && echo seed > j1/seed && sync -d j1/seed"));
+    try testing.expect(try scriptSucceeds(rig, j2, "mkdir -p j2 && echo seed > j2/seed && sync -d j2/seed"));
+
+    var stop = std.atomic.Value(bool).init(false);
+    var w1: SoakWriter = .{ .rig = rig, .d = j1, .dir = "j1", .tag = "j1", .stop = &stop };
+    var w2: SoakWriter = .{ .rig = rig, .d = j2, .dir = "j2", .tag = "j2", .stop = &stop };
+    var wd: SoakWriter = .{ .rig = rig, .d = j1, .dir = "data", .tag = "data", .stop = &stop };
+    const t1 = try std.Thread.spawn(.{}, SoakWriter.run, .{&w1});
+    const t2 = try std.Thread.spawn(.{}, SoakWriter.run, .{&w2});
+    const td = try std.Thread.spawn(.{}, SoakWriter.run, .{&wd});
+
+    var settles_total: u64 = 0;
+    var early_total: u64 = 0;
+    var extensions_total: u64 = 0;
+    var mgr_on_a = true;
+    const modes = [_][]const u8{ "kill", "stop", "umount" };
+
+    var cycle: u32 = 0;
+    while (cycle < cycles) : (cycle += 1) {
+        if (w1.failed.load(.acquire) or w2.failed.load(.acquire) or wd.failed.load(.acquire)) {
+            stop.store(true, .release);
+            t1.join();
+            t2.join();
+            td.join();
+            return error.WriterFailed;
+        }
+        const mode = modes[cycle % 3];
+        const next_uri = if (mgr_on_a) uri_d else uri_a;
+        const next_ident: initiator.HostPair = if (mgr_on_a) ident_d else ident_a;
+        var name_buf: [32]u8 = undefined;
+        const sname = try std.fmt.bufPrint(&name_buf, "soak-s{d}", .{cycle});
+
+        if (std.mem.eql(u8, mode, "kill")) {
+            try rig.kill9(mgr);
+        } else if (std.mem.eql(u8, mode, "stop")) {
+            _ = linux.kill(rig.daemons.items[mgr].pid, .STOP);
+            sleepMs(lease_clock.T_OWNER_MS + 5_000);
+        } else {
+            try rig.umount(mgr);
+        }
+
+        const s = try rig.spawnMount(sname, next_uri, next_ident, &.{});
+        const t_ready = clock.monotonicNs();
+        try rig.awaitLog(s, "ready: ", soak_ready_ns);
+        if (std.mem.eql(u8, mode, "stop")) try rig.kill9(mgr);
+
+        const settle_deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+        var settles: u64 = 0;
+        var early: u64 = 0;
+        while (clock.monotonicNs() < settle_deadline) {
+            const st = try rig.stats(s);
+            settles = json_scan.number(st, "writer_guard_succession_settles") orelse 0;
+            early = json_scan.number(st, "writer_guard_succession_early_settles") orelse 0;
+            gpa.free(st);
+            if (settles >= 1) break;
+            sleepMs(200);
+        }
+        const window_ms = (clock.monotonicNs() - t_ready) / std.time.ns_per_ms;
+        if (settles < 1) {
+            stop.store(true, .release);
+            t1.join();
+            t2.join();
+            td.join();
+            std.debug.print("\n--- soak cycle {d}: window did not settle ---\n", .{cycle + 1});
+            rig.printLogTail(s, 50);
+            return error.NoSettle;
+        }
+        const ss = try rig.stats(s);
+        defer gpa.free(ss);
+        const probes = json_scan.number(ss, "writer_guard_claim_probes") orelse 0;
+        const probe_bytes = json_scan.number(ss, "writer_guard_claim_probe_bytes") orelse 0;
+        const frames = json_scan.number(ss, "writer_guard_claim_probe_frames") orelse 0;
+        const ext_j1 = soakStat(rig, j1, "meta_pr_park_extensions");
+        const ext_j2 = soakStat(rig, j2, "meta_pr_park_extensions");
+        std.debug.print("\n--- soak cycle {d}/{d} mode={s} settles={d} early={d} extensions={d}+{d} probes={d} probe_bytes={d} frames={d} window_ms={d} ---\n", .{ cycle + 1, cycles, mode, settles, early, ext_j1, ext_j2, probes, probe_bytes, frames, window_ms });
+        try soakAssertHealthy(rig, j1, "j1");
+        try soakAssertHealthy(rig, j2, "j2");
+        try soakAssertHealthy(rig, s, "s");
+        settles_total += settles;
+        early_total += early;
+        extensions_total += ext_j1 + ext_j2;
+        mgr = s;
+        mgr_on_a = !mgr_on_a;
+    }
+
+    stop.store(true, .release);
+    t1.join();
+    t2.join();
+    td.join();
+    if (w1.failed.load(.acquire) or w2.failed.load(.acquire) or wd.failed.load(.acquire)) return error.WriterFailed;
+
+    const n1 = w1.fsynced.load(.acquire);
+    const n2 = w2.fsynced.load(.acquire);
+    const nd = wd.fsynced.load(.acquire);
+    var check_buf: [768]u8 = undefined;
+    const check = try std.fmt.bufPrint(&check_buf,
+        \\python3 -c '
+        \\import pathlib
+        \\for tag, n in (("j1", {d}), ("j2", {d}), ("data", {d})):
+        \\    d = pathlib.Path(tag)
+        \\    for i in range(1, n + 1):
+        \\        t = (d / ("f%d" % i)).read_text()
+        \\        assert t.startswith("%s-%d" % (tag, i)), (tag, i, t[:40])
+        \\print("ok", {d}, {d}, {d})
+        \\'
+    , .{ n1, n2, nd, n1, n2, nd });
+    const seen = rig.onMount(j1, check) catch |e| {
+        std.debug.print("\n--- soak fsynced-byte check failed ---\n", .{});
+        return e;
+    };
+    defer gpa.free(seen);
+    std.debug.print("\n--- soak totals: settles {d} early {d} extensions {d} fsynced j1={d} j2={d} data={d} ---\n{s}", .{ settles_total, early_total, extensions_total, n1, n2, nd, seen });
+    try testing.expectEqual(cycles, @as(u32, @intCast(settles_total)));
+    try testing.expect(early_total >= (if (cycles >= 20) @as(u64, 18) else cycles));
+    try testing.expect(n1 >= 1 and n2 >= 1 and nd >= 1);
+
+    try rig.umount(j1);
+    try rig.umount(j2);
+    try rig.umount(mgr);
+    const soak_bound = try bindDataForFsck(rig, &set, transport);
+    defer if (soak_bound) {
+        var stored_buf: [64]u8 = undefined;
+        if (std.fmt.bufPrintSentinel(&stored_buf, "{s}", .{set.dataDev()}, 0)) |stored_z| {
+            _ = linux.umount2(stored_z.ptr, linux.MNT.DETACH);
+        } else |_| {}
+    };
+    const soak_fsck = try rig.sqz(&.{ "fsck", "--offline", "--scrub", set.metaUri() });
+    defer rig.freeRun(soak_fsck);
+    if (!soak_fsck.term.success() or std.mem.indexOf(u8, soak_fsck.stdout, "findings: 0 (clean)") == null) {
+        std.debug.print("\n--- fsck --offline --scrub ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ soak_fsck.term, soak_fsck.stdout, soak_fsck.stderr });
+        return error.FsckNotClean;
+    }
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_a);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_b);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_c);
+    _ = try rig.disconnectIdentity(set.data_nqn, ident_d);
+    try rig.disconnect(&cm_d);
     try rig.disconnect(&cm_c);
     try rig.disconnect(&cm_b);
     try rig.disconnect(&cm);

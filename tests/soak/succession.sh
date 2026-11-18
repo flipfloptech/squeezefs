@@ -64,11 +64,25 @@ exec > >(stdbuf -oL tee -a "$LOG") 2>&1
 
 echo "pr6 succession soak: ring=$RING cycles=$CYCLES log=$LOG"
 
-# The nvmet driver (two host identities, the writer storm, and the
-# three-way manager cycle) lands next on this branch. The unit in
-# park_reclaim.zig already pins that a skipped bind extension expires
-# the park in the large-ring window, which is the soak's large-ring
-# assertion.
-echo "pr6 succession soak: driver not wired yet (ring=$RING cycles=$CYCLES)"
-echo "NEXT: tests/soak/succession.sh needs the nvmet two-host driver"
-exit 2
+CACHE=${SQZ_BUILD_ROOT:-/build}/zig-cache-v2
+PREFIX=${PREFIX:-zig-out-linux}
+export SQUEEZEFS_TEST_SOAK_CYCLES=$CYCLES
+if [ "$RING" = 1024 ]; then
+  export SQUEEZEFS_TEST_SOAK_JOURNAL_MB=1024
+else
+  unset SQUEEZEFS_TEST_SOAK_JOURNAL_MB
+  export SQUEEZEFS_TEST_SOAK_JOURNAL_MB=0
+fi
+
+set +e
+zig build --cache-dir "$CACHE" --prefix "$PREFIX" succession-soak --summary all
+ec=$?
+set -e
+if [ "$ec" -ne 0 ] || grep -E "steps succeeded \\(.* failed\\)|error: '.+' failed|HUNG TEST:" "$LOG" >/dev/null; then
+  echo "pr6 succession soak: FAILED ring=$RING cycles=$CYCLES exit=$ec"
+  echo "$ec" > "$LOG_DIR/succession-$RING.exit"
+  exit "${ec:-1}"
+fi
+echo "pr6 succession soak: ring=$RING cycles=$CYCLES done"
+echo "DONE"
+echo 0 > "$LOG_DIR/succession-$RING.exit"

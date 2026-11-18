@@ -419,6 +419,21 @@ pub fn build(b: *std.Build) void {
     const nvmet_smoke_step = b.step("nvmet-smoke", "Run the nvmeof fidelity tier (share/connect/format/mount/PR legs on the kernel nvmet target)");
     nvmet_smoke_runs.wire(nvmet_smoke_step);
 
+    // The PR-6 succession soak is not part of the gate: 20 cycles with
+    // SIGSTOP past T_owner exceed the gate's 900 s hang clamp.
+    const soak_tests = b.addTest(.{
+        .name = "squeezefs-succession-soak",
+        .root_module = squeezefs_mod,
+        .filters = &.{"pr6 succession soak"},
+        .test_runner = test_runner,
+    });
+    const run_soak = b.addRunArtifact(soak_tests);
+    run_soak.setCwd(exe.getEmittedBinDirectory());
+    run_soak.has_side_effects = true;
+    run_soak.addArg("--hang-limit-ms=7200000");
+    const soak_step = b.step("succession-soak", "PR-6 succession soak (decision 0004 §8.3): 20 successions at the derived or 1 GiB ring");
+    soak_step.dependOn(&run_soak.step);
+
     // ---- the nightly fuzz campaign (charter §11 "nightly fuzz"): the
     //      driver runs the build runner's fuzzer on every census target for
     //      `SQUEEZEFS_TEST_FUZZ_SECONDS` each, persists the corpus under

@@ -256,6 +256,14 @@ pub const LeaseClocks = struct {
         return .{ .t_owner_ms = t_owner_ms, .skew_max_ms = skew, .d_purge_ms = purge, .t_self_ms = t_self, .renew_ms = lease_clock.renewIntervalMs(t_self), .grace_ms = park.graceMs(t_owner_ms) };
     }
 
+    /// How long a successor waits for expected members to re-assert. A
+    /// member who last renewed just before the predecessor left parks at
+    /// `T_self` and then reclaims; `grace` alone, started when this
+    /// successor arms, can expire in that same instant.
+    pub fn successionGraceMs(self: LeaseClocks) u64 {
+        return self.t_self_ms +| self.grace_ms;
+    }
+
     /// The grant's clock words.
     pub fn grantHead(self: LeaseClocks, epoch: u64, term: u64, now_ms: u64, ack_prior_epoch: u64) verbs.GrantHead {
         return .{ .epoch = epoch, .term = term, .granted_at_owner_ms = now_ms, .ack_prior_epoch = ack_prior_epoch, .t_owner_ms = @intCast(self.t_owner_ms), .skew_max_ms = @intCast(self.skew_max_ms), .d_purge_ms = @intCast(self.d_purge_ms), .renew_ms = @intCast(self.renew_ms), .checkpoint_ceiling_ms = CHECKPOINT_LANDING_CEILING_MS, .n_ack = 0, .n_release = 0, .n_offered = 0, .reserved = @splat(0), .config_generation = 0 };
@@ -582,7 +590,11 @@ pub const Owner = struct {
         var grace: ?Grace = null;
         errdefer if (grace) |*g| g.deinit(gpa);
         if (expected.len != 0) {
-            grace = .{ .until_ms = now_ms + clocks.grace_ms };
+            // A member who last renewed just before the predecessor left
+            // parks at T_self, then reclaims. Grace of T_owner alone, started
+            // when this successor arms, can expire in that same instant.
+            // The window is T_self + grace so the reclaim still lands.
+            grace = .{ .until_ms = now_ms + clocks.successionGraceMs() };
             try grace.?.expected.appendSlice(gpa, expected);
         }
         const dead = try gpa.dupe(Expected, pre_dead);
@@ -1799,10 +1811,11 @@ test "grace, two halves on one deadline: a stranger is refused while the fresh h
     var deaths: Deaths = .{};
     defer deaths.list.deinit(gpa);
     o.bindDeathSink(deaths.sink());
-    try testing.expectEqual(@as(u64, 45_000), o.graceRemainingMs(10_000));
+    const window = clocks.successionGraceMs();
+    try testing.expectEqual(window, o.graceRemainingMs(10_000));
     // A stranger: refused naming the remaining window.
     const gr = o.join(joinReqOf(7, null, "/m7"), 11_000).grace_refused;
-    try testing.expectEqual(@as(u64, 44_000), gr.retry_after_ms);
+    try testing.expectEqual(window - 1_000, gr.retry_after_ms);
     try testing.expectEqual(Liveness.unknown, o.liveness(writerMemberId(testIdentity(7)), 11_000));
     // A's first join without an epoch is a re-assertion (expected).
     const reclaims0 = stats.membership_grace_reclaims.load();
@@ -1814,21 +1827,35 @@ test "grace, two halves on one deadline: a stranger is refused while the fresh h
     try testing.expectEqual(@as(u64, 9), gb.ack_prior_epoch);
     try testing.expect(o.join(joinReqOf(7, null, "/m7"), 15_000) == .granted);
     // The re-assertion half still admits a prior epoch of an unknown member until the deadline.
-    try testing.expect(o.join(joinReqOf(8, 3, "/m8"), 54_999) == .granted);
-    try testing.expect(o.join(joinReqOf(9, 3, "/m9"), 55_000) == .unknown_lease);
+    try testing.expect(o.join(joinReqOf(8, 3, "/m8"), 10_000 + window - 1) == .granted);
+    try testing.expect(o.join(joinReqOf(9, 3, "/m9"), 10_000 + window) == .unknown_lease);
     // Nobody died: both expected re-asserted.
-    try testing.expectEqual(@as(u32, 0), o.reapGraceDeadline(55_000));
+    try testing.expectEqual(@as(u32, 0), o.reapGraceDeadline(10_000 + window));
     try testing.expectEqual(@as(usize, 0), deaths.list.items.len);
     // A second owner whose expected member never returns: dead at the deadline, once.
     var o2 = try Owner.arm(gpa, testing.io, clocks, 1, 2, 1, &.{.{ .id = a, .key = 0x9999 }}, &.{}, 0);
     defer o2.deinit();
     o2.bindDeathSink(deaths.sink());
-    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(44_999));
-    try testing.expectEqual(@as(u32, 1), o2.reapGraceDeadline(45_000));
-    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(46_000));
+    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(window - 1));
+    try testing.expectEqual(@as(u32, 1), o2.reapGraceDeadline(window));
+    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(window + 1));
     try testing.expectEqual(@as(u64, 0), deaths.list.items[0].epoch);
     try testing.expectEqual(@as(u64, 0x9999), deaths.list.items[0].pr_key);
-    try testing.expectEqual(Liveness.dead, o2.liveness(a, 45_000));
+    try testing.expectEqual(Liveness.dead, o2.liveness(a, window));
+}
+
+test "the successor's grace covers a member who parks at T_self after the predecessor left (PR-6 soak): reap is not due at T_self, and is due at T_self + grace" {
+    const gpa = testing.allocator;
+    const clocks = try LeaseClocks.derive(45_000, 0, 100);
+    const a = writerMemberId(testIdentity(1));
+    var o = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{.{ .id = a, .key = 0x1111 }}, &.{}, 0);
+    defer o.deinit();
+    const window = clocks.successionGraceMs();
+    try testing.expectEqual(clocks.t_self_ms + clocks.grace_ms, window);
+    try testing.expect(window > clocks.t_self_ms);
+    try testing.expectEqual(@as(u32, 0), o.reapGraceDeadline(clocks.t_self_ms));
+    try testing.expectEqual(@as(u32, 0), o.reapGraceDeadline(window - 1));
+    try testing.expectEqual(@as(u32, 1), o.reapGraceDeadline(window));
 }
 
 test "the merged expected set (decision 0004 §4.6, KD17): arm with no rows and one Live page's identity opens a grace by itself; the deadline reaps the page-only identity with its page's host key and a row with no page with key 0; a re-asserted entry is never reaped; the census's liveness reads unknown for both inside the window" {
@@ -1839,7 +1866,8 @@ test "the merged expected set (decision 0004 §4.6, KD17): arm with no rows and 
     const back = writerMemberId(testIdentity(3));
     var o = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{.{ .id = page_only, .key = 0xA11 }}, &.{}, 0);
     defer o.deinit();
-    try testing.expectEqual(@as(u64, 45_000), o.graceRemainingMs(0));
+    const window = clocks.successionGraceMs();
+    try testing.expectEqual(window, o.graceRemainingMs(0));
     try testing.expectEqual(Liveness.unknown, o.liveness(page_only, 1));
     try testing.expect(o.join(joinReqOf(7, null, "/m7"), 1) == .grace_refused);
     var o2 = try Owner.arm(gpa, testing.io, clocks, 1, 2, 1, &.{ .{ .id = page_only, .key = 0xA11 }, .{ .id = row_only, .key = 0 }, .{ .id = back, .key = 0xB33 } }, &.{}, 0);
@@ -1848,9 +1876,9 @@ test "the merged expected set (decision 0004 §4.6, KD17): arm with no rows and 
     defer deaths.list.deinit(gpa);
     o2.bindDeathSink(deaths.sink());
     try testing.expect(o2.join(joinReqOf(3, null, "/m3"), 10) == .granted);
-    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(44_999));
-    try testing.expectEqual(@as(u32, 2), o2.reapGraceDeadline(45_000));
-    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(46_000));
+    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(window - 1));
+    try testing.expectEqual(@as(u32, 2), o2.reapGraceDeadline(window));
+    try testing.expectEqual(@as(u32, 0), o2.reapGraceDeadline(window + 1));
     try testing.expectEqual(@as(usize, 2), deaths.list.items.len);
     for (deaths.list.items) |d| {
         try testing.expectEqual(@as(u64, 0), d.epoch);
@@ -1907,7 +1935,7 @@ test "a predecessor-roster member that re-asserted, then left or was evicted, jo
     const b = writerMemberId(testIdentity(2));
     var o2 = try Owner.arm(gpa, testing.io, clocks, 1, 2, 1, &.{.{ .id = b, .key = 0 }}, &.{}, 0);
     defer o2.deinit();
-    try testing.expect(o2.join(joinReqOf(2, null, "/m2"), clocks.grace_ms + 1) == .granted);
+    try testing.expect(o2.join(joinReqOf(2, null, "/m2"), clocks.successionGraceMs() + 1) == .granted);
 }
 
 test "OQ-5: the same (node, mount_slot) LIVE at another mount point refuses naming the other; the same mount point replaces the prior state; the census pages in join order with a cursor; the push carriage rides the next grant once" {
@@ -2448,9 +2476,9 @@ test "succession census (decision 0004 §4.6): no grace is none; pending until e
     }
     var late = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{.{ .id = writerMemberId(testIdentity(3)), .key = 0xB22 }}, &.{}, 1_000);
     defer late.deinit();
-    try testing.expectEqual(@as(u32, 1), late.reapGraceDeadline(1_000 + clocks.grace_ms));
+    try testing.expectEqual(@as(u32, 1), late.reapGraceDeadline(1_000 + clocks.successionGraceMs()));
     {
-        const v = try late.successionCensus(gpa, 1_000 + clocks.grace_ms);
+        const v = try late.successionCensus(gpa, 1_000 + clocks.successionGraceMs());
         defer if (v == .complete) gpa.free(v.complete.keys);
         switch (v) {
             .complete => |c| {

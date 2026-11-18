@@ -7047,14 +7047,32 @@ const SoakWriter = struct {
     }
 };
 
+fn soakReadStats(rig: *Rig, d: usize) ![]u8 {
+    // A joiner mid-re-registration can answer EIO on `.stats` (errno 5).
+    // Zig 0.17 maps that to `error.Unexpected`. Retry past the window.
+    const deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+    var last: ?anyerror = null;
+    while (clock.monotonicNs() < deadline) {
+        if (rig.stats(d)) |st| return st else |e| {
+            last = e;
+            sleepMs(200);
+        }
+    }
+    return last orelse error.Timeout;
+}
+
 fn soakStat(rig: *Rig, d: usize, key: []const u8) u64 {
-    const st = rig.stats(d) catch return 0;
+    const st = soakReadStats(rig, d) catch return 0;
     defer rig.gpa.free(st);
     return json_scan.number(st, key) orelse 0;
 }
 
 fn soakAssertHealthy(rig: *Rig, d: usize, who: []const u8) !void {
-    const st = try rig.stats(d);
+    const st = soakReadStats(rig, d) catch |e| {
+        std.debug.print("\n--- soak {s} stats unreadable: {t} ---\n", .{ who, e });
+        rig.printLogTail(d, 40);
+        return e;
+    };
     defer rig.gpa.free(st);
     const expiries = json_scan.number(st, "appender_park_expiries") orelse 0;
     const fenced = json_scan.number(st, "writer_guard_fenced") orelse 0;
@@ -7155,11 +7173,12 @@ test "nvmet fidelity: pr6 succession soak (decision 0004 §8.3) — two joiners 
         var settles: u64 = 0;
         var early: u64 = 0;
         while (clock.monotonicNs() < settle_deadline) {
-            const st = try rig.stats(s);
-            settles = json_scan.number(st, "writer_guard_succession_settles") orelse 0;
-            early = json_scan.number(st, "writer_guard_succession_early_settles") orelse 0;
-            gpa.free(st);
-            if (settles >= 1) break;
+            if (soakReadStats(rig, s)) |st| {
+                settles = json_scan.number(st, "writer_guard_succession_settles") orelse 0;
+                early = json_scan.number(st, "writer_guard_succession_early_settles") orelse 0;
+                gpa.free(st);
+                if (settles >= 1) break;
+            } else |_| {}
             sleepMs(200);
         }
         const window_ms = (clock.monotonicNs() - t_ready) / std.time.ns_per_ms;
@@ -7172,7 +7191,7 @@ test "nvmet fidelity: pr6 succession soak (decision 0004 §8.3) — two joiners 
             rig.printLogTail(s, 50);
             return error.NoSettle;
         }
-        const ss = try rig.stats(s);
+        const ss = try soakReadStats(rig, s);
         defer gpa.free(ss);
         const probes = json_scan.number(ss, "writer_guard_claim_probes") orelse 0;
         const probe_bytes = json_scan.number(ss, "writer_guard_claim_probe_bytes") orelse 0;

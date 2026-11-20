@@ -7017,7 +7017,13 @@ test "nvmet fidelity: pr5 F14 — a held handover beside the member's carriage a
 }
 
 const soak_ready_ns: u64 = 180 * std.time.ns_per_s;
-const soak_meta_large: u64 = 2 << 30;
+// `--meta-journal-mb 1024` makes appender 0's fixed ring 1 GiB, and that
+// length is charged against the heap/16 ring budget (manager join
+// remaining, bind census). Two joiners may grow to the 32 MiB ceiling:
+// heap/16 >= 1 GiB + 64 MiB ⇒ heap >= 17 GiB; plus the journal and the
+// fixed structures ⇒ 20 GiB. A 2 GiB volume formats but refuses the first
+// join (`JoinAppender refused for capacity`).
+const soak_meta_large: u64 = 20 << 30;
 
 const SoakWriter = struct {
     rig: *Rig,

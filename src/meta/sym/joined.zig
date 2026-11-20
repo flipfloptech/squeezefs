@@ -239,6 +239,15 @@ pub const SharedLink = struct {
     lock: Io.Mutex = .init,
     mux: ?*dialer.Mux = null,
     retired: std.ArrayList(*dialer.Mux) = .empty,
+    /// The membership link parks the joiner when the manager session dies
+    /// (a clean unmount or a crash). A reply timeout does not poison the
+    /// mux, so a frozen manager (F1) does not take this path.
+    on_session_lost: ?LostHook = null,
+
+    pub const LostHook = struct {
+        ctx: ?*anyopaque,
+        call: *const fn (ctx: ?*anyopaque) void,
+    };
 
     /// The reply a call decodes into (borrowed until this thread's next
     /// call): per thread, mapped at its first call (`mem/lazy.zig` — a
@@ -328,6 +337,10 @@ pub const SharedLink = struct {
         }
         const peer_id = self.identity.peerId();
         const m = try dialer.connect(self.gpa, self.io, self.ep, &self.secret, &peer_id);
+        if (self.on_session_lost) |h| {
+            m.on_lost = h.call;
+            m.on_lost_ctx = h.ctx;
+        }
         self.mux = m;
         return m;
     }
@@ -565,6 +578,7 @@ pub const JoinedSet = struct {
             .fence = fence,
         };
         errdefer self.link.deinit();
+        self.link.on_session_lost = .{ .ctx = self, .call = &onManagerLinkLost };
         // `--join` names a listener the record may not yet carry: the
         // poll starts at the mounted record, so a later record (a
         // successor manager's first checkpoint) is what re-points.
@@ -1134,6 +1148,16 @@ pub const JoinedSet = struct {
         const ans = f.client.drainBarrier();
         if (ans == .unregistered) parkForSuccession(self);
         return ans;
+    }
+
+    /// The manager mux died (clean unmount or crash). Park at once so
+    /// acks are held before a successor's preempt-all can fence an
+    /// in-flight journal write. A reply timeout does not take this path.
+    fn onManagerLinkLost(ctx: ?*anyopaque) void {
+        const self: *JoinedSet = @ptrCast(@alignCast(ctx.?));
+        if (self.left.load(.acquire)) return;
+        log.warn("meta volume {s}: the manager link was lost — parked to hold acks until a successor admits the reclaim", .{self.be.path});
+        parkForSuccession(self);
     }
 
     fn parkForSuccession(ctx: ?*anyopaque) void {

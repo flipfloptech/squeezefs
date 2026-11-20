@@ -297,6 +297,10 @@ pub const Mux = struct {
     reader: std.Thread = undefined,
     poisoned: std.atomic.Value(bool) = .init(false),
     closing: std.atomic.Value(bool) = .init(false),
+    /// Fired once on an unexpected session death (not `close`). The
+    /// membership link uses this to park and hold acks at once.
+    on_lost: ?*const fn (ctx: ?*anyopaque) void = null,
+    on_lost_ctx: ?*anyopaque = null,
 
     pub fn isPoisoned(self: *const Mux) bool {
         return self.poisoned.load(.acquire);
@@ -422,6 +426,11 @@ pub const Mux = struct {
     /// idempotent retry resolves against durable state).
     fn poison(self: *Mux) void {
         if (self.poisoned.swap(true, .acq_rel)) return;
+        // Park before waking callers so a joiner holds acks before the
+        // next write can be fenced by a successor's preempt-all.
+        if (!self.closing.load(.acquire)) {
+            if (self.on_lost) |f| f(self.on_lost_ctx);
+        }
         stats.cluster_wire_sessions_poisoned.inc();
         for (self.cells) |*cell| {
             if (cell.state.cmpxchgStrong(Cell.ARMED, Cell.DELIVERING, .acq_rel, .acquire) == null) {

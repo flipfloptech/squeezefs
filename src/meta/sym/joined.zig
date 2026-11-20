@@ -457,6 +457,11 @@ pub const JoinedSet = struct {
     /// key to be observed registered again. Cleared by this volume's own
     /// beat. Peers do not `clear` while any of these is set (W26).
     succession_key_outstanding: std.atomic.Value(bool) = .init(false),
+    /// Set when this volume parks for a succession. Cleared only after
+    /// `successionReregister` adopts or registers a key for this park.
+    /// A still-visible key from the previous manager must not unpark, or
+    /// an in-flight acked journal write can be fenced and fail-stop.
+    reregister_pending: std.atomic.Value(bool) = .init(false),
     readmit: member_fence.Readmit = .{},
     resolution: member_fence.Resolution = .{},
     withdraw_drain: member_fence.WithdrawDrain = .{},
@@ -1169,6 +1174,8 @@ pub const JoinedSet = struct {
         // T_park_max and poison the joiner (the kill-matrix rows).
         if (self.fence == null) return;
         _ = self.park_gate.parkFor(.succession, clock.monotonicNs());
+        self.reregister_pending.store(true, .release);
+        _ = self.resolution.reopen();
         // The other volumes must publish a post-park registration before
         // this one releases a held write (W26). Marking ourselves would
         // deadlock: each side waits for a flag only the other clears.
@@ -1181,7 +1188,34 @@ pub const JoinedSet = struct {
             const js = be.joined orelse continue;
             js.succession_key_outstanding.store(true, .release);
             _ = js.park_gate.parkFor(.succession, now);
+            js.reregister_pending.store(true, .release);
+            _ = js.resolution.reopen();
         }
+    }
+
+    /// True when a still-standing host key may release this succession park.
+    /// False while this park still owes a post-succession re-registration:
+    /// the previous manager's key can remain visible until the successor's
+    /// preempt-all, and treating it as a clear lets an acked landing hit
+    /// the fence and fail-stop.
+    fn registrationClearsPark(self: *const JoinedSet) bool {
+        return !self.reregister_pending.load(.acquire);
+    }
+
+    /// A device write refusal while this succession park still owes a
+    /// re-registration, or while the gate is already parked, is Held.
+    pub fn writeRefusalIsHeld(self: *const JoinedSet) bool {
+        if (self.readmit.obs.manages or !self.readmit.obs.own_page_live) return false;
+        return self.park_gate.isParked() or self.reregister_pending.load(.acquire);
+    }
+
+    /// Capture the generation, reopen the word, and park. The lane waits
+    /// for a later `clear` after re-registration (decision 0004 §4.16).
+    pub fn holdWriteRefusal(self: *JoinedSet) member_fence.Answer {
+        const gen = if (self.readmit.word) |w| w.snapshot().gen else 0;
+        if (self.readmit.word) |w| _ = w.reopen();
+        if (self.readmit.on_held) |f| f(self.readmit.on_held_ctx);
+        return .{ .verdict = .held, .gen = gen };
     }
 
     fn peerKeyOutstanding(self: *JoinedSet) bool {
@@ -1346,7 +1380,7 @@ pub const JoinedSet = struct {
         }
         if (currency == .unreadable) return;
         const report = self.reservationReport();
-        if (report.readable and report.host_registered) self.succession_key_outstanding.store(false, .release);
+        if (report.readable and report.host_registered and self.registrationClearsPark()) self.succession_key_outstanding.store(false, .release);
         self.readmit.hold_clear = self.peerKeyOutstanding();
         const verdict = self.readmit.beat(who, mapped, report);
         if (self.readmit.obs.successor_page) {
@@ -1361,7 +1395,7 @@ pub const JoinedSet = struct {
                 }
             }
         }
-        if (self.readmit.obs.host_registered and !self.readmit.hold_clear) {
+        if (self.readmit.obs.host_registered and !self.readmit.hold_clear and self.registrationClearsPark()) {
             if (page0Owner(mapped)) |p0| {
                 self.mgr_writer = p0.writer_id;
                 self.mgr_term = p0.term;
@@ -1407,6 +1441,7 @@ pub const JoinedSet = struct {
             .live => blk: {
                 const report = self.reservationReport();
                 if (!report.readable) break :blk .unreadable;
+                if (!self.registrationClearsPark()) break :blk .unregistered;
                 if (report.rtype == 0 or (report.rtype == who.meta_rtype and report.host_registered)) {
                     if (report.host_registered) self.succession_key_outstanding.store(false, .release);
                     if (self.peerKeyOutstanding()) break :blk .unregistered;
@@ -1501,6 +1536,7 @@ pub const JoinedSet = struct {
                     // clears on seeing the flag already has this line.
                     log.warn("meta volume {s}: re-registered this host under key {x:0>16} after a succession", .{ self.be.path, f.client.key });
                     self.succession_key_outstanding.store(false, .release);
+                    self.reregister_pending.store(false, .release);
                     if (!self.peerKeyOutstanding() and self.park_gate.isParked()) {
                         _ = self.park_gate.release(0, 0);
                         _ = self.resolution.clear();
@@ -2255,6 +2291,9 @@ test "member fence: a held membership beat does not park for succession" {
     js.member_beat_held = .init(true);
     js.member_beat_hold_done = .init(false);
     js.member_beat_hold_path = null;
+    js.reregister_pending = .init(false);
+    js.resolution = .{};
+    js.readmit = member_fence.Readmit.joiner();
     // Non-null so this row is the hold, not the no-fence case. The callback
     // only tests the pointer for null.
     var fence_sentinel: host_fence.Joiner = undefined;
@@ -2266,6 +2305,10 @@ test "member fence: a held membership beat does not park for succession" {
     JoinedSet.parkForSuccession(@ptrCast(&js));
     try testing.expect(js.park_gate.isParked());
     try testing.expectEqual(park.Reason.succession, js.park_gate.reason);
+    try testing.expect(js.reregister_pending.load(.acquire));
+    try testing.expectEqual(member_fence.Resolution.State.pending, js.resolution.snapshot().state);
+    try testing.expect(!js.registrationClearsPark());
+    try testing.expect(js.writeRefusalIsHeld());
 }
 
 test "member fence: no device fence does not take a succession park" {

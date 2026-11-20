@@ -2933,6 +2933,38 @@ test "member fence: a held reservation conflict does not latch, is not counted, 
     lane.shutdown();
 }
 
+test "member fence: an EIO on an ACKED window is held and re-issued; the volume stays healthy (PR-6 soak cycle-3)" {
+    const h = try Harness.init(testing.allocator, "held-acked-eio");
+    defer h.deinit();
+    var rl: RollbackLog = .{ .gpa = testing.allocator };
+    defer rl.deinit();
+    var word: journal_guard.member_fence.Resolution = .{};
+    var readmit = journal_guard.member_fence.Readmit.joiner();
+    readmit.word = &word;
+    readmit.on_held_ctx = &word;
+    readmit.on_held = struct {
+        fn clearIt(ctx: ?*anyopaque) void {
+            const w: *journal_guard.member_fence.Resolution = @ptrCast(@alignCast(ctx.?));
+            _ = w.clear();
+        }
+    }.clearIt;
+    var hooks = rl.hooks();
+    hooks.readmit = journal_guard.member_fence.Readmit.hook;
+    hooks.ctx = &readmit;
+    hooks.word = &word;
+    try h.spawnLane(hooks, "600000", 0);
+    const lane = h.lane.?;
+    rl.acked = &lane.latch;
+    const failed0 = stats.volumes_failed.load();
+    test_seams.fail_windows.store(1, .release);
+    const a = try h.append(1, page_entry, 0xA1);
+    try a.ticket.wait().result;
+    try testing.expectEqual(journal.FailureLatch.Verdict.healthy, lane.latch.verdict());
+    try testing.expectEqual(failed0, stats.volumes_failed.load());
+    try testing.expectEqual(@as(usize, 0), rl.calls.items.len);
+    lane.shutdown();
+}
+
 test "member fence: a held window write is re-issued once the word clears" {
     const h = try Harness.init(testing.allocator, "held-resume");
     defer h.deinit();

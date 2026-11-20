@@ -1680,6 +1680,12 @@ pub const KvBackend = struct {
         const be: *KvBackend = @ptrCast(@alignCast(ctx.?));
         const js = be.joined orelse return .{ .verdict = .latch };
         if (class == .conflict or (op == .write and class == .eio)) js.noteDeviceRefusal();
+        // A write refusal during a succession park is Held even if the
+        // previous manager's key is still in the report: retrying spends
+        // the credit and latches an ACKED landing the successor then fences.
+        if ((class == .conflict or (op == .write and class == .eio)) and js.writeRefusalIsHeld()) {
+            return js.holdWriteRefusal();
+        }
         return js.readmit.answer(op, class);
     }
 

@@ -2281,7 +2281,7 @@ test "THE DOUBLE PARK (the kill matrix's, 2026-10-24) at the membership core: th
     // Renewals at the cadence carry the member past the grace window: a
     // reclaim from here is admitted only on the epoch the successor holds.
     var t = t1;
-    while (t <= t1 + clocks.grace_ms) {
+    while (t <= t1 + clocks.successionGraceMs()) {
         t += clocks.renew_ms;
         manual_now_ms = t;
         try testing.expectEqual(TickVerdict.renewed, m.tick(t, 2_000));
@@ -2439,7 +2439,7 @@ test "the census's writer keys (decision 0003 §DL): every listed writer's host 
     var succ = try Owner.arm(gpa, testing.io, clocks, 0, 2, 1, &.{.{ .id = writerMemberId(testIdentity(1)), .key = 0 }}, &.{}, 1000);
     defer succ.deinit();
     try testing.expectError(error.Incomplete, succ.writerKeys(gpa, 1000));
-    const keys = try succ.writerKeys(gpa, 1000 + clocks.grace_ms);
+    const keys = try succ.writerKeys(gpa, 1000 + clocks.successionGraceMs());
     defer gpa.free(keys);
     try testing.expectEqual(@as(usize, 0), keys.len);
 }

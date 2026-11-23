@@ -67,6 +67,7 @@ echo "pr6 succession soak: ring=$RING cycles=$CYCLES log=$LOG"
 CACHE=${SQZ_BUILD_ROOT:-/build}/zig-cache-v2
 PREFIX=${PREFIX:-zig-out-linux}
 export SQUEEZEFS_TEST_SOAK_CYCLES=$CYCLES
+export SQUEEZEFS_TEST_SOAK_LOG_DIR=$LOG_DIR
 if [ "$RING" = 1024 ]; then
   export SQUEEZEFS_TEST_SOAK_JOURNAL_MB=1024
 else

@@ -83,6 +83,9 @@ comptime {
 const testing = std.testing;
 
 const root_knob = "SQUEEZEFS_TEST_FIDELITY_ROOT";
+const soak_cycles_knob = "SQUEEZEFS_TEST_SOAK_CYCLES";
+const soak_journal_mb_knob = "SQUEEZEFS_TEST_SOAK_JOURNAL_MB";
+const soak_log_dir_knob = "SQUEEZEFS_TEST_SOAK_LOG_DIR";
 const state_dir_knob = "SQUEEZEFS_NVMEOF_STATE_DIR";
 const port_base_knob = "SQUEEZEFS_NVMET_PORT_ID_BASE";
 const hostnqn_knob = "SQUEEZEFS_HOSTNQN";
@@ -7055,8 +7058,15 @@ const SoakWriter = struct {
     }
 };
 
+fn soakHarnessU32(env: *const std.process.Environ.Map, key: []const u8, fallback: u32, lo: u32, hi: u32) u32 {
+    const raw = knobs.present(env.get(key)) orelse return fallback;
+    const n = std.fmt.parseInt(u32, raw, 10) catch return fallback;
+    if (n < lo or n > hi) return fallback;
+    return n;
+}
+
 fn soakCopyLogs(rig: *Rig) void {
-    const dest = std.testing.environ.getPosix("SQZ_SOAK_LOG_DIR") orelse return;
+    const dest = std.testing.environ.getPosix(soak_log_dir_knob) orelse return;
     for (rig.daemons.items) |d| {
         const name = std.fs.path.basename(d.log_path);
         var out_buf: [512]u8 = undefined;
@@ -7112,10 +7122,10 @@ test "nvmet fidelity: pr6 succession soak (decision 0004 §8.3) — two joiners 
         soakCopyLogs(rig);
         rig.deinit();
     }
-    if (std.testing.environ.getPosix("SQUEEZEFS_TEST_SOAK_CYCLES")) |v| try rig.env.put("SQUEEZEFS_TEST_SOAK_CYCLES", v);
-    if (std.testing.environ.getPosix("SQUEEZEFS_TEST_SOAK_JOURNAL_MB")) |v| try rig.env.put("SQUEEZEFS_TEST_SOAK_JOURNAL_MB", v);
-    const cycles = knobs.intKnob("SQUEEZEFS_TEST_SOAK_CYCLES", u32, &rig.env);
-    const journal_mb = knobs.intKnob("SQUEEZEFS_TEST_SOAK_JOURNAL_MB", u32, &rig.env);
+    if (std.testing.environ.getPosix(soak_cycles_knob)) |v| try rig.env.put(soak_cycles_knob, v);
+    if (std.testing.environ.getPosix(soak_journal_mb_knob)) |v| try rig.env.put(soak_journal_mb_knob, v);
+    const cycles = soakHarnessU32(&rig.env, soak_cycles_knob, 20, 1, 100);
+    const journal_mb = soakHarnessU32(&rig.env, soak_journal_mb_knob, 0, 0, 1024);
     const transport: configfs.Trtype = .loop;
     const ports = try rig.servicePorts(transport);
     var jb: [16]u8 = undefined;

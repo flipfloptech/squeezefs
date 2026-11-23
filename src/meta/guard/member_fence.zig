@@ -180,6 +180,19 @@ pub fn pageFacts(who: SelfView, pages: []const PageView, seen: Seen) PageFacts {
     return .{ .own_page_live = own_live, .successor_page = successor, .reasserted = reasserted, .sibling_death = sibling };
 }
 
+/// True when this incarnation's page is Recovering or Recovered under the
+/// same writer, node and term: the manager evicted it and recovery has
+/// taken the page. That is the re-join-in-place eligibility (decision 0003
+/// §BS, §DA.5), not a reason to latch the volume FAILED.
+pub fn ownPageAwaitingRejoin(who: SelfView, pages: []const PageView) bool {
+    for (pages) |p| {
+        if (p.appender_id != who.appender_id) continue;
+        if (p.writer_id != who.writer_id or p.node_token != who.node_token or p.term != who.term) return false;
+        return p.state == .recovering or p.state == .recovered;
+    }
+    return false;
+}
+
 pub fn noteRecovering(seen: *Seen, who: SelfView, pages: []const PageView) void {
     for (pages) |p| {
         if (p.state == .recovering and p.node_token == who.node_token) seen.note(p.appender_id, p.term);
@@ -1101,6 +1114,31 @@ test "member fence: C2 currency is Live only on every joined volume, and an unre
     try testing.expectEqual(Currency.unreadable, currencyOnVolumes(who, &.{ @as(?[]const PageView, &live0), null }, seen));
     try testing.expectEqual(Currency.dead, currencyOnVolumes(who, &.{ @as(?[]const PageView, &dead1), null }, seen));
     try testing.expect(!shouldWithdraw(true, null, true));
+}
+
+test "member fence: a Recovering or Recovered own page under this incarnation is re-join eligibility, not a usurped page (decision 0003 §BS)" {
+    const who = SelfView{ .appender_id = 1, .writer_id = 0xC0, .node_token = 0xC, .term = 1, .mgr_writer = 0xA0 };
+    const recovered = [_]PageView{
+        .{ .appender_id = 0, .state = .live, .writer_id = 0xA0, .node_token = 0xA, .term = 1 },
+        .{ .appender_id = 1, .state = .recovered, .writer_id = 0xC0, .node_token = 0xC, .term = 1 },
+    };
+    const recovering = [_]PageView{
+        .{ .appender_id = 0, .state = .live, .writer_id = 0xA0, .node_token = 0xA, .term = 1 },
+        .{ .appender_id = 1, .state = .recovering, .writer_id = 0xC0, .node_token = 0xC, .term = 1 },
+    };
+    const still_live = [_]PageView{
+        .{ .appender_id = 0, .state = .live, .writer_id = 0xA0, .node_token = 0xA, .term = 1 },
+        .{ .appender_id = 1, .state = .live, .writer_id = 0xC0, .node_token = 0xC, .term = 1 },
+    };
+    const usurped = [_]PageView{
+        .{ .appender_id = 0, .state = .live, .writer_id = 0xA0, .node_token = 0xA, .term = 1 },
+        .{ .appender_id = 1, .state = .recovered, .writer_id = 0xDD, .node_token = 0xC, .term = 1 },
+    };
+    try testing.expect(ownPageAwaitingRejoin(who, &recovered));
+    try testing.expect(ownPageAwaitingRejoin(who, &recovering));
+    try testing.expect(!ownPageAwaitingRejoin(who, &still_live));
+    try testing.expect(!ownPageAwaitingRejoin(who, &usurped));
+    try testing.expect(!ownPageAwaitingRejoin(who, &.{}));
 }
 
 fn holdConflict(_: ?*anyopaque, _: Op, class: Class) Answer {

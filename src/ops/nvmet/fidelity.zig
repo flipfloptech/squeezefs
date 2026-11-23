@@ -7116,6 +7116,9 @@ fn soakAssertHealthy(rig: *Rig, d: usize, who: []const u8) !void {
 }
 
 test "nvmet fidelity: pr6 succession soak (decision 0004 §8.3) — two joiners on two hosts write and fsync throughout, plus one data writer; the manager cycles SIGKILL, SIGSTOP past the claim TTL, and a clean unmount; a successor on a fourth host takes over each time; 0 fail-stops, appender_park_expiries 0, settles equal the cycle count with almost all early, fsynced bytes back, fsck 0, meta_pr_preempt_kept 0, data_pr_reconcile_in_window 0" {
+    if (std.testing.environ.getPosix(soak_cycles_knob) == null) {
+        return testkit.skip(@src(), .other_step, "the 20-succession soak runs under `zig build succession-soak` (hang limit 2 h); the gate's nvmet-smoke does not run it");
+    }
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer {

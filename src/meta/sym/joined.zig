@@ -1334,7 +1334,11 @@ pub const JoinedSet = struct {
         const seq = self.be.cp.checkpointSeq();
         if (self.left.load(.acquire)) return;
         const cycle_landed = seq != self.grow_judged_at_seq;
-        const succession_pending = self.park_gate.isParked() or self.resolution.snapshot().state == .pending;
+        // A T_self park is the evicted-member clock, not a succession: the
+        // UnknownLease reclaim path judges re-join in place (decision 0003
+        // §BS). Running the beat just because that park is up races recovery
+        // and can latch FAILED before the reclaim.
+        const succession_pending = (self.park_gate.isParked() and self.park_gate.reason == .succession) or self.resolution.snapshot().state == .pending;
         if (cycle_landed or succession_pending) {
             if (!self.membershipHoldActive()) self.censusBeat();
         }
@@ -1373,6 +1377,10 @@ pub const JoinedSet = struct {
         const currency = self.liveOnEveryJoined(who);
         if (currency == .dead) {
             self.readmit.obs.own_page_live = false;
+            // Recovered/Recovering under this incarnation is §BS eligibility,
+            // not a fence. The UnknownLease reclaim path judges un-landed
+            // work and either re-joins or poisons.
+            if (self.evictedOnEveryJoined(who)) return;
             self.resolution.terminate();
             if (self.left.load(.acquire)) return;
             _ = self.be.lane.latch.noteFence("the member-fence beat");
@@ -1561,6 +1569,24 @@ pub const JoinedSet = struct {
             if (!member_fence.pageFacts(who, fillPageViews(raw, &views), self.readmit.seen).own_page_live) return .dead;
         }
         return if (unreadable) .unreadable else .live;
+    }
+
+    /// Every joined volume's own page is still Live, or is Recovering /
+    /// Recovered under this incarnation (the manager evicted us). A
+    /// usurped or missing page is not this case.
+    fn evictedOnEveryJoined(self: *JoinedSet, who: member_fence.SelfView) bool {
+        const backends: []const *KvBackend = if (self.peers.len > 0) self.peers else (&[_]*KvBackend{self.be})[0..];
+        var any_evicted = false;
+        for (backends) |be| {
+            const raw = devicePages(self.be.gpa, be) catch return false;
+            defer self.be.gpa.free(raw);
+            var views: [64]member_fence.PageView = undefined;
+            const mapped = fillPageViews(raw, &views);
+            if (member_fence.pageFacts(who, mapped, self.readmit.seen).own_page_live) continue;
+            if (!member_fence.ownPageAwaitingRejoin(who, mapped)) return false;
+            any_evicted = true;
+        }
+        return any_evicted;
     }
 
     const RegisterOutcome = enum { refused, adopted, fresh, withdrawn };

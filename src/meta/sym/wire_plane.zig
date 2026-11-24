@@ -1282,6 +1282,12 @@ pub const WirePlane = struct {
     /// the retired (or parked) word — the poison.
     fn refuseRejoin(_: *WirePlane, j: *JoinedHalf, why: []const u8) bool {
         log.err("cluster wire: this joined mount cannot re-join in place — {s}; the fail-stop", .{why});
+        // retireIncarnation already failStop'd silently. noteFence logs
+        // only on the first latch, so emit the fence-class witness F4/F9
+        // await when the volume is already FAILED.
+        if (!j.js.be.lane.latch.noteFence("the re-join in place")) {
+            log.err("journal: reservation-conflict errno at the re-join in place — this holder's writes are fenced at the device (usurped or paused-then-preempted); latching the volume FAILED at once; mutations answer EIO until remount (single-writer guard)", .{});
+        }
         _ = j.member.words.fence();
         shard.stats.membership_self_fenced.set(1);
         const reason = "the home shard evicted this member and it could not re-join in place";

@@ -1371,19 +1371,19 @@ pub const JoinedSet = struct {
             .meta_rtype = nvme.RTYPE_WEAR,
         };
         const currency = self.liveOnEveryJoined(who);
-        if (currency == .dead) {
+        const evicted = currency == .dead and self.evictedOnEveryJoined(who);
+        if (currency == .dead and !evicted) {
             self.readmit.obs.own_page_live = false;
-            // Recovered/Recovering under this incarnation is §BS re-join
-            // eligibility, not a fence. The UnknownLease reclaim path
-            // judges un-landed work and either re-joins or poisons (and
-            // latches the fence class there).
-            if (self.evictedOnEveryJoined(who)) return;
             self.resolution.terminate();
             if (self.left.load(.acquire)) return;
             _ = self.be.lane.latch.noteFence("the member-fence beat");
             return;
         }
         if (currency == .unreadable) return;
+        if (evicted) self.readmit.obs.own_page_live = false;
+        // A Recovered/Recovering own page is §BS eligibility, not a fence.
+        // Fall through so the beat still repoints at the successor and a
+        // two-volume joiner can re-register (F6). The latch below is skipped.
         const report = self.reservationReport();
         if (report.readable and report.host_registered and self.registrationClearsPark()) self.succession_key_outstanding.store(false, .release);
         self.readmit.hold_clear = self.peerKeyOutstanding();
@@ -1407,7 +1407,7 @@ pub const JoinedSet = struct {
             }
             if (self.park_gate.reason == .succession) _ = self.park_gate.release(0, 0);
         }
-        if (verdict == .latch) {
+        if (verdict == .latch and !evicted) {
             if (self.left.load(.acquire)) return;
             _ = self.be.lane.latch.noteFence("the member-fence beat");
         }

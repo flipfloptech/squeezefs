@@ -89,6 +89,5 @@ verdict 0/0/0, 31 min. `~/tmp/pr6-gate/gate6.log`.
 
 ## Not in this note
 
-The official 16-loop `cpu+smoke` load. Decision 0003 §DO rows (owed for
-PR-4, PR-5 and PR-6; the owner's call, see the handoff). Landing `feat/pr6`
-onto `dev`.
+The official 16-loop `cpu+smoke` load. The §DO rows are decision 0003
+§DO.41–§DO.43 (PR-4's and PR-5's, §DO.34–§DO.40, were written with them).

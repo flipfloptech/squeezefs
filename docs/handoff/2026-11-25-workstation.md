@@ -26,17 +26,13 @@ The official 16-loop `cpu+smoke` load was not run (thermal derating;
 
 ## Next action, in this order
 
-1. **The owner's call on the §DO rows.** Decision 0003 §DO says every PR
-   lands with its §DO rows; PR-1 to PR-3 did (DO.1–DO.32), DO.33 is PR-4's
-   premise resolution, and no rows exist for PR-4, PR-5 or PR-6. The
-   standing instruction to this work is to leave decisions 0003 and 0004
-   unedited, so none were written. Either the owner lifts that for one
-   docs commit (DO.34+ for PR-4/5/6, drafted from the evidence notes) or
-   the debt stays recorded here.
-2. Land `feat/pr6` onto `dev` when the owner asks: `git checkout dev &&
-   git merge --ff-only feat/pr6` from `/home/justin/Source/squeezefs-zig`
-   (the local hook publishes `origin/dev`), then delete the branch.
-3. **The conformance suites on the current venue and kernel.** Every gate
+1. Done 2026-11-25 on the owner's word: decision 0003 §DO.34–§DO.43 record
+   PR-4, PR-5 and PR-6 as built (the table stopped at DO.32; DO.33 is
+   PR-4's premise resolution), and `feat/pr6` is fast-forwarded onto `dev`
+   (the local hook publishes `origin/dev`). The gate train runs the
+   post-landing greens; a red on these commits is fixed within the hour
+   or reverted.
+2. **The conformance suites on the current venue and kernel.** Every gate
    runs the pjdfstest subset (`suites-smoke`, ledger verdict 0/0/0 in
    gate 6). The release gate (`scripts/venue zig build -Drelease-gate=true
    gate-release`: full pjdfstest, LTP fs+syscalls, fstests `-g auto`,
@@ -47,7 +43,7 @@ The official 16-loop `cpu+smoke` load was not run (thermal derating;
    red in-process repro-ports and ledger rows (`docs/gates/*-exceptions.md`;
    a syncfs-only failure on 7.3.1 cites decision 0003 §DB), then the 3-run
    count. Never beside a gate.
-4. Optional: official 16-loop `cpu+smoke` load, on a cooler box or after a
+3. Optional: official 16-loop `cpu+smoke` load, on a cooler box or after a
    long cool-down.
 
 ## What F7a taught (for the other nvmet rows)

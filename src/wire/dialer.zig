@@ -465,6 +465,17 @@ pub const Mux = struct {
         }
     }
 
+    /// Drop the loss hook and mark this session closing, without joining
+    /// the reader or freeing the mux. A retired session stays on the
+    /// caller's list until `close` (a caller may still be in a cell).
+    /// Without this, a later EOF on the old socket fires `on_lost` and
+    /// parks a joiner that has already re-pointed at the successor.
+    pub fn disarmLost(self: *Mux) void {
+        self.closing.store(true, .release);
+        self.on_lost = null;
+        self.on_lost_ctx = null;
+    }
+
     /// Nudge the reader, join it, close the socket, free everything.
     pub fn close(self: *Mux) void {
         self.closing.store(true, .release);

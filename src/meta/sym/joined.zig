@@ -273,7 +273,7 @@ pub const SharedLink = struct {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
         const m = self.mux orelse return;
-        self.retired.append(self.gpa, m) catch m.close();
+        self.retireMuxLocked(m);
         self.mux = null;
     }
 
@@ -297,8 +297,17 @@ pub const SharedLink = struct {
         stats.peer_links_repointed.inc();
         self.ep = ep;
         const m = self.mux orelse return;
-        self.retired.append(self.gpa, m) catch m.close();
+        self.retireMuxLocked(m);
         self.mux = null;
+    }
+
+    /// Disarm `on_lost` before parking the mux on the retired list: a later
+    /// EOF on the predecessor's socket must not park a joiner that has
+    /// already re-pointed at the successor (F6: `kill9` of the frozen
+    /// manager after re-register).
+    fn retireMuxLocked(self: *SharedLink, m: *dialer.Mux) void {
+        m.disarmLost();
+        self.retired.append(self.gpa, m) catch m.close();
     }
 
     /// The endpoint the next dial takes (the current one; for tests).
@@ -324,7 +333,7 @@ pub const SharedLink = struct {
         }
         if (self.mux) |m| {
             if (!m.isPoisoned()) return m;
-            self.retired.append(self.gpa, m) catch m.close();
+            self.retireMuxLocked(m);
             self.mux = null;
             @import("../../wire/stats.zig").cluster_wire_reconnects.inc();
         }

@@ -3900,11 +3900,19 @@ fn printLogNeedles(rig: *Rig, path: []const u8) void {
         "succession",
         "refusing",
         "latching",
+        "link was lost",
+        "re-points",
+        "under key",
+        "T_self",
+        "withdrawn",
+        "TRIPWIRE",
+        "poisoning",
+        "got no reply",
     };
     std.debug.print("--- needles in {s} ---\n", .{path});
     var line_start: usize = 0;
     var shown: usize = 0;
-    while (line_start < text.len and shown < 80) {
+    while (line_start < text.len and shown < 160) {
         const rest = text[line_start..];
         const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
         const line = rest[0..nl];
@@ -3916,7 +3924,7 @@ fn printLogNeedles(rig: *Rig, path: []const u8) void {
         line_start += nl;
         if (line_start < text.len and text[line_start] == '\n') line_start += 1;
     }
-    if (shown == 80) std.debug.print("--- needle cap ---\n", .{});
+    if (shown == 160) std.debug.print("--- needle cap ---\n", .{});
 }
 
 fn unlinkPath(path: [:0]const u8) void {
@@ -4251,8 +4259,8 @@ test "nvmet fidelity: pr5 F6 — two metadata volumes (decision 0004 §8.2) — 
     // The write is the held window. It returns only after both volumes
     // have re-registered (C2: live on every joined volume).
     if (!try scriptSucceeds(rig, j, "echo x > d0/z && sync -d d0/z && cat d0/j")) {
-        printLogTailFile(rig, rig.daemons.items[j].log_path, 40);
-        printLogTailFile(rig, rig.daemons.items[s].log_path, 30);
+        printLogNeedles(rig, rig.daemons.items[j].log_path);
+        printLogNeedles(rig, rig.daemons.items[s].log_path);
         return error.HeldWrite;
     }
     const jlog = try rig.readLog(j);

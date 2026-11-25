@@ -471,6 +471,14 @@ pub const JoinedSet = struct {
     /// A still-visible key from the previous manager must not unpark, or
     /// an in-flight acked journal write can be fenced and fail-stop.
     reregister_pending: std.atomic.Value(bool) = .init(false),
+    /// This volume re-registered after the last unregistration it observed
+    /// (the beat's report, a refused write, a read's drain barrier), so it
+    /// owes nothing to a peer's later park (decision 0004 §4.10: "every
+    /// joined volume where the host was unregistered"). Marking it pending
+    /// anyway could never clear — `wantsRegister` is false for a registered
+    /// host — and a held write on the peer outlived `T_park_max` (F6 under
+    /// a full gate: S preempts v0, J re-registers on v0, S preempts v1).
+    post_preempt_registered: std.atomic.Value(bool) = .init(false),
     readmit: member_fence.Readmit = .{},
     resolution: member_fence.Resolution = .{},
     withdraw_drain: member_fence.WithdrawDrain = .{},
@@ -1160,7 +1168,10 @@ pub const JoinedSet = struct {
     pub fn drainAfterReadEio(self: *JoinedSet) pr.Barrier {
         const f = self.fence orelse return .unknown;
         const ans = f.client.drainBarrier();
-        if (ans == .unregistered) parkForSuccession(self);
+        if (ans == .unregistered) {
+            self.post_preempt_registered.store(false, .release);
+            parkForSuccession(self);
+        }
         return ans;
     }
 
@@ -1195,10 +1206,18 @@ pub const JoinedSet = struct {
         for (self.peers) |be| {
             if (be == self.be) continue;
             const js = be.joined orelse continue;
-            js.succession_key_outstanding.store(true, .release);
+            // The peer is parked either way (the cross-volume hold: its beat
+            // releases it once no key is outstanding). Only a peer that has
+            // not re-registered since it was last unregistered owes a key;
+            // the flags land before the park so its beat cannot release in
+            // between.
+            const owes_key = !js.post_preempt_registered.load(.acquire);
+            if (owes_key) {
+                js.succession_key_outstanding.store(true, .release);
+                js.reregister_pending.store(true, .release);
+            }
             _ = js.park_gate.parkFor(.succession, now);
-            js.reregister_pending.store(true, .release);
-            _ = js.resolution.reopen();
+            if (owes_key) _ = js.resolution.reopen();
         }
     }
 
@@ -1394,6 +1413,7 @@ pub const JoinedSet = struct {
         // Fall through so the beat still repoints at the successor and a
         // two-volume joiner can re-register (F6). The latch below is skipped.
         const report = self.reservationReport();
+        if (report.readable and !report.host_registered) self.post_preempt_registered.store(false, .release);
         if (report.readable and report.host_registered and self.registrationClearsPark()) self.succession_key_outstanding.store(false, .release);
         self.readmit.hold_clear = self.peerKeyOutstanding();
         const verdict = self.readmit.beat(who, mapped, report);
@@ -1549,6 +1569,7 @@ pub const JoinedSet = struct {
                     // The log lands before the flag drops, so a peer that
                     // clears on seeing the flag already has this line.
                     log.warn("meta volume {s}: re-registered this host under key {x:0>16} after a succession", .{ self.be.path, f.client.key });
+                    self.post_preempt_registered.store(true, .release);
                     self.succession_key_outstanding.store(false, .release);
                     self.reregister_pending.store(false, .release);
                     if (!self.peerKeyOutstanding() and self.park_gate.isParked()) {
@@ -1658,7 +1679,9 @@ pub const JoinedSet = struct {
     /// (decision 0004 §4.5.3). The beat can still say this host is registered
     /// after a preempt-all removed it.
     pub fn noteDeviceRefusal(self: *JoinedSet) void {
-        self.readmit.observeReport(self.reservationReport());
+        const report = self.reservationReport();
+        if (report.readable and !report.host_registered) self.post_preempt_registered.store(false, .release);
+        self.readmit.observeReport(report);
     }
 
     /// One metadata reservation report from this joiner's own client
@@ -2341,6 +2364,55 @@ test "member fence: a held membership beat does not park for succession" {
     try testing.expectEqual(member_fence.Resolution.State.pending, js.resolution.snapshot().state);
     try testing.expect(!js.registrationClearsPark());
     try testing.expect(js.writeRefusalIsHeld());
+}
+
+test "member fence: a peer that re-registered since its unregistration is parked by a later succession park but owes it no key (decision 0004 §4.10; F6 under a full gate)" {
+    var fence_sentinel: host_fence.Joiner = undefined;
+    var be_a: KvBackend = undefined;
+    var be_b: KvBackend = undefined;
+    var js_a: JoinedSet = undefined;
+    var js_b: JoinedSet = undefined;
+    var peers = [_]*KvBackend{ &be_a, &be_b };
+    inline for (.{ .{ &js_a, &be_a }, .{ &js_b, &be_b } }) |pair| {
+        const js: *JoinedSet = pair[0];
+        const be: *KvBackend = pair[1];
+        be.joined = js;
+        js.be = be;
+        js.peers = &peers;
+        js.member_beat_held = .init(false);
+        js.member_beat_hold_done = .init(false);
+        js.member_beat_hold_path = null;
+        js.reregister_pending = .init(false);
+        js.succession_key_outstanding = .init(false);
+        js.resolution = .{};
+        js.readmit = member_fence.Readmit.joiner();
+        js.fence = &fence_sentinel;
+        js.park_gate = park.ParkGate.arm(testing.io, 0, 48_000);
+    }
+    // v0 re-registered under the successor; v1 now observes its own
+    // preempt and parks.
+    js_a.post_preempt_registered = .init(true);
+    js_b.post_preempt_registered = .init(false);
+    JoinedSet.parkForSuccession(@ptrCast(&js_b));
+    try testing.expect(js_b.park_gate.isParked());
+    try testing.expect(js_b.reregister_pending.load(.acquire));
+    // The cross-volume hold stands: v0 is parked, and its beat releases it
+    // once v1's key is back. It owes no key of its own.
+    try testing.expect(js_a.park_gate.isParked());
+    try testing.expect(!js_a.reregister_pending.load(.acquire));
+    try testing.expect(!js_a.succession_key_outstanding.load(.acquire));
+    try testing.expect(js_a.registrationClearsPark());
+    try testing.expect(!js_b.peerKeyOutstanding());
+    // A peer that has not re-registered since it was unregistered owes one.
+    _ = js_a.park_gate.release(0, 0);
+    _ = js_b.park_gate.release(0, 0);
+    js_b.reregister_pending.store(false, .release);
+    js_a.post_preempt_registered.store(false, .release);
+    JoinedSet.parkForSuccession(@ptrCast(&js_b));
+    try testing.expect(js_a.park_gate.isParked());
+    try testing.expect(js_a.reregister_pending.load(.acquire));
+    try testing.expect(js_a.succession_key_outstanding.load(.acquire));
+    try testing.expect(js_b.peerKeyOutstanding());
 }
 
 test "member fence: no device fence does not take a succession park" {

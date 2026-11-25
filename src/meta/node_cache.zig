@@ -85,6 +85,13 @@ pub const ForestSlot = key.ForestSlot;
 pub const RecordRef = rec.RecordRef;
 pub const RecordKind = rec.RecordKind;
 
+/// Test seams. Default-inert.
+pub const test_seams = struct {
+    /// When set, a FUSE getxattr evicts every clean unpinned node first so
+    /// the xattr read must go to the device (F7a's drain barrier).
+    pub var evict_clean_before_getxattr: std.atomic.Value(bool) = .init(false);
+};
+
 // ---------------------------------------------------------------------------
 // Constants and derivations, each with its WHY.
 // ---------------------------------------------------------------------------
@@ -2163,8 +2170,19 @@ pub const NodeCache = struct {
     /// would actually free is reclaimed: `refs == 2` (the map's + the
     /// sweep's own probe).
     pub fn evictToBudget(self: *NodeCache) Allocator.Error!void {
+        try self.sweepDownTo(self.cfg.budget_bytes);
+    }
+
+    /// Test seam (`test_seams.evict_clean_before_getxattr`): every clean
+    /// unpinned node goes, whatever the budget, so the next leaf read must
+    /// reach the device. Two laps consume every second-chance bit.
+    pub fn evictAllClean(self: *NodeCache) Allocator.Error!void {
+        try self.sweepDownTo(0);
+    }
+
+    fn sweepDownTo(self: *NodeCache, target_bytes: u64) Allocator.Error!void {
         var attempts = 2 * (self.mapped.load(.monotonic) + 1);
-        while (self.cached_bytes.load() > self.cfg.budget_bytes and attempts > 0) {
+        while (self.cached_bytes.load() > target_bytes and attempts > 0) {
             attempts -= 1;
             const addr = self.clock.pop(self.io) orelse break;
             const n = self.tryGetMapped(addr) orelse continue; // stale clock entry

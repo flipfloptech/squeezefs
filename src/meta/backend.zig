@@ -3480,6 +3480,10 @@ pub const KvBackend = struct {
         return be.lane.latch.isFailed();
     }
 
+    pub fn evictCleanNodes(be: *KvBackend) void {
+        be.cache.evictAllClean() catch {};
+    }
+
     pub fn replayStats(be: *const KvBackend) ReplayStats {
         return be.replay;
     }

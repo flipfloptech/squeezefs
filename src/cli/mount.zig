@@ -1076,6 +1076,10 @@ fn mountMain(ctx: *Ctx) u8 {
         journal_lane.test_seams.delay_issue.store(1, .release);
         log.warn("test seam: SQUEEZEFS_TEST_JOURNAL_HOLD_LANDING — journal writes are held un-issued from here; acked metadata lives in the journal tail alone", .{});
     }
+    if (knobs.boolKnob("SQUEEZEFS_TEST_EVICT_CLEAN_NODES_ON_GETXATTR", env)) {
+        node_cache.test_seams.evict_clean_before_getxattr.store(true, .release);
+        log.warn("test seam: SQUEEZEFS_TEST_EVICT_CLEAN_NODES_ON_GETXATTR — a getxattr evicts every clean node-cache entry first so the xattr read goes to the device", .{});
+    }
 
     // 7. Serve until a stop latches or the session ends.
     serve(ctx, session, &vs);

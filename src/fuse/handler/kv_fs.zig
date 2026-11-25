@@ -6153,6 +6153,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             try screenXattr(a.name, error.NoAttribute);
             const local = try localOf(a.ino);
+            if (node_cache.test_seams.evict_clean_before_getxattr.load(.acquire)) {
+                if (@hasDecl(Store, "evictCleanNodes")) self.store.evictCleanNodes();
+            }
             const value = (try self.xattrValue(local, a.name)) orelse {
                 // A foreign file gone at its holder carries no attribute
                 // either: its stale handle, asked on the miss alone.

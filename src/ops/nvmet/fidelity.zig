@@ -4413,6 +4413,11 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
     // so the later getxattr hit and the drain barrier never moved.
     try env_j.put("SQUEEZEFS_META_NODE_CACHE_MB", "1");
     try env_j.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", "600000");
+    // Budget evictions still left mine/t's clean leaf cached about one run
+    // in three, so the drain getxattr never reached the device and the
+    // barrier counters stayed 0: the drain read evicts every clean leaf
+    // first. The fill's setxattrs are untouched.
+    try env_j.put("SQUEEZEFS_TEST_EVICT_CLEAN_NODES_ON_GETXATTR", "1");
     const j = try rig.spawnMountEnv("f7a-j", meta_uri_c, &env_j, &.{});
     try rig.awaitLog(j, "ready: ", mount_wait_ns);
     // 60 KiB xattrs spill into leaves. The second batch's publish evicts the
@@ -4476,6 +4481,38 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
         printLogTailFile(rig, rig.daemons.items[j].log_path, 40);
         return error.NodeNotEvicted;
     }
+    // The drain reader opens mine/t now, while M is alive (see `f7a_reader`).
+    var ready_buf: [linux.PATH_MAX]u8 = undefined;
+    const ready = try std.fmt.bufPrintSentinel(&ready_buf, "{s}/f7a-ready", .{rig.root}, 0);
+    var go_buf: [linux.PATH_MAX]u8 = undefined;
+    const go = try std.fmt.bufPrintSentinel(&go_buf, "{s}/f7a-go.fifo", .{rig.root}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, go.ptr, linux.S.IFIFO | 0o600, 0)));
+    var renv = try rig.envWithKnob("F7A_READY", ready);
+    defer renv.deinit();
+    try renv.put("F7A_GO", go);
+    var reader = try std.process.spawn(rig.io, .{
+        .argv = &.{ "python3", "-c", f7a_reader },
+        .cwd = .{ .path = rig.daemons.items[j].mp },
+        .environ_map = &renv,
+        .stdin = .ignore,
+    });
+    var reader_done = false;
+    defer if (!reader_done) {
+        if (reader.id) |pid| _ = linux.kill(pid, .KILL);
+        _ = reader.wait(rig.io) catch {};
+    };
+    const ready_deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+    while (linux.errno(linux.access(ready.ptr, linux.F_OK)) != .SUCCESS) {
+        if (reader.id) |pid| if (!alive(pid)) {
+            printLogTailFile(rig, rig.daemons.items[j].log_path, 40);
+            return error.ReaderDiedBeforeReady;
+        };
+        if (clock.monotonicNs() >= ready_deadline) {
+            printLogTailFile(rig, rig.daemons.items[j].log_path, 60);
+            return error.ReaderNotReady;
+        }
+        sleepMs(20);
+    }
     _ = linux.kill(rig.daemons.items[m].pid, .STOP);
     sleepMs(lease_clock.T_OWNER_MS + 5_000);
 
@@ -4530,11 +4567,30 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
     const still = if (nb_slot) |*nb| nb.inflightWrites() orelse 0 else 0;
     std.debug.print("\n--- F7a: drain refusal, inflight writes {d} ---\n", .{still});
     if (still == 0) return error.DrainWindowMissed;
-    // A read, not a stat: the name's inode stays cached; the xattr leaf does not.
-    const read_ok = try scriptSucceeds(rig, j, "python3 -c 'import os; os.getxattr(\"mine/t\", \"user.p\")'");
+    // The fd is already open. Releasing the fifo is the read instant.
+    if (reader.id) |pid| if (!alive(pid)) {
+        const dead = try reader.wait(rig.io);
+        reader_done = true;
+        std.debug.print("\n--- F7a: reader died before the drain read ({f}) ---\n", .{dead});
+        return error.ReadSurfaced;
+    };
+    try releaseFifoBounded(go, 5 * std.time.ns_per_s);
+    const reader_deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+    var reader_finished = false;
+    while (clock.monotonicNs() < reader_deadline) {
+        if (reader.id) |pid| if (!alive(pid)) {
+            reader_finished = true;
+            break;
+        };
+        sleepMs(50);
+    }
     flood.stop.store(true, .release);
     if (flood_thread) |t| t.join();
     flood_joined = true;
+    if (!reader_finished) return error.ReadSurfaced;
+    const read_term = try reader.wait(rig.io);
+    reader_done = true;
+    const read_ok = read_term.success();
 
     try rig.awaitLog(s, "ready: ", mount_wait_ns);
     const sj = try rig.stats(j);
@@ -4577,6 +4633,19 @@ fn memberClockMs(text: []const u8, mark: []const u8) ?u64 {
     const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
     return std.fmt.parseInt(u64, rest[0..end], 10) catch null;
 }
+
+/// F7a's drain reader: opens `mine/t` while the manager is up, then waits
+/// off the mount. A path getxattr after the stop looks `mine` up in the
+/// root — and a plain `python3 -c` lists its cwd at startup — and ino 1 is
+/// the frozen manager's: either can park at `meta_backend_start` until the
+/// successor admits the reclaim, long after the 60 ms drain.
+const f7a_reader =
+    \\import os
+    \\fd = os.open("mine/t", os.O_RDONLY)
+    \\os.close(os.open(os.environ["F7A_READY"], os.O_CREAT | os.O_WRONLY, 0o600))
+    \\os.read(os.open(os.environ["F7A_GO"], os.O_RDONLY), 1)
+    \\os.getxattr(fd, "user.p")
+;
 
 /// Opens `mine/t` while the manager is up, then waits off the mount.
 /// `fsetxattr` on that fd does not readdir the root (ino 1 is the manager's;

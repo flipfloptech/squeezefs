@@ -792,6 +792,10 @@ pub const MetaSet = struct {
         return false;
     }
 
+    pub fn evictCleanNodes(self: *MetaSet) void {
+        for (self.volumes) |be| be.evictCleanNodes();
+    }
+
     /// The one-line law over the SET (a member FAILED fails every mutation
     /// of the mount): the data plane's failure lines.
     pub fn admitsLine(self: *MetaSet, class: journal.FailureLatch.LogClass) bool {

@@ -1541,6 +1541,13 @@ const Clock = struct {
         try self.items.append(gpa, addr);
     }
 
+    /// Live entries (duplicates included).
+    fn len(self: *Clock, io: Io) usize {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.items.items.len - self.head;
+    }
+
     fn pop(self: *Clock, io: Io) ?u64 {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -2170,18 +2177,22 @@ pub const NodeCache = struct {
     /// would actually free is reclaimed: `refs == 2` (the map's + the
     /// sweep's own probe).
     pub fn evictToBudget(self: *NodeCache) Allocator.Error!void {
-        try self.sweepDownTo(self.cfg.budget_bytes);
+        try self.sweepDownTo(self.cfg.budget_bytes, 2 * (self.mapped.load(.monotonic) + 1));
     }
 
     /// Test seam (`test_seams.evict_clean_before_getxattr`): every clean
     /// unpinned node goes, whatever the budget, so the next leaf read must
-    /// reach the device. Two laps consume every second-chance bit.
+    /// reach the device. Two laps over the CLOCK's entries, not the mapped
+    /// count: a writing mount's clock carries duplicate entries (every
+    /// publish over a standing mapping pushes the address again), and a
+    /// sweep bounded by `mapped` spent itself on one hot leaf's duplicates
+    /// (F7a: 43k hits, 2 evictions).
     pub fn evictAllClean(self: *NodeCache) Allocator.Error!void {
-        try self.sweepDownTo(0);
+        try self.sweepDownTo(0, 2 * (self.clock.len(self.io) + 1));
     }
 
-    fn sweepDownTo(self: *NodeCache, target_bytes: u64) Allocator.Error!void {
-        var attempts = 2 * (self.mapped.load(.monotonic) + 1);
+    fn sweepDownTo(self: *NodeCache, target_bytes: u64, attempts_in: usize) Allocator.Error!void {
+        var attempts = attempts_in;
         while (self.cached_bytes.load() > target_bytes and attempts > 0) {
             attempts -= 1;
             const addr = self.clock.pop(self.io) orelse break;
@@ -3295,6 +3306,45 @@ test "eviction skips externally held nodes (evicting them frees nothing) and rec
         if (!vol.cache.contains(0)) break;
     }
     try testing.expect(!vol.cache.contains(0));
+}
+
+test "evictAllClean (the F7a seam) evicts every clean leaf whatever the budget and whatever its ref bit; the pinned interior and a dirty leaf stay" {
+    var vol = try Vol.init(8, 8);
+    defer vol.deinit();
+    vol.arm();
+    try vol.writeEmptyLeaf(0, 1, 1); // the pinned interior
+    for (1..6) |ext| {
+        const ino = ext;
+        var records = [_]Record{try Record.put(testing.allocator, &key.inodeKey(ino), 1, &iv(ino).encode())};
+        defer rec.deinitRecords(testing.allocator, &records);
+        try vol.writeNode(ext, ext + 1, 0, &key.inodeKey(ino), &key.inodeKey(ino), &records);
+    }
+    for (0..6) |ext| (try vol.cache.load(Vol.addrOf(ext))).?.release();
+    // Every leaf was just touched (its ref bit set) and fits the budget.
+    try testing.expectEqual(@as(usize, 6), vol.cache.mappedCount());
+    const dirty = (try vol.cache.load(Vol.addrOf(5))).?;
+    _ = try vol.apply(dirty, &key.inodeKey(5), .put, &iv(999_999).encode());
+    try testing.expect(dirty.state.isDirty());
+    dirty.release();
+    const ev0 = stats.meta_kv_node_cache_evictions.load();
+    try vol.cache.evictAllClean();
+    try testing.expectEqual(ev0 + 4, stats.meta_kv_node_cache_evictions.load());
+    for (1..5) |ext| try testing.expect(!vol.cache.contains(Vol.addrOf(ext)));
+    try testing.expect(vol.cache.contains(Vol.addrOf(0)));
+    try testing.expect(vol.cache.contains(Vol.addrOf(5)));
+    // A second sweep right after a touch evicts again: the seam runs on
+    // every getxattr.
+    (try vol.cache.load(Vol.addrOf(1))).?.release();
+    try vol.cache.evictAllClean();
+    try testing.expect(!vol.cache.contains(Vol.addrOf(1)));
+    // The clock of a mount that has been writing carries duplicate entries
+    // (every publish over a standing mapping pushes the address again), so
+    // a sweep bounded by the mapped count spends itself on one hot leaf's
+    // duplicates and never reaches the others (F7a: 43k hits, 2 evictions).
+    for (1..5) |ext| (try vol.cache.load(Vol.addrOf(ext))).?.release();
+    for (0..64) |_| try vol.cache.clock.push(vol.cache.io, vol.cache.gpa, Vol.addrOf(1));
+    try vol.cache.evictAllClean();
+    for (1..5) |ext| try testing.expect(!vol.cache.contains(Vol.addrOf(ext)));
 }
 
 test "eviction respects the budget, pins dirty and interior nodes, and a held snapshot keeps serving" {

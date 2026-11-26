@@ -4428,8 +4428,17 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
     try env_j.put("SQUEEZEFS_TEST_EVICT_CLEAN_NODES_ON_GETXATTR", "1");
     const j = try rig.spawnMountEnv("f7a-j", meta_uri_c, &env_j, &.{});
     try rig.awaitLog(j, "ready: ", mount_wait_ns);
+    try rig.awaitLog(j, "test seam: SQUEEZEFS_TEST_EVICT_CLEAN_NODES_ON_GETXATTR", mount_wait_ns);
     // 60 KiB xattrs spill into leaves. The second batch's publish evicts the
     // first batch's clean leaf, and getxattr re-reads it.
+    //
+    // The two files the drain reads (`f7a_reader`: mine/t and mine/u) carry
+    // twelve such xattrs, 720 KiB: on a forest every mint slot is its own
+    // tree with a PINNED root, and the rotor spreads these files over ~60
+    // slots, so a file's slot tree is a single root-leaf — 3–4 values,
+    // pinned, never evicted, every read a RAM hit (65 mapped nodes, 65
+    // pinned, the seam's clock empty). Overflowing the two trees puts
+    // `user.p` in a leaf under an interior root, which the seam evicts.
     const fill =
         \\mkdir -p mine && python3 -c '
         \\import os
@@ -4438,7 +4447,10 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
         \\    fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
         \\    os.close(fd)
         \\    os.setxattr(p, "user.p", blob)
-        \\put("mine/t")
+        \\for p in ("mine/t", "mine/u"):
+        \\    put(p)
+        \\    for i in range(11):
+        \\        os.setxattr(p, "user.f%d" % i, blob)
         \\for i in range(40):
         \\    put("mine/f%d" % i)
         \\' && sync -f mine && python3 -c '
@@ -4610,11 +4622,25 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
     const barriers = try statNumber(sj, "meta_pr_drain_barriers");
     const retries = try statNumber(sj, "meta_pr_read_retries_after_drain");
     const preempt_ns = try statNumber(ss, "writer_guard_preempt_all_ns");
-    std.debug.print("\n--- F7a: preempt_all_ns {d}, barriers {d}, retries {d}, read {s} ---\n", .{
+    // The node cache's movement since the fill: a storm whose reads never
+    // left RAM (an unevictable leaf) shows 0 loads here with the read ok.
+    const Delta = struct {
+        fn of(after: []const u8, before: []const u8, name: []const u8) !u64 {
+            return (statNumber(after, name) catch 0) -| (statNumber(before, name) catch 0);
+        }
+    };
+    std.debug.print("\n--- F7a: preempt_all_ns {d}, barriers {d}, retries {d}, read {s}; since the fill: loads {d}, misses {d}, hits {d}, evictions {d}, divert local {d}, holder {d}, token hits {d} ---\n", .{
         preempt_ns,
         barriers,
         retries,
         if (read_ok) "ok" else "fail",
+        try Delta.of(sj, pre2, "meta_kv_node_cache_loads"),
+        try Delta.of(sj, pre2, "meta_kv_node_cache_misses"),
+        try Delta.of(sj, pre2, "meta_kv_node_cache_hits"),
+        try Delta.of(sj, pre2, "meta_kv_node_cache_evictions"),
+        try Delta.of(sj, pre2, "dlm_token_local_reads"),
+        try Delta.of(sj, pre2, "dlm_token_reader_holder_resolves"),
+        try Delta.of(sj, pre2, "dlm_token_hits"),
     });
     if (!read_ok) return error.ReadSurfaced;
     try testing.expect(barriers >= 1);
@@ -4651,28 +4677,35 @@ fn memberClockMs(text: []const u8, mark: []const u8) ?u64 {
 /// successor admits the reclaim, long after the 60 ms drain.
 ///
 /// One read issued after the refusal missed the drain about one loaded
-/// gate in five (the fifo, python, FUSE, the eviction seam and the ring
-/// between them; every miss came with a slow target, `preempt_all_ns` ≥
-/// 61 ms against 59–60 on a pass). So from the go until 1 s later, four
-/// threads read back to back: each read evicts the leaf and takes the
-/// device's 60 ms, so a read is in flight at every instant of the drain.
-/// One read inside it is the barrier and the retry; every read must return.
+/// gate in five (every miss came with `preempt_all_ns` ≥ 61 ms against
+/// 59–60 on a pass: a J read admitted just before the preempt, drained
+/// with the writes, and nothing of J's touched the device inside the
+/// window). So from the go, before the preempt-all is released, until 1 s
+/// later, reads go back to back: each evicts the leaf and takes the
+/// device's 60 ms, so one is in flight at every instant of the drain, and
+/// the read issued inside it is the barrier and the retry. One stream per
+/// leaf — four threads on one fd made 20,077 reads a second with 2
+/// evictions: the concurrent holders kept the leaf referenced and the seam
+/// could not evict it. Two leaves (two files), so the stream whose read
+/// closes the drain is never the only one. Every read must return.
 const f7a_reader =
-    \\import os, threading, time
-    \\fd = os.open("mine/t", os.O_RDONLY)
+    \\import os, sys, threading, time
+    \\fds = [os.open("mine/t", os.O_RDONLY), os.open("mine/u", os.O_RDONLY)]
     \\os.close(os.open(os.environ["F7A_READY"], os.O_CREAT | os.O_WRONLY, 0o600))
     \\os.read(os.open(os.environ["F7A_GO"], os.O_RDONLY), 1)
-    \\failed = []
-    \\def storm():
+    \\failed, reads = [], [0, 0]
+    \\def stream(i):
     \\    end = time.monotonic() + 1.0
     \\    while time.monotonic() < end and not failed:
     \\        try:
-    \\            os.getxattr(fd, "user.p")
+    \\            os.getxattr(fds[i], "user.p")
+    \\            reads[i] += 1
     \\        except OSError as e:
     \\            failed.append(e)
-    \\threads = [threading.Thread(target=storm) for _ in range(4)]
+    \\threads = [threading.Thread(target=stream, args=(i,)) for i in range(2)]
     \\for t in threads: t.start()
     \\for t in threads: t.join()
+    \\print(f"--- F7a reader: {reads} reads, failed {failed} ---", file=sys.stderr)
     \\raise SystemExit(1 if failed else 0)
 ;
 

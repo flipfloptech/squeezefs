@@ -3908,6 +3908,11 @@ fn printLogNeedles(rig: *Rig, path: []const u8) void {
         "TRIPWIRE",
         "poisoning",
         "got no reply",
+        "slot leases",
+        "released by appender",
+        "REASSERT_HOLD",
+        "ring grew",
+        "GrowRing",
     };
     std.debug.print("--- needles in {s} ---\n", .{path});
     var line_start: usize = 0;
@@ -6677,7 +6682,12 @@ test "nvmet fidelity: pr5 F12 — a member held unregistered through a slot hand
     const now_idle = clock.monotonicNs();
     if (now_idle < idle_at) sleepMs((idle_at - now_idle) / std.time.ns_per_ms);
     rig.awaitLog(j, "did not land this tick (HandoverDeferred)", 20 * std.time.ns_per_s) catch |e| {
-        rig.printLogTail(j, 40);
+        // The cadence releases an idle rotor slot past M; what it saw.
+        const names = [_][]const u8{ "slot_rotor", "slot_acquires", "slot_forced_shrinks", "slot_lru_releases", "slot_handovers", "slot_handover_deferrals", "slot_offers", "slot_door_parks", "slot_door_resumed", "joined_ring_grows", "joined_ring_grow_deferrals", "meta_kv_journal_full_stalls" };
+        std.debug.print("\n--- F12: no handover attempt by burst_end+{d} s / stop+{d} s:", .{ (clock.monotonicNs() - burst_end) / std.time.ns_per_s, (clock.monotonicNs() - stop_ns) / std.time.ns_per_s });
+        for (names) |name| std.debug.print(" {s} {d}", .{ name, f12Stat(rig, j, name) catch 0 });
+        std.debug.print(" ---\n", .{});
+        printLogNeedles(rig, rig.daemons.items[j].log_path);
         return e;
     };
     if (try f12LogHas(rig, j, "released by appender")) return error.SlotReleasedEarly;

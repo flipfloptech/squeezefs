@@ -4566,6 +4566,16 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
         sleepMs(1);
     }
     flood.arm.store(true, .release);
+    // The fd is already open. The reader's storm starts now, before the
+    // preempt-all is released, so reads are in flight across the whole
+    // ~60 ms drain whatever the venue's load (see `f7a_reader`).
+    if (reader.id) |pid| if (!alive(pid)) {
+        const dead = try reader.wait(rig.io);
+        reader_done = true;
+        std.debug.print("\n--- F7a: reader died before the drain read ({f}) ---\n", .{dead});
+        return error.ReadSurfaced;
+    };
+    try releaseFifoBounded(go, 5 * std.time.ns_per_s);
     releaseFifo(fifo);
     const refuse_deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
     while (!flood.refused.load(.acquire)) {
@@ -4575,14 +4585,6 @@ test "nvmet fidelity: pr5 F7a — a joiner's node read during a preempt-all drai
     const still = if (nb_slot) |*nb| nb.inflightWrites() orelse 0 else 0;
     std.debug.print("\n--- F7a: drain refusal, inflight writes {d} ---\n", .{still});
     if (still == 0) return error.DrainWindowMissed;
-    // The fd is already open. Releasing the fifo is the read instant.
-    if (reader.id) |pid| if (!alive(pid)) {
-        const dead = try reader.wait(rig.io);
-        reader_done = true;
-        std.debug.print("\n--- F7a: reader died before the drain read ({f}) ---\n", .{dead});
-        return error.ReadSurfaced;
-    };
-    try releaseFifoBounded(go, 5 * std.time.ns_per_s);
     const reader_deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
     var reader_finished = false;
     while (clock.monotonicNs() < reader_deadline) {
@@ -4647,12 +4649,31 @@ fn memberClockMs(text: []const u8, mark: []const u8) ?u64 {
 /// root — and a plain `python3 -c` lists its cwd at startup — and ino 1 is
 /// the frozen manager's: either can park at `meta_backend_start` until the
 /// successor admits the reclaim, long after the 60 ms drain.
+///
+/// One read issued after the refusal missed the drain about one loaded
+/// gate in five (the fifo, python, FUSE, the eviction seam and the ring
+/// between them; every miss came with a slow target, `preempt_all_ns` ≥
+/// 61 ms against 59–60 on a pass). So from the go until 1 s later, four
+/// threads read back to back: each read evicts the leaf and takes the
+/// device's 60 ms, so a read is in flight at every instant of the drain.
+/// One read inside it is the barrier and the retry; every read must return.
 const f7a_reader =
-    \\import os
+    \\import os, threading, time
     \\fd = os.open("mine/t", os.O_RDONLY)
     \\os.close(os.open(os.environ["F7A_READY"], os.O_CREAT | os.O_WRONLY, 0o600))
     \\os.read(os.open(os.environ["F7A_GO"], os.O_RDONLY), 1)
-    \\os.getxattr(fd, "user.p")
+    \\failed = []
+    \\def storm():
+    \\    end = time.monotonic() + 1.0
+    \\    while time.monotonic() < end and not failed:
+    \\        try:
+    \\            os.getxattr(fd, "user.p")
+    \\        except OSError as e:
+    \\            failed.append(e)
+    \\threads = [threading.Thread(target=storm) for _ in range(4)]
+    \\for t in threads: t.start()
+    \\for t in threads: t.join()
+    \\raise SystemExit(1 if failed else 0)
 ;
 
 /// Opens `mine/t` while the manager is up, then waits off the mount.

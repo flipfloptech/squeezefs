@@ -28,6 +28,23 @@ marked. Red unit in `joined.zig`, F6 ×3, one full gate with `-Dfresh=true`
 (75/75, `~/tmp/pr6-gate/gate8-f6fix.log`). The train re-gates `dev` from
 here; it is running (`scripts/gate-train`, started this session).
 
+**The F7a misses the train then found (2026-11-26, `9348ef6e` and
+`724c0368`):** one run in three, `barriers 0, retries 0, read ok`, the
+shape of every F7a miss since gate 5. Not timing: instrumented, the
+drain reads made 20,077 getxattrs a second against 5 node loads, and
+J's 65 mapped nodes were all PINNED with the seam's clock empty. On a
+forest every mint slot is its own tree with a pinned root; the rotor
+spread the fill's files over ~60 slots, so a file's slot tree was a
+single root-leaf, pinned and unevictable. The fill now gives the two
+files the drain reads twelve 60 KiB xattrs each so their trees split and
+`user.p` lives in an evictable leaf; the reader runs one serial stream
+per file from before the preempt-all until 1 s after; the F7a line
+prints the node-cache and divert deltas. Alone 5/5 with 36–41 real
+loads. **Observation for the owner:** a forest pins one 256 KiB root per
+touched mint slot regardless of the node-cache budget — 65 roots, 17 MiB
+resident, on a 1 MiB budget after 88 small files. By design (pinned
+classes are exempt), but worth a look at production slot counts.
+
 **Residual hazard, not fixed:** `SESSION_IDLE_TIMEOUT_MS` (60 s) reaps a
 quiet membership session; the dialer's EOF fires `on_lost`, and
 `onManagerLinkLost` parks the self volume with `reregister_pending`,

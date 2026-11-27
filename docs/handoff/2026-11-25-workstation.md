@@ -45,6 +45,28 @@ touched mint slot regardless of the node-cache budget — 65 roots, 17 MiB
 resident, on a 1 MiB budget after 88 small files. By design (pinned
 classes are exempt), but worth a look at production slot counts.
 
+**The train's three greens (2026-11-27T00:03Z, 00:28Z, 00:56Z) stand on
+`5b2f0ef7`** (`.gate-train/ledger-v2.tsv`; 1830 / 1476 / 1673 s). On the
+way there `dev` moved four times after PR-6's landing: the F6 fix
+(`97de559a`), the F7a storm (`9348ef6e`), the F7a pinned-root fix
+(`724c0368`), the handoff (`49a77e87`) and F12's diagnostics
+(`5b2f0ef7`); each move restarts the count. Across the 14 train runs of
+2026-11-26 F6 never recurred and F7a never missed after `724c0368`.
+
+**F12 flaked twice in four runs on `49a77e87`** (2026-11-26T21:43Z,
+22:33Z), both at the wait for `did not land this tick (HandoverDeferred)`:
+the cadence made no release attempt on the idle rotor slot inside the
+20 s after the idle instant. A PR-5 row untouched this week (ten earlier
+train runs and every gate passed it; alone it passes), so it is a flake
+under a loaded gate, cause unknown — the 40-line tail was all growth-
+drain spam. `5b2f0ef7` makes the failure path print the cadence's slot
+stats (`slot_rotor`, forced shrinks, LRU releases, handovers, deferrals,
+door parks/resumes, ring grows/deferrals, journal stalls) and J's slot-
+lease and membership needles. Next miss: read those; the candidates are
+the slot never idle (`holderOps` is noted at door entry, two 40 s epochs),
+M moved, or the cadence not running. Not in `docs/gates/flakes.md` yet;
+the owner's call whether to list it with an owner.
+
 **Residual hazard, not fixed:** `SESSION_IDLE_TIMEOUT_MS` (60 s) reaps a
 quiet membership session; the dialer's EOF fires `on_lost`, and
 `onManagerLinkLost` parks the self volume with `reregister_pending`,
@@ -71,7 +93,7 @@ The official 16-loop `cpu+smoke` load was not run (thermal derating;
 1. Done 2026-11-25 on the owner's word: decision 0003 §DO.34–§DO.43 record
    PR-4, PR-5 and PR-6 as built (the table stopped at DO.32; DO.33 is
    PR-4's premise resolution), and `feat/pr6` is fast-forwarded onto `dev`
-   (the local hook publishes `origin/dev`). The gate train runs the
+   (the local hook publishes `origin/dev`). The gate train ran the
    post-landing greens; a red on these commits is fixed within the hour
    or reverted.
 2. **The conformance suites on the current venue and kernel.** Every gate

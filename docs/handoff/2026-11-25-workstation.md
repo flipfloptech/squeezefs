@@ -93,9 +93,14 @@ binary `7bb79dc9`, `SUITE_RUNS=1`, logs `~/tmp/suites/`):**
   sequence, kill -9 or a drop, remount, fsck → C10), then the fix in the
   rename-over-directory path or its replay; `~/tmp/suites/syncfs/510-repro-*.log`,
   results under `/build/suites-disk/suites-fstests-20261126-2118*`.
-- The overnight discovery (`~/tmp/suites/night/`): the full `-g auto` pass
-  (stops at 510), then `FSTESTS_AFTER=generic/510` onward, chained up to
-  three resumes. Read `progress.log` first.
+- The whole `-g auto` (`~/tmp/suites/night/`: the pass to 510 in 3627 s,
+  then `FSTESTS_AFTER=generic/510` to the end in 1654 s): 795 ran, 498 not
+  run by their requirements, 6 failures all existing by-design rows
+  (424, 441, 484, 563, 741, 798), the 3 syncfs-law rows skipped by the
+  probe, and ONE unadjudicated failure — generic/510 above. So the
+  release gate on this kernel is one fix away from its 3-run count:
+  fix 510 (red repro first), then `scripts/venue zig build
+  -Drelease-gate=true gate-release` (hours; never beside a gate).
 
 **Residual hazard, not fixed:** `SESSION_IDLE_TIMEOUT_MS` (60 s) reaps a
 quiet membership session; the dialer's EOF fires `on_lost`, and

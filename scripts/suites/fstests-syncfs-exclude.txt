@@ -1,0 +1,17 @@
+# xfstests rows whose LAW is syncfs's durability, skipped by the mount's probe
+# (charter §3 "FUSE_SYNCFS": "a row whose law is syncfs's durability skips by
+# the probe, naming it"): scripts/suites/fstests.sh mounts the TEST set once
+# before `check` and reads `.stats` `fuse_syncfs_reaches`; 0 (this kernel
+# sends no FUSE_SYNCFS — upstream from 7.4; stock 7.3.1 is the product's
+# floor, decision 0003 §DB) adds these to `check -E`. On a kernel whose
+# syncfs reaches the daemon they run. One per line: <test>  <the law>.
+#
+# Found 2026-11-26 on stock 7.3.1 (squeezefs 7bb79dc9): of the 68 dm-flakey
+# rows, 45 call `_scratch_sync` before the drop; one harness run each, these
+# three fail, all the same shape — bytes written then persisted by the sync
+# ALONE (other inodes are fsynced, never these) read back as zeros after the
+# drop and the replay; every fsynced byte and every link count is right.
+# `~/tmp/suites/syncfs/verdicts.txt` on the workstation; handoff 2026-11-25.
+generic/065  foo (8 KiB, 0xaa) is written, then `_scratch_sync`; mydir and hello are fsynced; after the drop foo reads zeros, hello and the five links are right
+generic/341  a/x/foo and a/x/bar (32 KiB each) are written, then `_scratch_sync`; the renamed-over directory a/x is fsynced; after the drop a/y/foo and a/y/bar read zeros
+generic/342  a/foo (16 KiB) is written, then `_scratch_sync`; the new a/foo is fsynced; after the drop a/bar (the renamed first file) reads zeros

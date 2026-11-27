@@ -67,6 +67,36 @@ the slot never idle (`holderOps` is noted at door entry, two 40 s epochs),
 M moved, or the cadence not running. Not in `docs/gates/flakes.md` yet;
 the owner's call whether to list it with an owner.
 
+**The conformance suites on stock 7.3.1, first pass (2026-11-26 evening,
+binary `7bb79dc9`, `SUITE_RUNS=1`, logs `~/tmp/suites/`):**
+- pjdfstest (full): clean — 0 failures, 0 unadjudicated, 0 stale rows.
+- LTP `fs` + `syscalls` (clone + build on first run): clean — 2 failure
+  ids, both adjudicated ledger rows; 9 venue failures (fail on ext4 too).
+- fstests `-g auto`: two harness fixes first. (1) xfstests `d07dca7` now
+  guards `struct delegation` with configure's `HAVE_STRUCT_DELEGATION`;
+  our glibc-2.43 edit on top broke the preprocessor — `fstests_patch_locktest`
+  restores upstream's file and edits only an older clone. (2) The charter's
+  "a row whose law is syncfs's durability skips by the probe": the harness
+  mounts the TEST set once before `check`, reads `fuse_syncfs_reaches`
+  (0 here: no FUSE_SYNCFS before 7.4) and adds `fstests-syncfs-exclude.txt`
+  to `-E`. Its three rows came from running all 45 flakey rows that
+  `_scratch_sync` before the drop, one harness run each: generic/065, 341,
+  342 lose bytes persisted by the sync alone (zeros after replay; every
+  fsynced byte and link count right). The other 42 pass.
+- **First product finding: generic/510** (3/3 reproducible):
+  `mkdir testdir/{A,B}; touch B/bar; sync; mv B/bar A/bar; mv -T A B;
+  fsync B/bar; drop; remount` → the tree is right (bar's single parent is
+  B, no A) and our fsck says `[C10] directory ino 3 — nlink 4 vs 2 + 1
+  subdirectories`: `testdir` kept two subdirectories' worth of links after
+  the replace-directory rename. Not the kernel floor (the fsync orders
+  everything before it in the journal). Next: a red smoke repro (the
+  sequence, kill -9 or a drop, remount, fsck → C10), then the fix in the
+  rename-over-directory path or its replay; `~/tmp/suites/syncfs/510-repro-*.log`,
+  results under `/build/suites-disk/suites-fstests-20261126-2118*`.
+- The overnight discovery (`~/tmp/suites/night/`): the full `-g auto` pass
+  (stops at 510), then `FSTESTS_AFTER=generic/510` onward, chained up to
+  three resumes. Read `progress.log` first.
+
 **Residual hazard, not fixed:** `SESSION_IDLE_TIMEOUT_MS` (60 s) reaps a
 quiet membership session; the dialer's EOF fires `on_lost`, and
 `onManagerLinkLost` parks the self volume with `reregister_pending`,

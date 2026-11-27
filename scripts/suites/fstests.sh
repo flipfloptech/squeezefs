@@ -47,6 +47,11 @@ FSTESTS_TIMEOUT_S=${FSTESTS_TIMEOUT_S:-14400}
 # Tests excluded in THIS venue only (`check -X`), each with its reason;
 # never a filesystem semantic (those are the ledger's).
 FSTESTS_VENUE_EXCLUDE="$SUITES_DIR/fstests-venue-exclude.txt"
+# Rows whose law is syncfs's durability (`_scratch_sync` before the flakey
+# drop, the synced bytes checked after replay); skipped only where the
+# mount's probe says FUSE_SYNCFS reaches no daemon (charter §3: "a row
+# whose law is syncfs's durability skips by the probe, naming it").
+FSTESTS_SYNCFS_EXCLUDE="$SUITES_DIR/fstests-syncfs-exclude.txt"
 # FSTESTS_PRELOAD=<path to libsqueezefs_il.so> (`1`: the one this build
 # installed beside $SQZ_BIN): `check` and so every test process — xfs_io,
 # filefrag, the tests' own tools — run under the interposer (charter §7;
@@ -69,15 +74,19 @@ fstests_preload_setup() {
   suite_log "preload: every test process under $so (${FSTESTS_CHECK_ENV[*]:1}); mounts -o $SUITE_MOUNT_OPTS"
 }
 
-# xfstests master defines `struct delegation` (the file-delegation tests'
-# fcntl argument) only `#ifndef F_GETDELEG`; glibc 2.43+ defines the
-# constants without the struct, so on a rolling venue locktest.c does not
-# compile ("storage size of 'deleg' isn't known"). The maintainer's fix
-# (https://lore.kernel.org/fstests/20260813150846.280498-1-zlang@kernel.org/)
-# takes the struct out of that guard; until it lands, the same edit here,
-# only where the guard still wraps the struct and glibc lacks it.
+# xfstests before 2026-10 defined `struct delegation` (the file-delegation
+# tests' fcntl argument) only `#ifndef F_GETDELEG`; glibc 2.43+ defines the
+# constants without the struct, so on a rolling venue locktest.c did not
+# compile ("storage size of 'deleg' isn't known"). Upstream's fix guards
+# the struct with configure's HAVE_STRUCT_DELEGATION; a clone that carries
+# it builds as is (and the old edit on top of it breaks both guards:
+# "'#endif' without '#if'"). The edit stays for an older clone only.
 fstests_patch_locktest() {
   local f="$FSTESTS_DIR/src/locktest.c"
+  # Upstream's file first: the decision below is about it, and a build
+  # that died midway left an edited copy behind.
+  git -C "$FSTESTS_DIR" checkout -q -- src/locktest.c 2>/dev/null || true
+  grep -q 'HAVE_STRUCT_DELEGATION' "$f" && return 0
   # A libc that completes the struct: nothing to do.
   printf '#include <fcntl.h>\nstruct delegation d;\n' | cc -x c -fsyntax-only - 2>/dev/null && return 0
   # The struct still inside the guard (the clone predates the fix)?
@@ -323,6 +332,32 @@ fstests_scopes_down() {
 }
 
 # One `check` pass. Failure ids (`generic/NNN`) to $2.
+# Charter §3 "FUSE_SYNCFS": one mount of the freshly formatted TEST set
+# through the helper xfstests uses, its `.stats` `fuse_syncfs_reaches`
+# (1: the bring-up's syncfs(2) reached the dispatcher; 0: this kernel sends
+# no FUSE_SYNCFS, upstream from 7.4), then the orderly umount. Prints the
+# value; an unreadable probe prints 1 so nothing skips on a doubt.
+fstests_probe_syncfs_reaches() {
+  local log="$RESULTS/syncfs-probe.log" dev="$TEST_LOOP" dir="$SETS/mnt-test" reaches="" deadline=$((SECONDS + 60))
+  echo "probe: mount -t fuse.squeezefs $dev $dir -o $SUITE_MOUNT_OPTS" >> "$log"
+  if mount -t fuse.squeezefs "$dev" "$dir" -o "$SUITE_MOUNT_OPTS" >> "$log" 2>&1; then
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      reaches=$(grep -oE '"fuse_syncfs_reaches": *[0-9]+' "$dir/.stats" 2>/dev/null | grep -oE '[0-9]+$' || true)
+      [ -n "$reaches" ] && break
+      sleep 1
+    done
+    echo "probe: fuse_syncfs_reaches '${reaches}' after $((60 - deadline + SECONDS)) s" >> "$log"
+    umount "$dir" >> "$log" 2>&1 || umount -l "$dir" >> "$log" 2>&1 || true
+    local w=0
+    while mountpoint -q "$dir" && [ "$w" -lt 60 ]; do sleep 1; w=$((w + 1)); done
+  else
+    echo "probe: mount failed" >> "$log"
+    suite_log "syncfs probe: the TEST set did not mount ($log); no row skips on it"
+  fi
+  # An unreadable probe is 1: nothing skips on a doubt.
+  echo "${reaches:-1}"
+}
+
 fstests_run() {
   local n=$1 failures=$2
   : > "$failures"
@@ -331,6 +366,16 @@ fstests_run() {
   fstests_scopes_down
   local exclude=()
   if [ -s "$FSTESTS_VENUE_EXCLUDE" ]; then grep -v '^#' "$FSTESTS_VENUE_EXCLUDE" | awk '{print $1}' | grep . > "$RESULTS/venue-exclude.list" || true; [ -s "$RESULTS/venue-exclude.list" ] && exclude=(-E "$RESULTS/venue-exclude.list"); fi
+  if [ -s "$FSTESTS_SYNCFS_EXCLUDE" ] && grep -qv '^#' "$FSTESTS_SYNCFS_EXCLUDE"; then
+    local reaches; reaches=$(fstests_probe_syncfs_reaches 2>> "$RESULTS/syncfs-probe.log")
+    if [ "$reaches" = 0 ]; then
+      grep -v '^#' "$FSTESTS_SYNCFS_EXCLUDE" | awk '{print $1}' | grep . >> "$RESULTS/venue-exclude.list"
+      exclude=(-E "$RESULTS/venue-exclude.list")
+      suite_log "run $n: fuse_syncfs_reaches 0 — this kernel sends no FUSE_SYNCFS (upstream from 7.4), so $(grep -v '^#' "$FSTESTS_SYNCFS_EXCLUDE" | grep -c .) row(s) whose law is syncfs's durability skip by the probe (charter §3; $FSTESTS_SYNCFS_EXCLUDE)"
+    else
+      suite_log "run $n: fuse_syncfs_reaches $reaches — the syncfs-law rows run"
+    fi
+  fi
   local what=()
   if [ -n "${FSTESTS_TESTS:-}" ]; then read -ra what <<< "$FSTESTS_TESTS"; else read -ra what <<< "$FSTESTS_GROUPS"; fi
   local rc=0 t0 t1
